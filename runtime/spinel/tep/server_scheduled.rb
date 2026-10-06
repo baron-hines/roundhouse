@@ -213,7 +213,7 @@ module Tep
           return false
         end
 
-        req.consume_body_via_scheduler(client)
+        return false unless req.consume_body_via_scheduler(client)
 
         res = Response.new
         begin
