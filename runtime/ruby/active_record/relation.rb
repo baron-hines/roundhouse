@@ -1379,9 +1379,8 @@ module ActiveRecord
       ok
     end
 
-    # `exists?` / `exists?(id)`. Hash/String forms are unsupported.
-    # Integer? narrows by early return — rust2 does not narrow Option
-    # across `unless x.nil?`. Unloaded: exists_sql (SELECT 1 LIMIT 1).
+    # Hash conditions share where's predicate builder; scalar conditions
+    # select the primary key. Unloaded: exists_sql (SELECT 1 LIMIT 1).
     def exists?(id = nil)
       return false if @limit == 0
       if id.nil?
@@ -1390,10 +1389,20 @@ module ActiveRecord
         return probe_existence(1) > 0
       end
       own_lists
-      @wheres << "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(id)}"
-      found = probe_existence(1) > 0
-      @wheres.pop
-      found
+      # Popped for the same reason `find` and `find_by` pop: a terminal
+      # that answered a question must not narrow the relation it was
+      # asked on.
+      sql = if id.is_a?(Hash)
+        hash_conditions(id)
+      else
+        "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(id)}"
+      end
+      @wheres << sql unless sql.empty?
+      begin
+        probe_existence(1) > 0
+      ensure
+        @wheres.pop unless sql.empty?
+      end
     end
 
     # How many probe rows `exists_sql(n)` returns. Shared by `exists?`,

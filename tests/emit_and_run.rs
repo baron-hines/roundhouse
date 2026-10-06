@@ -19,6 +19,9 @@ mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
 
+#[path = "emit_and_run/integer_query_exists.rs"]
+mod integer_query_exists;
+
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
     emit_and_run::real_blog()
