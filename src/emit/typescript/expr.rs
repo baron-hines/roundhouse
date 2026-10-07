@@ -3008,18 +3008,39 @@ fn js_send_inner(
                 _ => {}
             }
             // Int % Int: Ruby's result takes the divisor's sign
-            // (`-7 % 3 == 2`), JS's the dividend's. `((a % b) + b) % b`
-            // floors it; the IIFE evaluates each operand once.
+            // (`-7 % 3 == 2`), JS's the dividend's. Add the divisor only
+            // when the signs differ (`((a % b) + b) % b` can round the
+            // intermediate sum past 2**53); a zero remainder returns a
+            // literal `0` so JS's `-0` never leaks. The IIFE evaluates
+            // each operand once.
             if crate::emit::shared::div_pow::is_int_pair(r, arg) {
-                let a = || synth_ident("__a");
                 let b = || synth_ident("__b");
-                let rem = Js::binary(span, "%", a(), b());
-                let floored = Js::binary(span, "%", Js::binary(span, "+", rem, b()), b());
+                let m = || synth_ident("__m");
+                let zero = || Js::num(span, "0");
+                let signs_differ = Js::binary(
+                    span,
+                    "!==",
+                    Js::binary(span, "<", m(), zero()),
+                    Js::binary(span, "<", b(), zero()),
+                );
+                let floored = Js::synth(JsExpr::Ternary {
+                    cond: Js::binary(span, "===", m(), zero()),
+                    then: zero(),
+                    else_: Js::synth(JsExpr::Ternary {
+                        cond: signs_differ,
+                        then: Js::binary(span, "+", m(), b()),
+                        else_: m(),
+                    }),
+                });
                 return iife(
                     span,
                     vec![
                         const_decl("__a", js_expr(r)),
                         const_decl("__b", js_expr(arg)),
+                        const_decl(
+                            "__m",
+                            Js::binary(span, "%", synth_ident("__a"), synth_ident("__b")),
+                        ),
                         JsStmt::synth(JsStmtNode::Return(Some(floored))),
                     ],
                 );

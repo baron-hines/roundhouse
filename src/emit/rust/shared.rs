@@ -10,7 +10,8 @@
 /// divisor's sign (`-7 % 3 == 2`); Rust's `/` and `%` truncate toward
 /// zero. Render the floored form as a parenthesized block expression
 /// (bare, a leading `{ … } + x` would parse as a statement) that
-/// evaluates each operand once. `method` is `"/"` or `"%"`.
+/// evaluates each operand once. `x % -1` is always 0, and short-circuiting
+/// it avoids Rust's overflow panic on `i64::MIN % -1`. `method` is `"/"` or `"%"`.
 pub(crate) fn int_floor_div_mod(method: &str, lhs: &str, rhs: &str) -> String {
     match method {
         "/" => format!(
@@ -18,7 +19,8 @@ pub(crate) fn int_floor_div_mod(method: &str, lhs: &str, rhs: &str) -> String {
              if a % b != 0 && ((a < 0) != (b < 0)) {{ q - 1 }} else {{ q }} }})"
         ),
         _ => format!(
-            "({{ let (a, b): (i64, i64) = ({lhs}, {rhs}); let m = a % b; \
+            "({{ let (a, b): (i64, i64) = ({lhs}, {rhs}); let m = \
+             if b == -1 {{ 0 }} else {{ a % b }}; \
              if m != 0 && ((m < 0) != (b < 0)) {{ m + b }} else {{ m }} }})"
         ),
     }

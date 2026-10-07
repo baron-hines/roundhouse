@@ -34,7 +34,7 @@ fn rust_floors_int_div_and_mod() {
         "Int / Int not floored:\n{out}"
     );
     assert!(
-        out.contains("let m = a % b; if m != 0 && ((m < 0) != (b < 0)) { m + b } else { m }"),
+        out.contains("let m = if b == -1 { 0 } else { a % b }; if m != 0 && ((m < 0) != (b < 0)) { m + b } else { m }"),
         "Int % Int not floored:\n{out}"
     );
     assert!(out.contains("7.0 / 2.0"), "Float / Float should stay native:\n{out}");
@@ -44,7 +44,11 @@ fn rust_floors_int_div_and_mod() {
 fn typescript_floors_int_div_and_mod() {
     let out = emitted(BuildTarget::Typescript, "app/models/article.ts");
     assert!(out.contains("Math.floor(a / 2)"), "Int / Int not floored:\n{out}");
-    assert!(out.contains("(__a % __b + __b) % __b"), "Int % Int not floored:\n{out}");
+    assert!(out.contains("const __m = __a % __b"), "Int % Int not floored:\n{out}");
+    // Add the divisor only on a sign mismatch: a second `% __b` over
+    // `__m + __b` would round sums past 2**53.
+    assert!(out.contains("__m + __b :"), "Int % Int not floored:\n{out}");
+    assert!(!out.contains("+ __b) % __b"), "Int % Int sums before flooring:\n{out}");
     assert!(!out.contains("Math.floor(7.0 / 2.0)") && !out.contains("Math.floor(7 / 2)"),
         "Float / Float must not floor:\n{out}");
 }
