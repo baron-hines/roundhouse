@@ -2625,8 +2625,24 @@ fn js_send_inner(
                     // JS `replace` with a string replaces only the first,
                     // and the g-flag shim below only fires on a RegExp.
                     // `replaceAll` is the string-pattern native.
-                    let str_pat = matches!(strip_nullable(args[0].ty.as_ref()), Some(Ty::Str));
-                    let pat_js = if str_pat {
+                    // An empty literal pattern matches at every character
+                    // boundary; `/(?:)/gu` steps by code point, where
+                    // `replaceAll("", ..)` would split surrogate pairs.
+                    let empty_pat = matches!(
+                        &*args[0].node,
+                        ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()
+                    );
+                    let str_pat = !empty_pat
+                        && matches!(strip_nullable(args[0].ty.as_ref()), Some(Ty::Str));
+                    let pat_js = if empty_pat {
+                        Js::new(
+                            args[0].span,
+                            JsExpr::Regex {
+                                pattern: "(?:)".into(),
+                                flags: "gu".into(),
+                            },
+                        )
+                    } else if str_pat {
                         js_expr(&args[0])
                     } else if let ExprNode::Lit {
                         value: Literal::Regex { pattern, flags },

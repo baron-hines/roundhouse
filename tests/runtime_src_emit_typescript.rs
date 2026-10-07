@@ -280,8 +280,8 @@ fn runtime_corpus_phase1_gap_survey() {
 #[test]
 fn native_semantics_follow_ruby() {
     let methods = parse_methods_with_rbs(
-        "module Natives\n  def sorted(xs)\n    xs.sort\n  end\n  def words(xs)\n    xs.sort\n  end\n  def swap(s)\n    s.gsub(\"l\", \"L\")\n  end\n  def swap_rx(s)\n    s.gsub(/l+/, \"L\")\n  end\nend\n",
-        "module Natives\n  def sorted: (Array[Integer]) -> Array[Integer]\n  def words: (Array[String]) -> Array[String]\n  def swap: (String) -> String\n  def swap_rx: (String) -> String\nend\n",
+        "module Natives\n  def sorted(xs)\n    xs.sort\n  end\n  def words(xs)\n    xs.sort\n  end\n  def swap(s)\n    s.gsub(\"l\", \"L\")\n  end\n  def swap_rx(s)\n    s.gsub(/l+/, \"L\")\n  end\n  def spread(s)\n    s.gsub(\"\", \"-\")\n  end\nend\n",
+        "module Natives\n  def sorted: (Array[Integer]) -> Array[Integer]\n  def words: (Array[String]) -> Array[String]\n  def swap: (String) -> String\n  def swap_rx: (String) -> String\n  def spread: (String) -> String\nend\n",
     )
     .expect("parse");
     let out: Vec<String> = methods.iter().map(emit_method).collect();
@@ -289,4 +289,5 @@ fn native_semantics_follow_ruby() {
     assert!(out[1].contains("[...xs].sort()"), "string sort keeps the default:\n{}", out[1]);
     assert!(out[2].contains("s.replaceAll(\"l\", \"L\")"), "string gsub:\n{}", out[2]);
     assert!(out[3].contains("s.replace(/l+/g, \"L\")"), "regex gsub:\n{}", out[3]);
+    assert!(out[4].contains("s.replace(/(?:)/gu, \"-\")"), "empty gsub:\n{}", out[4]);
 }
