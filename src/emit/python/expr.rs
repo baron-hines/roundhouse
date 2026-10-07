@@ -1186,6 +1186,28 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
                 return r#"(_ for _ in ()).throw(TypeError("roundhouse: + with incompatible operand types"))"#.to_string();
             }
         }
+        // Array `&` / `|`: Python's `&`/`|` are undefined for lists.
+        // `dict.fromkeys` dedupes in insertion order, like Ruby.
+        if method == "&" || method == "|" {
+            use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
+            match classify_set_op(method, r, arg) {
+                SetOpCase::ArrayIntersect { .. } => {
+                    return format!(
+                        "[x for x in dict.fromkeys({}) if x in {}]",
+                        emit_expr(r),
+                        emit_expr(arg)
+                    );
+                }
+                SetOpCase::ArrayUnion { .. } => {
+                    return format!(
+                        "list(dict.fromkeys([*{}, *{}]))",
+                        emit_expr(r),
+                        emit_expr(arg)
+                    );
+                }
+                SetOpCase::Other => {}
+            }
+        }
         // `-` dispatch: Python supports numeric `-` natively; list
         // difference needs a comprehension. Incompatible refuses.
         if method == "-" {

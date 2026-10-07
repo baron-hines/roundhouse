@@ -8223,3 +8223,59 @@ fn an_rbs_array_block_runs_after_app_emission() {
         .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
         .assert_passes();
 }
+
+/// Array `&` and `|` are set intersection and union in Ruby. The
+/// typed targets used to print their native operators: bitwise on
+/// TypeScript (two arrays coerce to `0`), a `TypeError` on Python
+/// lists, and a `.&(…)` method call that Rust cannot parse.
+fn array_set_operators_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def self.common_ids\n    [1, 2, 2, 3] & [2, 3, 4]\n  end\n\n  def self.either_ids\n    [3, 1, 1] | [2, 1]\n  end\n",
+        )
+        .write(
+            "test/models/set_ops_test.rb",
+            "require \"test_helper\"\n\nclass SetOpsTest < ActiveSupport::TestCase\n  test \"array set operators\" do\n    assert_equal [2, 3], Article.common_ids\n    assert_equal [3, 1, 2], Article.either_ids\n  end\nend\n",
+        )
+}
+
+#[test]
+fn array_set_operators_run() {
+    array_set_operators_app()
+        .run_test("test/models/set_ops_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn array_set_operators_are_not_native_infix_on_typed_targets() {
+    use roundhouse::project::BuildTarget;
+    for (target, file, intersect, union) in [
+        (
+            BuildTarget::Typescript,
+            "app/models/article.ts",
+            "[...new Set([...[1, 2, 2, 3]])].filter(x => [2, 3, 4].includes(x))",
+            "[...new Set([...[3, 1, 1], ...[2, 1]])]",
+        ),
+        (
+            BuildTarget::Python,
+            "app/v2/models.py",
+            "[x for x in dict.fromkeys([1, 2, 2, 3]) if x in [2, 3, 4]]",
+            "list(dict.fromkeys([*[3, 1, 1], *[2, 1]]))",
+        ),
+        (
+            BuildTarget::Rust,
+            "src/models/article.rs",
+            "if __rhs.contains(x) && !__out.contains(x)",
+            "for x in __lhs.iter().chain(__rhs.iter())",
+        ),
+    ] {
+        let (tree, errors) = array_set_operators_app().emit(target);
+        assert!(errors.is_empty(), "{target:?}: {errors:?}");
+        let src = std::fs::read_to_string(tree.join(file))
+            .unwrap_or_else(|e| panic!("{target:?}: read {file}: {e}"));
+        assert!(src.contains(intersect), "{target:?} `&`:\n{src}");
+        assert!(src.contains(union), "{target:?} `|`:\n{src}");
+    }
+}

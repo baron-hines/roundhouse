@@ -195,6 +195,25 @@ pub(super) fn try_binary_operator(
             ));
         }
     }
+    // Array `&` / `|`: `Vec` has no such operator (the fall-through
+    // would print `.&(…)`). Collect first occurrences, keeping order.
+    if method == "&" || method == "|" {
+        use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
+        let (elem, keep, items) = match classify_set_op(method, r, &args[0]) {
+            SetOpCase::ArrayIntersect { elem } => {
+                (elem, "__rhs.contains(x) && ", "__lhs.iter()")
+            }
+            SetOpCase::ArrayUnion { elem } => (elem, "", "__lhs.iter().chain(__rhs.iter())"),
+            SetOpCase::Other => return None,
+        };
+        let elem_ty = crate::emit::rust::ty::rust_ty(elem);
+        return Some(format!(
+            "{{ let __lhs = {}; let __rhs = {}; let mut __out: Vec<{elem_ty}> = Vec::new(); \
+             for x in {items} {{ if {keep}!__out.contains(x) {{ __out.push(x.clone()); }} }} __out }}",
+            emit_expr(r),
+            emit_expr(&args[0]),
+        ));
+    }
     if matches!(method, "==" | "!=" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/") {
         // Binary-op LHS is a primary-demanding position. Without
         // the wrap, `x.len() as i64 < y` parses as the start of a

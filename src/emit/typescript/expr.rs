@@ -2916,6 +2916,45 @@ fn js_send_inner(
                 _ => {}
             }
         }
+        // Array `&` / `|`: TS's `&`/`|` are bitwise. Dedupe through a
+        // `Set` (insertion-ordered, like Ruby's result); `&` then keeps
+        // what the rhs includes.
+        if method == "&" || method == "|" {
+            use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
+            let dedup = |items: Vec<Js>| {
+                Js::synth(JsExpr::Array(vec![Js::synth(JsExpr::Spread(Js::synth(
+                    JsExpr::New {
+                        callee: synth_ident("Set"),
+                        args: vec![Js::synth(JsExpr::Array(items))],
+                    },
+                )))]))
+            };
+            match classify_set_op(method, r, arg) {
+                SetOpCase::ArrayIntersect { .. } => {
+                    let pred = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("x")],
+                        body: ArrowBody::Expr(Js::method_call(
+                            Span::synthetic(),
+                            js_expr(arg),
+                            "includes",
+                            vec![synth_ident("x")],
+                        )),
+                        is_async: false,
+                    });
+                    let lhs = dedup(vec![Js::synth(JsExpr::Spread(js_expr(r)))]);
+                    return Js::method_call(span, lhs, "filter", vec![pred]);
+                }
+                SetOpCase::ArrayUnion { .. } => {
+                    let mut out = dedup(vec![
+                        Js::synth(JsExpr::Spread(js_expr(r))),
+                        Js::synth(JsExpr::Spread(js_expr(arg))),
+                    ]);
+                    out.span = span;
+                    return out;
+                }
+                SetOpCase::Other => {}
+            }
+        }
         // `-` dispatch: TS's native `-` handles numerics. Array set-
         // difference uses filter + includes. Incompatible pairs refuse.
         if method == "-" {
