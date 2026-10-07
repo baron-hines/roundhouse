@@ -1254,8 +1254,13 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
         {
             return format!("{}.append({})", emit_expr(r), emit_expr(arg));
         }
-        if is_py_binop(method) {
-            return format!("{} {} {}", emit_expr(r), method, emit_expr(arg));
+        if let Some(prec) = py_binop_prec(method) {
+            return format!(
+                "{} {} {}",
+                emit_operand(r, prec, false),
+                method,
+                emit_operand(arg, prec, true)
+            );
         }
     }
     match recv {
@@ -1304,7 +1309,7 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
             }
         }
         Some(r) => {
-            let recv_s = emit_expr(r);
+            let recv_s = emit_recv(r);
             // Ruby type predicates map to Python builtins on the
             // receiver, not to a name-legalized method call.
             if method == "nil?" && args.is_empty() {
@@ -1502,26 +1507,66 @@ fn ruby_isinstance(recv: &str, cls: &str) -> String {
     }
 }
 
+/// A receiver, parenthesized when Python's `.` would otherwise bind
+/// inside it: a negative literal (`-5.abs` is `-(5.abs)`, and `5.abs`
+/// does not even tokenize) or an infix operator (`a - 10.abs`).
+fn emit_recv(r: &Expr) -> String {
+    let s = emit_expr(r);
+    let wrap = match &*r.node {
+        ExprNode::Lit { value: Literal::Int { value } } => *value < 0,
+        ExprNode::Lit { value: Literal::Float { value } } => value.is_sign_negative(),
+        ExprNode::Send { recv: Some(_), method, args, .. } => {
+            args.len() == 1 && is_py_binop(method.as_str())
+        }
+        _ => false,
+    };
+    if wrap { format!("({s})") } else { s }
+}
+
 fn is_py_binop(method: &str) -> bool {
-    matches!(
-        method,
-        "==" | "!="
-            | "<"
-            | "<="
-            | ">"
-            | ">="
-            | "+"
-            | "-"
-            | "*"
-            | "/"
-            | "%"
-            | "**"
-            | "<<"
-            | ">>"
-            | "|"
-            | "&"
-            | "^"
-    )
+    py_binop_prec(method).is_some()
+}
+
+/// Python binding strength of an infix operator, loosest first. The
+/// order matches Ruby's for these operators, except that Python chains
+/// comparisons (`a < b == c`), so one comparison never sits bare inside
+/// another.
+fn py_binop_prec(method: &str) -> Option<u8> {
+    Some(match method {
+        "==" | "!=" | "<" | "<=" | ">" | ">=" => 0,
+        "|" => 1,
+        "^" => 2,
+        "&" => 3,
+        "<<" | ">>" => 4,
+        "+" | "-" => 5,
+        "*" | "/" | "%" => 6,
+        "**" => 7,
+        _ => return None,
+    })
+}
+
+/// An operand of an infix operator of strength `parent`, parenthesized
+/// when it is itself an infix expression that would otherwise
+/// re-associate: `(a + 4) * 2` must not print as `a + 4 * 2`. Operators
+/// are left-associative here, so an equal-strength right operand wraps
+/// too (`a - (b - c)`).
+fn emit_operand(e: &Expr, parent: u8, right: bool) -> String {
+    let s = emit_expr(e);
+    let wrap = match &*e.node {
+        ExprNode::Send { recv: Some(_), method, args, .. } if args.len() == 1 => {
+            match py_binop_prec(method.as_str()) {
+                Some(p) => p < parent || (p == parent && (right || p == 0 || p == 7)),
+                None => false,
+            }
+        }
+        // `-2 ** 2` is `-(2 ** 2)` in Python.
+        ExprNode::Lit { value: Literal::Int { value } } => parent == 7 && !right && *value < 0,
+        ExprNode::Lit { value: Literal::Float { value } } => {
+            parent == 7 && !right && value.is_sign_negative()
+        }
+        _ => false,
+    };
+    if wrap { format!("({s})") } else { s }
 }
 
 pub(super) fn emit_literal(lit: &Literal) -> String {
