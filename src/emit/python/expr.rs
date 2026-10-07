@@ -1187,20 +1187,22 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
             }
         }
         // Array `&` / `|`: Python's `&`/`|` are undefined for lists.
-        // `dict.fromkeys` dedupes in insertion order, like Ruby.
+        // Dedupe in order by `==` against the prefix (not `dict.fromkeys`,
+        // which rejects unhashable elements such as nested lists); the
+        // lambda evaluates each operand exactly once, lhs first.
         if method == "&" || method == "|" {
             use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
             match classify_set_op(method, r, arg) {
                 SetOpCase::ArrayIntersect { .. } => {
                     return format!(
-                        "[x for x in dict.fromkeys({}) if x in {}]",
+                        "(lambda __l, __r: [x for i, x in enumerate(__l) if x in __r and x not in __l[:i]])({}, {})",
                         emit_expr(r),
                         emit_expr(arg)
                     );
                 }
                 SetOpCase::ArrayUnion { .. } => {
                     return format!(
-                        "list(dict.fromkeys([*{}, *{}]))",
+                        "(lambda __a: [x for i, x in enumerate(__a) if x not in __a[:i]])([*{}, *{}])",
                         emit_expr(r),
                         emit_expr(arg)
                     );

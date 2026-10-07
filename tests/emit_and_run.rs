@@ -8255,14 +8255,14 @@ fn array_set_operators_are_not_native_infix_on_typed_targets() {
         (
             BuildTarget::Typescript,
             "app/models/article.ts",
-            "[...new Set([...[1, 2, 2, 3]])].filter(x => [2, 3, 4].includes(x))",
+            "((__l, __r) => [...new Set([...__l])].filter(x => __r.includes(x)))([1, 2, 2, 3], [2, 3, 4])",
             "[...new Set([...[3, 1, 1], ...[2, 1]])]",
         ),
         (
             BuildTarget::Python,
             "app/v2/models.py",
-            "[x for x in dict.fromkeys([1, 2, 2, 3]) if x in [2, 3, 4]]",
-            "list(dict.fromkeys([*[3, 1, 1], *[2, 1]]))",
+            "(lambda __l, __r: [x for i, x in enumerate(__l) if x in __r and x not in __l[:i]])([1, 2, 2, 3], [2, 3, 4])",
+            "(lambda __a: [x for i, x in enumerate(__a) if x not in __a[:i]])([*[3, 1, 1], *[2, 1]])",
         ),
         (
             BuildTarget::Rust,

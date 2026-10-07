@@ -2931,18 +2931,26 @@ fn js_send_inner(
             };
             match classify_set_op(method, r, arg) {
                 SetOpCase::ArrayIntersect { .. } => {
+                    // Bind both operands as IIFE params so the rhs is
+                    // evaluated once (not per element), lhs first.
                     let pred = Js::synth(JsExpr::Arrow {
                         params: vec![js_param("x")],
                         body: ArrowBody::Expr(Js::method_call(
                             Span::synthetic(),
-                            js_expr(arg),
+                            synth_ident("__r"),
                             "includes",
                             vec![synth_ident("x")],
                         )),
                         is_async: false,
                     });
-                    let lhs = dedup(vec![Js::synth(JsExpr::Spread(js_expr(r)))]);
-                    return Js::method_call(span, lhs, "filter", vec![pred]);
+                    let lhs = dedup(vec![Js::synth(JsExpr::Spread(synth_ident("__l")))]);
+                    let body = Js::method_call(Span::synthetic(), lhs, "filter", vec![pred]);
+                    let f = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("__l"), js_param("__r")],
+                        body: ArrowBody::Expr(body),
+                        is_async: false,
+                    });
+                    return Js::call(span, f, vec![js_expr(r), js_expr(arg)]);
                 }
                 SetOpCase::ArrayUnion { .. } => {
                     let mut out = dedup(vec![
