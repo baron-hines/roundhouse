@@ -66,3 +66,84 @@ fn hash_existence_conditions_run_on_spinel() {
     );
     app().run_spinel(&script).assert_passes();
 }
+
+fn identifier_assertions(via_where: bool) -> String {
+    let key = if via_where {
+        "number = 7) OR 1=1 --"
+    } else {
+        "number = 7 OR 1=1 --"
+    };
+    let probe = if via_where {
+        "scope.where(conditions).exists?"
+    } else {
+        "scope.exists?(conditions)"
+    };
+    r#"
+Db.exec("INSERT INTO widgets (id, owner_id, number) VALUES (1, 2, 7)")
+failures = []
+[
+  {"__KEY__" => 7},
+  {"widgets" => {"__KEY__" => 7}},
+  {"widgets.__KEY__" => {"id" => 1}}
+].each do |conditions|
+  scope = Widget.where(owner_id: 1)
+  before = scope.to_sql
+  rejected = false
+  matched = false
+  queries = Db.capture_sql do
+    begin
+      matched = __PROBE__
+    rescue ArgumentError => error
+      rejected = error.message.include?("SQL identifier")
+    rescue StandardError => error
+      failures << "wrong error for #{conditions.inspect}: #{error.message}"
+    end
+  end
+  failures << "out-of-scope row matches #{conditions.inspect}" if matched
+  failures << "malformed key accepted: #{conditions.inspect}" unless rejected
+  failures << "malformed key executes SQL: #{conditions.inspect}" unless queries.empty?
+  failures << "malformed key changes the scope" unless scope.to_sql == before
+end
+raise failures.join("\n") unless failures.empty?
+
+[{"number" => 7}, {"widgets.number" => 7}, {"widgets" => {"number" => 7}}].each do |conditions|
+  scope = Widget.where(owner_id: 2)
+  raise "valid identifier misses its row" unless __PROBE__
+  scope = Widget.where(owner_id: 1)
+  raise "valid identifier escapes the scope" if __PROBE__
+end
+puts "Hash predicate identifiers passed"
+"#
+    .replace("__KEY__", key)
+    .replace("__PROBE__", probe)
+}
+
+#[test]
+fn hash_where_identifiers_run_on_ruby() {
+    app().run_ruby(&identifier_assertions(true)).assert_passes();
+}
+
+#[test]
+fn hash_exists_identifiers_run_on_ruby() {
+    app().run_ruby(&identifier_assertions(false)).assert_passes();
+}
+
+fn run_identifier_spinel(via_where: bool) {
+    let script = format!(
+        "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{}",
+        identifier_assertions(via_where)
+    );
+    app().run_spinel(&script).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn hash_where_identifiers_run_on_spinel() {
+    run_identifier_spinel(true);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn hash_exists_identifiers_run_on_spinel() {
+    run_identifier_spinel(false);
+}

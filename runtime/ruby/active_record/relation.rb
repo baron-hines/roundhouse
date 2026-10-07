@@ -1906,6 +1906,7 @@ module ActiveRecord
     # into a JOINed query where the bare name would be ambiguous —
     # `hidden_stories.user_id`, not `user_id`, after `joins(:hidings)`.
     def column_predicate(col, val)
+      col = sql_ident(col)
       qcol = col.include?(".") ? col : "#{@table}.#{col}"
       if val.is_a?(Relation)
         # A relation value is Rails' subquery form —
