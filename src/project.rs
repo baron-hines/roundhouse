@@ -930,6 +930,74 @@ fn resolve_runtime_sig_conflicts(files: &mut [(String, String)]) -> Result<(), S
     Ok(())
 }
 
+/// A plain class the app declares outside the Rails base classes
+/// (`app/models/probe.rb` holding `class Probe`, or one under
+/// `app/lib`/`lib`) is an `app.library_classes` entry. The ruby family
+/// and TypeScript emit those; the other emitters only emit the library
+/// classes they lower themselves (views, fixtures, tests), so the
+/// class is silently missing while the tests and controllers that
+/// call it are emitted, and the build fails later on an unknown name.
+/// Report each one per target until those emitters carry them.
+///
+/// Mixin modules are not reported: their bodies are spliced into the
+/// including models by the shared lowering. Synthesized classes
+/// (`origin` set) belong to the lowerer that made them. Classes whose
+/// ancestry reaches a framework base (`ApplicationJob < ActiveJob::Base`,
+/// `ApplicationMailer < ActionMailer::Base` and their subclasses) are
+/// not plain Ruby and are left to the job and mailer handling.
+fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
+    if !matches!(
+        target,
+        BuildTarget::Crystal
+            | BuildTarget::Elixir
+            | BuildTarget::Go
+            | BuildTarget::Kotlin
+            | BuildTarget::Python
+            | BuildTarget::Rust
+            | BuildTarget::Swift
+            | BuildTarget::CSharp
+    ) {
+        return;
+    }
+    for lc in &app.library_classes {
+        if lc.is_module || lc.origin.is_some() || !is_plain_ruby_class(app, lc) {
+            continue;
+        }
+        let span = lc
+            .methods
+            .first()
+            .map(|m| m.name_span)
+            .unwrap_or_else(crate::span::Span::synthetic);
+        emit::diagnostics::report_unsupported(
+            span,
+            target.as_str(),
+            "plain Ruby class",
+            format!(
+                "class `{}` is not emitted for this target (the ruby and typescript emits carry it)",
+                lc.name.0.as_str()
+            ),
+        );
+    }
+}
+
+/// True when every ancestor of `lc` is another app library class, so
+/// the chain ends at an implicit `Object` rather than a framework base.
+fn is_plain_ruby_class(app: &App, lc: &crate::dialect::LibraryClass) -> bool {
+    let mut parent = lc.parent.as_ref();
+    let mut hops = 0;
+    while let Some(p) = parent {
+        hops += 1;
+        if hops > app.library_classes.len() {
+            return false;
+        }
+        match app.library_classes.iter().find(|c| c.name == *p) {
+            Some(c) => parent = c.parent.as_ref(),
+            None => return false,
+        }
+    }
+    true
+}
+
 /// A non-integer primary key (`create_table …, id: :uuid`,
 /// `primary_key: "identifier", id: :string`) is carried end to end by
 /// the ruby-shape emit — CRuby, JRuby and Spinel: the analyzer types
@@ -1353,6 +1421,7 @@ pub fn target_files(
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
+    report_unemitted_library_classes(app, target);
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
     // Full forwarding currently has a native Ruby contract only. A
