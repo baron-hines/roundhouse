@@ -271,3 +271,22 @@ fn runtime_corpus_phase1_gap_survey() {
     );
     eprintln!("{report}");
 }
+
+/// Ruby methods whose same-named JS native means something else.
+/// `Array#sort` on numbers needs a numeric comparator (JS's default
+/// compares as strings, so `[10, 9, 1].sort()` is `[1, 10, 9]`), and
+/// `String#gsub` with a String pattern replaces every occurrence,
+/// which in JS is `replaceAll` (`replace` stops at the first).
+#[test]
+fn native_semantics_follow_ruby() {
+    let methods = parse_methods_with_rbs(
+        "module Natives\n  def sorted(xs)\n    xs.sort\n  end\n  def words(xs)\n    xs.sort\n  end\n  def swap(s)\n    s.gsub(\"l\", \"L\")\n  end\n  def swap_rx(s)\n    s.gsub(/l+/, \"L\")\n  end\nend\n",
+        "module Natives\n  def sorted: (Array[Integer]) -> Array[Integer]\n  def words: (Array[String]) -> Array[String]\n  def swap: (String) -> String\n  def swap_rx: (String) -> String\nend\n",
+    )
+    .expect("parse");
+    let out: Vec<String> = methods.iter().map(emit_method).collect();
+    assert!(out[0].contains("[...xs].sort((a, b) => a - b)"), "numeric sort:\n{}", out[0]);
+    assert!(out[1].contains("[...xs].sort()"), "string sort keeps the default:\n{}", out[1]);
+    assert!(out[2].contains("s.replaceAll(\"l\", \"L\")"), "string gsub:\n{}", out[2]);
+    assert!(out[3].contains("s.replace(/l+/g, \"L\")"), "regex gsub:\n{}", out[3]);
+}

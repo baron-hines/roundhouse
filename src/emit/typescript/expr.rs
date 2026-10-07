@@ -2415,15 +2415,33 @@ fn js_send_inner(
                     });
                     return Js::call(span, shell, vec![js_expr(r), js_expr(&args[0])]);
                 }
-                // `arr.sort` (no block) → JS Array#sort with default
-                // comparator on a fresh copy. JS's default sort is
-                // string-coerced (matches Ruby's sort for strings,
-                // diverges for numbers but those need an explicit
-                // comparator anyway).
+                // `arr.sort` (no block) → JS Array#sort on a fresh copy.
+                // JS's default comparator is string-coerced: right for
+                // strings, wrong for numbers (`[10, 9, 1].sort()` is
+                // `[1, 10, 9]`). A numeric element type gets the
+                // `(a, b) => a - b` comparator Ruby's `<=>` amounts to.
                 "sort" if args.is_empty() => {
                     let copy =
                         Js::new(span, JsExpr::Array(vec![Js::synth(JsExpr::Spread(js_expr(r)))]));
-                    return Js::method_call(span, copy, "sort", vec![]);
+                    let numeric = matches!(
+                        strip_nullable(r.ty.as_ref()),
+                        Some(Ty::Array { elem }) if matches!(**elem, Ty::Int | Ty::Float)
+                    );
+                    let cmp = if numeric {
+                        vec![Js::synth(JsExpr::Arrow {
+                            params: vec![js_param("a"), js_param("b")],
+                            body: ArrowBody::Expr(Js::binary(
+                                Span::synthetic(),
+                                "-",
+                                synth_ident("a"),
+                                synth_ident("b"),
+                            )),
+                            is_async: false,
+                        })]
+                    } else {
+                        vec![]
+                    };
+                    return Js::method_call(span, copy, "sort", cmp);
                 }
                 // Ruby's `Array#join` with no args uses `$,` as the
                 // separator (defaults to nil → ""). JS's
@@ -2603,7 +2621,14 @@ fn js_send_inner(
                             );
                         }
                     }
-                    let pat_js = if let ExprNode::Lit {
+                    // A String pattern replaces every occurrence in Ruby;
+                    // JS `replace` with a string replaces only the first,
+                    // and the g-flag shim below only fires on a RegExp.
+                    // `replaceAll` is the string-pattern native.
+                    let str_pat = matches!(strip_nullable(args[0].ty.as_ref()), Some(Ty::Str));
+                    let pat_js = if str_pat {
+                        js_expr(&args[0])
+                    } else if let ExprNode::Lit {
                         value: Literal::Regex { pattern, flags },
                     } = &*args[0].node
                     {
@@ -2679,7 +2704,8 @@ fn js_send_inner(
                     } else {
                         js_expr(&args[1])
                     };
-                    return Js::method_call(span, js_expr(r), "replace", vec![pat_js, repl_js]);
+                    let method = if str_pat { "replaceAll" } else { "replace" };
+                    return Js::method_call(span, js_expr(r), method, vec![pat_js, repl_js]);
                 }
                 // `s.tr(from, to)` — character translation. Limited
                 // to single-char from/to (covers framework Ruby's

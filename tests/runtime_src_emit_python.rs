@@ -52,3 +52,18 @@ def pluralize(count: int, word: str) -> str:
 ";
     assert_eq!(emitted.trim(), handwritten.trim());
 }
+
+/// `str.join` rejects non-strings, so `Array[Integer]#join` maps the
+/// elements through `str` first; `Array[String]#join` stays bare.
+#[test]
+fn join_on_integers_stringifies_elements() {
+    let methods = parse_methods_with_rbs(
+        "module Natives\n  def dashed(xs)\n    xs.join(\"-\")\n  end\n  def words(xs)\n    xs.join\n  end\nend\n",
+        "module Natives\n  def dashed: (Array[Integer]) -> String\n  def words: (Array[String]) -> String\nend\n",
+    )
+    .expect("parse");
+    let dashed = emit_method(&methods[0]);
+    let words = emit_method(&methods[1]);
+    assert!(dashed.contains("\"-\".join(map(str, xs))"), "int join:\n{dashed}");
+    assert!(words.contains("\"\".join(xs)"), "string join:\n{words}");
+}
