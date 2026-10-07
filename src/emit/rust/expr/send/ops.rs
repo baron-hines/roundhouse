@@ -195,7 +195,15 @@ pub(super) fn try_binary_operator(
             ));
         }
     }
-    if matches!(method, "==" | "!=" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/") {
+    // Int / Int and Int % Int floor in Ruby; Rust's operators truncate.
+    if matches!(method, "/" | "%") && crate::emit::shared::div_pow::is_int_pair(r, &args[0]) {
+        return Some(crate::emit::rust::shared::int_floor_div_mod(
+            method,
+            &emit_expr(r),
+            &emit_expr(&args[0]),
+        ));
+    }
+    if matches!(method, "==" | "!=" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/" | "%") {
         // Binary-op LHS is a primary-demanding position. Without
         // the wrap, `x.len() as i64 < y` parses as the start of a
         // turbofish (`i64<y, …>`). Decide pass stamps the bit;

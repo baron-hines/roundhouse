@@ -2973,13 +2973,21 @@ fn js_send_inner(
             }
         }
         // `/` and `**` dispatch: TS has both as native operators. Only
-        // Incompatible pairs need special handling.
+        // Incompatible pairs need special handling, plus Int / Int:
+        // Ruby floors it (`-7 / 2 == -4`), JS `/` yields a float.
         if method == "/" || method == "**" {
-            use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
+            use crate::emit::shared::div_pow::{classify_div_pow, is_int_pair, DivPowCase};
             if matches!(classify_div_pow(r, arg), DivPowCase::Incompatible) {
                 return iife_throw_msg(
                     span,
                     &format!("roundhouse: `{method}` with incompatible operand types"),
+                );
+            }
+            if method == "/" && is_int_pair(r, arg) {
+                return Js::call(
+                    span,
+                    Js::member(Span::synthetic(), synth_ident("Math"), "floor"),
+                    vec![Js::binary(span, "/", js_expr(r), js_expr(arg))],
                 );
             }
         }
@@ -2998,6 +3006,23 @@ fn js_send_inner(
                     return iife_throw_msg(span, "roundhouse: % with incompatible operand types");
                 }
                 _ => {}
+            }
+            // Int % Int: Ruby's result takes the divisor's sign
+            // (`-7 % 3 == 2`), JS's the dividend's. `((a % b) + b) % b`
+            // floors it; the IIFE evaluates each operand once.
+            if crate::emit::shared::div_pow::is_int_pair(r, arg) {
+                let a = || synth_ident("__a");
+                let b = || synth_ident("__b");
+                let rem = Js::binary(span, "%", a(), b());
+                let floored = Js::binary(span, "%", Js::binary(span, "+", rem, b()), b());
+                return iife(
+                    span,
+                    vec![
+                        const_decl("__a", js_expr(r)),
+                        const_decl("__b", js_expr(arg)),
+                        JsStmt::synth(JsStmtNode::Return(Some(floored))),
+                    ],
+                );
             }
         }
         // Comparison dispatch: between two Class refs, Ruby's `<`/`<=`/

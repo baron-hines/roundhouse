@@ -13,8 +13,9 @@
 //!
 //! NOTE: `%` on a numeric pair in Ruby follows the sign of the
 //! divisor (`-7 % 3 = 2`); C/Rust/Go/JS `%` follows the sign of the
-//! dividend (`-7 % 3 = -1`). Tolerated for now; rework when a
-//! fixture forces the distinction.
+//! dividend (`-7 % 3 = -1`). Emitters with a truncating `%` use
+//! [`super::div_pow::is_int_pair`] to emit the floored form for
+//! Int % Int.
 
 use crate::expr::Expr;
 use crate::ty::Ty;

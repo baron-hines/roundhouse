@@ -53,6 +53,17 @@ pub fn classify_div_pow(lhs: &Expr, rhs: &Expr) -> DivPowCase {
     }
 }
 
+/// True when both operands are typed `Int`. Ruby's `Integer#/`
+/// floors (`-7 / 2 == -4`) and `Integer#%` takes the sign of the
+/// divisor (`-7 % 3 == 2`); targets whose native operators truncate
+/// or produce floats consult this to emit the floor form instead.
+pub fn is_int_pair(lhs: &Expr, rhs: &Expr) -> bool {
+    matches!(
+        (lhs.ty.as_ref(), rhs.ty.as_ref()),
+        (Some(Ty::Int), Some(Ty::Int))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +144,13 @@ mod tests {
         let l = var_typed("a", arr.clone());
         let r = var_typed("b", arr);
         assert!(matches!(classify_div_pow(&l, &r), DivPowCase::Incompatible));
+    }
+
+    #[test]
+    fn int_pair_only_for_int_int() {
+        assert!(is_int_pair(&int_lit(7), &int_lit(2)));
+        assert!(!is_int_pair(&int_lit(7), &var_typed("b", Ty::Float)));
+        assert!(!is_int_pair(&int_lit(7), &untyped_var("b")));
     }
 
     #[test]

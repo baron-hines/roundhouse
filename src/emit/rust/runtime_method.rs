@@ -265,7 +265,10 @@ fn rt_emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                         let rs_cast = if is_float { rs } else { format!("{rs} as u32") };
                         return format!("{ls}.{pow_m}({rs_cast})");
                     }
-                    // `/` falls through to native.
+                    if crate::emit::shared::div_pow::is_int_pair(r, arg) {
+                        return crate::emit::rust::shared::int_floor_div_mod("/", &ls, &rs);
+                    }
+                    // Float `/` falls through to native.
                 }
                 DivPowCase::Incompatible => {
                     return format!(
@@ -297,6 +300,9 @@ fn rt_emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                 }
                 ModuloCase::Incompatible => {
                     return r#"panic!("roundhouse: % with incompatible operand types")"#.to_string();
+                }
+                ModuloCase::Numeric if crate::emit::shared::div_pow::is_int_pair(r, arg) => {
+                    return crate::emit::rust::shared::int_floor_div_mod("%", &ls, &rs);
                 }
                 ModuloCase::Numeric | ModuloCase::Unknown => {}
             }
