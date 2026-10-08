@@ -1082,6 +1082,7 @@ impl Analyzer {
     /// the refined registry. Iterates to a fixed point (capped; see
     /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
     pub fn analyze(&mut self, app: &mut App) {
+        self.fixpoint_checks = fixpoint_check::Checks::start();
         // An unresolvable include is a load-time error, not an open method
         // surface. Keep it in the class-body ledger even when no method is called.
         for class in &mut app.library_classes {
