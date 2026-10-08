@@ -3281,34 +3281,15 @@ fn translate_ruby_regex_anchors(pattern: &str) -> String {
     out
 }
 
-/// `((a: any[], b: any[]) => a.length === b.length && a.every((x, i) => x === b[i]))(l, r)`
-/// — element-wise Array equality, each operand evaluated once.
+/// Element-wise Array equality, each operand evaluated once. Nested
+/// arrays recurse (Ruby `[[2]] == [[2]]`), and a non-array operand
+/// (scalar, `nil`) compares with `===` instead of reading `.length`.
+const ARRAY_EQ_FN: &str = "(function eq(a: any, b: any): boolean { \
+return Array.isArray(a) && Array.isArray(b) \
+? a.length === b.length && a.every((x, i) => eq(x, b[i])) : a === b; })";
+
 fn array_eq(span: Span, l: Js, r: Js) -> Js {
-    let s = Span::synthetic;
-    let typed = |name: &str| JsParam { ty: Some(TsType("any[]".into())), ..js_param(name) };
-    let same_len = Js::binary(
-        s(),
-        "===",
-        Js::member(s(), synth_ident("a"), "length"),
-        Js::member(s(), synth_ident("b"), "length"),
-    );
-    let elem_eq = Js::synth(JsExpr::Arrow {
-        params: vec![js_param("x"), js_param("i")],
-        body: ArrowBody::Expr(Js::binary(
-            s(),
-            "===",
-            synth_ident("x"),
-            Js::index(s(), synth_ident("b"), synth_ident("i")),
-        )),
-        is_async: false,
-    });
-    let every = Js::method_call(s(), synth_ident("a"), "every", vec![elem_eq]);
-    let cmp = Js::synth(JsExpr::Arrow {
-        params: vec![typed("a"), typed("b")],
-        body: ArrowBody::Expr(Js::binary(s(), "&&", same_len, every)),
-        is_async: false,
-    });
-    Js::call(span, cmp, vec![l, r])
+    Js::call(span, Js::synth(JsExpr::Raw(ARRAY_EQ_FN.into())), vec![l, r])
 }
 
 fn ts_binop(method: &str) -> Option<&'static str> {
@@ -3539,12 +3520,17 @@ mod array_eq_tests {
 
     #[test]
     fn array_equality_compares_elements() {
-        let eq = "((a: any[], b: any[]) => a.length === b.length && a.every((x, i) => x === b[i]))([2, 4], xs)";
+        let eq = format!("{ARRAY_EQ_FN}([2, 4], xs)");
         assert_eq!(cmp("==", Some(ints())), eq);
         assert_eq!(cmp("!=", Some(ints())), format!("!{eq}"));
         // The literal alone is enough: the actual is often a call the
         // test typer leaves untyped.
         assert_eq!(cmp("!=", None), format!("!{eq}"));
+        // Nested arrays recurse; a non-array operand (nil) is `===`
+        // rather than a `.length` read.
+        assert!(ARRAY_EQ_FN.contains("eq(x, b[i])"));
+        assert!(ARRAY_EQ_FN.contains("Array.isArray(a) && Array.isArray(b)"));
+        assert!(ARRAY_EQ_FN.contains(": a === b"));
     }
 }
 
