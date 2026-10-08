@@ -1477,7 +1477,7 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         let (callback, opt_args): (&Expr, &[Expr]) = match (block.as_ref(), &args[..]) {
             (Some(b), rest) => (b, rest),
             (None, [first, rest @ ..])
-                if matches!(&*first.node, ExprNode::Lambda { params, .. } if params.is_empty()) =>
+                if matches!(&*first.node, ExprNode::Lambda { params, extra_params, .. } if params.is_empty() && extra_params.is_empty()) =>
             {
                 (first, rest)
             }

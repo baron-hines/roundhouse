@@ -305,12 +305,13 @@ fn rewrite(
         ExprNode::Lambda {
             params: lp,
             rest_param,
+            extra_params,
             block_param,
             body,
             ..
         } => {
             let mut inner = rebound.clone();
-            for p in lp.iter() {
+            for p in lp.iter().chain(extra_params.iter().map(|p| &p.name)) {
                 inner.remove(p);
             }
             if let Some(r) = rest_param.as_ref() {
@@ -552,10 +553,12 @@ fn collect_names(expr: &Expr, out: &mut HashSet<Symbol>) {
         ExprNode::Lambda {
             params,
             rest_param,
+            extra_params,
             block_param,
             ..
         } => {
             out.extend(params.iter().cloned());
+            out.extend(extra_params.iter().map(|p| p.name.clone()));
             if let Some(r) = rest_param {
                 out.insert(r.clone());
             }

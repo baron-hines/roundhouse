@@ -896,7 +896,10 @@ fn is_mock_tap(e: &Expr) -> bool {
 /// `None` for a block that does anything else.
 fn tap_mock(e: &Expr) -> Option<MockSpec> {
     let ExprNode::Send { block: Some(block), .. } = &*e.node else { return None };
-    let ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. } = &*block.node else { return None };
+    let ExprNode::Lambda { extra_params, params, rest_param: None, block_param: None, body, .. } = &*block.node else { return None };
+    if !extra_params.is_empty() {
+        return None;
+    }
     let [param] = params.as_slice() else { return None };
     let mut inner: BTreeMap<String, MockSpec> = BTreeMap::new();
     inner.insert(param.as_str().to_string(), MockSpec::default());
@@ -1418,13 +1421,13 @@ fn exception_class_name(arg: &Expr) -> Option<String> {
 /// arity matches; a block naming its own parameters is left as it is
 /// (mocha would hand it every argument, and this slot has one).
 fn predicate_lambda(block: Expr) -> Option<Expr> {
-    let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = *block.node else {
+    let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, block_style } = *block.node else {
         return None;
     };
     let params = if params.is_empty() && rest_param.is_none() { vec![Symbol::from("_host")] } else { params };
     Some(Expr::new(
         block.span,
-        ExprNode::Lambda { params, rest_param, block_param, body, block_style },
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, block_style },
     ))
 }
 
@@ -1532,7 +1535,7 @@ mod tests {
     fn lambda() -> Expr {
         Expr::new(
             sp(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { extra_params: Vec::new(),
                 rest_param: None,
                 params: vec![],
                 block_param: None,
@@ -1659,7 +1662,7 @@ mod tests {
         );
         let tap_block = Expr::new(
             sp(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { extra_params: Vec::new(),
                 rest_param: None,
                 params: vec![Symbol::from("m")],
                 block_param: None,

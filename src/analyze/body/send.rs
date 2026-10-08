@@ -217,9 +217,12 @@ impl<'a> BodyTyper<'a> {
         block: &Expr,
     ) -> Ctx {
         let mut new_ctx = outer.clone();
-        let ExprNode::Lambda { params, .. } = &*block.node else {
+        let ExprNode::Lambda { extra_params, params, .. } = &*block.node else {
             return new_ctx;
         };
+        if !extra_params.is_empty() {
+            return new_ctx;
+        }
         for name in params { new_ctx.class_objects.remove(name); }
         super::forget_class_object_writes(block, &mut new_ctx);
         // `form_with model: product do |form|` / `form_for @product do

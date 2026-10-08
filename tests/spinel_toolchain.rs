@@ -41,6 +41,10 @@ mod class_configuration;
 mod rails_root_join;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
+#[path = "support/lambda_signatures.rs"]
+mod lambda_signatures_contract;
+#[path = "spinel_toolchain/lambda_signatures.rs"]
+mod lambda_signatures;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]

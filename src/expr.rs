@@ -323,6 +323,16 @@ pub enum ExprNode {
         /// local variable or method 'args'`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest_param: Option<Symbol>,
+        /// The parameters `params` and `rest_param` do not hold, in
+        /// source order: optional positionals (`size = 18`, with
+        /// `default`), keywords (`key:` / `limit: 10`, `keyword`) and a
+        /// keyword rest (`**opts`, `keyword` and `rest`; empty name for
+        /// an anonymous `**`). Kept for the same reason as `rest_param`:
+        /// the body reads these names, and a signature without them
+        /// raises `NameError`. Optionals come after `params` and before
+        /// `rest_param`; keywords after it, as Ruby orders them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_params: Vec<crate::dialect::Param>,
         block_param: Option<Symbol>,
         body: Expr,
         /// Surface form when this Lambda represents a block attached to

@@ -806,7 +806,7 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
                 continue;
             }
             if let ExprNode::Send { args, .. } = &*expr.node {
-                if matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lambda { params, .. }) if params.is_empty()) {
+                if matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lambda { params, extra_params, .. }) if params.is_empty() && extra_params.is_empty()) {
                     continue;
                 }
             }

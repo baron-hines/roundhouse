@@ -2097,7 +2097,7 @@ pub(crate) fn partial_form_bindings(
     fn seed_scopes(e: &Expr, own_dir: Option<&str>, out: &mut Vec<(ViewKey, PartialFormBinding)>) {
         if let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*e.node {
             if method.as_str() == "form_with" {
-                if let ExprNode::Lambda { params, body, .. } = &*block.node {
+                if let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node {
                     if let Some(form_param) = params.first() {
                         let mut record_refs: HashSet<String> = HashSet::new();
                         let mut id_prefix = String::new();
@@ -2109,6 +2109,9 @@ pub(crate) fn partial_form_bindings(
                                     else {
                                         continue;
                                     };
+                if !extra_params.is_empty() {
+                    continue;
+                }
                                     match key.as_str() {
                                         "model" => {
                                             if let Some(r) = simple_ref(v) {
@@ -3455,7 +3458,7 @@ pub(super) fn rewrite_ivars_to_locals(expr: &Expr) -> Expr {
                 .collect(),
             kwargs: *kwargs,
         },
-        ExprNode::Lambda { rest_param, params, block_param, body, block_style } => ExprNode::Lambda { rest_param: rest_param.clone(),
+        ExprNode::Lambda { rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda { rest_param: rest_param.clone(), extra_params: extra_params.clone(),
             params: params.clone(),
             block_param: block_param.clone(),
             body: rewrite_ivars_to_locals(body),
