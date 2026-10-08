@@ -42,11 +42,26 @@ const SOURCE: &str = r#"class UnaryProbe
 end
 "#;
 
+// A receiver that defines `-@` itself keeps the unary send.
+const CUSTOM: &str = r#"class UnaryVec
+  def initialize(x)
+    @x = x
+  end
+  def -@
+    UnaryVec.new(0)
+  end
+  def flipped
+    v = UnaryVec.new(1)
+    -v
+  end
+end
+"#;
+
 fn lowered() -> roundhouse::App {
-    let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from([(
-        PathBuf::from("app/lib/unary_probe.rb"),
-        SOURCE.as_bytes().to_vec(),
-    )]))
+    let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from([
+        (PathBuf::from("app/lib/unary_probe.rb"), SOURCE.as_bytes().to_vec()),
+        (PathBuf::from("app/lib/unary_vec.rb"), CUSTOM.as_bytes().to_vec()),
+    ]))
     .unwrap();
     Analyzer::new(&app).analyze(&mut app);
     apply_numeric_unary_lowering(&mut app);
@@ -54,10 +69,14 @@ fn lowered() -> roundhouse::App {
 }
 
 fn body<'a>(app: &'a roundhouse::App, name: &str) -> &'a roundhouse::expr::Expr {
+    method_body(app, "UnaryProbe", name)
+}
+
+fn method_body<'a>(app: &'a roundhouse::App, class: &str, name: &str) -> &'a roundhouse::expr::Expr {
     let class = app
         .library_classes
         .iter()
-        .find(|c| c.name.0.as_str() == "UnaryProbe")
+        .find(|c| c.name.0.as_str() == class)
         .unwrap();
     &class.methods.iter().find(|m| m.name.as_str() == name).unwrap().body
 }
@@ -81,6 +100,14 @@ fn unary_on_a_number_lowers_to_arithmetic() {
     assert!(neg.contains("\"*\""), "`-a` should become `a * -1`:\n{neg}");
     let pos = format!("{:?}", body(&app, "pos_int"));
     assert!(!pos.contains("+@"), "`+a` should be the receiver itself:\n{pos}");
+}
+
+#[test]
+fn unary_on_a_custom_receiver_is_left_alone() {
+    let app = lowered();
+    let flipped = format!("{:?}", method_body(&app, "UnaryVec", "flipped"));
+    assert!(flipped.contains("-@"), "custom `-@` should stay a send:\n{flipped}");
+    assert!(!flipped.contains("\"*\""), "custom `-@` should not become `* -1`:\n{flipped}");
 }
 
 #[test]
