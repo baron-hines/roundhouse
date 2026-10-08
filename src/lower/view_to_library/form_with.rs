@@ -191,6 +191,15 @@ pub(super) fn emit_form_with_inline(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
     if !extra_params.is_empty() {
+        // A builder block with optional or keyword parameters has no
+        // lowering here, and a view has no dynamic path to fall back to:
+        // report it (the transpile fails) rather than render nothing.
+        crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+            block.span,
+            None,
+            crate::ident::Symbol::from("builder block with optional or keyword parameters"),
+            "a form or tag builder block takes only required parameters here",
+        ));
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     }
     let form_param = params
@@ -487,6 +496,15 @@ pub(super) fn emit_tag_builder_inline(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
     if !extra_params.is_empty() {
+        // A builder block with optional or keyword parameters has no
+        // lowering here, and a view has no dynamic path to fall back to:
+        // report it (the transpile fails) rather than render nothing.
+        crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+            block.span,
+            None,
+            crate::ident::Symbol::from("builder block with optional or keyword parameters"),
+            "a form or tag builder block takes only required parameters here",
+        ));
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     }
 

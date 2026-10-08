@@ -289,9 +289,17 @@ fn scope_source(v: &Expr) -> Option<String> {
     }
 }
 
-/// The body of a `-> { … }` as source; None for anything else.
+/// The body of a parameterless `-> { … }` as source; None for anything
+/// else. Rails calls `by:` / `with:` without arguments, so a parameter
+/// (a default such as `->(key = request.remote_ip) { key }` included)
+/// has nothing to bind once only the body is inlined.
 fn lambda_body_source(v: &Expr) -> Option<String> {
-    let ExprNode::Lambda { body, .. } = &*v.node else { return None };
+    let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*v.node else {
+        return None;
+    };
+    if !params.is_empty() || rest_param.is_some() || !extra_params.is_empty() || block_param.is_some() {
+        return None;
+    }
     Some(crate::emit::ruby::expr::emit_expr(body))
 }
 

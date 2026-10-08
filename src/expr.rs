@@ -671,7 +671,14 @@ impl ExprNode {
                 f(value);
                 f(body);
             }
-            ExprNode::Lambda { body, .. } => f(body),
+            ExprNode::Lambda { extra_params, body, .. } => {
+                // Defaults are evaluated where the lambda is called, before
+                // the body runs; walk them first.
+                for p in extra_params.iter_mut() {
+                    if let Some(d) = &mut p.default { f(d); }
+                }
+                f(body)
+            }
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
                     f(r);
@@ -883,7 +890,12 @@ impl ExprNode {
                 f(value);
                 f(body);
             }
-            ExprNode::Lambda { body, .. } => f(body),
+            ExprNode::Lambda { extra_params, body, .. } => {
+                for p in extra_params.iter() {
+                    if let Some(d) = &p.default { f(d); }
+                }
+                f(body)
+            }
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
                     f(r);

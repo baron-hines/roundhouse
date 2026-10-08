@@ -1055,15 +1055,16 @@ impl<'a> BodyTyper<'a> {
                     inner.class_objects.remove(name);
                 }
                 // Optional, keyword and keyword-rest parameters bind in the
-                // body like any local: an optional as its default's type
-                // (the default is evaluated where the lambda is called, so
-                // in the outer scope), `**opts` as a Symbol-keyed Hash, a
-                // required keyword as untyped (no caller evidence here,
-                // the same gradual answer a block parameter gets).
+                // body like any local: an optional as its default's type,
+                // `**opts` as a Symbol-keyed Hash, a required keyword as
+                // untyped (no caller evidence here, the same gradual answer a
+                // block parameter gets). A default is typed in the lambda's
+                // own scope as filled so far, so it reads an earlier extra
+                // parameter (`c = b`) rather than an outer local.
                 for param in extra_params.iter_mut() {
                     let ty = match (&mut param.default, param.keyword && param.rest) {
                         (_, true) => Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) },
-                        (Some(default), false) => self.analyze_expr(default, ctx),
+                        (Some(default), false) => self.analyze_expr(default, &inner),
                         (None, false) => Ty::Untyped,
                     };
                     if param.name.as_str().is_empty() {

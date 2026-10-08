@@ -76,3 +76,33 @@ fn a_strict_target_refuses_instead_of_dropping() {
         assert_eq!(refusal, refused, "{target:?}: {diags:?}");
     }
 }
+
+/// A block with an optional parameter still binds its required ones from
+/// the receiver: `[1, 2].map { |n, bonus = 2| n + bonus }` types `n` as the
+/// element type; left unbound it was an unresolved type.
+#[test]
+fn a_block_with_an_optional_parameter_keeps_its_element_type() {
+    let tree = std::collections::HashMap::from([
+        (std::path::PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define(version: 1) do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n".to_vec()),
+        (std::path::PathBuf::from("config/routes.rb"), b"Rails.application.routes.draw do\nend\n".to_vec()),
+        (std::path::PathBuf::from("app/models/article.rb"), b"class Article < ApplicationRecord\n  def self.sums\n    [1, 2].map { |n, bonus = 2| n + bonus }\n  end\nend\n".to_vec()),
+    ]);
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let mut diags = roundhouse::session::analyze_and_lower(&mut app);
+    diags.extend(roundhouse::analyze::diagnose(&app));
+    let unresolved: Vec<_> = diags
+        .iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnresolvedType { .. }))
+        .collect();
+    assert!(unresolved.is_empty(), "{unresolved:#?}");
+}
+
+/// `**nil` (no keywords accepted) has no representation; dropping it would
+/// let the emitted lambda accept keywords the source rejects, so ingest
+/// refuses it.
+#[test]
+fn a_no_keywords_parameter_is_refused() {
+    let result = ingest::prism::parse(b"f = ->(a, **nil) { a }", "<input>");
+    let program = result.node().as_program_node().expect("a Ruby program");
+    assert!(ingest::ingest_expr(&program.statements().as_node(), "<input>").is_err());
+}

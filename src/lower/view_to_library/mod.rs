@@ -2098,7 +2098,9 @@ pub(crate) fn partial_form_bindings(
         if let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*e.node {
             if method.as_str() == "form_with" {
                 if let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node {
-                    if let Some(form_param) = params.first() {
+                    // A block with optional or keyword parameters is not the
+                    // `|f|` scope this binds; it seeds nothing.
+                    if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
                         let mut record_refs: HashSet<String> = HashSet::new();
                         let mut id_prefix = String::new();
                         for arg in args {
@@ -2109,9 +2111,6 @@ pub(crate) fn partial_form_bindings(
                                     else {
                                         continue;
                                     };
-                if !extra_params.is_empty() {
-                    continue;
-                }
                                     match key.as_str() {
                                         "model" => {
                                             if let Some(r) = simple_ref(v) {

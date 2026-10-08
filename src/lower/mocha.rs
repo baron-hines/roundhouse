@@ -1417,14 +1417,17 @@ fn exception_class_name(arg: &Expr) -> Option<String> {
 }
 
 /// A `with` block as a lambda over the ONE argument the slot passes
-/// (the host). `|*|` / no params take a placeholder so the lambda's
-/// arity matches; a block naming its own parameters is left as it is
+/// (the host). `|*|` / no positional params take a placeholder so the
+/// lambda's arity matches; a block naming its own parameters is left as it is
 /// (mocha would hand it every argument, and this slot has one).
 fn predicate_lambda(block: Expr) -> Option<Expr> {
     let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, block_style } = *block.node else {
         return None;
     };
-    let params = if params.is_empty() && rest_param.is_none() { vec![Symbol::from("_host")] } else { params };
+    // An optional positional (`|value = 1|`) takes the host itself; only a
+    // block with no positional parameter of any kind gets the placeholder.
+    let takes_positional = !params.is_empty() || rest_param.is_some() || extra_params.iter().any(|p| !p.keyword);
+    let params = if takes_positional { params } else { vec![Symbol::from("_host")] };
     Some(Expr::new(
         block.span,
         ExprNode::Lambda { params, rest_param, extra_params, block_param, body, block_style },
@@ -1544,6 +1547,27 @@ mod tests {
             },
         )
     }
+fn lambda_with(extra: Vec<crate::dialect::Param>) -> Expr {
+    let mut l = lambda();
+    if let ExprNode::Lambda { extra_params, .. } = &mut *l.node { *extra_params = extra; }
+    l
+}
+#[test]
+fn an_optional_positional_takes_the_host_without_a_placeholder() {
+    let mut value = crate::dialect::Param::positional(Symbol::from("value"));
+    value.default = Some(Expr::new(sp(), ExprNode::Lit { value: Literal::Int { value: 1 } }));
+    let pred = predicate_lambda(lambda_with(vec![value])).expect("predicate");
+    let ExprNode::Lambda { params, .. } = &*pred.node else { panic!() };
+    assert!(params.is_empty(), "{params:?}");
+}
+#[test]
+fn a_keyword_only_block_still_gets_the_host_placeholder() {
+    let mut key = crate::dialect::Param::positional(Symbol::from("key"));
+    key.keyword = true;
+    let pred = predicate_lambda(lambda_with(vec![key])).expect("predicate");
+    let ExprNode::Lambda { params, .. } = &*pred.node else { panic!() };
+    assert_eq!(params, &vec![Symbol::from("_host")]);
+}
     fn as_send(e: &Expr) -> (&Expr, &str, &[Expr], &Option<Expr>) {
         let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { panic!("{:?}", e.node) };
         (recv, method.as_str(), args, block)

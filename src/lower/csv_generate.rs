@@ -32,6 +32,11 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     {
         return;
     }
+    // A block with optional or keyword parameters is not the `|csv|` shape;
+    // decline before any option is taken off the call.
+    if matches!(&*block.node, ExprNode::Lambda { extra_params, .. } if !extra_params.is_empty()) {
+        return;
+    }
     let Some(ExprNode::Hash { entries, .. }) = args.last_mut().map(|a| &mut *a.node) else {
         return;
     };
@@ -59,12 +64,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     ) {
         return;
     }
-    let ExprNode::Lambda { extra_params, params, body, .. } = &mut *block.node else {
+    let ExprNode::Lambda { params, body, .. } = &mut *block.node else {
         return;
     };
-    if !extra_params.is_empty() {
-        return;
-    }
     let Some(csv) = params.first().cloned() else {
         return;
     };

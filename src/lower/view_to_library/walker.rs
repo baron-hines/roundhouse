@@ -1200,9 +1200,14 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 // that no app in the corpus nested one. campfire does.
                 let cap_owned = next_capture_name(&ctx.accumulator);
                 let cap = cap_owned.as_str();
+                // Every parameter the block binds is a local in its body, the
+                // optional and keyword ones too: a read of one is not a
+                // helper call.
                 let cap_ctx = ViewCtx {
                     accumulator: cap.to_string(),
-                    ..ctx.with_locals(params.iter().map(|p| p.as_str().to_string()))
+                    ..ctx.with_locals(
+                        params.iter().chain(extra_params.iter().map(|p| &p.name)).map(|p| p.as_str().to_string()),
+                    )
                 };
                 let mut cap_stmts = vec![assign_accumulator_string_new(cap)];
                 cap_stmts.extend(walk_body(body, &cap_ctx));

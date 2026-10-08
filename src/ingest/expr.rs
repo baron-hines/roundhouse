@@ -2962,7 +2962,8 @@ fn refuse_block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResu
 /// order, for `ExprNode::Lambda.extra_params`. `params` holds only the
 /// required names, and the body reads these as well: dropping them made
 /// the emitted lambda raise `NameError`. `**nil` (no keywords accepted)
-/// binds nothing and is left out.
+/// has no representation here and is refused: dropped, the emitted block
+/// would accept the keywords the source rejects.
 fn block_extra_params(params_node: Option<Node<'_>>, file: &str) -> IngestResult<Vec<crate::dialect::Param>> {
     use crate::dialect::Param;
     let Some(pn) = params_node
@@ -2990,6 +2991,12 @@ fn block_extra_params(params_node: Option<Node<'_>>, file: &str) -> IngestResult
             param.default = Some(ingest_expr(&opt.value(), file)?);
             out.push(param);
         }
+    }
+    if pn.keyword_rest().is_some_and(|node| node.as_no_keywords_parameter_node().is_some()) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "a block or lambda with `**nil` (no keywords accepted) has no representation".into(),
+        });
     }
     if let Some(krp) = pn.keyword_rest().and_then(|node| node.as_keyword_rest_parameter_node()) {
         let name = krp.name().map(|loc| constant_id_str(&loc).to_string()).unwrap_or_default();
