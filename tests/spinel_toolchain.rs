@@ -41,6 +41,10 @@ mod class_configuration;
 mod rails_root_join;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
+#[path = "support/io_process_constants.rs"]
+mod io_process_constants_contract;
+#[path = "spinel_toolchain/io_process_constants.rs"]
+mod io_process_constants;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]

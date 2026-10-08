@@ -22,6 +22,10 @@ mod data_factory;
 mod rails_root_join;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
+#[path = "support/io_process_constants.rs"]
+mod io_process_constants_contract;
+#[path = "emit_and_run/io_process_constants.rs"]
+mod io_process_constants;
 
 /// The same anonymous keyword packet survives defaulting, local-name
 /// collisions, and a virtual override in emitted CRuby. Effectful input

@@ -1496,6 +1496,16 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "Timeout" && method.as_str() == "timeout" {
                     return Ty::Untyped;
                 }
+                // `r, w, pid = PTY.spawn(env, *cmd)`: the pty's reader
+                // and writer and the child's pid. With a block CRuby
+                // yields those and answers nil.
+                if id.0.as_str() == "PTY" && method.as_str() == "spawn" {
+                    if block_ret.is_some() {
+                        return Ty::Nil;
+                    }
+                    let file = || Ty::Class { id: ClassId(Symbol::from("File")), args: vec![] };
+                    return Ty::Tuple { elems: vec![file(), file(), Ty::Int] };
+                }
                 // `IO.popen` / `IO.copy_stream` — capture path; popen is
                 // polymorphic (block vs handle), copy_stream answers bytes.
                 if id.0.as_str() == "IO" {

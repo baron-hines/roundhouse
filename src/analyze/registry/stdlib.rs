@@ -510,8 +510,17 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `Timeout.timeout` / `rescue Timeout::Error` — Campfire unfurl
         // deadline and TimeLimitedVideoPreviewer#capture.
         "Timeout::Error",
+        // `rescue EOFError` around `readpartial` on a pipe or a pty.
+        "EOFError",
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
+    }
+    // `rescue Errno::ENOENT` / `Errno::EIO`: every Errno class that both
+    // CRuby (on every POSIX platform) and Spinel's runtime define. The
+    // lookup is by exact name, so the family is registered whole.
+    register_stdlib_class(classes, "Errno", &[], &[]);
+    for name in ERRNO_CLASSES {
+        register_stdlib_class(classes, &format!("Errno::{name}"), &[], &exception_surface);
     }
     for (exc, extra) in [
         ("ActiveRecord::RecordNotFound", None),
@@ -632,10 +641,29 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "IO", &[], &[
         ("pid", Ty::Int),
         ("read", Ty::Str),
+        ("readpartial", Ty::Str),
+        ("write", Ty::Int),
+        ("closed?", Ty::Bool),
         ("rewind", Ty::Int),
         ("binmode", io.clone()),
         ("close", Ty::Nil),
+        // io/console, a default gem: `[rows, columns]`.
+        ("winsize", Ty::Array { elem: Box::new(Ty::Int) }),
+        ("winsize=", Ty::Array { elem: Box::new(Ty::Int) }),
     ]);
+    // `PTY.spawn` answers `[File, File, Integer]`; a File handle is an IO.
+    classes.entry(ClassId(Symbol::from("File"))).or_default().parent =
+        Some(ClassId(Symbol::from("IO")));
+    // `require "pty"`. `PTY.spawn`'s return is a send special case: its
+    // block form answers nil.
+    register_stdlib_class(classes, "PTY", &[], &[]);
+    // A default gem a booted Rails app has already loaded; the BUNDLED
+    // row emits its require.
+    register_stdlib_class(classes, "Shellwords", &[
+        ("escape", Ty::Str), ("shellescape", Ty::Str),
+        ("join", Ty::Str), ("shelljoin", Ty::Str),
+        ("split", str_arr()), ("shellsplit", str_arr()), ("shellwords", str_arr()),
+    ], &[]);
     register_stdlib_class(classes, "IO::NULL", &[], &[]);
     register_stdlib_class(classes, "Process", &[], &[]);
     register_stdlib_class(classes, "Process::CLOCK_MONOTONIC", &[], &[]);
@@ -755,3 +783,17 @@ fn register_stdlib_class(
             .or_insert_with(|| ty.clone());
     }
 }
+
+/// The Errno classes CRuby defines on every POSIX platform that Spinel's
+/// runtime (`lib/sp_exc.c`) defines too.
+const ERRNO_CLASSES: &[&str] = &[
+    "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO", "ENXIO", "E2BIG", "ENOEXEC", "EBADF",
+    "ECHILD", "EAGAIN", "ENOMEM", "EACCES", "EFAULT", "EBUSY", "EEXIST", "EXDEV", "ENODEV",
+    "ENOTDIR", "EISDIR", "EINVAL", "ENFILE", "EMFILE", "ENOTTY", "EFBIG", "ENOSPC", "ESPIPE",
+    "EROFS", "EMLINK", "EPIPE", "EDOM", "ERANGE", "EDEADLK", "ENAMETOOLONG", "ENOLCK",
+    "ENOSYS", "ENOTEMPTY", "ELOOP", "ENOTSOCK", "EMSGSIZE", "EPROTOTYPE", "ENOPROTOOPT",
+    "EPROTONOSUPPORT", "ENOTSUP", "EOPNOTSUPP", "EAFNOSUPPORT", "EADDRINUSE",
+    "EADDRNOTAVAIL", "ENETDOWN", "ENETUNREACH", "ENETRESET", "ECONNABORTED", "ECONNRESET",
+    "ENOBUFS", "EISCONN", "ENOTCONN", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH",
+    "EALREADY", "EINPROGRESS", "ESTALE", "EDQUOT", "ECANCELED", "EOVERFLOW", "EILSEQ",
+];

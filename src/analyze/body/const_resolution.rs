@@ -42,7 +42,24 @@ class FalseClass < Object\nend\n\
 class NilClass < Object\nend\n\
 class Regexp < Object\nend\n\
 class Exception < Object\nend\n\
-class StandardError < Exception\nend\n";
+class StandardError < Exception\nend\n\
+class IO < Object\n  NULL: String\nend\n\
+class File < IO\n  NULL: String\nend\n\
+class Encoding < Object\n  UTF_8: Encoding\n  BINARY: Encoding\n  ASCII_8BIT: Encoding\n  US_ASCII: Encoding\nend\n";
+
+/// The type of a value constant `CORE_RBS` declares, as Ruby defines it.
+fn core_value_type(name: &str) -> Option<Ty> {
+    match name {
+        "Float::INFINITY" | "Float::NAN" | "Float::EPSILON" | "Float::MAX" | "Float::MIN" => {
+            Some(Ty::Float)
+        }
+        "IO::NULL" | "File::NULL" => Some(Ty::Str),
+        "Encoding::UTF_8" | "Encoding::BINARY" | "Encoding::ASCII_8BIT" | "Encoding::US_ASCII" => {
+            Some(Ty::Class { id: ClassId(Symbol::from("Encoding")), args: vec![] })
+        }
+        _ => None,
+    }
+}
 
 const CORE_URI: &str = "roundhouse-core:rbs";
 const RUNTIME_URI_PREFIX: &str = "roundhouse-runtime:";
@@ -664,22 +681,17 @@ fn answer_file(
                         })
                     });
                     let name = declaration.name();
-                    let builtin_float = matches!(
-                        name,
-                        "Float::INFINITY"
-                            | "Float::NAN"
-                            | "Float::EPSILON"
-                            | "Float::MAX"
-                            | "Float::MIN"
-                    ) && declaration.definitions().iter().all(|id| {
-                        graph
-                            .definitions()
-                            .get(id)
-                            .and_then(|definition| graph.documents().get(definition.uri_id()))
-                            .is_some_and(|document| document.uri() == CORE_URI)
+                    let builtin = core_value_type(name).filter(|_| {
+                        declaration.definitions().iter().all(|id| {
+                            graph
+                                .definitions()
+                                .get(id)
+                                .and_then(|definition| graph.documents().get(definition.uri_id()))
+                                .is_some_and(|document| document.uri() == CORE_URI)
+                        })
                     });
-                    let runtime = if builtin_float {
-                        Some(Arc::new(Ty::Float))
+                    let runtime = if let Some(ty) = builtin {
+                        Some(Arc::new(ty))
                     } else if !app_write && is_runtime_declaration(graph, declaration) {
                         runtime_value_types().get(declaration.name()).cloned()
                     } else {
