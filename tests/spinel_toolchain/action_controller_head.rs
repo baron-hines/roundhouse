@@ -93,7 +93,11 @@ end
         "headers were {:?}",
         not_modified.headers
     );
-    assert!(not_modified.body.is_empty(), "body was {:?}", not_modified.body);
+    assert!(
+        not_modified.body.is_empty(),
+        "body was {:?}",
+        not_modified.body
+    );
 
     let defaulted = server.get("/head-probe/defaulted");
     assert_eq!(defaulted.status, 200, "{}", server.log());
