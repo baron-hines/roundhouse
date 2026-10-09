@@ -1317,7 +1317,12 @@ impl<'a> BodyTyper<'a> {
                     match &*b.node {
                         ExprNode::Lambda { body, .. } => body.ty.clone(),
                         ExprNode::MethodRef { .. } => Some(method_ref_ty),
-                        _ => None,
+                        // Forwarded proc (`&callback`): the block slot is
+                        // occupied but there is no body to type. Presence
+                        // must still reach dispatch — `PTY.spawn` with a
+                        // block answers nil; treating the slot as absent
+                        // would invent the no-block Tuple.
+                        _ => Some(Ty::Untyped),
                     }
                 } else {
                     None

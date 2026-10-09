@@ -1536,8 +1536,11 @@ impl<'a> BodyTyper<'a> {
                     return Ty::Untyped;
                 }
                 // `r, w, pid = PTY.spawn(env, *cmd)`: the pty's reader
-                // and writer and the child's pid. With a block CRuby
-                // yields those and answers nil.
+                // and writer and the child's pid. With a block — brace,
+                // `do`, or forwarded `&callback` — CRuby yields those
+                // and answers nil. `block_ret.is_some()` is presence
+                // (forwarded procs carry `Untyped`); not only a typed
+                // lambda body.
                 if id.0.as_str() == "PTY" && method.as_str() == "spawn" {
                     if block_ret.is_some() {
                         return Ty::Nil;

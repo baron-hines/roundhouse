@@ -65,6 +65,14 @@ class TerminalProbe
       w.close
     }
   end
+
+  def self.spawn_forwarded
+    # A Proc (not a lambda): PTY yields one `[r, w, pid]` array to a
+    # forwarded block, and Proc parameters destructure it. The pin is
+    # that analysis sees the `&callback` slot and types the call as nil.
+    callback = proc { |r, w, _pid| r.close; w.close }
+    PTY.spawn("true", &callback)
+  end
 end
 "#;
 
@@ -77,6 +85,7 @@ puts TerminalProbe.quoted("a b'c")
 puts TerminalProbe.utf8("zaż")
 p TerminalProbe.terminal
 TerminalProbe.spawn_with_block
+p TerminalProbe.spawn_forwarded
 puts "spawned"
 "#;
 
@@ -87,5 +96,6 @@ Errno::ENOENT
 echo a\ b\'c
 UTF-8
 ["hi|end", true, true]
+nil
 spawned
 "#;
