@@ -31,6 +31,11 @@ fn app() -> roundhouse::App {
         PathBuf::from("app/models/probe.rb"),
         b"class Probe\n  def self.run\n    1 + 2\n  end\nend\n".to_vec(),
     );
+    // Explicit Object is the same terminal as an omitted superclass.
+    tree.insert(
+        PathBuf::from("app/models/probe_object.rb"),
+        b"class ProbeObject < Object\n  def self.run\n    1 + 2\n  end\nend\n".to_vec(),
+    );
     // Framework-based classes are not plain Ruby and stay unreported.
     tree.insert(
         PathBuf::from("app/jobs/application_job.rb"),
@@ -88,13 +93,24 @@ fn plain_class_reporting_partitions_transpile_targets() {
                 target.as_str()
             );
         } else {
-            assert_eq!(msgs.len(), 1, "{}: {msgs:?}", target.as_str());
-            assert!(msgs[0].contains("class `Probe`"), "{}", msgs[0]);
+            assert_eq!(msgs.len(), 2, "{}: {msgs:?}", target.as_str());
             assert!(
-                msgs[0].contains(&format!("({})", target.as_str())),
-                "{}",
-                msgs[0]
+                msgs.iter().any(|m| m.contains("class `Probe`")),
+                "{}: {msgs:?}",
+                target.as_str()
             );
+            assert!(
+                msgs.iter().any(|m| m.contains("class `ProbeObject`")),
+                "{}: {msgs:?}",
+                target.as_str()
+            );
+            for m in &msgs {
+                assert!(
+                    m.contains(&format!("({})", target.as_str())),
+                    "{}",
+                    m
+                );
+            }
         }
     }
 }

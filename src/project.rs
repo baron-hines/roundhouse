@@ -1013,8 +1013,10 @@ fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
     }
 }
 
-/// True when every ancestor of `lc` is another app library class, so
-/// the chain ends at an implicit `Object` rather than a framework base.
+/// True when every ancestor of `lc` is another app library class (or
+/// explicit `Object`), so the chain ends at `Object` rather than a
+/// framework / gem / stdlib base. Explicit `Object` is treated as the
+/// same terminal as an omitted superclass; other unknown parents reject.
 fn is_plain_ruby_class(app: &App, lc: &crate::dialect::LibraryClass) -> bool {
     let mut parent = lc.parent.as_ref();
     let mut hops = 0;
@@ -1025,6 +1027,7 @@ fn is_plain_ruby_class(app: &App, lc: &crate::dialect::LibraryClass) -> bool {
         }
         match app.library_classes.iter().find(|c| c.name == *p) {
             Some(c) => parent = c.parent.as_ref(),
+            None if p.0.as_str() == "Object" => parent = None,
             None => return false,
         }
     }
