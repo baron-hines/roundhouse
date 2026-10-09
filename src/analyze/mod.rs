@@ -609,6 +609,12 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            // `attachment_changes` — `lower::attached::push_attachment_changes`.
+            if !crate::lower::attached::attached_attrs(model).is_empty() {
+                cls.instance_methods
+                    .entry(Symbol::from("attachment_changes"))
+                    .or_insert_with(crate::lower::attached::attachment_changes_ty);
+            }
             for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
                 cls.instance_methods.entry(attr).or_insert(Ty::Class {
                     id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),

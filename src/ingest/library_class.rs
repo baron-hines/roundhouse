@@ -3431,14 +3431,11 @@ fn block_form_concern_filter(stmt: &ruby_prism::Node<'_>, file: &str) -> Option<
 /// True when an Unknown body item is a receiverless block-form call to
 /// a lifecycle hook the callback lowering handles.
 fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
-    use crate::expr::ExprNode;
     let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
-    let ExprNode::Send { recv: None, method, args, block: Some(_), .. } = &*expr.node else {
-        return false;
-    };
-    args.is_empty()
-        && crate::lower::model_to_library::BLOCK_CALLBACK_HOOKS
-            .contains(&method.as_str())
+    // The lowering's own recognizer, so a concern keeps exactly the
+    // callbacks a model body would: blocks, zero-arity lambda arguments
+    // (`before_update -> { @replaced = … }`) and their `on:` hash.
+    crate::lower::model_to_library::block_callback_shape(expr).is_some()
 }
 
 /// Model-DSL MACROS that a lowering expands back out of the

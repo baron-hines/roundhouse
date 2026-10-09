@@ -585,6 +585,7 @@ module ActionView
     # `authenticity_token` value is the form-field name; the token value
     # is empty here because spinel-blog doesn't sign sessions.
     def self.csrf_meta_tags
+      return "" if ActionController.forgery_switched_off
       %(<meta name="csrf-param" content="authenticity_token" />\n<meta name="csrf-token" content="#{html_escape(form_authenticity_token)}" />)
     end
 
@@ -863,6 +864,7 @@ module ActionView
       # on that lane). The explicit comparison is false for every
       # target's unset shape and for `false` alike.
       return "" if @broadcast_rendering == true
+      return "" if ActionController.forgery_switched_off
       %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
     end
 

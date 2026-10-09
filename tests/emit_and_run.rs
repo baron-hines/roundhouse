@@ -9122,3 +9122,203 @@ end
 "#)
         .assert_passes();
 }
+
+/// A concern's `before_update -> { … }` lambda callback, Rails'
+/// `attachment_changes`, and commit callbacks that run after `after_save`
+/// — campfire's `Message::Searchable` reindexes a message whose file was
+/// replaced: the lambda notes `attachment_changes.key?("attachment")`,
+/// and the `after_update_commit` reads the NEW file's name, which only
+/// exists once the save's own `after_save` has attached it. The lambda
+/// was dropped from the concern, `attachment_changes` didn't exist, and
+/// the commit hooks fired before `after_save`.
+#[test]
+fn a_replaced_attachment_is_seen_by_the_commit_callback() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", "class Doc < ApplicationRecord\n  include Tracked\n  has_one_attached :file\nend\n")
+        .write("app/models/doc/tracked.rb", r#"module Doc::Tracked
+  extend ActiveSupport::Concern
+
+  included do
+    before_update -> { @file_replaced = attachment_changes.key?("file") }
+    after_update_commit :note_file, if: :file_replaced?
+  end
+
+  def seen
+    @seen
+  end
+
+  private
+    def file_replaced?
+      @file_replaced
+    end
+
+    def note_file
+      @seen = file.filename.to_s
+    end
+end
+"#)
+        .run_ruby(r#"
+upload = ->(name) { { io: StringIO.new("bytes"), filename: name, content_type: "text/plain" } }
+doc = Doc.create!(name: "first", file: upload.("a.txt"))
+doc.update!(name: "renamed")
+raise "a rename noted a file: #{doc.seen.inspect}" unless doc.seen.nil?
+doc.update!(file: upload.("b.txt"))
+raise "the commit callback saw #{doc.seen.inspect}" unless doc.seen == "b.txt"
+raise "the change outlived the save: #{doc.attachment_changes.inspect}" unless doc.attachment_changes.empty?
+"#)
+        .assert_passes();
+}
+
+/// Three things Rails' test environment does that campfire's tests lean
+/// on, given on the CRuby tree's test support:
+/// - `allow_forgery_protection = false` (Rails' generated test.rb) means
+///   forms carry no authenticity token, so a cached fragment and a fresh
+///   render of it are the same bytes (campfire's messages caching test);
+/// - `ActiveSupport::Notifications.subscribe(regexp)` hears the fragment
+///   cache's reads and writes, keys in Rails' shape, until unsubscribed;
+/// - `freeze_time` stops `Time.current` on the instant records are
+///   stamped with (campfire's user test compares the two).
+#[test]
+fn rails_test_environment_tokens_cache_events_and_clock() {
+    emit_and_run::real_blog()
+        .edit("app/views/articles/_article.html.erb", "<div id=\"<%= dom_id(article) %>\"", "<% cache article do %>\n<div id=\"<%= dom_id(article) %>\"")
+        .edit("app/views/articles/_article.html.erb", "  </div>\n</div>\n", "  </div>\n</div>\n<% end %>\n")
+        .write(
+            "test/controllers/test_environments_controller_test.rb",
+            r#"require "test_helper"
+
+class TestEnvironmentsControllerTest < ActionDispatch::IntegrationTest
+  test "forms carry no token while forgery protection is off" do
+    get new_article_url
+    assert_select "form"
+    assert_select "input[name='authenticity_token']", count: 0
+    get articles_url
+    assert_select "form.button_to"
+    assert_select "input[name='authenticity_token']", count: 0
+  end
+
+  test "a subscriber hears fragment cache reads and writes until it unsubscribes" do
+    keys = []
+    subscriber = ActiveSupport::Notifications.subscribe(/\Acache_(read|write)\.active_support\z/) do |*, payload|
+      keys << payload[:key]
+    end
+    get articles_url
+    assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+    heard = keys.size
+    get articles_url
+    assert_equal heard, keys.size
+  end
+
+  test "freeze_time stops Time.current on the instant records are stamped with" do
+    freeze_time
+    article = Article.create!(title: "Frozen", body: "A sufficiently long article body.")
+    assert_equal Time.current, article.created_at
+    assert_equal Time.current, Article.find(article.id).updated_at
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/test_environments_controller_test.rb")
+        .assert_passes();
+}
+
+/// A Duration handed to the stdlib as a timeout, and `Timeout.timeout`
+/// answering its block's value — campfire's unfurl (`DEADLINE =
+/// 10.seconds` around the fetch, `open_timeout: 7.seconds` into
+/// `Net::HTTP.start`). The Duration did no arithmetic, so
+/// `TCPSocket.new(open_timeout:)` raised on `-` and every fetch failed;
+/// and `Timeout.timeout { record }` typed Untyped, so `render json:`
+/// wrote the record's `inspect` instead of its JSON.
+#[test]
+fn a_duration_times_out_the_stdlib_and_a_timed_block_keeps_its_type() {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  get \"/timed/:id\", to: \"articles#timed\"\n  get \"/twice\", to: \"articles#twice\"\n  resources :articles do\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", r#"class ArticlesController < ApplicationController
+  LIMIT = 2.seconds
+
+  def timed
+    card = Timeout.timeout(LIMIT) { Card.new(title: Article.find(params[:id]).title) }
+    render json: card
+  end
+
+  def twice
+    first = Article.first
+    again = Article.first
+    render plain: (first.id == again.id).to_s
+  end
+
+"#)
+        .write("app/models/card.rb", "class Card\n  include ActiveModel::Model\n\n  attr_accessor :title\nend\n")
+        .write(
+            "test/controllers/timed_articles_controller_test.rb",
+            r#"require "test_helper"
+
+require "active_record/testing/query_assertions"
+
+class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
+  include ActiveRecord::Assertions::QueryAssertions
+
+  test "a request replays an identical query, as Rails' query cache does" do
+    assert_queries_count(1) { get "/twice" }
+    assert_equal "true", response.body
+    assert_queries_count(2) { Article.first; Article.first }
+  end
+
+  test "the timed lookup renders the model's JSON" do
+    article = articles(:one)
+    get "/timed/#{article.id}"
+    assert_response :success
+    assert_equal article.title, JSON.parse(response.body)["title"]
+  end
+
+  test "a duration is a timeout the socket layer takes" do
+    server = TCPServer.new("127.0.0.1", 0)
+    socket = TCPSocket.new("127.0.0.1", server.addr[1], open_timeout: 1.second)
+    socket.close
+    server.close
+    assert_equal 1.5, (2.seconds - 0.5).to_f
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/timed_articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Destroying a record takes its attachments with it, as `dependent:`
+/// says: Rails' default `:purge_later` deletes the join row and purges
+/// the blob in an `ActiveStorage::PurgeJob` (run inline here, with no
+/// queue adapter), and `dependent: false` leaves both. Without it
+/// campfire's `Room#destroy_one_message_at_a_time` left every message's
+/// attachment row and file behind.
+#[test]
+fn destroying_an_owner_purges_its_attachments_as_dependent_says() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", "class Doc < ApplicationRecord\n  has_one_attached :file\n  has_one_attached :keep, dependent: false\nend\n")
+        .run_ruby(r#"
+upload = ->(name) { { io: StringIO.new("bytes"), filename: name, content_type: "text/plain" } }
+count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT count(*) FROM #{table}") }
+doc = Doc.create!(name: "first", file: upload.("a.txt"), keep: upload.("b.txt"))
+raise "attached #{count.("active_storage_attachments")}" unless count.("active_storage_attachments") == 2
+doc.destroy
+raise "rows left: #{count.("active_storage_attachments")}" unless count.("active_storage_attachments") == 1
+raise "blobs left: #{count.("active_storage_blobs")}" unless count.("active_storage_blobs") == 1
+raise "PurgeJob not recorded" unless ActiveJob.performed.include?("ActiveStorage::PurgeJob")
+"#)
+        .assert_passes();
+}

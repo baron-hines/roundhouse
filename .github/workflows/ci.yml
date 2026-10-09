@@ -1036,7 +1036,7 @@ jobs:
 
     services:
       redis:
-        image: redis
+        image: public.ecr.aws/docker/library/redis
         ports: ['6379:6379']
     env:
       # The oracle's `bundle install` lands inside build/campfire-oracle
@@ -1300,7 +1300,7 @@ jobs:
       verify-gen: ${{ steps.result.outputs.verify-gen }}
     services:
       redis:
-        image: redis
+        image: public.ecr.aws/docker/library/redis
         ports: ['6379:6379']
     env:
       BUNDLE_PATH: vendor/bundle
@@ -1402,7 +1402,7 @@ jobs:
     continue-on-error: true
     services:
       redis:
-        image: redis
+        image: public.ecr.aws/docker/library/redis
         ports: ['6379:6379']
     env:
       BUNDLE_PATH: vendor/bundle
