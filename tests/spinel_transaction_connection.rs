@@ -109,6 +109,29 @@ def break_case(name)
   check(name, v == :broke && Db._txn_depth == 0 && title == "during-break",
         "v=" + v.to_s + " depth=" + Db._txn_depth.to_s + " title=" + title)
 end
+
+# A ROLLBACK that itself fails (SQLite's transaction already ended some
+# other way, e.g. a constraint violation it resolves by aborting the
+# whole transaction) must not hide the original exception. Simulated
+# here by ending the transaction out from under `transaction`'s own
+# rescue before it gets to run its own ROLLBACK.
+def rollback_failure_case(name)
+  a = Article.create!(title: "before", body: "long enough body")
+  raised = nil
+  begin
+    Article.transaction do
+      a.update!(title: "during")
+      Db.exec("ROLLBACK")
+      raise "boom"
+    end
+  rescue => e
+    raised = e
+  end
+  title = Article.find(a.id).title
+  ok = !raised.nil? && raised.is_a?(RuntimeError) && raised.message == "boom" && title == "before"
+  detail = (raised.nil? ? "nil" : raised.class.to_s + ":" + raised.message) + " title=" + title
+  check(name, ok, detail)
+end
 "#;
 
 fn script(pool_size: usize) -> String {
@@ -121,6 +144,7 @@ fn script(pool_size: usize) -> String {
          Db.with_connection {{ rollback_case(\"nested, in a request lease\", \"nested\") }}\n\
          commit_case(\"nested and leased blocks commit with the outer one\")\n\
          return_case(\"a non-local return commits and restores depth\")\n\
+         rollback_failure_case(\"a failed ROLLBACK does not hide the original exception\")\n\
          puts \"done\"\n"
     )
 }
@@ -132,7 +156,7 @@ fn assert_all_ok(pool_size: usize) {
     assert!(out.lines().any(|l| l == "done"), "driver did not finish\n{out}\n{}", run.stderr);
     let failed: Vec<&str> = out.lines().filter(|l| l.starts_with("FAIL")).collect();
     assert!(failed.is_empty(), "pool_size {pool_size}:\n{}\n=== stdout ===\n{out}", failed.join("\n"));
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 7, "{out}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 8, "{out}");
 }
 
 #[test]
@@ -160,6 +184,7 @@ fn a_nested_transaction_joins_the_outer_one_on_cruby() {
          check(\"nested commit\", Article.find(a.id).title == \"nested\", \"\")\n\
          return_case(\"a non-local return commits and restores depth\")\n\
          break_case(\"a break commits and restores depth\")\n\
+         rollback_failure_case(\"a failed ROLLBACK does not hide the original exception\")\n\
          puts \"done\"\n"
     );
     let run = emit_and_run::real_blog().run_ruby(&script);
@@ -167,5 +192,5 @@ fn a_nested_transaction_joins_the_outer_one_on_cruby() {
     let out = &run.stdout;
     assert!(out.lines().any(|l| l == "done"), "{out}");
     assert!(!out.contains("FAIL"), "{out}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 5, "{out}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 6, "{out}");
 }

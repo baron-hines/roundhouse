@@ -473,7 +473,14 @@ module ActiveRecord
         rescue Exception => e
           rolled_back = true
           Db._txn_depth = 0
-          Db.exec("ROLLBACK")
+          begin
+            Db.exec("ROLLBACK")
+          rescue StandardError
+            # SQLite may already have ended the transaction itself (a
+            # constraint violation it resolves by aborting the whole
+            # transaction, not just the statement, does this) — the
+            # ROLLBACK's own failure must not hide the real error below.
+          end
           raise e
         ensure
           if rolled_back
