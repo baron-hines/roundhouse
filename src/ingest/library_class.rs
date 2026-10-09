@@ -3339,8 +3339,8 @@ pub fn ingest_concern_filters(
                     filters.push(f);
                 } else if let Some(name) = forgery_macro_name(&inner) {
                     // A forgery declaration `parse_filter_call` does not
-                    // model (`using: :header_only`, `with:
-                    // :null_session`, `prepend:`) changes how every
+                    // model (`prepend:`, a custom `store:`, an unknown
+                    // `with:`) changes how every
                     // includer checks requests. The `included` block is
                     // otherwise dropped, so it would vanish without a
                     // trace where the same line in a controller is a

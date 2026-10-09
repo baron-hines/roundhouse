@@ -178,8 +178,8 @@ fn bare_protect_from_forgery_still_registers_the_check() {
     assert!(rooms.contains("verify_authenticity_token"), "{rooms}");
 }
 
-/// A forgery declaration the filter parse does not model — campfire
-/// main's `protect_from_forgery using: :header_only, …` — inside a
+/// A forgery declaration the filter parse does not model — `prepend:
+/// true`, which Rails runs ahead of every other filter — inside a
 /// concern's `included do` was dropped without a trace, while the same
 /// line in a controller is a survey gap. It must be named the same way,
 /// and must not register a filter as if it were the token check.
@@ -188,7 +188,7 @@ fn an_unmodeled_forgery_option_in_a_concern_is_a_survey_gap() {
     use roundhouse::ingest::survey;
     let concern = AUTHENTICATION.replace(
         "protect_from_forgery with: :exception",
-        "protect_from_forgery using: :header_only, with: :exception",
+        "protect_from_forgery prepend: true, with: :exception",
     );
     let tree: HashMap<PathBuf, Vec<u8>> = [
         ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
