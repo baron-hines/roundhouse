@@ -10,7 +10,7 @@ module ActionDispatch
       def []: (String | Symbol key) -> untyped
       def key?: (String | Symbol key) -> bool
       def include?: (String | Symbol key) -> bool
-      def fetch: (String | Symbol key, ?untyped default) -> untyped
+      def fetch: (String | Symbol key, *untyped defaults) -> untyped
       def self.env_name: (String | Symbol key) -> String
     end
   end

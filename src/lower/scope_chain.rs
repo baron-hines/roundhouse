@@ -3050,7 +3050,7 @@ fn lower_relation_args(
                         );
                         let block = syn(
                             span,
-                            ExprNode::Lambda { rest_param: None,
+                            ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
                                 params: vec![x],
                                 block_param: None,
                                 body: id_read,
@@ -3453,7 +3453,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             args: vec![],
                             block: Some(syn(
                                 span,
-                                ExprNode::Lambda { rest_param: None,
+                                ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
                                     params: vec![attrs],
                                     block_param: None,
                                     body: save,
@@ -4027,8 +4027,10 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             // `Array#first(n)` (lobsters' `split.first(words * 2)`),
             // which is the hazard `counted_terminal`'s own note names.
             if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
+                // A scope proved to answer something else (a `Page`)
+                // names no relation, wherever it sits.
                 let names_a_scope = matches!(&*r.node, ExprNode::Send { method: rname, .. }
-                    if ctx.sole_scope_owner(rname).is_some());
+                    if ctx.sole_scope_owner(rname).is_some_and(|owner| ctx.scope_keeps_relation(owner, rname)));
                 if names_a_scope {
                     *expr = put(span, Some(r), counted, args, block, parenthesized);
                     return None;

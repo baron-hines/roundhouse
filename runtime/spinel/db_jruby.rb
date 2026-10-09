@@ -308,7 +308,8 @@ module Db
       st.execute(sql)
       word = sql.strip.split(" ", 2).first.to_s.upcase
       conn.in_txn = true if word == "BEGIN"
-      conn.in_txn = false if word == "COMMIT" || word == "ROLLBACK" || word == "END"
+      rollback_to_savepoint = word == "ROLLBACK" && sql.strip.upcase.start_with?("ROLLBACK TO ")
+      conn.in_txn = false if word == "COMMIT" || word == "END" || (word == "ROLLBACK" && !rollback_to_savepoint)
     rescue StandardError => e
       raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
       raise

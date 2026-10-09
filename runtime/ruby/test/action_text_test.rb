@@ -261,6 +261,7 @@ class ActionTextContentTest < Minitest::Test
   def test_blank_is_the_markup_blank
     assert ActionText::Content.new("").blank?
     assert ActionText::Content.new("   \n\t").blank?
+    assert ActionText::Content.new("\u00a0").blank?
     refute ActionText::Content.new("<div></div>").blank?
     refute ActionText::Content.new("<div><br></div>").blank?
     refute ActionText::Content.new("&nbsp;").blank?

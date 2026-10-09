@@ -148,34 +148,61 @@ fn reject_reordered_rewrite(mw: &ruby_prism::MultiWriteNode<'_>, file: &str) -> 
         }
         None
     }
-    fn source_order<'pr>(lefts: impl Iterator<Item = Node<'pr>>, out: &mut Vec<(String, usize)>) {
+    fn source_order<'pr>(
+        lefts: impl Iterator<Item = Node<'pr>>,
+        writes: &mut Vec<(String, usize)>,
+        targets: &mut Vec<usize>,
+    ) {
         for left in lefts {
             if let Some(group) = left.as_multi_target_node() {
-                source_order(group.lefts().iter(), out);
-            } else if let Some(name) = name_of(&left) {
-                out.push((name, left.location().start_offset()));
+                source_order(group.lefts().iter(), writes, targets);
+            } else {
+                let at = left.location().start_offset();
+                targets.push(at);
+                if let Some(name) = name_of(&left) {
+                    writes.push((name, at));
+                }
             }
         }
     }
     // The desugar's order: this level's plain targets, then each group's
     // (recursively, in the same shape).
-    fn desugar_order<'pr>(lefts: Vec<Node<'pr>>, out: &mut Vec<(String, usize)>) {
+    fn desugar_order<'pr>(
+        lefts: Vec<Node<'pr>>,
+        writes: &mut Vec<(String, usize)>,
+        targets: &mut Vec<usize>,
+    ) {
         let mut groups = Vec::new();
         for left in lefts {
             if let Some(group) = left.as_multi_target_node() {
                 groups.push(group);
-            } else if let Some(name) = name_of(&left) {
-                out.push((name, left.location().start_offset()));
+            } else {
+                let at = left.location().start_offset();
+                targets.push(at);
+                if let Some(name) = name_of(&left) {
+                    writes.push((name, at));
+                }
             }
         }
         for group in groups {
-            desugar_order(group.lefts().iter().collect(), out);
+            desugar_order(group.lefts().iter().collect(), writes, targets);
         }
     }
+    fn has_setter_target<'pr>(lefts: impl Iterator<Item = Node<'pr>>) -> bool {
+        lefts.into_iter().any(|left| {
+            if let Some(group) = left.as_multi_target_node() {
+                has_setter_target(group.lefts().iter())
+            } else {
+                left.as_call_target_node().is_some()
+            }
+        })
+    }
+    let mut ruby_targets = Vec::new();
     let mut ruby = Vec::new();
-    source_order(mw.lefts().iter(), &mut ruby);
+    source_order(mw.lefts().iter(), &mut ruby, &mut ruby_targets);
+    let mut ours_targets = Vec::new();
     let mut ours = Vec::new();
-    desugar_order(mw.lefts().iter().collect(), &mut ours);
+    desugar_order(mw.lefts().iter().collect(), &mut ours, &mut ours_targets);
     let last = |writes: &[(String, usize)], name: &str| {
         writes.iter().rev().find(|(n, _)| n == name).map(|(_, at)| *at)
     };
@@ -183,6 +210,13 @@ fn reject_reordered_rewrite(mw: &ruby_prism::MultiWriteNode<'_>, file: &str) -> 
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: "nested multi-write that writes one variable twice out of source order is not modeled".into(),
+        });
+    }
+    let has_setter = has_setter_target(mw.lefts().iter());
+    if has_setter && ruby_targets != ours_targets {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "nested multi-write with assignment-method targets would reorder setter side effects".into(),
         });
     }
     Ok(())
@@ -1180,6 +1214,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
             refuse_block_capture(l.parameters(), file)?;
+            let extra_params = block_extra_params(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = block_rest_param(l.parameters());
             let body = match l.body() {
@@ -1192,7 +1227,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { rest_param, params, block_param: None, body, block_style }
+            ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -2936,7 +2971,7 @@ fn ingest_call_block(
                 );
                 return Ok(Some(Expr::new(
                     sym_span,
-                    ExprNode::Lambda { rest_param: None,
+                    ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
                         params,
                         block_param: None,
                         body,
@@ -2999,6 +3034,7 @@ fn ingest_call_block(
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
                 refuse_block_capture(lam.parameters(), file)?;
+                let extra_params = block_extra_params(lam.parameters(), file)?;
                 let params = block_param_names(lam.parameters());
                 let mut rest_param = block_rest_param(lam.parameters());
                 let body = match lam.body() {
@@ -3010,7 +3046,7 @@ fn ingest_call_block(
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+                    ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style },
                 )));
             }
             // Any other proc-valued expression is evaluated once and passed as the block.
@@ -3067,6 +3103,7 @@ fn ingest_call_block(
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
     refuse_block_capture(b.parameters(), file)?;
+    let extra_params = block_extra_params(b.parameters(), file)?;
     let params = block_param_names(b.parameters());
     let mut rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
@@ -3078,7 +3115,7 @@ fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> Ing
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     Ok(Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+        ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style },
     ))
 }
 
@@ -3131,6 +3168,56 @@ fn refuse_block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResu
         });
     }
     Ok(())
+}
+
+/// The block's optional positionals, keywords and keyword rest, in source
+/// order, for `ExprNode::Lambda.extra_params`. `params` holds only the
+/// required names, and the body reads these as well: dropping them made
+/// the emitted lambda raise `NameError`. `**nil` (no keywords accepted)
+/// has no representation here and is refused: dropped, the emitted block
+/// would accept the keywords the source rejects.
+fn block_extra_params(params_node: Option<Node<'_>>, file: &str) -> IngestResult<Vec<crate::dialect::Param>> {
+    use crate::dialect::Param;
+    let Some(pn) = params_node
+        .and_then(|node| node.as_block_parameters_node())
+        .and_then(|node| node.parameters())
+    else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for opt in pn.optionals().iter() {
+        if let Some(op) = opt.as_optional_parameter_node() {
+            let mut param = Param::positional(Symbol::from(constant_id_str(&op.name())));
+            param.default = Some(ingest_expr(&op.value(), file)?);
+            out.push(param);
+        }
+    }
+    for kw in pn.keywords().iter() {
+        if let Some(req) = kw.as_required_keyword_parameter_node() {
+            let mut param = Param::positional(Symbol::from(constant_id_str(&req.name())));
+            param.keyword = true;
+            out.push(param);
+        } else if let Some(opt) = kw.as_optional_keyword_parameter_node() {
+            let mut param = Param::positional(Symbol::from(constant_id_str(&opt.name())));
+            param.keyword = true;
+            param.default = Some(ingest_expr(&opt.value(), file)?);
+            out.push(param);
+        }
+    }
+    if pn.keyword_rest().is_some_and(|node| node.as_no_keywords_parameter_node().is_some()) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "a block or lambda with `**nil` (no keywords accepted) has no representation".into(),
+        });
+    }
+    if let Some(krp) = pn.keyword_rest().and_then(|node| node.as_keyword_rest_parameter_node()) {
+        let name = krp.name().map(|loc| constant_id_str(&loc).to_string()).unwrap_or_default();
+        let mut param = Param::positional(Symbol::from(name.as_str()));
+        param.keyword = true;
+        param.rest = true;
+        out.push(param);
+    }
+    Ok(out)
 }
 
 fn block_param_names(params_node: Option<Node<'_>>) -> Vec<Symbol> {

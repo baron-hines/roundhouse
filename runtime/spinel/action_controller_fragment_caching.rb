@@ -21,14 +21,9 @@
 # `super` reaches these.
 #
 # Rendering with no controller in flight (a broadcast, a job, a test
-# rendering a view directly) goes through a detached
-# `ActionController::Base` — Rails renders those through a fresh
-# controller too, with the framework's settings. Rails' fresh controller
-# is the app's `ApplicationController` when the render names it; a
-# detached render here does not consult that class's overrides (campfire's
-# turns caching off outside a request), so such a fragment can be served
-# from `Rails.cache` where campfire would render it — the behaviour these
-# renders had before this file existed.
+# rendering a view directly) uses a detached controller. Since it cannot
+# recover the app controller's cache policy or cache-key overrides, it
+# fails closed and does not read or write shared fragments.
 #
 # NOT HERE: the `fragment_cache_key` class DSL (the `head` of the
 # combined key), template digests (the view's name stands in for its
@@ -37,42 +32,30 @@
 # MemoryStore` here) — such a fragment renders uncached rather than
 # stay forever.
 #
-# `perform_caching` and `cache_store` are class settings, answered by
-# the controller's own class when it set one and otherwise by
-# ActionController::Base (Rails' class_attribute also consults the
-# classes in between; those are not walked). Base's `perform_caching`
-# defaults to true, the framework default; the test harness sets it
+# `perform_caching` and `cache_store` are class settings inherited
+# through the controller hierarchy, like Rails' class_attribute.
+# Base's `perform_caching` defaults to true; the test harness sets it
 # false, as a generated `config/environments/test.rb` does.
 module ActionController
   class Base
     def self.perform_caching
-      own = @perform_caching
-      return own unless own.nil?
-      base = ActionController::Base.own_perform_caching
-      base.nil? ? true : base
+      return @perform_caching if instance_variable_defined?(:@perform_caching)
+      return true if self == ActionController::Base
+      superclass.perform_caching
     end
 
     def self.perform_caching=(value)
       @perform_caching = value
     end
 
-    def self.own_perform_caching
-      @perform_caching
-    end
-
     def self.cache_store
-      own = @cache_store
-      return own unless own.nil?
-      base = ActionController::Base.own_cache_store
-      base.nil? ? Rails.cache : base
+      return @cache_store if instance_variable_defined?(:@cache_store)
+      return Rails.cache if self == ActionController::Base
+      superclass.cache_store
     end
 
     def self.cache_store=(store)
       @cache_store = store
-    end
-
-    def self.own_cache_store
-      @cache_store
     end
 
     def perform_caching
@@ -123,6 +106,12 @@ end
 
 module ActionView
   module ViewHelpers
+    class DetachedFragmentController < ActionController::Base
+      def perform_caching
+        false
+      end
+    end
+
     def self.fragment_read(key)
       ActionView::ViewHelpers.fragment_controller.read_fragment(ActionView::ViewHelpers.fragment_name(key))
     end
@@ -135,7 +124,7 @@ module ActionView
     def self.fragment_controller
       controller = ActionController::Current.controller
       return controller unless controller.nil?
-      @detached_controller ||= ActionController::Base.new
+      @detached_controller ||= DetachedFragmentController.new
     end
 
     # The lowering's key already leads with "views/"; the controller adds

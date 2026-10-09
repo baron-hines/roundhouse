@@ -836,6 +836,10 @@ fn every_runtime_method_body_concretely_typed() {
     // Rails itself leaves dynamic: `Connection#select_value` (one SQL cell, as
     // `select_rows`' rows are), `Base.uncached`'s block value (the
     // `Timeout.timeout` shape), and `Relation#to_h`'s yielded pairs.
+    // `ActiveStorage::AttachedMany#each` (Rails' `delegate_missing_to
+    // :attachments`, for campfire's `body.embeds.each`) adds 1,
+    // MEASURED: the value of its `yield`, the same block-return escape
+    // `Relation#each` carries.
     // `in_batches` adds 2, MEASURED: the `yield self` in
     // `Relation#in_batches` and in the class-side fallback in
     // connection.rb, whose value is the block's — gradual, as
@@ -846,7 +850,15 @@ fn every_runtime_method_body_concretely_typed() {
     // value, so every read of one is gradual (38); `Session#to_hash`
     // reads the untyped session values it copies (1) and
     // `Http::Headers#[]` answers an untyped env value (1).
-    const CEILING: usize = 358;
+    // Main's HAML shortcut-class merge adds 2 more gradual reads.
+    // MEASURED 2026-10-09 (against origin/main a28539b6): `haml_class`
+    // (the HAML shortcut-class + hash `class:` merge) adds 2 on top of
+    // the above — its `value` param is `untyped` (a scalar the HAML
+    // compiler could not narrow further: String, Symbol, nil, or a
+    // conditional/ternary result), and the body reads it twice
+    // (`value.nil?`, `value.to_s`).
+    // Rebased onto main after `in_batches`: MEASURED 317 with haml_class, under main's 318.
+    const CEILING: usize = 357;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

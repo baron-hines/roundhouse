@@ -44,8 +44,12 @@ module SQLite3
       @closed = false
       @readonly = readonly
       flags = readonly ? SQL::OPEN_URI_READONLY : SQL::OPEN_URI_RWC
-      rc = SQL.sqlite3_open_v2(path.to_s, SQL.sq_db_out, flags, nil)
-      @dbh = SQL.read_ptr(SQL.sq_db_out)
+      rc = 0
+      @dbh = 0
+      Db.prepare_lock.synchronize do
+        rc = SQL.sqlite3_open_v2(path.to_s, SQL.sq_db_out, flags, nil)
+        @dbh = SQL.read_ptr(SQL.sq_db_out)
+      end
       if rc != SQL::OK
         # sqlite hands back a handle even when the open fails; it holds
         # the message and must still be closed.
@@ -94,9 +98,13 @@ module SQLite3
 
     def execute(sql)
       raise SQLite3::Exception, "cannot use a closed database" if @closed
-      rc = SQL.sqlite3_prepare_v2(@dbh, sql, -1, SQL.sq_stmt_out, nil)
+      rc = 0
+      stmt = 0
+      Db.prepare_lock.synchronize do
+        rc = SQL.sqlite3_prepare_v2(@dbh, sql, -1, SQL.sq_stmt_out, nil)
+        stmt = rc == SQL::OK ? SQL.read_ptr(SQL.sq_stmt_out) : 0
+      end
       raise_error(rc) if rc != SQL::OK
-      stmt = SQL.read_ptr(SQL.sq_stmt_out)
       rows = []
       begin
         while true

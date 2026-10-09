@@ -79,13 +79,7 @@ module ActiveSupport
 
       def read(name)
         key = ActiveSupport::Cache.expanded_key(name)
-        value = nil
-        @lock.synchronize do
-          if @data.key?(key)
-            value = @data.delete(key)
-            @data[key] = value
-          end
-        end
+        _, value = @lock.synchronize { read_locked(key) }
         MemoryStore.copy(value)
       end
 
@@ -113,7 +107,8 @@ module ActiveSupport
       # The cached value, or the block's — which is then written.
       def fetch(name)
         key = ActiveSupport::Cache.expanded_key(name)
-        return read(key) if exist?(key)
+        found, cached = @lock.synchronize { read_locked(key) }
+        return MemoryStore.copy(cached) if found
         value = yield
         write(key, value)
         value
@@ -169,6 +164,15 @@ module ActiveSupport
       end
 
       private
+
+      # Return presence separately because a cached nil is still a hit.
+      # Call only while holding @lock.
+      def read_locked(key)
+        return [false, nil] unless @data.key?(key)
+        value = @data.delete(key)
+        @data[key] = value
+        [true, value]
+      end
 
       def delete_locked(key)
         return false unless @data.key?(key)

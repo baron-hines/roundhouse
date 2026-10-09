@@ -2027,6 +2027,13 @@ fn nested_multi_write_refuses_a_reordered_last_write() {
     assert!(message.contains("out of source order"), "{message}");
     // The same name written twice in an order the desugar keeps is fine.
     assert!(parse("x, (y, x) = 1, [2, 3]").is_ok());
+
+    let Err(IngestError::Unsupported { message, .. }) =
+        parse("(self.flag, _), @observed = [1, 2], true")
+    else {
+        panic!("expected nested setter reordering to be unsupported");
+    };
+    assert!(message.contains("assignment-method targets"), "{message}");
 }
 
 #[test]

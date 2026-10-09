@@ -163,19 +163,39 @@ fn is_data_factory(value: &crate::expr::Expr) -> bool {
 /// indentation; a file that does not hold it is not the owner's.
 fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App) {
     let name = block.name.0.as_str();
+    let owner = file_owner(name, app);
+    let owner_stem = crate::naming::underscore(&owner);
+    let owner_rb_path = PathBuf::from(format!("app/models/{owner_stem}.rb"));
+    let owner_rbs_path = PathBuf::from(format!("app/models/{owner_stem}.rbs"));
     let depth = name.split("::").count();
     let last = name.rsplit("::").next().unwrap_or(name);
     let indent = "  ".repeat(depth - 1);
     let stem = crate::naming::underscore(name);
     let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
     let rendered = emit_library_class_decl(block, app, rb_path.clone());
-    let lines: Vec<&str> = rendered.content.lines().filter(|l| !l.starts_with("require")).collect();
-    let Some(body) = unwrapped(&lines, depth) else { return };
+    let lines: Vec<&str> = rendered.content.lines().collect();
+    let mut hoisted = Vec::new();
+    for line in lines.iter().filter(|line| line.starts_with("require_relative ")) {
+        let target = line.trim_start_matches("require_relative ").trim().trim_matches('"');
+        let rebased = rebase_relative(&stem, &owner, target, app);
+        hoisted.push(format!("require_relative {rebased:?}"));
+    }
+    hoisted.extend(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("require \""))
+            .map(|line| line.to_string()),
+    );
+    let body_lines: Vec<&str> = lines.iter().copied().filter(|line| !line.starts_with("require")).collect();
+    let Some(body) = unwrapped(&body_lines, depth) else { return };
     let sidecar = super::rbs::emit_library_class_rbs(block, &rb_path);
     let sidecar_lines: Vec<&str> = sidecar.content.lines().collect();
     let sidecar_body = unwrapped(&sidecar_lines, depth);
     for file in files.iter_mut() {
         let is_rb = file.path.extension().is_some_and(|e| e == "rb");
+        if (is_rb && file.path != owner_rb_path) || (!is_rb && file.path != owner_rbs_path) {
+            continue;
+        }
         let mut out: Vec<String> = Vec::new();
         let mut spliced = false;
         let mut lines = file.content.lines().peekable();
@@ -214,7 +234,11 @@ fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App)
         }
         if spliced {
             let trailing = if file.content.ends_with('\n') { "\n" } else { "" };
-            file.content = format!("{}{trailing}", out.join("\n"));
+            let mut content = out.join("\n");
+            if is_rb && !hoisted.is_empty() {
+                content = format!("{}\n\n{content}", hoisted.join("\n"));
+            }
+            file.content = format!("{content}{trailing}");
         }
     }
 }
@@ -763,11 +787,20 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
         } else {
             Vec::new()
         };
-        let scopes = crate::lower::rich_text::preload_scopes(model)
-            .into_iter()
-            .chain(plain_scopes)
-            .chain(crate::lower::attached::preload_scopes(model));
-        for (n, assoc) in scopes {
+        let rich = crate::lower::rich_text::preload_scopes(model).into_iter().map(|(n, assoc)| {
+            let spec = match crate::lower::rich_text::preload_scope_nested(&n) {
+                Some(nested) => format!("{{ {}: :{} }}", assoc.as_str(), nested.as_str()),
+                None => format!(":{}", assoc.as_str()),
+            };
+            (n, spec)
+        });
+        let scopes = rich.chain(
+            plain_scopes
+                .into_iter()
+                .chain(crate::lower::attached::preload_scopes(model))
+                .map(|(n, assoc)| (n, format!(":{}", assoc.as_str()))),
+        );
+        for (n, spec) in scopes {
             let n = n.as_str().to_string();
             // A declared scope of the same name wins — it has a real
             // body, and shadowing it would drop a filter.
@@ -775,7 +808,7 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
             if by_name.contains_key(&n) || RELATION_BUILTINS.contains(&n.as_str()) {
                 continue;
             }
-            preloads.insert(n, assoc.as_str().to_string());
+            preloads.insert(n, spec);
         }
     }
     // Class methods some call site reaches THROUGH a relation, which
@@ -832,11 +865,11 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
             }
         }
     }
-    for (name, assoc) in &preloads {
+    for (name, spec) in &preloads {
         body.push_str("\n    # Preload scope (Rails' `includes`): the association it names\n");
         body.push_str("    # joins this relation's preload specs, batched at `to_a`.\n");
         writeln!(body, "    def {name}").unwrap();
-        writeln!(body, "      preload(:{assoc})\n    end").unwrap();
+        writeln!(body, "      preload({spec})\n    end").unwrap();
     }
     let mut s = String::from(
         "# Generated Relation scope delegation (see\n\
@@ -7971,10 +8004,10 @@ enum PreloadKind {
     /// (`lower::attached::variations_ruby_source`), the proxy's fourth
     /// constructor argument.
     Attached { attr: String, owner: String, variations: String },
-    /// `has_many_attached :<attr>`: install an `AttachedMany` proxy per
-    /// record. Rows are still loaded on ask (`AttachedMany#attachments`);
-    /// the batch here is the memoized proxy, matching One's "one proxy
-    /// per record" contract.
+    /// `has_many_attached :<attr>`: one join over the attachment and blob
+    /// tables for the whole record set, installing a proxy per record
+    /// that answers its rows (`AttachedMany#_preload_rows`) without
+    /// asking again.
     AttachedMany { attr: String, owner: String },
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
@@ -8334,8 +8367,27 @@ end
                     src,
                     r#"
 def self._preload_batch_{name}(records)
+  ids = []
   records.each do |r|
-    r._preload_{name}(ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}"))
+    ids << r.id
+  end
+  rows_by = {{}}
+  if ids.length > 0
+    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.escape_int_list(ids) + ") ORDER BY a.id").each do |row|
+      rid = row["record_id"].to_i
+      list = rows_by[rid]
+      if list.nil?
+        list = []
+        rows_by[rid] = list
+      end
+      list.push(ActiveStorage::ManyAttachment.new(row["attachment_id"].to_i, ActiveStorage::Blob.from_row(row)))
+    end
+  end
+  records.each do |r|
+    many = ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}")
+    found = rows_by[r.id]
+    many._preload_rows(found.nil? ? [] : found)
+    r._preload_{name}(many)
   end
   []
 end

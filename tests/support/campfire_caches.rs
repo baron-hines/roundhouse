@@ -84,15 +84,24 @@ pub const DATA_BLOCK_METHODS: Contract = Contract {
     ContentKey.new(digest: value)
   end
 end
+
+class OtherDataBlockProbe
+  ContentKey = Data.define(:digest) do
+    def cache_key
+      "other-" + digest
+    end
+  end
+end
 "#,
     script: r#"key = DataBlockProbe.key("abc")
 puts key.cache_key
 puts key.digest
 puts DataBlockProbe::ContentKey.build("def").cache_key
+puts OtherDataBlockProbe::ContentKey.new(digest: "ghi").cache_key
 puts key == DataBlockProbe::ContentKey.new(digest: "abc")
 puts key.is_a?(DataBlockProbe::ContentKey)
 "#,
-    expected: "key-abc\nabc\nkey-def\ntrue\ntrue\n",
+    expected: "key-abc\nabc\nkey-def\nother-ghi\ntrue\ntrue\n",
 };
 
 /// `CachedResponses`' request surface: rack's encoding negotiation

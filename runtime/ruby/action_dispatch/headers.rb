@@ -39,9 +39,12 @@ module ActionDispatch
         key?(key)
       end
 
-      def fetch(key, default = nil)
+      def fetch(key, *defaults)
         name = Headers.env_name(key)
-        @env.key?(name) ? @env[name] : default
+        return @env[name] if @env.key?(name)
+        raise ArgumentError, "wrong number of arguments" if defaults.length > 1
+        return defaults[0] unless defaults.empty?
+        raise KeyError, "key not found: #{key}"
       end
 
       def self.env_name(key)
