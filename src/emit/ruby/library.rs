@@ -187,10 +187,20 @@ fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App)
             .map(|line| line.to_string()),
     );
     let body_lines: Vec<&str> = lines.iter().copied().filter(|line| !line.starts_with("require")).collect();
-    let Some(body) = unwrapped(&body_lines, depth) else { return };
+    let Some(body) = unwrapped(&body_lines, depth) else {
+        assert!(
+            block.methods.is_empty() && hoisted.is_empty(),
+            "Data.define methods or requires were not emitted for {name}"
+        );
+        return;
+    };
     let sidecar = super::rbs::emit_library_class_rbs(block, &rb_path);
     let sidecar_lines: Vec<&str> = sidecar.content.lines().collect();
     let sidecar_body = unwrapped(&sidecar_lines, depth);
+    assert!(
+        block.methods.is_empty() || sidecar_body.is_some(),
+        "Data.define methods were not emitted to the RBS sidecar for {name}"
+    );
     for file in files.iter_mut() {
         let is_rb = file.path.extension().is_some_and(|e| e == "rb");
         if (is_rb && file.path != owner_rb_path) || (!is_rb && file.path != owner_rbs_path) {
@@ -239,6 +249,9 @@ fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App)
                 content = format!("{}\n\n{content}", hoisted.join("\n"));
             }
             file.content = format!("{content}{trailing}");
+        }
+        if !block.methods.is_empty() {
+            assert!(spliced, "Data.define methods were not spliced into {file:?} for {name}");
         }
     }
 }

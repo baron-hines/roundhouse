@@ -5114,7 +5114,11 @@ impl Analyzer {
         // taken from what this block returned for that key: the same
         // records, in order, of the same classes. That is the contract the
         // cache relies on in Rails too; a snapshot of anything else would
-        // be the app's bug under either runtime.
+        // be the app's bug under either runtime. This is a domain contract,
+        // not a fact recoverable from arbitrary serialized data: callers
+        // must not reuse a key for a different result shape. The
+        // cache-through contract test exercises miss/hit reconstruction,
+        // ordering, and distinct Article/Comment keys.
         let yield_locals = yield_only_locals(body);
         let rebuild = |leaf: &Expr| {
             matches!(&*leaf.node, ExprNode::Send { method, block: Some(b), .. }

@@ -75,9 +75,16 @@ pub const DATA_BLOCK_METHODS: Contract = Contract {
       "key-" + digest
     end
 
+    def encoded_digest
+      DataKeySupportController.encode(digest)
+    end
+
     def self.build(value)
       new(digest: value)
     end
+  end
+
+  EmptyKey = Data.define(:value) do
   end
 
   def self.key(value)
@@ -96,12 +103,14 @@ end
     script: r#"key = DataBlockProbe.key("abc")
 puts key.cache_key
 puts key.digest
+puts key.encoded_digest
 puts DataBlockProbe::ContentKey.build("def").cache_key
 puts OtherDataBlockProbe::ContentKey.new(digest: "ghi").cache_key
 puts key == DataBlockProbe::ContentKey.new(digest: "abc")
 puts key.is_a?(DataBlockProbe::ContentKey)
+puts DataBlockProbe::EmptyKey.new(value: "empty").value
 "#,
-    expected: "key-abc\nabc\nkey-def\nother-ghi\ntrue\ntrue\n",
+    expected: "key-abc\nabc\nencoded-abc\nkey-def\nother-ghi\ntrue\ntrue\nempty\n",
 };
 
 /// `CachedResponses`' request surface: rack's encoding negotiation
@@ -441,7 +450,10 @@ end
 /// snapshot of that value rebuilds. Callers destructure the answer as
 /// the block's own (`@membership, @room = RecordCache.fetch(…) { … }`),
 /// so the analyzer types it as the block's value; both paths must then
-/// hand back records of those classes, in that order.
+/// hand back records of those classes, in that order. The snapshot path
+/// intentionally trusts the cache-key invariant: each key is populated
+/// only from the block result for that same key. A manually seeded or
+/// colliding snapshot with a different shape is outside this contract.
 pub const CACHE_THROUGH: Contract = Contract {
     path: "app/models/cache_through_probe.rb",
     source: r##"class CacheThroughProbe
@@ -464,6 +476,14 @@ pub const CACHE_THROUGH: Contract = Contract {
     end
     [ article.title, comment.body, article.class.name, comment.class.name ]
   end
+
+  def self.article_record(id)
+    fetch("article-#{id}") { [ Article.find(id) ] }.first
+  end
+
+  def self.comment_record(id)
+    fetch("comment-#{id}") { [ Comment.find(id) ] }.first
+  end
 end
 "##,
     script: concat!(
@@ -477,11 +497,15 @@ Comment.create!(article_id: article.id, commenter: "Reader", body: "First commen
 puts CacheThroughProbe.pair(article.id).inspect
 ActiveRecord::Base.connection.execute("UPDATE articles SET title = 'Renamed' WHERE id = #{article.id}")
 puts CacheThroughProbe.pair(article.id).inspect
+puts [ CacheThroughProbe.article_record(article.id).class.name, CacheThroughProbe.comment_record(article.id).class.name ].inspect
+puts [ CacheThroughProbe.article_record(article.id).class.name, CacheThroughProbe.comment_record(article.id).class.name ].inspect
 "#
     ),
     expected: concat!(
         "[\"Cached\", \"First comment\", \"Article\", \"Comment\"]\n",
         "[\"Cached\", \"First comment\", \"Article\", \"Comment\"]\n",
+        "[\"Article\", \"Comment\"]\n",
+        "[\"Article\", \"Comment\"]\n",
     ),
 };
 
@@ -489,4 +513,6 @@ puts CacheThroughProbe.pair(article.id).inspect
 pub fn assert_cache_through_signature(rbs: &str) {
     // `title`/`body` are nullable columns, and `comments.first` may be nil.
     assert!(rbs.contains("def self.pair: (untyped id) -> [String?, String?, String, String]"), "{rbs}");
+    assert!(rbs.contains("def self.article_record: (untyped id) -> Article"), "{rbs}");
+    assert!(rbs.contains("def self.comment_record: (untyped id) -> Comment"), "{rbs}");
 }

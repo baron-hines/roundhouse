@@ -18,7 +18,25 @@ fn nested_multi_write_destructures_each_group() {
 
 #[test]
 fn data_define_block_methods_belong_to_the_data_class() {
-    assert_runs(&contract::DATA_BLOCK_METHODS);
+    let run = contract::DATA_BLOCK_METHODS
+        .overlay()
+        .write(
+            "app/controllers/data_key_support_controller.rb",
+            r#"class DataKeySupportController < ApplicationController
+  def self.encode(value)
+    "encoded-" + value
+  end
+end
+"#,
+        )
+        .run_ruby(contract::DATA_BLOCK_METHODS.script);
+    run.assert_passes();
+    assert_eq!(run.stdout, contract::DATA_BLOCK_METHODS.expected, "stderr:\n{}", run.stderr);
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/data_block_probe.rb")).unwrap();
+    assert!(emitted.contains("def cache_key"), "{emitted}");
+    assert!(emitted.contains("def encoded_digest"), "{emitted}");
+    assert!(emitted.contains("EmptyKey = Data.define(:value) do"), "{emitted}");
+    assert!(emitted.contains("require_relative \"../controllers/data_key_support_controller\""), "{emitted}");
 }
 
 #[test]
