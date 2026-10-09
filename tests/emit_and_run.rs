@@ -28,6 +28,10 @@ mod rails_root_join;
 mod anonymous_keywords;
 #[path = "support/delegate_association.rs"]
 mod delegate_association;
+#[path = "support/io_process_constants.rs"]
+mod io_process_constants_contract;
+#[path = "emit_and_run/io_process_constants.rs"]
+mod io_process_constants;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The

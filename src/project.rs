@@ -6488,7 +6488,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 15] = [
+const BUNDLED: [(&str, &str); 17] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -6539,6 +6539,17 @@ const BUNDLED: [(&str, &str); 15] = [
     // TimeLimitedVideoPreviewer#capture. Default gem on CRuby/JRuby;
     // Spinel takes `runtime/ruby/timeout.rb` via spinel_files.
     ("Timeout", "timeout"),
+    // `Shellwords.escape`: a default gem that a booted Rails 8.1 app has
+    // already loaded, so apps call it without a require. INERT on our
+    // trees: `runtime/spinel/shellwords.rb` defines the module (no
+    // String/Array reopen — packages/shellwords' reopen makes
+    // String#split a PolyArray and the Rails tree fails C compile), so
+    // the program-defined-constant clause below drops the row.
+    ("Shellwords", "shellwords"),
+    // `PTY.spawn`: the app writes `require "pty"` (Rails does not load
+    // it), but an app file reaches the tree without its requires.
+    // Spinel takes `packages/pty`.
+    ("PTY", "pty"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,

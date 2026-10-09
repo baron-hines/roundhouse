@@ -47,6 +47,10 @@ mod native_http;
 mod strong_params;
 #[path = "spinel_toolchain/params_wrapper.rs"]
 mod params_wrapper;
+#[path = "support/io_process_constants.rs"]
+mod io_process_constants_contract;
+#[path = "spinel_toolchain/io_process_constants.rs"]
+mod io_process_constants;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]
