@@ -9176,3 +9176,33 @@ end
         .run_test("test/controllers/timed_articles_controller_test.rb")
         .assert_passes();
 }
+
+/// Destroying a record takes its attachments with it, as `dependent:`
+/// says: Rails' default `:purge_later` deletes the join row and purges
+/// the blob in an `ActiveStorage::PurgeJob` (run inline here, with no
+/// queue adapter), and `dependent: false` leaves both. Without it
+/// campfire's `Room#destroy_one_message_at_a_time` left every message's
+/// attachment row and file behind.
+#[test]
+fn destroying_an_owner_purges_its_attachments_as_dependent_says() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", "class Doc < ApplicationRecord\n  has_one_attached :file\n  has_one_attached :keep, dependent: false\nend\n")
+        .run_ruby(r#"
+upload = ->(name) { { io: StringIO.new("bytes"), filename: name, content_type: "text/plain" } }
+count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT count(*) FROM #{table}") }
+doc = Doc.create!(name: "first", file: upload.("a.txt"), keep: upload.("b.txt"))
+raise "attached #{count.("active_storage_attachments")}" unless count.("active_storage_attachments") == 2
+doc.destroy
+raise "rows left: #{count.("active_storage_attachments")}" unless count.("active_storage_attachments") == 1
+raise "blobs left: #{count.("active_storage_blobs")}" unless count.("active_storage_blobs") == 1
+raise "PurgeJob not recorded" unless ActiveJob.performed.include?("ActiveStorage::PurgeJob")
+"#)
+        .assert_passes();
+}

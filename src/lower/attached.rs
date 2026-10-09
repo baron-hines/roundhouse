@@ -757,6 +757,79 @@ pub(crate) fn push_attached_methods(methods: &mut Vec<MethodDef>, model: &Model)
         }
     }
     push_attachment_changes(methods, model);
+    push_purge_on_destroy(methods, model);
+}
+
+/// What destroying the owner does to an attachment, from the macro's
+/// `dependent:` — Rails' default `:purge_later` (the join row now, the
+/// blob in an `ActiveStorage::PurgeJob`), `:purge` (both now), or
+/// `false` (neither). `None` for a value Rails doesn't define, which
+/// keeps the default rather than guessing.
+fn attached_dependent(model: &Model, attr: &Symbol) -> Option<&'static str> {
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        if !matches!(method.as_str(), "has_one_attached" | "has_many_attached") {
+            continue;
+        }
+        let Some(ExprNode::Lit { value: Literal::Sym { value } }) = args.first().map(|a| &*a.node) else {
+            continue;
+        };
+        if value.as_str() != attr.as_str() {
+            continue;
+        }
+        for arg in &args[1..] {
+            let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+            for (k, v) in entries {
+                let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { continue };
+                if key.as_str() != "dependent" {
+                    continue;
+                }
+                return match &*v.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "purge" => Some("purge"),
+                    ExprNode::Lit { value: Literal::Bool { value: false } } => Some(""),
+                    _ => Some("purge_later"),
+                };
+            }
+        }
+    }
+    Some("purge_later")
+}
+
+/// ```ruby
+/// def after_destroy
+///   self.attachment.purge_later
+/// end
+/// ```
+///
+/// Destroying the owner takes its attachments with it, as Rails'
+/// `has_one :<attr>_attachment, dependent: :destroy` does, and the
+/// blob goes as `dependent:` says. Without it campfire's
+/// `Room#destroy_one_message_at_a_time` left every message's
+/// attachment row (and its file) behind.
+fn push_purge_on_destroy(methods: &mut Vec<MethodDef>, model: &Model) {
+    let attrs = attached_attrs(model).into_iter().chain(many_attached_attrs(model));
+    for (span, attr) in attrs {
+        let action = attached_dependent(model, &attr).unwrap_or("purge_later");
+        if action.is_empty() {
+            continue;
+        }
+        let syn = |node: ExprNode| Expr::new(span, node);
+        let call = syn(ExprNode::Send {
+            recv: Some(syn(ExprNode::Send {
+                recv: Some(syn(ExprNode::SelfRef)),
+                method: attr.clone(),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            })),
+            method: Symbol::from(action),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        });
+        super::model_to_library::markers::fold_into_or_push(methods, model, "after_destroy", call);
+    }
 }
 
 /// The type of `attachment_changes`: attribute name -> the blob the
