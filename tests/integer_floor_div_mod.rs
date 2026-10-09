@@ -18,6 +18,7 @@ fn emitted(target: BuildTarget, path: &str) -> String {
             "class Article < ApplicationRecord\n  \
              def self.floor_div\n    a = -7\n    a / 2\n  end\n\n  \
              def self.floor_mod\n    a = -7\n    a % 3\n  end\n\n  \
+             def self.floor_mod_neg_div\n    a = 7\n    a % -3\n  end\n\n  \
              def self.float_div\n    7.0 / 2.0\n  end\n\n",
         )
         .emit(target);
@@ -37,6 +38,10 @@ fn rust_floors_int_div_and_mod() {
         out.contains("let m = if b == -1 { 0 } else { a % b }; if m != 0 && ((m < 0) != (b < 0)) { m + b } else { m }"),
         "Int % Int not floored:\n{out}"
     );
+    // Negative divisor (`7 % -3 == -2`) must still hit the floored
+    // helper; a "fix negative rem only" form would still pass the
+    // `-7 % 3` site alone.
+    assert!(out.contains("-3_i64"), "neg-divisor mod missing:\n{out}");
     assert!(out.contains("7.0 / 2.0"), "Float / Float should stay native:\n{out}");
 }
 
@@ -46,9 +51,16 @@ fn typescript_floors_int_div_and_mod() {
     assert!(out.contains("Math.floor(a / 2)"), "Int / Int not floored:\n{out}");
     assert!(out.contains("const __m = __a % __b"), "Int % Int not floored:\n{out}");
     // Add the divisor only on a sign mismatch: a second `% __b` over
-    // `__m + __b` would round sums past 2**53.
+    // `__m + __b` would round sums past 2**53. Rem-vs-divisor (not
+    // "negative rem only") so `7 % -3` stays `-2`.
     assert!(out.contains("__m + __b :"), "Int % Int not floored:\n{out}");
+    // Printer omits parens: `__m < 0 !== __b < 0` (rem vs divisor).
+    assert!(
+        out.contains("__m < 0 !== __b < 0"),
+        "Int % Int must compare rem and divisor signs:\n{out}"
+    );
     assert!(!out.contains("+ __b) % __b"), "Int % Int sums before flooring:\n{out}");
+    assert!(out.contains("const __b = -3"), "neg-divisor mod missing:\n{out}");
     assert!(!out.contains("Math.floor(7.0 / 2.0)") && !out.contains("Math.floor(7 / 2)"),
         "Float / Float must not floor:\n{out}");
 }
@@ -59,5 +71,6 @@ fn python_int_div_is_floor_div() {
     assert!(out.contains("a // 2"), "Int / Int not `//`:\n{out}");
     // Python's `%` already follows the divisor's sign.
     assert!(out.contains("a % 3"), "{out}");
+    assert!(out.contains("a % -3"), "neg-divisor mod missing:\n{out}");
     assert!(out.contains("7.0 / 2.0"), "Float / Float should stay `/`:\n{out}");
 }
