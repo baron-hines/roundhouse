@@ -9163,12 +9163,12 @@ class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
     assert_equal article.title, JSON.parse(response.body)["title"]
   end
 
-  test "a duration is a timeout the socket layer takes" do
-    server = TCPServer.new("127.0.0.1", 0)
-    socket = TCPSocket.new("127.0.0.1", server.addr[1], open_timeout: 1.second)
-    socket.close
-    server.close
+  test "a duration is a timeout the stdlib takes" do
+    assert_nil IO.select(nil, nil, nil, 0.01.seconds)
+    assert_equal :ok, Timeout.timeout(1.second) { :ok }
     assert_equal 1.5, (2.seconds - 0.5).to_f
+    assert_equal 1.5, (2.seconds - 0.5.seconds).to_f
+    assert_operator 1.second, :<, 2
   end
 end
 "#,
