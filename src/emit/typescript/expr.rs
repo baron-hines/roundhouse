@@ -2576,11 +2576,11 @@ fn js_send_inner(
                         vec![js_expr(&args[0]), js_expr(&args[1])],
                     );
                 }
-                // `s.gsub(pat, repl)` → `s.replace(pat_with_g, repl)`.
-                // Ruby gsub replaces every match; JS replace defaults
-                // to first only — the regex needs a `g` flag. Patch
-                // it inline when the pattern is a regex literal;
-                // otherwise wrap with a runtime g-flag enforcer.
+                // `s.gsub(pat, repl)` — Ruby replaces every match.
+                // String patterns use `replaceAll`; regex patterns use
+                // `replace` with a `g` flag (literal patched inline, or
+                // a runtime enforcer). Empty literal `""` becomes
+                // `replace(/(?:)/gu, …)` so steps are by code point.
                 // Hash replacements (`s.gsub(re, MAP)`) wrap in a
                 // lookup callback `m => MAP[m]`.
                 "gsub" if args.len() == 2 => {
@@ -2621,88 +2621,7 @@ fn js_send_inner(
                             );
                         }
                     }
-                    // A String pattern replaces every occurrence in Ruby;
-                    // JS `replace` with a string replaces only the first,
-                    // and the g-flag shim below only fires on a RegExp.
-                    // `replaceAll` is the string-pattern native.
-                    // An empty literal pattern matches at every character
-                    // boundary; `/(?:)/gu` steps by code point, where
-                    // `replaceAll("", ..)` would split surrogate pairs.
-                    let empty_pat = matches!(
-                        &*args[0].node,
-                        ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()
-                    );
-                    let str_pat = !empty_pat
-                        && matches!(strip_nullable(args[0].ty.as_ref()), Some(Ty::Str));
-                    let pat_js = if empty_pat {
-                        Js::new(
-                            args[0].span,
-                            JsExpr::Regex {
-                                pattern: "(?:)".into(),
-                                flags: "gu".into(),
-                            },
-                        )
-                    } else if str_pat {
-                        js_expr(&args[0])
-                    } else if let ExprNode::Lit {
-                        value: Literal::Regex { pattern, flags },
-                    } = &*args[0].node
-                    {
-                        let new_flags = if flags.contains('g') {
-                            flags.clone()
-                        } else {
-                            format!("{flags}g")
-                        };
-                        Js::new(
-                            args[0].span,
-                            JsExpr::Regex {
-                                pattern: translate_ruby_regex_anchors(pattern),
-                                flags: new_flags,
-                            },
-                        )
-                    } else {
-                        // Runtime check — covers Const refs to regex
-                        // constants (`HTML_ESCAPE_PATTERN`) whose type
-                        // isn't visible at emit time.
-                        let raw = || js_expr(&args[0]);
-                        let needs_flag = Js::binary(
-                            Span::synthetic(),
-                            "&&",
-                            Js::binary(
-                                Span::synthetic(),
-                                "instanceof",
-                                raw(),
-                                synth_ident("RegExp"),
-                            ),
-                            Js::unary(
-                                Span::synthetic(),
-                                "!",
-                                Js::method_call(
-                                    Span::synthetic(),
-                                    Js::member(Span::synthetic(), raw(), "flags"),
-                                    "includes",
-                                    vec![Js::str(Span::synthetic(), "g")],
-                                ),
-                            ),
-                        );
-                        let with_flag = Js::synth(JsExpr::New {
-                            callee: synth_ident("RegExp"),
-                            args: vec![
-                                Js::member(Span::synthetic(), raw(), "source"),
-                                Js::binary(
-                                    Span::synthetic(),
-                                    "+",
-                                    Js::member(Span::synthetic(), raw(), "flags"),
-                                    Js::str(Span::synthetic(), "g"),
-                                ),
-                            ],
-                        });
-                        Js::synth(JsExpr::Ternary {
-                            cond: needs_flag,
-                            then: with_flag,
-                            else_: raw(),
-                        })
-                    };
+                    let (pat_js, method) = gsub_pattern_and_method(&args[0]);
                     let repl_js = if matches!(args[1].ty.as_ref(), Some(Ty::Hash { .. })) {
                         Js::synth(JsExpr::Arrow {
                             params: vec![JsParam {
@@ -2720,7 +2639,6 @@ fn js_send_inner(
                     } else {
                         js_expr(&args[1])
                     };
-                    let method = if str_pat { "replaceAll" } else { "replace" };
                     return Js::method_call(span, js_expr(r), method, vec![pat_js, repl_js]);
                 }
                 // `s.tr(from, to)` — character translation. Limited
@@ -3276,6 +3194,101 @@ pub(super) fn js_literal(span: Span, lit: &Literal) -> Js {
             )
         }
     }
+}
+
+
+/// Classify a `gsub` pattern into the JS pattern expression and the
+/// method name (`replace` vs `replaceAll`).
+///
+/// - Empty literal `""` → `/(?:)/gu` + `replace` (code-point steps;
+///   `replaceAll("", …)` would split surrogate pairs). Non-literal
+///   empty Str still uses `replaceAll` — covering that needs a runtime
+///   branch on every dynamic gsub.
+/// - Typed non-empty String → `replaceAll` (every occurrence).
+/// - Regex literal → `replace` with a `g` flag patched in.
+/// - Anything else → runtime g-flag enforcer + `replace`.
+fn gsub_pattern_and_method(pat: &Expr) -> (Js, &'static str) {
+    if matches!(
+        &*pat.node,
+        ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()
+    ) {
+        return (
+            Js::new(
+                pat.span,
+                JsExpr::Regex {
+                    pattern: "(?:)".into(),
+                    flags: "gu".into(),
+                },
+            ),
+            "replace",
+        );
+    }
+    if matches!(strip_nullable(pat.ty.as_ref()), Some(Ty::Str)) {
+        return (js_expr(pat), "replaceAll");
+    }
+    if let ExprNode::Lit {
+        value: Literal::Regex { pattern, flags },
+    } = &*pat.node
+    {
+        let new_flags = if flags.contains('g') {
+            flags.clone()
+        } else {
+            format!("{flags}g")
+        };
+        return (
+            Js::new(
+                pat.span,
+                JsExpr::Regex {
+                    pattern: translate_ruby_regex_anchors(pattern),
+                    flags: new_flags,
+                },
+            ),
+            "replace",
+        );
+    }
+    // Runtime check — covers Const refs to regex constants
+    // (`HTML_ESCAPE_PATTERN`) whose type isn't visible at emit time.
+    let raw = || js_expr(pat);
+    let needs_flag = Js::binary(
+        Span::synthetic(),
+        "&&",
+        Js::binary(
+            Span::synthetic(),
+            "instanceof",
+            raw(),
+            synth_ident("RegExp"),
+        ),
+        Js::unary(
+            Span::synthetic(),
+            "!",
+            Js::method_call(
+                Span::synthetic(),
+                Js::member(Span::synthetic(), raw(), "flags"),
+                "includes",
+                vec![Js::str(Span::synthetic(), "g")],
+            ),
+        ),
+    );
+    let with_flag = Js::synth(JsExpr::New {
+        callee: synth_ident("RegExp"),
+        args: vec![
+            Js::member(Span::synthetic(), raw(), "source"),
+            Js::binary(
+                Span::synthetic(),
+                "+",
+                Js::member(Span::synthetic(), raw(), "flags"),
+                Js::str(Span::synthetic(), "g"),
+            ),
+        ],
+    });
+    (
+        Js::synth(JsExpr::Ternary {
+            cond: needs_flag,
+            then: with_flag,
+            else_: raw(),
+        }),
+        "replace",
+    )
 }
 
 /// Walk a Ruby regex source, replacing string-boundary anchors with

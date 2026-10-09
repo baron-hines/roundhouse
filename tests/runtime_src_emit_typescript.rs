@@ -275,9 +275,10 @@ fn runtime_corpus_phase1_gap_survey() {
 
 /// Ruby methods whose same-named JS native means something else.
 /// `Array#sort` on numbers needs a numeric comparator (JS's default
-/// compares as strings, so `[10, 9, 1].sort()` is `[1, 10, 9]`), and
-/// `String#gsub` with a String pattern replaces every occurrence,
-/// which in JS is `replaceAll` (`replace` stops at the first).
+/// compares as strings, so `[10, 9, 1].sort()` is `[1, 10, 9]`).
+/// `String#gsub` with a String pattern replaces every occurrence
+/// (`replaceAll`); an empty literal pattern uses `replace(/(?:)/gu, …)`
+/// so steps are by code point (not UTF-16 units).
 #[test]
 fn native_semantics_follow_ruby() {
     let methods = parse_methods_with_rbs(
@@ -285,10 +286,14 @@ fn native_semantics_follow_ruby() {
         "module Natives\n  def sorted: (Array[Integer]) -> Array[Integer]\n  def words: (Array[String]) -> Array[String]\n  def swap: (String) -> String\n  def swap_rx: (String) -> String\n  def spread: (String) -> String\nend\n",
     )
     .expect("parse");
-    let out: Vec<String> = methods.iter().map(emit_method).collect();
-    assert!(out[0].contains("[...xs].sort((a, b) => a - b)"), "numeric sort:\n{}", out[0]);
-    assert!(out[1].contains("[...xs].sort()"), "string sort keeps the default:\n{}", out[1]);
-    assert!(out[2].contains("s.replaceAll(\"l\", \"L\")"), "string gsub:\n{}", out[2]);
-    assert!(out[3].contains("s.replace(/l+/g, \"L\")"), "regex gsub:\n{}", out[3]);
-    assert!(out[4].contains("s.replace(/(?:)/gu, \"-\")"), "empty gsub:\n{}", out[4]);
+    let sorted = emit_method(&methods[0]);
+    let words = emit_method(&methods[1]);
+    let swap = emit_method(&methods[2]);
+    let swap_rx = emit_method(&methods[3]);
+    let spread = emit_method(&methods[4]);
+    assert!(sorted.contains("[...xs].sort((a, b) => a - b)"), "numeric sort:\n{sorted}");
+    assert!(words.contains("[...xs].sort()"), "string sort keeps the default:\n{words}");
+    assert!(swap.contains("s.replaceAll(\"l\", \"L\")"), "string gsub:\n{swap}");
+    assert!(swap_rx.contains("s.replace(/l+/g, \"L\")"), "regex gsub:\n{swap_rx}");
+    assert!(spread.contains("s.replace(/(?:)/gu, \"-\")"), "empty gsub:\n{spread}");
 }
