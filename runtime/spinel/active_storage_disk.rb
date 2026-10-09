@@ -150,6 +150,7 @@ module ActiveStorage
   # `[0, 0]` for anything else, which `BlobMetadata` answers as nil.
   class ImageAnalyzer
     def self.dimensions(data, content_type)
+      return Previewer.video_dimensions(data) if content_type.start_with?("video/")
       n = data.bytesize
       return [0, 0] if n < 10
       b0 = data.getbyte(0).to_i

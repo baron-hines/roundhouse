@@ -228,6 +228,7 @@ module ActiveRecord
     # self either way (idempotent on already-destroyed records).
     def save: () -> bool
     def save_after_validation: () -> bool
+    def _insert_fixture: () -> bool
     def save!: () -> Base
     def destroy: () -> Base
     def destroy!: () -> Base

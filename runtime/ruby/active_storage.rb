@@ -335,8 +335,12 @@ module ActiveStorage
       image.attached?
     end
 
+    # Rails: the frame, then the variant of it this preview names
+    # (`variant.processed if variant?`) — the poster campfire serves is
+    # that variant, and its presentation shows one only once it exists.
     def processed
       process
+      variant.processed unless @variation.nil?
       self
     end
 
@@ -1042,23 +1046,32 @@ module ActiveStorage
       nil
     end
 
+    # Rails: the variant record exists. Looks it up and does not make
+    # it — campfire's presentation shows a thumbnail only when posting
+    # made one, rather than making it on view.
+    def processed?
+      return true if @record_id != 0
+      b = @blob
+      v = @variation
+      return false if b.nil? || v.nil?
+      rows = ActiveRecord.adapter.select_rows(
+        VariantWithRecord.record_select(
+          "vr.blob_id = " + ActiveRecord.adapter.escape_value(b.id) +
+          " AND vr.variation_digest = " + ActiveRecord.adapter.escape_value(v.digest) + " LIMIT 1"
+        )
+      )
+      return false if rows.length == 0
+      @record_id = rows[0]["variant_record_id"].to_i
+      @image_blob = Blob.from_row(rows[0])
+      true
+    end
+
     def process
-      return nil if @record_id != 0
+      return nil if processed?
       b = @blob
       v = @variation
       return nil if b.nil? || v.nil?
       digest = v.digest
-      rows = ActiveRecord.adapter.select_rows(
-        VariantWithRecord.record_select(
-          "vr.blob_id = " + ActiveRecord.adapter.escape_value(b.id) +
-          " AND vr.variation_digest = " + ActiveRecord.adapter.escape_value(digest) + " LIMIT 1"
-        )
-      )
-      if rows.length > 0
-        @record_id = rows[0]["variant_record_id"].to_i
-        @image_blob = Blob.from_row(rows[0])
-        return nil
-      end
       data = Processor.transform(Blob.service.download(b.key), b.content_type, v)
       image = Blob.create_and_upload!(
         data,
@@ -1305,6 +1318,7 @@ module ActiveStorage
     # unboxed only while every use is one the unboxed array supports,
     # and `each` from a block is not on that list.
     def find_variation(transformations)
+      return transformations if transformations.is_a?(Variation)
       return nil unless transformations.is_a?(Symbol)
       name = transformations.to_s
       i = 0
@@ -1323,8 +1337,11 @@ module ActiveStorage
     # call site — or nil for the poster as drawn. On a blob that is not
     # previewable the previewer itself refuses (ffmpeg has no poster
     # for an image), which is where Rails' `UnpreviewableError` lands.
+    # A declared NAME resolves here, as `variant(:thumb)` does:
+    # campfire's `preview(:poster)` names a variant of its
+    # `has_one_attached` block, which the poster is then served under.
     def preview(transformations)
-      Preview.new(blob, transformations)
+      Preview.new(blob, find_variation(transformations))
     end
 
     # `url_for(attachment)` / `polymorphic_url(attachment)`: the blob's
