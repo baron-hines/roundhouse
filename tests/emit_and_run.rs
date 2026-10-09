@@ -226,6 +226,8 @@ fn in_batches_runs_with_and_without_a_block() {
             "  validates :title, presence: true\n",
             "  validates :title, presence: true
 
+  scope :batched, -> { in_batches }
+
   def self.batch_total
     total = 0
     in_batches(of: 1) { |batch| total += batch.count }
@@ -254,6 +256,7 @@ Article.rename_all("Renamed")
 raise "rename_all" unless Article.all.map(&:title).uniq == ["Renamed"]
 raise "touch_everything" unless Article.touch_everything == 2
 raise "touch_comments" unless a.touch_comments == 1
+raise "batched scope" unless Article.batched.where(title: "Renamed").count == 2
 puts "in_batches passed"
 "#,
         );

@@ -1669,7 +1669,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         name: "in_batches",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
-        chain: ChainKind::Terminal,
+        chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
     // Constructors / first-or-X — return an element instance.
