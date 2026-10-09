@@ -756,6 +756,79 @@ pub(crate) fn push_attached_methods(methods: &mut Vec<MethodDef>, model: &Model)
             m.body.inherit_span(span);
         }
     }
+    push_attachment_changes(methods, model);
+}
+
+/// The type of `attachment_changes`: attribute name -> the blob the
+/// writer staged.
+pub fn attachment_changes_ty() -> Ty {
+    Ty::Hash { key: Box::new(Ty::Str), value: Box::new(blob_class_ty()) }
+}
+
+/// ```ruby
+/// def attachment_changes
+///   changes = {}
+///   changes["logo"] = @logo_pending unless @logo_pending.nil?
+///   changes
+/// end
+/// ```
+///
+/// Rails' dirty record of attachments assigned but not yet saved,
+/// keyed by attribute name — campfire's `Message::Searchable` asks
+/// `attachment_changes.key?("attachment")` in a `before_update` to learn
+/// the file was replaced. The writer's staged blob IS that record here:
+/// it is set by `<attr>=` and cleared once the save attaches it, so the
+/// hash answers through every callback up to `after_save`. Rails keeps
+/// an `ActiveStorage::Attached::Changes::CreateOne` as the value; this
+/// keeps the blob it wraps, so a caller reading the value's own API
+/// (`.attachable`, `.upload`) does not type.
+fn push_attachment_changes(methods: &mut Vec<MethodDef>, model: &Model) {
+    let attrs = attached_attrs(model);
+    let name = Symbol::from("attachment_changes");
+    if attrs.is_empty()
+        || super::model_to_library::model_defines_instance_method(model, &name)
+        || methods.iter().any(|m| m.name == name)
+    {
+        return;
+    }
+    let syn = |node: ExprNode| Expr::new(Span::synthetic(), node);
+    let changes = Symbol::from("changes");
+    let var = || syn(ExprNode::Var { id: crate::ident::VarId(0), name: changes.clone() });
+    let mut exprs = vec![syn(ExprNode::Assign {
+        target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: changes.clone() },
+        value: syn(ExprNode::Hash { entries: vec![], kwargs: false }),
+    })];
+    for (_span, attr) in &attrs {
+        let pending = || syn(ExprNode::Ivar { name: Symbol::from(format!("{}_pending", attr.as_str())) });
+        exprs.push(syn(ExprNode::If {
+            cond: syn(ExprNode::Send {
+                recv: Some(pending()),
+                method: Symbol::from("nil?"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            }),
+            then_branch: syn(ExprNode::Lit { value: Literal::Nil }),
+            else_branch: syn(ExprNode::Send {
+                recv: Some(var()),
+                method: Symbol::from("[]="),
+                args: vec![syn(ExprNode::Lit { value: Literal::Str { value: attr.as_str().to_string() } }), pending()],
+                block: None,
+                parenthesized: false,
+            }),
+        }));
+    }
+    exprs.push(var());
+    super::model_to_library::push_synth_instance_method(
+        methods,
+        model,
+        name,
+        Vec::new(),
+        syn(ExprNode::Seq { exprs }),
+        Some(super::model_to_library::fn_sig(vec![], attachment_changes_ty())),
+        AccessorKind::Method,
+        true,
+    );
 }
 
 /// ```ruby

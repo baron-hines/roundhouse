@@ -9006,3 +9006,56 @@ end
 "#)
         .assert_passes();
 }
+
+/// A concern's `before_update -> { … }` lambda callback, Rails'
+/// `attachment_changes`, and commit callbacks that run after `after_save`
+/// — campfire's `Message::Searchable` reindexes a message whose file was
+/// replaced: the lambda notes `attachment_changes.key?("attachment")`,
+/// and the `after_update_commit` reads the NEW file's name, which only
+/// exists once the save's own `after_save` has attached it. The lambda
+/// was dropped from the concern, `attachment_changes` didn't exist, and
+/// the commit hooks fired before `after_save`.
+#[test]
+fn a_replaced_attachment_is_seen_by_the_commit_callback() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", "class Doc < ApplicationRecord\n  include Tracked\n  has_one_attached :file\nend\n")
+        .write("app/models/doc/tracked.rb", r#"module Doc::Tracked
+  extend ActiveSupport::Concern
+
+  included do
+    before_update -> { @file_replaced = attachment_changes.key?("file") }
+    after_update_commit :note_file, if: :file_replaced?
+  end
+
+  def seen
+    @seen
+  end
+
+  private
+    def file_replaced?
+      @file_replaced
+    end
+
+    def note_file
+      @seen = file.filename.to_s
+    end
+end
+"#)
+        .run_ruby(r#"
+upload = ->(name) { { io: StringIO.new("bytes"), filename: name, content_type: "text/plain" } }
+doc = Doc.create!(name: "first", file: upload.("a.txt"))
+doc.update!(name: "renamed")
+raise "a rename noted a file: #{doc.seen.inspect}" unless doc.seen.nil?
+doc.update!(file: upload.("b.txt"))
+raise "the commit callback saw #{doc.seen.inspect}" unless doc.seen == "b.txt"
+raise "the change outlived the save: #{doc.attachment_changes.inspect}" unless doc.attachment_changes.empty?
+"#)
+        .assert_passes();
+}
