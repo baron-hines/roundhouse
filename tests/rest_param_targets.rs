@@ -6,11 +6,12 @@
 //! reported nothing. Those targets now say so; the ruby family, which
 //! renders `*args`, does not.
 //!
-//! A controller method has no rest slot at all (`Action` records
-//! required, optional and keyword parameters), so `def pick(*keys)`
-//! was emitted as `def pick` on EVERY target. It is refused at ingest
-//! the way the other unretained controller formals are, and a concern
-//! method spliced into a controller is ledgered on its own def.
+//! A controller method used to have no rest slot at all, so
+//! `def pick(*keys)` was emitted as `def pick` on EVERY target. `Action`
+//! now carries it (`Action::formal_params`), and the same targets report
+//! it there. What still has no slot, required positionals after the
+//! rest, is refused at ingest, and ledgered on its own def when a
+//! concern splices the method into a controller.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,10 +63,41 @@ const HELPER: &str = "module GaugesHelper
 end
 ";
 
+const CONCERN: &str = "module Picker
+  extend ActiveSupport::Concern
+
+  private
+    def spliced(*keys)
+      keys.length
+    end
+end
+";
+
+const CONTROLLER: &str = "class GaugesController < ApplicationController
+  include Picker
+
+  def index
+    @out = [pick(:a, :b), spliced(:c), plain_pick(1)]
+  end
+
+  private
+
+  def pick(*keys)
+    keys.length
+  end
+
+  def plain_pick(a, b = 1)
+    a
+  end
+end
+";
+
 fn ledgered(target: BuildTarget) -> Vec<String> {
     let mut app = ingest_app_from_tree(tree(&[
         ("app/models/gauge.rb", MODEL),
         ("app/helpers/gauges_helper.rb", HELPER),
+        ("app/controllers/concerns/picker.rb", CONCERN),
+        ("app/controllers/gauges_controller.rb", CONTROLLER),
     ]))
     .expect("ingest");
     roundhouse::session::analyze_and_lower(&mut app);
@@ -93,11 +125,15 @@ fn a_target_without_a_rest_carrier_reports_each_rest_parameter() {
         BuildTarget::Elixir,
     ] {
         let entries = ledgered(target);
-        assert_eq!(entries.len(), 3, "{target:?}: one per rest parameter; got {entries:?}");
+        // `spliced` once: the controller's copy shares the concern def's
+        // name span, so the two report as one entry.
+        assert_eq!(entries.len(), 5, "{target:?}: one per rest parameter; got {entries:?}");
         assert!(entries.iter().any(|d| d.contains("`*args` on `named`")), "{target:?}: {entries:?}");
         assert!(entries.iter().any(|d| d.contains("`*` on `anon`")), "{target:?}: {entries:?}");
         assert!(entries.iter().any(|d| d.contains("`*` on `mark`")), "{target:?}: {entries:?}");
-        assert!(!entries.iter().any(|d| d.contains("`plain`")), "{target:?}: {entries:?}");
+        assert!(entries.iter().any(|d| d.contains("`*keys` on `pick`")), "{target:?}: {entries:?}");
+        assert!(entries.iter().any(|d| d.contains("`*keys` on `spliced`")), "{target:?}: {entries:?}");
+        assert!(!entries.iter().any(|d| d.contains("`plain")), "{target:?}: {entries:?}");
     }
 }
 
@@ -109,28 +145,72 @@ fn the_ruby_family_does_not_report_what_it_renders() {
     }
 }
 
+/// The rest itself is carried; what has no slot is still refused, not
+/// dropped: positionals after it, and an anonymous `*` the body forwards
+/// (ingest would read the bare splat as `*nil`).
 #[test]
-fn a_controller_rest_parameter_is_refused_rather_than_dropped() {
-    for def in ["def pick(*keys)", "def pick(*)", "def pick(first, *rest, last)"] {
+fn a_controller_formal_without_a_slot_is_refused_rather_than_dropped() {
+    for (def, message) in [
+        ("def pick(first, *rest, last)", "required parameters after a positional rest on a controller method"),
+        ("def pick(*)\n    Array(*)", "anonymous positional rest is not retained"),
+        ("def pick((a, b))", "destructured positional parameters are not retained"),
+    ] {
         let controller = format!(
             "class GaugesController < ApplicationController\n  def index\n    @out = pick(:a, :b, :c)\n  end\n\n  private\n\n  {def}\n    \"picked\"\n  end\nend\n"
         );
         let err = ingest_app_from_tree(tree(&[("app/controllers/gauges_controller.rb", &controller)]))
             .err()
-            .unwrap_or_else(|| panic!("`{def}` must not ingest as `def pick`"));
-        assert!(
-            err.to_string().contains("positional rest declaration on a controller method"),
-            "`{def}`: {err}"
+            .unwrap_or_else(|| panic!("`{def}` must not ingest without its formals"));
+        assert!(err.to_string().contains(message), "`{def}`: {err}");
+    }
+}
+
+fn gauges(app: &roundhouse::App) -> &roundhouse::dialect::Controller {
+    app.controllers.iter().find(|c| c.name.0.as_str() == "GaugesController").expect("GaugesController")
+}
+
+#[test]
+fn a_controller_rest_parameter_is_carried() {
+    for (def, rest) in [("def pick(*keys)", "keys"), ("def pick(*)", "__anon_rest_")] {
+        let controller = format!(
+            "class GaugesController < ApplicationController\n  def index\n    @out = pick(:a, :b, :c)\n  end\n\n  private\n\n  {def}\n    \"picked\"\n  end\nend\n"
         );
+        let app = ingest_app_from_tree(tree(&[("app/controllers/gauges_controller.rb", &controller)]))
+            .unwrap_or_else(|e| panic!("`{def}`: {e}"));
+        let pick = gauges(&app).actions().find(|a| a.name.as_str() == "pick").expect("pick");
+        let carried = pick.rest_param.as_ref().map(|r| r.as_str().to_string()).unwrap_or_default();
+        assert!(carried.starts_with(rest), "`{def}`: rest {:?}", pick.rest_param);
     }
 }
 
 #[test]
-fn a_concern_rest_parameter_spliced_into_a_controller_is_ledgered() {
+fn a_concern_rest_parameter_spliced_into_a_controller_is_carried() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("app/controllers/concerns/picker.rb", CONCERN),
+        (
+            "app/controllers/gauges_controller.rb",
+            "class GaugesController < ApplicationController\n  include Picker\n\n  def index\n    @out = spliced(:a, :b)\n  end\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    let spliced = gauges(&app).actions().find(|a| a.name.as_str() == "spliced").expect("spliced");
+    assert_eq!(spliced.rest_param.as_ref().map(|r| r.as_str()), Some("keys"));
+    assert!(spliced.params.fields.is_empty(), "the rest must not become a required positional");
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let diags = roundhouse::analyze::diagnose(&app);
+    assert!(
+        !diags.iter().any(|d| d.to_string().contains("spliced into a controller")),
+        "got {diags:?}"
+    );
+}
+
+#[test]
+fn a_concern_positional_after_a_rest_spliced_into_a_controller_is_ledgered() {
     let mut app = ingest_app_from_tree(tree(&[
         (
             "app/controllers/concerns/picker.rb",
-            "module Picker\n  extend ActiveSupport::Concern\n\n  private\n    def pick(*keys)\n      \"picked\"\n    end\nend\n",
+            "module Picker\n  extend ActiveSupport::Concern\n\n  private\n    def pick(*keys, last)\n      \"picked\"\n    end\nend\n",
         ),
         (
             "app/controllers/gauges_controller.rb",
@@ -138,6 +218,8 @@ fn a_concern_rest_parameter_spliced_into_a_controller_is_ledgered() {
         ),
     ]))
     .expect("ingest");
+    // No copy whose `last` would bind ahead of `*keys`.
+    assert!(gauges(&app).actions().all(|a| a.name.as_str() != "pick"), "the misbound copy must not be spliced");
     // The `check` path: analyze without the post-analyze lowerings.
     let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
     analyzer.analyze(&mut app);
