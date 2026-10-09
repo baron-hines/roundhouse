@@ -2960,7 +2960,7 @@ fn js_send_inner(
                     out.span = span;
                     return out;
                 }
-                SetOpCase::Other => {}
+                SetOpCase::Unknown => {}
             }
         }
         // `-` dispatch: TS's native `-` handles numerics. Array set-

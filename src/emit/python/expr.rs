@@ -1207,7 +1207,7 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
                         emit_expr(arg)
                     );
                 }
-                SetOpCase::Other => {}
+                SetOpCase::Unknown => {}
             }
         }
         // `-` dispatch: Python supports numeric `-` natively; list
