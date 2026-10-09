@@ -420,6 +420,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         variant.class_methods.insert(Symbol::from("record_select"), Ty::Str);
         variant.class_methods.insert(Symbol::from("purge_records_of"), Ty::Nil);
         classes.insert(variant_id, variant);
+        let mut variant_record = ClassInfo::default();
+        variant_record.class_methods.insert(Symbol::from("count"), Ty::Int);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::VariantRecord")), variant_record);
 
         // One `attachable.variant :name, resize_to_limit: [w, h],
         // format: :f` declaration, constructed into the reader by
