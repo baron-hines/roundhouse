@@ -724,14 +724,15 @@ module ActiveRecord
       true
     end
 
-    # A fixture row, inserted as Rails' `insert_fixtures_set` writes it:
-    # raw, so no validations and NO CALLBACKS. Timestamps the fixture
-    # left out are filled, as Rails fills them. Running the save
+    # A row inserted raw, as Rails' fixture loader (`insert_fixtures_set`)
+    # and bulk inserts (`insert_all` / `insert_all!`) write one: no
+    # validations and NO CALLBACKS. Timestamps the attributes left out
+    # are filled, as Rails fills them. Running the save
     # callbacks here was wrong in a way a test can see: campfire's
     # Message `after_create_commit` marks the room's memberships unread,
     # so loading the message fixtures left the fixture users with unread
     # rooms Rails never gives them.
-    def _insert_fixture
+    def _insert_row
       fill_timestamps(true)
       self.id = _adapter_insert
       @persisted = true
