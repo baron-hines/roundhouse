@@ -368,8 +368,31 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `runtime/ruby/zlib.rb`); registering only it keeps a call to
     // `Zlib.deflate` an honest gap instead of a method that types and
     // then fails to resolve.
+    // `gzip` is Ruby's own on the ruby family and spinel's
+    // `packages/zlib` on spinel, so it types here and a strict target,
+    // whose port has no deflate, refuses the call by name
+    // (`project::RUBY_SPINEL_ONLY_METHODS`).
     register_stdlib_class(classes, "Zlib", &[
         ("crc32", Ty::Int),
+        ("gzip", Ty::Str),
+    ], &[]);
+    // `ActiveSupport::JSON` — Rails' coder, in `runtime/ruby/
+    // active_support_ext.rb` (the ruby family and spinel). `encode`
+    // answers the document; `decode` whatever the document holds.
+    register_stdlib_class(classes, "ActiveSupport::JSON", &[
+        ("encode", Ty::Str),
+        ("decode", Ty::Untyped),
+    ], &[]);
+    // `Rack::Utils` — the two encoding-negotiation functions, ported
+    // into `runtime/ruby/rack_utils.rb` (the rack gem's own on the ruby
+    // family). ONLY that surface, the IPAddr rule. A pair is
+    // `[name, quality]`; the name is nil for an empty header part.
+    let q_pair = Ty::Tuple {
+        elems: vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil] }, Ty::Float],
+    };
+    register_stdlib_class(classes, "Rack::Utils", &[
+        ("q_values", Ty::Array { elem: Box::new(q_pair) }),
+        ("select_best_encoding", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }),
     ], &[]);
     register_stdlib_class(classes, "IPAddr", &[], &[
         ("ipv4?", Ty::Bool), ("ipv6?", Ty::Bool), ("ipv4_mapped?", Ty::Bool),

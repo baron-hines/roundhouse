@@ -2634,6 +2634,15 @@ fn ruby_family_runtime_files(
                         require \"typeid\"\n"
                 .to_string();
         }
+        // `Rack::Utils`: the rack gem the overlay's Puma already loads,
+        // under the port's require path.
+        if path == "runtime/rack_utils.rb" {
+            *content = "# The rack gem's own Rack::Utils — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/rack_utils.rb exists for the targets\n\
+                        # that have no rack to load.\n\
+                        require \"rack/utils\"\n"
+                .to_string();
+        }
         if path == "runtime/zlib.rb" {
             *content = "# Ruby's own zlib — see `project::ruby_runtime_files`.\n\
                         # The port at runtime/ruby/zlib.rb exists for the targets\n\
@@ -4312,7 +4321,13 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Struct" | "Mutex" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "Comparable" | "Enumerable"
-        | "JSON::GeneratorError");
+        | "JSON::GeneratorError"
+        // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
+        // the ruby family; no strict target loads either.
+        | "Rack::Utils"
+        // `runtime/ruby/active_support_ext.rb` ships to the ruby family
+        // and spinel only.
+        | "ActiveSupport::JSON");
     if !bundled {
         return None;
     }
@@ -4323,6 +4338,13 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     }
     Some("bundled_constant")
 }
+
+/// Class methods of a stdlib class whose shared port (`runtime/ruby/`)
+/// stops short of them: Ruby's own library serves them on the ruby
+/// family and spinel's package on spinel, while a strict target's port
+/// has no body to call. `Zlib.gzip` needs a deflate the CRC-32 port
+/// (`runtime/ruby/zlib.rb`) does not have.
+const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[("Zlib", "gzip")];
 
 /// True when the app already defines `id` as a class/module value, so
 /// the availability gate must not ledger it as a missing runtime stub.
@@ -4394,6 +4416,22 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
+            }
+        }
+        if let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
+            && target != "spinel"
+            && target != "jruby"
+            && !expr.span.is_synthetic()
+            && let crate::expr::ExprNode::Const { path } = &*recv.node
+        {
+            let owner = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+            if RUBY_SPINEL_ONLY_METHODS.contains(&(owner.as_str(), method.as_str())) {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "bundled_method",
+                    format!("{owner}.{method} is only available on the ruby family and spinel"),
+                );
             }
         }
         // A mapped JSON call does not emit a Ruby module object. Skip
@@ -4946,6 +4984,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         // ruby family reaches Ruby's own through a bare `require`, so
         // this one only has to exist where that does not.
         "ipaddr",
+        // rack's `Utils.q_values` / `select_best_encoding`, ported for
+        // spinel (no rack gem to load); the ruby family swaps it for
+        // `require "rack/utils"` below, as ipaddr and zlib are swapped.
+        "rack_utils",
         // Ruby's `Logger` plus the two ActiveSupport wrappers in front
         // of it. Same arrangement as ipaddr, with one difference the
         // file's header gives: NOT swapped for Ruby's own on the

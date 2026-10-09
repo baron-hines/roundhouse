@@ -2616,7 +2616,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
             variants: vec![elem.clone(), Ty::Nil],
         },
         "index" | "find_index" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
-        "dup" | "clone" => Ty::Array { elem: Box::new(elem.clone()) },
+        // ActiveSupport's `deep_dup` copies the elements too; the shape
+        // is the receiver's (`lower::symbolize_keys` grounds it).
+        "dup" | "clone" | "deep_dup" => Ty::Array { elem: Box::new(elem.clone()) },
         // `clear` empties in place and returns SELF, so it keeps the
         // element type — the array is empty, not differently-typed.
         // Reached by `Resolv.clear_getaddresses_stubs` resetting the
@@ -2791,7 +2793,7 @@ pub(super) fn hash_method(
         "to_a" => Ty::Array {
             elem: Box::new(Ty::Tuple { elems: vec![key.clone(), value.clone()] }),
         },
-        "dup" | "clone" => Ty::Hash {
+        "dup" | "clone" | "deep_dup" => Ty::Hash {
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
@@ -3036,6 +3038,10 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // `[]` below keeps Str: the readers index inside `bytesize` (the
         // verifier's constant-time `secure_compare`).
         "getbyte" => Ty::Int,
+        // `byteslice(start, length)` — the bytes in that range, or nil
+        // when `start` lies past the end. campfire truncates a SHA-256
+        // hex digest to its first 32 bytes for a weak ETag.
+        "byteslice" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
         // `=~` (regex-match operator, desugars to `str.=~(re)`) → the
         // match position or nil. `match` (below) is the MatchData form.
         "=~" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },

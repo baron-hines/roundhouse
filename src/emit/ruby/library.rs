@@ -7389,6 +7389,11 @@ fn require_path_for_body_const(
         // (`project::IPADDR_STDLIB`) — so runtime code reads octets
         // everywhere and never `to_i`.
         "IPAddr" => Some("runtime/ipaddr".to_string()),
+        // `Rack::Utils` — rack's encoding negotiation, ported into
+        // `runtime/ruby/rack_utils.rb` for spinel and the rack gem's own
+        // on the ruby family (`project::ruby_runtime_files`). Anchored so
+        // a file that names it loads the one its tree has.
+        "Rack" => Some("runtime/rack_utils".to_string()),
         // `Resolv` — Ruby's resolver, ported into
         // `runtime/ruby/resolv.rb` for the targets that have none and
         // swapped for the stdlib on the ruby family. Anchored for the

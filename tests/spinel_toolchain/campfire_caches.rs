@@ -21,3 +21,9 @@ fn nested_multi_write_destructures_each_group_natively() {
 fn data_define_block_methods_belong_to_the_data_class_natively() {
     assert_runs_natively(&contract::DATA_BLOCK_METHODS);
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn response_helpers_run_as_rails_runs_them_natively() {
+    assert_runs_natively(&contract::RESPONSE_HELPERS);
+}

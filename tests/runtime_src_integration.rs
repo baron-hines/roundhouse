@@ -832,7 +832,13 @@ fn every_runtime_method_body_concretely_typed() {
     // of the id Rails passes through, whose RBS type is the flat
     // `String | Integer | Float | Array | nil` union (Float added after
     // #689 review; MEASURED, no change).
-    const CEILING: usize = 311;
+    // campfire's SQLite-observer caches (#698) add 40, MEASURED: the
+    // values `ActiveSupport::JSON.encode` walks (`jsonable`) and
+    // `ActiveSupport.deep_dup` copies are any JSON value / any session
+    // value, so every read of one is gradual (38); `Session#to_hash`
+    // reads the untyped session values it copies (1) and
+    // `Http::Headers#[]` answers an untyped env value (1).
+    const CEILING: usize = 351;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
