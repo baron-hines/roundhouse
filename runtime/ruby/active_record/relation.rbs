@@ -75,6 +75,8 @@ module ActiveRecord
     def or: (Relation other) -> Relation
     def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate) -> bool
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
+    def order_sql: (String fragment) -> Relation
+    def reorder_sql: (String fragment) -> Relation
     # In-memory sort of a LOADED relation. Records are `Base` (same
     # interim as first/take); `preloaded` stays bare for Spinel integer
     # seeds, but the loaded cache itself is a record array.
@@ -161,6 +163,7 @@ module ActiveRecord
     def ==: (untyped other) -> bool
     def filter: () { (Base) -> bool } -> Array[Base]
     def map: () { (Base) -> untyped } -> untyped
+    def to_h: () { (Base) -> Array[untyped] } -> Hash[untyped, untyped]
     def collect: () { (Base) -> untyped } -> untyped
     # `other` is `untyped`, NOT `Array[untyped]`, on all four set
     # operators: each body only hands the argument on to Array's own
@@ -183,6 +186,7 @@ module ActiveRecord
     def index_by: () { (Base) -> untyped } -> Hash[untyped, Base]
     def find_each: () { (Base) -> void } -> Relation
     def find_in_batches: () { (Array[Base]) -> void } -> Relation
+    def in_batches: (?of: Integer, ?order: Symbol?) ?{ (Relation) -> void } -> Relation
     # `map`/`collect` return `untyped`, NOT `Array[untyped]`: the result's
     # element type is whatever the BLOCK returns, which this RBS has no
     # type variable to say. `Array[untyped]` is a seed spinel TRUSTS, so
@@ -215,7 +219,7 @@ module ActiveRecord
     def one?: () -> bool
     def many?: () -> bool
     def all?: () { (Base) -> bool } -> bool
-    def exists?: (?Integer? id) -> bool
+    def exists?: (?(Integer | String | Hash[String | Symbol, untyped] | nil) id) -> bool
     def probe_existence: (Integer n) -> Integer
     def more_than?: (Integer n) -> bool
     def length: () -> Integer

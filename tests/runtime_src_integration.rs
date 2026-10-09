@@ -832,13 +832,21 @@ fn every_runtime_method_body_concretely_typed() {
     // of the id Rails passes through, whose RBS type is the flat
     // `String | Integer | Float | Array | nil` union (Float added after
     // #689 review; MEASURED, no change).
+    // Campfire's repin past 2393f01 adds 5, MEASURED, each from a value
+    // Rails itself leaves dynamic: `Connection#select_value` (one SQL cell, as
+    // `select_rows`' rows are), `Base.uncached`'s block value (the
+    // `Timeout.timeout` shape), and `Relation#to_h`'s yielded pairs.
+    // `in_batches` adds 2, MEASURED: the `yield self` in
+    // `Relation#in_batches` and in the class-side fallback in
+    // connection.rb, whose value is the block's — gradual, as
+    // `find_in_batches`' `yield records` already is.
     // campfire's SQLite-observer caches (#698) add 40, MEASURED: the
     // values `ActiveSupport::JSON.encode` walks (`jsonable`) and
     // `ActiveSupport.deep_dup` copies are any JSON value / any session
     // value, so every read of one is gradual (38); `Session#to_hash`
     // reads the untyped session values it copies (1) and
     // `Http::Headers#[]` answers an untyped env value (1).
-    const CEILING: usize = 351;
+    const CEILING: usize = 358;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -163,6 +163,111 @@ puts "later delegate ordering passed"
     assert!(run.stdout.contains("later delegate ordering passed"));
 }
 
+/// `to_sql` renders a relation as SQL another query can embed: the
+/// subquery runs, and selects exactly the commented article.
+#[test]
+fn a_relations_to_sql_runs_as_a_subquery() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.commented
+    where(\"articles.id IN (#{Comment.select(:article_id).to_sql})\")
+  end
+",
+        )
+        .run_ruby(
+            r#"commented = Article.create!(title: "Commented", body: "A sufficiently long body.")
+Article.create!(title: "Quiet", body: "A sufficiently long body.")
+Comment.create!(article: commented, commenter: "Reader", body: "Comment body")
+sql = Article.where(title: "Quiet").to_sql
+raise "to_sql: #{sql}" unless sql.start_with?("SELECT") && sql.include?("articles")
+ids = Article.commented.map(&:id)
+raise "subquery: #{ids.inspect}" unless ids == [commented.id]
+puts "to_sql subquery passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("to_sql subquery passed"));
+}
+
+/// A has_many reader followed by `to_sql` is rooted as the association's
+/// relation: the reader alone answers an Array, which has no `to_sql`,
+/// and `check` was clean while the emitted method raised NoMethodError.
+#[test]
+fn a_has_many_readers_to_sql_is_the_scoped_query() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def comment_sql
+    comments.to_sql
+  end
+",
+        )
+        .run_ruby(
+            r#"a = Article.create!(title: "One", body: "A sufficiently long body.")
+sql = a.comment_sql
+raise "comment_sql: #{sql}" unless sql.include?("comments") && sql.include?("article_id = #{a.id}")
+puts "has_many to_sql passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("has_many to_sql passed"));
+}
+
+/// `in_batches` with a block hands each batch as a relation; without
+/// one, `update_all` and `touch_all` reach every row.
+#[test]
+fn in_batches_runs_with_and_without_a_block() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  scope :batched, -> { in_batches }
+
+  def self.batch_total
+    total = 0
+    in_batches(of: 1) { |batch| total += batch.count }
+    total
+  end
+
+  def self.rename_all(title)
+    in_batches.update_all(title: title)
+  end
+
+  def self.touch_everything
+    in_batches(order: :desc).touch_all
+  end
+
+  def touch_comments
+    comments.in_batches.touch_all
+  end
+",
+        )
+        .run_ruby(
+            r#"a = Article.create!(title: "One", body: "A sufficiently long body.")
+Article.create!(title: "Two", body: "A sufficiently long body.")
+Comment.create!(article: a, commenter: "Reader", body: "Comment body")
+raise "batch_total: #{Article.batch_total}" unless Article.batch_total == 2
+Article.rename_all("Renamed")
+raise "rename_all" unless Article.all.map(&:title).uniq == ["Renamed"]
+raise "touch_everything" unless Article.touch_everything == 2
+raise "touch_comments" unless a.touch_comments == 1
+raise "batched scope" unless Article.batched.where(title: "Renamed").count == 2
+puts "in_batches passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("in_batches passed"));
+}
+
 /// A class object and its instances that define the same names: each
 /// side's call types and runs as that side's method.
 #[test]
@@ -520,6 +625,9 @@ fn dynamic_engine_route_targets_keep_their_source_boundary() {
         engine_mount::describe_errors(&app, &errors)
     );
 }
+
+#[path = "emit_and_run/integer_query_exists.rs"]
+mod integer_query_exists;
 
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
@@ -1188,6 +1296,52 @@ end
 "#,
         )
         .run_test("test/controllers/echoes_controller_test.rb")
+        .assert_passes();
+}
+
+/// `Date.parse(params[:from])` types the way a String argument does: a
+/// request parameter is a union whose other arms (nil, an Array, nested
+/// params) raise in Rails as well. The calendar sends after it run too:
+/// a week that starts on a named day, and `in_time_zone` with a zone
+/// that may be nil. Expected values are Rails 8.1's.
+#[test]
+fn date_parse_of_a_request_parameter_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/week\", to: \"weeks#show\"\n",
+        )
+        .write(
+            "app/controllers/weeks_controller.rb",
+            r#"class WeeksController < ApplicationController
+  def show
+    from = Date.parse(params[:from])
+    zone = Article.new.title
+    at = Time.utc(2024, 2, 15, 10, 0, 0)
+    render plain: [
+      from.iso8601, from.beginning_of_month.iso8601, Date.parse(params.require(:from)).year,
+      from.beginning_of_week.iso8601, from.beginning_of_week(:sunday).iso8601, from.end_of_week(:sunday).iso8601,
+      at.beginning_of_week(:sunday).day, at.end_of_week(:wednesday).day,
+      from.in_time_zone(zone).strftime("%H:%M")
+    ].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/weeks_controller_test.rb",
+            r#"require "test_helper"
+
+class WeeksControllerTest < ActionDispatch::IntegrationTest
+  test "a request parameter parses as a date" do
+    get "/week", params: { from: "2024-02-15" }
+    assert_equal "2024-02-15 2024-02-01 2024 2024-02-12 2024-02-11 2024-02-17 11 20 00:00", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/weeks_controller_test.rb")
         .assert_passes();
 }
 
@@ -8693,5 +8847,160 @@ end
 "#,
         )
         .run_test("test/models/article_delete_all_test.rb")
+        .assert_passes();
+}
+
+/// Destructured block parameters and nested multi-write targets bind
+/// every name. campfire's `|(host, secure, origin), index|` was emitted
+/// as `|index|`, and its body read three names nothing bound.
+#[test]
+fn nested_destructuring_binds_every_name() {
+    const SOURCE: &str = r#"class NestedDestructureProbe
+  def self.block_params
+    out = []
+    [[1, 2, 3], [4, 5, 6]].each_with_index do |(a, b, c), index|
+      out << [a, b, c, index]
+    end
+    out
+  end
+  def self.deep_block
+    [[1, [2, 3]]].map { |(a, (b, c))| [a, b, c] }
+  end
+  def self.lambda_param
+    adder = ->((a, b)) { a + b }
+    adder.call([20, 22])
+  end
+  def self.multi_write
+    _, (_, removed) = [1, [2, 3]]
+    removed
+  end
+  def self.deep_multi_write
+    a, (b, (c, d)) = [1, [2, [3, 4]]]
+    [a, b, c, d]
+  end
+  def self.expression
+    (a, (b, c) = [1, [2, 3]])
+  end
+end
+"#;
+    const ASSERTIONS: &str = r##"
+expected = {block_params: [[1, 2, 3, 0], [4, 5, 6, 1]], deep_block: [[1, 2, 3]], lambda_param: 42, multi_write: 3, deep_multi_write: [1, 2, 3, 4], expression: [1, [2, 3]]}
+expected.each do |method, want|
+  got = NestedDestructureProbe.public_send(method)
+  raise "#{method}: #{got.inspect}, expected #{want.inspect}" unless got == want
+end
+"##;
+    let native = std::process::Command::new("ruby").arg("-e")
+        .arg(format!("{SOURCE}\n{ASSERTIONS}"))
+        .output().expect("CRuby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    emit_and_run::real_blog()
+        .write("app/services/nested_destructure_probe.rb", SOURCE)
+        .run_ruby(ASSERTIONS).assert_passes();
+}
+
+/// `recv.m(**payload, badge: b)` where nothing types `recv`: the app's
+/// one `m` takes `**rest`, so the `**` the ingest desugar erased is put
+/// back (campfire's `WebPush::Pool#deliver_later`). Passed positionally
+/// it is Ruby 3's `wrong number of arguments (given 1, expected 0)`.
+#[test]
+fn a_keyword_splat_to_an_untyped_receiver_keeps_its_double_splat() {
+    emit_and_run::real_blog()
+        // A MODEL method, as campfire's `Push::Subscription#notification`
+        // is: models keep `badge:` a keyword beside `**params`.
+        .edit("app/models/comment.rb", "  validates :commenter", r#"  def kwsplat_probe_note(badge: 0, **params)
+    KwSplatNote.new(**params, badge: badge)
+  end
+
+  validates :commenter"#)
+        .write("app/services/kwsplat_probe.rb", r#"class KwSplatNote
+  attr_reader :title, :badge
+
+  def initialize(title:, badge:)
+    @title, @badge = title, badge
+  end
+end
+
+class KwSplatCaller
+  def self.call(items, payload)
+    items.map { |item| item.kwsplat_probe_note(**payload, badge: 3) }
+  end
+end
+"#)
+        .run_ruby(r#"
+article = Article.create!(title: "Splat title", body: "A sufficiently long article body.")
+comment = Comment.create!(article: article, commenter: "Reader", body: "Comment body")
+got = KwSplatCaller.call([comment], { title: "t" }).map { |n| [n.title, n.badge] }
+raise "keyword splat lost: #{got.inspect}" unless got == [["t", 3]]
+"#)
+        .assert_passes();
+}
+
+/// Rails' `association(:name).loaded?` on a belongs_to: false until the
+/// reader runs, true after — the question campfire's presentation tests
+/// ask of a page of messages.
+#[test]
+fn association_loaded_answers_for_a_belongs_to() {
+    emit_and_run::real_blog()
+        .write("app/services/loaded_probe.rb", r#"class LoadedProbe
+  def self.flags(comment)
+    before = comment.association(:article).loaded?
+    comment.article
+    [before, comment.association(:article).loaded?]
+  end
+end
+"#)
+        .run_ruby(r#"
+article = Article.create!(title: "Loaded title", body: "A sufficiently long article body.")
+comment = Comment.create!(article: article, commenter: "Reader", body: "Comment body")
+got = LoadedProbe.flags(Comment.find(comment.id))
+raise "association(:article).loaded? answered #{got.inspect}" unless got == [false, true]
+"#)
+        .assert_passes();
+}
+
+/// `owner.<has_many>.reload` reads the rows again (campfire's rooms
+/// test: `assert_empty room.memberships.reload`).
+#[test]
+fn has_many_reload_reads_the_rows_again() {
+    emit_and_run::real_blog()
+        .write("app/services/reload_probe.rb", r#"class ReloadProbe
+  def self.counts(article)
+    before = article.comments.size
+    Comment.create!(article_id: article.id, commenter: "Late", body: "Arrived later")
+    [before, article.comments.reload.size]
+  end
+end
+"#)
+        .run_ruby(r#"
+article = Article.create!(title: "Reload title", body: "A sufficiently long article body.")
+Comment.create!(article: article, commenter: "Reader", body: "Comment body")
+got = ReloadProbe.counts(Article.find(article.id))
+raise "reload answered #{got.inspect}" unless got == [1, 2]
+"#)
+        .assert_passes();
+}
+
+/// `reorder(Arel.sql("+articles.id"))` keeps its fragment: Rails takes an
+/// `Arel.sql` literal past the column-name check (campfire's
+/// `reorder(Arel.sql("+messages.created_at"))`, SQLite's index-skipping
+/// unary plus), while a bare String with the same text is refused.
+#[test]
+fn an_arel_sql_order_fragment_passes_the_column_check() {
+    emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", r#"class Article < ApplicationRecord
+  scope :plus_ordered, -> { order(:title).reorder(Arel.sql("+articles.id")) }
+"#)
+        .run_ruby(r#"
+Article.create!(title: "Second", body: "A sufficiently long article body.")
+Article.create!(title: "First", body: "A sufficiently long article body.")
+got = Article.plus_ordered.map(&:title)
+raise "Arel.sql order answered #{got.inspect}" unless got == ["Second", "First"]
+begin
+  Article.plus_ordered.reorder("+articles.id").to_a
+  raise "a bare String fragment passed the column check"
+rescue ArgumentError
+end
+"#)
         .assert_passes();
 }

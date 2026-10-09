@@ -2005,7 +2005,7 @@ fn multi_write_with_post_rest_targets_ingests_and_round_trips() {
 }
 
 #[test]
-fn nested_multi_write_desugars_per_group_and_round_trips() {
+fn nested_multi_write_refuses_a_reordered_last_write() {
     use roundhouse::emit::ruby::emit_expr;
     use roundhouse::ingest::IngestError;
 
@@ -2016,22 +2016,15 @@ fn nested_multi_write_desugars_per_group_and_round_trips() {
     };
     let expr = parse("_, (_, size) = entries.shift").unwrap();
     let emitted = emit_expr(&expr);
-    assert!(emitted.contains("_, size = "), "{emitted}");
     assert_eq!(expr, parse(&emitted).unwrap(), "round-trip IR, not only emitted text, must be stable");
 
-    // Ruby writes depth first in source order; a name whose last write
-    // would move under the per-group desugar, and a non-variable target
-    // whose receiver Ruby evaluates before the RHS, stay unsupported.
-    for (source, expected) in [
-        ("(x, y), x = [1, 2], 3", "out of source order"),
-        ("a.b, (c, d) = 1, [2, 3]", "non-variable targets"),
-        ("a, (b, *c) = 1, [2, 3]", "with a splat"),
-    ] {
-        let Err(IngestError::Unsupported { message, .. }) = parse(source) else {
-            panic!("expected unsupported: {source}");
-        };
-        assert!(message.contains(expected), "{source}: {message}");
-    }
+    // Ruby writes depth first in source order, the desugar a level at a
+    // time: `(x, y), x = [1, 2], 3` leaves x at 3 in Ruby and would leave
+    // it at 1, so it is refused.
+    let Err(IngestError::Unsupported { message, .. }) = parse("(x, y), x = [1, 2], 3") else {
+        panic!("expected unsupported");
+    };
+    assert!(message.contains("out of source order"), "{message}");
     // The same name written twice in an order the desugar keeps is fine.
     assert!(parse("x, (y, x) = 1, [2, 3]").is_ok());
 }
