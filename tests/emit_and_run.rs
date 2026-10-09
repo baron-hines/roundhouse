@@ -1187,6 +1187,37 @@ end
         .assert_passes();
 }
 
+/// `Date.parse(params[:from])` types the way a String argument does: a
+/// request parameter is a union whose other arms (nil, an Array, nested
+/// params) raise in Rails as well. The calendar send after it runs too.
+#[test]
+fn date_parse_of_a_request_parameter_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/week\", to: \"weeks#show\"\n",
+        )
+        .write(
+            "app/controllers/weeks_controller.rb",
+            "class WeeksController < ApplicationController\n  def show\n    from = Date.parse(params[:from])\n    render plain: \"#{from.iso8601} #{from.beginning_of_month.iso8601} #{Date.parse(params.require(:from)).year}\"\n  end\nend\n",
+        )
+        .write(
+            "test/controllers/weeks_controller_test.rb",
+            r#"require "test_helper"
+
+class WeeksControllerTest < ActionDispatch::IntegrationTest
+  test "a request parameter parses as a date" do
+    get "/week", params: { from: "2024-02-15" }
+    assert_equal "2024-02-15 2024-02-01 2024", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/weeks_controller_test.rb")
+        .assert_passes();
+}
+
 /// A job `perform_later` enqueues under the test adapter is held, not
 /// dropped, and a blockless `perform_enqueued_jobs only:` runs it
 /// (basecamp/once-campfire#296's tests). Its broadcast is JSON encoded

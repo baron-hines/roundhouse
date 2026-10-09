@@ -2265,6 +2265,8 @@ fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     };
     let accepts = |actual: Option<&Ty>, expected: &Ty| match actual {
         None | Some(Ty::Var { .. } | Ty::Untyped) => true,
+        // Not only an exact String: a request parameter's other arms (nil, an Array, nested params) raise in Rails too, as `Time.parse` accepts.
+        Some(Ty::Union { variants }) if *expected == Ty::Str => variants.contains(&Ty::Str),
         Some(actual) => actual == expected || matches!(expected, Ty::Union { variants } if variants.contains(actual)),
     };
     Some(if args.len() <= expected.len()
