@@ -5301,6 +5301,7 @@ impl Analyzer {
         params_by_method: &HashMap<ParamKey, ParamShape>,
         defined: &BTreeSet<ParamKey>,
     ) {
+        let mut observations = Vec::new();
         for (class_id, method, arg_tys, kw_tys, recv) in sites {
             let want = if recv == SiteRecv::Instance { MethodReceiver::Instance } else { MethodReceiver::Class };
             let on_side = self.inherited_param_owner(defined, class_id.clone(), &method, Some(want));
@@ -5313,18 +5314,9 @@ impl Analyzer {
             let Some(side) = Self::param_side(defined, &class_id, &method, recv) else { continue };
             let key = (class_id, method, side);
             let arg_tys = Self::place_keyword_args(params_by_method.get(&key), arg_tys, kw_tys);
-            let arity = arg_tys.len();
-            let entry = self
-                .inferred_params
-                .entry(key)
-                .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
-            if entry.len() < arity {
-                entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
-            }
-            for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
-            }
+            observations.push((key, arg_tys));
         }
+        fold_param_observations(&mut self.inferred_params, observations);
     }
 
     /// Every `(class, method)` the app defines, by name.
@@ -5550,15 +5542,7 @@ impl Analyzer {
                 }
             }
         }
-        for (key, tys) in adds {
-            let entry = self.inferred_params.entry(key).or_default();
-            if entry.len() < tys.len() {
-                entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
-            }
-            for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
-                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
-            }
-        }
+        fold_param_observations(&mut self.inferred_params, adds);
     }
 
     /// Every (class, method) pair's parameter names and canonical kinds
@@ -6968,6 +6952,38 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
         }
     }
     (only, except)
+}
+
+/// Join call-site observations into the parameter rows they name. A
+/// row a site doesn't reach yet is seeded pending (`Var`) up to the
+/// site's arity.
+///
+/// The size bound applies once to each row the fold touched, after
+/// every observation is joined: `bound` doesn't distribute over the
+/// join, so bounding after each pairwise join made a slot depend on
+/// the order its call sites were visited in (#617).
+pub(crate) fn fold_param_observations(
+    rows: &mut HashMap<ParamKey, Vec<Ty>>,
+    observations: Vec<(ParamKey, Vec<Ty>)>,
+) {
+    let mut touched: BTreeSet<ParamKey> = BTreeSet::new();
+    for (key, tys) in observations {
+        let entry = rows.entry(key.clone()).or_default();
+        if entry.len() < tys.len() {
+            entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
+        }
+        for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
+            *slot = unify_param_ty(std::mem::replace(slot, Ty::Bottom), observed);
+        }
+        touched.insert(key);
+    }
+    for key in touched {
+        if let Some(row) = rows.get_mut(&key) {
+            for slot in row.iter_mut() {
+                *slot = fixpoint_bound::bound(std::mem::replace(slot, Ty::Bottom));
+            }
+        }
+    }
 }
 
 /// Join a stored param type with a freshly observed argument type.
