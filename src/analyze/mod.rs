@@ -609,6 +609,12 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            // `attachment_changes` — `lower::attached::push_attachment_changes`.
+            if !crate::lower::attached::attached_attrs(model).is_empty() {
+                cls.instance_methods
+                    .entry(Symbol::from("attachment_changes"))
+                    .or_insert_with(crate::lower::attached::attachment_changes_ty);
+            }
             for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
                 cls.instance_methods.entry(attr).or_insert(Ty::Class {
                     id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
@@ -5349,6 +5355,7 @@ impl Analyzer {
         params_by_method: &HashMap<ParamKey, ParamShape>,
         defined: &BTreeSet<ParamKey>,
     ) {
+        let mut observations = Vec::new();
         for (class_id, method, arg_tys, kw_tys, recv) in sites {
             let want = if recv == SiteRecv::Instance { MethodReceiver::Instance } else { MethodReceiver::Class };
             let on_side = self.inherited_param_owner(defined, class_id.clone(), &method, Some(want));
@@ -5361,18 +5368,9 @@ impl Analyzer {
             let Some(side) = Self::param_side(defined, &class_id, &method, recv) else { continue };
             let key = (class_id, method, side);
             let arg_tys = Self::place_keyword_args(params_by_method.get(&key), arg_tys, kw_tys);
-            let arity = arg_tys.len();
-            let entry = self
-                .inferred_params
-                .entry(key)
-                .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
-            if entry.len() < arity {
-                entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
-            }
-            for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
-            }
+            observations.push((key, arg_tys));
         }
+        fold_param_observations(&mut self.inferred_params, observations);
     }
 
     /// Every `(class, method)` the app defines, by name.
@@ -5598,15 +5596,7 @@ impl Analyzer {
                 }
             }
         }
-        for (key, tys) in adds {
-            let entry = self.inferred_params.entry(key).or_default();
-            if entry.len() < tys.len() {
-                entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
-            }
-            for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
-                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
-            }
-        }
+        fold_param_observations(&mut self.inferred_params, adds);
     }
 
     /// Every (class, method) pair's parameter names and canonical kinds
@@ -7022,66 +7012,85 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
     (only, except)
 }
 
-/// Unify a stored param type with a freshly observed argument type.
-/// Mirrors Spinel's `detect_poly_in_node` (`spinel_codegen.rb:6961-7000`)
-/// joinrules at a higher level — we operate on `Ty` directly, so the
-/// rules are:
-/// - same type → keep
-/// - one side is `Ty::Var` (no info yet) → take the other, including
-///   when the other is `Untyped` (`Var` is the bottom of the join)
-/// - one side is `Untyped` (an argument nobody could type) → take the
-///   other: an untyped observation says nothing about the value, and
-///   letting it into the union turns every concrete observation into
-///   `untyped` downstream (gradual absorption at dispatch). campfire's
+/// Join call-site observations into the parameter rows they name. A
+/// row a site doesn't reach yet is seeded pending (`Var`) up to the
+/// site's arity.
+///
+/// The size bound applies once to each row the fold touched, after
+/// every observation is joined: `bound` doesn't distribute over the
+/// join, so bounding after each pairwise join made a slot depend on
+/// the order its call sites were visited in (#617).
+pub(crate) fn fold_param_observations(
+    rows: &mut HashMap<ParamKey, Vec<Ty>>,
+    observations: Vec<(ParamKey, Vec<Ty>)>,
+) {
+    let mut touched: BTreeSet<ParamKey> = BTreeSet::new();
+    for (key, tys) in observations {
+        let entry = rows.entry(key.clone()).or_default();
+        if entry.len() < tys.len() {
+            entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
+        }
+        for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
+            *slot = unify_param_ty(std::mem::replace(slot, Ty::Bottom), observed);
+        }
+        touched.insert(key);
+    }
+    for key in touched {
+        if let Some(row) = rows.get_mut(&key) {
+            for slot in row.iter_mut() {
+                *slot = fixpoint_bound::bound(std::mem::replace(slot, Ty::Bottom));
+            }
+        }
+    }
+}
+
+/// Join a stored param type with a freshly observed argument type.
+///
+/// The slot is carried from one fixpoint round to the next and its
+/// observations arrive in whatever order the call sites are visited,
+/// so this is a lattice join: commutative, associative and idempotent,
+/// with a pending `Var` as its identity (#617). It is defined on the
+/// canonical arm set `union_of` builds (nested unions flattened, one
+/// Hash and one Array spine, `Nil` kept as an arm, a pending `Var`
+/// dropped beside any other arm, inside spines too), with each
+/// top-level arm classified the same way whether it arrives bare or as
+/// an arm of a union:
+/// - pending (`Var`, no observation yet) is the identity. When only
+///   `Var`s remain, the join keeps the one with the smallest id; that
+///   is the slot seed `TyVar(0)`, so the seed stays the identity.
+/// - `Untyped` (an argument nobody could type) is absorbed by a
+///   non-nil concrete arm. It says nothing about the value, and letting
+///   it into the union turns every concrete observation into `untyped`
+///   downstream (gradual absorption at dispatch). campfire's
 ///   `start_new_session_for(user)` has three callers passing `User`
 ///   and one passing the result of a relation-delegated concern
 ///   finder the registry answers `untyped`; the parameter is a User.
-/// - one side is `Nil` and the other is concrete → nullable union (T?)
-/// - already a Union containing `observed` → keep
-/// - otherwise → widen via `union_of`
-fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
-    if stored == observed {
-        return stored;
+/// - `Nil` alone does not absorb `Untyped`: `Nil | untyped` stays. A
+///   nil observation beside an untyped one is no evidence that the
+///   parameter is always nil, and collapsing it to `Nil` typed every
+///   read of the parameter as a call on nil (the S2b Campfire case on
+///   #617).
+///
+/// Forward note: once `Untyped` carries its provenance (pending,
+/// unresolved, gradual; S2a on #617), only an unresolved `untyped` is
+/// absorbed this way, and a gradual one stays an arm beside concrete
+/// types. If arms with different provenance then share one `untyped`
+/// arm, merging them must keep gradual (gradual wins), or the result
+/// depends on the grouping again and the join stops being associative.
+pub(crate) fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
+    let joined = crate::analyze::body::drop_pending_arms(crate::analyze::body::union_of(stored, observed));
+    let Ty::Union { variants } = joined else {
+        return joined;
+    };
+    // `drop_pending_arms` leaves no `Var` in a union of two or more arms.
+    if !variants.iter().any(|v| !v.is_unknown() && !matches!(v, Ty::Nil)) {
+        return Ty::Union { variants };
     }
-    // `Var` is checked on both sides before `Untyped` so the join is
-    // commutative: `Var` (no observation) is below `Untyped` (an
-    // observed argument nobody could type), and `Untyped` is below a
-    // concrete type. Testing `Var | Untyped` together on `stored`
-    // first made `unify(Untyped, Var) = Var` but `unify(Var, Untyped)
-    // = Untyped`, so the result depended on the order call sites
-    // arrived in (#209).
-    if matches!(stored, Ty::Var { .. }) {
-        return observed;
+    let mut kept: Vec<Ty> = variants.into_iter().filter(|v| !matches!(v, Ty::Untyped)).collect();
+    match kept.len() {
+        1 => kept.pop().unwrap(),
+        _ => Ty::Union { variants: kept },
     }
-    if matches!(observed, Ty::Var { .. }) {
-        return stored;
-    }
-    if matches!(stored, Ty::Untyped) {
-        return observed;
-    }
-    if matches!(observed, Ty::Untyped) {
-        return stored;
-    }
-    // T + Nil → Union<T, Nil>; same for the symmetric case. Skip
-    // double-wrapping if `stored` already encodes the nullable form.
-    if matches!(observed, Ty::Nil) {
-        if let Ty::Union { variants } = &stored {
-            if variants.contains(&Ty::Nil) {
-                return stored;
-            }
-        }
-        return crate::analyze::body::union_of(stored, Ty::Nil);
-    }
-    if matches!(stored, Ty::Nil) {
-        return crate::analyze::body::union_of(observed, Ty::Nil);
-    }
-    // Union<T, ...> already containing observed → keep stored.
-    if let Ty::Union { variants } = &stored {
-        if variants.contains(&observed) {
-            return stored;
-        }
-    }
-    crate::analyze::body::union_of(stored, observed)
 }
 
 /// Convert a controller class name into the view-path prefix.

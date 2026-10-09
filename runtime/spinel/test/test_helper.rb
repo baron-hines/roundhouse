@@ -1844,21 +1844,35 @@ module RequestDispatch
     #
     # A GET/HEAD reads through one snapshot, as the dispatcher serves it,
     # so the suite exercises the same transaction shape production does.
+    #
+    # And under the query cache, as both production dispatchers and
+    # Rails' executor run a request: an identical SELECT inside one
+    # request replays (Rails logs it as CACHE, and its query counters
+    # skip it), so campfire's "looks up the boosters of all boosts at
+    # once" counts the same queries for two boosts as for three.
+    # Restored to what it found, so a request inside a test's own cached
+    # block leaves that block cached.
     snapshot = method == "GET" || method == "HEAD"
     if Db.in_lease?
+      cached = Db.query_cache_enabled?
+      Db.query_cache_begin unless cached
       Db.read_snapshot_begin if snapshot
       begin
         controller.process_action(matched.action)
       ensure
         Db.read_snapshot_end if snapshot
+        Db.query_cache_end unless cached
       end
     else
       Db.with_connection do
+        cached = Db.query_cache_enabled?
+        Db.query_cache_begin unless cached
         Db.read_snapshot_begin if snapshot
         begin
           controller.process_action(matched.action)
         ensure
           Db.read_snapshot_end if snapshot
+          Db.query_cache_end unless cached
         end
       end
     end

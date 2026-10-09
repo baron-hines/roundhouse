@@ -698,16 +698,23 @@ module ActiveRecord
         @persisted = true
         __track_saved_changes(was_new)
         after_create
-        after_create_commit
       else
         before_update
         fill_timestamps(false)
         _adapter_update
         __track_saved_changes(was_new)
         after_update
-        after_update_commit
       end
       after_save
+      # The commit callbacks fire once the save's own callbacks are
+      # done, as Rails runs them after the transaction: an
+      # `after_update_commit` reads what `after_save` wrote (an
+      # attachment, a rich-text body), not the record half saved.
+      if was_new
+        after_create_commit
+      else
+        after_update_commit
+      end
       after_save_commit
       after_commit
       true

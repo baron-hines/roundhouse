@@ -844,21 +844,11 @@ fn every_runtime_method_body_concretely_typed() {
     // `Relation#in_batches` and in the class-side fallback in
     // connection.rb, whose value is the block's — gradual, as
     // `find_in_batches`' `yield records` already is.
-    // campfire's SQLite-observer caches (#698) add 40, MEASURED: the
-    // values `ActiveSupport::JSON.encode` walks (`jsonable`) and
-    // `ActiveSupport.deep_dup` copies are any JSON value / any session
-    // value, so every read of one is gradual (38); `Session#to_hash`
-    // reads the untyped session values it copies (1) and
-    // `Http::Headers#[]` answers an untyped env value (1).
-    // Main's HAML shortcut-class merge adds 2 more gradual reads.
-    // MEASURED 2026-10-09 (against origin/main a28539b6): `haml_class`
-    // (the HAML shortcut-class + hash `class:` merge) adds 2 on top of
-    // the above — its `value` param is `untyped` (a scalar the HAML
-    // compiler could not narrow further: String, Symbol, nil, or a
-    // conditional/ternary result), and the body reads it twice
-    // (`value.nil?`, `value.to_s`).
-    // Rebased onto main after `in_batches`: MEASURED 317 with haml_class, under main's 318.
-    const CEILING: usize = 357;
+    // Canonical main a63bf7ba measured 321 gradual sites. The #720 Ruby
+    // runtime additions contribute 39 more, primarily from generic JSON,
+    // deep_dup, session and request-environment values; keep those
+    // intentional dynamic boundaries visible in this measured ceiling.
+    const CEILING: usize = 360;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

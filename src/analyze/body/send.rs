@@ -1573,9 +1573,16 @@ impl<'a> BodyTyper<'a> {
                     };
                 }
                 // `Timeout.timeout(sec) { ... }` — block result, or raises
-                // Timeout::Error. Campfire unfurl + video previewer.
+                // Timeout::Error. Campfire unfurl + video previewer. The
+                // block's own type when it is informative, as with
+                // `transaction { … }`: campfire's `unfurl` answers
+                // `Opengraph::Metadata?` through it, and `render json:`
+                // picks the record's writer from that type.
                 if id.0.as_str() == "Timeout" && method.as_str() == "timeout" {
-                    return Ty::Untyped;
+                    return match block_ret {
+                        Some(ret) if !matches!(ret, Ty::Var { .. }) => ret.clone(),
+                        _ => Ty::Untyped,
+                    };
                 }
                 // `r, w, pid = PTY.spawn(env, *cmd)`: the pty's reader
                 // and writer and the child's pid. With a block — brace,

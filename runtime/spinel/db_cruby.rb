@@ -240,6 +240,18 @@ module Db
     @pool.free[0]
   end
 
+  # `ActiveRecord::Base.transaction`'s per-thread nesting depth
+  # (connection.rb) — see the contract note in runtime/ruby/db.rbs.
+  # `Fiber[:k]` for the same reason `current_dbh` above uses it.
+  def self._txn_depth
+    d = Fiber[:ar_txn_depth]
+    d.nil? ? 0 : d
+  end
+
+  def self._txn_depth=(value)
+    Fiber[:ar_txn_depth] = value
+  end
+
   # Request-scoped connection lease. Checks out a handle, binds it to
   # this thread's fiber-storage so `current_dbh` resolves to it for the
   # block's duration, and returns it on completion (even on raise).

@@ -159,6 +159,19 @@ module Db
     @free[0]
   end
 
+  # `ActiveRecord::Base.transaction`'s per-thread nesting depth
+  # (connection.rb) — see the contract note in runtime/ruby/db.rbs.
+  # Mirrors db_cruby.rb: `Fiber[:k]` for the same reason `current_dbh`
+  # above uses it.
+  def self._txn_depth
+    d = Fiber[:ar_txn_depth]
+    d.nil? ? 0 : d
+  end
+
+  def self._txn_depth=(value)
+    Fiber[:ar_txn_depth] = value
+  end
+
   # Request-scoped connection lease. Mirrors db_cruby.rb: checks out a
   # Conn under @mutex (parking on @cv while the pool is momentarily
   # exhausted), binds it to fiber-storage so `current_dbh` resolves to it

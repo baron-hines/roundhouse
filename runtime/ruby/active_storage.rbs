@@ -81,6 +81,7 @@ module ActiveStorage
     def self.from_attachable: (untyped value) -> ActiveStorage::Blob?
     def download: () -> String
     def purge: () -> nil
+    def purge_later: () -> nil
     def video?: () -> bool
     def previewable?: () -> bool
     def preview_image: () -> ActiveStorage::Attached
@@ -218,6 +219,8 @@ module ActiveStorage
     def attach_blob: (ActiveStorage::Blob blob) -> nil
     def attach: (String data, String filename, String content_type) -> nil
     def purge: () -> nil
+    def purge_later: () -> nil
+    def detach_each: () -> Array[ActiveStorage::Blob]
     # `Attached::One#destroy` — see the .rb: purge under Rails' name.
     def destroy: () -> nil
   end
@@ -251,7 +254,13 @@ module ActiveStorage
     def attach_blob: (ActiveStorage::Blob blob) -> nil
     def attach: (String data, String filename, String content_type) -> nil
     def purge: () -> nil
+    def purge_later: () -> nil
+    def detach_each: () -> Array[ActiveStorage::Blob]
     def destroy: () -> nil
+  end
+
+  class PurgeJob
+    def self.perform_later: (ActiveStorage::Blob blob) -> nil
   end
 end
 

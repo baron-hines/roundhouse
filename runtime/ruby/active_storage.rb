@@ -791,6 +791,11 @@ module ActiveStorage
       nil
     end
 
+    # Rails' `purge_later`: the purge as an `ActiveStorage::PurgeJob`.
+    def purge_later
+      PurgeJob.perform_later(self)
+    end
+
     def video?
       @content_type.start_with?("video/")
     end
@@ -1366,20 +1371,34 @@ module ActiveStorage
     # Detach and delete: the attachment row, the blob row, and the
     # bytes — see `attach_blob` on why the blob goes too.
     def purge
+      detach_each.each { |blob| blob.purge }
+      nil
+    end
+
+    # Rails' default on the owner's destroy (`dependent: :purge_later`):
+    # the join row goes now, the blob in an `ActiveStorage::PurgeJob`.
+    def purge_later
+      detach_each.each { |blob| blob.purge_later }
+      nil
+    end
+
+    # Delete the join row(s) and answer the blobs they held.
+    def detach_each
       sql = "SELECT a.id AS attachment_id, " + Blob.columns("b") +
             " FROM active_storage_attachments a " +
             "JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = " +
             ActiveRecord.adapter.escape_value(@record_type) +
             " AND a.record_id = " + ActiveRecord.adapter.escape_value(@record_id) +
             " AND a.name = " + ActiveRecord.adapter.escape_value(@name)
+      blobs = []
       ActiveRecord.adapter.select_rows(sql).each do |row|
         ActiveRecord.adapter.delete("active_storage_attachments", row["attachment_id"].to_i)
-        Blob.from_row(row).purge
+        blobs.push(Blob.from_row(row))
       end
       @row_loaded = false
       @attachment_id = 0
       @blob = nil
-      nil
+      blobs
     end
 
     # `account.logo.destroy` — Rails' `Attached::One` has no `destroy`
@@ -1536,17 +1555,48 @@ module ActiveStorage
     end
 
     def purge
+      detach_each.each { |blob| blob.purge }
+      nil
+    end
+
+    def purge_later
+      detach_each.each { |blob| blob.purge_later }
+      nil
+    end
+
+    def detach_each
+      blobs = []
       attachments.each do |att|
         blob = att.blob
         ActiveRecord.adapter.delete("active_storage_attachments", att.id)
-        blob.purge unless blob.nil?
+        blobs.push(blob) unless blob.nil?
       end
       @rows_loaded = false
-      nil
+      blobs
     end
 
     def destroy
       purge
+    end
+  end
+
+  # Rails' `ActiveStorage::PurgeJob`, in the shape a lowered app job's
+  # `perform_later` takes: recorded by name (`assert_enqueued_jobs
+  # only: ActiveStorage::PurgeJob`), run inline, queued behind the
+  # request, or held for the test adapter.
+  class PurgeJob
+    def self.perform_later(blob)
+      ActiveJob.record_performed("ActiveStorage::PurgeJob")
+      if !ActiveJob.enqueue_only
+        if ActiveJob.drain_registered
+          ActiveJob.enqueue(-> { blob.purge })
+        else
+          blob.purge
+        end
+      else
+        ActiveJob.hold("ActiveStorage::PurgeJob", -> { blob.purge })
+      end
+      nil
     end
   end
 end
