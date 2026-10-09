@@ -62,6 +62,53 @@ def commit_case(name)
   title = Article.find(a.id).title
   check(name, title == "nested" && Db.in_lease? == false, "title=" + title)
 end
+
+# A non-local `return` out of the block never reaches `transaction`'s
+# `rescue` — only its `ensure` sees it — and Rails commits rather than
+# rolling back on a non-local exit. The depth must land back on 0 too,
+# or every later transaction on this thread silently joins one that no
+# longer exists (no BEGIN, nothing for a later ROLLBACK to undo).
+def do_txn_return(a)
+  Article.transaction do
+    a.update!(title: "during-return")
+    return :returned
+  end
+  :never
+end
+
+def return_case(name)
+  a = Article.create!(title: "before", body: "long enough body")
+  v = do_txn_return(a)
+  title = Article.find(a.id).title
+  check(name, v == :returned && Db._txn_depth == 0 && title == "during-return",
+        "v=" + v.to_s + " depth=" + Db._txn_depth.to_s + " title=" + title)
+end
+
+# `break` exits the `transaction` call itself (not a further-enclosing
+# method) with the break's value — same commit-not-rollback contract.
+# CRuby-only (see a_nested_transaction_joins_the_outer_one_on_cruby):
+# compiled into the same Spinel binary as `rollback_case`'s raising
+# block, this hits a Spinel codegen bug unrelated to this fix — the
+# `break` call site's `sp_brk_throw(...)` (void/noreturn) ends up as the
+# tail of the `result = yield` statement-expression that ANOTHER call
+# site of the same `self.transaction` needs a real value from, and gcc
+# rejects it ("invalid use of void expression"). Confirmed in isolation:
+# `break` alone compiles, `raise` alone compiles, the two together on
+# the same `yield`-based method do not, regardless of which script
+# calls which — the real_blog fixture's own `with_lock`/framework code
+# already gives `self.transaction` a raising call site, so there is no
+# Spinel consumer in this fixture where `break_case` would compile.
+# Worth its own Spinel issue; not filed from here.
+def break_case(name)
+  a = Article.create!(title: "before", body: "long enough body")
+  v = Article.transaction do
+    a.update!(title: "during-break")
+    break :broke
+  end
+  title = Article.find(a.id).title
+  check(name, v == :broke && Db._txn_depth == 0 && title == "during-break",
+        "v=" + v.to_s + " depth=" + Db._txn_depth.to_s + " title=" + title)
+end
 "#;
 
 fn script(pool_size: usize) -> String {
@@ -73,6 +120,7 @@ fn script(pool_size: usize) -> String {
          rollback_case(\"nested, bare\", \"nested\")\n\
          Db.with_connection {{ rollback_case(\"nested, in a request lease\", \"nested\") }}\n\
          commit_case(\"nested and leased blocks commit with the outer one\")\n\
+         return_case(\"a non-local return commits and restores depth\")\n\
          puts \"done\"\n"
     )
 }
@@ -84,7 +132,7 @@ fn assert_all_ok(pool_size: usize) {
     assert!(out.lines().any(|l| l == "done"), "driver did not finish\n{out}\n{}", run.stderr);
     let failed: Vec<&str> = out.lines().filter(|l| l.starts_with("FAIL")).collect();
     assert!(failed.is_empty(), "pool_size {pool_size}:\n{}\n=== stdout ===\n{out}", failed.join("\n"));
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 6, "{out}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 7, "{out}");
 }
 
 #[test]
@@ -109,12 +157,15 @@ fn a_nested_transaction_joins_the_outer_one_on_cruby() {
         "{PROBE}\nrollback_case(\"bare\", \"flat\")\nrollback_case(\"nested, bare\", \"nested\")\n\
          a = Article.create!(title: \"before\", body: \"long enough body\")\n\
          Article.transaction {{ Article.transaction {{ a.update!(title: \"nested\") }} }}\n\
-         check(\"nested commit\", Article.find(a.id).title == \"nested\", \"\")\nputs \"done\"\n"
+         check(\"nested commit\", Article.find(a.id).title == \"nested\", \"\")\n\
+         return_case(\"a non-local return commits and restores depth\")\n\
+         break_case(\"a break commits and restores depth\")\n\
+         puts \"done\"\n"
     );
     let run = emit_and_run::real_blog().run_ruby(&script);
     run.assert_passes();
     let out = &run.stdout;
     assert!(out.lines().any(|l| l == "done"), "{out}");
     assert!(!out.contains("FAIL"), "{out}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 3, "{out}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 5, "{out}");
 }

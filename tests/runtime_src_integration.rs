@@ -851,7 +851,19 @@ fn every_runtime_method_body_concretely_typed() {
     // conditional/ternary result), and the body reads it twice
     // (`value.nil?`, `value.to_s`).
     // Rebased onto main after `in_batches`: MEASURED 317 with haml_class, under main's 318.
-    const CEILING: usize = 317;
+    // `self.transaction`'s `ensure`-based depth/commit restore on a
+    // non-local exit (spinel-txn-pin #693, CodeRabbit): the nested
+    // branch's `ensure` (a second `Db._txn_depth = depth`, alongside the
+    // `rescue`'s own copy, now folded into the `begin`'s value position)
+    // adds 1; the outer branch's `ensure` adds 3 — its `if rolled_back
+    // then nil else … end` has to unify `nil` against `Db.exec("COMMIT")`'s
+    // declared `void` return, the same kind of escape this file's other
+    // `opts`-style branches already carry. Rebased onto main's
+    // `in_batches` (#713): re-measured fresh on this tree rather than
+    // summed from either side's base, since unrelated main changes
+    // shift base.rb/connection.rb's own counts independently
+    // (spinel-txn-pin #693) — 321, MEASURED after rebasing past #705/#709.
+    const CEILING: usize = 321;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -431,12 +431,19 @@ module ActiveRecord
     # signature so a call that passes them (directly, or via `with_lock`)
     # doesn't raise `ArgumentError`.
     #
-    # The depth is restored on every exit path by hand rather than in an
-    # `ensure`: Spinel (matz/spinel#8182) skips a `begin/rescue/ensure`'s
-    # ensure when the exception leaves through the rescue (re-raised) or
-    # matches no rescue, and a depth left at 1 turns every later
-    # transaction on the thread into a "nested" one with no BEGIN —
-    # writes that a ROLLBACK then cannot undo.
+    # The depth reset on an exception is explicit, in the `rescue`
+    # itself, rather than left to the `ensure` below: Spinel
+    # (matz/spinel#8182) skips a `begin/rescue/ensure`'s ensure when the
+    # exception leaves through the rescue (re-raised) or matches no
+    # rescue, and a depth left at 1 turns every later transaction on the
+    # thread into a "nested" one with no BEGIN — writes that a ROLLBACK
+    # then cannot undo. The `ensure` still carries the SAME reset (CRuby
+    # runs both; harmless, since both set the identical value) because a
+    # non-local exit from the block — `return`/`break`/`next` out of
+    # `transaction { ... }` — never reaches `rescue` at all, only
+    # `ensure`. As Rails does, a non-local exit (no exception) COMMITS
+    # the outermost transaction rather than rolling it back; `rolled_back`
+    # tells `ensure` which happened so the two paths can't double-apply.
     #
     # The depth itself reads/writes through `Db._txn_depth`/`=` (see
     # runtime/ruby/db.rbs) rather than `Thread.current` directly: a raw
@@ -454,22 +461,28 @@ module ActiveRecord
         rescue Exception => e
           Db._txn_depth = depth
           raise e
+        ensure
+          Db._txn_depth = depth
         end
-        Db._txn_depth = depth
-        result
       else
         Db.exec("BEGIN")
         Db._txn_depth = 1
+        rolled_back = false
         begin
           result = yield
         rescue Exception => e
+          rolled_back = true
           Db._txn_depth = 0
           Db.exec("ROLLBACK")
           raise e
+        ensure
+          if rolled_back
+            nil
+          else
+            Db._txn_depth = 0
+            Db.exec("COMMIT")
+          end
         end
-        Db._txn_depth = 0
-        Db.exec("COMMIT")
-        result
       end
     end
 

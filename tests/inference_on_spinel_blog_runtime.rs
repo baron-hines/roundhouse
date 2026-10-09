@@ -319,23 +319,28 @@ fn untyped_subexpressions_baseline() {
     // campfire's `reorder(Arel.sql("+messages.created_at"))`): 547 ->
     // 549, MEASURED — each one's `fragment` parameter, read here
     // without its RBS.
-    // Transaction join/pin (spinel-txn-pin #693, matz/spinel#8182),
-    // rebased onto #704: 549 -> 560, MEASURED. `self.transaction`'s
-    // per-thread nesting depth reads/writes through `Db._txn_depth`/`=`
-    // (runtime/ruby/db.rbs) instead of a raw `Thread.current[:ar_txn_depth]`:
-    // the companion RBS-paired probe has no model for the `Db` the depth
-    // used to bypass, so the raw `Thread.current` read/write there typed
-    // as the unresolved `Var`, not the honest gradual `Untyped` — routing
-    // it through `Db`'s own declared contract is what brings that probe
-    // to zero residual (see its hand-authored RBS and the `insert_db_stub`
+    // Transaction join/pin + its `ensure`-based non-local-exit fix
+    // (spinel-txn-pin #693, matz/spinel#8182), rebased onto #704:
+    // 549 -> 561, MEASURED. `self.transaction`'s per-thread nesting
+    // depth reads/writes through `Db._txn_depth`/`=` (runtime/ruby/db.rbs)
+    // instead of a raw `Thread.current[:ar_txn_depth]`: the companion
+    // RBS-paired probe has no model for the `Db` the depth used to
+    // bypass, so the raw `Thread.current` read/write there typed as the
+    // unresolved `Var`, not the honest gradual `Untyped` — routing it
+    // through `Db`'s own declared contract is what brings that probe to
+    // zero residual (see its hand-authored RBS and the `insert_db_stub`
     // mirror). This raw-inference probe (zero hand-authored signatures
     // anywhere, not even for the app's own runtime shims) has no such
     // stub for `Db` — confirmed by reverting to the `Thread.current` form
     // and re-measuring: exactly 549 (this branch's base after rebasing),
-    // so the old form cost this probe nothing. The eleven new sites are
-    // the depth variable's reads/writes/arithmetic now going through an
-    // unmodeled `Db` method. Its RBS-paired method stays at zero residual.
-    const CEILING: usize = 560;
+    // so the old form cost this probe nothing. Eleven of the twelve new
+    // sites are the depth variable's reads/writes/arithmetic now going
+    // through an unmodeled `Db` method; the twelfth is the `ensure`-based
+    // non-local-exit fix (CodeRabbit on #693) — its outer branch's
+    // `ensure`'s `if rolled_back then nil else … end` has to unify `nil`
+    // against the unresolved `Db.exec("COMMIT")` call. Its RBS-paired
+    // method stays at zero residual throughout.
+    const CEILING: usize = 561;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\
