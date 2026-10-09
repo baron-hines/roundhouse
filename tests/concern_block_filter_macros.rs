@@ -305,6 +305,60 @@ fn an_unrecognized_option_key_is_refused() {
     assert_refused(DEFAULT_BODY, "stamp_header('Accept-Language', prepend: true)");
 }
 
+/// The outer `|controller|` rewrite to `self` is a blind full-tree
+/// rewrite with no notion of scope. A nested block that redeclares
+/// `controller` as its OWN parameter shadows the outer one — its body's
+/// `controller` means that inner parameter, not the filter block's —
+/// so rewriting every `controller` read to `self` would reach inside
+/// and corrupt it (`items.map { |controller| controller.to_s }` would
+/// silently become `items.map { |controller| self.to_s }`).
+#[test]
+fn a_nested_block_param_shadowing_the_filter_block_param_is_refused() {
+    let body = r#"      before_action(**kwargs) do |controller|
+        response.headers['X-Stamp'] = value.map { |controller| controller.to_s }.join(',')
+      end"#;
+    assert_refused(body, "stamp_header([1, 2])");
+}
+
+/// Same shadowing hazard, a nested `->` lambda literal declaring its own
+/// `controller` parameter instead of a nested block.
+#[test]
+fn a_nested_lambda_param_shadowing_the_filter_block_param_is_refused() {
+    let body = r#"      before_action(**kwargs) do |controller|
+        response.headers['X-Stamp'] = (->(controller) { controller.to_s }).call(1)
+      end"#;
+    assert_refused(body, "stamp_header(1)");
+}
+
+/// A nested block's semicolon-declared LOCAL (`|x; controller|`) shadows
+/// exactly like a declared parameter, but the IR doesn't represent
+/// block-locals at all — ingestion drops the declaration, keeping only
+/// whatever the block's body does with it. What survives here is the
+/// local's first write (`controller = x.to_s`), which is still a
+/// same-named assignment at a nested depth and must be enough on its
+/// own to refuse the macro.
+#[test]
+fn a_nested_block_local_shadowing_the_filter_block_param_is_refused() {
+    let body = r#"      before_action(**kwargs) do |controller|
+        response.headers['X-Stamp'] = value.map { |x; controller| controller = x.to_s; controller }.join(',')
+      end"#;
+    assert_refused(body, "stamp_header([1, 2])");
+}
+
+/// A plain reassignment of the filter block's OWN parameter, in the
+/// SAME scope, with no nested block or lambda at all. Every read after
+/// `controller = nil` is of whatever was assigned, not of the actual
+/// controller the filter runs against — rewriting it to `self` would be
+/// just as wrong as the shadowing cases above.
+#[test]
+fn a_reassignment_of_the_filter_block_param_itself_is_refused() {
+    let body = r#"      before_action(**kwargs) do |controller|
+        controller = nil
+        response.headers['X-Stamp'] = value
+      end"#;
+    assert_refused(body, "stamp_header('Accept-Language')");
+}
+
 // ---------------------------------------------------------------------
 // Byte-identical pin: an existing Symbol-target concern macro (the
 // `allow_unauthenticated_access` shape from `class_body_macro_expansion.rs`)

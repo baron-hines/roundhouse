@@ -3785,6 +3785,22 @@ fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr:
 
     let mut body = body.clone();
     if let [self_param] = params.as_slice() {
+        // `rewrite_var_to_self_ref` is a blind full-tree rewrite: it
+        // turns every `Var` read matching `self_param`'s name into
+        // `SelfRef`, with no notion of scope. Refused, rather than
+        // risked, whenever `body_shadows_param` finds either a nested
+        // block/lambda that redeclares the same name as its own
+        // parameter (`items.map { |controller| controller.name }`
+        // would wrongly become `items.map { |controller| self.name }`)
+        // or a plain reassignment of that name anywhere in the body
+        // (`controller = nil`, or a block-local's first write, which is
+        // all that's left to see of a block-local once ingestion has
+        // already dropped its declaration) — no scope-aware rewrite
+        // exists here to tell any of those apart from a genuine read of
+        // the filter block's own parameter.
+        if body_shadows_param(&body, self_param) {
+            return None;
+        }
         rewrite_var_to_self_ref(&mut body, self_param);
     }
 
@@ -3838,6 +3854,70 @@ fn is_symbol_or_symbol_array(e: &crate::expr::Expr) -> bool {
         }
         _ => super::controller::ir_symbol(e).is_some(),
     }
+}
+
+/// `true` if `expr` holds, ANYWHERE at any depth, either of two things
+/// that make rewriting every `name`-named `Var` read to `self` unsafe:
+///
+///   * a Lambda node — a nested block or a nested `->`/`lambda`/`proc`
+///     literal — that redeclares `name` as one of its own parameters
+///     (required, rest, or block-capture). That nested scope shadows
+///     the outer binding of the same name, so its body's reads of
+///     `name` mean ITS OWN parameter, not the filter block's.
+///   * an assignment (`Assign`, `OpAssign`, or a `MultiAssign` target)
+///     whose target is a local variable named `name`. Even a PLAIN
+///     reassignment in the SAME scope (`controller = nil`) means every
+///     read after that point is of whatever was assigned, not the
+///     filter block's own parameter — rewriting it to `self` would be
+///     just as wrong as the lambda-shadowing case, only without a new
+///     scope to blame.
+///
+/// Both are checked by one scan, because a block-local (`|x; name|`)
+/// shadows exactly like a declared parameter does but ISN'T checked
+/// directly: the IR doesn't represent block-locals at all (ingestion
+/// already drops them — see `block_param_names` in `ingest/expr.rs`),
+/// so there is no declaration left to see by the time this runs. What
+/// IS still visible is the ASSIGNMENT such a block almost always needs
+/// to give its local a value (`controller = x.name`) — so the
+/// assignment check below catches a block-local shadow indirectly,
+/// through its first write, even though the declaration itself is
+/// invisible.
+///
+/// See `block_filter_from_macro_stmt`'s call site for why this refuses
+/// rather than rewriting scope-aware — no scope-aware rewrite exists
+/// here to tell a shadowed/reassigned binding from the filter block's
+/// own parameter.
+fn body_shadows_param(expr: &crate::expr::Expr, name: &crate::ident::Symbol) -> bool {
+    use crate::expr::{ExprNode, LValue};
+    match &*expr.node {
+        ExprNode::Lambda { params, rest_param, block_param, .. } => {
+            if params.iter().any(|p| p == name)
+                || rest_param.as_ref() == Some(name)
+                || block_param.as_ref() == Some(name)
+            {
+                return true;
+            }
+        }
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. }
+            if n == name =>
+        {
+            return true;
+        }
+        ExprNode::MultiAssign { targets, .. }
+            if targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if n == name)) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| {
+        if !found && body_shadows_param(c, name) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Rewrite every read of `name` (a block's own declared parameter) to
