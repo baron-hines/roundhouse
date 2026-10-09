@@ -1474,19 +1474,23 @@ fn block_callback_on(arg: &Expr) -> Option<crate::dialect::CallbackOn> {
 /// them, changes the arity or the binding and is declined.
 pub(super) fn block_defaults_bindable(block: &Expr) -> bool {
     match &*block.node {
-        ExprNode::Lambda { params, rest_param, extra_params, .. } if !extra_params.is_empty() => {
+        ExprNode::Lambda { params, rest_param, extra_params, .. } => {
+            if !params.is_empty() || rest_param.is_some() {
+                return false;
+            }
+            if extra_params.is_empty() {
+                return true;
+            }
             // A default may read an earlier parameter (`|a: 1, b: a|`),
             // which the hook binds first; a local of the enclosing
             // scope (`|key: prefix|`) has no binding inside the hook.
             let mut bound: Vec<&Symbol> = Vec::new();
-            params.is_empty()
-                && rest_param.is_none()
-                && extra_params.iter().all(|p| {
-                    let ok = !p.rest
-                        && p.default.as_ref().is_some_and(|d| reads_only(d, &bound));
-                    bound.push(&p.name);
-                    ok
-                })
+            extra_params.iter().all(|p| {
+                let ok = !p.rest
+                    && p.default.as_ref().is_some_and(|d| reads_only(d, &bound));
+                bound.push(&p.name);
+                ok
+            })
         }
         _ => true,
     }
@@ -1514,9 +1518,11 @@ pub(super) fn block_callback_shape(
         // `key == 7` (bound below). Anything else stays dynamic.
         (Some(b), _) if !block_defaults_bindable(b) => return None,
         (Some(b), rest) => (b, rest),
-        (None, [first, rest @ ..])
-            if matches!(&*first.node, ExprNode::Lambda { params, extra_params, .. } if params.is_empty() && extra_params.is_empty()) =>
-        {
+        (None, [first, rest @ ..]) if matches!(
+            &*first.node,
+            ExprNode::Lambda { params, rest_param, extra_params, .. }
+                if params.is_empty() && rest_param.is_none() && extra_params.is_empty()
+        ) => {
             (first, rest)
         }
         _ => return None,

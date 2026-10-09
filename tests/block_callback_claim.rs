@@ -87,3 +87,25 @@ fn a_block_default_reading_an_earlier_parameter_lowers() {
     assert!(hooked);
     assert!(!reports_unlowered(&messages), "{messages:#?}");
 }
+
+/// Required and rest parameters are not bound by the generated parameterless
+/// hook, whether supplied as a block or a lambda argument.
+#[test]
+fn callbacks_with_required_or_rest_parameters_are_declined() {
+    for (tag, callback) in [
+        ("required-block", "before_save { |key| self.body = key }"),
+        (
+            "rest-block",
+            "before_save { |*keys| self.body = keys.first }",
+        ),
+        ("required-lambda", "before_save ->(key) { self.body = key }"),
+        (
+            "rest-lambda",
+            "before_save ->(*keys) { self.body = keys.first }",
+        ),
+    ] {
+        let (messages, hooked) = lower_with(tag, &format!("  {callback}"));
+        assert!(!hooked, "{tag} unexpectedly lowered to a hook");
+        assert!(reports_unlowered(&messages), "{tag}: {messages:#?}");
+    }
+}
