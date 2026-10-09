@@ -58,18 +58,18 @@ module CgiIo
     bad_request = false
     parse_form_into(query, params) unless query.empty?
 
+    raw_body = ""
     if method == "POST" || method == "PATCH" || method == "PUT"
       length = (env["CONTENT_LENGTH"] || "0").to_i
       ctype  = env["CONTENT_TYPE"] || ""
+      raw_body = stdin.read(length).to_s if length > 0
       if length > 0 && ctype.start_with?("application/x-www-form-urlencoded")
-        body = stdin.read(length).to_s
-        parse_form_into(body, body_params)
+        parse_form_into(raw_body, body_params)
       elsif length > 0 && ctype.start_with?("multipart/form-data")
         # File parts land in the params tree as UploadedFile objects
         # under their bracket-nested name, the way Rack nests them; see
         # runtime/multipart.rb.
-        body = stdin.read(length).to_s
-        form = ActionDispatch::Http::Multipart.parse(body, ctype)
+        form = ActionDispatch::Http::Multipart.parse(raw_body, ctype)
         form.fields.each { |k, v| assign_form_pair(body_params, k, v) }
         form.file_parts.each { |part| assign_form_pair(body_params, part.name, part.file) }
       elsif length > 0 && ctype.start_with?("application/json")
@@ -80,9 +80,8 @@ module CgiIo
         # arrays. A malformed body is Rails' 400 (`bad_request`). The
         # spinel lane's twin is Tep::Request#parse_body_params with
         # `ParamBuilder.from_json`.
-        body = stdin.read(length).to_s
         begin
-          parsed = JSON.parse(body)
+          parsed = JSON.parse(raw_body)
           root = parsed.is_a?(Hash) ? parsed : { "_json" => parsed }
           root.each { |k, v| body_params[k.to_s] = json_munge(v) }
         rescue JSON::ParserError
@@ -115,7 +114,7 @@ module CgiIo
     # same URL typed into the address bar.
     accept = env.fetch("HTTP_ACCEPT", "").to_s
 
-    { method: method, path: path, params: params, body_params: body_params, cookies: cookies, accept: accept, bad_request: bad_request }
+    { method: method, path: path, params: params, body_params: body_params, cookies: cookies, accept: accept, bad_request: bad_request, raw_body: raw_body }
   end
 
   # Rails' deep_munge on one parsed JSON value: nils inside Arrays are
