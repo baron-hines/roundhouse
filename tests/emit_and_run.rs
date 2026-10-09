@@ -9113,3 +9113,66 @@ end
         .run_test("test/controllers/test_environments_controller_test.rb")
         .assert_passes();
 }
+
+/// A Duration handed to the stdlib as a timeout, and `Timeout.timeout`
+/// answering its block's value — campfire's unfurl (`DEADLINE =
+/// 10.seconds` around the fetch, `open_timeout: 7.seconds` into
+/// `Net::HTTP.start`). The Duration did no arithmetic, so
+/// `TCPSocket.new(open_timeout:)` raised on `-` and every fetch failed;
+/// and `Timeout.timeout { record }` typed Untyped, so `render json:`
+/// wrote the record's `inspect` instead of its JSON.
+#[test]
+fn a_duration_times_out_the_stdlib_and_a_timed_block_keeps_its_type() {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  get \"/timed/:id\", to: \"articles#timed\"\n  get \"/twice\", to: \"articles#twice\"\n  resources :articles do\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", r#"class ArticlesController < ApplicationController
+  LIMIT = 2.seconds
+
+  def timed
+    card = Timeout.timeout(LIMIT) { Card.new(title: Article.find(params[:id]).title) }
+    render json: card
+  end
+
+  def twice
+    first = Article.first
+    again = Article.first
+    render plain: (first.id == again.id).to_s
+  end
+
+"#)
+        .write("app/models/card.rb", "class Card\n  include ActiveModel::Model\n\n  attr_accessor :title\nend\n")
+        .write(
+            "test/controllers/timed_articles_controller_test.rb",
+            r#"require "test_helper"
+
+require "active_record/testing/query_assertions"
+
+class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
+  include ActiveRecord::Assertions::QueryAssertions
+
+  test "a request replays an identical query, as Rails' query cache does" do
+    assert_queries_count(1) { get "/twice" }
+    assert_equal "true", response.body
+    assert_queries_count(2) { Article.first; Article.first }
+  end
+
+  test "the timed lookup renders the model's JSON" do
+    article = articles(:one)
+    get "/timed/#{article.id}"
+    assert_response :success
+    assert_equal article.title, JSON.parse(response.body)["title"]
+  end
+
+  test "a duration is a timeout the socket layer takes" do
+    server = TCPServer.new("127.0.0.1", 0)
+    socket = TCPSocket.new("127.0.0.1", server.addr[1], open_timeout: 1.second)
+    socket.close
+    server.close
+    assert_equal 1.5, (2.seconds - 0.5).to_f
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/timed_articles_controller_test.rb")
+        .assert_passes();
+}
