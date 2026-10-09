@@ -1572,6 +1572,9 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some("Object extension")
                         }
+                        // Not refused again on a receiver the constant refusal already accounts for.
+                        _ if matches!(recv_ty, None | Some(Ty::Var { .. } | Ty::Untyped))
+                            && recv.as_ref().is_some_and(|r| rooted_in_refused_constant(r)) => None,
                         _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "as_json" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
@@ -4374,6 +4377,17 @@ fn is_ivar_params_rooted(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) ->
 /// Nil: comparing nil with a non-nil value raises, so a nil result cannot
 /// occur. A single nilable element (`[maybe].min`) or an all-nilable
 /// literal can still return nil without a comparison error.
+fn rooted_in_refused_constant(expr: &Expr) -> bool {
+    match &*expr.node {
+        ExprNode::Const { .. } => matches!(
+            &expr.diagnostic,
+            Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "constant"
+        ),
+        ExprNode::Send { recv: Some(recv), .. } => rooted_in_refused_constant(recv),
+        _ => false,
+    }
+}
+
 fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args: &[Expr]) -> Option<Ty> {
     if !matches!(method.as_str(), "min" | "max") || !args.is_empty() {
         return None;
