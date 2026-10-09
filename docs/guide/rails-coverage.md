@@ -187,8 +187,9 @@ an explicit type, negotiated formats also resolve through that registry
 (`.xml` → `application/xml`). The registry is fixed; app-specific
 `Mime.register` extensions are not supported. Other String/Symbol header
 names are normalized and their values stringified. A path-string location
-is passed through, while a record in `location:` is lowered through its
-conventional singular route helper (`@article` → `article_path(@article.id)`);
+is resolved through `url_for` and stripped of header-injection controls,
+while a record in `location:` is lowered through its conventional singular
+route helper (`@article` → `article_path(@article.id)`);
 custom polymorphic routing, nested record routes, and custom `to_param`
 are not implied by this support claim. The response body is empty, and
 the runtime omits Content-Type for 1xx, 204, 205 and 304 statuses. Direct

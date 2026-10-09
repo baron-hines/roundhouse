@@ -639,7 +639,10 @@ module ActionController
         options.each do |key, value|
           @headers[normalize_head_header_name(key.to_s)] = value.to_s
         end
-        @location = ActionView::ViewHelpers.url_for(location).to_s unless location.nil?
+        unless location.nil?
+          resolved_location = ActionView::ViewHelpers.url_for(location).to_s
+          @location = ActionController.sanitize_location(resolved_location)
+        end
       end
 
       if head_includes_content?(@status)
