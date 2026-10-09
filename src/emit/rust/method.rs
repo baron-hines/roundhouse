@@ -580,8 +580,10 @@ pub(super) fn emit_instance_method(
         // Skips the case where the tail is already a block-shaped
         // expression (closes with `}`) since those are statements
         // with no value, or a return statement.
+        // A writer is emitted void (`render_return`) whatever value
+        // its Ruby body ends on, so its tail is a statement too.
         let returns_unit = !is_init
-            && matches!(return_ty.as_ref(), Some(Ty::Nil) | None);
+            && (is_setter || matches!(return_ty.as_ref(), Some(Ty::Nil) | None));
         let needs_unit_terminator = returns_unit
             && i == last_idx
             && !line.trim_end().ends_with(';')
