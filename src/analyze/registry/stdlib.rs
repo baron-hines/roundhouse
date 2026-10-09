@@ -419,6 +419,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("read_multi", Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) }),
         ("write_multi", Ty::Bool),
     ]);
+
     // `FileUtils` — a default gem / spinel's `packages/fileutils`.
     register_stdlib_class(classes, "FileUtils", &[
         ("mkdir_p", Ty::Untyped), ("makedirs", Ty::Untyped),
@@ -588,6 +589,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // its observer on any driver error (see `SQLite3::Database`).
         "SQLite3::Exception", "SQLite3::CantOpenException",
         "SQLite3::BusyException", "SQLite3::SQLException",
+        // `rescue ArgumentError, RQRCodeCore::QRCodeRunTimeError` —
+        // campfire's `QrCodeController#show` answers 400 for data too
+        // long to encode. rqrcode_core's classes on the ruby family, the
+        // spinel-rqrcode package's (same names, same raise) on spinel.
+        "RQRCodeCore::QRCodeRunTimeError", "RQRCodeCore::QRCodeArgumentError",
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
     }
@@ -774,6 +780,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "Thread::Mutex", "Comparable", "Enumerable"] {
         register_stdlib_class(classes, name, &[], &[]);
     }
+    for (class, method) in BUILTIN_BLOCK_VALUE_METHODS {
+        classes
+            .entry(ClassId(Symbol::from(*class)))
+            .or_default()
+            .block_value_methods
+            .insert(Symbol::from(*method));
+    }
     // `Array.wrap` is folded by `lower::enumerable_ext` before emit.
     // Registered so the analyzer does not report it as unknown. The
     // element type is not known from a scalar argument.
@@ -849,6 +862,20 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         register_stdlib_class(classes, gem.name, &class_methods, &instance_methods);
     }
 }
+
+/// Library methods that answer their block's value, by Ruby's (or
+/// ActiveSupport's) definition rather than by inference:
+/// `mutex.synchronize { … }` — campfire's `ResponseCache#version` is
+/// `@mutex.synchronize { current_version }` — and a cache `fetch`, which
+/// answers the block's value on a miss and what such a block wrote on a
+/// hit. Only an informative block type is adopted (`block_value_return`).
+/// Re-seeded after every harvest of the app's own block-value methods
+/// (`Analyzer::harvest_block_value_methods`), which starts from empty.
+pub(crate) const BUILTIN_BLOCK_VALUE_METHODS: &[(&str, &str)] = &[
+    ("Mutex", "synchronize"),
+    ("Thread::Mutex", "synchronize"),
+    ("ActiveSupport::Cache::MemoryStore", "fetch"),
+];
 
 fn register_stdlib_class(
     classes: &mut HashMap<ClassId, ClassInfo>,

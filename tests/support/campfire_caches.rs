@@ -355,3 +355,129 @@ puts RecordSnapshotProbe.key
         "record-snapshot-v1/db/ns/3/session/abc\n",
     ),
 };
+
+/// A controller overriding Rails' three fragment-caching hooks the way
+/// campfire's `CachedResponses` does, each through `super`: caching off
+/// for `?nocache=1`, its own bounded store, and an epoch in the key that
+/// `POST /fragments/bump` moves. `GET /fragments/:id` caches the
+/// article's title under `<% cache @article %>`.
+pub fn fragments_overlay() -> Overlay {
+    real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/fragments/:id\", to: \"fragments#show\"\n  post \"/fragments/bump\", to: \"fragments#bump\"\n",
+        )
+        .write(
+            "app/controllers/fragments_controller.rb",
+            r#"class FragmentsController < ApplicationController
+  STORE = ActiveSupport::Cache::MemoryStore.new(size: 64 * 1024)
+  EPOCH = [ 0 ]
+
+  def perform_caching
+    super && params[:nocache].nil?
+  end
+
+  def cache_store
+    STORE
+  end
+
+  def combined_fragment_cache_key(key)
+    super([ EPOCH.length, key ])
+  end
+
+  def show
+    @article = Article.find(params[:id])
+  end
+
+  def bump
+    EPOCH.push(EPOCH.length)
+    head :ok
+  end
+end
+"#,
+        )
+        .write(
+            "app/views/fragments/show.html.erb",
+            "<% cache @article do %><p><%= @article.title %></p><% end %>\n",
+        )
+}
+
+/// `QrCodeController#show`'s rescue: data too long for any QR version
+/// raises `RQRCodeCore::QRCodeRunTimeError`, answered 400; a short URL
+/// renders its SVG.
+pub fn qr_code_overlay() -> Overlay {
+    real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/qr/:size\", to: \"qr_codes#show\"\n",
+        )
+        .write(
+            "app/controllers/qr_codes_controller.rb",
+            r#"class QrCodesController < ApplicationController
+  def show
+    svg = RQRCode::QRCode.new("https://example.com/" + ("x" * params[:size].to_i)).as_svg(viewbox: true)
+    render plain: svg, content_type: "image/svg+xml"
+  rescue ArgumentError, RQRCodeCore::QRCodeRunTimeError
+    head :bad_request
+  end
+end
+"#,
+        )
+}
+
+/// A cache-through method shaped like campfire's `RecordCache.fetch`:
+/// it answers its block's value on a miss and, on a hit, the records a
+/// snapshot of that value rebuilds. Callers destructure the answer as
+/// the block's own (`@membership, @room = RecordCache.fetch(…) { … }`),
+/// so the analyzer types it as the block's value; both paths must then
+/// hand back records of those classes, in that order.
+pub const CACHE_THROUGH: Contract = Contract {
+    path: "app/models/cache_through_probe.rb",
+    source: r##"class CacheThroughProbe
+  STORE = ActiveSupport::Cache::MemoryStore.new
+
+  def self.fetch(key)
+    if snapshot = STORE.read(key)
+      return ActiveSupport::JSON.decode(snapshot).map { |name, attributes| name.constantize.instantiate(attributes) }
+    end
+
+    records = yield
+    STORE.write(key, ActiveSupport::JSON.encode(records.map { |record| [ record.class.name, record.attributes_before_type_cast ] }))
+    records
+  end
+
+  def self.pair(id)
+    article, comment = fetch("pair-#{id}") do
+      found = Article.find(id)
+      [ found, found.comments.first ]
+    end
+    [ article.title, comment.body, article.class.name, comment.class.name ]
+  end
+end
+"##,
+    script: concat!(
+        "if ActiveRecord.adapter.nil?\n",
+        "  SqliteAdapter.configure(\":memory:\")\n",
+        "  ActiveRecord.adapter = SqliteAdapter\n",
+        "  Schema.statements.each { |sql| SqliteAdapter.execute_ddl(sql) }\n",
+        "end\n",
+        r#"article = Article.create!(title: "Cached", body: "A sufficiently long article body.")
+Comment.create!(article_id: article.id, commenter: "Reader", body: "First comment")
+puts CacheThroughProbe.pair(article.id).inspect
+ActiveRecord::Base.connection.execute("UPDATE articles SET title = 'Renamed' WHERE id = #{article.id}")
+puts CacheThroughProbe.pair(article.id).inspect
+"#
+    ),
+    expected: concat!(
+        "[\"Cached\", \"First comment\", \"Article\", \"Comment\"]\n",
+        "[\"Cached\", \"First comment\", \"Article\", \"Comment\"]\n",
+    ),
+};
+
+/// The caller's signature: typed through the cache-through method.
+pub fn assert_cache_through_signature(rbs: &str) {
+    // `title`/`body` are nullable columns, and `comments.first` may be nil.
+    assert!(rbs.contains("def self.pair: (untyped id) -> [String?, String?, String, String]"), "{rbs}");
+}

@@ -116,3 +116,89 @@ fn sqlite_observer_and_checkpointer_surface_runs() {
 fn record_snapshots_and_the_bounded_store_run() {
     assert_runs(&contract::RECORD_SNAPSHOT);
 }
+
+/// Rails' fragment caching through the controller, as campfire's
+/// `CachedResponses` overrides it: a view's `<% cache %>` is served only
+/// while `perform_caching`, under `combined_fragment_cache_key`, from
+/// `cache_store` — and each override's `super` reaches Rails' own. A
+/// commit that does not touch `updated_at` is served stale until the
+/// app's epoch moves the key, as it is in Rails; the test environment
+/// caches nothing until a test turns it on.
+#[test]
+fn view_fragments_go_through_the_controllers_caching() {
+    contract::fragments_overlay()
+        .write(
+            "test/controllers/fragments_controller_test.rb",
+            r#"require "test_helper"
+
+class FragmentsControllerTest < ActionDispatch::IntegrationTest
+  setup do
+    @article = Article.create!(title: "Original", body: "A sufficiently long article body.")
+  end
+
+  teardown do
+    ActionController::Base.perform_caching = false
+  end
+
+  def foreign_title(title)
+    ActiveRecord::Base.connection.execute("UPDATE articles SET title = '#{title}' WHERE id = #{@article.id}")
+  end
+
+  test "the test environment caches nothing" do
+    get "/fragments/#{@article.id}"
+    foreign_title("Changed")
+    get "/fragments/#{@article.id}"
+    assert_includes response.body, "Changed"
+  end
+
+  test "a cached fragment is served until the key moves" do
+    ActionController::Base.perform_caching = true
+    get "/fragments/#{@article.id}"
+    assert_includes response.body, "Original"
+    foreign_title("Changed")
+    get "/fragments/#{@article.id}"
+    assert_includes response.body, "Original"
+    get "/fragments/#{@article.id}?nocache=1"
+    assert_includes response.body, "Changed"
+    post "/fragments/bump"
+    get "/fragments/#{@article.id}"
+    assert_includes response.body, "Changed"
+    assert_includes FragmentsController::STORE.inspect, "entries=2"
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/fragments_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn qr_code_capacity_error_is_rescued_by_name() {
+    contract::qr_code_overlay()
+        .write(
+            "test/controllers/qr_codes_controller_test.rb",
+            r#"require "test_helper"
+
+class QrCodesControllerTest < ActionDispatch::IntegrationTest
+  test "a short url renders and an oversized one answers 400" do
+    get "/qr/10"
+    assert_response :success
+    assert_includes response.body, "<svg"
+    get "/qr/8000"
+    assert_response :bad_request
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/qr_codes_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn a_cache_through_method_answers_its_blocks_value_on_hit_and_miss() {
+    let run = contract::CACHE_THROUGH.overlay().run_ruby(contract::CACHE_THROUGH.script);
+    run.assert_passes();
+    assert_eq!(run.stdout, contract::CACHE_THROUGH.expected, "stderr:\n{}", run.stderr);
+    let rbs = std::fs::read_to_string(run.emitted.join("sig/app/models/cache_through_probe.rbs")).unwrap();
+    contract::assert_cache_through_signature(&rbs);
+}

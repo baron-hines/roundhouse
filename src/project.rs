@@ -4395,7 +4395,9 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "SQLite3::BusyException" | "SQLite3::SQLException"
         | "FileUtils" | "ActiveRecord::ConnectionAdapters::SQLite3Adapter"
         // runtime/spinel/active_support_cache.rb.
-        | "ActiveSupport::Cache" | "ActiveSupport::Cache::MemoryStore");
+        | "ActiveSupport::Cache" | "ActiveSupport::Cache::MemoryStore"
+        // rqrcode_core's / spinel-rqrcode's.
+        | "RQRCodeCore::QRCodeRunTimeError" | "RQRCodeCore::QRCodeArgumentError");
     if !bundled {
         return None;
     }
