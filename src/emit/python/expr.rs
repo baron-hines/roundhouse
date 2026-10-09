@@ -1473,10 +1473,23 @@ fn map_builtin_method(recv: &str, method: &str, ty: Option<&Ty>, args_s: &[Strin
         // and argument swap). No-arg join uses the empty separator (Ruby's
         // `$,` default is nil → ""). Gated to Array so a user `join`
         // method on another type isn't shadowed.
-        "join" if is_array => match args_s.first() {
-            Some(sep) => format!("{sep}.join({recv})"),
-            None => format!("\"\".join({recv})"),
-        },
+        // `str.join` only accepts strings; Ruby calls `to_s` on every
+        // element, so non-Str elems go through `map(str, …)` (`[1, 2].join("-")`
+        // is "1-2"; bare `"-".join([1, 2])` is a TypeError). Array[String]
+        // stays a bare join.
+        "join" if is_array => {
+            let str_elems =
+                matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Str));
+            let items = if str_elems {
+                recv.to_string()
+            } else {
+                format!("map(str, {recv})")
+            };
+            match args_s.first() {
+                Some(sep) => format!("{sep}.join({items})"),
+                None => format!("\"\".join({items})"),
+            }
+        }
         _ => return None,
     })
 }
