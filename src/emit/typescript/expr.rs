@@ -266,6 +266,57 @@ fn const_decl(name: &str, init: Js) -> JsStmt {
     })
 }
 
+/// Ruby Int / Int floors (`-7 / 2 == -4`); JS `/` yields a float.
+fn floor_int_div(span: Span, lhs: Js, rhs: Js) -> Js {
+    Js::call(
+        span,
+        Js::member(Span::synthetic(), synth_ident("Math"), "floor"),
+        vec![Js::binary(span, "/", lhs, rhs)],
+    )
+}
+
+/// Ruby Int % Int takes the divisor's sign (`-7 % 3 == 2`); JS `%`
+/// takes the dividend's. Add the divisor only when the signs differ
+/// (`((a % b) + b) % b` can round the intermediate sum past 2**53); a
+/// zero remainder returns a literal `0` so JS's `-0` never leaks.
+/// Operands are call arguments (not consts inside a sync IIFE) so an
+/// `await` in either side stays in the enclosing async method.
+fn floor_int_mod(span: Span, lhs: Js, rhs: Js) -> Js {
+    let b = || synth_ident("__b");
+    let m = || synth_ident("__m");
+    let zero = || Js::num(span, "0");
+    let signs_differ = Js::binary(
+        span,
+        "!==",
+        Js::binary(span, "<", m(), zero()),
+        Js::binary(span, "<", b(), zero()),
+    );
+    let floored = Js::synth(JsExpr::Ternary {
+        cond: Js::binary(span, "===", m(), zero()),
+        then: zero(),
+        else_: Js::synth(JsExpr::Ternary {
+            cond: signs_differ,
+            then: Js::binary(span, "+", m(), b()),
+            else_: m(),
+        }),
+    });
+    Js::call(
+        span,
+        Js::synth(JsExpr::Arrow {
+            params: vec![js_param("__a"), js_param("__b")],
+            body: ArrowBody::Block(vec![
+                const_decl(
+                    "__m",
+                    Js::binary(span, "%", synth_ident("__a"), synth_ident("__b")),
+                ),
+                JsStmt::synth(JsStmtNode::Return(Some(floored))),
+            ]),
+            is_async: false,
+        }),
+        vec![lhs, rhs],
+    )
+}
+
 fn return_stmt(value: Option<Js>) -> JsStmt {
     JsStmt::synth(JsStmtNode::Return(value))
 }
@@ -2980,14 +3031,21 @@ fn js_send_inner(
             }
         }
         // `/` and `**` dispatch: TS has both as native operators. Only
-        // Incompatible pairs need special handling.
+        // Incompatible pairs need special handling, plus Int / Int:
+        // Ruby floors it (`-7 / 2 == -4`), JS `/` yields a float.
         if method == "/" || method == "**" {
             use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
-            if matches!(classify_div_pow(r, arg), DivPowCase::Incompatible) {
-                return iife_throw_msg(
-                    span,
-                    &format!("roundhouse: `{method}` with incompatible operand types"),
-                );
+            match classify_div_pow(r, arg) {
+                DivPowCase::Incompatible => {
+                    return iife_throw_msg(
+                        span,
+                        &format!("roundhouse: `{method}` with incompatible operand types"),
+                    );
+                }
+                DivPowCase::IntFloor if method == "/" => {
+                    return floor_int_div(span, js_expr(r), js_expr(arg));
+                }
+                _ => {}
             }
         }
         // `%` dispatch: TS has native `%` for numerics; Str % args
@@ -3003,6 +3061,9 @@ fn js_send_inner(
                 }
                 ModuloCase::Incompatible => {
                     return iife_throw_msg(span, "roundhouse: % with incompatible operand types");
+                }
+                ModuloCase::IntFloor => {
+                    return floor_int_mod(span, js_expr(r), js_expr(arg));
                 }
                 _ => {}
             }

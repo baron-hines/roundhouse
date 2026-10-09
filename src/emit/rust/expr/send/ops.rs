@@ -195,6 +195,27 @@ pub(super) fn try_binary_operator(
             ));
         }
     }
+    // Int / Int and Int % Int floor in Ruby; Rust's operators truncate.
+    if method == "/" {
+        use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
+        if matches!(classify_div_pow(r, &args[0]), DivPowCase::IntFloor) {
+            return Some(crate::emit::rust::shared::int_floor_div_mod(
+                crate::emit::rust::shared::FloorOp::Div,
+                &emit_expr(r),
+                &emit_expr(&args[0]),
+            ));
+        }
+    }
+    if method == "%" {
+        use crate::emit::shared::modulo::{classify_modulo, ModuloCase};
+        if matches!(classify_modulo(r, &args[0]), ModuloCase::IntFloor) {
+            return Some(crate::emit::rust::shared::int_floor_div_mod(
+                crate::emit::rust::shared::FloorOp::Mod,
+                &emit_expr(r),
+                &emit_expr(&args[0]),
+            ));
+        }
+    }
     // Array `&` / `|`: `Vec` has no such operator (the fall-through
     // would print `.&(…)`). Collect first occurrences, keeping order.
     // Same-elem only: mismatched Array element types have no common
@@ -229,7 +250,10 @@ pub(super) fn try_binary_operator(
             SetOpCase::Unknown => {}
         }
     }
-    if matches!(method, "==" | "!=" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/" | "&" | "|") {
+    if matches!(
+        method,
+        "==" | "!=" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/" | "%" | "&" | "|"
+    ) {
         // Binary-op LHS is a primary-demanding position. Without
         // the wrap, `x.len() as i64 < y` parses as the start of a
         // turbofish (`i64<y, …>`). Decide pass stamps the bit;

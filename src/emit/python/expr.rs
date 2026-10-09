@@ -1254,14 +1254,19 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
         }
         // `/` and `**` dispatch: Python has both natively. Ruby's Int/Int
         // is integer division (towards -infinity); Python's `/` is true
-        // division, and `//` is floor. For now emit `/` unconditionally;
-        // refine if an Int/Int case forces the floor-div distinction.
+        // division, and `//` is floor, so Int / Int emits `//`.
         if method == "/" || method == "**" {
             use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
-            if matches!(classify_div_pow(r, arg), DivPowCase::Incompatible) {
-                return format!(
-                    r#"(_ for _ in ()).throw(TypeError("roundhouse: `{method}` with incompatible operand types"))"#
-                );
+            match classify_div_pow(r, arg) {
+                DivPowCase::Incompatible => {
+                    return format!(
+                        r#"(_ for _ in ()).throw(TypeError("roundhouse: `{method}` with incompatible operand types"))"#
+                    );
+                }
+                DivPowCase::IntFloor if method == "/" => {
+                    return format!("{} // {}", emit_expr(r), emit_expr(arg));
+                }
+                _ => {}
             }
         }
         // `%` dispatch: Python's native `%` covers numeric and string
