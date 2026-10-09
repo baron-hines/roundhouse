@@ -37,6 +37,20 @@ fn a_block_callback_with_keyword_defaults_runs_with_them() {
         .assert_passes();
 }
 
+/// Folding callbacks into one hook must not make nested lambdas from
+/// different callbacks capture the same generated default local.
+#[test]
+fn callbacks_keep_distinct_captured_default_locals() {
+    super::emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  before_save { |a: \"first\", key: a| @callback = -> { key } }\n  before_save { |key: \"second\"| self.body = @callback.call }\n",
+        )
+        .run_ruby("article = Article.create!(title: \"T\", body: \"long enough body\")\nraise \"expected first callback's captured value, got #{article.body.inspect}\" unless article.body == \"first\"\nputs \"ok\"\n")
+        .assert_passes();
+}
+
 /// A required keyword (`|key:|`) has no default to bind: the block is not
 /// spliced into a hook body with `key` unbound.
 #[test]

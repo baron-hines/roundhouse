@@ -1492,7 +1492,7 @@ pub(super) fn block_defaults_bindable(block: &Expr) -> bool {
                 ok
             })
         }
-        _ => true,
+        _ => false,
     }
 }
 
@@ -1570,6 +1570,100 @@ fn reads_only(expr: &Expr, bound: &[&Symbol]) -> bool {
     }
 }
 
+fn collect_local_names(expr: &Expr, names: &mut std::collections::HashSet<Symbol>) {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => {
+            names.insert(name.clone());
+        }
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+            names.insert(name.clone());
+        }
+        ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => {
+            names.insert(name.clone());
+        }
+        ExprNode::MultiAssign { targets, .. } => {
+            names.extend(targets.iter().filter_map(|target| match target {
+                LValue::Var { name, .. } => Some(name.clone()),
+                _ => None,
+            }));
+        }
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+            names.extend(params.iter().cloned());
+            names.extend(rest_param.iter().cloned());
+            names.extend(extra_params.iter().map(|p| p.name.clone()));
+            names.extend(block_param.iter().cloned());
+        }
+        _ => {}
+    }
+    expr.node.for_each_child(&mut |child| collect_local_names(child, names));
+}
+
+fn fresh_callback_local(
+    span: Span,
+    index: usize,
+    occupied: &mut std::collections::HashSet<Symbol>,
+) -> Symbol {
+    let base = format!("__roundhouse_callback_{}_{}", span.start, index);
+    let mut suffix = 0;
+    loop {
+        let name = Symbol::from(format!("{base}_{suffix}"));
+        if occupied.insert(name.clone()) {
+            return name;
+        }
+        suffix += 1;
+    }
+}
+
+/// Rename callback-local references while respecting nested lambda bindings.
+/// Unshadowed nested lambdas deliberately follow the renamed outer binding so
+/// each folded callback closure retains its own value.
+fn rename_callback_locals(expr: &mut Expr, renames: &std::collections::HashMap<Symbol, Symbol>) {
+    match &mut *expr.node {
+        ExprNode::Var { name, .. } => {
+            if let Some(replacement) = renames.get(name) {
+                *name = replacement.clone();
+            }
+        }
+        ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => {
+            if let LValue::Var { name, .. } = target {
+                if let Some(replacement) = renames.get(name) {
+                    *name = replacement.clone();
+                }
+            }
+            expr.node.for_each_child_mut(&mut |child| rename_callback_locals(child, renames));
+        }
+        ExprNode::MultiAssign { targets, .. } => {
+            for target in targets {
+                if let LValue::Var { name, .. } = target {
+                    if let Some(replacement) = renames.get(name) {
+                        *name = replacement.clone();
+                    }
+                }
+            }
+            expr.node.for_each_child_mut(&mut |child| rename_callback_locals(child, renames));
+        }
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
+            let visible: std::collections::HashMap<Symbol, Symbol> = renames
+                .iter()
+                .filter(|(name, _)| {
+                    !params.contains(name)
+                        && rest_param.as_ref() != Some(name)
+                        && !extra_params.iter().any(|p| &p.name == *name)
+                        && block_param.as_ref() != Some(name)
+                })
+                .map(|(name, replacement)| (name.clone(), replacement.clone()))
+                .collect();
+            for param in extra_params {
+                if let Some(default) = &mut param.default {
+                    rename_callback_locals(default, &visible);
+                }
+            }
+            rename_callback_locals(body, &visible);
+        }
+        _ => expr.node.for_each_child_mut(&mut |child| rename_callback_locals(child, renames)),
+    }
+}
+
 fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr) {
     {
         let Some((callback, hook_name, on)) = block_callback_shape(expr) else {
@@ -1587,23 +1681,55 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         let lambda_body = if extra_params.is_empty() {
             lambda_body.clone()
         } else {
+            let mut occupied = std::collections::HashSet::new();
+            for method in methods.iter() {
+                occupied.extend(method.params.iter().map(|p| p.name.clone()));
+                if let Some(param) = &method.block_param {
+                    occupied.insert(param.name.clone());
+                }
+                collect_local_names(&method.body, &mut occupied);
+            }
+            collect_local_names(lambda_body, &mut occupied);
+            for param in extra_params {
+                occupied.insert(param.name.clone());
+                if let Some(default) = &param.default {
+                    collect_local_names(default, &mut occupied);
+                }
+            }
+            let renames: std::collections::HashMap<Symbol, Symbol> = extra_params
+                .iter()
+                .enumerate()
+                .map(|(index, param)| {
+                    (
+                        param.name.clone(),
+                        fresh_callback_local(expr.span, index, &mut occupied),
+                    )
+                })
+                .collect();
+            let mut body = lambda_body.clone();
+            rename_callback_locals(&mut body, &renames);
             let mut stmts: Vec<Expr> = extra_params
                 .iter()
                 .filter_map(|p| {
                     p.default.as_ref().map(|d| {
+                        let mut default = d.clone();
+                        rename_callback_locals(&mut default, &renames);
                         Expr::new(
                             d.span,
                             ExprNode::Assign {
-                                target: LValue::Var { id: VarId(0), name: p.name.clone() },
-                                value: d.clone(),
+                                target: LValue::Var {
+                                    id: VarId(0),
+                                    name: renames[&p.name].clone(),
+                                },
+                                value: default,
                             },
                         )
                     })
                 })
                 .collect();
-            match &*lambda_body.node {
+            match &*body.node {
                 ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
-                _ => stmts.push(lambda_body.clone()),
+                _ => stmts.push(body),
             }
             seq(stmts)
         };

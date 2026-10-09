@@ -109,3 +109,15 @@ fn callbacks_with_required_or_rest_parameters_are_declined() {
         assert!(reports_unlowered(&messages), "{tag}: {messages:#?}");
     }
 }
+
+/// A method-reference block cannot be spliced into a generated hook; it
+/// must remain unclaimed rather than silently disappearing.
+#[test]
+fn a_method_reference_callback_is_declined() {
+    let (messages, hooked) = lower_with(
+        "method-reference",
+        "  before_save(&method(:callback))",
+    );
+    assert!(!hooked);
+    assert!(reports_unlowered(&messages), "{messages:#?}");
+}
