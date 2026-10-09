@@ -8,7 +8,9 @@ fn mri_jobs_and_oracle_caches_use_the_central_ruby_line() {
     let workflow: serde_yaml_ng::Value = serde_yaml_ng::from_str(&source).unwrap();
     let minimum = fs::read_to_string(".ruby-version").unwrap();
     assert_eq!(workflow["env"]["MRI_RUBY"].as_str(), Some(minimum.trim()));
-    let (mut mri, mut jruby, mut oracles) = (0, 0, 0);
+    let next = workflow["env"]["MRI_RUBY_NEXT"].as_str().expect("MRI_RUBY_NEXT");
+    assert_ne!(next, minimum.trim(), "the next-line lane must not repeat the minimum");
+    let (mut mri, mut mri_next, mut jruby, mut oracles) = (0, 0, 0, 0);
     for (name, job) in workflow["jobs"].as_mapping().unwrap() {
         assert!(job["env"].get("MRI_RUBY").is_none(), "{name:?} shadows MRI");
         for step in job["steps"].as_sequence().unwrap() {
@@ -20,6 +22,14 @@ fn mri_jobs_and_oracle_caches_use_the_central_ruby_line() {
             if uses.starts_with("ruby/setup-ruby@") {
                 match step["with"]["ruby-version"].as_str() {
                     Some("${{ env.MRI_RUBY }}") => mri += 1,
+                    Some("${{ env.MRI_RUBY_NEXT }}") => {
+                        assert_eq!(
+                            name.as_str(),
+                            Some("compare-ruby-next"),
+                            "the next MRI line belongs to compare-ruby-next"
+                        );
+                        mri_next += 1;
+                    }
                     Some("jruby-10.0") => jruby += 1,
                     version => panic!("{name:?} bypasses the MRI selector: {version:?}"),
                 }
@@ -31,7 +41,7 @@ fn mri_jobs_and_oracle_caches_use_the_central_ruby_line() {
             }
         }
     }
-    assert!(mri > 0 && jruby > 0 && oracles > 0);
+    assert!(mri > 0 && mri_next == 1 && jruby > 0 && oracles > 0);
 }
 
 /// Active Node work uses one current major. A leftover Node 20 pin

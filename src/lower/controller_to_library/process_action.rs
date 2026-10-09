@@ -8,6 +8,7 @@ use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+use super::rewrites;
 use super::util::method_name_for_action;
 
 /// A statement in the synthesized before_action preamble — the filter
@@ -15,6 +16,8 @@ use super::util::method_name_for_action;
 /// method defined on this controller or an ancestor (`authenticate_user`
 /// on ApplicationController firing for every subclass action); `Block`
 /// inlines a block-form filter's body (`before_action { @page = page }`).
+/// `Lead` is not a filter: an always-on head of `process_action`
+/// (ParamsWrapper) that Rails runs outside the callback chain.
 /// `halt_check` appends `return if performed?` after the statement —
 /// Rails' halting semantics: a filter that renders or redirects skips
 /// the action. It's set only when the filter body can respond, so
@@ -36,6 +39,8 @@ pub(super) enum PreambleStmt {
         unless_cond_expr: Option<Expr>,
         halt_check: bool,
     },
+    /// Always-on head of `process_action` — not a before_action.
+    Lead { body: Expr },
 }
 
 /// Build the `process_action(action_name)` dispatcher:
@@ -104,6 +109,7 @@ pub(super) fn dispatcher_bodies<'a>(
                 out.push(body);
                 out.extend([if_cond_expr, unless_cond_expr].into_iter().flatten());
             }
+            PreambleStmt::Lead { body } => out.push(body),
         }
     }
     out.extend(wraps.around.iter().flat_map(filter_guards));
@@ -178,6 +184,7 @@ pub(super) fn synthesize_process_action(
                 };
                 (stmt, *halt_check)
             }
+            PreambleStmt::Lead { body } => (body.clone(), false),
         };
         stmts.push(stmt);
         if halt_check {
@@ -243,6 +250,8 @@ pub(super) fn synthesize_process_action(
                     }),
                     None => body.clone(),
                 },
+                // `Lead` is preamble-only; after filters never carry one.
+                PreambleStmt::Lead { body } => body.clone(),
             });
         }
     }
@@ -285,6 +294,15 @@ pub(super) fn synthesize_process_action(
     if let Some(first) = publics.first() {
         body.inherit_span(first.body.span);
     }
+
+    // Action bodies already run `rewrite_request_format` through
+    // `lower_action_body`. Everything *spliced into* this dispatcher —
+    // filter `if:`/`unless:` lambdas, block-form filter bodies
+    // (`before_action -> { … }`), and `rescue_from` handlers — skips
+    // that pipeline. One pass over the finished body closes the class
+    // of gap (map_expr walks If / Seq / Lambda / BeginRescue). The
+    // transform is idempotent on already-rewritten action-arm Sends.
+    body = rewrites::rewrite_request_format(&body);
 
     let param_sym = Symbol::from(param);
     MethodDef {
@@ -429,6 +447,11 @@ fn cond_from_guards(
     if let Some(name) = unless_cond {
         conds.push(negate(predicate(name)));
     }
+    // `request.format.<pred>?` in these exprs is rewritten once over
+    // the finished `process_action` body in `synthesize_process_action`
+    // (same helper action bodies get via `lower_action_body`). Do not
+    // re-apply here — that would special-case only the guard combiner
+    // and leave block-form filter / rescue bodies still raw.
     if let Some(c) = if_cond_expr {
         conds.push(c.clone());
     }
