@@ -718,7 +718,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::Int),
     },
     CatalogedMethod {
         name: "insert",

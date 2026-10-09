@@ -615,10 +615,16 @@ module ActiveRecord
 
     # Bulk DELETE without instantiating records or running callbacks —
     # ActiveRecord's `Model.delete_all` (used by seeds/tests for table
-    # resets; `Relation#delete_all` covers the scoped form).
+    # resets; `Relation#delete_all` covers the scoped form). Returns
+    # the affected-row count, as Rails does. This default is the
+    # compile surface: the strict targets' adapter contract has no
+    # `changes`, and their models carry the lowerer-emitted Db-direct
+    # override, so the count is read before the delete. The
+    # ruby-family connection.rb reopen answers with the exact count.
     def self.delete_all
+      n = _adapter_count
       ActiveRecord.adapter.delete_all(table_name)
-      nil
+      n
     end
 
     def self.destroy_all

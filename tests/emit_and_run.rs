@@ -8641,3 +8641,30 @@ fn array_set_operators_are_not_native_infix_on_typed_targets() {
         assert!(src.contains(union), "{target:?} `|`:\n{src}");
     }
 }
+
+/// `Model.delete_all` returns the affected-row count, as Rails does —
+/// the class form and the scoped `Relation` form alike. The class form
+/// used to type as `Int` while running to `nil`.
+#[test]
+fn delete_all_returns_affected_row_count() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/article_delete_all_test.rb",
+            r#"require "test_helper"
+
+class ArticleDeleteAllTest < ActiveSupport::TestCase
+  test "delete_all returns the number of rows deleted" do
+    Comment.delete_all
+    Article.delete_all
+    3.times { |i| Article.create!(title: "gone-#{i}", body: "Body text here") }
+    Article.create!(title: "kept", body: "Body text here")
+    assert_equal 3, Article.where("title LIKE 'gone-%'").delete_all
+    assert_equal 1, Article.delete_all
+    assert_equal 0, Article.delete_all
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_delete_all_test.rb")
+        .assert_passes();
+}
