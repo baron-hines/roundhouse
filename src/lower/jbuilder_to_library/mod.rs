@@ -713,9 +713,13 @@ fn emit_object_filled(raw_stmts: &[&Expr], ctx: &Ctx) -> (Vec<Expr>, bool) {
         // emitted for the single DSL statement attributes back to it.
         let src_span = raw_stmts[index].span;
         // An array is a value even when it is empty (`_array` sets
-        // `[]`); a partial's object is empty when the partial sets
+        // `[]`); a partial's object is empty when the partial may set
         // nothing.
-        let filled = matches!(only, JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. });
+        let filled = match only {
+            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } => true,
+            JbStmt::Partial { partial_path, .. } => partial_always_filled(partial_path, ctx),
+            _ => false,
+        };
         let whole = match only {
             JbStmt::ArrayPartial { collection, partial_path, item_var } => {
                 Some(emit_array_partial(collection, partial_path, item_var, ctx))
@@ -1720,8 +1724,12 @@ fn emit_array_block(collection: &Expr, item_var: &Symbol, body: &Expr, ctx: &Ctx
     } else {
         crate::expr::BlockStyle::Do
     };
+    // Whether every element sets a pair: a partial may set nothing,
+    // unless its template always does.
+    let mut filled = false;
     let element = match single_partial {
         Some((partial_path, locals)) => {
+            filled = partial_always_filled(&partial_path, ctx);
             // The arguments get the rewrites a `PairPartial` argument
             // gets (`<x>_url` to its absolute URL, `h`).
             let locals = locals
@@ -1734,7 +1742,9 @@ fn emit_array_block(collection: &Expr, item_var: &Symbol, body: &Expr, ctx: &Ctx
             let mut inner = ctx.clone();
             inner.accumulator = format!("{}_{}", ctx.accumulator, item_var.as_str());
             let mut exprs = vec![assign_accumulator_string_new(&inner.accumulator)];
-            exprs.extend(emit_object(&stmts, &inner));
+            let (object, always) = emit_object_filled(&stmts, &inner);
+            filled = always;
+            exprs.extend(object);
             let mut result = var_ref(Symbol::from(inner.accumulator.as_str()));
             result.hint = Some(IrHint::StringBuilderResult);
             exprs.push(result);
@@ -1762,7 +1772,26 @@ fn emit_array_block(collection: &Expr, item_var: &Symbol, body: &Expr, ctx: &Ctx
             value: collection.clone(),
         },
     );
-    let mapped = send(Some(var_ref(col.clone())), "map", Vec::new(), Some(block), false);
+    let mut mapped = send(Some(var_ref(col.clone())), "map", Vec::new(), Some(block), false);
+    // Jbuilder drops an element whose block sets nothing
+    // (`_map_collection` deletes BLANK): `.reject { |e| e == "{}" }`
+    // when an element may be empty. Only an empty object is `{}`.
+    if !filled {
+        let el = Symbol::from("__el");
+        let is_blank = send(Some(var_ref(el.clone())), "==", vec![lit_str("{}".to_string())], None, false);
+        let reject = Expr::new(
+            Span::synthetic(),
+            ExprNode::Lambda {
+                extra_params: Vec::new(),
+                rest_param: None,
+                params: vec![el],
+                block_param: None,
+                body: is_blank,
+                block_style: crate::expr::BlockStyle::Brace,
+            },
+        );
+        mapped = send(Some(mapped), "reject", Vec::new(), Some(reject), false);
+    }
     let joined = send(Some(mapped), "join", vec![lit_str(",".to_string())], None, true);
     // Jbuilder's `array!` answers `[]` for a nil collection, and
     // `json.<key>(nil) { … }` goes through it.
@@ -1910,6 +1939,10 @@ pub(crate) struct PartialParams {
     /// Each partial's ivar parameters: the ivar, then its parameter.
     ivars: std::collections::HashMap<(String, String), Vec<(Symbol, Symbol)>>,
     closures: std::collections::HashMap<Symbol, Vec<Symbol>>,
+    /// The partials whose every render is a non-empty value: an object
+    /// with a pair on every path, or an array. A render of any other
+    /// partial may come out `{}`, which Jbuilder treats as BLANK.
+    filled: std::collections::HashSet<(String, String)>,
 }
 
 impl PartialParams {
@@ -1987,10 +2020,49 @@ fn partial_params(app: &App) -> PartialParams {
             }
             ivars.push((iv.clone(), param));
         }
+        if template_always_filled(&flatten_cache_blocks(stmts_of(&v.body))) {
+            out.filled.insert(key.clone());
+        }
         out.params.insert(key.clone(), names);
         out.ivars.insert(key, ivars);
     }
     out
+}
+
+/// Whether a template's every render is a non-empty value: a lone
+/// `json.array!` (an array, even an empty one), or an object with a
+/// pair on every path. Conservative: a partial or a block on another
+/// call counts as possibly empty.
+fn template_always_filled(stmts: &[&Expr]) -> bool {
+    let mut dsl = stmts.iter().map(|s| classify(s)).filter(|c| !matches!(c, JbStmt::Local));
+    if let (Some(JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. }), None) = (dsl.next(), dsl.next()) {
+        return true;
+    }
+    sets_a_pair(stmts)
+}
+
+/// Whether every run of `stmts`, as an object's statements, sets a pair.
+fn sets_a_pair(stmts: &[&Expr]) -> bool {
+    stmts.iter().any(|s| match classify(s) {
+        JbStmt::Extract { attrs, .. } => !attrs.is_empty(),
+        JbStmt::Pair { .. } | JbStmt::PairPartial { .. } | JbStmt::PairBlock { .. } => true,
+        JbStmt::Nested { body, .. } => sets_a_pair(&flatten_cache_blocks(stmts_of(body))),
+        JbStmt::Cond { then_branch, else_branch, .. } => {
+            sets_a_pair(&branch_stmts(then_branch)) && sets_a_pair(&branch_stmts(else_branch))
+        }
+        // The body's pairs, or a rescue's after them (`emit_guarded`).
+        JbStmt::Guarded { body, rescues } => {
+            sets_a_pair(&branch_stmts(body)) && rescues.iter().all(|r| sets_a_pair(&branch_stmts(&r.body)))
+        }
+        _ => false,
+    })
+}
+
+/// Whether a render of `partial_path` from this template is always a
+/// non-empty value (`PartialParams::filled`).
+fn partial_always_filled(partial_path: &str, ctx: &Ctx) -> bool {
+    let (mod_path, method) = partial_target(partial_path, &ctx.resource_dir);
+    ctx.partials.filled.contains(&partial_key(&mod_path, &method))
 }
 
 /// Each jbuilder template's partial renders: the partial's key, its
