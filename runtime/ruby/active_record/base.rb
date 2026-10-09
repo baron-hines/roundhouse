@@ -958,6 +958,36 @@ module ActiveRecord
       self
     end
 
+    # `#lock!` (`ActiveRecord::Locking::Pessimistic#lock!`) — reloads
+    # the record with a row lock and answers self. SQLite is a single
+    # writer with no `SELECT … FOR UPDATE` support, so inside a
+    # transaction a plain `reload` already gives the guarantee Rails
+    # extracts from the row lock: the enclosing `BEGIN` serializes
+    # writers, so nothing can land between this read and a following
+    # write in the same transaction. A Postgres adapter would spell
+    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
+    # runtime keeps the Rails signature but doesn't need the clause.
+    def lock!(lock = true)
+      reload
+    end
+
+    # `#with_lock` (`ActiveRecord::Locking::Pessimistic#with_lock`) —
+    # locks the record, then runs the block inside a transaction,
+    # answering the block's value. Dispatches through
+    # `self.class.transaction` (same `self.class.` pattern as
+    # `schema_columns` elsewhere in this file) rather than a bare
+    # `transaction`: Base has no instance-level transaction delegator
+    # like Rails' `ActiveRecord::Transactions#transaction`, only the
+    # class one in connection.rb. An exception raised in the block
+    # rolls the transaction back and re-raises, same as `transaction`
+    # itself.
+    def with_lock(*args)
+      self.class.transaction do
+        lock!
+        yield
+      end
+    end
+
     # ---- Lifecycle hooks (no-ops; subclasses override) --------------
 
     # Fired by the synthesized `initialize` tail and the hydration

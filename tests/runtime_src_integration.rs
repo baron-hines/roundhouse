@@ -816,7 +816,11 @@ fn every_runtime_method_body_concretely_typed() {
     // block/return gradual after `sec: Integer | Float` — polymorphic yield.
     // `AttachedMany#attachments` stays typed via raw SQL + ManyAttachment
     // (not Relation over the synthesized Attachment MODEL).
-    const CEILING: usize = 304;
+    // `ActiveRecord::Base#with_lock` (#644) adds 1: its block's return
+    // value is gradual, same `untyped` escape as `self.transaction`'s
+    // block value (`lock!` itself stays concretely typed — it's a
+    // plain `reload`).
+    const CEILING: usize = 305;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

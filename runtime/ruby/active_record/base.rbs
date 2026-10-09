@@ -230,6 +230,11 @@ module ActiveRecord
     def destroy: () -> Base
     def destroy!: () -> Base
     def reload: () -> Base
+    # `lock!` reloads (see the note on the body); `with_lock` runs the
+    # block in a transaction and answers its value, same gradual
+    # `untyped` escape as `self.transaction` in connection.rbs.
+    def lock!: (?bool lock) -> Base
+    def with_lock: (*untyped args) { () -> untyped } -> untyped
     # `touch` is no-arg on purpose; see the note on the body.
     def touch: () -> bool
 
