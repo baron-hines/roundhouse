@@ -13,8 +13,9 @@
 # after config.ru, and threads do not survive a fork), keyed by pid like
 # the WAL checkpointer. The thread blocks on a Thread::Queue rather than
 # polling, and takes its own Db lease per pass, as `Main.job_loop` does.
-# The queue itself is thread_state's: a shared Array under a lock.
-# Nothing is retried and nothing survives a restart: the ledgered limit
+# The queue itself is thread_state's: a shared Array under a lock, of
+# closures and serialized ActiveJob payloads (`enqueue_payload`, below),
+# drained in the order they arrived. Nothing is retried and nothing survives a restart: the ledgered limit
 # of the in-process queue (docs/pipeline/runtime.md).
 module ActiveJob
   @drain_pid = nil
@@ -34,6 +35,7 @@ module ActiveJob
   class << self
     alias_method :record_performed_for_tests, :record_performed
     alias_method :enqueue_locked, :enqueue
+    alias_method :enqueue_payload_locked, :enqueue_payload
   end
 
   def self.record_performed(job_name)
@@ -44,6 +46,14 @@ module ActiveJob
   def self.enqueue(work)
     start_drainer if @drain_pid != Process.pid
     enqueue_locked(work)
+    @wake << true
+    nil
+  end
+
+  # A serialized job (`lower::job_payload`) wakes the same drain.
+  def self.enqueue_payload(json)
+    start_drainer if @drain_pid != Process.pid
+    enqueue_payload_locked(json)
     @wake << true
     nil
   end

@@ -201,9 +201,21 @@ module ActiveJob
   # never holds the queue against the requests still enqueueing.
   QUEUE_LOCK = Mutex.new
 
+  # Both kinds of entry go in under the one lock, the entry and its
+  # `ORDER` mark together, so the drain never sees a mark without its
+  # entry (see `PAYLOADS` in the shared file).
   def self.enqueue(work)
     QUEUE_LOCK.synchronize do
       PENDING << work
+      ORDER << "p"
+    end
+    nil
+  end
+
+  def self.enqueue_payload(json)
+    QUEUE_LOCK.synchronize do
+      PAYLOADS << json
+      ORDER << "j"
     end
     nil
   end
@@ -211,7 +223,7 @@ module ActiveJob
   def self.pending_count
     n = 0
     QUEUE_LOCK.synchronize do
-      n = PENDING.length
+      n = PENDING.length + PAYLOADS.length
     end
     n
   end
@@ -219,14 +231,27 @@ module ActiveJob
   def self.drain
     ran = 0
     while true
+      kind = ""
       work = nil
+      json = nil
       QUEUE_LOCK.synchronize do
-        work = PENDING.shift if PENDING.length > 0
+        if ORDER.length > 0
+          kind = ORDER.shift
+          if kind == "p"
+            work = PENDING.shift
+          else
+            json = PAYLOADS.shift
+          end
+        end
       end
-      break if work.nil?
+      break if kind == ""
       begin
-        work.call
-        ran = ran + 1
+        if !work.nil?
+          work.call
+          ran = ran + 1
+        elsif !json.nil?
+          ran = ran + 1 if perform_payload(json)
+        end
       rescue StandardError => e
         warn "[job] a queued job raised: " + e.message
       end

@@ -190,7 +190,7 @@ not add generic class-object/Relation support to strict targets.
 | Component | Status |
 |---|---|
 | Action Cable | Every server target: `/cable`, `turbo_stream_from` subscriptions, model broadcasts. Campfire tier adds application channels with `subscribed`/`unsubscribed`, `stream_for`, and presence. |
-| Active Job | Campfire tier: `perform_later` runs on an in-process queue in the app; `ActiveJob::TestHelper` assertions in the tests. No external queue adapter. |
+| Active Job | Campfire tier: `perform_later` runs on an in-process queue in the app; `ActiveJob::TestHelper` assertions in the tests. On the Ruby-family lanes a job is queued as a serialized ActiveJob payload (GlobalID records, primitives, Symbols, Times and Arrays of them), honoring `queue_as`, `discard_on ActiveJob::DeserializationError` and `enqueue_after_transaction_commit`; a job with other argument types keeps a closure, with a warning. No external queue adapter. |
 | Active Storage | Campfire tier: blobs and attachments, the disk service, the engine's routes (redirect and representation), variants via libvips on Spinel. No cloud services. |
 | Action Text | Campfire tier: `has_rich_text`, the safe-list sanitizer, attachment rendering. |
 | Action Mailer | Ruby tier: mailer classes, `mail(...)`, `deliver_now`/`deliver_later` — delivery appends to `ActionMailer::Base.deliveries` (Rails' `:test` method, which the emitted tests assert against). No SMTP. |

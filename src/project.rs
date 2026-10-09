@@ -3424,6 +3424,29 @@ fn apply_cable_channels(files: &mut [(String, String)], app: &App) {
 ///
 /// A SPAN REPLACE between two markers, not a match on today's text —
 /// same reason `apply_cable_connection` gives.
+/// Write `JobRegistry` — each payload job's writer and reader, and the
+/// record locators they use — into `runtime/job_registry.rb`, from
+/// `App::job_plans`. A span replace between markers, like
+/// `apply_global_id_locate`; an app with no payload jobs keeps a
+/// registry whose `perform` answers false.
+fn apply_job_registry(files: &mut [(String, String)], app: &App) {
+    const HEAD: &str = "  # >>> generated: job-registry\n";
+    const TAIL: &str = "  # <<< generated: job-registry\n";
+    let generated = format!(
+        "{HEAD}{}{TAIL}",
+        crate::lower::job_payload::registry_source(&app.job_plans)
+    );
+    for (path, content) in files.iter_mut() {
+        if !path.ends_with("job_registry.rb") {
+            continue;
+        }
+        let Some(start) = content.find(HEAD) else { continue };
+        let Some(rel_end) = content[start..].find(TAIL) else { continue };
+        let end = start + rel_end + TAIL.len();
+        content.replace_range(start..end, &generated);
+    }
+}
+
 fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
     const HEAD: &str = "    # >>> generated: global-id-locate\n";
     const TAIL: &str = "    # <<< generated: global-id-locate\n";
@@ -4713,6 +4736,14 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         files.push(("sig/runtime/json_column.rbs".to_string(), rbs));
     }
 
+    // ActiveJob payload codecs. Same reason as the JSON-column sidecar:
+    // the readers take parsed JSON, which only the sidecar can type.
+    {
+        let rbs = crate::runtime_files::read_to_string("runtime/spinel/active_job_serialization.rbs")
+            .map_err(|e| format!("read runtime/spinel/active_job_serialization.rbs: {e}"))?;
+        files.push(("sig/runtime/active_job_serialization.rbs".to_string(), rbs));
+    }
+
     // Duration sidecar — pins @seconds Integer so ago/from_now stay
     // Time-typed under AOT inference (an untyped @seconds widens the
     // temporal arithmetic to poly against the Time-typed C return).
@@ -5184,6 +5215,8 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // a method nothing defined.
     apply_global_id_locate(&mut files, app);
     apply_attachable_locate(&mut files, app);
+    // Same reason: both lanes require `runtime/job_registry.rb`.
+    apply_job_registry(&mut files, app);
     apply_views_aggregator(&mut files);
     apply_models_aggregator(&mut files);
     apply_module_mixins(&mut files, app, MixinForm::Reopen);

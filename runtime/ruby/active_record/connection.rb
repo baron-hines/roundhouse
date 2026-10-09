@@ -127,6 +127,25 @@ module ActiveRecord
     end
   end
 
+  # The edges of `Model.transaction`, for work that has to wait for the
+  # COMMIT. No-ops here, so this file stays self-contained; the
+  # Ruby-family job registry (runtime/job_registry.rb) redefines them to
+  # hold the ActiveJob payloads of jobs that set
+  # `enqueue_after_transaction_commit`, and a later definition wins.
+  module TransactionHooks
+    def self.began
+      nil
+    end
+
+    def self.committed
+      nil
+    end
+
+    def self.rolled_back
+      nil
+    end
+  end
+
   # Row set from `Connection#execute` / `#exec_query`. Mirrors the
   # slice of `ActiveRecord::Result` the corpus uses: `to_a`, `first`,
   # `each`, `rows`.
@@ -428,14 +447,19 @@ module ActiveRecord
     # under this flat implementation. They exist on the signature so a
     # call that passes them (directly, or via `with_lock`) doesn't
     # raise `ArgumentError`.
+    #
+    # Each edge is reported to `TransactionHooks` (above).
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       Db.exec("BEGIN")
+      ActiveRecord::TransactionHooks.began
       begin
         result = yield
         Db.exec("COMMIT")
+        ActiveRecord::TransactionHooks.committed
         result
       rescue => e
         Db.exec("ROLLBACK")
+        ActiveRecord::TransactionHooks.rolled_back
         raise e
       end
     end
