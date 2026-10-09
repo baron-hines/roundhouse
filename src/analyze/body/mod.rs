@@ -2738,7 +2738,8 @@ pub(crate) fn union_of(a: Ty, b: Ty) -> Ty {
         return a;
     }
     if a == b {
-        return a;
+        // `==` ignores record field order; keep the canonical one.
+        return Ty::canonical_min(a, b);
     }
     // Structural join for same-shape generic containers — `Hash<A,B>
     // | Hash<C,D>` is more usefully expressed as `Hash<A|C, B|D>`
@@ -2821,11 +2822,13 @@ fn push_union_variants(t: Ty, out: &mut Vec<Ty>) {
             }
             out.push(Ty::Array { elem });
         }
-        other => {
-            if !out.contains(&other) {
-                out.push(other);
-            }
-        }
+        other => match out.iter_mut().find(|v| **v == other) {
+            // An equal variant can differ in record field order; keep
+            // the canonical one so the result doesn't depend on which
+            // arrived first.
+            Some(existing) => *existing = Ty::canonical_min(existing.clone(), other),
+            None => out.push(other),
+        },
     }
 }
 
@@ -4098,6 +4101,73 @@ mod tests {
             other => panic!("expected a union, got {other:?}"),
         };
         assert_eq!(spines, 1, "hash spines must merge, got {via_nil_first:?}");
+    }
+
+    fn record(fields: &[(&str, Ty)]) -> Ty {
+        Ty::Record {
+            row: Row {
+                fields: fields.iter().map(|(k, t)| (Symbol::from(*k), t.clone())).collect(),
+                rest: None,
+            },
+        }
+    }
+
+    fn field_order(t: &Ty) -> Vec<String> {
+        match t {
+            Ty::Record { row } => row.fields.keys().map(|k| k.as_str().to_string()).collect(),
+            other => panic!("expected a record, got {other:?}"),
+        }
+    }
+
+    /// Record rows are equal regardless of field order, so a union's
+    /// canonical variant order must not depend on it either.
+    #[test]
+    fn union_of_orders_records_regardless_of_field_order() {
+        let ab_int = record(&[("a", Ty::Int), ("b", Ty::Int)]);
+        let ba_int = record(&[("b", Ty::Int), ("a", Ty::Int)]);
+        let ab_str = record(&[("a", Ty::Str), ("b", Ty::Int)]);
+        assert_eq!(
+            union_of(ab_int.clone(), ab_str.clone()),
+            union_of(ab_str.clone(), ba_int.clone()),
+        );
+        for (x, y) in [(ab_int.clone(), ab_str.clone()), (ba_int.clone(), ab_str.clone())] {
+            check_record_laws(x, y);
+        }
+    }
+
+    fn check_record_laws(x: Ty, y: Ty) {
+        let universe = [x.clone(), y.clone(), Ty::Nil, Ty::Int, union_of(x, Ty::Nil), union_of(y, Ty::Str)];
+        for a in &universe {
+            for b in &universe {
+                assert_eq!(union_of(a.clone(), b.clone()), union_of(b.clone(), a.clone()), "{a:?} ⊔ {b:?}");
+                for c in &universe {
+                    assert_eq!(
+                        union_of(union_of(a.clone(), b.clone()), c.clone()),
+                        union_of(a.clone(), union_of(b.clone(), c.clone())),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two arrivals of one record in different field orders keep one
+    /// of the source orders, and the same one whichever came first:
+    /// some targets emit fields in that order.
+    #[test]
+    fn union_of_keeps_one_source_field_order_for_equal_records() {
+        let ab = record(&[("a", Ty::Int), ("b", Ty::Str)]);
+        let ba = record(&[("b", Ty::Str), ("a", Ty::Int)]);
+        let one = union_of(ab.clone(), ba.clone());
+        let other = union_of(ba.clone(), ab.clone());
+        assert_eq!(field_order(&one), field_order(&other));
+        let nil_first = union_of(union_of(ba.clone(), Ty::Nil), ab.clone());
+        let nil_last = union_of(union_of(ab, Ty::Nil), ba);
+        let order = |t: &Ty| match t {
+            Ty::Union { variants } => field_order(&variants[0]),
+            other => panic!("expected a union, got {other:?}"),
+        };
+        assert_eq!(order(&nil_first), order(&nil_last));
+        assert_eq!(order(&nil_first), field_order(&one));
     }
 
     // Lattice laws for every join that feeds a slot the fixpoint carries
