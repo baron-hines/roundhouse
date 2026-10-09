@@ -9231,3 +9231,36 @@ end
         .run_test("test/models/fixture_load_test.rb")
         .assert_passes();
 }
+
+/// `owner.assoc.create!(attributes)` in a test, with the attributes in a
+/// local: the test-side association rewrite kept only a LITERAL hash and
+/// replaced anything else with the foreign key alone, so campfire's
+/// `rooms(:pets).messages.create!(attributes)` saved a message with no
+/// creator ("Validation failed: Creator must exist"). The value now
+/// merges the key in, and the association's key wins over the caller's,
+/// as in Rails.
+#[test]
+fn an_association_create_keeps_attributes_held_in_a_local() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/assoc_create_test.rb",
+            r#"require "test_helper"
+
+class AssocCreateTest < ActiveSupport::TestCase
+  test "attributes in a local reach the record" do
+    attributes = { commenter: "Reader", body: "Comment body" }
+    comment = articles(:one).comments.create!(attributes)
+    assert_equal "Reader", comment.commenter
+    assert_equal articles(:one).id, comment.article_id
+  end
+
+  test "the association's key wins over the caller's" do
+    comment = articles(:one).comments.create!(commenter: "Lit", body: "Literal body", article_id: articles(:two).id)
+    assert_equal articles(:one).id, comment.article_id
+  end
+end
+"#,
+        )
+        .run_test("test/models/assoc_create_test.rb")
+        .assert_passes();
+}
