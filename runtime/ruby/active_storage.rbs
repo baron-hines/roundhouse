@@ -170,6 +170,7 @@ module ActiveStorage
     def initialize: (ActiveStorage::Blob? blob, ActiveStorage::Variation? variation) -> void
     def blob: () -> ActiveStorage::Blob?
     def variation: () -> ActiveStorage::Variation?
+    def processed?: () -> bool
     def processed: () -> ActiveStorage::VariantWithRecord
     def self.record_select: (String where) -> String
     def self.purge_records_of: (Integer blob_id) -> nil
@@ -211,10 +212,10 @@ module ActiveStorage
     def analyze: () -> nil
     # The named variant (`:thumb`) — a declared variation — or an
     # inline transformation hash, which is the identity variant.
-    def variant: (Symbol | Hash[Symbol, untyped] transformations) -> ActiveStorage::VariantWithRecord
+    def variant: (Symbol | Hash[Symbol, untyped] | ActiveStorage::Variation transformations) -> ActiveStorage::VariantWithRecord
     def representation: (Symbol | Hash[Symbol, untyped] transformations) -> ActiveStorage::VariantWithRecord
-    def find_variation: (Symbol | Hash[Symbol, untyped] transformations) -> ActiveStorage::Variation?
-    def preview: (ActiveStorage::Variation? transformations) -> ActiveStorage::Preview
+    def find_variation: (Symbol | Hash[Symbol, untyped] | ActiveStorage::Variation | nil transformations) -> ActiveStorage::Variation?
+    def preview: (Symbol | ActiveStorage::Variation | nil transformations) -> ActiveStorage::Preview
     def url: () -> String
     def attach_blob: (ActiveStorage::Blob blob) -> nil
     def attach: (String data, String filename, String content_type) -> nil

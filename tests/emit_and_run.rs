@@ -9279,12 +9279,16 @@ class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
     assert_equal article.title, JSON.parse(response.body)["title"]
   end
 
-  test "a duration is a timeout the socket layer takes" do
+  test "duration works with socket and stdlib timeout APIs" do
     server = TCPServer.new("127.0.0.1", 0)
     socket = TCPSocket.new("127.0.0.1", server.addr[1], connect_timeout: 1.second)
     socket.close
     server.close
+    assert_nil IO.select(nil, nil, nil, 0.01.seconds)
+    assert_equal :ok, Timeout.timeout(1.second) { :ok }
     assert_equal 1.5, (2.seconds - 0.5).to_f
+    assert_equal 1.5, (2.seconds - 0.5.seconds).to_f
+    assert_operator 1.second, :<, 2
   end
 end
 "#,
@@ -9345,5 +9349,84 @@ end
 "#,
         )
         .run_test("test/models/fixture_load_test.rb")
+        .assert_passes();
+}
+
+/// `owner.assoc.create!(attributes)` in a test, with the attributes in a
+/// local: the test-side association rewrite kept only a LITERAL hash and
+/// replaced anything else with the foreign key alone, so campfire's
+/// `rooms(:pets).messages.create!(attributes)` saved a message with no
+/// creator ("Validation failed: Creator must exist"). The value now
+/// merges the key in, and the association's key wins over the caller's,
+/// as in Rails.
+#[test]
+fn an_association_create_keeps_attributes_held_in_a_local() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/assoc_create_test.rb",
+            r#"require "test_helper"
+
+class AssocCreateTest < ActiveSupport::TestCase
+  test "attributes in a local reach the record" do
+    attributes = { commenter: "Reader", body: "Comment body" }
+    comment = articles(:one).comments.create!(attributes)
+    assert_equal "Reader", comment.commenter
+    assert_equal articles(:one).id, comment.article_id
+  end
+
+  test "the association's key wins over the caller's" do
+    comment = articles(:one).comments.create!(commenter: "Lit", body: "Literal body", article_id: articles(:two).id)
+    assert_equal articles(:one).id, comment.article_id
+  end
+end
+"#,
+        )
+        .run_test("test/models/assoc_create_test.rb")
+        .assert_passes();
+}
+
+/// Active Storage's "was it made?" questions, as campfire's
+/// presentation asks them so a view never makes a preview: a variant is
+/// `processed?` once its record exists (looked up, not made);
+/// `preview(:poster)` names a variant the owner's `has_one_attached`
+/// block declares; and `url_for` of a Preview held in a typed local is
+/// the preview's representation URL, not the object.
+#[test]
+fn a_variant_is_processed_once_its_record_exists_and_a_preview_resolves_its_name() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", r#"class Doc < ApplicationRecord
+  has_one_attached :file do |attachable|
+    attachable.variant :thumb, resize_to_limit: [ 10, 10 ]
+    attachable.variant :poster, format: :webp, resize_to_limit: [ 10, 10 ]
+  end
+
+  def poster_url
+    poster = file.preview(:poster)
+    ActionView::ViewHelpers.url_for(poster)
+  end
+end
+"#)
+        .run_ruby(r#"
+doc = Doc.create!(name: "first", file: { io: StringIO.new("bytes"), filename: "a.mov", content_type: "video/quicktime" })
+thumb = doc.file.representation(:thumb)
+raise "processed before any record" if thumb.processed?
+image = ActiveStorage::Blob.create_and_upload!("png", "a.png", "image/png")
+connection = ActiveRecord::Base.connection
+connection.execute("INSERT INTO active_storage_variant_records (blob_id, variation_digest) VALUES (#{doc.file.blob.id}, '#{thumb.variation.digest}')")
+record_id = connection.select_value("SELECT max(id) FROM active_storage_variant_records")
+connection.execute("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES ('image', 'ActiveStorage::VariantRecord', #{record_id}, #{image.id}, '2026-01-01')")
+raise "not processed once its record exists" unless doc.file.representation(:thumb).processed?
+preview = doc.file.preview(:poster)
+raise "preview named #{preview.variation&.name.inspect}" unless preview.variation.name == "poster"
+url = doc.poster_url
+raise "url_for(preview) answered #{url.inspect}" unless url.is_a?(String) && url.include?("/representations/")
+"#)
         .assert_passes();
 }
