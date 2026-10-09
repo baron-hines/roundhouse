@@ -547,6 +547,9 @@ fn dynamic_engine_route_targets_keep_their_source_boundary() {
     );
 }
 
+#[path = "emit_and_run/integer_query_exists.rs"]
+mod integer_query_exists;
+
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
     emit_and_run::real_blog()
