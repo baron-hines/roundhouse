@@ -7899,11 +7899,13 @@ pub(crate) fn extract_ivar_assignments_in(
 
 /// Widen an existing Hash ivar's value-type to include `incoming`.
 ///
-/// Only fires when the existing entry is `Hash { .. }` — if the ivar
-/// was assigned a typed class instance (e.g. `@hash = Foo.new`), the
-/// class's own `[]=` method shouldn't retype the ivar to a generic
-/// Hash. The widening exists to grow empty-Hash-literal types from
-/// observed `[]=` writes, not to retype class instances.
+/// Only fires when the existing entry has a Hash spine, bare or as an
+/// arm of a union (`Hash[K, V] | Nil`, a hash that is nil on some
+/// path) — if the ivar was assigned a typed class instance (e.g.
+/// `@hash = Foo.new`), the class's own `[]=` method shouldn't retype
+/// the ivar to a generic Hash. The widening exists to grow
+/// empty-Hash-literal types from observed `[]=` writes, not to retype
+/// class instances. Skipping a nullable Hash lost the write (#617).
 ///
 /// The write joins `Hash[K, incoming]` into the slot with
 /// [`body::join_ivar_slot`], the same join the plain assignments use,
@@ -7921,7 +7923,11 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         );
         return;
     };
-    let Ty::Hash { key, .. } = existing else {
+    let spine = match existing {
+        Ty::Union { variants } => variants.iter().find(|v| matches!(v, Ty::Hash { .. })),
+        other => Some(other),
+    };
+    let Some(Ty::Hash { key, .. }) = spine else {
         return;
     };
     let key = if matches!(**key, Ty::Var { .. }) {

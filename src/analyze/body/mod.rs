@@ -4213,6 +4213,51 @@ mod tests {
         assert_eq!(writes_first, want);
     }
 
+    /// A nullable Hash ivar (`@data = nil` on one path, `{}` on
+    /// another) still records its `[]=` writes. Ignoring them left
+    /// `Hash[Var, Var] | Nil` (or the first write's value type) after
+    /// a `String` and an `Integer` were stored, the shape of the
+    /// unsound `@data` typing on #617's soundness frontier.
+    #[test]
+    fn index_writes_widen_a_nullable_hash_ivar() {
+        let want = Ty::Union {
+            variants: vec![
+                Ty::Hash {
+                    key: Box::new(Ty::Str),
+                    value: Box::new(Ty::Union { variants: vec![Ty::Int, Ty::Str] }),
+                },
+                Ty::Nil,
+            ],
+        };
+        let seeded = harvested_ivar("data", vec![
+            ivar_write("data", Ty::Nil),
+            ivar_write("data", empty_hash()),
+            ivar_index_write("data", Ty::Str),
+            ivar_index_write("data", Ty::Int),
+        ]);
+        assert_eq!(seeded, want);
+        let written_first = harvested_ivar("data", vec![
+            ivar_index_write("data", Ty::Str),
+            ivar_write("data", Ty::Nil),
+            ivar_index_write("data", Ty::Int),
+            ivar_write("data", empty_hash()),
+        ]);
+        assert_eq!(written_first, want);
+    }
+
+    /// The widening still leaves an ivar holding a class instance (or
+    /// a nullable one) alone: that class's own `[]=` runs, not Hash's.
+    #[test]
+    fn index_writes_leave_a_class_instance_ivar_alone() {
+        let foo = Ty::Class { id: ClassId(Symbol::from("Foo")), args: vec![] };
+        let nullable_foo = Ty::Union { variants: vec![foo, Ty::Nil] };
+        let got = harvested_ivar("x", vec![
+            ivar_write("x", nullable_foo.clone()),
+            ivar_index_write("x", Ty::Int),
+        ]);
+        assert_eq!(got, nullable_foo);
+    }
+
     #[test]
     fn concrete_value_shapes_are_truthy_for_boolean_operators() {
         let values = [
