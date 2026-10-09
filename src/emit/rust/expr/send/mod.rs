@@ -258,9 +258,14 @@ pub(super) fn emit_send(
                 .unwrap_or(false),
             // A declared parameter is authoritative: its RBS type is
             // the emitted Rust type (`value: Option<String>`).
-            ExprNode::Var { name, .. } => super::param_ty(name.as_str())
-                .map(|t| super::util::is_option_ty(&t))
-                .unwrap_or(false),
+            // Skipped once the read is narrowed to a non-Option type
+            // (the Var arm then emits an unwrapped value).
+            ExprNode::Var { name, .. } => {
+                super::param_ty(name.as_str())
+                    .map(|t| super::util::is_option_ty(&t))
+                    .unwrap_or(false)
+                    && r.ty.as_ref().map_or(true, super::util::is_option_ty)
+            }
             // Other locals are NOT trustworthy: rust can render a local
             // with a nilable body-typer Ty as a plain `&str` (the
             // router's path segments), where `.map()` doesn't compile.
