@@ -1317,12 +1317,14 @@ impl<'a> BodyTyper<'a> {
                     match &*b.node {
                         ExprNode::Lambda { body, .. } => body.ty.clone(),
                         ExprNode::MethodRef { .. } => Some(method_ref_ty),
-                        // Forwarded proc (`&callback`): the block slot is
-                        // occupied but there is no body to type. Presence
-                        // must still reach dispatch — `PTY.spawn` with a
-                        // block answers nil; treating the slot as absent
-                        // would invent the no-block Tuple.
-                        _ => Some(Ty::Untyped),
+                        // Forwarded proc (`&callback`): Var in the block
+                        // slot, no body to type. Presence must still reach
+                        // dispatch — `PTY.spawn` with a block answers nil.
+                        // Do not treat `&nil` (Lit) or other non-Var slot
+                        // shapes as a yielding block: `String#bytes(&nil)`
+                        // still answers the byte array.
+                        ExprNode::Var { .. } => Some(Ty::Untyped),
+                        _ => None,
                     }
                 } else {
                     None
