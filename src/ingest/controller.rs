@@ -872,6 +872,17 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
     for a in option_args {
+        // A concern macro's `before_action(**kwargs) { ... }` substitutes
+        // the call's options Hash under a `**` splat rather than the
+        // bare trailing Hash literal a hand-written filter uses — unwrap
+        // it the same way `filter_from_send` does, so a macro's expanded
+        // block-form filter (`ingest::app::block_filter_from_macro_stmt`)
+        // carries `only:`/`except:`/`if:`/`unless:` exactly as a
+        // hand-written one would.
+        let a = match &*a.node {
+            ExprNode::KeywordSplat { value } => value,
+            _ => a,
+        };
         let ExprNode::Hash { entries, .. } = &*a.node else { continue };
         for (k, v) in entries {
             let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
