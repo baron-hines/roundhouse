@@ -435,8 +435,14 @@ fn restore_kwrest_splat(args: &mut Vec<Expr>, params: &[Param]) {
     if args.len() != positional + 1 {
         return;
     }
+    // A plain read (`f(**h)`) or one of the merge chains the desugar
+    // makes of a splat beside literal keywords (`f(k: v, **h)` →
+    // `{ k: v }.merge(h)`, `f(**h, k: v)` → `h.merge({ k: v })`).
+    // Splatting the whole chain is exact: `merge` keeps Ruby's
+    // last-wins order between the two halves and evaluates them left
+    // to right, once.
     let Some(hash) = args.last() else { return };
-    if !is_pure_read(hash) {
+    if splat_shape(hash).is_none() {
         return;
     }
     let hash = args.pop().expect("checked above");
