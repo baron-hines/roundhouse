@@ -43,6 +43,7 @@ module SQLite3
     def initialize(path, readonly: false)
       @closed = false
       @readonly = readonly
+      @lock = Mutex.new
       flags = readonly ? SQL::OPEN_URI_READONLY : SQL::OPEN_URI_RWC
       rc = 0
       @dbh = 0
@@ -76,47 +77,52 @@ module SQLite3
     end
 
     def closed?
-      @closed
+      @lock.synchronize { @closed }
     end
 
     def close
-      return nil if @closed
-      SQL.sqlite3_close(@dbh)
-      @closed = true
+      @lock.synchronize do
+        return nil if @closed
+        rc = SQL.sqlite3_close(@dbh)
+        raise_error(rc) if rc != SQL::OK
+        @closed = true
+      end
       nil
     end
 
     def busy_timeout=(milliseconds)
-      SQL.sqlite3_busy_timeout(@dbh, milliseconds)
+      @lock.synchronize { SQL.sqlite3_busy_timeout(@dbh, milliseconds) }
       milliseconds
     end
 
     def busy_handler_timeout=(milliseconds)
-      SQL.sqlite3_busy_timeout(@dbh, milliseconds)
+      @lock.synchronize { SQL.sqlite3_busy_timeout(@dbh, milliseconds) }
       milliseconds
     end
 
     def execute(sql)
-      raise SQLite3::Exception, "cannot use a closed database" if @closed
-      rc = 0
-      stmt = 0
-      Db.prepare_lock.synchronize do
-        rc = SQL.sqlite3_prepare_v2(@dbh, sql, -1, SQL.sq_stmt_out, nil)
-        stmt = rc == SQL::OK ? SQL.read_ptr(SQL.sq_stmt_out) : 0
-      end
-      raise_error(rc) if rc != SQL::OK
-      rows = []
-      begin
-        while true
-          rc = SQL.sqlite3_step(stmt)
-          break if rc == SQL::DONE
-          raise_error(rc) if rc != SQL::ROW
-          rows.push(row(stmt))
+      @lock.synchronize do
+        raise SQLite3::Exception, "cannot use a closed database" if @closed
+        rc = 0
+        stmt = 0
+        Db.prepare_lock.synchronize do
+          rc = SQL.sqlite3_prepare_v2(@dbh, sql, -1, SQL.sq_stmt_out, nil)
+          stmt = rc == SQL::OK ? SQL.read_ptr(SQL.sq_stmt_out) : 0
         end
-      ensure
-        SQL.sqlite3_finalize(stmt)
+        raise_error(rc) if rc != SQL::OK
+        rows = []
+        begin
+          while true
+            rc = SQL.sqlite3_step(stmt)
+            break if rc == SQL::DONE
+            raise_error(rc) if rc != SQL::ROW
+            rows.push(row(stmt))
+          end
+        ensure
+          SQL.sqlite3_finalize(stmt)
+        end
+        rows
       end
-      rows
     end
 
     def get_first_row(sql)
