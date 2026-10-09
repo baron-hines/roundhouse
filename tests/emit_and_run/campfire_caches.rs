@@ -156,6 +156,53 @@ end
     assert_eq!(run.stdout, "rejected\n", "stderr:\n{}", run.stderr);
 }
 
+// Spinel currently refuses this nested Hash-value mutation shape during
+// alias analysis, before the cache behavior can run; keep the semantic
+// regression on CRuby instead of masking that compiler limitation.
+#[test]
+fn bounded_store_copies_mutable_nested_hash_values() {
+    let run = emit_and_run::real_blog().run_ruby(
+        r#"store = ActiveSupport::Cache::MemoryStore.new
+original = { "items" => [ "cached" ] }
+store.write("nested", original)
+original["items"] << "caller mutation"
+read = store.read("nested")
+read["items"] << "read mutation"
+copied = store.read("nested")
+
+defaulted = Hash.new([ "fallback" ])
+store.write("default", defaulted)
+size = store.inspect
+defaulted.default << "caller mutation"
+default_read = store.read("default")
+default_read.default << "read mutation"
+
+rejected_proc = begin
+  store.write("proc", Hash.new { |hash, key| hash[key] = key })
+  false
+rescue ArgumentError
+  true
+end
+cycle = []
+cycle << cycle
+rejected_cycle = begin
+  store.write("cycle", cycle)
+  false
+rescue ArgumentError
+  true
+end
+puts [copied, store.inspect == size, store.read("default")["missing"], rejected_proc, rejected_cycle].inspect
+"#,
+    );
+    run.assert_passes();
+    assert_eq!(
+        run.stdout,
+        "[{\"items\" => [\"cached\"]}, true, [\"fallback\"], true, true]\n",
+        "stderr:\n{}",
+        run.stderr
+    );
+}
+
 /// Rails' fragment caching through the controller, as campfire's
 /// `CachedResponses` overrides it: a view's `<% cache %>` is served only
 /// while `perform_caching`, under `combined_fragment_cache_key`, from

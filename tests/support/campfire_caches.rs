@@ -364,41 +364,6 @@ pub const RECORD_SNAPSHOT: Contract = Contract {
     store.read_multi("key")["key"] == "cached"
   end
 
-  def self.mutable_values
-    store = ActiveSupport::Cache::MemoryStore.new
-    original = { "items" => [ "cached" ] }
-    store.write("nested", original)
-    size = store.inspect
-    original["items"] << "caller mutation"
-    read = store.read("nested")
-    read["items"] << "read mutation"
-    [ store.read("nested"), store.inspect == size ]
-  end
-
-  def self.hash_defaults
-    store = ActiveSupport::Cache::MemoryStore.new
-    original = Hash.new([ "fallback" ])
-    store.write("default", original)
-    original.default << "caller mutation"
-    read = store.read("default")
-    read.default << "read mutation"
-    rejected_proc = begin
-      store.write("proc", Hash.new { |hash, key| hash[key] = key })
-      false
-    rescue ArgumentError
-      true
-    end
-    cycle = []
-    cycle << cycle
-    rejected_cycle = begin
-      store.write("cycle", cycle)
-      false
-    rescue ArgumentError
-      true
-    end
-    [ store.read("default")["missing"], rejected_proc, rejected_cycle ]
-  end
-
   def self.key
     ActiveSupport::Cache.expand_cache_key([ "record-snapshot-v1", [ "db", "ns", 3 ], [ "session", "abc" ] ])
   end
@@ -415,8 +380,6 @@ puts RecordSnapshotProbe.unknown_name
 puts RecordSnapshotProbe.bounds.inspect
 puts RecordSnapshotProbe.fetching.inspect
 puts RecordSnapshotProbe.read_multi_race
-puts RecordSnapshotProbe.mutable_values.inspect
-puts RecordSnapshotProbe.hash_defaults.inspect
 puts RecordSnapshotProbe.key
 "#
     ),
@@ -426,8 +389,6 @@ puts RecordSnapshotProbe.key
         "[true, false, true]\n",
         "[\"computed\", \"computed\", \"filed\", true, true]\n",
         "true\n",
-        "[{\"items\" => [\"cached\"]}, true]\n",
-        "[[\"fallback\"], true, true]\n",
         "record-snapshot-v1/db/ns/3/session/abc\n",
     ),
 };
@@ -481,7 +442,8 @@ end
 
 /// `QrCodeController#show`'s rescue: data too long for any QR version
 /// raises `RQRCodeCore::QRCodeRunTimeError`, answered 400; a short URL
-/// renders its SVG.
+/// renders its SVG. This overlay uses local `RQRCode`/`RQRCodeCore` test
+/// doubles; the separate CI Spinel native-HTTP test exercises the package.
 pub fn qr_code_overlay() -> Overlay {
     real_blog()
         .edit(

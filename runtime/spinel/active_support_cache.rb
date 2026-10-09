@@ -110,9 +110,15 @@ module ActiveSupport
       def fetch(name)
         key = ActiveSupport::Cache.expanded_key(name)
         found, cached = @lock.synchronize { read_locked(key) }
-        return MemoryStore.copy(cached) if found
-        value = yield
-        write(key, value)
+        # Keep one result path: Spinel inlines yield-bearing methods at
+        # call sites, where an early return is mis-typed as the caller's.
+        value = if found
+          MemoryStore.copy(cached)
+        else
+          computed = yield
+          write(key, computed)
+          computed
+        end
         value
       end
 
