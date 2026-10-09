@@ -7722,7 +7722,7 @@ pub(crate) fn extract_ivar_assignments_in(
                 // the same ivar accumulate (rather than the last write
                 // winning). Mirrors the simple flow-sensitive join.
                 let merged = match out.remove(name) {
-                    Some(prev) => crate::analyze::body::union_of(prev, ty),
+                    Some(prev) => crate::analyze::body::join_ivar_slot(prev, ty),
                     None => ty,
                 };
                 out.insert(name.clone(), fixpoint_bound::bound(merged));
@@ -7735,7 +7735,7 @@ pub(crate) fn extract_ivar_assignments_in(
         ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
             if let Some(ty) = value.ty.clone() {
                 let merged = match out.remove(name) {
-                    Some(prev) => crate::analyze::body::union_of(prev, ty),
+                    Some(prev) => crate::analyze::body::join_ivar_slot(prev, ty),
                     None => ty,
                 };
                 out.insert(name.clone(), fixpoint_bound::bound(merged));
@@ -7754,7 +7754,7 @@ pub(crate) fn extract_ivar_assignments_in(
                         crate::analyze::body::multiassign_target_ty(&value.ty, i)
                     {
                         let merged = match out.remove(name) {
-                            Some(prev) => crate::analyze::body::union_of(prev, ty),
+                            Some(prev) => crate::analyze::body::join_ivar_slot(prev, ty),
                             None => ty,
                         };
                         out.insert(name.clone(), fixpoint_bound::bound(merged));
@@ -7905,11 +7905,12 @@ pub(crate) fn extract_ivar_assignments_in(
 /// Hash. The widening exists to grow empty-Hash-literal types from
 /// observed `[]=` writes, not to retype class instances.
 ///
-/// When the existing value-side is a fresh type variable (`Ty::Var`),
-/// it's replaced rather than unioned — the variable came from the
-/// empty-literal `{}` and carries no information. Same for the key
-/// side: a TyVar key collapses to `Str` since `[]=` writes use
-/// `key.to_s` strings in the runtime conventions here.
+/// The write joins `Hash[K, incoming]` into the slot with
+/// [`body::join_ivar_slot`], the same join the plain assignments use,
+/// so a pending `Var` from the empty literal `{}` drops out whether
+/// the literal or the write is seen first. `K` is the existing key; a
+/// pending key collapses to `Str` since `[]=` writes use `key.to_s`
+/// strings in the runtime conventions here.
 fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming: &Ty) {
     let Some(existing) = out.get(name) else {
         // No prior entry — seed a fresh Hash[Str, incoming]. Matches
@@ -7920,7 +7921,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         );
         return;
     };
-    let Ty::Hash { key, value } = existing else {
+    let Ty::Hash { key, .. } = existing else {
         return;
     };
     let key = if matches!(**key, Ty::Var { .. }) {
@@ -7928,13 +7929,9 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
     } else {
         key.clone()
     };
-    let value = if matches!(**value, Ty::Var { .. }) {
-        Box::new(incoming.clone())
-    } else {
-        // The general widening is exactly the canonical type join.
-        Box::new(crate::analyze::body::union_of((**value).clone(), incoming.clone()))
-    };
-    out.insert(name.clone(), fixpoint_bound::bound(Ty::Hash { key, value }));
+    let write = Ty::Hash { key, value: Box::new(incoming.clone()) };
+    let merged = crate::analyze::body::join_ivar_slot(existing.clone(), write);
+    out.insert(name.clone(), fixpoint_bound::bound(merged));
 }
 
 // Diagnostic emission -----------------------------------------------------

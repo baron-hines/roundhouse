@@ -2829,6 +2829,49 @@ fn push_union_variants(t: Ty, out: &mut Vec<Ty>) {
     }
 }
 
+/// The join for an ivar slot the fixpoint carries between rounds
+/// (`extract_ivar_assignments`' repeated writes and `[]=` widening).
+///
+/// [`union_of`] with a pending `Var` as the identity: a `Var` arm
+/// drops out wherever another arm sits beside it, at the top and
+/// inside Hash and Array spines, so `{}` (`Hash[Var, Var]`) joined
+/// with a `[]=` write gives the same Hash whichever arrived first, as
+/// `widen_hash_ivar_value` always meant (it replaced a `Var` value
+/// side). `Untyped` stays an arm: gradual absorption is unchanged
+/// (#617).
+pub(crate) fn join_ivar_slot(a: Ty, b: Ty) -> Ty {
+    drop_pending_arms(union_of(a, b))
+}
+
+/// Remove `Var` arms that sit beside a non-`Var` arm, in a union and
+/// inside Hash and Array spines. A union of `Var`s alone keeps the one
+/// with the smallest id (canonical order sorts them first), so every
+/// pending value is one element of the lattice. Expects `union_of`'s
+/// canonical form and returns it.
+pub(crate) fn drop_pending_arms(t: Ty) -> Ty {
+    match t {
+        Ty::Hash { key, value } => Ty::Hash {
+            key: Box::new(drop_pending_arms(*key)),
+            value: Box::new(drop_pending_arms(*value)),
+        },
+        Ty::Array { elem } => Ty::Array { elem: Box::new(drop_pending_arms(*elem)) },
+        Ty::Union { variants } => {
+            let mut variants: Vec<Ty> = variants.into_iter().map(drop_pending_arms).collect();
+            if variants.iter().any(|v| !matches!(v, Ty::Var { .. })) {
+                variants.retain(|v| !matches!(v, Ty::Var { .. }));
+            } else {
+                variants.truncate(1);
+            }
+            Ty::canonicalize_variants(&mut variants);
+            match variants.len() {
+                1 => variants.pop().unwrap(),
+                _ => Ty::Union { variants },
+            }
+        }
+        other => other,
+    }
+}
+
 pub(super) fn union_many(tys: Vec<Ty>) -> Ty {
     // Fold through `union_of` so the same Bottom-filtering, structural
     // container join, and flatten/dedup normalization applies.
@@ -4055,6 +4098,119 @@ mod tests {
             other => panic!("expected a union, got {other:?}"),
         };
         assert_eq!(spines, 1, "hash spines must merge, got {via_nil_first:?}");
+    }
+
+    // Lattice laws for every join that feeds a slot the fixpoint carries
+    // from one round to the next (#617, "Any order"). A worklist that
+    // visits producers in another order joins the same observations in
+    // another order and grouping, so each carried-slot join has to be
+    // commutative, associative and idempotent, with pending (`Var`) as
+    // its identity. The universe is generated from `law_universe` plus
+    // the unknown-arm shapes the joins classify, normalized through the
+    // join under test (a carried slot only ever holds a join's output),
+    // and every law is checked over every pair and triple.
+
+    fn pending() -> Ty {
+        Ty::Var { var: TyVar(0) }
+    }
+
+    fn carried_slot_universe(join: fn(Ty, Ty) -> Ty) -> Vec<Ty> {
+        let mut raw = law_universe();
+        raw.extend([
+            Ty::Var { var: TyVar(2) },
+            Ty::Union { variants: vec![Ty::Str, Ty::Untyped] },
+            Ty::Union { variants: vec![Ty::Int, Ty::Var { var: TyVar(4) }] },
+            Ty::Union { variants: vec![Ty::Untyped, Ty::Nil] },
+            Ty::Union { variants: vec![Ty::Var { var: TyVar(5) }, Ty::Nil] },
+        ]);
+        let mut out: Vec<Ty> = Vec::new();
+        for t in raw {
+            let t = join(pending(), t);
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    fn check_carried_slot_join_laws(name: &str, join: fn(Ty, Ty) -> Ty) {
+        let universe = carried_slot_universe(join);
+        for a in &universe {
+            assert_eq!(join(pending(), a.clone()), *a, "{name}: pending ⊔ {a:?}");
+            assert_eq!(join(a.clone(), pending()), *a, "{name}: {a:?} ⊔ pending");
+            assert_eq!(join(a.clone(), a.clone()), *a, "{name}: {a:?} ⊔ itself");
+            for b in &universe {
+                let ab = join(a.clone(), b.clone());
+                assert_eq!(ab, join(b.clone(), a.clone()), "{name}: {a:?} ⊔ {b:?} must commute");
+                for c in &universe {
+                    assert_eq!(
+                        join(ab.clone(), c.clone()),
+                        join(a.clone(), join(b.clone(), c.clone())),
+                        "{name}: ({a:?} ⊔ {b:?}) ⊔ {c:?} must associate",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ivar_slot_join_is_a_lattice_join() {
+        check_carried_slot_join_laws("join_ivar_slot", join_ivar_slot);
+    }
+
+    /// `@ivar = <ty>` with the value's type already stamped.
+    fn ivar_write(name: &str, ty: Ty) -> Expr {
+        let mut value = synth(ExprNode::Lit { value: Literal::Nil });
+        value.ty = Some(ty);
+        synth(ExprNode::Assign { target: LValue::Ivar { name: Symbol::from(name) }, value })
+    }
+
+    /// `@ivar[key] = <ty>`, the `[]=` Send form.
+    fn ivar_index_write(name: &str, ty: Ty) -> Expr {
+        let mut key = synth(ExprNode::Lit { value: Literal::Str { value: "k".to_string() } });
+        key.ty = Some(Ty::Str);
+        let mut value = synth(ExprNode::Lit { value: Literal::Nil });
+        value.ty = Some(ty);
+        synth(ExprNode::Send {
+            recv: Some(synth(ExprNode::Ivar { name: Symbol::from(name) })),
+            method: Symbol::from("[]="),
+            args: vec![key, value],
+            block: None,
+            parenthesized: false,
+        })
+    }
+
+    /// The ivar's harvested type after `stmts`, run in the order given.
+    fn harvested_ivar(name: &str, stmts: Vec<Expr>) -> Ty {
+        let mut out = HashMap::new();
+        crate::analyze::extract_ivar_assignments(&synth(ExprNode::Seq { exprs: stmts }), &mut out);
+        out.remove(&Symbol::from(name)).expect("ivar harvested")
+    }
+
+    fn empty_hash() -> Ty {
+        Ty::Hash { key: Box::new(Ty::Var { var: TyVar(0) }), value: Box::new(Ty::Var { var: TyVar(0) }) }
+    }
+
+    /// `@h = {}` and `@h[k] = v` give one type whichever is harvested
+    /// first: the `{}` literal's `Var`s are pending in both joins.
+    #[test]
+    fn empty_hash_seed_and_index_writes_join_in_any_order() {
+        let seed_first = harvested_ivar("h", vec![
+            ivar_write("h", empty_hash()),
+            ivar_index_write("h", Ty::Int),
+            ivar_index_write("h", Ty::Str),
+        ]);
+        let writes_first = harvested_ivar("h", vec![
+            ivar_index_write("h", Ty::Int),
+            ivar_index_write("h", Ty::Str),
+            ivar_write("h", empty_hash()),
+        ]);
+        let want = Ty::Hash {
+            key: Box::new(Ty::Str),
+            value: Box::new(Ty::Union { variants: vec![Ty::Int, Ty::Str] }),
+        };
+        assert_eq!(seed_first, want);
+        assert_eq!(writes_first, want);
     }
 
     #[test]
