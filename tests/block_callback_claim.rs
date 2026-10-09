@@ -94,6 +94,7 @@ fn a_block_default_reading_an_earlier_parameter_lowers() {
 fn callbacks_with_required_or_rest_parameters_are_declined() {
     for (tag, callback) in [
         ("required-block", "before_save { |key| self.body = key }"),
+        ("required-keyword-block", "before_save { |key:| self.body = key }"),
         (
             "rest-block",
             "before_save { |*keys| self.body = keys.first }",
