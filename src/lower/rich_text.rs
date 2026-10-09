@@ -558,29 +558,17 @@ fn push_owner_methods(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol
         true,
     );
 
-    // `rich_text_<attr>_loaded?` — the load-once flag above, as the flat
-    // predicate Rails spells `association(:rich_text_<attr>).loaded?`
-    // (`lower::assoc_loaded` rewrites that spelling onto this name, the
-    // way it does `boosts.loaded?` onto `boosts_loaded?`). True once the
-    // reader looked, a builder installed a record, or a preload ran.
+    // `rich_text_<attr>_loaded?` — the flat spelling of Rails'
+    // `association(:rich_text_<attr>).loaded?` (see `assoc_loaded`).
     push(
         methods,
         model,
-        loaded_predicate_name(attr),
+        Symbol::from(format!("rich_text_{}_loaded?", attr.as_str())),
         Vec::new(),
-        Expr::new(
-            Span::synthetic(),
-            ExprNode::Send {
-                recv: Some(ivar(loaded.as_str())),
-                method: Symbol::from("=="),
-                args: vec![lit_true()],
-                block: None,
-                parenthesized: false,
-            },
-        ),
+        ivar(loaded.as_str()),
         Some(fn_sig(vec![], Ty::Bool)),
         AccessorKind::Method,
-        true,
+        false,
     );
 
     // `build_rich_text_<attr>` — a new record already pointed at this
@@ -1019,12 +1007,6 @@ pub fn preload_scope_nested(scope: &Symbol) -> Option<Symbol> {
     scope.as_str().ends_with("_and_embeds").then(|| {
         crate::lower::attached::many_attachments_assoc_name(&Symbol::from(EMBEDS))
     })
-}
-
-/// `rich_text_<attr>_loaded?` — the flat predicate behind Rails'
-/// `association(:rich_text_<attr>).loaded?`.
-pub fn loaded_predicate_name(attr: &Symbol) -> Symbol {
-    Symbol::from(format!("rich_text_{}_loaded?", attr.as_str()))
 }
 
 /// `_preload_rich_text_<attr>` — the setter the batch loader calls.

@@ -579,16 +579,6 @@ impl Analyzer {
                     .entry(name)
                     .or_insert(Ty::Relation { of: model.name.clone() });
             }
-            // And the load-once predicate `push_owner_methods` writes
-            // beside the reader (`rich_text_body_loaded?`), so
-            // `association(:rich_text_body).loaded?` types under check.
-            if app.models.iter().any(crate::lower::rich_text::is_record_model) {
-                for (_span, attr) in crate::lower::rich_text::rich_text_attrs(model) {
-                    cls.instance_methods
-                        .entry(crate::lower::rich_text::loaded_predicate_name(&attr))
-                        .or_insert(Ty::Bool);
-                }
-            }
             if crate::lower::plain_text_attr::record_table_present(&app.schema) {
                 for name in crate::lower::plain_text_attr::preload_scope_names(model) {
                     cls.class_methods
@@ -776,6 +766,20 @@ impl Analyzer {
                     // (no post-analyze lower) can type
                     // `message.boosts.loaded?` via `assoc_loaded_ty`
                     // without cataloguing Relation `#loaded?`.
+                    cls.instance_methods
+                        .entry(Symbol::from(format!("{}_loaded?", name.as_str())))
+                        .or_insert(Ty::Bool);
+                    cls.instance_methods
+                        .entry(Symbol::from(format!("reload_{}", name.as_str())))
+                        .or_insert(ty.clone());
+                }
+                // The singular readers' flat `<name>_loaded?` (Rails'
+                // `association(:name).loaded?`), synthesized beside them.
+                if matches!(
+                    assoc,
+                    crate::dialect::Association::HasOne { .. }
+                        | crate::dialect::Association::BelongsTo { polymorphic: false, .. }
+                ) {
                     cls.instance_methods
                         .entry(Symbol::from(format!("{}_loaded?", name.as_str())))
                         .or_insert(Ty::Bool);
@@ -8200,6 +8204,7 @@ fn register_has_rich_text(model: &crate::dialect::Model, methods: &mut HashMap<S
             methods.entry(Symbol::from(name)).or_insert(record.clone());
         }
         methods.entry(Symbol::from(format!("{a}?"))).or_insert(Ty::Bool);
+        methods.entry(Symbol::from(format!("rich_text_{a}_loaded?"))).or_insert(Ty::Bool);
         methods.entry(Symbol::from(format!("{a}="))).or_insert(Ty::Untyped);
     }
 }

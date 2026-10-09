@@ -340,17 +340,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             classes.insert(many_id, many);
         }
 
-        // `owner.association(:name)` — answers `loaded?` and nothing
-        // else (`BodyTyper::association_reflection_ty`).
-        {
-            let mut handle = ClassInfo::default();
-            handle.instance_methods.insert(Symbol::from("loaded?"), Ty::Bool);
-            classes.insert(
-                ClassId(Symbol::from(crate::analyze::body::ASSOCIATION_HANDLE)),
-                handle,
-            );
-        }
-
         let mut blob = ClassInfo::default();
         for (m, ty) in [
             ("id", Ty::Int),

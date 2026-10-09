@@ -304,8 +304,8 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
     let enum_map = super::enum_symbols::enum_columns(app);
     let json_map = super::has_json::has_json_columns(&app.models);
     let by_model = super::assoc_loaded::has_many_by_model(app);
-    let flags = super::assoc_loaded::loaded_flags_by_model(app);
     let readers = super::assoc_loaded::association_readers_by_model(app);
+    let flat_loaded = super::assoc_loaded::flat_loaded_by_model(app);
     let sole_includer = app.sole_includer_of_modules();
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
@@ -320,8 +320,8 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &json_map,
                 &sole_includer,
                 &by_model,
-                &flags,
                 &readers,
+                &flat_loaded,
             );
         });
     });
@@ -337,8 +337,8 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &json_map,
                 &sole_includer,
                 &by_model,
-                &flags,
                 &readers,
+                &flat_loaded,
             );
         });
     }
@@ -354,8 +354,8 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &json_map,
                 &sole_includer,
                 &by_model,
-                &flags,
                 &readers,
+                &flat_loaded,
             );
         });
     });
@@ -371,8 +371,8 @@ fn rewrite_mid_node(
     json_map: &super::has_json::HasJsonColumns,
     sole_includer: &std::collections::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
     by_model: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
-    flags: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
     readers: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
+    flat_loaded: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
 ) {
     if !helpers.is_empty() {
         super::route_format_suffix::rewrite_node(e, helpers);
@@ -393,7 +393,7 @@ fn rewrite_mid_node(
     if !json_map.is_empty() {
         super::has_json::rewrite_node(e, json_map);
     }
-    super::assoc_loaded::rewrite_node(e, enclosing, sole_includer, by_model, flags, readers);
+    super::assoc_loaded::rewrite_node(e, enclosing, sole_includer, by_model, readers, flat_loaded);
 }
 
 fn apply_route_url_followups(

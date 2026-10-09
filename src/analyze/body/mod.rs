@@ -58,7 +58,7 @@ pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
 mod narrowing;
 mod send;
-pub(crate) use send::{ASSOCIATION_HANDLE, PARAM_VALUE};
+pub(crate) use send::PARAM_VALUE;
 pub(crate) use send::string_answers;
 
 /// Typed constants for generated expressions without Ruby source spans.
@@ -1441,9 +1441,6 @@ impl<'a> BodyTyper<'a> {
                     return t;
                 }
                 if let Some(t) = self.assoc_loaded_ty(recv.as_ref(), method) {
-                    return t;
-                }
-                if let Some(t) = self.association_reflection_ty(recv_ty.as_ref(), ctx.self_ty.as_ref(), method, args) {
                     return t;
                 }
                 // `x.attr = v` evaluates to `v` — Ruby's rule for an

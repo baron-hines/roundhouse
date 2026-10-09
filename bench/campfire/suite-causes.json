@@ -50,12 +50,12 @@
     },
     {
       "slug": "presentation-preload-introspection",
-      "title": "`ActionText::RichText#embeds` and `record.association(:name).loaded?` — the presentation-preload tests read Rails' association internals",
+      "title": "`ActionText::RichText#embeds` — a presentation-preload test walks the rich text's attached blobs",
       "owner": "compiler",
-      "match": "undefined method '(embeds' for an instance of ActionText::RichText|association' for an instance of Message|first_n' for an instance of Message::Pagination::Page)",
+      "match": "undefined method 'embeds' for an instance of ActionText::RichText",
       "match_test": "MessageTest#test_presentation_",
-      "note": "campfire 2393f01 (2026-10-05) added two `MessageTest` cases for `Message.with_presentation` and `Message::Pagination::Page#preload_associations`: one walks `message.body.embeds` under `assert_no_queries`, the other asserts `message.association(:rich_text_body).loaded?` before and after a page preloads only the rendered rows. Served 2026-10-09: the synthesized `ActionText::RichText` declares `has_many_attached :embeds` and fills it after save from the blobs its body's attachment nodes name (Rails' `before_save`, run after the insert because an attachment row needs the id); `with_rich_text_<attr>_and_embeds` preloads `{ rich_text_<attr>: :embeds_attachments }`, and a has_many-attached batch installs the rows it found so `embeds.each` asks nothing. `association(:name).loaded?` types and lowers onto the flat `<name>_loaded?` flag (has_many, and the rich text's `rich_text_<attr>_loaded?`). The Page scopes (`last_page` through `last_page_of`, `first_page`'s `Page.load`) are no longer taken for relations, so `page.first(2)` stays `Array#first`. The second test is green; the first one's remaining failure is `deferred-preload-timing`.",
-      "at_zero": "served 2026-10-09 (`test_presentation_pages_preload_only_the_rendered_messages` green; `…associations_load_together` now fails only on `deferred-preload-timing`); the rule stays as a regression tripwire."
+      "note": "campfire 2393f01 (2026-10-05) added two `MessageTest` cases for `Message.with_presentation` and `Message::Pagination::Page#preload_associations`. The second (`association(:rich_text_body).loaded?` before and after a page preloads only the rendered rows) passes since `association(:name).loaded?` lowers onto each association's flat `<name>_loaded?` reader. The first walks `message.body.embeds` under `assert_no_queries`. Served 2026-10-09: the synthesized `ActionText::RichText` declares `has_many_attached :embeds` and fills it after save from the blobs its body's attachment nodes name (Rails' `before_save`, run after the insert because an attachment row needs the id); `with_rich_text_<attr>_and_embeds` preloads `{ rich_text_<attr>: :embeds_attachments }`, and the has_many-attached batch installs the rows it found, so `embeds.each` asks nothing. That test's remaining failure is `deferred-preload-timing`.",
+      "at_zero": "served 2026-10-09 (`embeds` modeled and preloaded; `…associations_load_together` now fails only on `deferred-preload-timing`); the rule stays as a regression tripwire."
     },
     {
       "slug": "turbo-signed-stream-name",
