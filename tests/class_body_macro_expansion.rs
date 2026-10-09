@@ -313,6 +313,47 @@ end
 }
 
 #[test]
+fn a_parent_controller_class_method_can_shadow_a_nested_filter_macro() {
+    let application_controller = r#"
+class ApplicationController < ActionController::Base
+  include Authentication
+  def self.allow_unauthenticated_access(**options)
+    before_action :require_authentication, **options
+  end
+end
+"#;
+    let things_controller = r#"
+class ThingsController < ApplicationController
+  require_unauthenticated_access only: :new
+  def new
+  end
+end
+"#;
+    let tree = [
+        ("app/controllers/concerns/authentication.rb", AUTHENTICATION),
+        ("app/controllers/application_controller.rb", application_controller),
+        ("app/controllers/things_controller.rb", things_controller),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+
+    let app = ingest_app_from_tree(tree).expect("shadowed filter macro stays an ingest gap");
+    assert!(filters(&app).is_empty(), "must not inline the concern's auth skip");
+    let controller = app
+        .controllers
+        .iter()
+        .find(|controller| controller.name.0.as_str() == "ThingsController")
+        .expect("ThingsController ingested");
+    assert!(controller.body.iter().any(|item| matches!(
+        item,
+        ControllerBodyItem::Unknown { expr, .. }
+            if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
+                if method.as_str() == "require_unauthenticated_access")
+    )));
+}
+
+#[test]
 fn nested_filter_macro_expansion_has_a_total_work_budget() {
     let mut methods = String::from("def macro_0\n before_action :authenticate\nend\n");
     for index in 1..15 {

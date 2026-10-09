@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use roundhouse::dialect::{MethodReceiver, MethodVisibility, ModelBodyItem};
 use roundhouse::expr::ExprNode;
 use roundhouse::ingest::{ingest_app_from_tree, survey};
+use roundhouse::project::BuildTarget;
+use roundhouse::ty::Ty;
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -582,7 +584,7 @@ fn emitted_positioning_runs_reorder_block_move_lock_and_rebalance() {
     let run = emit_and_run::real_blog()
         .write("app/models/concerns/positioning_concern.rb", POSITIONING_CONCERN)
         .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.integer \"order\"\n    t.date \"archived_on\"\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
-        .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active\n\n  def minimum_created_at_iso8601\n    (Comment.where(article_id: article_id).minimum(:created_at) || Time.current).iso8601\n  end\n\n  def active_extrema_keys\n    Comment.where(article_id: article_id).group(:active).minimum(:position_score).keys\n  end")
+        .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active\n\n  def created_at\n    \"display timestamp\"\n  end\n\n  def minimum_created_at_iso8601\n    (Comment.where(article_id: article_id).minimum(:created_at) || Time.current).iso8601\n  end\n\n  def active_extrema_keys\n    Comment.where(article_id: article_id).group(:active).minimum(:position_score).keys\n  end")
         .run_ruby(r#"
 article = Article.create!(title: "Positioning owner", body: "A sufficiently long article body")
 other_article = Article.create!(title: "Other owner", body: "A sufficiently long article body")
@@ -648,4 +650,41 @@ puts "positioning semantics passed"
 "#);
     run.assert_passes();
     assert!(run.stdout.contains("positioning semantics passed"));
+}
+
+#[test]
+fn grouped_extrema_in_a_local_relation_do_not_get_a_scalar_type() {
+    let (_, app, _) = emit_and_run::real_blog()
+        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.boolean \"active\", default: true, null: false")
+        .edit(
+            "app/models/comment.rb",
+            "  belongs_to :article",
+            "  belongs_to :article\n\n  def grouped_position_score_keys\n    grouped = Comment.where(article_id: article_id).group(:active)\n    grouped.minimum(:position_score).keys\n  end",
+        )
+        .emit_with_app(BuildTarget::Ruby);
+
+    let method = model(&app, "Comment")
+        .methods()
+        .find(|method| method.name.as_str() == "grouped_position_score_keys")
+        .expect("grouped extrema probe method ingested");
+    let mut extrema_types = Vec::new();
+    fn collect_extrema_types(expr: &roundhouse::expr::Expr, out: &mut Vec<Option<Ty>>) {
+        if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "minimum") {
+            out.push(expr.ty.clone());
+        }
+        expr.node.for_each_child(&mut |child| collect_extrema_types(child, out));
+    }
+    collect_extrema_types(&method.body, &mut extrema_types);
+    assert_eq!(extrema_types.len(), 1, "expected one minimum call");
+    let has_schema_scalar_type = match &extrema_types[0] {
+        Some(Ty::Int | Ty::Float | Ty::Time | Ty::Date | Ty::Str | Ty::Bool) => true,
+        Some(Ty::Union { variants }) => variants
+            .iter()
+            .any(|ty| matches!(ty, Ty::Int | Ty::Float | Ty::Time | Ty::Date | Ty::Str | Ty::Bool)),
+        _ => false,
+    };
+    assert!(
+        !has_schema_scalar_type,
+        "grouping stored in a local must remain untyped until relation grouping provenance exists: {extrema_types:?}"
+    );
 }

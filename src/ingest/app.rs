@@ -3190,6 +3190,29 @@ fn expand_class_body_macros(app: &mut App) {
     }
 
     let surfaces = controller_concern_surfaces(app);
+    let inherited_class_methods: HashMap<_, std::collections::HashSet<_>> = app
+        .controllers
+        .iter()
+        .map(|controller| {
+            let mut methods = std::collections::HashSet::new();
+            let mut current = Some(controller);
+            let mut seen = std::collections::HashSet::new();
+            while let Some(ancestor) = current {
+                if !seen.insert(&ancestor.name) {
+                    break;
+                }
+                methods.extend(ancestor.body.iter().filter_map(|item| match item {
+                    ControllerBodyItem::ClassMethod { method, .. } => Some(method.name.clone()),
+                    _ => None,
+                }));
+                current = ancestor
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| app.controllers.iter().find(|candidate| &candidate.name == parent));
+            }
+            (controller.name.clone(), methods)
+        })
+        .collect();
 
     for controller in &mut app.controllers {
         let includes = &surfaces.controllers[&controller.name].direct_includes;
@@ -3209,10 +3232,7 @@ fn expand_class_body_macros(app: &mut App) {
             .into_iter()
             .filter_map(|(name, definitions)| (definitions > 1).then_some(name))
             .collect();
-        shadowed_macros.extend(controller.body.iter().filter_map(|item| match item {
-            ControllerBodyItem::ClassMethod { method, .. } => Some(method.name.clone()),
-            _ => None,
-        }));
+        shadowed_macros.extend(inherited_class_methods[&controller.name].iter().cloned());
         let mut expanded: Vec<ControllerBodyItem> = Vec::new();
         for item in std::mem::take(&mut controller.body) {
             let ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } = &item
