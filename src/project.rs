@@ -3423,11 +3423,12 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
     for model in &app.global_id_locate_models {
         let name = model.as_str();
         let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        let allowed = global_id_name_check(app, name);
         generated.push_str(&format!(
             "    def self.locate_{suffix}(gid_param)\n\
              \x20     parts = parts_from(gid_param)\n\
              \x20     return nil if parts.nil?\n\
-             \x20     return nil unless parts[1] == \"{name}\"\n\n\
+             \x20     return nil unless {allowed}\n\n\
              \x20     {name}.find(cast_id(parts[2]))\n\
              \x20   end\n",
         ));
@@ -3435,11 +3436,12 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
     for model in &app.global_id_locate_signed_models {
         let name = model.as_str();
         let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        let allowed = global_id_name_check(app, name);
         generated.push_str(&format!(
             "    def self.locate_signed_{suffix}(sgid, purpose)\n\
              \x20     parts = parts_from_signed(sgid, purpose)\n\
              \x20     return nil if parts.nil?\n\
-             \x20     return nil unless parts[1] == \"{name}\"\n\n\
+             \x20     return nil unless {allowed}\n\n\
              \x20     {name}.find(cast_id(parts[2]))\n\
              \x20   end\n",
         ));
@@ -3455,6 +3457,24 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
         let end = start + rel_end + TAIL.len();
         content.replace_range(start..end, &generated);
     }
+}
+
+/// Rails GlobalID names STI instances by their concrete class, while a
+/// lookup with `only: Base` permits any descendant. Keep that bounded
+/// behavior without constantizing a class name from the wire: `sti_scope`
+/// records the app's known subclasses on the base model before emission.
+fn global_id_name_check(app: &App, base: &str) -> String {
+    let subclasses = app
+        .models
+        .iter()
+        .find(|model| model.name.0.as_str() == base)
+        .map(|model| model.sti_subclass_names.as_slice())
+        .unwrap_or_default();
+    std::iter::once(base)
+        .chain(subclasses.iter().map(|name| name.0.as_str()))
+        .map(|name| format!("parts[1] == \"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" || ")
 }
 
 /// Write `ActionText::Attachable.locate(model_name, id)` into
