@@ -106,15 +106,16 @@ pub fn apply_attach_lowering(app: &mut crate::app::App) {
 }
 
 /// `x.preview(format: :webp, resize_to_limit: [w, h])` ->
-/// `x.preview(ActiveStorage::Variation.new("", w, h, "webp"))`. Only
-/// `preview`: `variant`/`representation` take a declared name in the
-/// corpus, and their inline form stays the identity variant the
-/// runtime documents. A hash with a key this cannot lower is left as
-/// written.
+/// `x.preview(ActiveStorage::Variation.new("", w, h, "webp"))`, and the
+/// same for `variant` / `representation` written inline — campfire's
+/// `embeds.first.blob.variant(resize_to_limit: [ 1024, 768 ])`, the
+/// variant Action Text's own blob partial would make. A declared NAME
+/// (`variant(:thumb)`) is not a hash and is left for the runtime to
+/// look up; a hash with a key this cannot lower is left as written.
 fn rewrite_inline_transformation(e: &mut Expr) {
     e.node.for_each_child_mut(&mut rewrite_inline_transformation);
     let ExprNode::Send { method, args, .. } = &mut *e.node else { return };
-    if method.as_str() != "preview" || args.len() != 1 {
+    if !matches!(method.as_str(), "preview" | "variant" | "representation") || args.len() != 1 {
         return;
     }
     let ExprNode::Hash { entries, .. } = &*args[0].node else { return };

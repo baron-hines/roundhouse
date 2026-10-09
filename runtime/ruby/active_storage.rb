@@ -795,6 +795,12 @@ module ActiveStorage
       nil
     end
 
+    # Rails' `blob.variant(transformations)`: the blob under a
+    # Variation (`lower::attached` builds one from an inline hash).
+    def variant(variation)
+      VariantWithRecord.new(self, variation)
+    end
+
     # Rails' `purge_later`: the purge as an `ActiveStorage::PurgeJob`.
     def purge_later
       PurgeJob.perform_later(self)
@@ -1500,6 +1506,12 @@ module ActiveStorage
         out.push(ManyAttachment.new(row["attachment_id"].to_i, Blob.from_row(row)))
       end
       out
+    end
+
+    # Rails' `Attached::Many` delegates the collection reads to its
+    # attachments: `message.body.embeds.first.blob`.
+    def first
+      attachments.first
     end
 
     # The batch loader's setter: the rows one `IN` query found for this
