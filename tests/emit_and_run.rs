@@ -6069,6 +6069,9 @@ mod action_not_found;
 #[path = "emit_and_run/finder_miss_readers.rs"]
 mod finder_miss_readers;
 
+#[path = "emit_and_run/finder_miss_messages.rs"]
+mod finder_miss_messages;
+
 /// A concern split in two, mixed into more than one controller: the
 /// inner module calls a method only its includers have (through the
 /// outer one). With several includers `self` in the inner module is the

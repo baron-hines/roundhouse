@@ -304,7 +304,11 @@ fn untyped_subexpressions_baseline() {
     // the raises now pass through: `id` in Base#find (x2), Relation#find
     // and Relation#find_ids, and the ruby-family Base#find_by!'s
     // `conditions`. Companion RBS probe stays at zero residual.
-    const CEILING: usize = 534;
+    // Rails 8.1 finder-miss wording: 534 -> 540, MEASURED. The net six
+    // new sites are all in Relation#find_ids' multi-id message (the
+    // `inspect`ed id list and the interpolated model, key and expected
+    // count); the single-id messages trade one site for one.
+    const CEILING: usize = 540;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

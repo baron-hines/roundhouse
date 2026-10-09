@@ -268,9 +268,9 @@ module ActiveRecord
     # Reject nil before a key-typed adapter can coerce it to a real
     # zero/empty-string key.
     def self.find(id)
-      raise RecordNotFound.new("Couldn't find #{name} with id=#{id}", name, primary_key, id) if id.nil?
+      raise RecordNotFound.new("Couldn't find #{name} without an ID", name, primary_key, id) if id.nil?
       result = _find_primary_key_input(id)
-      raise RecordNotFound.new("Couldn't find #{name} with id=#{id}", name, primary_key, id) if result.nil?
+      raise RecordNotFound.new("Couldn't find #{name} with '#{primary_key}'=#{id.inspect}", name, primary_key, id) if result.nil?
       result
     end
 

@@ -1169,7 +1169,7 @@ module ActiveRecord
     # dispatch layer) instead of returning nil when the relation is empty.
     def first!
       record = first
-      raise RecordNotFound.new("Couldn't find record in #{@model.table_name}", @model.name, @model.primary_key) if record.nil?
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
       record
     end
 
@@ -1642,6 +1642,13 @@ module ActiveRecord
     # narrow every later use of it to that one row. Popped BEFORE the
     # raise for the same reason — an exception a caller rescues must not
     # leave the relation altered.
+    #
+    # The messages are Rails 8.1's (`raise_record_not_found_exception!`)
+    # minus the ` [WHERE ...]` suffix Rails appends for a scoped
+    # relation: Rails renders it from Arel with `?` binds, while the
+    # wheres here are SQL text with the values already filled in, so
+    # the suffix could not match. An unscoped relation's message is
+    # exactly Rails'.
     def find(id)
       return find_ids(id) if id.is_a?(Array)
       key = @model._cast_primary_key(id)
@@ -1657,7 +1664,7 @@ module ActiveRecord
         @wheres.pop
       end
       if record.nil?
-        raise RecordNotFound.new("Couldn't find record in #{@model.table_name} with id=#{id}", @model.name, @model.primary_key, id)
+        raise RecordNotFound.new("Couldn't find #{@model.name} with '#{@model.primary_key}'=#{id.inspect}", @model.name, @model.primary_key, id)
       end
       record
     end
@@ -1700,7 +1707,8 @@ module ActiveRecord
         @wheres.pop
       end
       if rows.length != expected
-        raise RecordNotFound.new("Couldn't find all records in #{@table} with ids=#{ids}", @model.name, @model.primary_key, ids)
+        listed = ids.map { |each_id| each_id.inspect }.join(", ")
+        raise RecordNotFound.new("Couldn't find all #{Inflector.pluralize_word(@model.name, 2)} with '#{@model.primary_key}': (#{listed}) (found #{rows.length} results, but was looking for #{expected}).", @model.name, @model.primary_key, ids)
       end
       if @orders.empty?
         keys.map { |key| rows.find { |row| row.id == key } }
@@ -1732,7 +1740,7 @@ module ActiveRecord
     # `find_by!` — `find_by` that raises `RecordNotFound` on no match.
     def find_by!(conditions)
       record = find_by(conditions)
-      raise RecordNotFound.new("Couldn't find record in #{@model.table_name}", @model.name, @model.primary_key) if record.nil?
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
       record
     end
 
