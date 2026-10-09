@@ -3423,24 +3423,24 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
     for model in &app.global_id_locate_models {
         let name = model.as_str();
         let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        let find = global_id_find(app, name);
         generated.push_str(&format!(
             "    def self.locate_{suffix}(gid_param)\n\
              \x20     parts = parts_from(gid_param)\n\
              \x20     return nil if parts.nil?\n\
-             \x20     return nil unless parts[1] == \"{name}\"\n\n\
-             \x20     {name}.find(cast_id(parts[2]))\n\
+             {find}\
              \x20   end\n",
         ));
     }
     for model in &app.global_id_locate_signed_models {
         let name = model.as_str();
         let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        let find = global_id_find(app, name);
         generated.push_str(&format!(
             "    def self.locate_signed_{suffix}(sgid, purpose)\n\
              \x20     parts = parts_from_signed(sgid, purpose)\n\
              \x20     return nil if parts.nil?\n\
-             \x20     return nil unless parts[1] == \"{name}\"\n\n\
-             \x20     {name}.find(cast_id(parts[2]))\n\
+             {find}\
              \x20   end\n",
         ));
     }
@@ -3455,6 +3455,41 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
         let end = start + rel_end + TAIL.len();
         content.replace_range(start..end, &generated);
     }
+}
+
+/// The name check and finder shared by both `locate_*` entry points.
+///
+/// An STI base also accepts its known subclasses' names: Rails mints an
+/// STI row's GlobalID with the row's own class, and `only: Room` admits
+/// every descendant. Nothing is constantized from the wire — the names
+/// are the closed set `sti_scope` stamped on the base model. The finder
+/// stays the base's (hydration is base-classed), so a subclass name is
+/// confirmed against the row: the record must mint that same name, or
+/// `Rooms::Open/<id of a plain Room>` would answer the plain room where
+/// Rails' scoped `Rooms::Open.find` finds nothing.
+fn global_id_find(app: &App, base: &str) -> String {
+    let subclasses = app
+        .models
+        .iter()
+        .find(|model| model.name.0.as_str() == base)
+        .map(|model| model.sti_subclass_names.as_slice())
+        .unwrap_or_default();
+    let allowed = std::iter::once(base)
+        .chain(subclasses.iter().map(|name| name.0.as_str()))
+        .map(|name| format!("parts[1] == \"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    if subclasses.is_empty() {
+        return format!(
+            "      return nil unless {allowed}\n\n      {base}.find(cast_id(parts[2]))\n"
+        );
+    }
+    format!(
+        "      return nil unless {allowed}\n\n\
+         \x20     record = {base}.find(cast_id(parts[2]))\n\
+         \x20     return nil unless record.to_gid_param == GlobalID.param(parts[1], record.id)\n\n\
+         \x20     record\n"
+    )
 }
 
 /// Write `ActionText::Attachable.locate(model_name, id)` into
