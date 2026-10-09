@@ -23,6 +23,15 @@ def assert(value, message)
   raise message unless value
 end
 
+[
+  [[1, 2, 3], ->(n) { n > 9 }, false],
+  [[1, 2, 3], ->(n) { n == 2 }, false],
+].each do |list, predicate, expected|
+  runtime_result = ActiveSupport.many?(list, &predicate)
+  rails_result = list.many?(&predicate)
+  assert(runtime_result == expected && runtime_result == rails_result, "many? block zero/one-match result must match Rails 8.1.4")
+end
+
 seen = []
 runtime_many = ActiveSupport.many?([1, 2, 3, 4]) { |n| seen << n; n > 1 }
 assert(runtime_many && seen == [1, 2, 3], "many? block must count matches and stop on the second")

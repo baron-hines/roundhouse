@@ -87,8 +87,10 @@ fn active_support_many_block_and_squish_bang_run_natively() {
             r#"class ActiveSupportProbe
   def self.many_matches
     seen = []
-    result = [1, 2, 3, 4].many? { |n| seen << n; n > 1 }
-    [result, seen.length]
+    zero = [1, 2, 3].many? { |n| n > 9 }
+    one = [1, 2, 3].many? { |n| n == 2 }
+    multiple = [1, 2, 3, 4].many? { |n| seen << n; n > 1 }
+    [zero, one, multiple, seen.length]
   end
 
   def self.squish_bang
@@ -99,7 +101,7 @@ end
 "#,
         )
         .run_spinel(
-            r#"raise "many? block did not count matches/stop at two" unless ActiveSupportProbe.many_matches == [true, 3]
+            r#"raise "many? block zero/one/multiple or short circuit failed" unless ActiveSupportProbe.many_matches == [false, false, true, 3]
 raise "squish! did not match Unicode whitespace semantics" unless ActiveSupportProbe.squish_bang == "foo bar"
 puts "ActiveSupport core extensions native passed"
 "#,
