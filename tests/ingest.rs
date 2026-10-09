@@ -2005,6 +2005,38 @@ fn multi_write_with_post_rest_targets_ingests_and_round_trips() {
 }
 
 #[test]
+fn nested_multi_write_desugars_per_group_and_round_trips() {
+    use roundhouse::emit::ruby::emit_expr;
+    use roundhouse::ingest::IngestError;
+
+    let parse = |source: &str| {
+        let result = ruby_prism::parse(source.as_bytes());
+        let program = result.node();
+        roundhouse::ingest::ingest_expr(&program.as_program_node().unwrap().statements().as_node(), "<snippet>")
+    };
+    let expr = parse("_, (_, size) = entries.shift").unwrap();
+    let emitted = emit_expr(&expr);
+    assert!(emitted.contains("_, size = "), "{emitted}");
+    assert_eq!(expr, parse(&emitted).unwrap(), "round-trip IR, not only emitted text, must be stable");
+
+    // Ruby writes depth first in source order; a name whose last write
+    // would move under the per-group desugar, and a non-variable target
+    // whose receiver Ruby evaluates before the RHS, stay unsupported.
+    for (source, expected) in [
+        ("(x, y), x = [1, 2], 3", "out of source order"),
+        ("a.b, (c, d) = 1, [2, 3]", "non-variable targets"),
+        ("a, (b, *c) = 1, [2, 3]", "with a splat"),
+    ] {
+        let Err(IngestError::Unsupported { message, .. }) = parse(source) else {
+            panic!("expected unsupported: {source}");
+        };
+        assert!(message.contains(expected), "{source}: {message}");
+    }
+    // The same name written twice in an order the desugar keeps is fine.
+    assert!(parse("x, (y, x) = 1, [2, 3]").is_ok());
+}
+
+#[test]
 fn multi_write_temporary_does_not_capture_a_user_target() {
     let source = "a, *__mw_0, c = [11, 22, 33]";
     let result = ruby_prism::parse(source.as_bytes());

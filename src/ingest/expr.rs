@@ -92,6 +92,9 @@ fn ingest_multi_write(
     span: Span,
     file: &str,
 ) -> IngestResult<ExprNode> {
+    if mw.rest().is_none() && mw.lefts().iter().any(|left| left.as_multi_target_node().is_some()) {
+        return ingest_nested_multi_write(mw, span, file);
+    }
     let mut targets: Vec<crate::expr::LValue> = Vec::new();
     for left in mw.lefts().iter() {
         targets.push(multi_write_target(&left, file)?);
@@ -216,6 +219,124 @@ fn ingest_multi_write(
         exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
     }
     exprs.push(tmp_read());
+    Ok(ExprNode::Seq { exprs })
+}
+
+/// `_, (_, size) = pair` — a parenthesized group among the targets.
+/// Desugared to native destructuring one level at a time: the RHS binds
+/// a temp, the outer `MultiAssign` writes each group into its own temp,
+/// and each group is then a `MultiAssign` over that temp. Ruby converts
+/// a group's value exactly as it converts a top-level RHS (`to_ary`, or
+/// a lone value padded with nil), so every level stays the construct the
+/// analyzer and emitters already carry, and the Seq ends in the RHS
+/// temp — `(a, (b, c) = x)` evaluates to `x`.
+///
+/// Only variable targets are accepted, at every level, and no group may
+/// splat. Receivers and indexes on an assignment target run BEFORE the
+/// RHS in Ruby; the desugar evaluates them after it, so those shapes
+/// stay unsupported rather than silently reordered.
+fn ingest_nested_multi_write(
+    mw: &ruby_prism::MultiWriteNode<'_>,
+    span: Span,
+    file: &str,
+) -> IngestResult<ExprNode> {
+    fn unsupported(file: &str, message: &str) -> IngestError {
+        IngestError::Unsupported { file: file.into(), message: message.into() }
+    }
+    fn temp(location: &ruby_prism::Location<'_>, start: impl std::fmt::Display) -> Symbol {
+        let stem = format!("__mw_{start}");
+        let mut name = stem.clone();
+        let mut suffix = 0;
+        while super::sources::generated_local_is_reserved(location, &name) {
+            suffix += 1;
+            name = format!("{stem}_{suffix}");
+        }
+        Symbol::from(name)
+    }
+    fn var(span: Span, name: &Symbol) -> Expr {
+        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() })
+    }
+    // One level: its targets, and the group assignments it defers.
+    fn level<'pr>(
+        lefts: impl Iterator<Item = Node<'pr>>,
+        location: &ruby_prism::Location<'_>,
+        file: &str,
+        deferred: &mut std::collections::VecDeque<(Symbol, Span, Vec<Node<'pr>>)>,
+        written: &mut Vec<(String, usize)>,
+    ) -> IngestResult<Vec<crate::expr::LValue>> {
+        let mut targets = Vec::new();
+        for left in lefts {
+            if let Some(group) = left.as_multi_target_node() {
+                if group.rest().is_some() || !group.rights().is_empty() {
+                    return Err(unsupported(file, "nested multi-write group with a splat is not modeled"));
+                }
+                let name = temp(location, group.location().start_offset());
+                let group_span = super::util::node_span(&left, file);
+                targets.push(crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() });
+                deferred.push_back((name, group_span, group.lefts().iter().collect()));
+                continue;
+            }
+            if left.as_local_variable_target_node().is_none()
+                && left.as_instance_variable_target_node().is_none()
+            {
+                return Err(unsupported(
+                    file,
+                    "nested multi-write with non-variable targets requires preserved LHS evaluation order",
+                ));
+            }
+            let target = multi_write_target(&left, file)?;
+            if let crate::expr::LValue::Var { name, .. } | crate::expr::LValue::Ivar { name } = &target {
+                written.push((name.as_str().to_string(), left.location().start_offset()));
+            }
+            targets.push(target);
+        }
+        Ok(targets)
+    }
+    // Ruby writes the targets in source order, depth first; the desugar
+    // writes a level at a time. The two agree unless a name is written
+    // twice and the last write differs (`(x, y), x = …`).
+    fn source_order<'pr>(lefts: impl Iterator<Item = Node<'pr>>, out: &mut Vec<(String, usize)>) {
+        for left in lefts {
+            if let Some(group) = left.as_multi_target_node() {
+                source_order(group.lefts().iter(), out);
+            } else if let Some(local) = left.as_local_variable_target_node() {
+                out.push((constant_id_str(&local.name()).to_string(), left.location().start_offset()));
+            } else if let Some(ivar) = left.as_instance_variable_target_node() {
+                let raw = constant_id_str(&ivar.name());
+                out.push((raw.strip_prefix('@').unwrap_or(raw).to_string(), left.location().start_offset()));
+            }
+        }
+    }
+    let location = mw.location();
+    let rhs = temp(&location, span.start);
+    let value = ingest_expr(&mw.value(), file)?;
+    let mut exprs = vec![Expr::new(
+        span,
+        ExprNode::Assign {
+            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: rhs.clone() },
+            value,
+        },
+    )];
+    let mut deferred = std::collections::VecDeque::new();
+    let mut written = Vec::new();
+    let targets = level(mw.lefts().iter(), &location, file, &mut deferred, &mut written)?;
+    exprs.push(Expr::new(span, ExprNode::MultiAssign { targets, value: var(span, &rhs) }));
+    while let Some((name, group_span, lefts)) = deferred.pop_front() {
+        let targets = level(lefts.into_iter(), &location, file, &mut deferred, &mut written)?;
+        exprs.push(Expr::new(group_span, ExprNode::MultiAssign { targets, value: var(group_span, &name) }));
+    }
+    let mut ordered = Vec::new();
+    source_order(mw.lefts().iter(), &mut ordered);
+    let last = |writes: &[(String, usize)], name: &str| {
+        writes.iter().rev().find(|(n, _)| n == name).map(|(_, at)| *at)
+    };
+    if ordered.iter().any(|(name, _)| last(&ordered, name) != last(&written, name)) {
+        return Err(unsupported(
+            file,
+            "nested multi-write that writes one variable twice out of source order is not modeled",
+        ));
+    }
+    exprs.push(var(span, &rhs));
     Ok(ExprNode::Seq { exprs })
 }
 
