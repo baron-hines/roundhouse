@@ -376,9 +376,27 @@ module ActionText
 
     # Rails delegates this to the blob, whose `filename` is an
     # `ActiveStorage::Filename` (extension, base, …); the node carries
-    # the same name as text, so wrap it the same way.
+    # the same name as text, so wrap it the same way. A node that names
+    # its blob only by sgid (campfire's helper tests embed one so) reads
+    # the blob's own.
     def filename
-      ActiveStorage::Filename.new(self["filename"])
+      text = self["filename"]
+      return ActiveStorage::Filename.new(text) unless text == ""
+      b = blob
+      b.nil? ? ActiveStorage::Filename.new("") : b.filename
+    end
+
+    # Delegated to the blob too, as `active_storage/blobs/_blob` reads it
+    # for the file's size; the node's `filesize` without one.
+    def byte_size
+      b = blob
+      b.nil? ? self["filesize"].to_i : b.byte_size
+    end
+
+    # The blob the sgid names, when it names one.
+    def blob
+      return nil unless resolved_model_name == "ActiveStorage::Blob"
+      ActiveStorage::Blob.find(resolved_id)
     end
 
     def url
