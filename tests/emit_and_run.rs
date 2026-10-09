@@ -9264,3 +9264,49 @@ end
         .run_test("test/models/assoc_create_test.rb")
         .assert_passes();
 }
+
+/// Active Storage's "was it made?" questions, as campfire's
+/// presentation asks them so a view never makes a preview: a variant is
+/// `processed?` once its record exists (looked up, not made);
+/// `preview(:poster)` names a variant the owner's `has_one_attached`
+/// block declares; and `url_for` of a Preview held in a typed local is
+/// the preview's representation URL, not the object.
+#[test]
+fn a_variant_is_processed_once_its_record_exists_and_a_preview_resolves_its_name() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", r#"class Doc < ApplicationRecord
+  has_one_attached :file do |attachable|
+    attachable.variant :thumb, resize_to_limit: [ 10, 10 ]
+    attachable.variant :poster, format: :webp, resize_to_limit: [ 10, 10 ]
+  end
+
+  def poster_url
+    poster = file.preview(:poster)
+    ActionView::ViewHelpers.url_for(poster)
+  end
+end
+"#)
+        .run_ruby(r#"
+doc = Doc.create!(name: "first", file: { io: StringIO.new("bytes"), filename: "a.mov", content_type: "video/quicktime" })
+thumb = doc.file.representation(:thumb)
+raise "processed before any record" if thumb.processed?
+image = ActiveStorage::Blob.create_and_upload!("png", "a.png", "image/png")
+connection = ActiveRecord::Base.connection
+connection.execute("INSERT INTO active_storage_variant_records (blob_id, variation_digest) VALUES (#{doc.file.blob.id}, '#{thumb.variation.digest}')")
+record_id = connection.select_value("SELECT max(id) FROM active_storage_variant_records")
+connection.execute("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES ('image', 'ActiveStorage::VariantRecord', #{record_id}, #{image.id}, '2026-01-01')")
+raise "not processed once its record exists" unless doc.file.representation(:thumb).processed?
+preview = doc.file.preview(:poster)
+raise "preview named #{preview.variation&.name.inspect}" unless preview.variation.name == "poster"
+url = doc.poster_url
+raise "url_for(preview) answered #{url.inspect}" unless url.is_a?(String) && url.include?("/representations/")
+"#)
+        .assert_passes();
+}
