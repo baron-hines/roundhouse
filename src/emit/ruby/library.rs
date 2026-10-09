@@ -90,6 +90,24 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // tree entirely, which the broadcast tests caught at once. Those
     // keep their own file and the extra body-end with it; moving them
     // is a change to the model emit, not to this one.
+    // `X = Data.define(:a) do def … end` — the block's methods travel as
+    // a library class of X's name (`ingest::library_class::
+    // data_block_classes`) and render back into the block, the one place
+    // they run before anything reads the class.
+    let (data_blocks, lcs): (Vec<LibraryClass>, Vec<LibraryClass>) = {
+        let all = std::mem::take(&mut lcs);
+        let factories: std::collections::HashSet<String> = all
+            .iter()
+            .flat_map(|lc| {
+                lc.constants.iter().filter(|(_, value)| is_data_factory(value)).map(move |(name, _)| {
+                    format!("{}::{}", lc.name.0.as_str(), name.as_str())
+                })
+            })
+            .collect();
+        all.into_iter().partition(|lc| {
+            !lc.is_module && lc.parent.is_none() && factories.contains(lc.name.0.as_str())
+        })
+    };
     let emitted_here: std::collections::HashSet<&str> =
         lcs.iter().map(|lc| lc.name.0.as_str()).collect();
     let owner_in_this_tree = |lc: &LibraryClass| -> Option<String> {
@@ -119,9 +137,86 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             if let Some(kids) = children.get(lc.name.0.as_str()) {
                 splice_nested(&mut files, lc, kids, app);
             }
+            for block in &data_blocks {
+                splice_data_block(&mut files, block, app);
+            }
             files
         })
         .collect()
+}
+
+/// `Data.define(<symbols>)` — the factory `analyze::data` models.
+fn is_data_factory(value: &crate::expr::Expr) -> bool {
+    matches!(
+        &*value.node,
+        ExprNode::Send { recv: Some(recv), method, block: None, .. }
+            if method.as_str() == "define"
+                && matches!(&*recv.node, ExprNode::Const { path }
+                    if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["Data"]))
+    )
+}
+
+/// Render `block`'s methods into the `X = Data.define(…)` line that
+/// declares it, as the `do … end` the source wrote, and into the
+/// sidecar's `class X < ::Data` declaration. The line is the one
+/// `emit_library_class_decl` wrote for the owner, at the owner's body
+/// indentation; a file that does not hold it is not the owner's.
+fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App) {
+    let name = block.name.0.as_str();
+    let depth = name.split("::").count();
+    let last = name.rsplit("::").next().unwrap_or(name);
+    let indent = "  ".repeat(depth - 1);
+    let stem = crate::naming::underscore(name);
+    let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
+    let rendered = emit_library_class_decl(block, app, rb_path.clone());
+    let lines: Vec<&str> = rendered.content.lines().filter(|l| !l.starts_with("require")).collect();
+    let Some(body) = unwrapped(&lines, depth) else { return };
+    let sidecar = super::rbs::emit_library_class_rbs(block, &rb_path);
+    let sidecar_lines: Vec<&str> = sidecar.content.lines().collect();
+    let sidecar_body = unwrapped(&sidecar_lines, depth);
+    for file in files.iter_mut() {
+        let is_rb = file.path.extension().is_some_and(|e| e == "rb");
+        let mut out: Vec<String> = Vec::new();
+        let mut spliced = false;
+        let mut lines = file.content.lines().peekable();
+        while let Some(line) = lines.next() {
+            if spliced {
+                out.push(line.to_string());
+                continue;
+            }
+            if is_rb {
+                let factory = line
+                    .strip_prefix(&indent)
+                    .and_then(|rest| rest.strip_prefix(&format!("{last} = Data.define")))
+                    .is_some_and(|rest| !rest.contains(" do") && (rest.is_empty() || rest.ends_with(')')));
+                out.push(if factory { format!("{line} do") } else { line.to_string() });
+                if factory {
+                    out.push(body.clone());
+                    out.push(format!("{indent}end"));
+                    spliced = true;
+                }
+            } else {
+                out.push(line.to_string());
+                if line == format!("{indent}class {last} < ::Data") {
+                    // The members' readers follow up to the class's `end`.
+                    while let Some(next) = lines.peek() {
+                        if *next == format!("{indent}end") {
+                            break;
+                        }
+                        out.push(lines.next().unwrap().to_string());
+                    }
+                    if let Some(methods) = &sidecar_body {
+                        out.push(methods.clone());
+                    }
+                    spliced = true;
+                }
+            }
+        }
+        if spliced {
+            let trailing = if file.content.ends_with('\n') { "\n" } else { "" };
+            file.content = format!("{}{trailing}", out.join("\n"));
+        }
+    }
 }
 
 /// A child's `require_relative` target, expressed from its parent's
