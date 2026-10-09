@@ -7,7 +7,15 @@
 //! `with_lock` runs `lock!` then the block inside a transaction, answering
 //! the block's value — same contract Rails documents, minus the lock
 //! clause's actual SQL effect (the clause itself, `true` or a String, is
-//! accepted — see below). Exercised on both the Ruby and Spinel targets;
+//! accepted — see below). Also covers `with_lock`'s Rails 8.1 shape:
+//! a trailing options Hash (`isolation:`/`requires_new:`/`joinable:`,
+//! Rails' `DatabaseStatements#transaction` keywords) separated from the
+//! lock-clause argument, both forwarded to `transaction` rather than
+//! raising `ArgumentError`. (Nested transactions — `with_lock` or
+//! `transaction` called from inside one already open — still error on
+//! SQLite; #644 made `with_lock` always open its own, which the corpus
+//! doesn't yet exercise nested. Tracked separately, not fixed here —
+//! see the PR thread.) Exercised on both the Ruby and Spinel targets;
 //! the Spinel case is `#[ignore]`d like its sibling suites (CI's
 //! `spinel-framework` job runs it with `--ignored` — see
 //! `scripts/ci-plan.py`'s `SPINEL_TESTS`).
@@ -76,6 +84,22 @@ Db.exec("UPDATE widgets SET name = 'clause-value' WHERE id = #{clause.id}")
 locked_clause = clause.lock!("FOR UPDATE NOWAIT")
 raise "lock! with a String clause should still reload" unless clause.name == "clause-value"
 raise "lock! with a String clause should return self" unless locked_clause.equal?(clause)
+
+# `Model.transaction` accepts (and ignores) Rails' three keyword
+# options so a real app's call — and `with_lock`'s own forwarding,
+# below — doesn't raise `ArgumentError`.
+direct_txn_result = Widget.transaction(requires_new: true, isolation: :serializable, joinable: false) do
+  :direct_txn_value
+end
+raise "Model.transaction should accept Rails' transaction options" unless direct_txn_result == :direct_txn_value
+
+opts = Widget.create!(name: "opts-start")
+opts_result = opts.with_lock(requires_new: true, isolation: :serializable, joinable: false) do
+  opts.update!(name: "opts-value")
+  :opts_block_value
+end
+raise "with_lock should accept Rails' transaction options without raising" unless opts_result == :opts_block_value
+raise "with_lock should still commit with options forwarded" unless Widget.find(opts.id).name == "opts-value"
 
 puts "lock! and with_lock contract passed"
 "#;

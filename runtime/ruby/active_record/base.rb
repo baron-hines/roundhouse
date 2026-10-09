@@ -983,9 +983,22 @@ module ActiveRecord
     # class one in connection.rb. An exception raised in the block
     # rolls the transaction back and re-raises, same as `transaction`
     # itself.
+    #
+    # Rails' own shape (`ActiveRecord::Locking::Pessimistic#with_lock`)
+    # is `args.extract_options!` for the trailing transaction-options
+    # Hash, then the lock clause (`true` when nothing is left).
+    # `extract_options!` itself is an ActiveSupport `Array` extension
+    # this runtime doesn't carry, so the same split is spelled out by
+    # hand: pop a trailing Hash, default the rest to `true`.
     def with_lock(*args)
-      self.class.transaction do
-        lock!
+      transaction_opts = args.last.is_a?(Hash) ? args.pop : {}
+      lock = args.empty? ? true : args.first
+      self.class.transaction(
+        isolation: transaction_opts[:isolation],
+        requires_new: transaction_opts[:requires_new],
+        joinable: transaction_opts.key?(:joinable) ? transaction_opts[:joinable] : true
+      ) do
+        lock!(lock)
         yield
       end
     end
