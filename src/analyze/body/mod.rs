@@ -4328,6 +4328,68 @@ mod tests {
         assert_eq!(got, nullable_foo);
     }
 
+    /// Every order of `stmts`, for the order-independence checks below.
+    fn permutations(stmts: Vec<Expr>) -> Vec<Vec<Expr>> {
+        if stmts.len() <= 1 {
+            return vec![stmts];
+        }
+        let mut out = Vec::new();
+        for i in 0..stmts.len() {
+            let mut rest = stmts.clone();
+            let first = rest.remove(i);
+            for mut tail in permutations(rest) {
+                tail.insert(0, first.clone());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// A `[]=` write harvested before the `{}` seed is kept, whatever
+    /// the slot holds when it arrives (nothing, `nil` or a pending
+    /// `Var`): the harvest gives one type in every statement order.
+    #[test]
+    fn index_writes_before_the_hash_seed_are_kept_in_any_order() {
+        let want_nullable = Ty::Union {
+            variants: vec![
+                Ty::Hash {
+                    key: Box::new(Ty::Str),
+                    value: Box::new(Ty::Union { variants: vec![Ty::Int, Ty::Str] }),
+                },
+                Ty::Nil,
+            ],
+        };
+        let stmts = vec![
+            ivar_write("data", Ty::Nil),
+            ivar_write("data", empty_hash()),
+            ivar_index_write("data", Ty::Str),
+            ivar_index_write("data", Ty::Int),
+        ];
+        for order in permutations(stmts) {
+            assert_eq!(harvested_ivar("data", order.clone()), want_nullable, "order {order:?}");
+        }
+        let want = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Int) };
+        let stmts = vec![
+            ivar_write("data", Ty::Var { var: TyVar(3) }),
+            ivar_write("data", empty_hash()),
+            ivar_index_write("data", Ty::Int),
+        ];
+        for order in permutations(stmts) {
+            assert_eq!(harvested_ivar("data", order.clone()), want, "order {order:?}");
+        }
+    }
+
+    /// A class instance's `[]=` is that class's, before or after the
+    /// instance is assigned.
+    #[test]
+    fn index_writes_leave_a_class_instance_ivar_alone_in_any_order() {
+        let foo = Ty::Class { id: ClassId(Symbol::from("Foo")), args: vec![] };
+        let nullable_foo = Ty::Union { variants: vec![foo, Ty::Nil] };
+        for order in permutations(vec![ivar_write("x", nullable_foo.clone()), ivar_index_write("x", Ty::Int)]) {
+            assert_eq!(harvested_ivar("x", order), nullable_foo);
+        }
+    }
+
     #[test]
     fn concrete_value_shapes_are_truthy_for_boolean_operators() {
         let values = [

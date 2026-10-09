@@ -7715,24 +7715,49 @@ pub(crate) fn extract_ivar_assignments_in(
     out: &mut HashMap<Symbol, Ty>,
     env: &ivar_set::IvarNameEnv<'_>,
 ) {
+    let mut walk = IvarWalk::default();
+    walk_ivar_assignments(expr, out, env, &mut walk);
+    // `[]=` writes join once the walk has seen every assignment, so a
+    // write that comes before the `{}` seed (or before the class
+    // instance that owns `[]=`) gives the same slot as one after it
+    // (#617).
+    let mut index_writes: std::collections::BTreeMap<Symbol, Ty> = std::collections::BTreeMap::new();
+    for (name, value) in walk.index_writes {
+        let joined = match index_writes.remove(&name) {
+            Some(prev) => crate::analyze::body::union_of(prev, value),
+            None => value,
+        };
+        index_writes.insert(name, joined);
+    }
+    for (name, value) in index_writes {
+        widen_hash_ivar_value(out, &name, value);
+        walk.touched.insert(name);
+    }
     // The size bound applies once to each slot the walk wrote, after
     // all of its writes are joined: `bound` doesn't distribute over the
     // join, so bounding after each write made the slot depend on the
     // order of its writes (#617).
-    let mut touched: BTreeSet<Symbol> = BTreeSet::new();
-    walk_ivar_assignments(expr, out, env, &mut touched);
-    for name in touched {
+    for name in walk.touched {
         if let Some(ty) = out.remove(&name) {
             out.insert(name, fixpoint_bound::bound(ty));
         }
     }
 }
 
+/// What a walk of one body collects besides the slots themselves.
+#[derive(Default)]
+struct IvarWalk {
+    /// Ivars the walk assigned, bounded once at the end.
+    touched: BTreeSet<Symbol>,
+    /// `@ivar[k] = v` value types, joined into their slots at the end.
+    index_writes: Vec<(Symbol, Ty)>,
+}
+
 fn walk_ivar_assignments(
     expr: &Expr,
     out: &mut HashMap<Symbol, Ty>,
     env: &ivar_set::IvarNameEnv<'_>,
-    touched: &mut BTreeSet<Symbol>,
+    walk: &mut IvarWalk,
 ) {
     match &*expr.node {
         ExprNode::Assign { target: LValue::Ivar { name }, value } => {
@@ -7745,7 +7770,7 @@ fn walk_ivar_assignments(
                     None => ty,
                 };
                 out.insert(name.clone(), merged);
-                touched.insert(name.clone());
+                walk.touched.insert(name.clone());
             }
         }
         // Short-circuit compound assignment to an ivar (`@x ||= y`,
@@ -7759,7 +7784,7 @@ fn walk_ivar_assignments(
                     None => ty,
                 };
                 out.insert(name.clone(), merged);
-                touched.insert(name.clone());
+                walk.touched.insert(name.clone());
             }
         }
         // `@a, @b = expr` — destructuring assignment. Each ivar target
@@ -7779,11 +7804,11 @@ fn walk_ivar_assignments(
                             None => ty,
                         };
                         out.insert(name.clone(), merged);
-                        touched.insert(name.clone());
+                        walk.touched.insert(name.clone());
                     }
                 }
             }
-            walk_ivar_assignments(value, out, env, touched);
+            walk_ivar_assignments(value, out, env, walk);
         }
         // `@hash[k] ||= v` / `@hash[k] = v` in the OpAssign / Assign
         // Index forms (the `||=` accumulator idiom — `@hat_groups[k] ||=
@@ -7795,13 +7820,12 @@ fn walk_ivar_assignments(
         | ExprNode::OpAssign { target: LValue::Index { recv, index }, value, .. } => {
             if let ExprNode::Ivar { name } = &*recv.node {
                 if let Some(v_ty) = &value.ty {
-                    widen_hash_ivar_value(out, name, v_ty);
-                    touched.insert(name.clone());
+                    walk.index_writes.push((name.clone(), v_ty.clone()));
                 }
             }
-            walk_ivar_assignments(recv, out, env, touched);
-            walk_ivar_assignments(index, out, env, touched);
-            walk_ivar_assignments(value, out, env, touched);
+            walk_ivar_assignments(recv, out, env, walk);
+            walk_ivar_assignments(index, out, env, walk);
+            walk_ivar_assignments(value, out, env, walk);
         }
         // `@hash[k] = v` parses as Send to `[]=` with @hash as the
         // receiver. The Hash literal `@hash = {}` only seeds key/value
@@ -7814,16 +7838,15 @@ fn walk_ivar_assignments(
         {
             if let ExprNode::Ivar { name } = &*recv.node {
                 if let Some(v_ty) = &args[1].ty {
-                    widen_hash_ivar_value(out, name, v_ty);
-                    touched.insert(name.clone());
+                    walk.index_writes.push((name.clone(), v_ty.clone()));
                 }
             }
-            walk_ivar_assignments(recv, out, env, touched);
+            walk_ivar_assignments(recv, out, env, walk);
             for a in args {
-                walk_ivar_assignments(a, out, env, touched);
+                walk_ivar_assignments(a, out, env, walk);
             }
             if let Some(b) = block {
-                walk_ivar_assignments(b, out, env, touched);
+                walk_ivar_assignments(b, out, env, walk);
             }
         }
         // Walk into other Send forms so nested `[]=` writes (e.g.
@@ -7837,27 +7860,27 @@ fn walk_ivar_assignments(
         ExprNode::Send { recv, method, args, block, .. } => {
             ivar_set::harvest_ivar_set(recv, method, args, env, out);
             if let Some(r) = recv {
-                walk_ivar_assignments(r, out, env, touched);
+                walk_ivar_assignments(r, out, env, walk);
             }
             for a in args {
-                walk_ivar_assignments(a, out, env, touched);
+                walk_ivar_assignments(a, out, env, walk);
             }
             if let Some(b) = block {
-                walk_ivar_assignments(b, out, env, touched);
+                walk_ivar_assignments(b, out, env, walk);
             }
         }
         ExprNode::Seq { exprs } => {
             for e in exprs {
-                walk_ivar_assignments(e, out, env, touched);
+                walk_ivar_assignments(e, out, env, walk);
             }
         }
         // The condition is walked too: `if (@message = Model.find(..))`
         // assigns the ivar inside the test, a common `find_*` filter
         // idiom. Without visiting `cond`, that ivar never gets typed.
         ExprNode::If { cond, then_branch, else_branch } => {
-            walk_ivar_assignments(cond, out, env, touched);
-            walk_ivar_assignments(then_branch, out, env, touched);
-            walk_ivar_assignments(else_branch, out, env, touched);
+            walk_ivar_assignments(cond, out, env, walk);
+            walk_ivar_assignments(then_branch, out, env, walk);
+            walk_ivar_assignments(else_branch, out, env, walk);
         }
         // `while cond; body; end` — body may contain `@hash[k] = v`
         // (Parameters' initialize loop). Without this arm, ivar
@@ -7865,16 +7888,16 @@ fn walk_ivar_assignments(
         // invisible. The condition is walked for the same
         // assignment-in-test reason as `If`.
         ExprNode::While { cond, body, .. } => {
-            walk_ivar_assignments(cond, out, env, touched);
-            walk_ivar_assignments(body, out, env, touched);
+            walk_ivar_assignments(cond, out, env, walk);
+            walk_ivar_assignments(body, out, env, walk);
         }
         ExprNode::RescueModifier { expr, fallback } => {
-            walk_ivar_assignments(expr, out, env, touched);
-            walk_ivar_assignments(fallback, out, env, touched);
+            walk_ivar_assignments(expr, out, env, walk);
+            walk_ivar_assignments(fallback, out, env, walk);
         }
         ExprNode::Case { arms, .. } => {
             for arm in arms {
-                walk_ivar_assignments(&arm.body, out, env, touched);
+                walk_ivar_assignments(&arm.body, out, env, walk);
             }
         }
         // `a && (@x = y)` / `a || (@x = y)` — an ivar assigned inside a
@@ -7882,25 +7905,25 @@ fn walk_ivar_assignments(
         // so the buried assignment still gets typed. (Compound `@x ||= y`
         // is `OpAssign`, handled by its own arm above — not `BoolOp`.)
         ExprNode::BoolOp { left, right, .. } => {
-            walk_ivar_assignments(left, out, env, touched);
-            walk_ivar_assignments(right, out, env, touched);
+            walk_ivar_assignments(left, out, env, walk);
+            walk_ivar_assignments(right, out, env, walk);
         }
         // Rescue/ensure and lifecycle constructs may also contain
         // assignments; recurse to catch them.
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            walk_ivar_assignments(body, out, env, touched);
+            walk_ivar_assignments(body, out, env, walk);
             for r in rescues {
-                walk_ivar_assignments(&r.body, out, env, touched);
+                walk_ivar_assignments(&r.body, out, env, walk);
             }
             if let Some(e) = else_branch {
-                walk_ivar_assignments(e, out, env, touched);
+                walk_ivar_assignments(e, out, env, walk);
             }
             if let Some(e) = ensure {
-                walk_ivar_assignments(e, out, env, touched);
+                walk_ivar_assignments(e, out, env, walk);
             }
         }
-        ExprNode::Lambda { body, .. } => walk_ivar_assignments(body, out, env, touched),
-        ExprNode::Return { value } => walk_ivar_assignments(value, out, env, touched),
+        ExprNode::Lambda { body, .. } => walk_ivar_assignments(body, out, env, walk),
+        ExprNode::Return { value } => walk_ivar_assignments(value, out, env, walk),
         // Any other assignment target (local var, constant, attribute) that
         // wasn't matched by the ivar/index arms above. We record no ivar for
         // the target itself, but the RHS can still assign ivars inside a
@@ -7909,54 +7932,49 @@ fn walk_ivar_assignments(
         // Without descending here, those ivars are invisible to the
         // controller→view channel and read as `ivar_unresolved` in the view.
         ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
-            walk_ivar_assignments(value, out, env, touched);
+            walk_ivar_assignments(value, out, env, walk);
         }
         // `let x = <expr with block> in body` — same reasoning as the local
         // assignment above; walk both the bound value and the body.
         ExprNode::Let { value, body, .. } => {
-            walk_ivar_assignments(value, out, env, touched);
-            walk_ivar_assignments(body, out, env, touched);
+            walk_ivar_assignments(value, out, env, walk);
+            walk_ivar_assignments(body, out, env, walk);
         }
         _ => {}
     }
 }
 
-/// Widen an existing Hash ivar's value-type to include `incoming`.
+/// Widen an ivar's Hash value-type with the joined value type of the
+/// `[]=` writes one body made to it.
 ///
-/// Only fires when the existing entry has a Hash spine, bare or as an
-/// arm of a union (`Hash[K, V] | Nil`, a hash that is nil on some
-/// path) — if the ivar was assigned a typed class instance (e.g.
-/// `@hash = Foo.new`), the class's own `[]=` method shouldn't retype
-/// the ivar to a generic Hash. The widening exists to grow
-/// empty-Hash-literal types from observed `[]=` writes, not to retype
-/// class instances. Skipping a nullable Hash lost the write (#617).
-///
-/// The write joins `Hash[K, incoming]` into the slot with
-/// [`body::join_ivar_slot`], the same join the plain assignments use,
-/// so a pending `Var` from the empty literal `{}` drops out whether
-/// the literal or the write is seen first. `K` is the existing key; a
-/// pending key collapses to `Str` since `[]=` writes use `key.to_s`
-/// strings in the runtime conventions here.
-fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming: &Ty) {
+/// A slot with a Hash spine, bare or as an arm of a union (`Hash[K, V]
+/// | Nil`, a hash that is nil on some path), joins `Hash[K, incoming]`
+/// with [`body::join_ivar_slot`], the join the plain assignments use;
+/// a pending key collapses to `Str` since `[]=` writes use `key.to_s`
+/// strings in the runtime conventions here. A slot with no value yet
+/// (absent, `nil` or a pending `Var`) gains `Hash[Str, incoming]`. A
+/// slot holding anything else, such as a class instance (`@hash =
+/// Foo.new`), is left alone: that class's own `[]=` runs, and the
+/// widening exists to grow empty-Hash-literal types, not to retype
+/// class instances.
+fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming: Ty) {
     let Some(existing) = out.get(name) else {
         // No prior entry — seed a fresh Hash[Str, incoming]. Matches
         // the Crystal collector's "fresh entry" branch.
-        out.insert(name.clone(), Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) });
+        out.insert(name.clone(), Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming) });
         return;
     };
-    let spine = match existing {
-        Ty::Union { variants } => variants.iter().find(|v| matches!(v, Ty::Hash { .. })),
-        other => Some(other),
+    let arms: &[Ty] = match existing {
+        Ty::Union { variants } => variants,
+        other => std::slice::from_ref(other),
     };
-    let Some(Ty::Hash { key, .. }) = spine else {
-        return;
+    let key = match arms.iter().find(|v| matches!(v, Ty::Hash { .. })) {
+        Some(Ty::Hash { key, .. }) if !matches!(**key, Ty::Var { .. }) => key.clone(),
+        Some(_) => Box::new(Ty::Str),
+        None if arms.iter().all(|v| matches!(v, Ty::Nil | Ty::Var { .. })) => Box::new(Ty::Str),
+        None => return,
     };
-    let key = if matches!(**key, Ty::Var { .. }) {
-        Box::new(Ty::Str)
-    } else {
-        key.clone()
-    };
-    let write = Ty::Hash { key, value: Box::new(incoming.clone()) };
+    let write = Ty::Hash { key, value: Box::new(incoming) };
     let merged = crate::analyze::body::join_ivar_slot(existing.clone(), write);
     out.insert(name.clone(), merged);
 }
