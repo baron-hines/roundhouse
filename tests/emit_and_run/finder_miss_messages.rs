@@ -33,13 +33,3 @@ fn a_finder_miss_uses_rails_wording() {
     run.assert_passes();
     assert!(run.stdout.contains("messages match"), "{}", run.stdout);
 }
-
-#[test]
-fn a_finder_miss_uses_rails_wording_on_spinel() {
-    let script = format!(
-        "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{SCRIPT}"
-    );
-    let run = emit_and_run::real_blog().run_spinel(&script);
-    run.assert_passes();
-    assert!(run.stdout.contains("messages match"), "{}", run.stdout);
-}

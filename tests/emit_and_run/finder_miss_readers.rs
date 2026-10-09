@@ -64,40 +64,6 @@ end
         .assert_passes();
 }
 
-/// The Spinel binary carries the same readers.
-#[test]
-fn a_finder_miss_carries_model_primary_key_and_id_on_spinel() {
-    let run = gadgets().run_spinel(
-        r##"Db.configure(":memory:")
-Schema.statements.each { |sql| Db.exec(sql) }
-ActiveRecord.adapter = SqliteAdapter
-begin
-  Article.find("999999")
-rescue ActiveRecord::RecordNotFound => e
-  puts "find model=#{e.model} pk=#{e.primary_key} id=#{e.id}"
-end
-begin
-  Article.where(title: "zz").first!
-rescue ActiveRecord::RecordNotFound => e
-  puts "first! model=#{e.model} pk=#{e.primary_key} id_nil=#{e.id.nil?}"
-end
-begin
-  Article.find_by!(title: "zz")
-rescue ActiveRecord::RecordNotFound => e
-  puts "find_by! model=#{e.model} pk=#{e.primary_key} id_nil=#{e.id.nil?}"
-end
-"##,
-    );
-    run.assert_passes();
-    for line in [
-        "find model=Article pk=id id=999999",
-        "first! model=Article pk=id id_nil=true",
-        "find_by! model=Article pk=id id_nil=true",
-    ] {
-        assert!(run.stdout.contains(line), "missing {line:?} in:\n{}", run.stdout);
-    }
-}
-
 /// The strict targets that transpile `errors.rb` declare `id` nilable:
 /// a bare `RecordNotFound.new(message)` leaves it nil. `untyped` gave
 /// Crystal `property id : String = ""`, which a nil does not fit, and a

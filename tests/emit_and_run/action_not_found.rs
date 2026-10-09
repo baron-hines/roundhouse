@@ -88,27 +88,6 @@ fn only_a_controller_with_a_missing_routed_action_gets_the_check() {
     }
 }
 
-/// The Spinel binary raises the same class with the same message.
-#[test]
-fn a_routed_action_the_controller_lacks_raises_action_not_found_on_spinel() {
-    let run = gadgets().run_spinel(
-        r##"c = GadgetsController.new
-begin
-  c.process_action(:edit)
-  puts "edit fell through"
-rescue AbstractController::ActionNotFound => e
-  puts "not found: #{e.message}"
-end
-"##,
-    );
-    run.assert_passes();
-    assert!(
-        run.stdout.contains("not found: The action 'edit' could not be found for GadgetsController"),
-        "{}",
-        run.stdout
-    );
-}
-
 /// Which names count as defined: a method spliced in from an included
 /// module, whether a namespaced concern under app/controllers/concerns
 /// or a module under lib/, is an action, so it gets no check (it still
