@@ -273,6 +273,10 @@ module Main
   # pass are the ones a single request enqueued, and they are far more
   # likely to touch the same rows than not.
   #
+  # A queued job is a closure or, for a job whose arguments serialize,
+  # an ActiveJob payload that `ActiveJob.drain` hands to the generated
+  # job registry (runtime/job_registry.rb). Both kinds drain in order.
+  #
   # NOTHING IS RETRIED and nothing survives a restart. The queue is a
   # process-local Array — that is the honest shape for a single-worker
   # binary with no store, and it is the ledgered limit rather than an

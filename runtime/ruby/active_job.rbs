@@ -19,6 +19,7 @@ module ActiveJob
   PAYLOADS: Array[String]
   ORDER: Array[String]
   def self.enqueue_payload: (String json) -> nil
+  def self.enqueue_payload_after_commit: (String json) -> nil
   def self.pending_count: () -> Integer
   def self.perform_payload: (String json) -> bool
   def self.drain: () -> Integer

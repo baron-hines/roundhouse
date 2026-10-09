@@ -78,6 +78,12 @@ pub struct JobPlan {
     /// `discard_on ActiveJob::DeserializationError`, declared on the job
     /// or inherited from a job ancestor.
     pub discards_deserialization_error: bool,
+    /// `self.enqueue_after_transaction_commit = true`, on the job or a
+    /// job ancestor. Rails 8.1 defaults it to false; Lobsters'
+    /// `ApplicationJob` sets it. The payload is then held until the
+    /// open transaction commits, and dropped if it rolls back.
+    #[serde(default)]
+    pub enqueue_after_commit: bool,
     pub params: Vec<JobParam>,
     /// Set when the job keeps its Proc; `params` is then empty.
     pub fallback: Option<JobFallback>,
@@ -128,6 +134,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
             job: name.clone(),
             queue,
             discards_deserialization_error: discards,
+            enqueue_after_commit: enqueues_after_commit(app, lc),
             params,
             fallback,
         });
@@ -354,6 +361,31 @@ fn is_discard_on_deserialization(call: &Expr) -> bool {
                 .trim_start_matches("::") == "ActiveJob::DeserializationError")
 }
 
+/// `self.enqueue_after_transaction_commit = <bool>` in the class body
+/// or a job ancestor's, nearest first; false (Rails 8.1's default) when
+/// none says.
+fn enqueues_after_commit(app: &App, lc: &LibraryClass) -> bool {
+    for class in ancestry(app, lc) {
+        for call in &class.unknown_calls {
+            if let Some(value) = enqueue_after_commit_literal(call) {
+                return value;
+            }
+        }
+    }
+    false
+}
+
+fn enqueue_after_commit_literal(call: &Expr) -> Option<bool> {
+    let ExprNode::Send { method, args, .. } = &*call.node else { return None };
+    if method.as_str() != "enqueue_after_transaction_commit=" || args.len() != 1 {
+        return None;
+    }
+    match &*args[0].node {
+        ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
+        _ => None,
+    }
+}
+
 fn is_literal_queue_as(call: &Expr) -> bool {
     let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return false };
     method.as_str() == "queue_as"
@@ -367,7 +399,10 @@ fn is_literal_queue_as(call: &Expr) -> bool {
 /// an ancestor (`ApplicationJob`) every one of whose job descendants
 /// does. The Ruby emitter skips its "dropped" ledger line for these.
 pub fn modelled_class_body_call(app: &App, lc: &LibraryClass, call: &Expr) -> bool {
-    if !is_literal_queue_as(call) && !is_discard_on_deserialization(call) {
+    if !is_literal_queue_as(call)
+        && !is_discard_on_deserialization(call)
+        && enqueue_after_commit_literal(call).is_none()
+    {
         return false;
     }
     let name = lc.name.0.as_str();
@@ -511,7 +546,13 @@ fn rewrite_enqueue(body: &mut Expr, plan: &JobPlan, args: Vec<Expr>) -> bool {
             span,
             ExprNode::Send {
                 recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveJob")] })),
-                method: Symbol::from("enqueue_payload"),
+                // `enqueue_payload_after_commit` holds it while a
+                // transaction is open (`runtime/job_registry.rb`).
+                method: Symbol::from(if plan.enqueue_after_commit {
+                    "enqueue_payload_after_commit"
+                } else {
+                    "enqueue_payload"
+                }),
                 args: vec![payload],
                 block: None,
                 parenthesized: true,
