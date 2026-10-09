@@ -3256,6 +3256,19 @@ fn expand_class_body_macros(app: &mut App) {
                 }
             }
             let body = substitute_params(&macro_def, args);
+            let Some(body) = expand_nested_filter_macros(&body, &module, &macros, &mut Vec::new())
+            else {
+                survey::record(&IngestError::Unsupported {
+                    file: format!("{}", controller.name.0.as_str()),
+                    message: format!(
+                        "class-body macro not expanded: `{}` from {} holds a statement that is not filter DSL",
+                        method.as_str(),
+                        module.0.as_str()
+                    ),
+                });
+                expanded.push(item);
+                continue;
+            };
             match expand_macro_filters(&body, &module) {
                 Some(items) => {
                     let mut comments = leading_comments.clone();
@@ -3304,6 +3317,61 @@ fn expand_class_body_macros(app: &mut App) {
         }
         controller.body = expanded;
     }
+}
+
+/// Inline same-concern class-method calls inside a filter macro before
+/// interpreting its body. Rails concerns commonly compose a macro from
+/// another macro (`require_unauthenticated_access` calls
+/// `allow_unauthenticated_access`, then adds its own redirect filter).
+/// Each nested call is substituted with the same literal-argument rules as
+/// the outer call; unknown calls, cycles, or non-filter statements remain a
+/// fail-closed refusal in `expand_macro_filters`.
+fn expand_nested_filter_macros(
+    body: &crate::expr::Expr,
+    module: &crate::ident::ClassId,
+    macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+    stack: &mut Vec<crate::ident::Symbol>,
+) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode};
+
+    fn expand_statements(
+        body: &Expr,
+        module: &crate::ident::ClassId,
+        macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+        stack: &mut Vec<crate::ident::Symbol>,
+    ) -> Option<Vec<Expr>> {
+        let statements: Vec<&Expr> = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.iter().collect(),
+            _ => vec![body],
+        };
+        let mut out = Vec::new();
+        for statement in statements {
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node
+            else {
+                out.push(statement.clone());
+                continue;
+            };
+            let Some(def) = macros
+                .get(module)
+                .and_then(|methods| methods.iter().find(|candidate| &candidate.name == method))
+            else {
+                out.push(statement.clone());
+                continue;
+            };
+            if stack.len() >= 32 || stack.contains(method) {
+                return None;
+            }
+            stack.push(method.clone());
+            let nested = substitute_params(def, args);
+            let expanded = expand_statements(&nested, module, macros, stack);
+            stack.pop();
+            out.extend(expanded?);
+        }
+        Some(out)
+    }
+
+    let exprs = expand_statements(body, module, macros, stack)?;
+    Some(Expr::new(body.span, ExprNode::Seq { exprs }))
 }
 
 /// The macro's body with its parameters replaced by the call's
