@@ -6540,8 +6540,11 @@ const BUNDLED: [(&str, &str); 17] = [
     // Spinel takes `runtime/ruby/timeout.rb` via spinel_files.
     ("Timeout", "timeout"),
     // `Shellwords.escape`: a default gem that a booted Rails 8.1 app has
-    // already loaded, so apps call it without a require. Spinel takes
-    // `packages/shellwords`.
+    // already loaded, so apps call it without a require. INERT on our
+    // trees: `runtime/spinel/shellwords.rb` defines the module (no
+    // String/Array reopen — packages/shellwords' reopen makes
+    // String#split a PolyArray and the Rails tree fails C compile), so
+    // the program-defined-constant clause below drops the row.
     ("Shellwords", "shellwords"),
     // `PTY.spawn`: the app writes `require "pty"` (Rails does not load
     // it), but an app file reaches the tree without its requires.
