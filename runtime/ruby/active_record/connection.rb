@@ -417,26 +417,52 @@ module ActiveRecord
     end
 
     # `Model.transaction { ... }` — the block inside BEGIN/COMMIT, with
-    # ROLLBACK + re-raise on any exception. Flat transactions only: the
-    # corpus never nests (a nested BEGIN would error in SQLite rather
-    # than silently join, which is the honest failure).
+    # ROLLBACK + re-raise on any exception. A nested call JOINS the
+    # outer transaction, as Rails' default (`requires_new: false`) does:
+    # no BEGIN of its own, and an exception from it rolls back the whole
+    # outer transaction when it reaches the outer block. The depth is
+    # per thread, like the connection the transaction runs on.
     #
     # `isolation:`, `requires_new:`, and `joinable:` are Rails'
     # `DatabaseStatements#transaction` keyword options (the same three
     # `with_lock` forwards — see base.rb). All three are accepted and
-    # ignored: no isolation levels, and no SAVEPOINT-backed nesting
-    # under this flat implementation. They exist on the signature so a
-    # call that passes them (directly, or via `with_lock`) doesn't
-    # raise `ArgumentError`.
+    # ignored: no isolation levels, and no SAVEPOINT-backed `requires_new:`
+    # under this joined-by-default implementation. They exist on the
+    # signature so a call that passes them (directly, or via `with_lock`)
+    # doesn't raise `ArgumentError`.
+    #
+    # The depth is restored on every exit path by hand rather than in an
+    # `ensure`: Spinel (matz/spinel#8182) skips a `begin/rescue/ensure`'s
+    # ensure when the exception leaves through the rescue (re-raised) or
+    # matches no rescue, and a depth left at 1 turns every later
+    # transaction on the thread into a "nested" one with no BEGIN —
+    # writes that a ROLLBACK then cannot undo.
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
-      Db.exec("BEGIN")
-      begin
-        result = yield
+      depth = Thread.current[:ar_txn_depth]
+      depth = 0 if depth.nil?
+      if depth > 0
+        Thread.current[:ar_txn_depth] = depth + 1
+        begin
+          result = yield
+        rescue Exception => e
+          Thread.current[:ar_txn_depth] = depth
+          raise e
+        end
+        Thread.current[:ar_txn_depth] = depth
+        result
+      else
+        Db.exec("BEGIN")
+        Thread.current[:ar_txn_depth] = 1
+        begin
+          result = yield
+        rescue Exception => e
+          Thread.current[:ar_txn_depth] = 0
+          Db.exec("ROLLBACK")
+          raise e
+        end
+        Thread.current[:ar_txn_depth] = 0
         Db.exec("COMMIT")
         result
-      rescue => e
-        Db.exec("ROLLBACK")
-        raise e
       end
     end
 

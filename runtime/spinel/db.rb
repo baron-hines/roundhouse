@@ -1290,6 +1290,11 @@ module Db
   end
 
   def self.with_connection
+    # Re-entrant: a nested lease, or one inside a transaction that a BEGIN
+    # outside any lease pinned (`pin_transaction`), keeps the thread's
+    # connection. A second lease would rebind it and, on release, unbind
+    # (and roll back) the outer holder's.
+    return yield if !Thread.current[:db_conn].nil?
     pool = pool_for_thread
     idx = pool.lease
     conn = pool.conn(idx)
@@ -1533,11 +1538,33 @@ module Db
 
   def self.exec(sql)
     record_query(sql)
-    write(current_conn, sql, false)
+    conn = current_conn
+    write(conn, sql, false)
+    pin_transaction(conn)
     # A value, not `nil`: spinel compiles a method ending in a bare nil
     # as void, and `Db.with_connection { Db.exec(...) }` assigns the
     # block's value (`result = yield`), which cannot hold a void.
     true
+  end
+
+  # A BEGIN outside a lease binds its connection to this thread until
+  # the transaction ends, as db_pg.rb does (roundhouse#585). Without it a
+  # lease taken inside the transaction (`Rails::Executor#wrap`, a cable
+  # broadcast, a job) checked out ANOTHER connection: its writes waited
+  # out the write permit and failed on SQLite's lock, or, when the shard
+  # handed back the transaction's own connection, `release_abandoned_write`
+  # rolled the transaction back at the lease's end and the rest of the
+  # block autocommitted. Pinned, `in_lease?` is true, so the executor and
+  # `with_connection` reuse the connection instead of leasing.
+  def self.pin_transaction(conn)
+    if !conn.in_txn?
+      Thread.current[:db_conn] = nil if Thread.current[:db_txn_pin] == true
+      Thread.current[:db_txn_pin] = false
+    elsif !in_lease?
+      Thread.current[:db_conn] = conn
+      Thread.current[:db_txn_pin] = true
+    end
+    nil
   end
 
   # A write that returns rows (`INSERT … RETURNING`, roundhouse#91): it
