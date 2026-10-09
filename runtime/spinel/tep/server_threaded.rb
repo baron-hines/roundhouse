@@ -212,7 +212,7 @@ module Tep
           return false
         end
 
-        req.consume_body_via_io(io, client)
+        return false unless req.consume_body_via_io(io, client)
 
         res = Response.new
         begin
