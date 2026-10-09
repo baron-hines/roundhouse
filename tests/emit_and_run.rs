@@ -139,6 +139,35 @@ fn model_concern_delegate_through_belongs_to_runs() {
 }
 
 #[test]
+fn active_support_many_block_and_squish_bang_run_in_emitted_ruby() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/active_support_probe.rb",
+            r#"class ActiveSupportProbe
+  def self.many_matches
+    seen = []
+    result = [1, 2, 3, 4].many? { |n| seen << n; n > 1 }
+    [result, seen.length]
+  end
+
+  def self.squish_bang
+    text = "\u00a0foo\u2003bar\u2028".dup
+    text.squish!
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"raise "many? block did not count matches/stop at two" unless ActiveSupportProbe.many_matches == [true, 3]
+raise "squish! did not match Unicode whitespace semantics" unless ActiveSupportProbe.squish_bang == "foo bar"
+puts "ActiveSupport core extensions emitted Ruby passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("ActiveSupport core extensions emitted Ruby passed"));
+}
+
+#[test]
 fn later_delegate_replaces_an_earlier_handwritten_method() {
     let run = delegate_association::overlay()
         .write(

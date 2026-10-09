@@ -98,6 +98,13 @@ class String
     empty? || match?(/\A[[:space:]]*\z/)
   end
 
+  # Rails' destructive form returns the receiver even when unchanged.
+  def squish!
+    gsub!(/[[:space:]]+/, " ")
+    strip!
+    self
+  end
+
   # `html_safe` promotes to the marked type; plain strings answer
   # `html_safe?` false so the escape-aware `html_escape` escapes them.
   # (Both were identity/true in the earlier positional-only world —
