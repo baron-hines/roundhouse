@@ -1266,6 +1266,17 @@ module Db
     @pools[0].first
   end
 
+  # `ActiveRecord::Base.transaction`'s per-thread nesting depth
+  # (connection.rb) — see the contract note in runtime/ruby/db.rbs.
+  def self._txn_depth
+    d = Thread.current[:ar_txn_depth]
+    d.nil? ? 0 : d
+  end
+
+  def self._txn_depth=(value)
+    Thread.current[:ar_txn_depth] = value
+  end
+
   # Request-scoped connection lease for the thread-per-connection
   # server. Leases a connection index (parking on the pool's condition
   # variable while none is free), binds its DbConn to this thread's

@@ -1072,6 +1072,19 @@ pub fn insert_db_stub(
             Ty::Bool,
         ),
     );
+    // `ActiveRecord::Base.transaction`'s per-thread nesting depth
+    // (connection.rb) — boxed behind this accessor instead of a raw
+    // `Thread.current`/`Fiber[]` read so the body-typer resolves it
+    // concretely, same as every other Db call here. See the contract
+    // note in runtime/ruby/db.rbs.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_depth"),
+        fn_sig(vec![], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("_txn_depth="),
+        fn_sig(vec![(Symbol::from("value"), Ty::Int)], Ty::Int),
+    );
     classes.insert(ClassId(Symbol::from("Db")), db_info);
 
     // MessageDigest — the keyed-digest primitive surface, same

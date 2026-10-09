@@ -67,4 +67,14 @@ module Db
   def self.escape_int_opt: (Integer?) -> String
   def self.escape_float_opt: (Float?) -> String
   def self.escape_bool_opt: (bool?) -> String
+  # Per-thread `ActiveRecord::Base.transaction` nesting depth
+  # (connection.rb): 0 outside any open transaction, incremented by a
+  # joining nested call. A typed accessor instead of a raw
+  # `Thread.current`/`Fiber[]` read so connection.rb's `self.transaction`
+  # body stays concretely typed — each shim boxes it behind its own
+  # in-lease storage convention (`Thread.current` in the spinel-FFI
+  # shim, `Fiber[]` in the cruby/jruby gem shims, same as their own
+  # `current_dbh`/`current_conn`).
+  def self._txn_depth: () -> Integer
+  def self._txn_depth=: (Integer) -> Integer
 end

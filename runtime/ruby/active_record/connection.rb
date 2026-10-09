@@ -437,30 +437,37 @@ module ActiveRecord
     # matches no rescue, and a depth left at 1 turns every later
     # transaction on the thread into a "nested" one with no BEGIN —
     # writes that a ROLLBACK then cannot undo.
+    #
+    # The depth itself reads/writes through `Db._txn_depth`/`=` (see
+    # runtime/ruby/db.rbs) rather than `Thread.current` directly: a raw
+    # `Thread.current[:k]` read has no declared return type for this
+    # narrow RBS-only probe (unlike the full pipeline's stdlib model),
+    # so it type-checked as the unresolved `Var` here, not the honest
+    # gradual `Untyped` — `Db`'s own contract keeps this method
+    # concretely typed the same way its `Db.exec` calls already are.
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
-      depth = Thread.current[:ar_txn_depth]
-      depth = 0 if depth.nil?
+      depth = Db._txn_depth
       if depth > 0
-        Thread.current[:ar_txn_depth] = depth + 1
+        Db._txn_depth = depth + 1
         begin
           result = yield
         rescue Exception => e
-          Thread.current[:ar_txn_depth] = depth
+          Db._txn_depth = depth
           raise e
         end
-        Thread.current[:ar_txn_depth] = depth
+        Db._txn_depth = depth
         result
       else
         Db.exec("BEGIN")
-        Thread.current[:ar_txn_depth] = 1
+        Db._txn_depth = 1
         begin
           result = yield
         rescue Exception => e
-          Thread.current[:ar_txn_depth] = 0
+          Db._txn_depth = 0
           Db.exec("ROLLBACK")
           raise e
         end
-        Thread.current[:ar_txn_depth] = 0
+        Db._txn_depth = 0
         Db.exec("COMMIT")
         result
       end
