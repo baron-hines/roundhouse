@@ -660,6 +660,30 @@ fn an_unforwarded_anonymous_rest_is_a_represented_formal() {
     assert_eq!(run.stdout, "7\n7\n7\n");
 }
 
+/// A nested `def` binds its own parameters, so a bare `*` inside it
+/// forwards its own rest and does not make the outer `*` forwarded.
+#[test]
+fn a_nested_def_forwarding_its_own_rest_leaves_the_outer_rest_represented() {
+    let source = "class Probe; def target(*); def nested(*) = inner(*); 7; end; def inner(*a) = a.size; end";
+    let script = "puts Probe.new.target; puts Probe.new.target(1, 2, 3)";
+    let native = Command::new("ruby")
+        .args(["-e", &format!("{source}; {script}")])
+        .output()
+        .unwrap();
+    assert!(native.status.success());
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "7\n7\n");
+    let errors: Vec<_> = diagnose(&analyzed(source))
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/probe.rb", source)
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, "7\n7\n");
+}
+
 /// A body that forwards the anonymous rest (`g(*)`) keeps the recorded
 /// fact: the bare splat would ingest as `*nil`, and forwarding it is not
 /// modeled yet.

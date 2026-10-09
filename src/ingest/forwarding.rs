@@ -50,6 +50,11 @@ fn forwards_anonymous_rest(node: &ruby_prism::Node<'_>) -> bool {
         found: bool,
     }
     impl<'pr> ruby_prism::Visit<'pr> for V {
+        // A nested `def` binds its own parameters: its bare `*` forwards
+        // its own rest, not this one. Blocks stay walked, since a bare
+        // `*` inside one forwards the enclosing method's rest.
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+
         fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
             if node.expression().is_none() {
                 self.found = true;
