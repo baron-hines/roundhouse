@@ -1228,14 +1228,17 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
         // is integer division (towards -infinity); Python's `/` is true
         // division, and `//` is floor, so Int / Int emits `//`.
         if method == "/" || method == "**" {
-            use crate::emit::shared::div_pow::{classify_div_pow, is_int_pair, DivPowCase};
-            if matches!(classify_div_pow(r, arg), DivPowCase::Incompatible) {
-                return format!(
-                    r#"(_ for _ in ()).throw(TypeError("roundhouse: `{method}` with incompatible operand types"))"#
-                );
-            }
-            if method == "/" && is_int_pair(r, arg) {
-                return format!("{} // {}", emit_expr(r), emit_expr(arg));
+            use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
+            match classify_div_pow(r, arg) {
+                DivPowCase::Incompatible => {
+                    return format!(
+                        r#"(_ for _ in ()).throw(TypeError("roundhouse: `{method}` with incompatible operand types"))"#
+                    );
+                }
+                DivPowCase::IntFloor if method == "/" => {
+                    return format!("{} // {}", emit_expr(r), emit_expr(arg));
+                }
+                _ => {}
             }
         }
         // `%` dispatch: Python's native `%` covers numeric and string

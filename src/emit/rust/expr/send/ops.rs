@@ -196,12 +196,25 @@ pub(super) fn try_binary_operator(
         }
     }
     // Int / Int and Int % Int floor in Ruby; Rust's operators truncate.
-    if matches!(method, "/" | "%") && crate::emit::shared::div_pow::is_int_pair(r, &args[0]) {
-        return Some(crate::emit::rust::shared::int_floor_div_mod(
-            method,
-            &emit_expr(r),
-            &emit_expr(&args[0]),
-        ));
+    if method == "/" {
+        use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
+        if matches!(classify_div_pow(r, &args[0]), DivPowCase::IntFloor) {
+            return Some(crate::emit::rust::shared::int_floor_div_mod(
+                crate::emit::rust::shared::FloorOp::Div,
+                &emit_expr(r),
+                &emit_expr(&args[0]),
+            ));
+        }
+    }
+    if method == "%" {
+        use crate::emit::shared::modulo::{classify_modulo, ModuloCase};
+        if matches!(classify_modulo(r, &args[0]), ModuloCase::IntFloor) {
+            return Some(crate::emit::rust::shared::int_floor_div_mod(
+                crate::emit::rust::shared::FloorOp::Mod,
+                &emit_expr(r),
+                &emit_expr(&args[0]),
+            ));
+        }
     }
     if matches!(method, "==" | "!=" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/" | "%") {
         // Binary-op LHS is a primary-demanding position. Without

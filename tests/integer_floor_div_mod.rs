@@ -30,7 +30,7 @@ fn rust_floors_int_div_and_mod() {
     let out = emitted(BuildTarget::Rust, "src/models/article.rs");
     assert!(!out.contains(".%("), "`%` emitted as a method call:\n{out}");
     assert!(
-        out.contains("let q = a / b; if a % b != 0 && ((a < 0) != (b < 0)) { q - 1 } else { q }"),
+        out.contains("if b == -1 { a.wrapping_neg() } else { let q = a / b; if a % b != 0 && ((a < 0) != (b < 0)) { q - 1 } else { q } }"),
         "Int / Int not floored:\n{out}"
     );
     assert!(
