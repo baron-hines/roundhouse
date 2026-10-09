@@ -850,25 +850,11 @@ module ActionView
   end
 end
 
-module ActionController
-  class Base
-    def self.cache_store
-      @cache_store
-    end
-
-    def self.cache_store=(store)
-      @cache_store = store
-    end
-
-    def self.perform_caching
-      @perform_caching
-    end
-
-    def self.perform_caching=(value)
-      @perform_caching = value
-    end
-  end
-end
+# Rails' test environment does not cache fragments
+# (`config.action_controller.perform_caching = false` in a generated
+# `config/environments/test.rb`); a test turns it on around a block. The
+# knob itself is runtime/action_controller_fragment_caching.rb's.
+ActionController::Base.perform_caching = false
 
 # ---- Query assertions ------------------------------------------------
 #

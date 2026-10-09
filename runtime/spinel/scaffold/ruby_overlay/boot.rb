@@ -293,6 +293,10 @@ else
   "UTC"
 end
 ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(tz_name, tz_name)
+# Rails' fragment caching through the controller: reopens
+# `ActionView::ViewHelpers.fragment_read/_write`, so after every file that
+# defines them.
+require_relative "runtime/action_controller_fragment_caching"
 # The app/models.rb aggregator (generated — see apply_models_aggregator)
 # loads every model/support class. Model files only require their own
 # LOAD-time deps (superclass, class-body consts); method-body references

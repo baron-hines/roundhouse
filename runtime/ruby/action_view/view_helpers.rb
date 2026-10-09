@@ -234,6 +234,21 @@ module ActionView
     # for the two lanes that can use it. A poly walk over untyped values
     # and an `Array#sort` are not shapes every strict target's emit
     # answers, and this seam keeps them off those trees.
+    # A view's `<% cache key do %>` reads and writes its fragment through
+    # these two (`lower::view_to_library::walker`, `emit_cached_fragment`):
+    # `nil` from the read is a miss, and the write answers what it stored.
+    # This shared form is the runtime's own store; the ruby family and
+    # spinel reopen both (runtime/action_controller_fragment_caching.rb)
+    # to go through the controller as Rails' CacheHelper does —
+    # `perform_caching`, `combined_fragment_cache_key`, `cache_store`.
+    def self.fragment_read(key)
+      Rails.cache.read_str(key)
+    end
+
+    def self.fragment_write(key, value, ttl)
+      Rails.cache.write_str(key, value, ttl)
+    end
+
     def self.to_query(params)
       to_query_pairs(params, "")
     end

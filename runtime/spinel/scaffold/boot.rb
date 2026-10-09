@@ -250,6 +250,10 @@ require_relative "config/routes"
 # same-name cmeth dispatch (matz/spinel#517), so this is now a plain
 # require_relative under both CRuby and spinel.
 require_relative "config/importmap"
+# Rails' fragment caching through the controller: reopens
+# `ActionView::ViewHelpers.fragment_read/_write`, so after every file that
+# defines them.
+require_relative "runtime/action_controller_fragment_caching"
 # The app/models.rb aggregator (generated — see apply_models_aggregator)
 # loads every model/support class. Model files only require their own
 # LOAD-time deps (superclass, class-body consts); method-body references
