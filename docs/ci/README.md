@@ -29,7 +29,9 @@ advisory jobs and the scheduled Full cycle for the multi-target ledger.
 | **Scheduled / manual Full validation** | Full validation (the extra-language ledger and publication cycle) |
 
 PRs without a special label run a Ruby floor: fixture preparation, unit
-tests, Store analysis, the CRuby comparison against Rails, and Campfire
+tests, Store analysis, the CRuby comparison against Rails (on `MRI_RUBY`, the
+supported minimum, with its runtime gates repeated on `MRI_RUBY_NEXT` in
+`compare-ruby-next`), and Campfire
 conformance/comparison. Four unit shards cover all package test targets in
 bounded batches; ignored integrations need selected toolchain lanes. Framework
 and toolchain suites also run inside comparison jobs, not necessarily as
