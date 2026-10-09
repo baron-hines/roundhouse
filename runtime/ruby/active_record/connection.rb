@@ -135,8 +135,11 @@ module ActiveRecord
       @rows = rows
     end
 
+    # Rails' shape: each row an Array of its values, in column order
+    # (`to_a` is the hashes). campfire reads ids an `insert_all!`
+    # returned with `.rows.flatten`.
     def rows
-      @rows
+      @rows.map { |row| row.values }
     end
 
     def to_a
