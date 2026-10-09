@@ -56,6 +56,8 @@ mod controller_super_ivars;
 mod assoc_pluck_typed;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
+#[path = "emit_and_run/action_text_markdown.rs"]
+mod action_text_markdown;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The
@@ -1660,6 +1662,120 @@ raise "name lost: #{reloaded.name.inspect}" unless reloaded.name == "body"
 puts "action_text markdown storage passed"
 "##,
         )
+        .assert_passes();
+}
+
+/// The pinned Writebook Page tests exercise this exact behavior: a new
+/// Page's `markable` method returns the raw Markdown stored by `has_markdown`.
+/// Keep the source-shaped `ActionText::Markdown < Record` declaration here so
+/// the emitted model resolves the Action Text base against shared runtime code.
+#[test]
+fn writebook_page_markable_runs_against_emitted_markdown_runtime() {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define(version: 1) do
+  create_table "pages", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+  end
+
+  create_table "action_text_markdowns", force: :cascade do |t|
+    t.text "content", default: "", null: false
+    t.string "name", null: false
+    t.bigint "record_id", null: false
+    t.string "record_type", null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+  end
+end
+"#,
+        )
+        .write(
+            "lib/rails_ext/action_text_markdown.rb",
+            r#"module ActionText
+  class Markdown < Record
+    belongs_to :record, polymorphic: true
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/page.rb",
+            r#"class Page < ApplicationRecord
+  has_markdown :body
+
+  def markable
+    body.content.to_s
+  end
+end
+"#,
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .run_ruby(
+            r###"
+page = Page.new(body: "## Markdown Content\n\nWith **bold** text.")
+raise "raw markdown changed: #{page.markable.inspect}" unless page.markable == "## Markdown Content\n\nWith **bold** text."
+empty = Page.new(body: "")
+raise "empty markdown changed: #{empty.markable.inspect}" unless empty.markable == ""
+puts "Writebook Page markable behavior passed"
+"###,
+        )
+        .assert_passes();
+}
+
+/// A nested include file must load after the parent class is established,
+/// so its namespace can reopen the intended class rather than a placeholder.
+#[test]
+fn nested_included_module_loads_inside_its_parent_class() {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :action_text_markdowns do |t|\n    t.text :content\n  end\nend\n",
+        )
+        .write(
+            "app/models/action_text/markdown.rb",
+            r#"module ActionText
+  class Markdown < ApplicationRecord
+    include ActionText::Markdown::Uploads
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/action_text/markdown/uploads.rb",
+            r#"module ActionText
+  class Markdown < ApplicationRecord
+    module Uploads
+      def nested_upload_module_loaded?
+        true
+      end
+    end
+  end
+end
+"#,
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .run_ruby(r#"
+raise "nested module was not included" unless ActionText::Markdown.new.nested_upload_module_loaded?
+puts "nested include namespace passed"
+"#)
         .assert_passes();
 }
 
