@@ -293,7 +293,13 @@ fn untyped_subexpressions_baseline() {
     // exists? key dispatch (#549 / #403): 519 -> 523, MEASURED. Four new
     // Base sites from exists? / _exists_primary_key_input (nil guard +
     // cast + adapter). Companion RBS probe stays at zero residual.
-    const CEILING: usize = 523;
+    // Pessimistic locking (#644 / #671): 523 -> 529, MEASURED. The six
+    // new sites are `with_lock`'s `*args` split (the trailing options
+    // Hash and the lock clause) and the `isolation:` / `requires_new:` /
+    // `joinable:` pass-through into `transaction`, all accepted and
+    // ignored under SQLite. Its RBS-paired methods keep the gradual
+    // `untyped` escape `self.transaction` already has.
+    const CEILING: usize = 529;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\
