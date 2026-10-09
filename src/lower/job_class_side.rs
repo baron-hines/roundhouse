@@ -83,6 +83,9 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         ));
     }
 
+    // The jobs given a synthesized `perform_later`: the ones
+    // `lower::job_payload` can plan a payload for.
+    let mut wrapped: BTreeSet<String> = BTreeSet::new();
     for lc in app.library_classes.iter_mut() {
         if !jobs.contains(lc.name.0.as_str()) {
             continue;
@@ -404,8 +407,12 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             ));
         }
 
+        if wrappers.iter().any(|w| w.name.as_str() == "perform_later") {
+            wrapped.insert(lc.name.0.as_str().to_string());
+        }
         lc.methods.extend(wrappers);
     }
+    app.job_plans = super::job_payload::plan_jobs(app, &jobs, &wrapped);
     diags
 }
 

@@ -158,6 +158,7 @@ fn tiny_blog_round_trips() {
         view_visible_controller_methods: std::collections::BTreeSet::new(),
         global_id_locate_models: std::collections::BTreeSet::new(),
         global_id_locate_signed_models: std::collections::BTreeSet::new(),
+        job_plans: Vec::new(),
         attachable_unsigned_models: Vec::new(),
         pending_attachment_on_load: Vec::new(),
         load_hook_class_macros: Vec::new(),

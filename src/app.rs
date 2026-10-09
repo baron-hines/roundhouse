@@ -177,6 +177,13 @@ pub struct App {
     /// `locate_signed_<model>(sgid, purpose)`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub global_id_locate_signed_models: BTreeSet<Symbol>,
+    /// How each job's arguments are written to an ActiveJob payload, or
+    /// why the job keeps its Proc. Worked out by
+    /// [`crate::lower::job_payload::plan_jobs`] from the job's call
+    /// sites; read by the Ruby emitter's enqueue rewrite and by
+    /// `project::apply_job_registry`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_plans: Vec<crate::lower::job_payload::JobPlan>,
     /// Model names whose attachment sgid the app resolves even when
     /// its SIGNATURE fails — campfire's `%w[ User ]`, read by
     /// [`crate::ingest::on_load_reopen`] from the `from_node` reopen
@@ -728,6 +735,7 @@ impl App {
             generated_helper_methods: BTreeMap::new(),
             global_id_locate_models: BTreeSet::new(),
             global_id_locate_signed_models: BTreeSet::new(),
+            job_plans: Vec::new(),
             attachable_unsigned_models: Vec::new(),
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),

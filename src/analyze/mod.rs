@@ -5194,6 +5194,20 @@ impl Analyzer {
                 self.collect_send_sites(&scope_item.body, Some(&model.name), true, helpers, &mut sites);
                 self.record_callers(&model.name, &sites[from..]);
             }
+            // A block-form lifecycle hook (`after_create_commit -> {
+            // room.receive(self) }`) is a method body that only becomes
+            // a method at lowering, so its calls were never sites: the
+            // callee's parameters stayed untyped. campfire's
+            // `Room#receive(message)` was, and through it the message
+            // `Room::PushMessageJob` is enqueued with.
+            for item in model.body.iter() {
+                let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+                if let Some(body) = block_callback_body(expr) {
+                    let from = sites.len();
+                    self.collect_send_sites(body, Some(&model.name), false, helpers, &mut sites);
+                    self.record_callers(&model.name, &sites[from..]);
+                }
+            }
         }
         for lc in &app.library_classes {
             for method in &lc.methods {
@@ -6930,6 +6944,27 @@ fn build_sourced_filter_chain(
         }
     }
     (chain, block_bindings)
+}
+
+/// The body of a block-form model lifecycle hook — `after_save do … end`
+/// or `after_create_commit -> { … }` — on the shape
+/// `model_to_library::markers::push_block_callback` lowers to a method.
+fn block_callback_body(expr: &Expr) -> Option<&Expr> {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        return None;
+    };
+    if !crate::lower::model_to_library::BLOCK_CALLBACK_HOOKS.contains(&method.as_str()) {
+        return None;
+    }
+    let callback = match (block.as_ref(), args.first()) {
+        (Some(b), _) => b,
+        (None, Some(first)) => first,
+        _ => return None,
+    };
+    match &*callback.node {
+        ExprNode::Lambda { params, body, .. } if params.is_empty() => Some(body),
+        _ => None,
+    }
 }
 
 /// `only:` / `except:` of a block-form filter call, from its keyword
