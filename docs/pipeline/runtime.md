@@ -1255,12 +1255,18 @@ warns about.
 overlay records the Hash, so a test that reads `entry[:payload]` and
 subscripts it passes on CRuby and does not on spinel. Both entries carry
 `action: :message` and the stream, which is what `assert_broadcasts`
-reads, so the test helper itself agrees across the two. The narrower
-consequence is in the renderer: `payload_json` writes Integer values
-only, because two call sites in one app is the whole surface anybody has
-asked for. A String or nested value needs the renderer widened — and
-that is a monomorphization decision to take deliberately, not a cast to
-sneak in.
+reads, so the test helper itself agrees across the two.
+
+**The text is what Rails writes** (#619). Rails encodes a broadcast with
+ActiveSupport::JSON, so every value is JSON (a String, nil, a Float, a
+Symbol, a nested Hash or Array) and `<`, `>` and `&` inside strings come
+out as `\u003c`, `\u003e`, `\u0026`. Both lanes write exactly that with
+`JsonBuilder.escape_html_entities(JSON.generate(...))`: spinel's
+`payload_json` and Turbo `Transport`, the overlay's `Registry.deliver`,
+and both lanes' `pubsub.broadcasts`. `payload_json` used to write
+Integer values only (`value.to_s`), enough for campfire's two call sites;
+a String value - a terminal relayed over a channel broadcasts its output
+as one - came out as invalid JSON, which the client drops.
 
 ### Active Storage's engine routes are mounted by the dispatcher
 

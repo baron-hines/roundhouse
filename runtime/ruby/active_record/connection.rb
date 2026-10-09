@@ -412,6 +412,15 @@ module ActiveRecord
       end
     end
 
+    # `Model.delete_all` for a model without the lowerer-emitted
+    # override: the rows the DELETE removed, read off the statement
+    # rather than counted beforehand. Ruby-family-only because
+    # `changes` is — see base.rb's default.
+    def self.delete_all
+      ActiveRecord.adapter.delete_all(table_name)
+      ActiveRecord.adapter.changes
+    end
+
     # `Model.update_counters(id, col: delta, …)` — atomic column
     # increments (`col = col + delta`) on one row, skipping validations
     # and callbacks. Returns the affected-row count.

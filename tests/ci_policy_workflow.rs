@@ -141,6 +141,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
         "compare",
         "compare-extra",
         "compare-ruby",
+        "compare-ruby-next",
         "compare-jruby",
     ] {
         assert_eq!(
@@ -159,6 +160,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
         "compare",
         "compare-extra",
         "compare-ruby",
+        "compare-ruby-next",
         "compare-jruby",
     ] {
         assert_eq!(
