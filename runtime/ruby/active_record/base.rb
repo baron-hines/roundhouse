@@ -966,7 +966,9 @@ module ActiveRecord
     # writers, so nothing can land between this read and a following
     # write in the same transaction. A Postgres adapter would spell
     # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
-    # runtime keeps the Rails signature but doesn't need the clause.
+    # runtime keeps the Rails signature — `lock` may be `true` or a
+    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
+    # doesn't need either under SQLite; both are accepted and ignored.
     def lock!(lock = true)
       reload
     end

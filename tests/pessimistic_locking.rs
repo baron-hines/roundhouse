@@ -6,8 +6,9 @@
 //! reloads (the enclosing transaction already serializes writers) and
 //! `with_lock` runs `lock!` then the block inside a transaction, answering
 //! the block's value — same contract Rails documents, minus the lock
-//! clause itself. Exercised on both the Ruby and Spinel targets; the
-//! Spinel case is `#[ignore]`d like its sibling suites (CI's
+//! clause's actual SQL effect (the clause itself, `true` or a String, is
+//! accepted — see below). Exercised on both the Ruby and Spinel targets;
+//! the Spinel case is `#[ignore]`d like its sibling suites (CI's
 //! `spinel-framework` job runs it with `--ignored` — see
 //! `scripts/ci-plan.py`'s `SPINEL_TESTS`).
 #[path = "support/emit_and_run.rs"]
@@ -66,6 +67,15 @@ rescue => e
 end
 raise "expected with_lock to re-raise the block's exception" unless raised
 raise "with_lock should roll back the block's write on exception" unless Widget.find(widget.id).name == "value-from-block"
+
+# `lock!` also accepts Rails' String locking-clause form
+# (`lock!("FOR UPDATE NOWAIT")`); SQLite has no use for it, so it is
+# accepted and ignored, same as the default `true`.
+clause = Widget.create!(name: "clause-start")
+Db.exec("UPDATE widgets SET name = 'clause-value' WHERE id = #{clause.id}")
+locked_clause = clause.lock!("FOR UPDATE NOWAIT")
+raise "lock! with a String clause should still reload" unless clause.name == "clause-value"
+raise "lock! with a String clause should return self" unless locked_clause.equal?(clause)
 
 puts "lock! and with_lock contract passed"
 "#;
