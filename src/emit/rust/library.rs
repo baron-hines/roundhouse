@@ -45,6 +45,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         name: crate::ident::ClassId(crate::ident::Symbol::from("__emit_module__")),
         is_module: false,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: std::mem::take(&mut colored),
         nullable_columns: Vec::new(),
@@ -145,7 +146,15 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
                 // lowerings call it through a typed receiver
                 // (`parent.dom_prefix()`), and a static override of an
                 // instance contract strands that call site.
-                && !matches!(m.name.as_str(), "dom_prefix" | "dom_record_key" | "to_param")
+                // Literal controller identity methods still implement an instance API.
+                && !matches!(
+                    m.name.as_str(),
+                    "dom_prefix"
+                        | "dom_record_key"
+                        | "to_param"
+                        | "controller_name"
+                        | "controller_path"
+                )
         })
         .map(|m| m.name.as_str().to_string())
         .collect();
@@ -1078,6 +1087,36 @@ end
         );
     }
 
+    /// Session `#[]` rust-emits `Option<String>`. `verified_request?`
+    /// must use `.is_none()` / `unwrap_or_default`, not Value `.is_null()`.
+    #[test]
+    fn verified_request_session_nil_uses_is_none() {
+        let src = emit_action_controller();
+        let secret = method_body(&src, "csrf_session_secret");
+        assert!(
+            secret.contains("is_none()"),
+            "session[] nil? should be Option::is_none:\n{secret}"
+        );
+        assert!(
+            !secret.contains("is_null()"),
+            "session[] nil? must not emit Value::is_null:\n{secret}"
+        );
+        assert!(
+            secret.contains("unwrap_or_default()"),
+            "session[] to_s should be Option unwrap_or_default:\n{secret}"
+        );
+        let pred = method_body(&src, "verified_request_pred");
+        assert!(
+            pred.contains("csrf_token_valid_pred")
+                && (pred.contains("&(") || pred.contains("&self.csrf_session_secret") || pred.contains("&csrf_session_secret")),
+            "csrf_token_valid? String args must borrow as &str:\n{pred}"
+        );
+        assert!(
+            !pred.contains("csrf_token_valid_pred") || !pred.contains("expected.clone()"),
+            "owned expected.clone() is E0308 against &str:\n{pred}"
+        );
+    }
+
     /// Column-union params render as `serde_json::Value`; `nil?` is
     /// `.is_null()`, not Option `.is_none()`.
     #[test]
@@ -1157,6 +1196,11 @@ end
             set_index.contains("header_key_ok_pred(Some("),
             "header_key_ok? takes String?, wrap &str:\n{set_index}"
         );
+        let key_at = method_body(&src, "key_at");
+        assert!(
+            !key_at.contains(".map("),
+            "keys[i].to_s on Array[String] must not Option-map a plain String:\n{key_at}"
+        );
         let val_at = method_body(&src, "val_at");
         assert!(
             val_at.contains("unwrap_or_default()"),
@@ -1181,5 +1225,38 @@ end
             csrf.contains("serde_json::Value::Null"),
             "untyped nil tail is Value::Null:\n{csrf}"
         );
+    }
+}
+
+#[cfg(test)]
+mod numeric_unary_emit_tests {
+    use super::emit_library_class;
+
+    fn emit(ruby: &str, rbs: &str) -> String {
+        let classes = crate::runtime_src::parse_library_with_rbs(ruby.as_bytes(), rbs, "unary.rb")
+            .expect("snippet parses and types");
+        let mut app = crate::App::new();
+        app.library_classes = classes;
+        crate::lower::numeric_unary::apply_numeric_unary_lowering(&mut app);
+        crate::emit::rust::decide::decide_classes(&mut app.library_classes);
+        crate::emit::rust::expr::with_emit_ctx(crate::emit::rust::EmitCtx::default(), || {
+            app.library_classes.iter().map(|c| emit_library_class(c).expect("emits")).collect()
+        })
+    }
+
+    /// `-n` is a `-@` send; it used to come out as the method call
+    /// `n.-@()`, which does not parse. `(-5).abs` lost its parens, and
+    /// `-5_i64.abs()` is `-(5_i64.abs())`: -5, with no error anywhere.
+    #[test]
+    fn negation_is_arithmetic_and_negative_receivers_keep_parens() {
+        let out = emit(
+            "module Unary\n  def self.neg(n)\n    -n\n  end\n  def self.neg_sum(n)\n    -(n + 4)\n  end\n  def self.pos(n)\n    +n\n  end\n  def self.neg_abs\n    (-5).abs\n  end\n  def self.diff_abs(n)\n    (n - 10).abs\n  end\nend\n",
+            "module Unary\n  def self.neg: (Integer n) -> Integer\n  def self.neg_sum: (Integer n) -> Integer\n  def self.pos: (Integer n) -> Integer\n  def self.neg_abs: () -> Integer\n  def self.diff_abs: (Integer n) -> Integer\nend\n",
+        );
+        assert!(!out.contains("-@") && !out.contains("+@"), "operator method leaked:\n{out}");
+        assert!(out.contains("n * -1_i64"), "`-n` not lowered:\n{out}");
+        assert!(out.contains("(n + 4_i64) * -1_i64"), "`-(n + 4)` re-associated:\n{out}");
+        assert!(out.contains("(-5_i64).abs()"), "negative receiver lost its parens:\n{out}");
+        assert!(out.contains("(n - 10_i64).abs()"), "infix receiver lost its parens:\n{out}");
     }
 }

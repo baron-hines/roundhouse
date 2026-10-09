@@ -1,4 +1,32 @@
 module ActiveRecord
+  # A Relation's `includes`/`preload`, deferred until a record asks.
+  #
+  # `load_records` used to batch-load every included association the
+  # moment the rows arrived. On a page whose records only feed a cached
+  # collection (campfire's room page: 40 messages, their rich text,
+  # creators, boosts and attachments), the cache key needs each record's
+  # id and updated_at, and on a hit nothing reads an association at all:
+  # the batch loads were most of the page's database time. Now each record
+  # carries this object, and the first association read on any of them
+  # (an emitted reader calls `_await_preload`) runs the same batched
+  # preload for the whole group, once. A miss issues the same queries as
+  # before, later; a hit issues none of them.
+  class PendingPreload
+    def initialize(model, records, specs)
+      @model = model
+      @records = records
+      @specs = specs
+      @done = false
+    end
+
+    def run
+      return nil if @done
+      @done = true
+      @model.preload_associations(@records, @specs)
+      nil
+    end
+  end
+
   # A lazy, chainable query builder — the metaprogramming-free analog of
   # ActiveRecord::Relation. Lowered model code drives it: `scope`s become
   # class methods that take/return a Relation, associations return one,
@@ -855,7 +883,10 @@ module ActiveRecord
         rows = ActiveRecord.adapter.select_rows(to_sql)
         rows.map { |row| @model.instantiate(row) }
       end
-      @model.preload_associations(records, @includes) if @includes.length > 0 && !@skip_preloading
+      if @includes.length > 0 && !@skip_preloading && records.length > 0
+        pending = ActiveRecord::PendingPreload.new(@model, records, @includes.dup)
+        records.each { |record| record._pend_preload(pending) }
+      end
       records
     end
 
@@ -1229,6 +1260,43 @@ module ActiveRecord
       out
     end
 
+    # `sole`'s loaded-relation reading: the first two (or fewer) of an
+    # already-loaded page, still in relation order — the loaded-cache
+    # counterpart to `loaded_tail`, and every `loaded`-touching step of
+    # it (the cap, the indexing loop) lives in THIS top-level helper
+    # rather than inline in `sole` itself. `@records`'s own ivar type
+    # carries an untyped/poly component, and `sole` also assigns the
+    # unloaded branch's `to_a` Array to a `rows` local of its own;
+    # splitting the loaded branch's work out to a call boundary, same
+    # as `loaded_tail`, gives `loaded` here its own concrete `Array
+    # [Base]` type from the narrowed (non-nil) argument rather than
+    # carrying that poly residue into `sole`'s body, which is what the
+    # ceiling tests on this runtime's type precision caught.
+    def loaded_sole_rows(loaded)
+      cap = loaded.length < 2 ? loaded.length : 2
+      out = []
+      i = 0
+      while i < cap
+        out << loaded[i]
+        i += 1
+      end
+      out
+    end
+
+    # `sole`'s unloaded-probe size: `min(2, limit)`, nil meaning the
+    # usual 2, clamped at 0 or above. A top-level helper rather than a
+    # local computed inline in `sole` with an if/else (one arm the
+    # literal `2`, the other derived from `@limit`): merging those two
+    # origins into one local left it an unresolved type variable where
+    # `sole` assigns it back to `@limit` — same `Integer? -> Integer`
+    # call-boundary fix as `loaded_head`, above.
+    def sole_probe_limit(limit)
+      return 2 if limit.nil?
+      return 0 if limit < 0
+      return 2 if limit > 2
+      limit
+    end
+
     def count
       rows = ActiveRecord.adapter.select_rows(count_sql)
       rows.length == 0 ? 0 : rows[0]["n"].to_i
@@ -1252,13 +1320,43 @@ module ActiveRecord
     # terminal to this method, so the scalar `count` keeps its
     # Integer return (no polymorphic count). Single group expression
     # (the corpus shape); Rails' multi-group array keys would need a
-    # composite key here first.
+    # composite key here first. HAVING and DISTINCT ride the same SQL
+    # as `to_sql` so the Hash only contains surviving groups, and a
+    # distinct projection counts distinct values per group (#343).
     def group_count
       key = @groups.join(", ")
-      sql = "SELECT #{key} AS k, COUNT(*) AS n FROM #{@table}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
-      sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
-      sql = "#{sql} GROUP BY #{key}"
+      # DISTINCT uses a subquery so a multi-column / aliased `select`
+      # never lands inside SQLite's one-expression COUNT(DISTINCT …).
+      # HAVING filters groups on the original grouped relation first
+      # (source columns and aggregates), then distinct-count rows that
+      # belong to survivors. Non-distinct keeps `@select_sql` so HAVING
+      # can name selected aliases, matching `count_sql`.
+      sql = if @distinct
+        inner = append_join_where(
+          "#{cte_prefix}SELECT DISTINCT #{distinct_count_columns}, #{key} AS k FROM #{from_source}"
+        )
+        if @havings.length > 0
+          survivors = append_group_having(
+            append_join_where("#{cte_prefix}SELECT #{key} AS __rh_k FROM #{from_source}")
+          )
+          clause = "#{key} IN (SELECT __rh_k FROM (#{survivors}) AS __rh_surv)"
+          inner = if @wheres.length > 0
+            "#{inner} AND #{clause}"
+          else
+            "#{inner} WHERE #{clause}"
+          end
+        end
+        "SELECT k, COUNT(*) AS n FROM (#{inner}) AS __rh_gc GROUP BY k"
+      else
+        proj = if @select_sql.nil?
+          "#{key} AS k, COUNT(*) AS n"
+        else
+          "#{@select_sql}, #{key} AS k, COUNT(*) AS n"
+        end
+        append_group_having(
+          append_join_where("#{cte_prefix}SELECT #{proj} FROM #{from_source}")
+        )
+      end
       h = {}
       rows = ActiveRecord.adapter.select_rows(sql)
       rows.each { |row| h[row["k"]] = row["n"].to_i }
@@ -1638,6 +1736,73 @@ module ActiveRecord
       record
     end
 
+    # `sole` (Rails 7.0) — the relation's one record: `RecordNotFound`
+    # when it matches none, `SoleRecordExceeded` when it matches more.
+    # Rails reads `first(2)` and checks the size, so one query of at
+    # most two rows tells the three cases apart.
+    #
+    # A LOADED relation decides from the memoized `@records` instead of
+    # re-querying — Rails' own `first(2)` reads the loaded Array once
+    # `loaded?` — so a caller that already has the page in memory (an
+    # eager-loaded association, a prior `each`) costs no second trip to
+    # the database.
+    #
+    # Unloaded, `first_n` cannot serve the probe: it always asks for
+    # its own `n`, which would override a SMALLER existing `@limit`
+    # (`limit(1).sole` must probe 1 row, not 2, so two matching rows
+    # settle as the first one rather than `SoleRecordExceeded`; a
+    # `limit(0)` relation must probe 0 and always read as
+    # `RecordNotFound`), and it unconditionally clears `@records`
+    # afterward, which would discard a cache this branch never had to
+    # begin with. So the probe borrows and restores `@limit` itself,
+    # capped at the relation's own limit (nil meaning the usual 2,
+    # clamped at 0 or above), and restores `@records` to nil — what it
+    # was, since this branch only runs when the relation is unloaded —
+    # rather than to whatever the probe's own LIMIT happened to cache.
+    def sole
+      loaded = @records
+      unless loaded.nil?
+        rows = loaded_sole_rows(loaded)
+        raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+        raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
+        return rows[0]
+      end
+      prior_limit = @limit
+      @limit = sole_probe_limit(prior_limit)
+      rows = to_a
+      @limit = prior_limit
+      @records = nil
+      raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+      raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
+      rows[0]
+    end
+
+    # `find_sole_by(conditions)` — Rails' `where(conditions).sole`. A
+    # terminal, so its predicate is popped as in `find_by`; popped in an
+    # `ensure` because `sole` raises on the two answers that are not one
+    # record, and a caller that rescues must get the relation back as
+    # it was.
+    #
+    # `add_condition` unconditionally clears `@records` — it has no way
+    # to know in advance whether the new predicate still matches a
+    # loaded set — so a relation that was loaded before this call loses
+    # its memo the moment the temporary condition is pushed. The
+    # `ensure` restores the ORIGINAL `@records` saved before that push,
+    # not whatever `sole`'s own probe leaves behind, so a loaded
+    # relation's records are intact afterward whether `sole` returns or
+    # raises.
+    def find_sole_by(conditions)
+      prior_records = @records
+      pushed = add_condition(conditions, [], false)
+      begin
+        record = sole
+      ensure
+        @wheres.pop if pushed
+        @records = prior_records
+      end
+      record
+    end
+
     # NO `new` HERE, AND NOT BY OVERSIGHT. Rails builds records through
     # a relation (`User.active_bots.new`), but under spinel this class's
     # constructor is already `sp_Relation_new`, so an instance method of
@@ -1735,9 +1900,10 @@ module ActiveRecord
 
     def count_sql
       # DISTINCT / GROUP BY must count the result-set shape, not the
-      # underlying rows (#343). Mirror exists_sql's DISTINCT-pk
-      # discipline; scalar `count` on a grouped relation counts groups
-      # (Hash form is `group_count`). LIMIT/OFFSET stay off total_count.
+      # underlying rows (#343). Scalar `count` on a grouped relation
+      # counts groups; the Hash form is `group_count`. LIMIT/OFFSET
+      # stay off this SQL so a windowed relation still answers the
+      # unwindowed total.
       if !@groups.empty?
         # Keep an explicit projection so HAVING can name selected
         # aliases (`select("COUNT(*) AS n").having("n > 1")`).
@@ -1749,26 +1915,29 @@ module ActiveRecord
         return "SELECT COUNT(*) AS n FROM (#{inner}) AS __rh_count"
       end
       if @distinct
-        # `select(:title).distinct.count` counts distinct titles, not pks.
-        # When `from(...)` replaces the model table, drop the model-table
-        # qualifier so the key projects from the active FROM source.
-        cols = if !@select_sql.nil?
-          @select_sql
-        elsif @from.nil?
-          "#{@table}.#{@model.primary_key}"
-        elsif @joins.length > 0
-          # Bare pk is ambiguous once another joined table also has
-          # that column (`from("parents").joins(...).distinct.count`).
-          "#{from_source}.#{@model.primary_key}"
-        else
-          @model.primary_key.to_s
-        end
         inner = append_join_where(
-          "#{cte_prefix}SELECT DISTINCT #{cols} FROM #{from_source}"
+          "#{cte_prefix}SELECT DISTINCT #{distinct_count_columns} FROM #{from_source}"
         )
         return "SELECT COUNT(*) AS n FROM (#{inner}) AS __rh_count"
       end
       append_join_where("#{cte_prefix}SELECT COUNT(*) AS n FROM #{from_source}")
+    end
+
+    # Projection COUNT(DISTINCT …) / `SELECT DISTINCT` use for a
+    # distinct relation: an explicit `select` list when present, else
+    # the primary key, qualified against the active FROM source.
+    def distinct_count_columns
+      if !@select_sql.nil?
+        @select_sql
+      elsif @from.nil?
+        "#{@table}.#{@model.primary_key}"
+      elsif @joins.length > 0
+        # Bare pk is ambiguous once another joined table also has
+        # that column (`from("parents").joins(...).distinct.count`).
+        "#{from_source}.#{@model.primary_key}"
+      else
+        @model.primary_key.to_s
+      end
     end
 
     # `SELECT 1 AS one … LIMIT n` for existence probes. Drops ORDER BY

@@ -57,6 +57,7 @@ pub(super) fn external_class_method_param_tys(class: &str, method: &str) -> Opti
         }
         ("Db", "escape_bool_opt") => Some(vec![Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }]),
         ("Db", "last_insert_rowid") => Some(vec![]),
+        ("Db", "changes") => Some(vec![]),
         // `Broadcasts::method(HashMap<String, Value>)` — the lowerer
         // emits kwargs as a HashMap; the runtime shim accepts that
         // shape and pulls named fields out.
@@ -82,6 +83,7 @@ pub(super) fn external_class_method_param_tys(class: &str, method: &str) -> Opti
         ("ActionController", "location_host") => Some(vec![Ty::Str]),
         ("ActionController", "find_substr") => Some(vec![Ty::Str, Ty::Str]),
         ("ActionController", "find_last") => Some(vec![Ty::Str, Ty::Str]),
+        ("ActionController", "csrf_token_valid?") => Some(vec![Ty::Str, Ty::Str]),
         _ => None,
     }
 }
@@ -377,6 +379,20 @@ pub(super) fn dispatch_method_by_recv_ty(
             }
             "include?" if args.len() == 1 => {
                 Some(format!("{recv_s}.contains(&*({}))", args_s[0]))
+            }
+            // `String#match?(re)` → `re.is_match(str)`. Rust has no
+            // `str::match_pred`; the Regex is the natural receiver
+            // (mirrors the TypeScript `re.test(s)` flip).
+            "match?" if args.len() == 1 => {
+                Some(format!("{}.is_match(&*({recv_s}))", args_s[0]))
+            }
+            _ => None,
+        },
+        // `Regexp#match?(str)` → `re.is_match(str)` when the receiver
+        // is already the pattern (validations, flipped call sites).
+        Some(Ty::Class { id, .. }) if id.0.as_str() == "Regexp" => match method {
+            "match?" if args.len() == 1 => {
+                Some(format!("{recv_s}.is_match(&*({}))", args_s[0]))
             }
             _ => None,
         },

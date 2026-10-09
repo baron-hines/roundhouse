@@ -62,6 +62,10 @@
 //!
 //!   cargo run --bin dump_ir -- fixtures/real-blog \
 //!       --raw-views --select 'articles/*'
+//!
+//! Survey mode: set `ROUNDHOUSE_INGEST_SURVEY=1` (same env as
+//! `roundhouse check --continue`) to record unsupported constructs and
+//! keep going. Required for profiling apps that are not yet zero-error.
 
 use std::path::PathBuf;
 
@@ -91,6 +95,16 @@ fn dump() {
             std::process::exit(2);
         }
     };
+
+    // Honor ROUNDHOUSE_INGEST_SURVEY the same way `roundhouse check` does,
+    // so dump_ir can profile apps that are not yet zero-error (Mastodon,
+    // etc.) without aborting at the first unsupported construct.
+    if std::env::var("ROUNDHOUSE_INGEST_SURVEY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+    {
+        roundhouse::ingest::survey::activate();
+    }
 
     let mut app = ingest_app(&opts.fixture).unwrap_or_else(|e| {
         eprintln!("ingest {}: {:?}", opts.fixture.display(), e);
@@ -528,6 +542,14 @@ fn visit_subexprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         | ExprNode::ForwardKeywords
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                f(key);
+                visit_subexprs(key, f);
+                f(value);
+                visit_subexprs(value, f);
+            }
+        }
         ExprNode::If { cond, then_branch, else_branch } => {
             f(cond); visit_subexprs(cond, f);
             f(then_branch); visit_subexprs(then_branch, f);

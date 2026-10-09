@@ -67,6 +67,7 @@ mod perform_all_later;
 pub mod authenticate_by;
 pub mod group_count;
 pub mod bool_fold;
+pub mod generates_token_for;
 pub mod spliced_concern_bodies;
 pub mod unported_rails_subclasses;
 pub mod pathname_ctor;
@@ -117,6 +118,7 @@ pub mod in_predicate;
 pub mod including;
 pub mod enum_symbols;
 pub mod has_json;
+pub mod serialize;
 pub mod assoc_loaded;
 pub mod object_extend;
 pub mod param_rebind;
@@ -136,6 +138,7 @@ pub mod destroy_by;
 pub mod has_one_builder;
 pub mod inquiry;
 pub mod byte_size;
+pub mod numeric_unary;
 pub mod tag_builder;
 pub mod kwsplat;
 pub mod literal_append;
@@ -153,14 +156,17 @@ pub mod send_dispatch;
 pub mod relation_counted_terminal;
 pub(crate) mod secure_password;
 pub mod attached;
+pub mod attachment_model;
 pub mod attached_url;
 pub mod send_file;
 pub mod helper_kwargs;
 pub mod kwrest_forward;
 pub mod column_ops;
+pub mod generated_write_guard;
 pub mod signed_id;
 pub(crate) mod secure_token;
 pub mod rich_text;
+pub mod plain_text_attr;
 pub mod capture_inline;
 pub mod partial_qualify;
 pub mod time_current;
@@ -174,6 +180,7 @@ pub mod view;
 pub mod view_buffer_passing;
 pub mod tag_block_passing;
 pub mod lazy_model_state;
+pub mod deferred_preload;
 pub mod view_to_library;
 
 pub use blank::apply_blank_lowering;
@@ -501,6 +508,9 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("symbolize_keys", &["config_reader"]),
     // No runs_after: it reads the ingested enum tables and rewrites only the key argument.
     ("enum_mapping_keys", &[]),
+    // `-x` / `+x` on a typed Integer or Float → `x * -1` / `x`; local
+    // expression rewrite, no ordering constraints.
+    ("numeric_unary", &[]),
     // `f(**h)` (erased to `f(h)` at ingest) → `f(k: h[:k], …)` when the
     // callee declares explicit keywords. Reads the arg count against the
     // callee's signature, so it must see the argument list as ingested —
@@ -532,7 +542,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // so it has no ordering constraints of its own.
     ("module_mixins", &[]),
     ("transaction_ground", &[]),
-    ("column_ops", &[]),
+    ("generated_write_guard", &[]),
+    ("column_ops", &["generated_write_guard"]),
     // `signed_id(purpose: :avatar)` → the runtime SignedId call, with
     // the model name folded into the purpose. BEFORE `duration`: the
     // `expires_in:` argument this wraps in `.to_i` is an
@@ -575,7 +586,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // include dropped. Reads only the class's own writer surface and
     // writes only new methods, so no ordering constraints.
     ("active_model_model", &[]),
-    ("update_kwargs", &[]),
+    ("update_kwargs", &["generated_write_guard"]),
     // `record.update!(creator: user)` -> `update!(creator_id: user.id)`.
     // AFTER `update_kwargs`, which INLINES the same shape into typed
     // writer assignments when it can — and a `belongs_to` writer is the
@@ -861,6 +872,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("symbolize_keys");
     enum_mapping_keys::apply_enum_mapping_keys(app);
     ran!("enum_mapping_keys");
+    numeric_unary::apply_numeric_unary_lowering(app);
+    ran!("numeric_unary");
     diags.extend(crate::timings::phase("post-analyze: kwsplat", || {
         kwsplat::apply_kwsplat_expansion(app)
     }));
@@ -882,6 +895,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("module_mixins");
     transaction_ground::apply_transaction_grounding(app);
     ran!("transaction_ground");
+    diags.extend(generated_write_guard::apply(app));
+    ran!("generated_write_guard");
     column_ops::apply_column_ops_lowering(app);
     ran!("column_ops");
     signed_id::apply_signed_id_lowering(app);
@@ -952,7 +967,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("attached_url");
     diags.extend(kwrest_forward::apply_kwrest_forward_lowering(app));
     ran!("kwrest_forward");
-    helper_kwargs::apply_helper_kwarg_positional_lowering(app);
+    diags.extend(helper_kwargs::apply_helper_kwarg_positional_lowering(app));
     ran!("helper_kwargs");
     view_to_library::form_wrapper::preserve_argument_owners(app, registry);
     ran!("form_wrapper_owners");
@@ -1127,7 +1142,7 @@ pub(crate) fn for_each_owned_hook_body(
         }
     }
     for model in &mut app.models {
-        let crate::dialect::Model { name, body, .. } = model;
+        let crate::dialect::Model { name, body, class_attr_defaults, .. } = model;
         let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
         for item in body {
             match item {
@@ -1165,6 +1180,9 @@ pub(crate) fn for_each_owned_hook_body(
                 }
                 _ => {}
             }
+        }
+        for default in class_attr_defaults.values_mut() {
+            f(default);
         }
     }
     for lc in &mut app.library_classes {
@@ -1218,6 +1236,10 @@ pub(crate) fn for_each_owned_hook_body(
                         f(default);
                     }
                     f(&mut action.body)
+                }
+                crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
+                    visit_param_defaults(&mut method.params, f);
+                    f(&mut method.body)
                 }
                 crate::dialect::ControllerBodyItem::Unknown { expr, .. } => f(expr),
                 // A filter's `if:` / `unless:` lambda body is spliced into
@@ -1298,6 +1320,9 @@ pub(crate) fn for_each_hook_body_ref(
                 _ => {}
             }
         }
+        for default in model.class_attr_defaults.values() {
+            f(default);
+        }
     }
     for lc in &app.library_classes {
         for method in &lc.methods {
@@ -1338,6 +1363,10 @@ pub(crate) fn for_each_hook_body_ref(
                         f(default);
                     }
                     f(&action.body)
+                }
+                crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
+                    visit_param_defaults(&method.params, f);
+                    f(&method.body)
                 }
                 crate::dialect::ControllerBodyItem::Unknown { expr, .. } => f(expr),
                 crate::dialect::ControllerBodyItem::Filter { filter, .. } => {
@@ -1463,9 +1492,10 @@ pub use test_module_to_library::{
 };
 pub use ty_coerce_insertion::{insert_ty_coercions, insert_ty_coercions_with_extras};
 pub use view_to_library::{
-    ViewLowerCtx, flatten_lcs_to_functions, lower_view_to_library_class,
-    lower_views_to_library_classes, lower_views_to_library_functions,
-    preliminary_view_classes, type_view_library_classes,
+    MAX_UNCACHED_COLLECTION_LENGTH, ViewLowerCtx, flatten_lcs_to_functions,
+    lower_view_to_library_class, lower_views_to_library_classes,
+    lower_views_to_library_functions, preliminary_view_classes,
+    type_view_library_classes,
 };
 pub use jbuilder_to_library::{
     jbuilder_signature_classes, lower_jbuilder_to_library_class, lower_jbuilder_to_library_classes,
@@ -1542,6 +1572,7 @@ pub fn module_funcs_to_library_class(
         name: ClassId(crate::ident::Symbol::from(name)),
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),

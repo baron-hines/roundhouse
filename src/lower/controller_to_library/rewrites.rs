@@ -599,7 +599,7 @@ pub(super) fn rewrite_render_to_views(
                         value: Expr::new(
                             e.span,
                             ExprNode::Send {
-                                recv: Some(const_path(
+                                recv: Some(typed_exception_const(
                                     &["ActionView", "MissingTemplate"],
                                     e.span,
                                 )),
@@ -2308,9 +2308,15 @@ pub fn rewrite_route_helpers(
 ) -> Expr {
     let expr = &strip_url_helpers_receiver(expr);
     map_expr(expr, &|e| match &*e.node {
+        // `controller_path` is ActionController::Base's underscored
+        // namespace path (`"admin/users"`), never a route helper — the
+        // `_path` suffix alone would otherwise steal bare calls into
+        // `RouteHelpers.controller_path` and leave the synthesized
+        // Base override unreachable.
         ExprNode::Send { recv: None, method, args, block, parenthesized }
             if (method.as_str().ends_with("_path")
                 || method.as_str().ends_with("_url"))
+                && method.as_str() != "controller_path"
                 && !shadowed.contains(method) =>
         {
             // `RouteHelpers` only emits `_path` helpers — Rails'
@@ -2699,6 +2705,19 @@ pub(crate) fn const_path(segments: &[&str], span: Span) -> Expr {
     )
 }
 
+/// Like `const_path`, but stamps `Ty::Class` so the emit-time
+/// ruby-family availability gate sees lowers-added raises
+/// (`MissingTemplate` from a missing `render`).
+pub(crate) fn typed_exception_const(segments: &[&str], span: Span) -> Expr {
+    let name = segments.join("::");
+    let mut expr = const_path(segments, span);
+    expr.ty = Some(crate::ty::Ty::Class {
+        id: crate::ident::ClassId(Symbol::from(name)),
+        args: vec![],
+    });
+    expr
+}
+
 /// True when `e` is a bare `params` send: no receiver, no args, no
 /// block. This is the recv shape `params.expect(...)` parses to.
 fn is_bare_params(e: &Expr) -> bool {
@@ -2866,7 +2885,7 @@ fn params_require_permit(resource: Symbol, fields: Vec<Symbol>, span: Span) -> E
             style: ArrayStyle::Brackets,
         },
     );
-    Expr::new(
+    let mut permit = Expr::new(
         span,
         ExprNode::Send {
             recv: Some(require_call),
@@ -2875,7 +2894,11 @@ fn params_require_permit(resource: Symbol, fields: Vec<Symbol>, span: Span) -> E
             block: None,
             parenthesized: true,
         },
-    )
+    );
+    // Remember the source form: `expect` and `require.permit` refuse a
+    // malformed request differently (see `FROM_PARAMS_EXPECT`).
+    permit.decisions |= crate::expr::FROM_PARAMS_EXPECT;
+    permit
 }
 
 fn nil_expr(span: Span) -> Expr {
