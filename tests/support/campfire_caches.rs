@@ -169,3 +169,106 @@ puts ResponseHelpersProbe.decoded.inspect
         "[\"rooms\", \"/rooms/1?a=<b>&c\", nil, 7, 1.5, true, \"html\", {\"token\" => \"t\", \"n\" => [1, nil]}]\n",
     ),
 };
+
+/// `ResponseCache`'s observer and `SqliteWalCheckpoint`'s connection:
+/// `PRAGMA data_version` holds still on its own connection until another
+/// connection commits; a read-only connection refuses writes; a missing
+/// file cannot be opened read-only; the block form closes; rows are
+/// Arrays of native column values. Beside it the Rails surface the two
+/// read — `connection_db_config`, `SQLite3Adapter.resolve_path`,
+/// `connection_pool.with_connection(&:transaction_open?)` — and the
+/// checkpointer's `flock` lock file.
+pub const SQLITE_OBSERVER: Contract = Contract {
+    path: "app/models/sqlite_observer_probe.rb",
+    source: r##"require "fileutils"
+
+class SqliteObserverProbe
+  DIR = "tmp/sqlite_observer_probe"
+
+  def self.observe
+    FileUtils.rm_rf(DIR)
+    FileUtils.mkdir_p(DIR)
+    path = File.join(DIR, "observed.sqlite3")
+    SQLite3::Database.new(path) do |db|
+      db.execute("PRAGMA journal_mode=WAL")
+      db.execute("CREATE TABLE notes (body TEXT)")
+    end
+    observer = SQLite3::Database.new(path, readonly: true)
+    first = observer.get_first_value("PRAGMA data_version")
+    still = observer.get_first_value("PRAGMA data_version") == first
+    SQLite3::Database.new(path) { |db| db.execute("INSERT INTO notes VALUES ('committed')") }
+    moved = observer.get_first_value("PRAGMA data_version") != first
+    rows = observer.execute("SELECT body, 7, 2.5, NULL FROM notes")
+    refused = begin
+      observer.execute("INSERT INTO notes VALUES ('refused')")
+      "written"
+    rescue SQLite3::Exception
+      "refused"
+    end
+    observer.close
+    missing = begin
+      SQLite3::Database.new(File.join(DIR, "missing.sqlite3"), readonly: true)
+      "opened"
+    rescue SQLite3::Exception
+      "cannot open"
+    end
+    checkpoint = nil
+    held = SQLite3::Database.new(path) do |db|
+      db.busy_handler_timeout = 1_000
+      checkpoint = db.execute("PRAGMA wal_checkpoint(PASSIVE)").first
+    end
+    [ first.is_a?(Integer), still, moved, rows, refused, missing, checkpoint.length, checkpoint[0], held.closed?, observer.closed? ]
+  end
+
+  def self.config
+    config = ActiveRecord::Base.connection_db_config
+    [ config.database, config.adapter ]
+  end
+
+  def self.resolved
+    [
+      ActiveRecord::ConnectionAdapters::SQLite3Adapter.resolve_path("storage/test.sqlite3", root: "/app"),
+      ActiveRecord::ConnectionAdapters::SQLite3Adapter.resolve_path("file:/data/x.sqlite3?mode=ro", root: "/app"),
+      ActiveRecord::ConnectionAdapters::SQLite3Adapter.resolve_path("file:///data/y.sqlite3", root: "/app"),
+      ActiveRecord::ConnectionAdapters::SQLite3Adapter.resolve_path("file:rel.sqlite3?mode=memory", root: "/app")
+    ]
+  end
+
+  def self.transactions
+    outside = ActiveRecord::Base.connection_pool.with_connection(&:transaction_open?)
+    inside = ActiveRecord::Base.transaction { ActiveRecord::Base.connection_pool.with_connection(&:transaction_open?) }
+    [ outside, inside ]
+  end
+
+  def self.locks
+    FileUtils.mkdir_p(File.join(DIR, "pids"))
+    lock_path = File.join(DIR, "pids", "probe.lock")
+    first = File.open(lock_path, File::RDWR | File::CREAT, 0644)
+    taken = first.flock(File::LOCK_EX | File::LOCK_NB)
+    second = File.open(lock_path, File::RDWR | File::CREAT, 0644)
+    busy = second.flock(File::LOCK_EX | File::LOCK_NB)
+    first.flock(File::LOCK_UN)
+    first.close
+    retaken = second.flock(File::LOCK_EX | File::LOCK_NB)
+    second.close
+    [ taken, busy, retaken ]
+  end
+end
+"##,
+    // The native consumer boots libraries without a database; give it the
+    // in-memory one the CRuby overlay's `run_ruby` configures.
+    script: r#"Db.configure(":memory:") if ActiveRecord::Base.connection_db_config.database.empty?
+puts SqliteObserverProbe.observe.inspect
+puts SqliteObserverProbe.config.inspect
+puts SqliteObserverProbe.resolved.inspect
+puts SqliteObserverProbe.transactions.inspect
+puts SqliteObserverProbe.locks.inspect
+"#,
+    expected: concat!(
+        "[true, true, true, [[\"committed\", 7, 2.5, nil]], \"refused\", \"cannot open\", 3, 0, true, true]\n",
+        "[\":memory:\", \"sqlite3\"]\n",
+        "[\"/app/storage/test.sqlite3\", \"/data/x.sqlite3\", \"/data/y.sqlite3\", \"/app/rel.sqlite3\"]\n",
+        "[false, true]\n",
+        "[0, false, 0]\n",
+    ),
+};

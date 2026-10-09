@@ -111,6 +111,9 @@ require_relative "runtime/active_record_serialization"
 # Record equality (same class + same persisted id) — a reopen of
 # ActiveRecord::Base; the CRuby overlay's twin is active_record_bang.rb.
 require_relative "runtime/active_record_equality_spinel"
+# `ActiveRecord::Base.connection_db_config`, `connection_pool` and
+# `transaction_open?` over the Db shim loaded above.
+require_relative "runtime/active_record_db_config"
 require_relative "config/schema"
 require_relative "runtime/action_dispatch"
 # Typed Request value object (remote_ip / referer / xhr? / env bag) —

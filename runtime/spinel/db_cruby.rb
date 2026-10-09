@@ -257,6 +257,24 @@ module Db
     !Fiber[:db_handle].nil?
   end
 
+  # `ActiveRecord::Base.connection_db_config` answers from these
+  # (runtime/spinel/active_record_db_config.rb): the database this
+  # process configured, the adapter name Rails would report for it, and
+  # whether the holder is inside a transaction of its own — the request
+  # read snapshot is the shim's, not the app's, so it does not count.
+  def self.database_path
+    @path
+  end
+
+  def self.adapter_name
+    "sqlite3"
+  end
+
+  def self.transaction_open?
+    conn = current_dbh
+    conn.transaction_active? && conn.instance_variable_get(:@rh_snapshot) != :open
+  end
+
   def self.with_connection
     h = nil
     adopt_after_fork

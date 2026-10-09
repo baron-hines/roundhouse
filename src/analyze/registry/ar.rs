@@ -105,11 +105,24 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             .or_default();
         for m in [
             "transaction",
-            "connection_pool",
             "establish_connection",
         ] {
             base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
         }
+        // Which database, and the pool's `with_connection` — served on the
+        // ruby family and spinel by runtime/spinel/active_record_db_config.rb.
+        base.class_methods
+            .entry(Symbol::from("connection_db_config"))
+            .or_insert(Ty::Class {
+                id: ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations::HashConfig")),
+                args: vec![],
+            });
+        base.class_methods
+            .entry(Symbol::from("connection_pool"))
+            .or_insert(Ty::Class {
+                id: ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::DbPool")),
+                args: vec![],
+            });
         base.class_methods
             .entry(Symbol::from("connection"))
             .or_insert_with(connection_ty);
@@ -132,6 +145,28 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         base.class_methods
             .entry(Symbol::from("strict_loading_by_default"))
             .or_insert(Ty::Bool);
+    }
+
+    {
+        let config = classes
+            .entry(ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations::HashConfig")))
+            .or_default();
+        for m in ["database", "adapter", "name", "env_name"] {
+            config.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
+        // The block's value: whatever the caller computes from the connection.
+        classes
+            .entry(ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::DbPool")))
+            .or_default()
+            .instance_methods
+            .entry(Symbol::from("with_connection"))
+            .or_insert(Ty::Untyped);
+        classes
+            .entry(ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::SQLite3Adapter")))
+            .or_default()
+            .class_methods
+            .entry(Symbol::from("resolve_path"))
+            .or_insert(Ty::Str);
     }
 
     // CollectionProxy — the runtime helper transpiled models use

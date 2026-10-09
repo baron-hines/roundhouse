@@ -106,3 +106,8 @@ end
         .run_test("test/controllers/cached_pages_controller_test.rb")
         .assert_passes();
 }
+
+#[test]
+fn sqlite_observer_and_checkpointer_surface_runs() {
+    assert_runs(&contract::SQLITE_OBSERVER);
+}

@@ -106,6 +106,9 @@ require_relative "runtime/action_view_number_helper"
 require_relative "runtime/action_view_form_builder_extras"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+# `ActiveRecord::Base.connection_db_config`, `connection_pool` and
+# `transaction_open?` over the Db shim loaded above.
+require_relative "runtime/active_record_db_config"
 require_relative "runtime/active_record_serialization"
 require_relative "runtime/active_record_relation_ext"
 require_relative "config/schema"

@@ -2634,6 +2634,24 @@ fn ruby_family_runtime_files(
                         require \"typeid\"\n"
                 .to_string();
         }
+        // `SQLite3::Database`: the sqlite3 gem the CRuby tree's Db shim
+        // already loads. JRuby has no sqlite3 gem (its Db shim is JDBC),
+        // so there the constant is refused at emit
+        // (`unavailable_class_module_construct`) and the file is empty.
+        if path == "runtime/sqlite3_database.rb" {
+            *content = if flavor == RubyFlavor::JRuby {
+                "# SQLite3::Database is not available on JRuby: the sqlite3 gem is\n\
+                 # CRuby's, and this tree's Db shim is JDBC. A program naming it is\n\
+                 # refused at emit — see `project::unavailable_class_module_construct`.\n"
+                    .to_string()
+            } else {
+                "# The sqlite3 gem's own SQLite3::Database — see\n\
+                 # `project::ruby_runtime_files`. The port at\n\
+                 # runtime/spinel/sqlite3_database.rb is spinel's, over the FFI.\n\
+                 require \"sqlite3\"\n"
+                    .to_string()
+            };
+        }
         // `Rack::Utils`: the rack gem the overlay's Puma already loads,
         // under the port's require path.
         if path == "runtime/rack_utils.rb" {
@@ -4327,13 +4345,20 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Rack::Utils"
         // `runtime/ruby/active_support_ext.rb` ships to the ruby family
         // and spinel only.
-        | "ActiveSupport::JSON");
+        | "ActiveSupport::JSON"
+        // The sqlite3 gem on the ruby family, `runtime/spinel/
+        // sqlite3_database.rb` over the FFI on spinel; `FileUtils` is a
+        // default gem / `packages/fileutils`; the Rails classes come
+        // with `runtime/spinel/active_record_db_config.rb`.
+        | "SQLite3::Database" | "SQLite3::Exception" | "SQLite3::CantOpenException"
+        | "SQLite3::BusyException" | "SQLite3::SQLException"
+        | "FileUtils" | "ActiveRecord::ConnectionAdapters::SQLite3Adapter");
     if !bundled {
         return None;
     }
-    // Nokogiri does not supply HTML5 on JRuby. The other bundled
-    // values remain available there.
-    if target == "jruby" && name != "Rails::HTML5::SafeListSanitizer" {
+    // Nokogiri does not supply HTML5 on JRuby, and the sqlite3 gem does
+    // not run there. The other bundled values remain available.
+    if target == "jruby" && name != "Rails::HTML5::SafeListSanitizer" && !name.starts_with("SQLite3::") {
         return None;
     }
     Some("bundled_constant")
@@ -4343,8 +4368,15 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
 /// stops short of them: Ruby's own library serves them on the ruby
 /// family and spinel's package on spinel, while a strict target's port
 /// has no body to call. `Zlib.gzip` needs a deflate the CRC-32 port
-/// (`runtime/ruby/zlib.rb`) does not have.
-const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[("Zlib", "gzip")];
+/// (`runtime/ruby/zlib.rb`) does not have. A Rails class method served
+/// only by a ruby-family/spinel runtime file is gated the same way.
+const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
+    ("Zlib", "gzip"),
+    // Answered from the Db shim (`runtime/spinel/
+    // active_record_db_config.rb`); a strict target's Db glue has none.
+    ("ActiveRecord::Base", "connection_db_config"),
+    ("ActiveRecord::Base", "connection_pool"),
+];
 
 /// True when the app already defines `id` as a class/module value, so
 /// the availability gate must not ledger it as a missing runtime stub.
@@ -6647,7 +6679,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 17] = [
+const BUNDLED: [(&str, &str); 18] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -6709,6 +6741,10 @@ const BUNDLED: [(&str, &str); 17] = [
     // it), but an app file reaches the tree without its requires.
     // Spinel takes `packages/pty`.
     ("PTY", "pty"),
+    // `FileUtils.mkdir_p` / `remove_entry` — campfire's WAL checkpointer
+    // makes its lock directory. A default gem on CRuby/JRuby (Rails has
+    // loaded it); spinel takes `packages/fileutils`.
+    ("FileUtils", "fileutils"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,

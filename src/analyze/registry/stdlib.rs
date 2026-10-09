@@ -376,6 +376,34 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("crc32", Ty::Int),
         ("gzip", Ty::Str),
     ], &[]);
+    // `SQLite3::Database` — the sqlite3 gem on the ruby family, and
+    // `runtime/spinel/sqlite3_database.rb` (the same surface over the FFI)
+    // on spinel. ONLY that surface: campfire's `ResponseCache` keeps a
+    // read-only observer (`new(path, readonly: true)`,
+    // `get_first_value("PRAGMA data_version")`, `close`) and its WAL
+    // checkpointer opens a block-form connection, sets
+    // `busy_handler_timeout=` and `execute`s a pragma. A row is an Array
+    // of column values.
+    let sqlite_db = Ty::Class { id: ClassId(Symbol::from("SQLite3::Database")), args: vec![] };
+    register_stdlib_class(classes, "SQLite3::Database", &[
+        ("new", sqlite_db.clone()),
+        ("open", sqlite_db.clone()),
+    ], &[
+        ("execute", Ty::Array { elem: Box::new(Ty::Array { elem: Box::new(Ty::Untyped) }) }),
+        ("get_first_row", Ty::Union { variants: vec![Ty::Array { elem: Box::new(Ty::Untyped) }, Ty::Nil] }),
+        ("get_first_value", Ty::Untyped),
+        ("close", Ty::Nil),
+        ("closed?", Ty::Bool),
+        ("readonly?", Ty::Bool),
+        ("busy_timeout=", Ty::Int),
+        ("busy_handler_timeout=", Ty::Int),
+    ]);
+    // `FileUtils` — a default gem / spinel's `packages/fileutils`.
+    register_stdlib_class(classes, "FileUtils", &[
+        ("mkdir_p", Ty::Untyped), ("makedirs", Ty::Untyped),
+        ("rm_rf", Ty::Untyped), ("rm_f", Ty::Untyped),
+        ("remove_entry", Ty::Nil), ("touch", Ty::Untyped),
+    ], &[]);
     // `ActiveSupport::JSON` — Rails' coder, in `runtime/ruby/
     // active_support_ext.rb` (the ruby family and spinel). `encode`
     // answers the document; `decode` whatever the document holds.
@@ -535,6 +563,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "Timeout::Error",
         // `rescue EOFError` around `readpartial` on a pipe or a pty.
         "EOFError",
+        // `rescue SQLite3::Exception` — campfire's `ResponseCache` drops
+        // its observer on any driver error (see `SQLite3::Database`).
+        "SQLite3::Exception", "SQLite3::CantOpenException",
+        "SQLite3::BusyException", "SQLite3::SQLException",
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
     }

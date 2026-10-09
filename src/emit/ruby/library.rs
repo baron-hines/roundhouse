@@ -7394,6 +7394,10 @@ fn require_path_for_body_const(
         // on the ruby family (`project::ruby_runtime_files`). Anchored so
         // a file that names it loads the one its tree has.
         "Rack" => Some("runtime/rack_utils".to_string()),
+        // `SQLite3::Database` — the gem on the ruby family, the FFI port
+        // (`runtime/spinel/sqlite3_database.rb`) on spinel; one require
+        // path either way.
+        "SQLite3" => Some("runtime/sqlite3_database".to_string()),
         // `Resolv` — Ruby's resolver, ported into
         // `runtime/ruby/resolv.rb` for the targets that have none and
         // swapped for the stdlib on the ruby family. Anchored for the
