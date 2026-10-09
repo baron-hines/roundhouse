@@ -12,6 +12,8 @@
 #   which keeps a page rendered inside a transaction out of the cache.
 #   The transaction is the app's: the request read snapshot the shims
 #   open around a GET does not count, as Rails has no such thing.
+# - `ActiveRecord::Base.instantiate_named(name, attributes)` — what
+#   `lower::record_snapshot` makes of `name.constantize.instantiate(...)`.
 # - `ActiveRecord::ConnectionAdapters::SQLite3Adapter.resolve_path` —
 #   Rails main's (activerecord/lib/active_record/connection_adapters/
 #   sqlite3_adapter.rb): a `file:` URI's path, expanded against the app
@@ -97,6 +99,18 @@ module ActiveRecord
 
     def self.connection_pool
       ActiveRecord::ConnectionAdapters::DbPool.new
+    end
+
+    # `name.constantize.instantiate(attributes)` (`lower::record_snapshot`):
+    # the app's models are a closed set, so the class is a `case` over
+    # their names rather than a constant computed from a String. Each arm
+    # is that model's own `instantiate` (String-keyed, as Rails'); an
+    # unknown name raises as `constantize` does. The arms are written per
+    # app by `project::apply_instantiate_named`.
+    def self.instantiate_named(name, attributes)
+      # >>> generated: instantiate-named
+      raise NameError, "uninitialized constant #{name}"
+      # <<< generated: instantiate-named
     end
   end
 end

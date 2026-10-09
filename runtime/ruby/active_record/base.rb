@@ -854,6 +854,17 @@ module ActiveRecord
       changes.key?(name)
     end
 
+    # Rails' `changed?` / `has_changes_to_save?`: any column pending.
+    # campfire's `RecordCache` snapshots only records with none.
+    def changed?
+      changes = changes_to_save
+      !changes.empty?
+    end
+
+    def has_changes_to_save?
+      changed?
+    end
+
     def attribute_was(name)
       changes = changes_to_save
       changes[name]

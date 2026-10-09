@@ -67,6 +67,9 @@ require_relative "runtime/active_support_duration"
 # type to ground on. Before anything that can hold a `present?` site.
 require_relative "runtime/active_support_ext"
 require_relative "runtime/rails"
+# `ActiveSupport::Cache::MemoryStore` (a `Rails::Cache`) and
+# `ActiveSupport::Cache.expand_cache_key`.
+require_relative "runtime/active_support_cache"
 # Ruby's `Logger` + `ActiveSupport::Logger`/`TaggedLogging` — the stack
 # `config.logger =` builds, and the `Logger::Formatter` an app's own
 # formatter subclasses (a LOAD-time reference, so this must precede

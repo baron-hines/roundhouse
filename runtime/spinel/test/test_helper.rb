@@ -829,21 +829,12 @@ end
 # a memory store and turns caching on around one block, through Rails'
 # four knobs, then asserts a cached page runs no presentation queries.
 # The runtime fragment-caches message partials in its own store; these
-# give the test the settings it reads and restores. `MemoryStore` is the
-# store class `Rails.cache` already answers with on this tree.
+# give the test the settings it reads and restores. A fresh
+# `ActiveSupport::Cache::MemoryStore` (runtime/active_support_cache.rb) is
+# a `Rails::Cache`, so it can stand in for `Rails.cache` here.
 module Rails
   def self.cache=(store)
     @cache_store = store
-  end
-end
-
-module ActiveSupport
-  module Cache
-    class MemoryStore
-      def self.new
-        Rails.cache.class.new
-      end
-    end
   end
 end
 

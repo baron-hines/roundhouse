@@ -255,20 +255,103 @@ class SqliteObserverProbe
   end
 end
 "##,
-    // The native consumer boots libraries without a database; give it the
-    // in-memory one the CRuby overlay's `run_ruby` configures.
-    script: r#"Db.configure(":memory:") if ActiveRecord::Base.connection_db_config.database.empty?
-puts SqliteObserverProbe.observe.inspect
+    script: concat!(
+        "# The native consumer boots libraries without a database; give it the\n",
+        "# in-memory one the CRuby overlay's `run_ruby` configures.\n",
+        "if ActiveRecord.adapter.nil?\n",
+        "  SqliteAdapter.configure(\":memory:\")\n",
+        "  ActiveRecord.adapter = SqliteAdapter\n",
+        "  Schema.statements.each { |sql| SqliteAdapter.execute_ddl(sql) }\n",
+        "end\n",
+        r#"puts SqliteObserverProbe.observe.inspect
 puts SqliteObserverProbe.config.inspect
 puts SqliteObserverProbe.resolved.inspect
 puts SqliteObserverProbe.transactions.inspect
 puts SqliteObserverProbe.locks.inspect
-"#,
+"#
+    ),
     expected: concat!(
         "[true, true, true, [[\"committed\", 7, 2.5, nil]], \"refused\", \"cannot open\", 3, 0, true, true]\n",
         "[\":memory:\", \"sqlite3\"]\n",
         "[\"/app/storage/test.sqlite3\", \"/data/x.sqlite3\", \"/data/y.sqlite3\", \"/app/rel.sqlite3\"]\n",
         "[false, true]\n",
         "[0, false, 0]\n",
+    ),
+};
+
+/// `RecordCache` and `FragmentCache`: a record's raw attributes, through
+/// JSON and back with `name.constantize.instantiate(attributes)`, are a
+/// persisted, unchanged copy (timestamps to the microsecond); a String-
+/// keyed `Model.instantiate` reads the same; an unknown name raises
+/// `NameError` as `constantize` does. The bounded store evicts least-
+/// recently-used entries, at Rails' entry cost, down to three quarters
+/// of its size; `fetch` keeps the first value; Array keys file under
+/// their joined form; reads are copies.
+pub const RECORD_SNAPSHOT: Contract = Contract {
+    path: "app/models/record_snapshot_probe.rb",
+    source: r##"class RecordSnapshotProbe
+  def self.round_trip
+    created = Article.create!(title: "Snapshot", body: "A sufficiently long article body.")
+    article = Article.find(created.id)
+    raw = article.attributes_before_type_cast
+    snapshot = ActiveSupport::JSON.encode([ [ article.class.name, raw ] ])
+    rebuilt = ActiveSupport::JSON.decode(snapshot).map { |name, attributes| name.constantize.instantiate(attributes) }.first
+    direct = Article.instantiate(raw.merge("title" => "Merged"))
+    [ raw.keys.sort, rebuilt.persisted?, rebuilt.changed?, rebuilt.id == article.id, rebuilt.title,
+      rebuilt.created_at == article.created_at, rebuilt.created_at.usec == article.created_at.usec,
+      rebuilt.equal?(article), direct.title, direct.persisted? ]
+  end
+
+  def self.unknown_name
+    attributes = { "id" => 1 }
+    "NoSuchModel".constantize.instantiate(attributes)
+    "built"
+  rescue NameError
+    "NameError"
+  end
+
+  def self.bounds
+    store = ActiveSupport::Cache::MemoryStore.new(size: 1330)
+    store.write("first", "a" * 100)
+    store.write("second", "b" * 100)
+    store.read("first")
+    store.write("third", "c" * 400)
+    [ store.exist?("first"), store.exist?("second"), store.exist?("third") ]
+  end
+
+  def self.fetching
+    store = ActiveSupport::Cache::MemoryStore.new
+    first = store.fetch("k") { "computed" }
+    second = store.fetch("k") { "recomputed" }
+    store.write([ "record", 1, nil, [ "a", "b" ] ], "filed")
+    copies = !store.read("k").equal?(store.read("k"))
+    store.delete("k")
+    [ first, second, store.read("record/1//a/b"), copies, store.read("k").nil? ]
+  end
+
+  def self.key
+    ActiveSupport::Cache.expand_cache_key([ "record-snapshot-v1", [ "db", "ns", 3 ], [ "session", "abc" ] ])
+  end
+end
+"##,
+    script: concat!(
+        "if ActiveRecord.adapter.nil?\n",
+        "  SqliteAdapter.configure(\":memory:\")\n",
+        "  ActiveRecord.adapter = SqliteAdapter\n",
+        "  Schema.statements.each { |sql| SqliteAdapter.execute_ddl(sql) }\n",
+        "end\n",
+        r#"puts RecordSnapshotProbe.round_trip.inspect
+puts RecordSnapshotProbe.unknown_name
+puts RecordSnapshotProbe.bounds.inspect
+puts RecordSnapshotProbe.fetching.inspect
+puts RecordSnapshotProbe.key
+"#
+    ),
+    expected: concat!(
+        "[[\"body\", \"created_at\", \"id\", \"title\", \"updated_at\"], true, false, true, \"Snapshot\", true, true, false, \"Merged\", true]\n",
+        "NameError\n",
+        "[true, false, true]\n",
+        "[\"computed\", \"computed\", \"filed\", true, true]\n",
+        "record-snapshot-v1/db/ns/3/session/abc\n",
     ),
 };

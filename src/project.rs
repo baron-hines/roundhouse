@@ -3442,6 +3442,47 @@ fn apply_cable_channels(files: &mut [(String, String)], app: &App) {
 ///
 /// A SPAN REPLACE between two markers, not a match on today's text —
 /// same reason `apply_cable_connection` gives.
+/// `ActiveRecord::Base.instantiate_named` (runtime/spinel/
+/// active_record_db_config.rb): one arm per model, by the name
+/// `record.class.name` answers for it, and an STI subclass name the
+/// base hydrates. See `lower::record_snapshot`.
+fn apply_instantiate_named(files: &mut [(String, String)], app: &App) {
+    const HEAD: &str = "      # >>> generated: instantiate-named\n";
+    const TAIL: &str = "      # <<< generated: instantiate-named\n";
+    let mut arms: Vec<(String, String)> = Vec::new();
+    for model in &app.models {
+        let name = model.name.0.as_str().to_string();
+        arms.push((name.clone(), name.clone()));
+        for sub in &model.sti_subclass_names {
+            if !app.models.iter().any(|m| m.name == *sub) {
+                arms.push((sub.0.as_str().to_string(), name.clone()));
+            }
+        }
+    }
+    // No models, no arms: the default body (a NameError) stays.
+    if arms.is_empty() {
+        return;
+    }
+    let mut generated = String::from(HEAD);
+    generated.push_str("      case name\n");
+    for (name, class) in &arms {
+        generated.push_str(&format!(
+            "      when {name:?} then {class}.instantiate(attributes)\n"
+        ));
+    }
+    generated.push_str("      else raise NameError, \"uninitialized constant #{name}\"\n      end\n");
+    generated.push_str(TAIL);
+    for (path, content) in files.iter_mut() {
+        if !path.ends_with("active_record_db_config.rb") {
+            continue;
+        }
+        let Some(start) = content.find(HEAD) else { continue };
+        let Some(rel_end) = content[start..].find(TAIL) else { continue };
+        let end = start + rel_end + TAIL.len();
+        content.replace_range(start..end, &generated);
+    }
+}
+
 fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
     const HEAD: &str = "    # >>> generated: global-id-locate\n";
     const TAIL: &str = "    # <<< generated: global-id-locate\n";
@@ -4352,7 +4393,9 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         // with `runtime/spinel/active_record_db_config.rb`.
         | "SQLite3::Database" | "SQLite3::Exception" | "SQLite3::CantOpenException"
         | "SQLite3::BusyException" | "SQLite3::SQLException"
-        | "FileUtils" | "ActiveRecord::ConnectionAdapters::SQLite3Adapter");
+        | "FileUtils" | "ActiveRecord::ConnectionAdapters::SQLite3Adapter"
+        // runtime/spinel/active_support_cache.rb.
+        | "ActiveSupport::Cache" | "ActiveSupport::Cache::MemoryStore");
     if !bundled {
         return None;
     }
@@ -4376,7 +4419,16 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
     // active_record_db_config.rb`); a strict target's Db glue has none.
     ("ActiveRecord::Base", "connection_db_config"),
     ("ActiveRecord::Base", "connection_pool"),
+    // `lower::record_snapshot`'s closed-world `constantize` — the
+    // generated `case` lives in the same ruby-family/spinel file.
+    ("ActiveRecord::Base", "instantiate_named"),
 ];
+
+/// Instance methods only the ruby family and spinel can answer: a model's
+/// `attributes_before_type_cast` is a Hash of every column's raw stored
+/// value, one value type per column, which a strict target's Hash cannot
+/// hold.
+const RUBY_SPINEL_ONLY_INSTANCE_METHODS: &[&str] = &["attributes_before_type_cast"];
 
 /// True when the app already defines `id` as a class/module value, so
 /// the availability gate must not ledger it as a missing runtime stub.
@@ -4449,6 +4501,19 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
             }
+        }
+        if let crate::expr::ExprNode::Send { recv: Some(_), method, .. } = &*expr.node
+            && target != "spinel"
+            && target != "jruby"
+            && !expr.span.is_synthetic()
+            && RUBY_SPINEL_ONLY_INSTANCE_METHODS.contains(&method.as_str())
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_method",
+                format!("#{method} is only available on the ruby family and spinel"),
+            );
         }
         if let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
             && target != "spinel"
@@ -5228,6 +5293,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // chosen. Generating on only one lane would leave the other calling
     // a method nothing defined.
     apply_global_id_locate(&mut files, app);
+    apply_instantiate_named(&mut files, app);
     apply_attachable_locate(&mut files, app);
     apply_views_aggregator(&mut files);
     apply_models_aggregator(&mut files);

@@ -398,6 +398,27 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("busy_timeout=", Ty::Int),
         ("busy_handler_timeout=", Ty::Int),
     ]);
+    // `ActiveSupport::Cache` — `expand_cache_key` and the bounded
+    // `MemoryStore`, in runtime/spinel/active_support_cache.rb (the ruby
+    // family and spinel). A cached value is whatever was written.
+    register_stdlib_class(classes, "ActiveSupport::Cache", &[
+        ("expand_cache_key", Ty::Str),
+    ], &[]);
+    let memory_store = Ty::Class { id: ClassId(Symbol::from("ActiveSupport::Cache::MemoryStore")), args: vec![] };
+    register_stdlib_class(classes, "ActiveSupport::Cache::MemoryStore", &[
+        ("new", memory_store),
+    ], &[
+        ("read", Ty::Untyped),
+        ("write", Ty::Bool),
+        ("fetch", Ty::Untyped),
+        ("delete", Ty::Bool),
+        ("exist?", Ty::Bool),
+        ("clear", Ty::Untyped),
+        ("cleanup", Ty::Nil),
+        ("prune", Ty::Nil),
+        ("read_multi", Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) }),
+        ("write_multi", Ty::Bool),
+    ]);
     // `FileUtils` — a default gem / spinel's `packages/fileutils`.
     register_stdlib_class(classes, "FileUtils", &[
         ("mkdir_p", Ty::Untyped), ("makedirs", Ty::Untyped),

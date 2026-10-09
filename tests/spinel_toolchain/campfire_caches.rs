@@ -33,3 +33,9 @@ fn response_helpers_run_as_rails_runs_them_natively() {
 fn sqlite_observer_and_checkpointer_surface_runs_natively() {
     assert_runs_natively(&contract::SQLITE_OBSERVER);
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn record_snapshots_and_the_bounded_store_run_natively() {
+    assert_runs_natively(&contract::RECORD_SNAPSHOT);
+}

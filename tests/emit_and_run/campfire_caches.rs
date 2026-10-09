@@ -111,3 +111,8 @@ end
 fn sqlite_observer_and_checkpointer_surface_runs() {
     assert_runs(&contract::SQLITE_OBSERVER);
 }
+
+#[test]
+fn record_snapshots_and_the_bounded_store_run() {
+    assert_runs(&contract::RECORD_SNAPSHOT);
+}
