@@ -159,3 +159,35 @@ fn only_a_routed_name_nothing_defines_gets_the_check() {
         assert!(!src.contains("ActionNotFound"), "{p}:\n{src}");
     }
 }
+
+/// `alias_method :index, :show` makes `index` an action, because `show`
+/// is a public action. The alias counts as defined, so only `edit`,
+/// which nothing defines, gets the check.
+fn aliased() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  resources :gadgets, only: [:index, :show, :edit]\n",
+        )
+        .write(
+            "app/controllers/gadgets_controller.rb",
+            "class GadgetsController < ApplicationController\n  def show\n    render json: { ok: true }\n  end\n  alias_method :index, :show\nend\n",
+        )
+}
+
+#[test]
+fn an_alias_of_a_public_action_is_defined() {
+    let (emitted, _) = aliased().emit(roundhouse::project::BuildTarget::Ruby);
+    let src = std::fs::read_to_string(emitted.join("app/controllers/gadgets_controller.rb")).expect("read");
+    assert!(src.contains("could not be found for GadgetsController\" if [:edit].include?(action_name)\n"), "{src}");
+    aliased()
+        .run_ruby(
+            r##"{ "/gadgets" => 200, "/gadgets/1" => 200, "/gadgets/1/edit" => 404 }.each do |path, want|
+  got, = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+  raise "GET #{path} answered #{got}, want #{want}" unless got == want
+end
+"##,
+        )
+        .assert_passes();
+}

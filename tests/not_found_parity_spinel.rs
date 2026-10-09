@@ -104,3 +104,35 @@ puts "messages match"
     run.assert_passes();
     assert!(run.stdout.contains("messages match"), "{}", run.stdout);
 }
+
+/// An `alias_method` of a public action is an action: no
+/// `ActionNotFound` for it, while a name nothing defines still raises.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_alias_of_a_public_action_is_defined_on_spinel() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  resources :gadgets, only: [:index, :show, :edit]\n",
+        )
+        .write(
+            "app/controllers/gadgets_controller.rb",
+            "class GadgetsController < ApplicationController\n  def show\n    render json: { ok: true }\n  end\n  alias_method :index, :show\nend\n",
+        )
+        .run_spinel(
+            r##"[:index, :edit].each do |action|
+  begin
+    GadgetsController.new.process_action(action)
+    puts "#{action}: dispatched"
+  rescue AbstractController::ActionNotFound
+    puts "#{action}: not found"
+  end
+end
+"##,
+        );
+    run.assert_passes();
+    for line in ["index: dispatched", "edit: not found"] {
+        assert!(run.stdout.contains(line), "missing {line:?} in:\n{}", run.stdout);
+    }
+}

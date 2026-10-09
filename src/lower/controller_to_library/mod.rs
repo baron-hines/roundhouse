@@ -790,13 +790,15 @@ fn collect_attr_accessor_methods(controller: &Controller) -> Vec<MethodDef> {
 /// exist, an ordering this pass (which only ever sees one controller's
 /// own `methods`) doesn't have access to. Ledgered rather than
 /// dropped so the survey names exactly which alias didn't resolve.
-fn apply_alias_methods(controller: &Controller, methods: &mut Vec<MethodDef>) {
+/// The `alias_method :new, :old` pairs in a controller's class body, in
+/// declaration order, as `(new, old)`.
+fn alias_method_pairs(controller: &Controller) -> Vec<(Symbol, Symbol)> {
     use crate::expr::Literal;
     let sym = |e: &Expr| match &*e.node {
         ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
         _ => None,
     };
-    let aliases: Vec<(Symbol, Symbol)> = controller
+    controller
         .body
         .iter()
         .filter_map(|item| {
@@ -811,8 +813,11 @@ fn apply_alias_methods(controller: &Controller, methods: &mut Vec<MethodDef>) {
             let old_name = sym(args.get(1)?)?;
             Some((new_name, old_name))
         })
-        .collect();
-    for (new_name, old_name) in aliases {
+        .collect()
+}
+
+fn apply_alias_methods(controller: &Controller, methods: &mut Vec<MethodDef>) {
+    for (new_name, old_name) in alias_method_pairs(controller) {
         let Some(old) = methods.iter().find(|m| m.name == old_name).cloned() else {
             crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
                 file: controller.name.0.as_str().to_string(),
@@ -1267,13 +1272,22 @@ fn build_methods(
     // read, so a routed name may be an action it cannot see.
     let mut missing: Vec<Symbol> = Vec::new();
     if let (Some(routed), Some(spliced)) = (routed, action_check) {
-        let defined: std::collections::HashSet<&Symbol> = publics_inlined
+        let mut defined: std::collections::HashSet<Symbol> = publics_inlined
             .iter()
-            .map(|a| &a.name)
-            .chain(inherited.iter())
-            .chain(spliced.iter())
+            .map(|a| a.name.clone())
+            .chain(inherited.iter().cloned())
+            .chain(spliced.iter().cloned())
             .collect();
-        missing = routed.iter().filter(|a| !defined.contains(a)).cloned().collect();
+        // `alias_method :index, :show` makes `index` a public action
+        // when `show` is one. `apply_alias_methods` writes the copy
+        // only after this point, so count it here. An alias of an
+        // alias resolves in declaration order, as Ruby does.
+        for (new_name, old_name) in alias_method_pairs(controller) {
+            if defined.contains(&old_name) {
+                defined.insert(new_name);
+            }
+        }
+        missing = routed.iter().filter(|a| !defined.contains(*a)).cloned().collect();
         missing.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     }
 
