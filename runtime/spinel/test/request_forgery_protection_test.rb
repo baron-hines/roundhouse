@@ -91,6 +91,10 @@ class RequestForgeryProtectionTest < Minitest::Test
     refute controller(method: "POST", params: ok, headers: { "HTTP_ORIGIN" => "http://chat.example.com:8080" }, session_token: secret).verified_request?
     proxied = { "HTTP_X_FORWARDED_PROTO" => "https", "HTTP_ORIGIN" => "https://chat.example.com" }
     assert controller(method: "POST", params: ok, headers: proxied, session_token: secret).verified_request?
+    # A Host header naming the scheme's standard port is the same origin
+    # a browser writes without it.
+    explicit = tls.merge("HTTP_HOST" => "chat.example.com:443", "HTTP_ORIGIN" => "https://chat.example.com")
+    assert controller(method: "POST", params: ok, headers: explicit, session_token: secret).verified_request?
   end
 
   # Action Cable's handshake check: same host, or any localhost port in
@@ -108,6 +112,9 @@ class RequestForgeryProtectionTest < Minitest::Test
     assert rfp.cable_origin_allowed?("https://chat.example.com", tls, false)
     refute rfp.cable_origin_allowed?("http://chat.example.com", tls, false)
     assert_equal "https://chat.example.com", rfp.base_url_for("chat.example.com", "on", "")
+    assert_equal "https://chat.example.com", rfp.base_url_for("chat.example.com:443", "", "https")
+    assert_equal "http://chat.example.com", rfp.base_url_for("chat.example.com:80", "", "")
+    assert_equal "http://chat.example.com:443", rfp.base_url_for("chat.example.com:443", "", "")
   end
 
   def test_development_also_allows_any_localhost_port

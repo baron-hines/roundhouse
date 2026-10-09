@@ -66,10 +66,13 @@ module ActionController
     # The base URL a request arrived on, from its Host header and the
     # same TLS evidence `ActionDispatch::Request#ssl?` reads (`HTTPS=on`
     # from the server, or `X-Forwarded-Proto` from a proxy that
-    # terminated TLS in front of it).
+    # terminated TLS in front of it), the scheme's standard port dropped
+    # as `Request#base_url` drops it.
     def self.base_url_for(host, https, forwarded_proto)
       tls = https == "on" || forwarded_proto.split(",").first.to_s.strip.downcase == "https"
-      (tls ? "https://" : "http://") + host
+      default = tls ? ":443" : ":80"
+      bare = host.end_with?(default) ? host[0, host.length - default.length].to_s : host
+      (tls ? "https://" : "http://") + bare
     end
 
     # Action Cable's `allow_request_origin?`, the check a `/cable`
