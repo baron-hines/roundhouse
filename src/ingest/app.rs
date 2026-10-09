@@ -160,6 +160,30 @@ pub fn ingest_inflections<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::naming
     out
 }
 
+/// Does Ruby source `text` read the top-level constant `name` as code: a
+/// bare `X`, a rooted `::X`, or the `X` that starts a path `X::Y`?
+fn names_root_constant(text: &str, name: &str) -> bool {
+    struct Reads<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Reads<'_> {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            self.found |= super::util::constant_id_str(&node.name()) == self.name;
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if node.parent().is_none() {
+                self.found |= node.name().is_some_and(|id| super::util::constant_id_str(&id) == self.name);
+            }
+            ruby_prism::visit_constant_path_node(self, node);
+        }
+    }
+    let parsed = ruby_prism::parse(text.as_bytes());
+    let mut reads = Reads { name, found: false };
+    ruby_prism::Visit::visit(&mut reads, &parsed.node());
+    reads.found
+}
+
 /// A module or class an initializer defines at the top level, kept
 /// when the app's own code names it and nothing else defines it.
 ///
@@ -199,13 +223,25 @@ fn keep_initializer_defined(
     let referenced = |name: &str| {
         sources.iter().any(|f| {
             let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
-            (rel.starts_with("app/") || rel.starts_with("lib/"))
-                && f.text.match_indices(name).any(|(i, _)| {
-                    let before = f.text[..i].chars().next_back();
-                    let after = f.text[i + name.len()..].chars().next();
-                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
-                        && matches!(after, Some('.') | Some(':'))
-                })
+            if !(rel.starts_with("app/") || rel.starts_with("lib/")) {
+                return false;
+            }
+            // In Ruby, a comment or a string naming it is not a reference.
+            if rel.ends_with(".rb") {
+                return f.text.contains(name) && names_root_constant(&f.text, name);
+            }
+            // A template is not Ruby to parse, so its text is matched.
+            f.text.match_indices(name).any(|(i, _)| {
+                let head = &f.text[..i];
+                let rooted = head.strip_suffix("::").is_some_and(|h| {
+                    !h.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                });
+                let before = head.chars().next_back();
+                let after = f.text[i + name.len()..].chars().next();
+                // Not only `X.` / `X::`: forem reads `ApplicationConfig["KEY"]`.
+                (rooted || !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':'))
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
         })
     };
     for lc in candidates {
@@ -750,6 +786,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // referenced at runtime) drops out. Same isolate-per-file tolerance
     // as extras/lib — the file carries Bundler/railtie noise that must
     // not abort ingest.
+    // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
+    app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
         let file = app_config_path.display().to_string();
@@ -1847,6 +1885,7 @@ end
     if !late_on_load.is_empty() {
         splice_concerns_into_models_named(&mut app, &late_on_load);
     }
+    super::model_delegate::lower_model_delegates(&mut app);
     super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     // Admission needs complete controller permit demand and model DSL,
@@ -2926,6 +2965,16 @@ const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
 /// exist everywhere would be worse than not modeling them at all.
 const REFINEMENT_MACROS: &[&str] = &["using"];
 
+/// `wrap_parameters` in a form ParamsWrapper's lowering reads
+/// (`false`, a name, a model, `format:`/`include:`/`exclude:`/`name:`):
+/// consumed by `lower::controller_to_library::params_wrapper`, so not a
+/// survey line. Any other form keeps the line, and the lowering does not
+/// guess at it.
+fn is_recognized_wrap_parameters(method: &str, args: &[crate::expr::Expr]) -> bool {
+    method == "wrap_parameters"
+        && crate::lower::controller_to_library::params_wrapper::is_recognized_wrap_parameters_call(args)
+}
+
 /// A receiverless, blockless call left in a controller's class body
 /// after every consumer has run is a macro roundhouse does not
 /// recognize — `rate_limit`, say. Its effect (a guard, a filter, a
@@ -2950,7 +2999,7 @@ fn report_unrecognized_controller_macros(app: &App) {
         };
         for item in &controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else {
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
                 continue;
             };
             if CONSUMED_CONTROLLER_MACROS.contains(&method.as_str()) {
@@ -2981,6 +3030,9 @@ fn report_unrecognized_controller_macros(app: &App) {
             // `build_sourced_filter_chain` seeds its ivars with, so this
             // exclusion is exactly as wide as the support actually is.
             if super::controller::lambda_filter_target(expr).is_some() {
+                continue;
+            }
+            if is_recognized_wrap_parameters(method.as_str(), args) {
                 continue;
             }
             let file = file_of(expr.span.file);
@@ -6995,6 +7047,85 @@ fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
         }
     }
     found
+}
+
+/// Whether Rails wraps a JSON body for every controller by default
+/// (`App::wrap_parameters_by_default`). Railtie soup, read by line scan
+/// as `extract_config_time_zone` reads it, in Rails' own precedence:
+/// `config.load_defaults` 7.0+ switches the key on; an explicit
+/// `config.action_controller.wrap_parameters_by_default = …` (application
+/// or an initializer) wins over that; and the pre-7.0 generator's
+/// initializer, `wrap_parameters format: [:json]` inside
+/// `on_load(:action_controller)`, wraps for every controller too.
+fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    let code_lines = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.starts_with('#'))
+            .collect()
+    };
+    let mut files: Vec<Vec<String>> = Vec::new();
+    let mut default = false;
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        let lines = code_lines(&source);
+        for line in &lines {
+            if let Some(rest) = line.strip_prefix("config.load_defaults") {
+                // `config.load_defaults 8.1` and `config.load_defaults(8.1)`.
+                let version: String = rest
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(v) = version.parse::<f64>() {
+                    default = v >= 7.0;
+                }
+            }
+        }
+        files.push(lines);
+    }
+    let init_dir = dir.join("config/initializers");
+    if vfs.is_dir(&init_dir) {
+        if let Ok(paths) = read_rb_files(vfs, &init_dir) {
+            for path in paths {
+                if let Ok(source) = vfs.read(&path) {
+                    files.push(code_lines(&source));
+                }
+            }
+        }
+    }
+    for line in files.iter().flatten() {
+        if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
+            let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            if rest.starts_with("true") {
+                default = true;
+            } else if rest.starts_with("false") {
+                default = false;
+            }
+        } else if let Some(rest) = line.strip_prefix("wrap_parameters format:") {
+            // Receiverless only — `WidgetsController.wrap_parameters …` is
+            // that controller's call, not the app-wide on_load default.
+            // Format alone (the pre-7 generator); `include:` / `exclude:` /
+            // `name:` on the same line are not modeled as the app default.
+            if rest.contains("include:") || rest.contains("exclude:") || rest.contains("name:") {
+                continue;
+            }
+            // Exact `:json` / `json` entry — not a substring of `:json_api`.
+            default = wrap_parameters_format_includes_json(rest);
+        }
+    }
+    default
+}
+
+/// Whether a `wrap_parameters format: …` argument list names `:json`
+/// exactly (Rails' ParamsWrapper check), not a longer synonym such as
+/// `:json_api`.
+fn wrap_parameters_format_includes_json(rest: &str) -> bool {
+    rest.split(|c: char| matches!(c, ',' | '[' | ']' | '(' | ')' | ' ' | '\t'))
+        .map(|tok| tok.trim().trim_matches(|c| c == '"' || c == '\''))
+        .any(|tok| tok == ":json" || tok == "json")
 }
 
 fn extract_config_time_zone(source: &[u8]) -> Option<String> {
