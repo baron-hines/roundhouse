@@ -720,6 +720,21 @@ module ActiveRecord
       true
     end
 
+    # A fixture row, inserted as Rails' `insert_fixtures_set` writes it:
+    # raw, so no validations and NO CALLBACKS. Timestamps the fixture
+    # left out are filled, as Rails fills them. Running the save
+    # callbacks here was wrong in a way a test can see: campfire's
+    # Message `after_create_commit` marks the room's memberships unread,
+    # so loading the message fixtures left the fixture users with unread
+    # rooms Rails never gives them.
+    def _insert_fixture
+      fill_timestamps(true)
+      self.id = _adapter_insert
+      @persisted = true
+      _note_hydrated
+      true
+    end
+
     # ---- Saved-change tracking (ActiveModel::Dirty subset) ----------
     # Rails exposes what the last save changed via `saved_changes` /
     # `id_previously_changed?` / the per-attribute predicates the
