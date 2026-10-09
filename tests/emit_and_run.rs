@@ -6063,6 +6063,9 @@ end
 #[path = "emit_and_run/concern_accessors.rs"]
 mod concern_accessors;
 
+#[path = "emit_and_run/action_not_found.rs"]
+mod action_not_found;
+
 /// A concern split in two, mixed into more than one controller: the
 /// inner module calls a method only its includers have (through the
 /// outer one). With several includers `self` in the inner module is the
