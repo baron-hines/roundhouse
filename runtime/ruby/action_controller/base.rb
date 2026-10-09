@@ -361,6 +361,14 @@ module ActionController
     # subscript spelling.
     attr_reader   :cache_control_max_age, :cache_control_public
 
+    # `response` is this controller in the shared runtime, so controller
+    # actions that set `response.content_type` need the same writer Rails'
+    # response object exposes.
+    def content_type=(value)
+      @content_type = value
+      @content_type
+    end
+
     def initialize
       @params  = {}
       @path_parameters = {}
@@ -445,18 +453,18 @@ module ActionController
     # Rails' `controller_name` / `controller_path`: the demodulized
     # underscored leaf (`ArticlesController` → `"articles"`) and the
     # path form that keeps namespaces (`Admin::UsersController` →
-    # `"admin/users"`). Derived from the class name so every controller
-    # answers without a dispatch-time assign.
+    # `"admin/users"`). Defaults answer for `ActionController::Base`
+    # itself. Each concrete controller's lowerer overrides both with
+    # string literals — AOT targets cannot host `self.class.to_s`
+    # reflection, and a shared ActiveSupport char-walk (`underscore`
+    # / `demodulize`) does not yet compile on every strict-target
+    # string emit.
     def controller_name
-      leaf = ActiveSupport.demodulize(self.class.to_s)
-      leaf = leaf[0, leaf.length - 10].to_s if leaf.end_with?("Controller")
-      ActiveSupport.underscore(leaf)
+      "base"
     end
 
     def controller_path
-      path = self.class.to_s
-      path = path[0, path.length - 10].to_s if path.end_with?("Controller")
-      ActiveSupport.underscore(path)
+      "action_controller/base"
     end
 
     # Subclasses override. Error message omits `self.class.name` —
@@ -536,6 +544,20 @@ module ActionController
     # the harness when a consumer needs them.
     def response
       self
+    end
+
+    # Rails' `self.response_body =` (campfire's MessagesController and
+    # CachedResponses serve a prebuilt page this way). A body is a
+    # response, so the before_action halting check sees it; nil clears
+    # it, as in Rails, and `body` stays the String it always is.
+    def response_body
+      @body
+    end
+
+    def response_body=(value)
+      @body = value.to_s
+      @performed = !value.nil?
+      @body
     end
 
     # ---- conditional GET: ALWAYS FRESH -----------------------------

@@ -32,6 +32,27 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     );
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
 
+    // GlobalID mint + Locator — unsigned `param`/`uri`/`signed` and the
+    // locate / locate_signed class methods. Return types for locate*
+    // with a literal `only:` are refined in `body/send.rs` to the named
+    // model (nilable); Untyped here is the gradual fallback for a
+    // computed `only:`.
+    {
+        let mut gid = ClassInfo::default();
+        for m in ["param", "uri", "signed"] {
+            gid.class_methods.insert(Symbol::from(m), Ty::Str);
+        }
+        classes.insert(ClassId(Symbol::from("GlobalID")), gid);
+        let mut locator = ClassInfo::default();
+        locator
+            .class_methods
+            .insert(Symbol::from("locate"), Ty::Untyped);
+        locator
+            .class_methods
+            .insert(Symbol::from("locate_signed"), Ty::Untyped);
+        classes.insert(ClassId(Symbol::from("GlobalID::Locator")), locator);
+    }
+
     // `ActionController::BrowserBlocker.blocked?(user_agent, floors)` —
     // the gate `ingest::allow_browser` synthesizes into a controller
     // body for `allow_browser`, answered by
@@ -477,10 +498,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "TypeError", "NameError", "NoMethodError", "IndexError",
         "KeyError", "RangeError", "IOError", "NotImplementedError",
         "FrozenError", "ZeroDivisionError", "StopIteration",
-        // Both CRuby's bundled libraries and Spinel's uri/net packages
-        // define these exception classes; emitted requires load them.
+        "ThreadError", "ClosedQueueError",
+        // CRuby's bundled libraries and Spinel's uri/net/json packages
+        // recognize these exception names; emitted requires load them.
         "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
-        "OpenSSL::OpenSSLError", "JSON::ParserError",
+        "OpenSSL::OpenSSLError", "JSON::ParserError", "JSON::GeneratorError",
         // Campfire tip: `rescue SystemCallError` / `OpenSSL::SSL::SSLError`
         // on pooled web-push connections; `rescue Vips::Error` beside
         // ActiveStorage::PreviewError when drawing attachment variants.
@@ -488,13 +510,23 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `Timeout.timeout` / `rescue Timeout::Error` — Campfire unfurl
         // deadline and TimeLimitedVideoPreviewer#capture.
         "Timeout::Error",
+        // `rescue EOFError` around `readpartial` on a pipe or a pty.
+        "EOFError",
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
+    }
+    // `rescue Errno::ENOENT` / `Errno::EIO`: every Errno class that both
+    // CRuby (on every POSIX platform) and Spinel's runtime define. The
+    // lookup is by exact name, so the family is registered whole.
+    register_stdlib_class(classes, "Errno", &[], &[]);
+    for name in ERRNO_CLASSES {
+        register_stdlib_class(classes, &format!("Errno::{name}"), &[], &exception_surface);
     }
     for (exc, extra) in [
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
         ("ActiveRecord::ValueTooLong", None),
+        ("ActiveRecord::SoleRecordExceeded", None),
         // Not `ActiveRecord::Base`: no instance surface is registered there, so `e.record.errors` would still fail.
         ("ActiveRecord::RecordInvalid", Some(("record", Ty::Untyped))),
         // Names overlap `project::RUBY_FAMILY_RUNTIME_CONSTANTS` (emit
@@ -585,6 +617,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // A class test such as `URI.parse(url).is_a?(URI::HTTP)` names the
     // real bundled class, without claiming any extra instance methods.
     register_stdlib_class(classes, "URI::HTTP", &[], &[]);
+    register_stdlib_class(classes, "URI::HTTPS", &[], &[]);
     for response in ["Net::HTTPRedirection", "Net::HTTPOK"] {
         register_stdlib_class(classes, response, &[], &[]);
     }
@@ -603,18 +636,43 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Timeout.timeout`, and `IO.popen` / `copy_stream` live in the
     // send special-cases (`body/send.rs`) — catalog entries would win
     // before those cases and kill unit-aware `clock_gettime` (Float for
-    // `:millisecond`). Nested value Consts (`IO::NULL`,
-    // `Process::CLOCK_MONOTONIC`) are empty ClassIds the way `URI::HTTP`
-    // is. Instance methods on an `IO` handle still belong here.
+    // `:millisecond`). Nested *namespace* Consts (`Process::CLOCK_*`)
+    // stay empty ClassIds the way `URI::HTTP` is. Value Consts
+    // (`IO::NULL` / `File::NULL`) are typed Strings via CORE_RBS — do
+    // not also register them here or the ClassId fallback disagrees.
+    // Instance methods on an `IO` handle still belong here. `winsize` /
+    // `winsize=` wait on carrying `require "io/console"` into the
+    // emitted tree; admitting them without that load is check-quiet /
+    // runtime `NoMethodError`.
     let io = Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![] };
     register_stdlib_class(classes, "IO", &[], &[
         ("pid", Ty::Int),
         ("read", Ty::Str),
+        ("readpartial", Ty::Str),
+        ("write", Ty::Int),
+        ("closed?", Ty::Bool),
         ("rewind", Ty::Int),
         ("binmode", io.clone()),
         ("close", Ty::Nil),
     ]);
-    register_stdlib_class(classes, "IO::NULL", &[], &[]);
+    // `File < IO` — Ruby's hierarchy (not a PTY detail). File's class
+    // methods are registered earlier; the parent is set once `IO` exists
+    // so instance methods (`readpartial`, `closed?`, …) resolve on a
+    // File handle, including `PTY.spawn`'s reader/writer.
+    classes
+        .get_mut(&ClassId(Symbol::from("File")))
+        .expect("File registered above")
+        .parent = Some(ClassId(Symbol::from("IO")));
+    // `require "pty"`. `PTY.spawn`'s return is a send special case: its
+    // block form answers nil; block yields are typed in `block_params_for`.
+    register_stdlib_class(classes, "PTY", &[], &[]);
+    // A default gem a booted Rails app has already loaded; the BUNDLED
+    // row emits its require.
+    register_stdlib_class(classes, "Shellwords", &[
+        ("escape", Ty::Str), ("shellescape", Ty::Str),
+        ("join", Ty::Str), ("shelljoin", Ty::Str),
+        ("split", str_arr()), ("shellsplit", str_arr()), ("shellwords", str_arr()),
+    ], &[]);
     register_stdlib_class(classes, "Process", &[], &[]);
     register_stdlib_class(classes, "Process::CLOCK_MONOTONIC", &[], &[]);
     register_stdlib_class(classes, "Process::CLOCK_REALTIME", &[], &[]);
@@ -631,6 +689,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // Do not invent member or synchronization return types here.
     register_stdlib_class(classes, "Struct", &[], &[]);
     register_stdlib_class(classes, "Mutex", &[], &[]);
+    // The queue constructors, Thread's core aliases, and the standard
+    // mixins likewise need exact entries for source constant resolution.
+    // No queue element, synchronization or mixin method types are added;
+    // the Ruby-family runtimes supply the actual behavior.
+    for name in ["Queue", "SizedQueue", "Thread::Queue", "Thread::SizedQueue",
+        "Thread::Mutex", "Comparable", "Enumerable"] {
+        register_stdlib_class(classes, name, &[], &[]);
+    }
     // `Array.wrap` is folded by `lower::enumerable_ext` before emit.
     // Registered so the analyzer does not report it as unknown. The
     // element type is not known from a scalar argument.
@@ -725,3 +791,17 @@ fn register_stdlib_class(
             .or_insert_with(|| ty.clone());
     }
 }
+
+/// The Errno classes CRuby defines on every POSIX platform that Spinel's
+/// runtime (`lib/sp_exc.c`) defines too.
+const ERRNO_CLASSES: &[&str] = &[
+    "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO", "ENXIO", "E2BIG", "ENOEXEC", "EBADF",
+    "ECHILD", "EAGAIN", "ENOMEM", "EACCES", "EFAULT", "EBUSY", "EEXIST", "EXDEV", "ENODEV",
+    "ENOTDIR", "EISDIR", "EINVAL", "ENFILE", "EMFILE", "ENOTTY", "EFBIG", "ENOSPC", "ESPIPE",
+    "EROFS", "EMLINK", "EPIPE", "EDOM", "ERANGE", "EDEADLK", "ENAMETOOLONG", "ENOLCK",
+    "ENOSYS", "ENOTEMPTY", "ELOOP", "ENOTSOCK", "EMSGSIZE", "EPROTOTYPE", "ENOPROTOOPT",
+    "EPROTONOSUPPORT", "ENOTSUP", "EOPNOTSUPP", "EAFNOSUPPORT", "EADDRINUSE",
+    "EADDRNOTAVAIL", "ENETDOWN", "ENETUNREACH", "ENETRESET", "ECONNABORTED", "ECONNRESET",
+    "ENOBUFS", "EISCONN", "ENOTCONN", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH",
+    "EALREADY", "EINPROGRESS", "ESTALE", "EDQUOT", "ECANCELED", "EOVERFLOW", "EILSEQ",
+];
