@@ -64,6 +64,8 @@ end
     broadcast_per_user
     broadcast_gone
     broadcast_with_attributes
+    broadcast_helpers_dom_id
+    broadcast_bare_dom_id
   end
 
   private
@@ -86,6 +88,14 @@ end
       broadcast_append_to :rooms, target: :shared_rooms,
         partial: "rooms/row", locals: { room: @room },
         attributes: { maintain_scroll: true, tone: "quiet", missing: nil }
+    end
+
+    def broadcast_helpers_dom_id
+      broadcast_remove_to :rooms, target: helpers.dom_id(@room, :boosts)
+    end
+
+    def broadcast_bare_dom_id
+      broadcast_remove_to :lobby, target: helpers.dom_id(@room)
     end
 end
 "#,
@@ -193,4 +203,21 @@ fn no_broadcast_to_call_survives_into_the_emit() {
     assert!(!src.contains("broadcast_prepend_to"), "{src}");
     assert!(!src.contains("broadcast_replace_to"), "{src}");
     assert!(!src.contains("broadcast_remove_to"), "{src}");
+}
+
+/// `target: helpers.dom_id(record, :prefix)` — campfire 8a6e429's boost
+/// broadcast — spells the same id as `target: [record, :prefix]`, and
+/// `helpers.dom_id(record)` the unprefixed one. Before, the call was left
+/// as written and raised NoMethodError on the record.
+#[test]
+fn a_helpers_dom_id_target_spells_rails_dom_id() {
+    let src = controller_src();
+    assert!(
+        src.contains("Broadcasts.remove(stream: \"rooms\", target: \"boosts_#{@room.dom_prefix}_#{@room.dom_record_key}\")"),
+        "{src}",
+    );
+    assert!(
+        src.contains("Broadcasts.remove(stream: \"lobby\", target: \"#{@room.dom_prefix}_#{@room.dom_record_key}\")"),
+        "{src}",
+    );
 }

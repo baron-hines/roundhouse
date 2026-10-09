@@ -236,6 +236,13 @@ module Dom
   # scanning forward from the hit gives a suffix of the tag rather than
   # the tag.
   def self.select(root, selector)
+    select_tags(root, selector).map { root }
+  end
+
+  # The START TAG of each element `select` matches, in document order —
+  # what `css_select` hands back as an Element. Same scan as `select`;
+  # `select` keeps answering the root per match (see above).
+  def self.select_tags(root, selector)
     chunk = target_chunk(selector)
     negated = negated_attrs(chunk)
     chunk = without_negations(chunk)
@@ -247,10 +254,15 @@ module Dom
     fragment = fragment_for(selector)
     nodes = []
     return nodes if fragment == ""
+    # One element is one start tag, however many times the anchor
+    # fragment occurs inside it (`.message[data-message-id]` anchors on
+    # `message`, which a message's own tag spells several times).
+    seen = []
     from = 0
     while (i = root.index(fragment, from))
       from = i + fragment.length
       start = tag_start(root, i)
+      next if seen.include?(start)
       stop = root.index(">", i)
       tag_end = stop.nil? ? root.length : stop
       tag = root[start, tag_end - start + 1].to_s
@@ -265,9 +277,34 @@ module Dom
       # attribute keeps it, and assert_select compares decoded values.
       attrs.each { |a| ok = false unless attr_matches?(tag, a) }
       negated.each { |a| ok = false if attr_present?(tag, a) }
-      nodes << root if ok
+      if ok
+        seen << start
+        nodes << tag
+      end
     end
     nodes
+  end
+
+  # One element `css_select` answered: its start tag, read for
+  # attributes the way a Nokogiri node's `[]` reads them. Values are
+  # returned as written in the markup; an entity inside one is not
+  # decoded (Nokogiri would decode it).
+  class Element
+    def initialize(tag)
+      @tag = tag
+    end
+
+    def [](name)
+      start = @tag.index(" #{name}=\"")
+      return nil if start.nil?
+      rest = @tag[start + name.length + 3, @tag.length].to_s
+      close = rest.index("\"")
+      close.nil? ? rest : rest[0, close].to_s
+    end
+
+    def to_s
+      @tag
+    end
   end
 
   # Concatenated descendant text of a node. Stub: the node's html
@@ -2067,6 +2104,13 @@ module RequestDispatch
   # target can compile on a value it cannot type. The root arrives
   # untyped by construction — it is whatever HTML library the app's own
   # test reached for.
+  # Rails' `css_select(selector)`: the elements of the last response
+  # that match, each answering `[]` for its attributes (campfire's
+  # `css_select(".message[data-message-id]").map { it["id"] }`).
+  def css_select(selector)
+    Dom.select_tags(Dom.parse(@__response.body.to_s), selector).map { |tag| Dom::Element.new(tag) }
+  end
+
   def assert_select(selector_or_root, content_or_opts = nil, opts = nil, &block)
     if selector_or_root.is_a?(String)
       body = @__response.body.to_s

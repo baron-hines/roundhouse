@@ -32,6 +32,7 @@ end
 module Dom
   def self.parse: (String html) -> String
   def self.select: (String root, String selector) -> Array[String]
+  def self.select_tags: (String root, String selector) -> Array[String]
   def self.text: (String node) -> String
   def self.fragment_for: (String selector) -> String
   def self.selector_attrs: (String chunk) -> Array[String]
@@ -44,6 +45,13 @@ module Dom
   def self.selector_id: (String base) -> String
   def self.selector_classes: (String base) -> Array[String]
   def self.without_id: (String base) -> String
+
+  class Element
+    @tag: String
+    def initialize: (String tag) -> void
+    def []: (String name) -> String?
+    def to_s: () -> String
+  end
 end
 
 # Captured response from a dispatched in-process request. The four
@@ -335,6 +343,7 @@ module RequestDispatch
   # Second arg is either the selector (root form), the content string
   # to match against the rendered tag, or an options Hash, or nil.
   # Returns void (raises on mismatch).
+  def css_select: (String selector) -> Array[Dom::Element]
   def assert_select: (
     untyped selector_or_root,
     ?(String | Hash[Symbol, untyped])? content_or_opts,

@@ -2450,6 +2450,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         // cross-module helper reference.
         let own_methods: std::collections::HashSet<Symbol> =
             lc.methods.iter().map(|m| m.name.clone()).collect();
+        let is_controller = app.controllers.iter().any(|c| c.name == lc.name);
         for m in &mut lc.methods {
             // A helper module's own methods become module-functions so the
             // rewritten `Module.method` call has a real target — Rails mixed
@@ -2473,6 +2474,13 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
             // to params but not to real self-dispatched methods.
             let own_params: std::collections::HashSet<Symbol> =
                 m.params.iter().map(|p| p.name.clone()).collect();
+            // `helpers.dom_id(...)` inside a controller: Rails'
+            // `ActionController::Helpers#helpers`, the controller's view
+            // context. Collapsed the way `ActionController::Base.helpers`
+            // is, onto the module functions the call names.
+            if is_controller && !own_methods.contains(&Symbol::from("helpers")) {
+                rewrite_controller_helpers_proxy(&mut m.body, &app.helper_method_index);
+            }
             rewrite_helper_calls(
                 &mut m.body,
                 &app.helper_method_index,
@@ -3272,6 +3280,27 @@ fn is_rails_url_helpers(node: &ExprNode) -> bool {
     }
     matches!(cur, ExprNode::Const { path }
         if path.last().map(|s| s.as_str() == "Rails").unwrap_or(false))
+}
+
+/// `helpers.<m>(args)` in a controller body → `<AppHelper>.<m>(args)`
+/// when an app helper defines `m` (Rails' controller view context
+/// includes every app helper), else `ActionView::ViewHelpers.<m>(args)`
+/// — the same module-function surface `ActionController::Base.helpers`
+/// collapses onto. Only the receiver-less `helpers` reader is matched.
+fn rewrite_controller_helpers_proxy(expr: &mut Expr, index: &HashMap<Symbol, ClassId>) {
+    expr.node
+        .for_each_child_mut(&mut |c| rewrite_controller_helpers_proxy(c, index));
+    let ExprNode::Send { recv: Some(r), method, .. } = &mut *expr.node else { return };
+    let is_proxy = matches!(&*r.node, ExprNode::Send { recv: None, method: h, args, block: None, .. }
+        if h.as_str() == "helpers" && args.is_empty());
+    if !is_proxy {
+        return;
+    }
+    let path = match index.get(method) {
+        Some(module) => module.0.as_str().split("::").map(Symbol::from).collect(),
+        None => view_helpers_path(),
+    };
+    *r.node = ExprNode::Const { path };
 }
 
 fn view_helpers_path() -> Vec<Symbol> {

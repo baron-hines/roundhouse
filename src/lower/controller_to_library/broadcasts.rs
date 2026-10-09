@@ -226,6 +226,44 @@ fn dom_target(value: &Expr, span: Span) -> Option<Expr> {
         // — an id the app spells itself. Already a String; nothing to
         // resolve, and rebuilding it would only be a chance to differ.
         ExprNode::StringInterp { .. } => Some(value.clone()),
+        // `target: helpers.dom_id(@boost.message, :boosts)` (or a bare
+        // `dom_id(...)`) — the same id the array form spells, through
+        // the helper that spells it: Rails' `dom_id(record, prefix)`.
+        ExprNode::Send { recv, method, args, block: None, .. }
+            if method.as_str() == "dom_id" && recv.as_ref().is_none_or(is_helpers_proxy) =>
+        {
+            match args.as_slice() {
+                [record] => {
+                    record_singular(record)
+                        .or_else(|| decline(span, "target: record is not a nameable record"))?;
+                    Some(Expr::new(
+                        span,
+                        ExprNode::StringInterp {
+                            parts: vec![
+                                crate::expr::InterpPart::Expr {
+                                    expr: dom_identity_call(record.clone(), "dom_prefix"),
+                                },
+                                crate::expr::InterpPart::Text { value: "_".to_string() },
+                                crate::expr::InterpPart::Expr {
+                                    expr: dom_identity_call(record.clone(), "dom_record_key"),
+                                },
+                            ],
+                        },
+                    ))
+                }
+                [record, prefix] => dom_target(
+                    &Expr::new(
+                        value.span,
+                        ExprNode::Array {
+                            elements: vec![record.clone(), prefix.clone()],
+                            style: Default::default(),
+                        },
+                    ),
+                    span,
+                ),
+                _ => decline(span, "target: dom_id takes a record and an optional prefix"),
+            }
+        }
         ExprNode::Array { elements, .. } => {
             let [record, prefix] = elements.as_slice() else {
                 return decline(span, "target: array is not [record, prefix]");
@@ -255,8 +293,14 @@ fn dom_target(value: &Expr, span: Span) -> Option<Expr> {
                 },
             ))
         }
-        _ => decline(span, "target: is not a literal or [record, prefix]"),
+        _ => decline(span, "target: is not a literal, [record, prefix] or dom_id(record, prefix)"),
     }
+}
+
+/// The controller's view-context reader, `helpers` with no receiver.
+fn is_helpers_proxy(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+        if method.as_str() == "helpers" && args.is_empty())
 }
 
 /// `"#{record.dom_prefix()}_#{record.dom_record_key()}"` — the
