@@ -802,11 +802,9 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         // markers::push_block_callback, on the shape it reads: a block,
         // or a parameterless lambda as the first argument.
         if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
-            // A block declaring optional/keyword parameters is declined
-            // there, so it reports here like any unlowered DSL call.
-            if block.as_ref().is_some_and(|b| {
-                !matches!(&*b.node, ExprNode::Lambda { extra_params, .. } if !extra_params.is_empty())
-            }) {
+            // A block whose extra parameters can't be bound from their
+            // defaults is declined there, so it reports here.
+            if block.as_ref().is_some_and(self::markers::block_defaults_bindable) {
                 continue;
             }
             if let ExprNode::Send { args, .. } = &*expr.node {

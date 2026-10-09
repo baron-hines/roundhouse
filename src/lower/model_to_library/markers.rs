@@ -1466,6 +1466,23 @@ fn block_callback_on(arg: &Expr) -> Option<crate::dialect::CallbackOn> {
 /// passes the record as an ARGUMENT to the other and leaves `self` as
 /// the declaring context. Two different bindings, and only one of them
 /// is the shape this splices into a hook method body.
+/// Can a block callback's extra parameters be bound from their defaults
+/// alone? True for a block without them, and for one whose parameters are
+/// all optional (`|key: 7|`, `|x = 1|`): `Proc#arity` is 0, so Rails'
+/// `ActiveSupport::Callbacks` `instance_exec`s it with no argument and
+/// every default applies. A keyword rest, or a required parameter beside
+/// them, changes the arity or the binding and is declined.
+pub(super) fn block_defaults_bindable(block: &Expr) -> bool {
+    match &*block.node {
+        ExprNode::Lambda { params, rest_param, extra_params, .. } if !extra_params.is_empty() => {
+            params.is_empty()
+                && rest_param.is_none()
+                && extra_params.iter().all(|p| p.default.is_some() && !p.rest)
+        }
+        _ => true,
+    }
+}
+
 fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr) {
     {
         let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
@@ -1475,14 +1492,12 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         // doc comment). Either way what follows it is the option hash,
         // so both spellings share one `on:` parse below.
         let (callback, opt_args): (&Expr, &[Expr]) = match (block.as_ref(), &args[..]) {
-            // A block declaring optional/keyword parameters
-            // (`before_save { |key:| … }`) binds names the spliced hook
-            // body has no binding for: leave it on the dynamic path.
-            (Some(b), _)
-                if matches!(&*b.node, ExprNode::Lambda { extra_params, .. } if !extra_params.is_empty()) =>
-            {
-                return;
-            }
+            // A block declaring optional/keyword parameters binds names
+            // the spliced hook body has none for, unless every one has a
+            // default: Rails runs an arity-0 block with `instance_exec`
+            // and no argument, so `before_save { |key: 7| … }` sees
+            // `key == 7` (bound below). Anything else stays dynamic.
+            (Some(b), _) if !block_defaults_bindable(b) => return,
             (Some(b), rest) => (b, rest),
             (None, [first, rest @ ..])
                 if matches!(&*first.node, ExprNode::Lambda { params, extra_params, .. } if params.is_empty() && extra_params.is_empty()) =>
@@ -1520,9 +1535,35 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             ("before_validation" | "after_validation", Some(_)) => hook,
             _ => return,
         };
-        let ExprNode::Lambda { body: lambda_body, .. } = &*callback.node else {
+        let ExprNode::Lambda { body: lambda_body, extra_params, .. } = &*callback.node else {
             return;
         };
+        // `|key: 7, x = 1|` (see `block_defaults_bindable`): bind each
+        // default as a local ahead of the body.
+        let lambda_body = if extra_params.is_empty() {
+            lambda_body.clone()
+        } else {
+            let mut stmts: Vec<Expr> = extra_params
+                .iter()
+                .filter_map(|p| {
+                    p.default.as_ref().map(|d| {
+                        Expr::new(
+                            d.span,
+                            ExprNode::Assign {
+                                target: LValue::Var { id: VarId(0), name: p.name.clone() },
+                                value: d.clone(),
+                            },
+                        )
+                    })
+                })
+                .collect();
+            match &*lambda_body.node {
+                ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
+                _ => stmts.push(lambda_body.clone()),
+            }
+            seq(stmts)
+        };
+        let lambda_body = &lambda_body;
 
         // Translate Rails-API broadcast calls (`assoc.broadcast_replace_to(...)`
         // etc.) inside the block body to spinel-shape `Broadcasts.<action>(...)`

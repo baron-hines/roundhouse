@@ -22,16 +22,30 @@ fn a_form_block_with_an_optional_parameter_is_reported_not_dropped() {
 }
 
 
-/// A block callback declaring keyword parameters (`before_save { |key: 7| … }`)
-/// is not spliced into a hook body that has no `key` binding; it stays
-/// unlowered (and is reported as such) instead.
+/// A block callback whose parameters all have defaults (`|key: 7|`) has
+/// arity 0, so Rails runs it with no argument and the default applies:
+/// the spliced hook binds `key = 7` ahead of the body.
 #[test]
-fn a_block_callback_with_keyword_parameters_is_not_spliced_unbound() {
-    let (tree, errors) = super::emit_and_run::real_blog()
+fn a_block_callback_with_keyword_defaults_runs_with_them() {
+    super::emit_and_run::real_blog()
         .edit(
             "app/models/article.rb",
             "class Article < ApplicationRecord\n",
             "class Article < ApplicationRecord\n  before_save { |key: 7| self.body = \"#{body} #{key}\" }\n",
+        )
+        .run_ruby("a = Article.create!(title: \"T\", body: \"long enough body\")\nraise \"got #{a.body.inspect}\" unless a.body == \"long enough body 7\"\nputs \"ok\"\n")
+        .assert_passes();
+}
+
+/// A required keyword (`|key:|`) has no default to bind: the block is not
+/// spliced into a hook body with `key` unbound.
+#[test]
+fn a_block_callback_with_a_required_keyword_is_not_spliced_unbound() {
+    let (tree, errors) = super::emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  before_save { |key:| self.body = \"#{body} #{key}\" }\n",
         )
         .emit(roundhouse::project::BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
