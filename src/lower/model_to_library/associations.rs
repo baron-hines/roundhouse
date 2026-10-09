@@ -341,7 +341,7 @@ pub(super) fn push_association_methods(
                 {
                     methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, sentinel));
                 }
-                push_singular_loaded_reader(methods, model, owner, name);
+                push_singular_loaded_reader(methods, model, owner, name, false);
             }
             Association::HasOne {
                 name,
@@ -361,7 +361,7 @@ pub(super) fn push_association_methods(
                     scope.as_ref(),
                 ));
                 methods.push(synth_has_one_preload_setter(owner, name, target));
-                push_singular_loaded_reader(methods, model, owner, name);
+                push_singular_loaded_reader(methods, model, owner, name, true);
                 // Writer + after_save only when `autosave: true`. A cache-only
                 // writer on plain `has_one` would accept `owner.child = …`
                 // then drop the child on save (silent data loss vs Rails /
@@ -1122,6 +1122,7 @@ fn push_singular_loaded_reader(
     model: &Model,
     owner: &ClassId,
     name: &Symbol,
+    flag_is_written: bool,
 ) {
     let flat = Symbol::from(format!("{}_loaded?", name.as_str()));
     if model_defines_instance_method(model, &flat)
@@ -1129,7 +1130,14 @@ fn push_singular_loaded_reader(
     {
         return;
     }
-    methods.push(synth_cache_reader(owner, flat, loaded_ivar(name), Ty::Bool));
+    let mut reader = synth_cache_reader(owner, flat, loaded_ivar(name), Ty::Bool);
+    if !flag_is_written {
+        // belongs_to never caches its target, so nothing writes
+        // `@<name>_loaded` and no strict target declares the field;
+        // reading it would be an undeclared member. It is never loaded.
+        reader.body = lit_bool(false);
+    }
+    methods.push(reader);
 }
 
 /// `def reload_<name>; @<name>_loaded = false; <name>; end`.
