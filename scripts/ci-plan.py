@@ -45,6 +45,7 @@ BASE = [
     "build-roundhouse",
     "store-check",
     "compare-ruby",
+    "compare-ruby-next",
     "campfire-conformance",
     "campfire-compare",
 ]

@@ -41,6 +41,10 @@ env:
   # CI selects the latest patch on this MRI line. The local minimum lives in
   # .ruby-version; keep both anchors aligned. Exact repro pins remain separate.
   MRI_RUBY: '3.4'
+  # The next MRI line, exercised by compare-ruby-next as a forward-
+  # compatibility lane. MRI_RUBY stays the supported minimum; once this
+  # line has run green for a while, swap the two.
+  MRI_RUBY_NEXT: '4.0'
   # The Rails apps the /ide/ + /playground/ demos ship (in-browser). Pinned
   # so the page — and any blog post's claims about it — stay stable against
   # upstream churn; bump deliberately. Each bundle embeds the app's LICENSE
@@ -2340,6 +2344,39 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/compare ruby
 
+  # compare-ruby-next: compare-ruby's CRuby runtime gates on the next MRI
+  # line (MRI_RUBY_NEXT). A separate job, not a second setup-ruby inside
+  # compare-ruby, so the two lines run in parallel and a failure names
+  # the Ruby version that broke. The Rails comparison stays on MRI_RUBY.
+  compare-ruby-next:
+    needs: [generate-fixture, plan]
+    if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'compare-ruby-next') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: real-blog-fixture
+      - name: Extract fixture
+        run: tar -xzf real-blog.tar.gz
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.MRI_RUBY_NEXT }}
+          bundler-cache: true
+          working-directory: ./runtime/spinel/scaffold
+      - name: cargo test --test framework_tests_ruby -- --ignored
+        run: cargo test --test framework_tests_ruby -- --ignored --nocapture
+      - name: cargo test --test uuid_key_ruby -- --ignored
+        if: ${{ !cancelled() }}
+        run: cargo test --test uuid_key_ruby -- --ignored --nocapture
+      - name: cargo test --test tiny_api cruby_gate_ -- --ignored
+        if: ${{ !cancelled() }}
+        run: cargo test --test tiny_api cruby_gate_ -- --ignored --nocapture
+
   # compare-jruby: same emitted tree as compare-ruby but served by Puma
   # on the JVM via JRuby with the JDBC db backend (runtime/db.rb =
   # db_jruby.rb). The Rails reference runs under CRuby 3.4 (the default
@@ -3695,7 +3732,7 @@ jobs:
     # can still require them. Unselected PR skips must not fail this gate.
     # cancelled() overrides GitHub's implicit success(): evaluate skipped
     # or failed needs, but do not schedule gates after workflow cancellation.
-    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, browser-smoke-typescript, campfire-conformance, campfire-compare]
+    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, compare-ruby-next, browser-smoke-typescript, campfire-conformance, campfire-compare]
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -3715,7 +3752,7 @@ jobs:
   # Informational validation summary; no branch-protection or merge policy.
   ci-summary:
     name: CI summary
-    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, browser-smoke-typescript, campfire-conformance, campfire-compare, compact-required, compare-extra, compare-jruby, build-wasm, browser-smoke-ide, build-site, smoke, smoke-extra, writebook-inventory, spinel-build, spinel-framework, campfire-spinel-build, campfire-spinel-compare, campfire-spinel-db, spinel-toolchain, spinel-compare, spinel-smoke, campfire-archive-build, campfire-smoke, campfire-smoke-docker, archive-results, assemble-site]
+    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, compare-ruby-next, browser-smoke-typescript, campfire-conformance, campfire-compare, compact-required, compare-extra, compare-jruby, build-wasm, browser-smoke-ide, build-site, smoke, smoke-extra, writebook-inventory, spinel-build, spinel-framework, campfire-spinel-build, campfire-spinel-compare, campfire-spinel-db, spinel-toolchain, spinel-compare, spinel-smoke, campfire-archive-build, campfire-smoke, campfire-smoke-docker, archive-results, assemble-site]
     # Report selected failures and expected skips; stop on workflow cancellation.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
