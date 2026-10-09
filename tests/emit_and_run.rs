@@ -1189,7 +1189,9 @@ end
 
 /// `Date.parse(params[:from])` types the way a String argument does: a
 /// request parameter is a union whose other arms (nil, an Array, nested
-/// params) raise in Rails as well. The calendar send after it runs too.
+/// params) raise in Rails as well. The calendar sends after it run too:
+/// a week that starts on a named day, and `in_time_zone` with a zone
+/// that may be nil. Expected values are Rails 8.1's.
 #[test]
 fn date_parse_of_a_request_parameter_runs() {
     emit_and_run::real_blog()
@@ -1200,7 +1202,20 @@ fn date_parse_of_a_request_parameter_runs() {
         )
         .write(
             "app/controllers/weeks_controller.rb",
-            "class WeeksController < ApplicationController\n  def show\n    from = Date.parse(params[:from])\n    render plain: \"#{from.iso8601} #{from.beginning_of_month.iso8601} #{Date.parse(params.require(:from)).year}\"\n  end\nend\n",
+            r#"class WeeksController < ApplicationController
+  def show
+    from = Date.parse(params[:from])
+    zone = Article.new.title
+    at = Time.utc(2024, 2, 15, 10, 0, 0)
+    render plain: [
+      from.iso8601, from.beginning_of_month.iso8601, Date.parse(params.require(:from)).year,
+      from.beginning_of_week.iso8601, from.beginning_of_week(:sunday).iso8601, from.end_of_week(:sunday).iso8601,
+      at.beginning_of_week(:sunday).day, at.end_of_week(:wednesday).day,
+      from.in_time_zone(zone).strftime("%H:%M")
+    ].join(" ")
+  end
+end
+"#,
         )
         .write(
             "test/controllers/weeks_controller_test.rb",
@@ -1209,7 +1224,7 @@ fn date_parse_of_a_request_parameter_runs() {
 class WeeksControllerTest < ActionDispatch::IntegrationTest
   test "a request parameter parses as a date" do
     get "/week", params: { from: "2024-02-15" }
-    assert_equal "2024-02-15 2024-02-01 2024", response.body
+    assert_equal "2024-02-15 2024-02-01 2024 2024-02-12 2024-02-11 2024-02-17 11 20 00:00", response.body
   end
 end
 "#,
