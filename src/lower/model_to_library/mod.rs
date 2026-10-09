@@ -1361,14 +1361,30 @@ pub(crate) fn push_scope_methods(
         // `__rel` is an optional POSITIONAL param — it must precede any
         // keyword params in the def (`def recent(user = nil, __rel = …,
         // unmerged: true)`), or the signature is a syntax error.
-        let insert_at = params
-            .iter()
-            .position(|p| p.keyword)
-            .unwrap_or(params.len());
-        params.insert(
-            insert_at,
-            Param::with_default(rel_param.clone(), relation_new_self()),
-        );
+        //
+        // A REST param (`*tags`) is the same exception `insert_rel_param`
+        // (the emit-side twin of this function, for user-written
+        // relation-taking class methods) has: an optional positional
+        // can't follow a splat, so `__rel` goes in as an optional
+        // KEYWORD instead, ahead of any `**opts`. `parse_scope` drops a
+        // scope lambda's splat today, so `scope.params` never actually
+        // carries a rest param yet — this branch is dead until that
+        // changes (a separate, later fix) — but kept here so the two
+        // insertion sites stay consistent rather than silently diverging
+        // the day it does.
+        if params.iter().any(|p| p.rest && !p.keyword) {
+            let at = params.iter().position(|p| p.rest && p.keyword).unwrap_or(params.len());
+            params.insert(at, Param::keyword(rel_param.clone(), Some(relation_new_self())));
+        } else {
+            let insert_at = params
+                .iter()
+                .position(|p| p.keyword)
+                .unwrap_or(params.len());
+            params.insert(
+                insert_at,
+                Param::with_default(rel_param.clone(), relation_new_self()),
+            );
+        }
 
         let mut body = scope.body.clone();
         crate::lower::scope_chain::rewrite_scope_body(
