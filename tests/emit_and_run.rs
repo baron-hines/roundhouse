@@ -9234,7 +9234,7 @@ end
 /// answering its block's value — campfire's unfurl (`DEADLINE =
 /// 10.seconds` around the fetch, `open_timeout: 7.seconds` into
 /// `Net::HTTP.start`). The Duration did no arithmetic, so
-/// `TCPSocket.new(open_timeout:)` raised on `-` and every fetch failed;
+/// `TCPSocket.new(connect_timeout:)` could not convert it and every fetch failed;
 /// and `Timeout.timeout { record }` typed Untyped, so `render json:`
 /// wrote the record's `inspect` instead of its JSON.
 #[test]
@@ -9281,7 +9281,7 @@ class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
 
   test "a duration is a timeout the socket layer takes" do
     server = TCPServer.new("127.0.0.1", 0)
-    socket = TCPSocket.new("127.0.0.1", server.addr[1], open_timeout: 1.second)
+    socket = TCPSocket.new("127.0.0.1", server.addr[1], connect_timeout: 1.second)
     socket.close
     server.close
     assert_equal 1.5, (2.seconds - 0.5).to_f
