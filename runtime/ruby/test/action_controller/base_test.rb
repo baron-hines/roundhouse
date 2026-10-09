@@ -66,11 +66,13 @@ class ActionControllerBaseTest < Minitest::Test
   def test_response_body_can_be_assigned
     @controller.response.response_body = "<p>body</p>"
     assert_equal "<p>body</p>", @controller.body
+    assert_equal "<p>body</p>", @controller.response_body
     assert @controller.performed?
   end
 
-  def test_nil_response_body_does_not_mark_the_response_performed
+  def test_nil_response_body_clears_the_body_without_performing
     @controller.response.response_body = nil
+    assert_equal "", @controller.body
     refute @controller.performed?
   end
 

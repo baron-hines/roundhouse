@@ -126,40 +126,69 @@ fn append_lowers_to_a_broadcasts_call_with_the_records_own_partial() {
     );
 }
 
-/// Rails GlobalID uses the STI record's concrete class name. The stored
-/// `type` value may be demodulized by Rails configuration, so derive the
-/// name from the runtime class rather than the database column.
+/// Rails mints an STI row's GlobalID with the row's own class. Rows
+/// hydrate base-classed here, so the base's `to_gid_param` reads the
+/// `type` column (as `dom_prefix` does): `Room.find` and `becomes!`
+/// then mint the same stream name.
 #[test]
-fn model_global_ids_use_the_concrete_runtime_class_name() {
+fn sti_global_ids_name_the_row_class_from_the_type_column() {
     let mut app = sti_room_app();
     assert!(
         roundhouse::analyze::diagnose(&app).is_empty(),
         "the synthesized GlobalID method must remain fully typed"
     );
-    app.global_id_locate_models
-        .insert(roundhouse::ident::Symbol::from("Room"));
+    app.global_id_locate_models.insert(roundhouse::ident::Symbol::from("Room"));
+    app.global_id_locate_signed_models.insert(roundhouse::ident::Symbol::from("Room"));
     let files = ruby::emit_library(&app)
         .into_iter()
         .chain(ruby::emit_lowered_models(&app))
         .collect::<Vec<_>>();
     let src = find(&files, "room.rb");
-    assert!(
-        src.contains("GlobalID.param(self.class.name, self.id)"),
-        "the base model must use the concrete class name, not the STI column:\n{src}"
-    );
+    let mint = src
+        .split("def to_gid_param")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  end").next())
+        .unwrap_or_else(|| panic!("no to_gid_param in room.rb:\n{src}"));
+    assert!(mint.contains("case @type"), "dispatch on the type column:\n{mint}");
+    assert!(mint.contains("when \"Rooms::Open\""), "{mint}");
+    assert!(mint.contains("\"Room\""), "unknown types keep the base name:\n{mint}");
+    assert!(!mint.contains("self.class"), "hydration is base-classed:\n{mint}");
 
     let files = roundhouse::project::spinel_base_files(&app, roundhouse::fixtures::real_blog())
         .expect("Spinel base files");
     let locator = files
         .iter()
         .find(|(path, _)| path.ends_with("global_id_locator.rb"))
-        .map(|(_, content)| content)
-        .expect("global_id_locator.rb")
-        .clone();
-    assert!(
-        locator.contains("return nil unless parts[1] == \"Room\" || parts[1] == \"Rooms::Open\""),
-        "a base-class lookup must accept its known STI subclass without resolving wire constants:\n{locator}"
-    );
+        .map(|(_, content)| content.clone())
+        .expect("global_id_locator.rb");
+    for entry in ["def self.locate_room(", "def self.locate_signed_room("] {
+        let body = locator
+            .split(entry)
+            .nth(1)
+            .and_then(|rest| rest.split("\n    end").next())
+            .unwrap_or_else(|| panic!("no {entry} in:\n{locator}"));
+        assert!(
+            body.contains("return nil unless parts[1] == \"Room\" || parts[1] == \"Rooms::Open\""),
+            "the closed set of names, nothing constantized from the wire:\n{body}"
+        );
+        assert!(
+            body.contains("return nil unless record.to_gid_param == GlobalID.param(parts[1], record.id)"),
+            "a subclass name must match the row it finds:\n{body}"
+        );
+    }
+}
+
+/// A model with no STI subclasses keeps the literal name and the plain
+/// finder.
+#[test]
+fn plain_models_keep_the_literal_global_id_name() {
+    let app = lowered_app();
+    let files = ruby::emit_library(&app)
+        .into_iter()
+        .chain(ruby::emit_lowered_models(&app))
+        .collect::<Vec<_>>();
+    let src = find(&files, "room.rb");
+    assert!(src.contains("GlobalID.param(\"Room\", self.id)"), "{src}");
 }
 
 /// The association is read ONCE. The stream name and the DOM target both

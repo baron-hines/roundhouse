@@ -438,8 +438,13 @@ pub enum Streamable {
 /// appears, and the call sites are not all ours to see — the app's test
 /// helpers are app code.
 ///
-/// The record's concrete class name comes from `self.class.name`, which
-/// matches Rails' GlobalID behavior even when STI stores demodulized names.
+/// The model NAME is a compile-time fact, baked as a literal — except
+/// on an STI base, whose rows belong to subclasses. Rails mints those
+/// with the row's own class (`gid://app/Rooms::Open/3`). Hydration here
+/// is base-classed, so the name dispatches on the `type` column, the
+/// same way `dom_prefix` does: a row loaded through `Room.find` and one
+/// recast by `becomes!` mint the same stream name, and a type naming
+/// no known subclass keeps the base's name.
 pub fn push_to_gid_param(
     methods: &mut Vec<crate::dialect::MethodDef>,
     model: &crate::dialect::Model,
@@ -451,32 +456,7 @@ pub fn push_to_gid_param(
     {
         return;
     }
-    let self_ref = || Expr::new(crate::span::Span::synthetic(), ExprNode::SelfRef);
-    let mut class_read = Expr::new(
-        crate::span::Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(self_ref()),
-            method: Symbol::from("class"),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    class_read.ty = Some(crate::ty::Ty::Class {
-        id: model.name.clone(),
-        args: vec![],
-    });
-    let mut model_name = Expr::new(
-        crate::span::Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(class_read),
-            method: Symbol::from("name"),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    model_name.ty = Some(crate::ty::Ty::Str);
+    let model_name = gid_model_name(model);
     // `self.id`, NOT `@id`: this method lands on every model INCLUDING
     // the abstract `ApplicationRecord`, and an ivar read there makes
     // the ancestor hold the `@id` slot — the union point that widens
@@ -532,6 +512,49 @@ pub fn push_to_gid_param(
         mutates_self: false,
         block_param: None,
     });
+}
+
+fn gid_model_name(model: &Model) -> Expr {
+    let str_lit = |value: &str| {
+        let mut e = Expr::new(
+            crate::span::Span::synthetic(),
+            ExprNode::Lit { value: Literal::Str { value: value.to_string() } },
+        );
+        e.ty = Some(crate::ty::Ty::Str);
+        e
+    };
+    let base = model.name.0.as_str();
+    if model.sti_subclass_names.is_empty() {
+        return str_lit(base);
+    }
+    let mut arms: Vec<crate::expr::Arm> = model
+        .sti_subclass_names
+        .iter()
+        .map(|sub| crate::expr::Arm {
+            pattern: crate::expr::Pattern::Lit {
+                value: Literal::Str { value: sub.0.as_str().to_string() },
+            },
+            guard: None,
+            body: str_lit(sub.0.as_str()),
+        })
+        .collect();
+    arms.push(crate::expr::Arm {
+        pattern: crate::expr::Pattern::Wildcard,
+        guard: None,
+        body: str_lit(base),
+    });
+    let mut case = Expr::new(
+        crate::span::Span::synthetic(),
+        ExprNode::Case {
+            scrutinee: Expr::new(
+                crate::span::Span::synthetic(),
+                ExprNode::Ivar { name: Symbol::from("type") },
+            ),
+            arms,
+        },
+    );
+    case.ty = Some(crate::ty::Ty::Str);
+    case
 }
 
 /// Ask the record for its GlobalID parameter. Besides matching Rails'

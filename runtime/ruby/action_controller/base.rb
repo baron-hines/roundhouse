@@ -546,12 +546,16 @@ module ActionController
       self
     end
 
+    # Rails' `self.response_body =` (campfire's MessagesController and
+    # CachedResponses serve a prebuilt page this way). A body is a
+    # response, so the before_action halting check sees it; nil clears
+    # it, as in Rails, and `body` stays the String it always is.
     def response_body
       @body
     end
 
     def response_body=(value)
-      @body = value
+      @body = value.to_s
       @performed = !value.nil?
       @body
     end
