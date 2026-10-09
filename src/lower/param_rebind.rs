@@ -320,6 +320,13 @@ fn rewrite(
             if let Some(b) = block_param.as_ref() {
                 inner.remove(b);
             }
+            // Defaults read the enclosing method's (rebound) parameters
+            // too, unless one of the lambda's own parameters shadows them.
+            for p in extra_params.iter_mut() {
+                if let Some(d) = p.default.as_mut() {
+                    rewrite(d, params, &mut inner.clone(), used);
+                }
+            }
             rewrite(body, params, &mut inner, used);
         }
         ExprNode::Var { name, .. } => {
