@@ -668,11 +668,20 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
         } else {
             Vec::new()
         };
-        let scopes = crate::lower::rich_text::preload_scopes(model)
-            .into_iter()
-            .chain(plain_scopes)
-            .chain(crate::lower::attached::preload_scopes(model));
-        for (n, assoc) in scopes {
+        let rich = crate::lower::rich_text::preload_scopes(model).into_iter().map(|(n, assoc)| {
+            let spec = match crate::lower::rich_text::preload_scope_nested(&n) {
+                Some(nested) => format!("{{ {}: :{} }}", assoc.as_str(), nested.as_str()),
+                None => format!(":{}", assoc.as_str()),
+            };
+            (n, spec)
+        });
+        let scopes = rich.chain(
+            plain_scopes
+                .into_iter()
+                .chain(crate::lower::attached::preload_scopes(model))
+                .map(|(n, assoc)| (n, format!(":{}", assoc.as_str()))),
+        );
+        for (n, spec) in scopes {
             let n = n.as_str().to_string();
             // A declared scope of the same name wins — it has a real
             // body, and shadowing it would drop a filter.
@@ -680,7 +689,7 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
             if by_name.contains_key(&n) || RELATION_BUILTINS.contains(&n.as_str()) {
                 continue;
             }
-            preloads.insert(n, assoc.as_str().to_string());
+            preloads.insert(n, spec);
         }
     }
     // Class methods some call site reaches THROUGH a relation, which
@@ -737,11 +746,11 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
             }
         }
     }
-    for (name, assoc) in &preloads {
+    for (name, spec) in &preloads {
         body.push_str("\n    # Preload scope (Rails' `includes`): the association it names\n");
         body.push_str("    # joins this relation's preload specs, batched at `to_a`.\n");
         writeln!(body, "    def {name}").unwrap();
-        writeln!(body, "      preload(:{assoc})\n    end").unwrap();
+        writeln!(body, "      preload({spec})\n    end").unwrap();
     }
     let mut s = String::from(
         "# Generated Relation scope delegation (see\n\
@@ -1270,8 +1279,10 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     let names = crate::lower::scope_chain::all_scope_names(&scopes);
     let user_returns = crate::lower::scope_chain::build_user_method_returns(&app.models);
     let unique_keys = crate::lower::scope_chain::build_unique_keys(&app.models, &app.schema);
+    let materializing = crate::lower::scope_chain::build_materializing_scopes(&app.models);
     let regs = crate::lower::scope_chain::Registries {
         scopes: &scopes,
+        materializing: &materializing,
         models: &models,
         assocs: &assocs,
         assoc_class_methods: &assoc_class_methods,
@@ -7829,10 +7840,10 @@ enum PreloadKind {
     /// (`lower::attached::variations_ruby_source`), the proxy's fourth
     /// constructor argument.
     Attached { attr: String, owner: String, variations: String },
-    /// `has_many_attached :<attr>`: install an `AttachedMany` proxy per
-    /// record. Rows are still loaded on ask (`AttachedMany#attachments`);
-    /// the batch here is the memoized proxy, matching One's "one proxy
-    /// per record" contract.
+    /// `has_many_attached :<attr>`: one join over the attachment and blob
+    /// tables for the whole record set, installing a proxy per record
+    /// that answers its rows (`AttachedMany#_preload_rows`) without
+    /// asking again.
     AttachedMany { attr: String, owner: String },
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
@@ -8192,8 +8203,27 @@ end
                     src,
                     r#"
 def self._preload_batch_{name}(records)
+  ids = []
   records.each do |r|
-    r._preload_{name}(ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}"))
+    ids << r.id
+  end
+  rows_by = {{}}
+  if ids.length > 0
+    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.escape_int_list(ids) + ") ORDER BY a.id").each do |row|
+      rid = row["record_id"].to_i
+      list = rows_by[rid]
+      if list.nil?
+        list = []
+        rows_by[rid] = list
+      end
+      list.push(ActiveStorage::ManyAttachment.new(row["attachment_id"].to_i, ActiveStorage::Blob.from_row(row)))
+    end
+  end
+  records.each do |r|
+    many = ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}")
+    found = rows_by[r.id]
+    many._preload_rows(found.nil? ? [] : found)
+    r._preload_{name}(many)
   end
   []
 end

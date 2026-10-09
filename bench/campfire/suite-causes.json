@@ -41,12 +41,21 @@
   ],
   "causes": [
     {
+      "slug": "deferred-preload-timing",
+      "title": "A relation's `includes` run when a record first reads one, not at load — `assert_no_queries` after `to_a` sees the preload",
+      "owner": "compiler",
+      "match": "expected 0 queries, got \\d+",
+      "match_test": "MessageTest#test_presentation_associations_load_together",
+      "note": "`Message.where(...).with_presentation.to_a`, then `assert_no_queries { … every presentation association … }`. Rails runs the preloads inside `to_a`; the ruby family defers them (`ActiveRecord::PendingPreload`, `lower::deferred_preload`, de8edb3) until the first association read on any record of the group, so the same nine batched queries — creators, avatars, rich texts, their embeds, attachments, boosts, boosters, their avatars, rooms — land inside the block. Nothing is N+1 and nothing is missing; the queries are counted in the wrong window. Closing it means running a loaded relation's includes eagerly again, which is a choice about the deferral (it was made for pages that serve a cached collection), not a missing feature."
+    },
+    {
       "slug": "presentation-preload-introspection",
       "title": "`ActionText::RichText#embeds` and `record.association(:name).loaded?` — the presentation-preload tests read Rails' association internals",
       "owner": "compiler",
-      "match": "undefined method '(embeds' for an instance of ActionText::RichText|association' for an instance of Message)",
+      "match": "undefined method '(embeds' for an instance of ActionText::RichText|association' for an instance of Message|first_n' for an instance of Message::Pagination::Page)",
       "match_test": "MessageTest#test_presentation_",
-      "note": "campfire 2393f01 (2026-10-05) added two `MessageTest` cases for `Message.with_presentation` and `Message::Pagination::Page#preload_associations`: one walks `message.body.embeds` under `assert_no_queries`, the other asserts `message.association(:rich_text_body).loaded?` before and after a page preloads only the rendered rows. The runtime's `ActionText::RichText` has no `embeds` (the rich text's attached blobs), and a hydrated record has no association-proxy object to ask `loaded?` — associations are readers that hydrate, so there is no per-association loaded state to report. The app path itself emits with zero errors; only these two introspection tests are unpassed. Arrived with the CAMPFIRE_SHA bump 90b3300 -> 2393f01."
+      "note": "campfire 2393f01 (2026-10-05) added two `MessageTest` cases for `Message.with_presentation` and `Message::Pagination::Page#preload_associations`: one walks `message.body.embeds` under `assert_no_queries`, the other asserts `message.association(:rich_text_body).loaded?` before and after a page preloads only the rendered rows. Served 2026-10-09: the synthesized `ActionText::RichText` declares `has_many_attached :embeds` and fills it after save from the blobs its body's attachment nodes name (Rails' `before_save`, run after the insert because an attachment row needs the id); `with_rich_text_<attr>_and_embeds` preloads `{ rich_text_<attr>: :embeds_attachments }`, and a has_many-attached batch installs the rows it found so `embeds.each` asks nothing. `association(:name).loaded?` types and lowers onto the flat `<name>_loaded?` flag (has_many, and the rich text's `rich_text_<attr>_loaded?`). The Page scopes (`last_page` through `last_page_of`, `first_page`'s `Page.load`) are no longer taken for relations, so `page.first(2)` stays `Array#first`. The second test is green; the first one's remaining failure is `deferred-preload-timing`.",
+      "at_zero": "served 2026-10-09 (`test_presentation_pages_preload_only_the_rendered_messages` green; `…associations_load_together` now fails only on `deferred-preload-timing`); the rule stays as a regression tripwire."
     },
     {
       "slug": "turbo-signed-stream-name",

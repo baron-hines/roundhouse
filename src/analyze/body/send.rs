@@ -696,6 +696,64 @@ impl<'a> BodyTyper<'a> {
         found.then_some(Ty::Bool)
     }
 
+    /// `owner.association(:name)` — Rails' reflection handle on one
+    /// association. Typed only for an association with a load-once flag
+    /// (`<name>_loaded?`: a has_many, or Action Text's `rich_text_<attr>`)
+    /// and only as the class whose one method is `loaded?`, because that
+    /// is the one question `lower::assoc_loaded` can answer (it rewrites
+    /// `association(:name).loaded?` onto `name_loaded?`). Anything else
+    /// asked of the handle stays an unresolved send. An untyped owner (a
+    /// test's block parameter) resolves by the unique class carrying the
+    /// predicate, as `assoc_loaded_ty` does for views — outside a model's
+    /// own methods only, matching the lowering.
+    pub(super) fn association_reflection_ty(
+        &self,
+        recv_ty: Option<&Ty>,
+        self_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[crate::expr::Expr],
+    ) -> Option<Ty> {
+        if method.as_str() != "association" || args.len() != 1 {
+            return None;
+        }
+        let ExprNode::Lit { value: crate::expr::Literal::Sym { value: name } } = &*args[0].node
+        else {
+            return None;
+        };
+        let flat = Symbol::from(format!("{}_loaded?", name.as_str()));
+        let has_flat = |id: &ClassId| -> bool {
+            let mut current = Some(id);
+            for _ in 0..32 {
+                let Some(cid) = current else { return false };
+                let Some(cls) = self.classes().get(cid) else { return false };
+                if cls.instance_methods.contains_key(&flat) {
+                    return true;
+                }
+                current = cls.parent.as_ref();
+            }
+            false
+        };
+        let handle = Ty::Class { id: ClassId(Symbol::from(ASSOCIATION_HANDLE)), args: vec![] };
+        match recv_ty {
+            Some(Ty::Class { id, .. }) => has_flat(id).then_some(handle),
+            // Not inside a model's own method: `lower::assoc_loaded`
+            // leaves an untyped receiver there unrewritten, and typing
+            // it here would quiet check over a NoMethodError.
+            Some(Ty::Untyped) | None
+                if !matches!(self_ty, Some(Ty::Class { id, .. })
+                    if self.classes().get(id).is_some_and(|c| c.table.is_some())) =>
+            {
+                let carriers = self
+                    .classes()
+                    .values()
+                    .filter(|cls| cls.instance_methods.contains_key(&flat))
+                    .count();
+                (carriers == 1).then_some(handle)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn normalize_trailing_kwargs(
         &self,
         recv_ty: Option<&Ty>,
@@ -3409,6 +3467,11 @@ pub(super) fn params_as_hash() -> Ty {
 
 /// The request-params value a nested read answers: a scalar, a hash or an array, whichever the request carried.
 pub(crate) const PARAM_VALUE: &str = "Roundhouse::ParamValue";
+
+/// The class `owner.association(:name)` types as — see
+/// `association_reflection_ty`. Registered in `registry::ar` with
+/// `loaded?` alone.
+pub(crate) const ASSOCIATION_HANDLE: &str = "ActiveRecord::Associations::Association";
 
 pub(crate) fn param_value_ty() -> Ty {
     Ty::Class { id: crate::ident::ClassId(Symbol::from(PARAM_VALUE)), args: vec![] }

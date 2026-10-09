@@ -579,6 +579,16 @@ impl Analyzer {
                     .entry(name)
                     .or_insert(Ty::Relation { of: model.name.clone() });
             }
+            // And the load-once predicate `push_owner_methods` writes
+            // beside the reader (`rich_text_body_loaded?`), so
+            // `association(:rich_text_body).loaded?` types under check.
+            if app.models.iter().any(crate::lower::rich_text::is_record_model) {
+                for (_span, attr) in crate::lower::rich_text::rich_text_attrs(model) {
+                    cls.instance_methods
+                        .entry(crate::lower::rich_text::loaded_predicate_name(&attr))
+                        .or_insert(Ty::Bool);
+                }
+            }
             if crate::lower::plain_text_attr::record_table_present(&app.schema) {
                 for name in crate::lower::plain_text_attr::preload_scope_names(model) {
                     cls.class_methods

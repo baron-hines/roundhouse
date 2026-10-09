@@ -28,6 +28,86 @@ use crate::ident::{ClassId, Symbol, VarId};
 /// threaded relation lands in the `__rel` slot (see `thread_rel`).
 pub type ScopeRegistry = HashMap<ClassId, HashMap<Symbol, Vec<Param>>>;
 
+/// Per model, the scopes and relation-taking class methods whose body
+/// answers something OTHER than a relation over the model: Rails
+/// returns a scope lambda's value as-is when it is not nil, and
+/// campfire's pagination scopes answer a `Page` (an Array) —
+/// `scope :first_page, -> { Page.load(ordered, :first, PAGE_SIZE) }`,
+/// `scope :last_page, -> { last_page_of(PAGE_SIZE) }` through a class
+/// method that does the same, `scope :page_before, ->(m) {
+/// before(m).last_page }` through a sibling. The call still threads the
+/// relation in (it is still a scope), but what comes back is not one,
+/// so a following `first(2)` is `Array#first`, not `first_n`.
+pub type MaterializingScopes = HashMap<ClassId, HashSet<Symbol>>;
+
+/// See [`MaterializingScopes`]. A body materializes when its tail is a
+/// relation terminal (the analyzer's own classification, `last(n)`), a
+/// call on a constant naming some OTHER class (`Page.load(…)`), or a
+/// call to a scope or class method of this model that materializes —
+/// to a fixpoint, so declaration order does not matter.
+pub fn build_materializing_scopes(models: &[Model]) -> MaterializingScopes {
+    let mut out: MaterializingScopes = HashMap::new();
+    for m in models {
+        let scope_names: HashSet<Symbol> = m.scopes().map(|s| s.name.clone()).collect();
+        let bodies: Vec<(&Symbol, &Expr)> = m
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                ModelBodyItem::Scope { scope, .. } => Some((&scope.name, &scope.body)),
+                ModelBodyItem::Method { method, .. }
+                    if method.receiver == crate::dialect::MethodReceiver::Class =>
+                {
+                    Some((&method.name, &method.body))
+                }
+                _ => None,
+            })
+            .collect();
+        let tail = |body: &Expr| -> Option<Expr> {
+            match &*body.node {
+                ExprNode::Seq { exprs } => exprs.last().cloned(),
+                ExprNode::Lambda { body, .. } => Some(body.clone()),
+                _ => Some(body.clone()),
+            }
+        };
+        let own = m.name.0.as_str().rsplit("::").next().unwrap_or("");
+        let mut set: HashSet<Symbol> = HashSet::new();
+        for (name, body) in &bodies {
+            let Some(t) = tail(body) else { continue };
+            let terminal = crate::analyze::body_is_relation_query(&t, &m.name, &scope_names)
+                && !matches!(
+                    crate::analyze::scope_return_seed(&t, &m.name, &scope_names),
+                    crate::ty::Ty::Relation { .. }
+                );
+            let foreign_const = matches!(&*t.node, ExprNode::Send { recv: Some(r), .. }
+                if matches!(&*r.node, ExprNode::Const { path }
+                    if path.last().is_some_and(|last| last.as_str() != own)));
+            if terminal || foreign_const {
+                set.insert((*name).clone());
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (name, body) in &bodies {
+                if set.contains(*name) {
+                    continue;
+                }
+                let Some(t) = tail(body) else { continue };
+                if matches!(&*t.node, ExprNode::Send { method, .. } if set.contains(method)) {
+                    set.insert((*name).clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !set.is_empty() {
+            out.insert(m.name.clone(), set);
+        }
+    }
+    out
+}
+
 /// Per-model UNIQUE key column sets — the conflict targets an
 /// `insert_all` has to skip on (see the inlining in [`rewrite`]).
 ///
@@ -2068,6 +2148,8 @@ fn is_relation_expr(e: &Expr, ctx: &Ctx, locals: &Locals) -> bool {
 /// the relation parameter), `None` at every other call site.
 pub struct Ctx<'a> {
     pub scopes: &'a ScopeRegistry,
+    /// See [`MaterializingScopes`].
+    pub materializing: &'a MaterializingScopes,
     pub models: &'a HashSet<ClassId>,
     pub assocs: &'a AssocRegistry,
     /// Class methods that take an association's relation as their
@@ -2111,6 +2193,9 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     fn scope_of(&self, model: &ClassId, method: &Symbol) -> bool {
         self.scopes.get(model).is_some_and(|s| s.contains_key(method))
+    }
+    fn materializes(&self, model: &ClassId, method: &Symbol) -> bool {
+        self.materializing.get(model).is_some_and(|s| s.contains(method))
     }
     /// The ONE model that declares `name` as a scope — `None` when no
     /// model does, and `None` when two or more do.
@@ -2158,6 +2243,7 @@ impl Ctx<'_> {
     fn at_callsite(&self) -> Ctx<'_> {
         Ctx {
             scopes: self.scopes,
+            materializing: self.materializing,
             models: self.models,
             assocs: self.assocs,
             unique_keys: self.unique_keys,
@@ -3128,7 +3214,12 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             crate::lower::relation_counted_terminal::rewrite_count_gt_when(expr, |rel| {
                 is_relation_expr(rel, ctx, locals)
             });
-            model
+            // A scope that answers a `Page` threads the relation in, and
+            // what comes back is not one.
+            match (&model, &*expr.node) {
+                (Some(m), ExprNode::Send { method, .. }) if ctx.materializes(m, method) => None,
+                _ => model,
+            }
         }
         _ => {
             // Any other node (If/BoolOp/Case/…): recurse children, keeping
@@ -3924,7 +4015,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             // which is the hazard `counted_terminal`'s own note names.
             if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
                 let names_a_scope = matches!(&*r.node, ExprNode::Send { method: rname, .. }
-                    if ctx.sole_scope_owner(rname).is_some());
+                    if ctx.sole_scope_owner(rname).is_some_and(|owner| !ctx.materializes(owner, rname)));
                 if names_a_scope {
                     *expr = put(span, Some(r), counted, args, block, parenthesized);
                     return None;
@@ -4015,8 +4106,10 @@ fn rewrite_relation_taking_body(
     // unguarded inline: this entry point takes registries, not the app,
     // so there is no schema here to read a conflict target from.
     let empty_unique = UniqueKeys::new();
+    let empty_materializing = MaterializingScopes::new();
     let ctx = Ctx {
         scopes,
+        materializing: &empty_materializing,
         models,
         assocs,
         unique_keys: &empty_unique,
@@ -4043,6 +4136,7 @@ pub fn rewrite_call_site(
 ) {
     let ctx = Ctx {
         scopes: regs.scopes,
+        materializing: regs.materializing,
         models: regs.models,
         assocs: regs.assocs,
         unique_keys: regs.unique_keys,
@@ -4062,6 +4156,7 @@ pub fn rewrite_call_site(
 /// one struct instead of every signature between here and the emitter.
 pub struct Registries<'a> {
     pub scopes: &'a ScopeRegistry,
+    pub materializing: &'a MaterializingScopes,
     pub models: &'a HashSet<ClassId>,
     pub assocs: &'a AssocRegistry,
     pub assoc_class_methods: &'a AssocClassMethods,
@@ -4279,6 +4374,11 @@ mod tests {
         EMPTY.get_or_init(AssocClassMethods::new)
     }
 
+    fn empty_materializing() -> &'static MaterializingScopes {
+        static EMPTY: std::sync::OnceLock<MaterializingScopes> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(MaterializingScopes::new)
+    }
+
     fn empty_unique_keys() -> &'static UniqueKeys {
         static EMPTY: std::sync::OnceLock<UniqueKeys> = std::sync::OnceLock::new();
         EMPTY.get_or_init(UniqueKeys::new)
@@ -4291,6 +4391,7 @@ mod tests {
     ) -> Registries<'a> {
         Registries {
             scopes,
+            materializing: empty_materializing(),
             models,
             assocs,
             assoc_class_methods: empty_assoc_cm(),
@@ -4306,6 +4407,7 @@ mod tests {
     ) -> Ctx<'a> {
         Ctx {
             scopes,
+            materializing: empty_materializing(),
             models,
             assocs,
             unique_keys: empty_unique_keys(),
@@ -4573,6 +4675,7 @@ mod tests {
     ) -> Ctx<'a> {
         Ctx {
             scopes,
+            materializing: empty_materializing(),
             models,
             assocs,
             unique_keys: empty_unique_keys(),

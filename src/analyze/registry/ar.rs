@@ -324,11 +324,31 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
                     elem: Box::new(class_ty(&many_row_id)),
                 },
             );
+            // `delegate_missing_to :attachments` — `each` is the
+            // Enumerable call the corpus makes (`embeds.each(&:filename)`).
+            many.instance_methods.insert(
+                Symbol::from("each"),
+                super::block_fn(
+                    &class_ty(&many_row_id),
+                    Ty::Array { elem: Box::new(class_ty(&many_row_id)) },
+                ),
+            );
             many.instance_methods.insert(Symbol::from("attach_blob"), Ty::Nil);
             many.instance_methods.insert(Symbol::from("attach"), Ty::Nil);
             many.instance_methods.insert(Symbol::from("purge"), Ty::Nil);
             many.instance_methods.insert(Symbol::from("destroy"), Ty::Nil);
             classes.insert(many_id, many);
+        }
+
+        // `owner.association(:name)` — answers `loaded?` and nothing
+        // else (`BodyTyper::association_reflection_ty`).
+        {
+            let mut handle = ClassInfo::default();
+            handle.instance_methods.insert(Symbol::from("loaded?"), Ty::Bool);
+            classes.insert(
+                ClassId(Symbol::from(crate::analyze::body::ASSOCIATION_HANDLE)),
+                handle,
+            );
         }
 
         let mut blob = ClassInfo::default();
