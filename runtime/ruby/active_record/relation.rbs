@@ -212,6 +212,8 @@ module ActiveRecord
     def minimum: (String | Symbol expr) -> untyped
     def maximum: (String | Symbol expr) -> untyped
     private def extreme: (String | Symbol expr, String function) -> untyped
+    private def grouped_extreme: (String column, String function) -> Hash[untyped, untyped]
+    private def boolean_group_column?: (String group) -> bool
     def group_count: () -> Hash[untyped, Integer]
     def empty?: () -> bool
     def any?: () -> bool

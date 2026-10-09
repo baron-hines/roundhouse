@@ -1347,9 +1347,8 @@ module ActiveRecord
     end
 
     # `minimum(:column)` / `maximum(:column)` — SQL extrema over the
-    # current relation. The subquery preserves the relation scope without
-    # loading records; its projection is replaced with the requested column
-    # so a caller's unrelated `select` cannot hide the aggregate input.
+    # current relation. The aggregate replaces the projection and ordering,
+    # while the relation's filters, grouping and pagination remain in place.
     def minimum(expr)
       extreme(expr, "MIN")
     end
@@ -1361,15 +1360,70 @@ module ActiveRecord
     def extreme(expr, function)
       column = expr.to_s.to_sym
       raise ArgumentError, "unknown aggregate column: #{expr}" unless @model.schema_columns.include?(column)
-      term = "active_record_extreme.#{column}"
+      return grouped_extreme(column.to_s, function) if @groups.length > 0
       scoped = spawn
-      scoped.select(column)
-      rows = ActiveRecord.adapter.select_rows(
-        "SELECT #{function}(#{term}) AS value FROM (#{scoped.to_sql}) AS active_record_extreme"
-      )
-      rows.length == 0 ? nil : rows[0]["value"]
+      projection = "#{function}(#{@table}.#{column}) AS value"
+      projection = "#{@select_sql}, #{projection}" if @havings.length > 0 && !@select_sql.nil?
+      scoped.select(projection)
+      scoped.reorder
+      rows = ActiveRecord.adapter.select_rows(scoped.to_sql)
+      return nil if rows.length == 0
+      value = rows[0]["value"]
+      @model.schema_boolean_columns.include?(column) ? ActiveSupport.cast_boolean(value) : value
     end
     private :extreme
+
+    # Grouped calculations return a key-to-extreme Hash, as Rails does.
+    # Aliasing each group expression keeps both scalar keys and composite
+    # Array keys stable even when a group expression is qualified.
+    def grouped_extreme(column, function)
+      names = []
+      boolean_groups = []
+      selects = []
+      @groups.each_with_index do |group, index|
+        name = "__rh_group_#{index}"
+        names << name
+        boolean_groups << boolean_group_column?(group)
+        selects << "#{group} AS #{name}"
+      end
+      selects << "#{function}(#{@table}.#{column}) AS value"
+      scoped = spawn
+      selects.unshift(@select_sql) if @havings.length > 0 && !@select_sql.nil?
+      scoped.select(selects.join(", "))
+      scoped.reorder
+      rows = ActiveRecord.adapter.select_rows(scoped.to_sql)
+      grouped = {}
+      rows.each do |row|
+        key_values = []
+        names.each_with_index do |name, index|
+          value = row[name]
+          key_values << (boolean_groups[index] ? ActiveSupport.cast_boolean(value) : value)
+        end
+        key = names.length == 1 ? key_values[0] : key_values
+        value = row["value"]
+        value = ActiveSupport.cast_boolean(value) if @model.schema_boolean_columns.include?(column.to_sym)
+        grouped[key] = value
+      end
+      grouped
+    end
+    private :grouped_extreme
+
+    # Group expressions are emitted as qualified model columns for Symbol
+    # inputs. Do not infer a type from a joined table's similarly named
+    # column or from an arbitrary SQL expression.
+    def boolean_group_column?(group)
+      expression = group.strip
+      prefix = "#{@table}."
+      column = if expression.start_with?(prefix)
+        expression[prefix.length..].to_sym
+      elsif expression.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
+        expression.to_sym
+      else
+        nil
+      end
+      !column.nil? && @model.schema_boolean_columns.include?(column)
+    end
+    private :boolean_group_column?
 
     # `group(:col).count` — Rails hands back a Hash of group-key =>
     # COUNT. The group_count lowering renames the grouped chain's

@@ -581,7 +581,7 @@ puts "macro runtime parity passed"
 fn emitted_positioning_runs_reorder_block_move_lock_and_rebalance() {
     let run = emit_and_run::real_blog()
         .write("app/models/concerns/positioning_concern.rb", POSITIONING_CONCERN)
-        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.boolean \"active\", default: true, null: false")
+        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
         .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active")
         .run_ruby(r#"
 article = Article.create!(title: "Positioning owner", body: "A sufficiently long article body")
@@ -591,16 +591,29 @@ items = 4.times.map { |index| make.call(article, index + 1) }
 siblings = ->(owner) { Comment.where(article_id: owner.id) }
 raise "initial sibling order" unless siblings.call(article).positioned.ids == items.map(&:id)
 raise "default score sequence: #{items.map(&:position_score).inspect}" unless items.map(&:position_score) == [1.0, 2.0, 3.0, 4.0]
+inactive = make.call(article, 5, false)
 projected = siblings.call(article).active.positioned.select(:id)
 raise "minimum ignored the relation scope/projection" unless projected.minimum(:position_score) == 1.0
 raise "maximum ignored the relation scope/projection" unless projected.maximum(:position_score) == 4.0
+raise "grouped minimum" unless siblings.call(article).group(:article_id).minimum(:position_score) == { article.id => 1.0 }
+raise "grouped maximum" unless siblings.call(article).group(:article_id).maximum(:position_score) == { article.id => 5.0 }
+raise "composite grouped minimum" unless siblings.call(article).group(:article_id, :commenter).minimum(:position_score) == { [article.id, "Position"] => 1.0 }
+raise "grouped having" unless siblings.call(article).group(:article_id).having("MIN(position_score) < 2").minimum(:position_score) == { article.id => 1.0 }
+raise "grouped boolean keys" unless siblings.call(article).group(:active).minimum(:position_score) == { true => 1.0, false => 5.0 }
+raise "composite boolean keys" unless siblings.call(article).group(:article_id, :active).minimum(:position_score) == { [article.id, true] => 1.0, [article.id, false] => 5.0 }
+raise "grouped extrema ignores ordering" unless siblings.call(article).order(:position_score).group(:article_id).minimum(:position_score) == { article.id => 1.0 }
+raise "nullable boolean group key" unless siblings.call(article).group(:featured).minimum(:position_score) == { nil => 1.0 }
+raise "boolean extrema" unless siblings.call(article).minimum(:active) == false && siblings.call(article).maximum(:active) == true
+having_alias = siblings.call(article).select("COUNT(*) AS n").group(:article_id).having("n > 1")
+raise "having select alias" unless having_alias.minimum(:position_score) == { article.id => 1.0 }
+raise "aggregate ignores order/limit" unless siblings.call(article).order(:position_score).limit(1).maximum(:position_score) == 5.0
+raise "aggregate offset should have no result" unless siblings.call(article).offset(1).minimum(:position_score).nil?
 raise "empty minimum should be nil" unless siblings.call(article).where(id: -1).minimum(:position_score).nil?
 begin
   siblings.call(article).minimum("position_score) FROM active_record_extreme; DROP TABLE comments; --")
   raise "aggregate accepted an SQL expression as a column"
 rescue ArgumentError
 end
-inactive = make.call(article, 5, false)
 foreign = make.call(other_article, 1)
 items[3].move_to_position(0)
 raise "move to first" unless siblings.call(article).active.positioned.ids == [items[3].id, items[0].id, items[1].id, items[2].id]

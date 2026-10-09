@@ -311,6 +311,10 @@ module ActiveRecord
       []
     end
 
+    def self.schema_boolean_columns
+      []
+    end
+
     def self.instantiate(_row)
       raise NotImplementedError, "#{name}.instantiate must be overridden"
     end

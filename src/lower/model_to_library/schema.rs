@@ -358,6 +358,9 @@ pub(super) fn push_schema_methods(
     push_schema_symbol_list(methods, owner, "schema_date_columns", table, |c| {
         matches!(c.col_type, crate::schema::ColumnType::Date)
     });
+    push_schema_symbol_list(methods, owner, "schema_boolean_columns", table, |c| {
+        matches!(c.col_type, crate::schema::ColumnType::Boolean)
+    });
 
     // def self.instantiate(row); instance = from_row(<Model>Row.from_raw(row)); instance.mark_persisted!; instance; end
     //
