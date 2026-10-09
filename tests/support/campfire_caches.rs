@@ -388,15 +388,6 @@ pub const RECORD_SNAPSHOT: Contract = Contract {
     rescue ArgumentError
       true
     end
-    identity = {}.compare_by_identity
-    identity["same".dup] = 1
-    identity["same".dup] = 2
-    rejected_identity = begin
-      store.write("identity", identity)
-      false
-    rescue ArgumentError
-      true
-    end
     cycle = []
     cycle << cycle
     rejected_cycle = begin
@@ -405,7 +396,7 @@ pub const RECORD_SNAPSHOT: Contract = Contract {
     rescue ArgumentError
       true
     end
-    [ store.read("default")["missing"], rejected_proc, rejected_identity, rejected_cycle ]
+    [ store.read("default")["missing"], rejected_proc, rejected_cycle ]
   end
 
   def self.key
@@ -436,7 +427,7 @@ puts RecordSnapshotProbe.key
         "[\"computed\", \"computed\", \"filed\", true, true]\n",
         "true\n",
         "[{\"items\" => [\"cached\"]}, true]\n",
-        "[[\"fallback\"], true, true, true]\n",
+        "[[\"fallback\"], true, true]\n",
         "record-snapshot-v1/db/ns/3/session/abc\n",
     ),
 };
@@ -501,6 +492,24 @@ pub fn qr_code_overlay() -> Overlay {
         .write(
             "app/controllers/qr_codes_controller.rb",
             r#"class QrCodesController < ApplicationController
+  module RQRCodeCore
+    class QRCodeRunTimeError < RuntimeError
+    end
+  end
+
+  module RQRCode
+    class QRCode
+      def initialize(data)
+        raise RQRCodeCore::QRCodeRunTimeError if data.length > 100
+        @data = data
+      end
+
+      def as_svg(viewbox: false)
+        "<svg>#{@data}</svg>"
+      end
+    end
+  end
+
   def show
     svg = RQRCode::QRCode.new("https://example.com/" + ("x" * params[:size].to_i)).as_svg(viewbox: true)
     render plain: svg, content_type: "image/svg+xml"

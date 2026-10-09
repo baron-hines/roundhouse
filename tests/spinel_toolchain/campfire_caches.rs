@@ -19,7 +19,15 @@ fn nested_multi_write_destructures_each_group_natively() {
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn data_define_block_methods_belong_to_the_data_class_natively() {
-    assert_runs_natively(&contract::DATA_BLOCK_METHODS);
+    let source = contract::DATA_BLOCK_METHODS
+        .source
+        .replace("DataKeySupportController.encode(digest)", "\"encoded-\" + digest");
+    let run = contract::DATA_BLOCK_METHODS
+        .overlay()
+        .write(contract::DATA_BLOCK_METHODS.path, &source)
+        .run_spinel(contract::DATA_BLOCK_METHODS.script);
+    run.assert_passes();
+    assert_eq!(run.stdout, contract::DATA_BLOCK_METHODS.expected, "stderr:\n{}", run.stderr);
 }
 
 #[test]

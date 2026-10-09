@@ -137,6 +137,25 @@ fn record_snapshots_and_the_bounded_store_run() {
     assert_runs(&contract::RECORD_SNAPSHOT);
 }
 
+#[test]
+fn bounded_store_rejects_identity_hashes_without_retaining_aliases() {
+    let run = emit_and_run::real_blog().run_ruby(
+        r#"store = ActiveSupport::Cache::MemoryStore.new
+identity = {}.compare_by_identity
+identity["same".dup] = 1
+identity["same".dup] = 2
+begin
+  store.write("identity", identity)
+  puts "accepted"
+rescue ArgumentError
+  puts "rejected"
+end
+"#,
+    );
+    run.assert_passes();
+    assert_eq!(run.stdout, "rejected\n", "stderr:\n{}", run.stderr);
+}
+
 /// Rails' fragment caching through the controller, as campfire's
 /// `CachedResponses` overrides it: a view's `<% cache %>` is served only
 /// while `perform_caching`, under `combined_fragment_cache_key`, from
@@ -152,6 +171,12 @@ fn view_fragments_go_through_the_controllers_caching() {
             r#"require "test_helper"
 
 class FragmentsControllerTest < ActionDispatch::IntegrationTest
+  class NilParentController < ActionController::Base
+  end
+
+  class NilChildController < NilParentController
+  end
+
   setup do
     @article = Article.create!(title: "Original", body: "A sufficiently long article body.")
   end
@@ -169,6 +194,30 @@ class FragmentsControllerTest < ActionDispatch::IntegrationTest
     foreign_title("Changed")
     get "/fragments/#{@article.id}"
     assert_includes response.body, "Changed"
+  end
+
+  test "explicit nil cache settings override inherited values" do
+    NilParentController.perform_caching = nil
+    assert NilParentController.perform_caching.nil?
+    assert NilChildController.perform_caching.nil?
+    NilParentController.cache_store = nil
+    assert NilParentController.cache_store.nil?
+    assert NilChildController.cache_store.nil?
+  end
+
+  test "detached fragments do not use the shared cache" do
+    previous_store = ActionController::Base.cache_store
+    store = ActiveSupport::Cache::MemoryStore.new
+    ActionController::Base.cache_store = store
+    ActionController::Current.controller = nil
+    controller = ActionView::ViewHelpers.fragment_controller
+    name = ActiveSupport::Cache.expanded_key(controller.combined_fragment_cache_key("detached"))
+    assert ActionView::ViewHelpers.fragment_read("views/detached").nil?
+    assert_equal "body", ActionView::ViewHelpers.fragment_write("views/detached", "body", 0)
+    assert store.read(name).nil?
+  ensure
+    ActionController::Current.controller = nil
+    ActionController::Base.cache_store = previous_store
   end
 
   test "a cached fragment is served until the key moves" do

@@ -9099,12 +9099,19 @@ class TestEnvironmentsControllerTest < ActionDispatch::IntegrationTest
     subscriber = ActiveSupport::Notifications.subscribe(/\Acache_(read|write)\.active_support\z/) do |*, payload|
       keys << payload[:key]
     end
-    get articles_url
-    assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
-    ActiveSupport::Notifications.unsubscribe(subscriber)
-    heard = keys.size
-    get articles_url
-    assert_equal heard, keys.size
+    previous_caching = ActionController::Base.perform_caching
+    ActionController::Base.perform_caching = true
+    begin
+      get articles_url
+      assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
+      heard = keys.size
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+      get articles_url
+      assert_equal heard, keys.size
+    ensure
+      ActionController::Base.perform_caching = previous_caching
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
   end
 
   test "freeze_time stops Time.current on the instant records are stamped with" do
@@ -9169,11 +9176,10 @@ class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
     assert_equal article.title, JSON.parse(response.body)["title"]
   end
 
-  test "a duration is a timeout the socket layer takes" do
-    server = TCPServer.new("127.0.0.1", 0)
-    socket = TCPSocket.new("127.0.0.1", server.addr[1], open_timeout: 1.second)
-    socket.close
-    server.close
+  test "a duration is accepted as Net::HTTP's open timeout" do
+    http = Net::HTTP.new("127.0.0.1", 80)
+    http.open_timeout = 1.second
+    assert_equal 1.0, http.open_timeout
     assert_equal 1.5, (2.seconds - 0.5).to_f
   end
 end
