@@ -1596,8 +1596,23 @@ module Db
       Thread.current[:db_conn] = conn
       Thread.current[:db_txn_pin] = true
     else
-      write(conn, sql, false)
-      pin_transaction(conn)
+      # A COMMIT or ROLLBACK that itself raises (SQLite already aborted
+      # the transaction some other way) must not skip pin_transaction:
+      # without it the reservation this thread took at BEGIN leaks, and
+      # on pool_size 1 no other thread can ever lease again. A plain
+      # `begin/ensure` with no `rescue` clause is the one shape Spinel
+      # (matz/spinel#8182) runs the `ensure` for even when the exception
+      # propagates uncaught, so this needs no explicit duplicate the way
+      # `self.transaction`'s `rescue`-plus-`ensure` does. pin_transaction
+      # reads `conn.in_txn?` itself to decide whether to release — a
+      # raise that left the transaction genuinely open (not SQLite's
+      # doing) keeps the reservation, same as a successful write that
+      # hasn't reached COMMIT/ROLLBACK yet.
+      begin
+        write(conn, sql, false)
+      ensure
+        pin_transaction(conn)
+      end
     end
     # A value, not `nil`: spinel compiles a method ending in a bare nil
     # as void, and `Db.with_connection { Db.exec(...) }` assigns the

@@ -157,6 +157,33 @@ def pool1_pin_safety_case(name)
   check(name, title == "during" && other_count == 1,
         "title=" + title + " other_count=" + other_count.to_s)
 end
+
+# Pool size 1 only. `INSERT OR ROLLBACK` is SQLite's own conflict
+# resolution: a NOT NULL violation under it aborts (and rolls back) the
+# WHOLE transaction, not just the statement, and the statement itself
+# raises — the same failure shape a transaction-aborting constraint
+# violation gives `self.transaction`'s own COMMIT/ROLLBACK (finding 2).
+# Before this fix, `Db.exec`'s non-BEGIN branch called `pin_transaction`
+# only after a successful write, so this write's raise skipped it
+# entirely: the reservation this transaction took at BEGIN leaked, and
+# on pool_size 1 no later `with_connection` lease could ever complete
+# again — `t.join(5)` below would time out forever without it.
+def exec_releases_pin_when_a_write_aborts_the_transaction_case(name)
+  raised = nil
+  begin
+    Article.transaction do
+      Db.exec("INSERT OR ROLLBACK INTO articles (title, body, created_at, updated_at) VALUES ('x', 'y', NULL, NULL)")
+    end
+  rescue => e
+    raised = e
+  end
+  t = Thread.new { Db.with_connection { Article.create!(title: "after-abort", body: "long enough body") } }
+  joined = !t.join(5).nil?
+  after_count = Article.where(title: "after-abort").count
+  ok = !raised.nil? && joined && after_count == 1
+  detail = "raised=" + (raised.nil? ? "nil" : raised.class.to_s) + " joined=" + joined.to_s + " after_count=" + after_count.to_s
+  check(name, ok, detail)
+end
 "#;
 
 fn script(pool_size: usize) -> String {
@@ -164,7 +191,8 @@ fn script(pool_size: usize) -> String {
     // shard — it is the only size where a second thread's lease has
     // nowhere else to come from.
     let pool1_case = if pool_size == 1 {
-        "pool1_pin_safety_case(\"a concurrent lease cannot steal the open transaction's connection\")\n"
+        "pool1_pin_safety_case(\"a concurrent lease cannot steal the open transaction's connection\")\n\
+         exec_releases_pin_when_a_write_aborts_the_transaction_case(\"a write that aborts the transaction releases the pin\")\n"
     } else {
         ""
     };
@@ -190,7 +218,7 @@ fn assert_all_ok(pool_size: usize) {
     assert!(out.lines().any(|l| l == "done"), "driver did not finish\n{out}\n{}", run.stderr);
     let failed: Vec<&str> = out.lines().filter(|l| l.starts_with("FAIL")).collect();
     assert!(failed.is_empty(), "pool_size {pool_size}:\n{}\n=== stdout ===\n{out}", failed.join("\n"));
-    let expected = if pool_size == 1 { 9 } else { 8 };
+    let expected = if pool_size == 1 { 10 } else { 8 };
     assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), expected, "{out}");
 }
 
