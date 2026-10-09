@@ -9,6 +9,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -20,12 +21,10 @@ reuse = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reuse)
 
 
-def bundle(receipt, reports=None):
+def bundle(receipt):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("receipt.json", json.dumps(receipt))
-        for name, data in (reports or {}).items():
-            archive.writestr(name, data)
     return buffer.getvalue()
 
 
@@ -48,7 +47,6 @@ class EvidenceTests(unittest.TestCase):
             attempt=1,
             executed=True,
             outcomes=["success", "success"],
-            reports={},
         )
         self.run = {
             "id": 400,
@@ -103,7 +101,7 @@ class EvidenceTests(unittest.TestCase):
         for conclusion in ("failure", "cancelled", "success", None):
             with self.subTest(conclusion=conclusion):
                 self.run["conclusion"] = conclusion
-                self.assertEqual(self.find(), (self.job["html_url"], {}))
+                self.assertEqual(self.find(), self.job["html_url"])
                 self.assertIn("actions/runs/400/attempts/1/jobs", self.paths)
 
     def test_rejects_different_pr_repo_branch_workflow_and_inputs(self):
@@ -216,43 +214,26 @@ class EvidenceTests(unittest.TestCase):
         ):
             list(api.pages("jobs", "jobs"))
 
-    def test_zip_paths_duplicates_missing_reports_and_symlinks_are_rejected(self):
+    def test_zip_paths_duplicates_unexpected_files_and_symlinks_are_rejected(self):
         for extra in ("../receipt.json", "/tmp/receipt.json", "run.sh", "receipt.json"):
             with self.subTest(extra=extra):
-                data = bundle(self.receipt, {extra: b"untrusted"})
+                buffer = io.BytesIO()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    with zipfile.ZipFile(buffer, "w") as archive:
+                        archive.writestr("receipt.json", json.dumps(self.receipt))
+                        archive.writestr(extra, b"untrusted")
                 with self.assertRaises(ValueError):
-                    reuse.read_bundle(data, "store-check")
+                    reuse.read_bundle(buffer.getvalue())
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
             link = zipfile.ZipInfo("receipt.json")
             link.external_attr = 0o120777 << 16
             archive.writestr(link, "target")
         with self.assertRaises(ValueError):
-            reuse.read_bundle(buffer.getvalue(), "store-check")
-
-    def test_reports_are_restored_as_data_and_checked_against_the_receipt(self):
-        reports = {
-            "check-report.txt": b"honest check report",
-            "check-inventory.json": b'{"schema":1}',
-        }
-        receipt = dict(
-            self.receipt,
-            reports={
-                name: reuse.hashlib.sha256(data).hexdigest()
-                for name, data in reports.items()
-            },
-        )
-        store_check = dict(reuse.JOBS["store-check"], reports=list(reports))
-        with patch.dict(reuse.JOBS, {"store-check": store_check}):
-            self.assertEqual(
-                reuse.read_bundle(bundle(receipt, reports), "store-check"),
-                (receipt, reports),
-            )
-            reports["check-report.txt"] = b"different report"
-            with self.assertRaises(ValueError):
-                reuse.read_bundle(bundle(receipt, reports), "store-check")
+            reuse.read_bundle(buffer.getvalue())
         with patch.object(reuse, "MAX_BUNDLE", 10), self.assertRaises(ValueError):
-            reuse.read_bundle(bundle(self.receipt), "store-check")
+            reuse.read_bundle(bundle(self.receipt))
 
 
 class InputTests(unittest.TestCase):
@@ -486,14 +467,8 @@ class InputTests(unittest.TestCase):
             "GITHUB_STEP_SUMMARY": str(self.root / "summary"),
         }
 
-    def test_probe_hit_restores_configured_reports_without_minting_execution_evidence(self):
-        reports = {
-            "check-report.txt": b"validated check",
-            "check-inventory.json": b"{}",
-        }
-        store_check = dict(reuse.JOBS["store-check"], reports=list(reports))
+    def test_probe_hit_does_not_mint_execution_evidence(self):
         with (
-            patch.dict(reuse.JOBS, {"store-check": store_check}),
             patch.dict(os.environ, self.pr_env(), clear=True),
             patch.object(reuse, "GitHub") as api,
             patch.object(
@@ -504,14 +479,12 @@ class InputTests(unittest.TestCase):
             patch.object(
                 reuse,
                 "find_execution",
-                return_value=("https://github.com/original/job/42", reports),
+                return_value="https://github.com/original/job/42",
             ),
         ):
             api.return_value.get.return_value = {"workflow_id": 17}
             reuse.probe("store-check", self.root / "source")
             self.assertIn("hit=true\n", (self.root / "outputs").read_text())
-            for name, data in reports.items():
-                self.assertEqual(Path(name).read_bytes(), data)
             self.assertFalse(
                 (reuse.state_dir("store-check") / "bundle").exists()
             )
@@ -853,8 +826,6 @@ class InputTests(unittest.TestCase):
                 reuse.record(job, outcomes)
             self.assertFalse((root / "bundle").exists())
             environment.return_value = {"rustc": "before"}
-            for report in reuse.JOBS[job]["reports"]:
-                Path(report).write_text("actual successful report")
             reuse.record(job, outcomes)
             self.assertTrue((root / "bundle/receipt.json").is_file())
 
