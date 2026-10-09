@@ -872,7 +872,11 @@ fn every_runtime_method_body_concretely_typed() {
     // contract intentionally keeps raw SQL result values `untyped`;
     // coercing them would break Rails' column-dependent return type. The
     // merged tree measures 323 after the transaction-runtime change above.
-    const CEILING: usize = 323;
+    // Schema-driven extrema deserialization adds 9 measured gradual sites
+    // in Relation: aggregate values and group keys cross the raw SQL boundary
+    // as column-dependent Boolean/Date/Time values. The concrete method-body
+    // gate still requires every call and body to resolve.
+    const CEILING: usize = 332;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

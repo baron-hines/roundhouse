@@ -1362,14 +1362,14 @@ module ActiveRecord
       raise ArgumentError, "unknown aggregate column: #{expr}" unless @model.schema_columns.include?(column)
       return grouped_extreme(column.to_s, function) if @groups.length > 0
       scoped = spawn
-      projection = "#{function}(#{@table}.#{column}) AS value"
+      projection = "#{function}(#{@table}.#{ActiveRecord.adapter.quote_column_name(column)}) AS value"
       projection = "#{@select_sql}, #{projection}" if @havings.length > 0 && !@select_sql.nil?
       scoped.select(projection)
       scoped.reorder
       rows = ActiveRecord.adapter.select_rows(scoped.to_sql)
       return nil if rows.length == 0
       value = rows[0]["value"]
-      @model.schema_boolean_columns.include?(column) ? ActiveSupport.cast_boolean(value) : value
+      cast_schema_value(value, column)
     end
     private :extreme
 
@@ -1378,15 +1378,13 @@ module ActiveRecord
     # Array keys stable even when a group expression is qualified.
     def grouped_extreme(column, function)
       names = []
-      boolean_groups = []
       selects = []
       @groups.each_with_index do |group, index|
         name = "__rh_group_#{index}"
         names << name
-        boolean_groups << boolean_group_column?(group)
         selects << "#{group} AS #{name}"
       end
-      selects << "#{function}(#{@table}.#{column}) AS value"
+      selects << "#{function}(#{@table}.#{ActiveRecord.adapter.quote_column_name(column)}) AS value"
       scoped = spawn
       selects.unshift(@select_sql) if @havings.length > 0 && !@select_sql.nil?
       scoped.select(selects.join(", "))
@@ -1397,33 +1395,51 @@ module ActiveRecord
         key_values = []
         names.each_with_index do |name, index|
           value = row[name]
-          key_values << (boolean_groups[index] ? ActiveSupport.cast_boolean(value) : value)
+          group = @groups[index]
+          group_column = schema_group_column(group)
+          key_values << (group_column.nil? ? value : cast_schema_value(value, group_column))
         end
         key = names.length == 1 ? key_values[0] : key_values
-        value = row["value"]
-        value = ActiveSupport.cast_boolean(value) if @model.schema_boolean_columns.include?(column.to_sym)
-        grouped[key] = value
+        grouped[key] = cast_schema_value(row["value"], column.to_sym)
       end
       grouped
     end
     private :grouped_extreme
 
-    # Group expressions are emitted as qualified model columns for Symbol
-    # inputs. Do not infer a type from a joined table's similarly named
-    # column or from an arbitrary SQL expression.
-    def boolean_group_column?(group)
+    # Recover a model-column group key only from a bare or explicitly
+    # model-qualified identifier. Arbitrary SQL and joined-table columns
+    # remain untyped rather than borrowing a coincidentally named schema field.
+    def schema_group_column(group)
       expression = group.strip
-      prefix = "#{@table}."
-      column = if expression.start_with?(prefix)
-        expression[prefix.length..].to_sym
-      elsif expression.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
-        expression.to_sym
-      else
-        nil
+      table_name = @model.table_name.to_s
+      quoted_table = "\"#{table_name.gsub("\"", "\"\"")}\""
+      prefixes = ["#{@table}.", "#{table_name}.", "#{quoted_table}."]
+      column = nil
+      prefixes.each do |prefix|
+        if expression.start_with?(prefix)
+          column = expression[prefix.length..]
+          break
+        end
       end
-      !column.nil? && @model.schema_boolean_columns.include?(column)
+      column = expression if column.nil?
+      if column.start_with?("\"") && column.end_with?("\"")
+        column = column[1...-1].gsub("\"\"", "\"")
+      end
+      return nil unless column.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
+      candidate = column.to_sym
+      @model.schema_columns.include?(candidate) ? candidate : nil
     end
-    private :boolean_group_column?
+    private :schema_group_column
+
+    # Raw aggregate rows need the same schema-selected conversions as
+    # hydrated model fields; otherwise SQLite returns temporal values as text.
+    def cast_schema_value(value, column)
+      return ActiveSupport.cast_boolean(value) if @model.schema_boolean_columns.include?(column)
+      return ActiveSupport.parse_db_time(value) if @model.schema_time_columns.include?(column)
+      return ActiveSupport.parse_db_date(value) if @model.schema_date_columns.include?(column)
+      value
+    end
+    private :cast_schema_value
 
     # `group(:col).count` — Rails hands back a Hash of group-key =>
     # COUNT. The group_count lowering renames the grouped chain's

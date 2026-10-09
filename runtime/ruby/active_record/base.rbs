@@ -40,6 +40,8 @@ module ActiveRecord
     def changes: () -> Integer
     %a{abstract}
     def escape_value: (untyped value) -> String
+    %a{abstract}
+    def quote_column_name: (String | Symbol name) -> String
   end
 
   # The global adapter slot. Set once during boot; read everywhere

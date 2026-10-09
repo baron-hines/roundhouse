@@ -581,7 +581,7 @@ puts "macro runtime parity passed"
 fn emitted_positioning_runs_reorder_block_move_lock_and_rebalance() {
     let run = emit_and_run::real_blog()
         .write("app/models/concerns/positioning_concern.rb", POSITIONING_CONCERN)
-        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
+        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.integer \"order\"\n    t.date \"archived_on\"\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
         .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active")
         .run_ruby(r#"
 article = Article.create!(title: "Positioning owner", body: "A sufficiently long article body")
@@ -604,6 +604,17 @@ raise "composite boolean keys" unless siblings.call(article).group(:article_id, 
 raise "grouped extrema ignores ordering" unless siblings.call(article).order(:position_score).group(:article_id).minimum(:position_score) == { article.id => 1.0 }
 raise "nullable boolean group key" unless siblings.call(article).group(:featured).minimum(:position_score) == { nil => 1.0 }
 raise "boolean extrema" unless siblings.call(article).minimum(:active) == false && siblings.call(article).maximum(:active) == true
+items[0].update!(order: 7)
+items[1].update!(order: 2)
+raise "reserved aggregate column" unless siblings.call(article).minimum(:order) == 2 && siblings.call(article).maximum(:order) == 7
+items[0].update!(archived_on: Date.iso8601("2024-03-04"))
+items[1].update!(archived_on: Date.iso8601("2024-03-02"))
+raise "date extrema type/value" unless siblings.call(article).minimum(:archived_on).iso8601 == "2024-03-02"
+date_keys = siblings.call(article).group(:archived_on).minimum(:position_score).keys
+raise "grouped date key type: #{date_keys.map { |key| [key, key.class] }.inspect}" unless date_keys.all? { |key| key.nil? || key.is_a?(Date) }
+raise "time extrema type" unless siblings.call(article).minimum(:created_at).is_a?(Time)
+raise "grouped time key type" unless siblings.call(article).group(:created_at).minimum(:position_score).keys.all? { |key| key.is_a?(Time) }
+raise "quoted boolean group" unless siblings.call(article).group('"comments"."active"').minimum(:position_score) == { true => 1.0, false => 5.0 }
 having_alias = siblings.call(article).select("COUNT(*) AS n").group(:article_id).having("n > 1")
 raise "having select alias" unless having_alias.minimum(:position_score) == { article.id => 1.0 }
 raise "aggregate ignores order/limit" unless siblings.call(article).order(:position_score).limit(1).maximum(:position_score) == 5.0
