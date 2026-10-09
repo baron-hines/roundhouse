@@ -1062,6 +1062,32 @@ class DbPool
     nil
   end
 
+  # Claim connection index `idx` SPECIFICALLY, not "any free index" —
+  # `pin_transaction` always claims index 0, the same connection
+  # `current_conn`'s unleased fallback hands out, so a `with_connection`
+  # lease elsewhere cannot also check that connection out from under an
+  # open, unleased (bare) transaction. Waits, like `lease`, while
+  # another lease already holds it.
+  def reserve(idx)
+    @lock.synchronize do
+      claimed = false
+      while !claimed
+        i = 0
+        while i < @free.length
+          if @free[i] == idx
+            @free.delete_at(i)
+            claimed = true
+            i = @free.length
+          else
+            i += 1
+          end
+        end
+        @cv.wait(@lock) if !claimed
+      end
+    end
+    nil
+  end
+
   def conn(idx)
     @conns[idx]
   end
@@ -1567,11 +1593,24 @@ module Db
   # rolled the transaction back at the lease's end and the rest of the
   # block autocommitted. Pinned, `in_lease?` is true, so the executor and
   # `with_connection` reuse the connection instead of leasing.
+  #
+  # The pin ALSO claims a real lease on the pool (`DbPool#reserve`), not
+  # just the thread-local binding: `current_conn`'s unleased fallback is
+  # always `@pools[0].first` (index 0), the exact connection this pins,
+  # so without a real reservation a `with_connection` lease on another
+  # thread could check that same connection out from under this open,
+  # unleased transaction — with pool_size 1 there is nowhere else for it
+  # to come from. Its cleanup (`release_abandoned_write`) would then roll
+  # this thread's still-open transaction back out from under it.
   def self.pin_transaction(conn)
     if !conn.in_txn?
-      Thread.current[:db_conn] = nil if Thread.current[:db_txn_pin] == true
+      if Thread.current[:db_txn_pin] == true
+        Thread.current[:db_conn] = nil
+        @pools[0].release(0)
+      end
       Thread.current[:db_txn_pin] = false
     elsif !in_lease?
+      @pools[0].reserve(0)
       Thread.current[:db_conn] = conn
       Thread.current[:db_txn_pin] = true
     end

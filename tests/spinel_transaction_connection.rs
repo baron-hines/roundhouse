@@ -132,9 +132,42 @@ def rollback_failure_case(name)
   detail = (raised.nil? ? "nil" : raised.class.to_s + ":" + raised.message) + " title=" + title
   check(name, ok, detail)
 end
+
+# Pool size 1 only: `pin_transaction` used to bind the open bare
+# transaction's connection to this thread WITHOUT taking a real pool
+# lease on it. A second thread's `with_connection`, concurrent with
+# this still-open transaction, had nowhere else to come from on a
+# one-connection shard — it got the SAME connection, and its own
+# cleanup (`release_abandoned_write`) rolled this thread's open
+# transaction back out from under it. `sleep` gives the second thread a
+# window to run (and, pre-fix, to interfere) before this transaction
+# commits; it does not make the check itself timing-dependent — the
+# assertions are both threads' final, persisted writes.
+def pool1_pin_safety_case(name)
+  a = Article.create!(title: "before", body: "long enough body")
+  t = nil
+  Article.transaction do
+    a.update!(title: "during")
+    t = Thread.new { Db.with_connection { Article.create!(title: "other", body: "long enough body") } }
+    sleep 0.2
+  end
+  t.join
+  title = Article.find(a.id).title
+  other_count = Article.where(title: "other").count
+  check(name, title == "during" && other_count == 1,
+        "title=" + title + " other_count=" + other_count.to_s)
+end
 "#;
 
 fn script(pool_size: usize) -> String {
+    // `pool1_pin_safety_case` only means anything on a one-connection
+    // shard — it is the only size where a second thread's lease has
+    // nowhere else to come from.
+    let pool1_case = if pool_size == 1 {
+        "pool1_pin_safety_case(\"a concurrent lease cannot steal the open transaction's connection\")\n"
+    } else {
+        ""
+    };
     format!(
         "Db.configure(\"txn.sqlite3\", pool_size: {pool_size})\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\nDb.write_permit_timeout = 0.2\n{PROBE}\n\
          rollback_case(\"bare\", \"flat\")\n\
@@ -145,6 +178,7 @@ fn script(pool_size: usize) -> String {
          commit_case(\"nested and leased blocks commit with the outer one\")\n\
          return_case(\"a non-local return commits and restores depth\")\n\
          rollback_failure_case(\"a failed ROLLBACK does not hide the original exception\")\n\
+         {pool1_case}\
          puts \"done\"\n"
     )
 }
@@ -156,7 +190,8 @@ fn assert_all_ok(pool_size: usize) {
     assert!(out.lines().any(|l| l == "done"), "driver did not finish\n{out}\n{}", run.stderr);
     let failed: Vec<&str> = out.lines().filter(|l| l.starts_with("FAIL")).collect();
     assert!(failed.is_empty(), "pool_size {pool_size}:\n{}\n=== stdout ===\n{out}", failed.join("\n"));
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 8, "{out}");
+    let expected = if pool_size == 1 { 9 } else { 8 };
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), expected, "{out}");
 }
 
 #[test]
