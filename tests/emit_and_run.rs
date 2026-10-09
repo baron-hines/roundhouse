@@ -44,6 +44,8 @@ mod controller_response_body;
 mod render_to_string_partial_ivar;
 #[path = "emit_and_run/request_optional_port.rs"]
 mod request_optional_port;
+#[path = "emit_and_run/controller_super_ivars.rs"]
+mod controller_super_ivars;
 #[path = "emit_and_run/assoc_pluck_typed.rs"]
 mod assoc_pluck_typed;
 #[path = "emit_and_run/sti_global_id.rs"]
@@ -6072,6 +6074,15 @@ end
 
 #[path = "emit_and_run/concern_accessors.rs"]
 mod concern_accessors;
+
+#[path = "emit_and_run/action_not_found.rs"]
+mod action_not_found;
+
+#[path = "emit_and_run/finder_miss_readers.rs"]
+mod finder_miss_readers;
+
+#[path = "emit_and_run/finder_miss_messages.rs"]
+mod finder_miss_messages;
 
 /// A concern split in two, mixed into more than one controller: the
 /// inner module calls a method only its includers have (through the
