@@ -352,6 +352,20 @@ fn ingest_controller_body_item(
             });
         }
         super::forwarding::reject_entrypoint(&def, file, "controller method")?;
+        // `Action` records required, optional, keyword and keyword-rest
+        // parameters, and nothing for `*rest` or the positionals after
+        // it. Dropping them would emit `def pick` for `def pick(*keys)`
+        // while the call sites still pass arguments.
+        if def.parameters().is_some_and(|pn| {
+            pn.rest().is_some_and(|r| r.as_rest_parameter_node().is_some())
+                || pn.posts().iter().next().is_some()
+        }) {
+            return Err(IngestError::Unsupported {
+                file: file.to_string(),
+                message: "positional rest declaration on a controller method is not preserved yet"
+                    .to_string(),
+            });
+        }
         let action_name = constant_id_str(&def.name()).to_string();
         let body_expr = match def.body() {
             Some(b) => ingest_expr(&b, file)?,
