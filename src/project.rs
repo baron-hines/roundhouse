@@ -963,24 +963,33 @@ fn resolve_runtime_sig_conflicts(files: &mut [(String, String)]) -> Result<(), S
 /// call it are emitted, and the build fails later on an unknown name.
 /// Report each one per target until those emitters carry them.
 ///
+/// The gate is a denylist of targets that already emit plain library
+/// classes (fail-closed for new `BuildTarget`s), matching sibling
+/// `report_*` polarity. Roda is intentionally not on that list: its
+/// spike emit never walks `app.library_classes`, so a PORO would stay
+/// silently dropped under an allowlist of today's non-emitters.
+///
 /// Mixin modules are not reported: their bodies are spliced into the
 /// including models by the shared lowering. Synthesized classes
 /// (`origin` set) belong to the lowerer that made them. Classes whose
 /// ancestry reaches a framework base (`ApplicationJob < ActiveJob::Base`,
 /// `ApplicationMailer < ActionMailer::Base` and their subclasses) are
 /// not plain Ruby and are left to the job and mailer handling.
-fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
-    if !matches!(
+fn target_emits_app_library_classes(target: BuildTarget) -> bool {
+    matches!(
         target,
-        BuildTarget::Crystal
-            | BuildTarget::Elixir
-            | BuildTarget::Go
-            | BuildTarget::Kotlin
-            | BuildTarget::Python
-            | BuildTarget::Rust
-            | BuildTarget::Swift
-            | BuildTarget::CSharp
-    ) {
+        BuildTarget::Blog
+            | BuildTarget::Ruby
+            | BuildTarget::Jruby
+            | BuildTarget::Spinel
+            | BuildTarget::Typescript
+            | BuildTarget::TypescriptWorker
+        // Roda omitted: spike emit does not walk `app.library_classes`.
+    )
+}
+
+fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
+    if target_emits_app_library_classes(target) {
         return;
     }
     for lc in &app.library_classes {

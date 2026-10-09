@@ -4,6 +4,11 @@
 //! nothing: the test calling `Probe.run` was emitted against a class
 //! that was not, and the transpile reported zero errors. Each of those
 //! targets now reports the class as unsupported.
+//!
+//! The production gate denylists emitters that already carry plain
+//! library classes (fail-closed). This suite partitions
+//! `BuildTarget::TRANSPILE` against that contract so a new target
+//! cannot stay silent without updating the denylist.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -55,30 +60,41 @@ fn reported(app: &roundhouse::App, target: BuildTarget) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn a_plain_class_is_unsupported_on_the_targets_that_do_not_emit_it() {
-    let app = app();
-    for target in [
-        BuildTarget::Rust,
-        BuildTarget::Python,
-        BuildTarget::CSharp,
-        BuildTarget::Go,
-        BuildTarget::Kotlin,
-        BuildTarget::Swift,
-        BuildTarget::Crystal,
-        BuildTarget::Elixir,
-    ] {
-        let msgs = reported(&app, target);
-        assert_eq!(msgs.len(), 1, "{}: {msgs:?}", target.as_str());
-        assert!(msgs[0].contains("class `Probe`"), "{}", msgs[0]);
-        assert!(msgs[0].contains(&format!("({})", target.as_str())), "{}", msgs[0]);
-    }
+/// Mirrors `target_emits_app_library_classes` in `src/project.rs`.
+/// Keep in lockstep: the partition test fails if a TRANSPILE target is
+/// added without updating both sides.
+fn emits_plain_library_classes(target: BuildTarget) -> bool {
+    matches!(
+        target,
+        BuildTarget::Ruby
+            | BuildTarget::Jruby
+            | BuildTarget::Spinel
+            | BuildTarget::Typescript
+            | BuildTarget::TypescriptWorker
+        // Roda omitted — same as production: spike does not emit POROs.
+    )
 }
 
 #[test]
-fn the_targets_that_emit_a_plain_class_do_not_report_it() {
+fn plain_class_reporting_partitions_transpile_targets() {
     let app = app();
-    for target in [BuildTarget::Ruby, BuildTarget::Spinel, BuildTarget::Typescript] {
-        assert_eq!(reported(&app, target), Vec::<String>::new(), "{}", target.as_str());
+    for &target in BuildTarget::TRANSPILE {
+        let msgs = reported(&app, target);
+        if emits_plain_library_classes(target) {
+            assert_eq!(
+                msgs,
+                Vec::<String>::new(),
+                "{} should stay quiet: {msgs:?}",
+                target.as_str()
+            );
+        } else {
+            assert_eq!(msgs.len(), 1, "{}: {msgs:?}", target.as_str());
+            assert!(msgs[0].contains("class `Probe`"), "{}", msgs[0]);
+            assert!(
+                msgs[0].contains(&format!("({})", target.as_str())),
+                "{}",
+                msgs[0]
+            );
+        }
     }
 }
