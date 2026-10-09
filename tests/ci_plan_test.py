@@ -181,6 +181,13 @@ class Routing(unittest.TestCase):
             self.assertNotIn("campfire-latest", plan["required"])
         for paths in (["README.md"], ["src/analyze/call.rs"], ["src/emit/go.rs"]):
             self.assertNotIn("campfire-latest", ci.select(paths)["jobs"])
+        # A pull request never plans it, even under ci:full or with unknown
+        # inputs (both of which otherwise select it).
+        for plan in (
+            ci.select([], full=True, campfire_latest=False),
+            ci.select([], spinel_lane=True, campfire_latest=False),
+        ):
+            self.assertNotIn("campfire-latest", plan["jobs"])
         self.assertNotIn("campfire-latest", ci.BASE)
         self.assertNotIn("campfire-latest", ci.PUBLICATION)
 
@@ -275,6 +282,56 @@ class Routing(unittest.TestCase):
             self.assertNotIn("assemble-site", plan["jobs"])
             self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
 
+    def run_planner(self, event_body, env, changed):
+        with tempfile.TemporaryDirectory() as directory:
+            event = Path(directory) / "event.json"
+            event.write_text(json.dumps(event_body))
+            env = {
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_SHA": "1" * 40,
+                "CI_SPINEL_REVISION": "2" * 40,
+                **env,
+            }
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch("sys.argv", ["ci-plan.py", "plan"]),
+                patch.object(ci, "changed_inputs", **changed),
+                patch.object(ci.subprocess, "check_output", return_value="3" * 40 + "\n"),
+                patch.object(ci, "write_outputs") as output,
+            ):
+                self.assertEqual(ci.main(), 0)
+            return output.call_args.args[0]
+
+    def test_main_push_resolves_campfire_main_for_campfire_latest(self):
+        outputs = self.run_planner(
+            {"before": "0" * 40},
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"},
+            {"return_value": (["src/emit/go.rs"], None)},
+        )
+        self.assertIn("campfire-latest", outputs["plan"]["jobs"])
+        self.assertEqual(outputs["campfire-latest-revision"], "3" * 40)
+
+    def test_pull_requests_never_plan_campfire_latest(self):
+        pr = {"pull_request": {"number": 1, "labels": [{"name": "ci:full"}], "draft": False}}
+        for changed in (
+            {"return_value": (["README.md"], None)},
+            {"side_effect": ValueError("unknown inputs")},
+        ):
+            outputs = self.run_planner(
+                pr,
+                {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/1/merge"},
+                changed,
+            )
+            self.assertNotIn("campfire-latest", outputs["plan"]["jobs"])
+            self.assertEqual(outputs["campfire-latest-revision"], "")
+        unknown = self.run_planner(
+            {"pull_request": {"number": 1, "labels": [], "draft": False}},
+            {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/1/merge"},
+            {"side_effect": ValueError("unknown inputs")},
+        )
+        self.assertIn("campfire-conformance", unknown["plan"]["jobs"])
+        self.assertNotIn("campfire-latest", unknown["plan"]["jobs"])
+
     def test_full_input_on_main_still_selects_every_sdk(self):
         with tempfile.TemporaryDirectory() as directory:
             event = Path(directory) / "event.json"
@@ -320,7 +377,8 @@ class Routing(unittest.TestCase):
             ):
                 self.assertEqual(ci.main(), 0)
             plan = output.call_args.args[0]["plan"]
-            self.assertEqual(plan["jobs"], ci.SPINEL_LANE)
+            # A pull request: the Spinel lane without campfire-latest.
+            self.assertEqual(plan["jobs"], [j for j in ci.SPINEL_LANE if j != "campfire-latest"])
             self.assertEqual(plan["extra_compare"], [])
             self.assertFalse(plan["wasm"])
             self.assertTrue(

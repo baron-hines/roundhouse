@@ -133,8 +133,9 @@ SPINEL11 = [
 # Main-push / unknown-input Spinel suite (advisory). PR `ci:spinel` uses the
 # narrower CORE focus lane (built in focus_plan) and makes those jobs required.
 # campfire-latest runs where the advisory Spinel suite does (main push,
-# unknown inputs) and on Full: a same-day signal after every merge, never
-# in a PR's own plan.
+# unknown inputs) and on Full: a same-day signal after every merge. A pull
+# request never plans it, `ci:full` and unknown inputs included
+# (`select(campfire_latest=False)`): the PR's own diff cannot move it.
 SPINEL_LANE = [*BASE, *SPINEL11, "build-site", "archive-results", "campfire-latest"]
 # campfire-latest tracks basecamp/once-campfire main unpinned: it reports
 # how far main is from CAMPFIRE_SHA and never gates (see the workflow).
@@ -418,6 +419,7 @@ def select(
     focus_spinel=False,
     publish=False,
     project_scope=None,
+    campfire_latest=True,
 ):
     focus_extras = tuple(focus_extras or ())
     # Publication always requires full mode — reject before any narrow lane
@@ -430,7 +432,7 @@ def select(
         return focus_plan(focus_extras, focus_jruby, focus_spinel)
     if spinel_lane and not full:
         return finish(
-            SPINEL_LANE,
+            [j for j in SPINEL_LANE if campfire_latest or j != "campfire-latest"],
             [],
             [],
             False,
@@ -542,7 +544,8 @@ def select(
         wasm = site = spinel = writebook = True
         reasons.append("full validation requested")
         jobs_selected.update(SPINEL11)
-        jobs_selected.add("campfire-latest")
+        if campfire_latest:
+            jobs_selected.add("campfire-latest")
         spinel_tests.update(SPINEL_TESTS)
     if spinel:
         jobs_selected.add("spinel-build")
@@ -932,6 +935,7 @@ def main():
         focus_spinel=focus_spinel,
         publish=publish,
         project_scope=project_scope,
+        campfire_latest=not pr,
     )
     if reason:
         plan["reasons"].append(reason)

@@ -2006,9 +2006,15 @@ jobs:
             > /tmp/campfire-latest-strict.log 2>&1 || status=$?
           errors=$(grep -c 'error\[' /tmp/campfire-latest-strict.log || true)
           gaps=$(sed -n 's/.*Survey: \([0-9]*\) ingest gap.*/\1/p' /tmp/campfire-latest-strict.log | head -1)
+          # No survey line means no gap was recorded, but only a run that
+          # finished or stopped at counted errors proves that: a crash with
+          # neither is unknown, and the suite must not run on it.
+          if [ -z "$gaps" ]; then
+            if [ "$status" -ne 0 ] && [ "$errors" -eq 0 ]; then gaps=unknown; else gaps=0; fi
+          fi
           echo "errors=$errors" >> "$GITHUB_OUTPUT"
-          echo "gaps=${gaps:-0}" >> "$GITHUB_OUTPUT"
-          echo "campfire main strict emit: ${gaps:-0} ingest gap(s), $errors error(s), exit $status"
+          echo "gaps=$gaps" >> "$GITHUB_OUTPUT"
+          echo "campfire main strict emit: $gaps ingest gap(s), $errors error(s), exit $status"
           sed -n '/── Survey/,$p' /tmp/campfire-latest-strict.log
           grep 'error\[' /tmp/campfire-latest-strict.log || true
       - name: Run campfire's suite against the emit
@@ -2033,7 +2039,11 @@ jobs:
             total=$(awk -F'|' '{t += $4} END {print t+0}' /tmp/campfire-latest-tally.txt)
             suite="$tests of $total tests green (pinned floor: $floor)"
           else
-            suite="not run: the emit stops at ${GAPS:-?} ingest gap(s)"
+            if [ "${GAPS:-}" = "unknown" ]; then
+              suite="not run: the strict emit failed before a survey (see the step log)"
+            else
+              suite="not run: the emit stops at ${GAPS:-?} ingest gap(s)"
+            fi
           fi
           {
             echo "## Campfire main vs. the pin"
