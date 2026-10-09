@@ -2342,6 +2342,8 @@ fn synthesize_template_only_actions(app: &mut App) {
                 kw_params: Vec::new(),
                 kwrest_param: None,
                 block_param: None,
+                rest_param: None,
+                anonymous_formal: None,
                 name_span: crate::span::Span::synthetic(),
                 body: method.body,
                 renders: RenderTarget::Inferred,
@@ -2459,7 +2461,7 @@ fn splice_concerns_into_controllers(app: &mut App) {
         crate::ident::ClassId,
         HashMap<crate::ident::Symbol, crate::ident::ClassId>,
     > = HashMap::new();
-    let mut rest_spliced: std::collections::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+    let mut posts_spliced: std::collections::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
         std::collections::HashSet::new();
 
     for controller in &mut app.controllers {
@@ -2556,21 +2558,39 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 if let Some(consts) = module_constants.get(module) {
                     qualify_lexical_consts(&mut body, module, consts);
                 }
-                // `Action` has no positional-rest slot; the loop below
-                // would make `*rest` one required positional. Ledger it
-                // on the module's own def instead (see the end).
+                // `Action` keeps `*rest` in its own slot, between the
+                // optionals and the keywords; a required positional
+                // AFTER it has no slot, and the loop below would move it
+                // in front. Ledger that on the module's own def instead
+                // (see the end).
                 if method
                     .params
                     .iter()
-                    .any(|p| p.rest && !p.keyword && !p.from_kwrest && !p.forwarding)
+                    .skip_while(|p| !(p.rest && !p.keyword && !p.forwarding))
+                    .skip(1)
+                    .any(|p| !p.keyword && !p.rest && !p.forwarding && !p.from_kwrest && !p.from_keyword)
                 {
-                    rest_spliced.insert((module.clone(), method.name.clone()));
+                    posts_spliced.insert((module.clone(), method.name.clone()));
                 }
                 let mut params = Row::closed();
                 let mut opt_params = Vec::new();
                 let mut kw_params = Vec::new();
                 let mut kwrest_param = None;
+                let mut rest_param = None;
+                let mut anonymous_formal = None;
                 for p in &method.params {
+                    if p.forwarding {
+                        anonymous_formal = Some(crate::dialect::AnonymousFormal::Forwarding);
+                        continue;
+                    }
+                    if p.keyword && p.rest && p.name.as_str().is_empty() {
+                        anonymous_formal = Some(crate::dialect::AnonymousFormal::KeywordRest);
+                        continue;
+                    }
+                    if p.rest && !p.keyword {
+                        rest_param = Some(p.name.clone());
+                        continue;
+                    }
                     // A keyword stays a keyword: flattened to a
                     // positional it no longer parses when its name is
                     // reserved (`next: nil`) or when a required keyword
@@ -2608,6 +2628,8 @@ fn splice_concerns_into_controllers(app: &mut App) {
                         kw_params,
                         kwrest_param,
                         block_param: method.block_param.as_ref().map(|p| p.name.clone()),
+                        rest_param,
+                        anonymous_formal,
                         body,
                         renders: RenderTarget::Inferred,
                         effects: crate::effect::EffectSet::pure(),
@@ -2659,9 +2681,9 @@ fn splice_concerns_into_controllers(app: &mut App) {
         for m in &mut lc.methods {
             if m.unsupported_formals.is_none()
                 && matches!(m.receiver, MethodReceiver::Instance)
-                && rest_spliced.contains(&(lc.name.clone(), m.name.clone()))
+                && posts_spliced.contains(&(lc.name.clone(), m.name.clone()))
             {
-                m.unsupported_formals = Some(crate::dialect::UnsupportedFormal::ControllerRest);
+                m.unsupported_formals = Some(crate::dialect::UnsupportedFormal::ControllerPosts);
             }
         }
     }
@@ -6313,6 +6335,8 @@ fn synthesize_redirect_controller(
                     kw_params: Vec::new(),
                     kwrest_param: None,
                     block_param: None,
+                    rest_param: None,
+                    anonymous_formal: None,
                     name_span: Span::synthetic(),
                     body,
                     // The action IS the redirect, which is what the
