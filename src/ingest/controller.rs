@@ -797,7 +797,7 @@ impl LambdaFilterTarget {
 /// receiverless `Send` to that name carrying the block, itself a
 /// `Lambda`). The IR-level twin of `lambda_body_expr` above, one stage
 /// later and returning the body rather than re-ingesting it.
-fn ir_lambda_body(e: &Expr) -> Option<Expr> {
+pub(super) fn ir_lambda_body(e: &Expr) -> Option<Expr> {
     match &*e.node {
         ExprNode::Lambda { body, .. } => Some(body.clone()),
         ExprNode::Send { recv: None, method, args, block: Some(b), .. }
@@ -812,7 +812,7 @@ fn ir_lambda_body(e: &Expr) -> Option<Expr> {
     }
 }
 
-fn ir_symbol(e: &Expr) -> Option<Symbol> {
+pub(super) fn ir_symbol(e: &Expr) -> Option<Symbol> {
     match &*e.node {
         ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
         _ => None,

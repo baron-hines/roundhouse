@@ -3718,7 +3718,7 @@ fn expand_macro_filters(
 /// the ENCLOSING macro method in source, not the filter — inlining the
 /// body would change what they do).
 fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr::Expr> {
-    use crate::expr::{Expr, ExprNode};
+    use crate::expr::{Expr, ExprNode, Literal};
 
     let ExprNode::Send { recv: None, method, args, block: Some(blk), parenthesized } = &*stmt.node
     else {
@@ -3730,16 +3730,53 @@ fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr:
     let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = &*blk.node else {
         return None;
     };
-    // Only options may ride beside a block target. A positional arg that
-    // is neither a bare options Hash nor a `**`-splatted one is a shape
-    // `before_action`'s block form never takes.
+    // Only options may ride beside a block target, and only options
+    // `lambda_filter_target` can actually read back off the expanded
+    // block-form filter it reconstructs below. A positional arg that is
+    // neither a bare options Hash nor a `**`-splatted one is a shape
+    // `before_action`'s block form never takes; refused outright.
+    //
+    // Beyond the Hash shape, every ENTRY is checked too — this is the
+    // difference from `filter_from_send`'s Symbol-target path, which
+    // never had this gap because `lambda_filter_target` only loosely
+    // parses `only:`/`except:`/`if:`/`unless:` (and silently ignores any
+    // other key): a value shape it can't read back doesn't fail, it
+    // just quietly becomes "no scope"/"no guard", which would make the
+    // expanded filter run with the WRONG scope or guard instead of not
+    // expanding — a correctness regression the all-or-nothing contract
+    // exists to prevent. So refuse here, unexpanded, unless every entry
+    // is one `lambda_filter_target` is known to read faithfully:
+    //   * key is a Symbol literal in {only, except, if, unless};
+    //   * only/except: a Symbol literal, or an Array of Symbol literals;
+    //   * if/unless: a Symbol literal, or exactly the lambda shapes
+    //     `ir_lambda_body` reads (`-> { … }` / `lambda { … }` /
+    //     `proc { … }`).
+    // `lambda_filter_target` itself keeps its existing loose parsing —
+    // that's the pre-existing gap for a HAND-WRITTEN
+    // `before_action(if: 'cond') { … }`, a separate issue.
     for a in args {
         let unwrapped = match &*a.node {
             ExprNode::KeywordSplat { value } => value,
             _ => a,
         };
-        if !matches!(&*unwrapped.node, ExprNode::Hash { .. }) {
+        let ExprNode::Hash { entries, .. } = &*unwrapped.node else {
             return None;
+        };
+        for (k, v) in entries {
+            let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+                return None;
+            };
+            let shape_ok = match key.as_str() {
+                "only" | "except" => is_symbol_or_symbol_array(v),
+                "if" | "unless" => {
+                    super::controller::ir_symbol(v).is_some()
+                        || super::controller::ir_lambda_body(v).is_some()
+                }
+                _ => false,
+            };
+            if !shape_ok {
+                return None;
+            }
         }
     }
     if rest_param.is_some() || block_param.is_some() || params.len() > 1 {
@@ -3784,6 +3821,23 @@ fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr:
             parenthesized: *parenthesized,
         },
     ))
+}
+
+/// `only:`/`except:` shape `lambda_filter_target` reads faithfully via
+/// `ir_symbol_list`: a bare Symbol literal, or an Array whose elements
+/// are ALL Symbol literals. Stricter than `ir_symbol_list` itself, which
+/// silently drops any element that isn't one (so `only: ['index']`
+/// would read back as an EMPTY list, scoping the filter to no actions
+/// at all rather than refusing) — exactly the loose-parsing gap this
+/// function exists to keep `block_filter_from_macro_stmt` out of.
+fn is_symbol_or_symbol_array(e: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        ExprNode::Array { elements, .. } => {
+            elements.iter().all(|el| super::controller::ir_symbol(el).is_some())
+        }
+        _ => super::controller::ir_symbol(e).is_some(),
+    }
 }
 
 /// Rewrite every read of `name` (a block's own declared parameter) to

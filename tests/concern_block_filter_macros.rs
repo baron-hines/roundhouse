@@ -271,6 +271,40 @@ fn a_value_lambda_declaring_its_own_params_is_refused() {
     assert_refused(DEFAULT_BODY, "stamp_header(->(ctx) { 'Signature' })");
 }
 
+/// `only:`/`except:` a String isn't a shape `ir_symbol_list` reads as a
+/// Symbol at all — it reads back as an EMPTY list, which would scope the
+/// expanded filter to no actions instead of just `:index` (the opposite
+/// of the all-or-nothing contract: silently wrong rather than refused).
+#[test]
+fn an_only_option_that_is_a_string_not_a_symbol_is_refused() {
+    assert_refused(DEFAULT_BODY, "stamp_header('Accept-Language', only: 'index')");
+}
+
+/// `if:`/`unless:` a String is neither a Symbol method-name guard nor a
+/// lambda `ir_lambda_body` can read — `lambda_filter_target` would read
+/// it as no guard at all, running the filter unconditionally.
+#[test]
+fn an_if_option_that_is_a_string_not_a_symbol_or_lambda_is_refused() {
+    assert_refused(DEFAULT_BODY, "stamp_header('Accept-Language', if: 'cond')");
+}
+
+/// `if:`/`unless:` an Array of symbols is neither shape either — same
+/// silent-no-guard gap as the String case above.
+#[test]
+fn an_if_option_that_is_an_array_is_refused() {
+    assert_refused(DEFAULT_BODY, "stamp_header('Accept-Language', if: [:a, :b])");
+}
+
+/// An option key `lambda_filter_target` doesn't recognize at all
+/// (`prepend:`, meant for `prepend_before_action`-style ordering) is
+/// silently ignored there rather than erroring — which would make the
+/// expanded filter drop the ordering the macro call asked for without
+/// any record of the gap.
+#[test]
+fn an_unrecognized_option_key_is_refused() {
+    assert_refused(DEFAULT_BODY, "stamp_header('Accept-Language', prepend: true)");
+}
+
 // ---------------------------------------------------------------------
 // Byte-identical pin: an existing Symbol-target concern macro (the
 // `allow_unauthenticated_access` shape from `class_body_macro_expansion.rs`)
