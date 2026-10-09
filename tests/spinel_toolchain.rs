@@ -45,6 +45,8 @@ mod anonymous_keywords;
 mod native_http;
 #[path = "spinel_toolchain/strong_params.rs"]
 mod strong_params;
+#[path = "spinel_toolchain/params_wrapper.rs"]
+mod params_wrapper;
 #[path = "support/io_process_constants.rs"]
 mod io_process_constants_contract;
 #[path = "spinel_toolchain/io_process_constants.rs"]
