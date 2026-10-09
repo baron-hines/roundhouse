@@ -9163,12 +9163,12 @@ class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
     assert_equal article.title, JSON.parse(response.body)["title"]
   end
 
-  test "a duration is a timeout the socket layer takes" do
-    server = TCPServer.new("127.0.0.1", 0)
-    socket = TCPSocket.new("127.0.0.1", server.addr[1], open_timeout: 1.second)
-    socket.close
-    server.close
+  test "a duration is a timeout the stdlib takes" do
+    assert_nil IO.select(nil, nil, nil, 0.01.seconds)
+    assert_equal :ok, Timeout.timeout(1.second) { :ok }
     assert_equal 1.5, (2.seconds - 0.5).to_f
+    assert_equal 1.5, (2.seconds - 0.5.seconds).to_f
+    assert_operator 1.second, :<, 2
   end
 end
 "#,
@@ -9204,5 +9204,63 @@ raise "rows left: #{count.("active_storage_attachments")}" unless count.("active
 raise "blobs left: #{count.("active_storage_blobs")}" unless count.("active_storage_blobs") == 1
 raise "PurgeJob not recorded" unless ActiveJob.performed.include?("ActiveStorage::PurgeJob")
 "#)
+        .assert_passes();
+}
+
+/// Fixtures load the way Rails' `insert_fixtures_set` loads them: raw
+/// rows, no validations and no callbacks. A callback that raises would
+/// abort the load if it ran; campfire's Message `after_create_commit`
+/// marked memberships unread at load time, so the fixture users began
+/// with unread rooms Rails never gives them.
+#[test]
+fn fixture_rows_load_without_running_callbacks() {
+    emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", "class Comment < ApplicationRecord\n  before_save { raise \"a callback ran for a fixture row\" }\n  after_create_commit { raise \"a commit callback ran for a fixture row\" }\n")
+        .write(
+            "test/models/fixture_load_test.rb",
+            r#"require "test_helper"
+
+class FixtureLoadTest < ActiveSupport::TestCase
+  test "every comment fixture is in the table, stamped" do
+    assert_operator Comment.count, :>, 0
+    assert Comment.all.all? { |comment| comment.created_at && comment.updated_at }
+  end
+end
+"#,
+        )
+        .run_test("test/models/fixture_load_test.rb")
+        .assert_passes();
+}
+
+/// `owner.assoc.create!(attributes)` in a test, with the attributes in a
+/// local: the test-side association rewrite kept only a LITERAL hash and
+/// replaced anything else with the foreign key alone, so campfire's
+/// `rooms(:pets).messages.create!(attributes)` saved a message with no
+/// creator ("Validation failed: Creator must exist"). The value now
+/// merges the key in, and the association's key wins over the caller's,
+/// as in Rails.
+#[test]
+fn an_association_create_keeps_attributes_held_in_a_local() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/assoc_create_test.rb",
+            r#"require "test_helper"
+
+class AssocCreateTest < ActiveSupport::TestCase
+  test "attributes in a local reach the record" do
+    attributes = { commenter: "Reader", body: "Comment body" }
+    comment = articles(:one).comments.create!(attributes)
+    assert_equal "Reader", comment.commenter
+    assert_equal articles(:one).id, comment.article_id
+  end
+
+  test "the association's key wins over the caller's" do
+    comment = articles(:one).comments.create!(commenter: "Lit", body: "Literal body", article_id: articles(:two).id)
+    assert_equal articles(:one).id, comment.article_id
+  end
+end
+"#,
+        )
+        .run_test("test/models/assoc_create_test.rb")
         .assert_passes();
 }
