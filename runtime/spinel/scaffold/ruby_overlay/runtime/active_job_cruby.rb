@@ -34,6 +34,7 @@ module ActiveJob
   class << self
     alias_method :record_performed_for_tests, :record_performed
     alias_method :enqueue_locked, :enqueue
+    alias_method :enqueue_payload_locked, :enqueue_payload
   end
 
   def self.record_performed(job_name)
@@ -44,6 +45,14 @@ module ActiveJob
   def self.enqueue(work)
     start_drainer if @drain_pid != Process.pid
     enqueue_locked(work)
+    @wake << true
+    nil
+  end
+
+  # A serialized job (`lower::job_payload`) wakes the same drain.
+  def self.enqueue_payload(json)
+    start_drainer if @drain_pid != Process.pid
+    enqueue_payload_locked(json)
     @wake << true
     nil
   end
