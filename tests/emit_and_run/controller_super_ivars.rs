@@ -25,7 +25,7 @@ fn an_override_reads_the_ivars_its_super_call_wrote() {
         )
         .write(
             "app/views/drafts/index.html.erb",
-            "<p id=\"listed\"><%= @listed_label %></p>\n",
+            "<p id=\"listed\"><%= @listed_label %></p>\n<p id=\"count\">count <%= @listed %></p>\n",
         )
         .write(
             "test/controllers/drafts_controller_test.rb",
@@ -37,6 +37,7 @@ class DraftsControllerTest < ActionDispatch::IntegrationTest
     get "/drafts"
     assert_response :success
     assert_includes response.body, "#{Article.count + 1} listed"
+    assert_includes response.body, "count #{Article.count}"
   end
 end
 "##,

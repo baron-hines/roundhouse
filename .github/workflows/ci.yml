@@ -1916,8 +1916,12 @@ jobs:
       # 90b33002 on the same box), 69 of 70 files. The two unpassed are
       # new `MessageTest` cases reading preload internals
       # (`presentation-preload-introspection` in suite-causes.json), and
-      # they turn `message_test` red. The floor is left to this
-      # runner's measurement of the bump.
+      # they turn `message_test` red.
+      #
+      # 392/66 -> 412/69, on the notice this bump's own run emitted
+      # (`61503a01`: 412 of 414, 69 of 70, 2 skipped). The runner now
+      # agrees with the laptop on files green: the vips loader-policy
+      # skips no longer cost a file.
       #
       # 391/66 -> 392/66, on the notice `eb2a4d09`'s run emitted (the
       # `to_gid` mint). Files green did not move: the test it turned
@@ -1926,8 +1930,8 @@ jobs:
       # has no per-object method table — or until upstream takes
       # basecamp/once-campfire#280, #279's twin for this file.
         env:
-          FLOOR_TESTS: 392
-          FLOOR_FILES: 66
+          FLOOR_TESTS: 412
+          FLOOR_FILES: 69
         run: |
           set -euo pipefail
           tests=$(awk -F'|' '{p += $3} END {print p+0}' /tmp/campfire-tally.txt)

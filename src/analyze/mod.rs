@@ -3100,6 +3100,19 @@ impl Analyzer {
                         }
                     }
                 }
+                // An override calling `super` renders with what the
+                // overridden action wrote too (its entry in
+                // `chained_bindings` keeps both layers).
+                if expr_calls_super(&action.body) {
+                    if let Some(inherited) = chained_bindings.get(&action.name) {
+                        for (k, v) in inherited {
+                            if v.is_open() {
+                                continue;
+                            }
+                            ivars.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
                 if let Some(layout_name) = &effective_layout {
                     view_feeders
                         .entry(layout_name.clone())
