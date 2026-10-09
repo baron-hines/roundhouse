@@ -1471,7 +1471,12 @@ module ActiveStorage
     # corpus makes — campfire's `message.body.embeds.each(&:filename)`.
     def each
       rows = attachments
-      rows.each { |att| yield att }
+      i = 0
+      n = rows.length
+      while i < n
+        yield rows[i]
+        i += 1
+      end
       rows
     end
 

@@ -832,7 +832,11 @@ fn every_runtime_method_body_concretely_typed() {
     // of the id Rails passes through, whose RBS type is the flat
     // `String | Integer | Float | Array | nil` union (Float added after
     // #689 review; MEASURED, no change).
-    const CEILING: usize = 311;
+    // `ActiveStorage::AttachedMany#each` (Rails' `delegate_missing_to
+    // :attachments`, for campfire's `body.embeds.each`) adds 1,
+    // MEASURED: the value of its `yield`, the same block-return escape
+    // `Relation#each` carries.
+    const CEILING: usize = 312;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
