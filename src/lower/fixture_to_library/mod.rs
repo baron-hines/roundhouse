@@ -547,7 +547,7 @@ fn build_load_method_body(
                     // marked memberships unread, so the fixture users
                     // started with unread rooms.
                     //
-                    // `_insert_fixture` (runtime/ruby/active_record/
+                    // `_insert_row` (runtime/ruby/active_record/
                     // base.rb) fills omitted timestamps and inserts.
                     // Every target's AR base is transpiled from that
                     // file, so every target has it.
@@ -555,7 +555,7 @@ fn build_load_method_body(
                     // Safe because a fixture assigns only scalar
                     // columns — never an association object — so there
                     // is no autosave to miss.
-                    method: Symbol::from("_insert_fixture"),
+                    method: Symbol::from("_insert_row"),
                     args: vec![],
                     block: None,
                     // Explicit parens so per-target emit doesn't drop

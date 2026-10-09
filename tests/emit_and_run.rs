@@ -9316,3 +9316,37 @@ raise "url_for(preview) answered #{url.inspect}" unless url.is_a?(String) && url
 "#)
         .assert_passes();
 }
+
+/// `insert_all!` and `insert_all` are one raw INSERT per row in Rails:
+/// no validations, no callbacks, timestamps filled. `insert_all!`
+/// raises on a duplicate and answers an `ActiveRecord::Result` of the
+/// RETURNING columns, whose `rows` are Arrays of values (campfire's
+/// search test reads new ids with `.rows.flatten`); `insert_all` skips
+/// a duplicate. Both used to run the save callbacks, and `insert_all!`
+/// was undefined.
+#[test]
+fn bulk_inserts_skip_callbacks_and_insert_all_bang_returns_its_rows() {
+    emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", r#"class Comment < ApplicationRecord
+  after_create_commit { raise "a callback ran for a bulk insert" }
+
+  def self.bulk_ids(article, names)
+    rows = names.map { |name| { article_id: article.id, commenter: name, body: "Bulk body" } }
+    Comment.insert_all!(rows, returning: %w[ id commenter ]).rows
+  end
+
+  def self.bulk_skipping(article, names)
+    rows = names.map { |name| { article_id: article.id, commenter: name, body: "Bulk body" } }
+    Comment.insert_all(rows)
+  end
+"#)
+        .run_ruby(r#"
+article = Article.create!(title: "Bulk", body: "A sufficiently long article body.")
+rows = Comment.bulk_ids(article, ["a", "b"])
+raise "rows #{rows.inspect}" unless rows.map(&:last) == ["a", "b"] && rows.all? { |r| r.first.is_a?(Integer) }
+raise "timestamps" unless Comment.where(article_id: article.id).all? { |c| c.created_at && c.updated_at }
+Comment.bulk_skipping(article, ["c"])
+raise "count #{Comment.where(article_id: article.id).count}" unless Comment.where(article_id: article.id).count == 3
+"#)
+        .assert_passes();
+}
