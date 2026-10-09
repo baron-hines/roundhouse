@@ -72,9 +72,9 @@ end
 fn strict_targets_declare_the_finder_miss_id_nilable() {
     use roundhouse::project::BuildTarget;
     for (target, path, want) in [
-        (BuildTarget::Crystal, "src/errors.cr", "property id : String | Int64 | Array(String | Int64) | Nil\n"),
+        (BuildTarget::Crystal, "src/errors.cr", "property id : String | Int64 | Float64 | Array(String | Int64 | Float64) | Nil\n"),
         (BuildTarget::Kotlin, "src/main/kotlin/Errors.kt", "primaryKey: String? = null, id: Any? = null)"),
-        (BuildTarget::Python, "app/errors.py", "    id: str | int | list[str | int] | None\n"),
+        (BuildTarget::Python, "app/errors.py", "    id: str | int | float | list[str | int | float] | None\n"),
         (BuildTarget::CSharp, "app/runtime/Errors.cs", "string? primaryKey = null, object? id = null)"),
         (BuildTarget::Swift, "Sources/App/Errors.swift", "_ primaryKey: String? = nil, _ id: Any? = nil)"),
     ] {
