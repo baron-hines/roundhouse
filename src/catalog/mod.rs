@@ -1199,6 +1199,22 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
+    // `order(Arel.sql(…))` / `reorder(Arel.sql(…))`, renamed by
+    // `lower::arel_sql_order` so the fragment skips the column check.
+    CatalogedMethod {
+        name: "order_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reorder_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
     CatalogedMethod {
         name: "skip_preloading!",
         receiver: ReceiverContext::Relation,
@@ -1653,8 +1669,8 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         name: "in_batches",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
-        chain: ChainKind::Terminal,
-        return_kind: Some(ReturnKind::ArrayOfSelf),
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
     },
     // Constructors / first-or-X — return an element instance.
     CatalogedMethod {
@@ -1723,6 +1739,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     // Writes through the relation.
     CatalogedMethod {
         name: "update_all",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "touch_all",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,

@@ -836,11 +836,15 @@ fn every_runtime_method_body_concretely_typed() {
     // Rails itself leaves dynamic: `Connection#select_value` (one SQL cell, as
     // `select_rows`' rows are), `Base.uncached`'s block value (the
     // `Timeout.timeout` shape), and `Relation#to_h`'s yielded pairs.
+    // `in_batches` adds 2, MEASURED: the `yield self` in
+    // `Relation#in_batches` and in the class-side fallback in
+    // connection.rb, whose value is the block's — gradual, as
+    // `find_in_batches`' `yield records` already is.
     // `ActiveStorage::AttachedMany#each` (Rails' `delegate_missing_to
     // :attachments`, for campfire's `body.embeds.each`) adds 1,
     // MEASURED: the value of its `yield`, the same block-return escape
     // `Relation#each` carries.
-    const CEILING: usize = 317;
+    const CEILING: usize = 319;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
