@@ -692,6 +692,10 @@ pub enum UnsupportedFormal {
     Destructured,
     AnonymousRest,
     NoKeywords,
+    /// A positional rest (`*args`, `*`) on a method a concern splices
+    /// into a controller. The controller's action record has no rest
+    /// slot, so the splice would make it one required positional.
+    ControllerRest,
 }
 
 impl UnsupportedFormal {
@@ -700,6 +704,7 @@ impl UnsupportedFormal {
             Self::Destructured => "destructured positional parameters are not retained",
             Self::AnonymousRest => "anonymous positional rest is not retained",
             Self::NoKeywords => "the no-keywords constraint is not retained",
+            Self::ControllerRest => "a positional rest on a method spliced into a controller is not retained",
         }
     }
 }

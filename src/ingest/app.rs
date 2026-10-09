@@ -2448,6 +2448,8 @@ fn splice_concerns_into_controllers(app: &mut App) {
         crate::ident::ClassId,
         HashMap<crate::ident::Symbol, crate::ident::ClassId>,
     > = HashMap::new();
+    let mut rest_spliced: std::collections::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+        std::collections::HashSet::new();
 
     for controller in &mut app.controllers {
         let include_groups = crate::analyze::controller_include_groups(controller);
@@ -2543,6 +2545,16 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 if let Some(consts) = module_constants.get(module) {
                     qualify_lexical_consts(&mut body, module, consts);
                 }
+                // `Action` has no positional-rest slot; the loop below
+                // would make `*rest` one required positional. Ledger it
+                // on the module's own def instead (see the end).
+                if method
+                    .params
+                    .iter()
+                    .any(|p| p.rest && !p.keyword && !p.from_kwrest && !p.forwarding)
+                {
+                    rest_spliced.insert((module.clone(), method.name.clone()));
+                }
                 let mut params = Row::closed();
                 let mut opt_params = Vec::new();
                 let mut kw_params = Vec::new();
@@ -2630,6 +2642,16 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 .or_default()
                 .entry(name.clone())
                 .or_insert(sig);
+        }
+    }
+    for lc in &mut app.library_classes {
+        for m in &mut lc.methods {
+            if m.unsupported_formals.is_none()
+                && matches!(m.receiver, MethodReceiver::Instance)
+                && rest_spliced.contains(&(lc.name.clone(), m.name.clone()))
+            {
+                m.unsupported_formals = Some(crate::dialect::UnsupportedFormal::ControllerRest);
+            }
         }
     }
     app.concern_spliced_actions = spliced_origin;
