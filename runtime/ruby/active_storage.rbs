@@ -265,6 +265,10 @@ module ActiveStorage
   class PurgeJob
     def self.perform_later: (ActiveStorage::Blob blob) -> nil
   end
+
+  class VariantRecord
+    def self.count: () -> Integer
+  end
 end
 
 # See the .rb: Active Storage's engine-mounted route helpers, reopened
