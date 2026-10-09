@@ -238,7 +238,7 @@ module ActionCable
   # Cable encodes the payload with ActiveSupport::JSON, so a String,
   # a Symbol, nil, a Float or a nested Hash or Array is written as JSON
   # (not with `to_s`), and `<`, `>` and `&` inside strings come out as
-  # `<`, `>`, `&`. `JSON.generate` walks the value
+  # `\u003c`, `\u003e`, `\u0026`. `JSON.generate` walks the value
   # whatever it holds; `escape_html_entities` adds Rails' escapes. The
   # CRuby overlay's transport writes the same text (`Registry.deliver`).
   #
