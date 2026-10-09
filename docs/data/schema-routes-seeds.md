@@ -83,14 +83,21 @@ DDL, so that dialect returns an error for it. Postgres renders what
 ingest kept, so it shares the current ingest and IR limits.
 `schema.rb` ingest drops `array: true`; an index's `order:` and
 `opclass:`, and expression indexes; precision on `numeric`,
-`datetime` and `time`; a `limit:` of 1 or 2 on an `integer` column
-(so no `smallint`; 5 to 8 is a `bigint`, as in Rails); and schema
-qualifiers. The key forms the
+`datetime` and `time`; and schema qualifiers. An `integer` `limit:` of 1
+or 2 still normalizes to `ColumnType::Integer` for ordinary typing, but
+its original smallint width is retained as negative evidence for generated
+int4 results; 3 and 4 are exact PostgreSQL `integer`, and 5 to 8 normalize
+to `bigint`, as in Rails. The key forms the
 PostgreSQL dumper writes are read as the keys they name: `id: :serial`
 is an `integer` key, and a hash-valued `id: { type: :string, limit:
 32 }` keeps its type and limit. And the folds below
-apply (`jsonb` and `json` both render `jsonb`, `timestamptz` renders
-`timestamp`). A partial index's predicate (`t.index … where:`,
+apply (`timestamptz` renders `timestamp`). The IR preserves `json` and
+`jsonb` separately so PostgreSQL DDL keeps the source type. SQLite stores both
+as text, and both use the same Ruby `JsonColumn` encoding/decoding path; this
+does not add PostgreSQL runtime support.
+Roda's current Sequel schema mapping remains text-backed and records the
+original type in a comment rather than claiming native JSONB support.
+A partial index's predicate (`t.index … where:`,
 `add_index … where:` in the migration fold, or `WHERE` in
 `structure.sql`) is kept as the source database wrote it. Postgres
 renders it on every index. SQLite renders it on a unique index, where
@@ -115,10 +122,10 @@ performance can differ while row semantics stay the same. Custom PostgreSQL
 methods are preserved as identifiers, but their extension must already be
 installed by a PostgreSQL deployment.
 Postgres column types map to their SQLite storage at
-ingest (`uuid` → TEXT via `ColumnType::Uuid`, `jsonb` → json,
-`citext` → text, `timestamptz` → datetime, `inet`/`cidr`/`macaddr`/
-`enum` → string); a type with no mapping is an ingest error (a ledger
-line under `--survey`), never a silent drop — its index would still be
+ingest (`uuid` → TEXT via `ColumnType::Uuid`, `json`/`jsonb` → the same
+text-backed JSON representation, `citext` → text, `timestamptz` → datetime,
+`inet`/`cidr`/`macaddr`/`enum` → string); a type with no mapping is an
+ingest error (a ledger line under `--survey`), never a silent drop — its index would still be
 emitted and the DDL would not apply. A non-integer primary key
 (`create_table …, id: :uuid` / `primary_key: "identifier", id:
 :string`) renders as `TEXT PRIMARY KEY` in SQLite and is carried end
@@ -142,6 +149,130 @@ as an unsupported construct at emit time, per target, rather than as
 an ingest gap that would be false of the ruby family (#90;
 `fixtures/tiny-blog-uuid` + `tests/uuid_key_ruby.rs` run the shape
 on CRuby, and the same fixture compiles and serves under Spinel).
+
+### Generated columns
+
+`Column.generated` retains a generated expression and its `stored` or
+`virtual` mode separately from its declared result type. For example:
+
+```ruby
+t.string "first_name"
+t.string "last_name"
+t.virtual "display_name", type: :string,
+  as: "first_name || ' ' || coalesce(last_name, '')", stored: true
+```
+
+The portable expression subset is deliberately bounded: unbounded string/text
+columns, SQL string literals, parentheses, `||`, and `coalesce` with at least
+two arguments. Expressions are validated against the complete table and kept
+verbatim. A separate PostgreSQL DDL-only ingest API opts into the same subset
+plus `::text`, `::varchar`, `::character varying`, and equivalent
+`CAST(... AS ...)` forms over unbounded string/text expressions. The default
+application ingest remains portable, so PostgreSQL-only casts still fail app
+checking and cannot reach current SQLite project emission. Use
+`ingest_schema_with_generated_expression_dialect` or the corresponding
+`structure.sql`/migration entry point with
+`schema::generated::GeneratedExpressionDialect::Postgres`, then call
+`render_schema_statements_for(..., Dialect::Postgres)` to render DDL. This
+source-expression mode is not a database selector and does not enable
+PostgreSQL model persistence or a PostgreSQL application target.
+
+That PostgreSQL DDL mode also accepts `::integer`, `::int4`, and
+`CAST(... AS integer/int4)` only when the cast input is text, such as
+`(payload ->> 'count'::text)::integer`. The declared generated result must
+be an exact PostgreSQL int4. It does not admit integer-column operands,
+integer literals, arithmetic, or other numeric casts; any `coalesce` input
+must still satisfy the existing text-only rules. Because ordinary typing folds
+several source widths into `ColumnType::Integer`,
+`schema.rb` integer limits 1 and 2, and `structure.sql` `smallint`/`int2`,
+`serial`/`serial4`, and integer types with typmods retain negative width
+evidence and are refused as generated int4 results. Bare `integer`, `int`,
+and `int4`, and Rails limits 3 and 4, remain eligible. This does not change
+ordinary model typing or rendered SQLite types. In `structure.sql`, a
+qualified integer type is considered exact only as unquoted `pg_catalog.int4`;
+`integer` and `int` are unqualified SQL grammar aliases, not catalog type
+names. The parser otherwise keeps its ordinary normalized type but refuses
+generated int4 output because another schema can define a domain or type
+with the same name.
+
+That explicit PostgreSQL DDL mode also accepts `->` and `->>` when the left
+operand is an exact `json` or `jsonb` column and the selector is a SQL string
+literal (including Rails' `'key'::text` form) or a decimal array index
+with an optional leading minus, within the full signed int4 range.
+The operators can be chained; `->` may produce an intermediate JSON value,
+and `->>` produces text. That text can be the generated result or feed the
+explicit int4 cast described above.
+Expressions remain verbatim, so PostgreSQL preserves the source JSON type's
+behavior. The default application ingest remains portable, and SQLite DDL
+validation rejects a schema imported in PostgreSQL mode. This adds no
+PostgreSQL model persistence and leaves the shared serialized-text
+`JsonColumn` model path unchanged.
+
+Other PostgreSQL operators, casts to non-text types apart from the bounded
+text-to-int4 casts above, other functions,
+generated-column references, defaults, generated keys/timestamps,
+length-limited casts or operand types remain explicit errors. A table must
+contain an ordinary column. Source types normalized to text for ordinary model
+typing (such as network types, enums, `citext`, and fixed-width characters)
+remain unsupported here. Column names that are SQL keywords must be
+double-quoted in the expression. Unresolved keyword splats in column options
+are rejected because they can hide generated-column metadata.
+Migration folding permits renaming or dropping an unindexed generated output
+when the resulting table still validates. `change_column` on an existing
+generated output and replacement of a generated output by an ordinary column
+are rejected. Renaming or dropping a source column that a generated expression
+uses is rejected without rewriting the source SQL; renaming or dropping an
+indexed generated output is also an explicit error.
+Assigning a default to a generated output is rejected before changing schema
+state, including during survey recovery. Ordinary defaults and generated-column
+nullability changes remain supported.
+`remove_reference` and `remove_belongs_to` cannot remove a generated output;
+their folded changes are also validated before altering generated expressions.
+The same metadata is read from a complete `GENERATED ALWAYS AS (...) STORED`
+or `VIRTUAL` clause in `structure.sql`; unsupported clauses cannot silently
+become writable columns. Roda emission rejects generated columns. SQLite DDL
+supports both modes; the separate PostgreSQL DDL renderer currently accepts
+stored columns only, even though PostgreSQL 18 also supports virtual columns.
+PostgreSQL text casts and JSON extraction require the explicit DDL-only ingest
+mode described above; this does not enable a PostgreSQL runtime backend.
+
+Normal model inserts and updates omit generated columns, while SELECT and
+reload retain them. Generated attributes start nil, including a database
+`NOT NULL` attribute. The `ruby`, `jruby`, and `spinel` persistence runtimes
+use one `INSERT ... RETURNING` statement to read the inserted key and generated
+values before create callbacks; there is no separate post-insert SELECT. The
+SQLite persistence path requires SQLite 3.35 or newer, matching the
+`Db.exec_returning` runtime gate. SQLite 3.31 through 3.34 support generated
+columns in DDL but cannot run this model-persistence path. Project emission
+also refuses targets whose runtime does not provide `Db.exec_returning`. These
+runtime gates do not change the standalone schema DDL renderers: they continue
+to preserve every accepted SQLite generated-column mode and stored-only
+PostgreSQL generated columns. The single statement does not wrap the rest of
+model save or callbacks in a transaction; callers that need rollback when
+later application code raises must use their transaction.
+Tables without a declared primary key can return SQLite's rowid from the
+insert adapter primitive, but the existing model create/save lifecycle does
+not support keyless models end to end.
+An explicitly assigned nonnil value remains in memory through callbacks and
+until reload. This create-time hydration does not add generated-column dirty
+tracking or refresh generated values after later writes; updates leave the
+previous value in memory until explicit reload, as observed with Rails 8.1.4
+and SQLite. Existing
+full-column update behavior also remains: saving only a generated-field
+assignment on a mixed table may still write unchanged ordinary fields. A
+table with no writable non-key fields uses `DEFAULT VALUES` on insert and
+issues no UPDATE.
+
+Direct writes that the current lowering would silently discard remain
+unsupported: generated-model `insert_all`/`insert_all!`, and `update_column`
+or named `touch` calls that can address a generated field, including
+`belongs_to ..., touch: :generated_column` callbacks. Ordinary literal
+column names retain their existing behavior; dynamic names on generated
+models fail closed. Static seed SQL follows ordinary `create!` filtering.
+Explicit generated values in YAML fixtures are rejected with fixture, record,
+and column context. The regression suites are `tests/generated_columns*.rs`;
+`generated_columns_spinel` executes the SQLite contract natively in the
+selected Spinel CI suite.
 
 ## `config/routes.rb` → `RouteTable` → `RouteHelpers.<x>_path`
 
