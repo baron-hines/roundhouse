@@ -1186,6 +1186,34 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
                 return r#"(_ for _ in ()).throw(TypeError("roundhouse: + with incompatible operand types"))"#.to_string();
             }
         }
+        // Array `&` / `|`: Python's `&`/`|` are undefined for lists.
+        // Membership uses `type(a) is type(b) and a == b` so Int/Float
+        // stay distinct like Ruby `eql?` (`1 | 1.0` keeps both), while
+        // nested lists still compare structurally. Not `dict.fromkeys`
+        // (rejects unhashables). Lambda evaluates each operand once.
+        if method == "&" || method == "|" {
+            use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
+            let eql = "lambda a, b: type(a) is type(b) and a == b";
+            match classify_set_op(method, r, arg) {
+                SetOpCase::ArrayIntersect { .. } => {
+                    return format!(
+                        "(lambda __l, __r, __eq: [x for i, x in enumerate(__l) if any(__eq(x, y) for y in __r) and not any(__eq(x, y) for y in __l[:i])])({}, {}, {})",
+                        emit_expr(r),
+                        emit_expr(arg),
+                        eql,
+                    );
+                }
+                SetOpCase::ArrayUnion { .. } => {
+                    return format!(
+                        "(lambda __a, __eq: [x for i, x in enumerate(__a) if not any(__eq(x, y) for y in __a[:i])])([*{}, *{}], {})",
+                        emit_expr(r),
+                        emit_expr(arg),
+                        eql,
+                    );
+                }
+                SetOpCase::Unknown => {}
+            }
+        }
         // `-` dispatch: Python supports numeric `-` natively; list
         // difference needs a comprehension. Incompatible refuses.
         if method == "-" {
