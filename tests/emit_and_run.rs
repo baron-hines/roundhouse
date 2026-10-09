@@ -9059,3 +9059,57 @@ raise "the change outlived the save: #{doc.attachment_changes.inspect}" unless d
 "#)
         .assert_passes();
 }
+
+/// Three things Rails' test environment does that campfire's tests lean
+/// on, given on the CRuby tree's test support:
+/// - `allow_forgery_protection = false` (Rails' generated test.rb) means
+///   forms carry no authenticity token, so a cached fragment and a fresh
+///   render of it are the same bytes (campfire's messages caching test);
+/// - `ActiveSupport::Notifications.subscribe(regexp)` hears the fragment
+///   cache's reads and writes, keys in Rails' shape, until unsubscribed;
+/// - `freeze_time` stops `Time.current` on the instant records are
+///   stamped with (campfire's user test compares the two).
+#[test]
+fn rails_test_environment_tokens_cache_events_and_clock() {
+    emit_and_run::real_blog()
+        .edit("app/views/articles/_article.html.erb", "<div id=\"<%= dom_id(article) %>\"", "<% cache article do %>\n<div id=\"<%= dom_id(article) %>\"")
+        .edit("app/views/articles/_article.html.erb", "  </div>\n</div>\n", "  </div>\n</div>\n<% end %>\n")
+        .write(
+            "test/controllers/test_environments_controller_test.rb",
+            r#"require "test_helper"
+
+class TestEnvironmentsControllerTest < ActionDispatch::IntegrationTest
+  test "forms carry no token while forgery protection is off" do
+    get new_article_url
+    assert_select "form"
+    assert_select "input[name='authenticity_token']", count: 0
+    get articles_url
+    assert_select "form.button_to"
+    assert_select "input[name='authenticity_token']", count: 0
+  end
+
+  test "a subscriber hears fragment cache reads and writes until it unsubscribes" do
+    keys = []
+    subscriber = ActiveSupport::Notifications.subscribe(/\Acache_(read|write)\.active_support\z/) do |*, payload|
+      keys << payload[:key]
+    end
+    get articles_url
+    assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+    heard = keys.size
+    get articles_url
+    assert_equal heard, keys.size
+  end
+
+  test "freeze_time stops Time.current on the instant records are stamped with" do
+    freeze_time
+    article = Article.create!(title: "Frozen", body: "A sufficiently long article body.")
+    assert_equal Time.current, article.created_at
+    assert_equal Time.current, Article.find(article.id).updated_at
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/test_environments_controller_test.rb")
+        .assert_passes();
+}
