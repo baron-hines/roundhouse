@@ -8615,8 +8615,8 @@ fn array_set_operators_are_not_native_infix_on_typed_targets() {
         (
             BuildTarget::Python,
             "app/v2/models.py",
-            "(lambda __l, __r: [x for i, x in enumerate(__l) if x in __r and x not in __l[:i]])([1, 2, 2, 3], [2, 3, 4])",
-            "(lambda __a: [x for i, x in enumerate(__a) if x not in __a[:i]])([*[3, 1, 1], *[2, 1]])",
+            "(lambda __l, __r, __eq: [x for i, x in enumerate(__l) if any(__eq(x, y) for y in __r) and not any(__eq(x, y) for y in __l[:i])])([1, 2, 2, 3], [2, 3, 4], lambda a, b: type(a) is type(b) and a == b)",
+            "(lambda __a, __eq: [x for i, x in enumerate(__a) if not any(__eq(x, y) for y in __a[:i])])([*[3, 1, 1], *[2, 1]], lambda a, b: type(a) is type(b) and a == b)",
         ),
         (
             BuildTarget::Rust,

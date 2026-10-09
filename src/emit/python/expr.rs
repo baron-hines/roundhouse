@@ -1187,24 +1187,28 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
             }
         }
         // Array `&` / `|`: Python's `&`/`|` are undefined for lists.
-        // Dedupe in order by `==` against the prefix (not `dict.fromkeys`,
-        // which rejects unhashable elements such as nested lists); the
-        // lambda evaluates each operand exactly once, lhs first.
+        // Membership uses `type(a) is type(b) and a == b` so Int/Float
+        // stay distinct like Ruby `eql?` (`1 | 1.0` keeps both), while
+        // nested lists still compare structurally. Not `dict.fromkeys`
+        // (rejects unhashables). Lambda evaluates each operand once.
         if method == "&" || method == "|" {
             use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
+            let eql = "lambda a, b: type(a) is type(b) and a == b";
             match classify_set_op(method, r, arg) {
                 SetOpCase::ArrayIntersect { .. } => {
                     return format!(
-                        "(lambda __l, __r: [x for i, x in enumerate(__l) if x in __r and x not in __l[:i]])({}, {})",
+                        "(lambda __l, __r, __eq: [x for i, x in enumerate(__l) if any(__eq(x, y) for y in __r) and not any(__eq(x, y) for y in __l[:i])])({}, {}, {})",
                         emit_expr(r),
-                        emit_expr(arg)
+                        emit_expr(arg),
+                        eql,
                     );
                 }
                 SetOpCase::ArrayUnion { .. } => {
                     return format!(
-                        "(lambda __a: [x for i, x in enumerate(__a) if x not in __a[:i]])([*{}, *{}])",
+                        "(lambda __a, __eq: [x for i, x in enumerate(__a) if not any(__eq(x, y) for y in __a[:i])])([*{}, *{}], {})",
                         emit_expr(r),
-                        emit_expr(arg)
+                        emit_expr(arg),
+                        eql,
                     );
                 }
                 SetOpCase::Unknown => {}
