@@ -122,7 +122,9 @@ module ActiveSupport
       def read_multi(*names)
         out = {}
         names.each do |name|
-          out[name] = read(name) if exist?(name)
+          key = ActiveSupport::Cache.expanded_key(name)
+          found, value = @lock.synchronize { read_locked(key) }
+          out[name] = MemoryStore.copy(value) if found
         end
         out
       end

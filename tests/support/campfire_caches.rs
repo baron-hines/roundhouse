@@ -308,6 +308,17 @@ puts SqliteObserverProbe.locks.inspect
 pub const RECORD_SNAPSHOT: Contract = Contract {
     path: "app/models/record_snapshot_probe.rb",
     source: r##"class RecordSnapshotProbe
+  class DeleteAfterExistStore < ActiveSupport::Cache::MemoryStore
+    # Deterministically model a delete in the gap between read_multi's
+    # separate exist? and read calls. An atomic read_multi never calls
+    # exist?, so it sees the entry before that competing delete.
+    def exist?(name)
+      found = super
+      delete(name) if found
+      found
+    end
+  end
+
   def self.round_trip
     created = Article.create!(title: "Snapshot", body: "A sufficiently long article body.")
     article = Article.find(created.id)
@@ -347,6 +358,12 @@ pub const RECORD_SNAPSHOT: Contract = Contract {
     [ first, second, store.read("record/1//a/b"), copies, store.read("k").nil? ]
   end
 
+  def self.read_multi_race
+    store = DeleteAfterExistStore.new
+    store.write("key", "cached")
+    store.read_multi("key")["key"] == "cached"
+  end
+
   def self.key
     ActiveSupport::Cache.expand_cache_key([ "record-snapshot-v1", [ "db", "ns", 3 ], [ "session", "abc" ] ])
   end
@@ -362,6 +379,7 @@ end
 puts RecordSnapshotProbe.unknown_name
 puts RecordSnapshotProbe.bounds.inspect
 puts RecordSnapshotProbe.fetching.inspect
+puts RecordSnapshotProbe.read_multi_race
 puts RecordSnapshotProbe.key
 "#
     ),
@@ -370,6 +388,7 @@ puts RecordSnapshotProbe.key
         "NameError\n",
         "[true, false, true]\n",
         "[\"computed\", \"computed\", \"filed\", true, true]\n",
+        "true\n",
         "record-snapshot-v1/db/ns/3/session/abc\n",
     ),
 };
