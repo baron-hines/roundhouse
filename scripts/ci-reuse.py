@@ -27,11 +27,6 @@ JOBS = {
         "tests": [],
         "reports": [],
     },
-    "writebook-inventory": {
-        "checks": ["Build Roundhouse and run inventory", "Save complete check report"],
-        "tests": ["tests/writebook.rs"],
-        "reports": ["writebook-check.txt", "writebook-inventory-current.json"],
-    },
     "smoke-rust": {
         "name": "smoke (rust)",
         "checks": ["scripts/smoke rust"],
@@ -67,7 +62,7 @@ def digest(value):
 def repository_inputs(job):
     # Unknown paths, all shared test support, fixtures, docs and executable
     # READMEs are included. Only unrelated top-level Rust test binaries are
-    # excluded: these two commands neither compile nor execute them.
+    # excluded: those commands neither compile nor execute them.
     entries = []
     for entry in command("git", "ls-tree", "-rz", "HEAD").split(b"\0"):
         if not entry:
