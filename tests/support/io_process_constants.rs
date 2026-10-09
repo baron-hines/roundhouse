@@ -73,6 +73,16 @@ class TerminalProbe
     callback = proc { |r, w, _pid| r.close; w.close }
     PTY.spawn("true", &callback)
   end
+
+  def self.spawn_nil_forwarded
+    # `&nil` via a local: Ruby passes no block, so spawn answers the
+    # reader/writer/pid tuple (not nil).
+    callback = nil
+    out, input, pid = PTY.spawn("true", &callback)
+    input.close
+    out.close
+    pid.is_a?(Integer)
+  end
 end
 "#;
 
@@ -86,6 +96,7 @@ puts TerminalProbe.utf8("zaż")
 p TerminalProbe.terminal
 TerminalProbe.spawn_with_block
 p TerminalProbe.spawn_forwarded
+p TerminalProbe.spawn_nil_forwarded
 puts "spawned"
 "#;
 
@@ -97,5 +108,6 @@ echo a\ b\'c
 UTF-8
 ["hi|end", true, true]
 nil
+true
 spawned
 "#;
