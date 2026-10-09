@@ -51,6 +51,7 @@ end
   "find nil" => [miss("find nil") { Article.find(nil) }, ["Article", "id", nil]],
   "find array" => [miss("find array") { Article.find([article.id, 999]) }, ["Article", "id", [article.id, 999]]],
   "where find" => [miss("where find") { Article.where(title: "Present").find(999) }, ["Article", "id", 999]],
+  "relation find nil" => [miss("relation find nil") { Article.where(title: "Present").find(nil) }, ["Article", "id", nil]],
   "find_by!" => [miss("find_by!") { Article.find_by!(title: "zz") }, ["Article", "id", nil]],
   "relation find_by!" => [miss("relation find_by!") { Article.where(title: "Present").find_by!(body: "zz") }, ["Article", "id", nil]],
   "first!" => [miss("first!") { Article.where(title: "zz").first! }, ["Article", "id", nil]],

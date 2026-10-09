@@ -308,7 +308,10 @@ fn untyped_subexpressions_baseline() {
     // new sites are all in Relation#find_ids' multi-id message (the
     // `inspect`ed id list and the interpolated model, key and expected
     // count); the single-id messages trade one site for one.
-    const CEILING: usize = 540;
+    // Relation#find(nil)'s "without an ID" raise (#689 review):
+    // 540 -> 541, MEASURED. The one new site is the `id.nil?` guard's
+    // read of the unseeded `id`.
+    const CEILING: usize = 541;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

@@ -18,6 +18,7 @@ end
   "find integer" => [message("find integer") { Article.find(999) }, "Couldn't find Article with 'id'=999"],
   "find nil" => [message("find nil") { Article.find(nil) }, "Couldn't find Article without an ID"],
   "relation find array" => [message("relation find array") { ActiveRecord::Relation.new(Article).find([article.id, 999]) }, "Couldn't find all Articles with 'id': (#{article.id}, 999) (found 1 results, but was looking for 2)."],
+  "relation find nil" => [message("relation find nil") { ActiveRecord::Relation.new(Article).where(title: "Present").find(nil) }, "Couldn't find Article without an ID"],
   "unscoped relation find" => [message("unscoped relation find") { ActiveRecord::Relation.new(Article).find(999) }, "Couldn't find Article with 'id'=999"],
   "first!" => [message("first!") { ActiveRecord::Relation.new(Comment).first! }, "Couldn't find Comment"],
   "sole" => [message("sole") { ActiveRecord::Relation.new(Comment).sole }, "Couldn't find Comment"],

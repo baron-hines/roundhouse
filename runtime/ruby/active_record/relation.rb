@@ -1650,6 +1650,9 @@ module ActiveRecord
     # the suffix could not match. An unscoped relation's message is
     # exactly Rails'.
     def find(id)
+      # Rails compacts the ids first, so `find(nil)` has none: the
+      # "without an ID" form, with no id, as `Base.find(nil)` raises.
+      raise RecordNotFound.new("Couldn't find #{@model.name} without an ID", @model.name, @model.primary_key) if id.nil?
       return find_ids(id) if id.is_a?(Array)
       key = @model._cast_primary_key(id)
       prior_limit = @limit
