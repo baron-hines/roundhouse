@@ -172,6 +172,32 @@ class Routing(unittest.TestCase):
         self.assertNotIn("build-wasm", plan["jobs"])
         self.assertIn("generated_columns_spinel", plan["spinel_tests"])
 
+    def test_campfire_latest_is_advisory_and_never_in_a_pr_plan(self):
+        # Unpinned basecamp/once-campfire main: reported after every merge
+        # and on Full, advisory, and never part of a PR's own plan.
+        for plan in (ci.select([], spinel_lane=True), ci.select([], full=True)):
+            self.assertIn("campfire-latest", plan["jobs"])
+            self.assertIn("campfire-latest", plan["advisory"])
+            self.assertNotIn("campfire-latest", plan["required"])
+        for paths in (["README.md"], ["src/analyze/call.rs"], ["src/emit/go.rs"]):
+            self.assertNotIn("campfire-latest", ci.select(paths)["jobs"])
+        self.assertNotIn("campfire-latest", ci.BASE)
+        self.assertNotIn("campfire-latest", ci.PUBLICATION)
+
+    def test_campfire_latest_failure_does_not_fail_the_gate(self):
+        plan = ci.select([], spinel_lane=True)
+        needs = {job: {"result": "success", "outputs": {"execution": "success"}} for job in plan["jobs"]}
+        needs["plan"] = {"result": "success"}
+        needs["compact-required"] = {"result": "success"}
+        needs["campfire-spinel-compare"]["outputs"] = {
+            "default": "success", "minor-gc": "success", "verify-gen": "success"
+        }
+        # continue-on-error reports success; the execution output carries the failure.
+        needs["campfire-latest"] = {"result": "success", "outputs": {"execution": "failure"}}
+        failures, complete = ci.check_results(plan, needs)
+        self.assertEqual(failures, [])
+        self.assertFalse(complete)
+
     def test_spinel_compact_gate_only_requires_publication_floor(self):
         plan = ci.select([], spinel_lane=True)
         needs = {

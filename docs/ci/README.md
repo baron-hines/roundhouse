@@ -25,14 +25,18 @@ advisory jobs and the scheduled Full cycle for the multi-target ledger.
 | **Draft or ready** + `ci:spinel` | Ruby floor plus the **CORE** Spinel lane (required for that run) |
 | **Draft or ready** + focus label(s) | Ruby floor plus **only** the selected focus lanes (required) |
 | **Draft or ready** + `ci:full` | Full validation (all targets, WASM, Writebook, Spinel); extras stay advisory |
-| **Push to canonical `main`** | Ruby floor plus the full Spinel suite (advisory); extra-language SDKs wait for the schedule |
+| **Push to canonical `main`** | Ruby floor plus the full Spinel suite and `campfire-latest` (both advisory); extra-language SDKs wait for the schedule |
 | **Scheduled / manual Full validation** | Full validation (the extra-language ledger and publication cycle) |
 
 PRs without a special label run a Ruby floor: fixture preparation, unit
 tests, Store analysis, the CRuby comparison against Rails (on `MRI_RUBY`, the
 supported minimum, with its runtime gates repeated on `MRI_RUBY_NEXT` in
 `compare-ruby-next`), and Campfire
-conformance/comparison. Four unit shards cover all package test targets in
+conformance/comparison. Campfire conformance is pinned (`CAMPFIRE_SHA`)
+and blocking; `campfire-latest` runs the same suite against
+basecamp/once-campfire `main` on that app's own Ruby after every merge to
+`main` and on Full, advisory, and its job summary reports ingest gaps,
+strict-emit errors and tests against the pinned floor. Four unit shards cover all package test targets in
 bounded batches; ignored integrations need selected toolchain lanes. Framework
 and toolchain suites also run inside comparison jobs, not necessarily as
 standalone checks. **Spinel is not part of `BASE`.**
