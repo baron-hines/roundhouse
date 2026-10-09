@@ -94,3 +94,18 @@ end
         .run_test("test/controllers/shouts_controller_test.rb")
         .assert_passes();
 }
+
+/// A destructured parameter beside an optional one: the destructuring
+/// binds through a temp (`destructure_block_params`) and the default
+/// stays in the signature, in a `->` literal and in a block alike.
+#[test]
+fn a_destructured_parameter_beside_a_default_runs() {
+    super::emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def self.destructured_defaults\n    pair = ->((a, b), scale = 10) { (a.to_i + b.to_i) * scale.to_i }\n    [pair.call([1, 2]), pair.call([1, 2], 2), [[3, 4]].map { |(a, b), bonus = 1| a.to_i * b.to_i + bonus.to_i }.sum].join(\"|\")\n  end\n",
+        )
+        .run_ruby("got = Article.destructured_defaults\nraise \"expected 30|6|4, got #{got}\" unless got == \"30|6|4\"\nputs \"ok\"\n")
+        .assert_passes();
+}
