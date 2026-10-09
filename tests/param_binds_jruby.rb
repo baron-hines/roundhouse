@@ -3,6 +3,7 @@
 # Requires JRuby 10+ and the jdbc-sqlite3 gem.
 raise "JRuby required" unless RUBY_ENGINE == "jruby"
 
+require_relative "../runtime/ruby/active_record/errors"
 require_relative "../runtime/spinel/db_jruby"
 require_relative "../runtime/spinel/test/statement_cache_cases"
 

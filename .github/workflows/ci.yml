@@ -1044,7 +1044,15 @@ jobs:
           test -n "$TESTS"
           status=0
           for suite in $TESTS; do
-            cargo test --test "$suite" -- --ignored --nocapture || status=1
+            case "$suite" in
+              param_binds|param_binds_values|param_binds_cleanup)
+                # These suites also contain JRuby tests, run in compare-jruby.
+                cargo test --test "$suite" -- --ignored --nocapture _spinel || status=1
+                ;;
+              *)
+                cargo test --test "$suite" -- --ignored --nocapture || status=1
+                ;;
+            esac
           done
           exit "$status"
       - *advisory-result
