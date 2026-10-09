@@ -288,6 +288,22 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         // record itself (not `Self | Nil` like `find_by`).
         return_kind: Some(ReturnKind::SelfType),
     },
+    // `sole` / `find_sole_by` (Rails 7.0) raise unless exactly one row
+    // matches, so they answer the record itself, like `find_by!`.
+    CatalogedMethod {
+        name: "sole",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
     // `find_or_initialize_by` reads, and on a miss builds an unsaved
     // instance in memory — a SELECT with no write either way.
     CatalogedMethod {
@@ -702,7 +718,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::Int),
     },
     CatalogedMethod {
         name: "insert",
@@ -849,6 +865,34 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         effect: EffectClass::DbRead,
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    // `#lock!` (`ActiveRecord::Locking::Pessimistic`) reloads with a
+    // row lock and answers the reloaded record — on sqlite (single
+    // writer, no `SELECT … FOR UPDATE` support) the runtime
+    // implements it as a plain `reload`, so it shares `reload`'s
+    // classification exactly: DbRead effect, `() -> Base` per the
+    // shared-runtime-method sidecar convention (see `save!` above;
+    // `lock!` is `Base#lock!`, not monomorphized per model).
+    CatalogedMethod {
+        name: "lock!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    // `#with_lock` runs `lock!` then yields inside a transaction,
+    // answering the block's value — same gradual escape as
+    // `ActiveRecord::Base.transaction` (`analyze/registry/ar.rs`):
+    // the return type isn't statically tracked, so `Untyped`. Its
+    // own direct effect (before the block's statements are visited
+    // and classified independently) is the `lock!` read; any writes
+    // the block performs attach to their own Send nodes.
+    CatalogedMethod {
+        name: "with_lock",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Untyped),
     },
     // ---- Instance-method state predicates ----
     // Pure — query in-memory flags the record already carries.
@@ -1456,6 +1500,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::SelfType),
     },
     CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
         name: "first!",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
@@ -1839,7 +1890,7 @@ mod tests {
         // SqliteAdapter classified as Read must still be in the
         // catalog as DbRead under at least one receiver context.
         for m in [
-            "all", "find", "find_by", "find_by!", "first", "last",
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
             "where", "limit", "offset", "order", "group", "having",
             "joins", "includes", "preload", "select", "distinct",
             "count", "exists?", "pluck", "pick", "take",
@@ -1897,7 +1948,7 @@ mod tests {
     #[test]
     fn terminal_reads_are_classified() {
         for m in [
-            "all", "find", "find_by", "find_by!", "first", "last",
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
             "take", "count", "exists?", "pluck", "pick",
             "sum", "average", "maximum", "minimum",
         ] {
