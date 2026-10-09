@@ -3727,7 +3727,8 @@ fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr:
     if !super::controller::is_lambda_filter_macro(method.as_str()) {
         return None;
     }
-    let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = &*blk.node else {
+    let ExprNode::Lambda { params, rest_param, block_param, extra_params, body, block_style } = &*blk.node
+    else {
         return None;
     };
     // Only options may ride beside a block target, and only options
@@ -3779,7 +3780,7 @@ fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr:
             }
         }
     }
-    if rest_param.is_some() || block_param.is_some() || params.len() > 1 {
+    if rest_param.is_some() || block_param.is_some() || !extra_params.is_empty() || params.len() > 1 {
         return None;
     }
 
@@ -3830,6 +3831,7 @@ fn block_filter_from_macro_stmt(stmt: &crate::expr::Expr) -> Option<crate::expr:
                     params: vec![],
                     rest_param: None,
                     block_param: None,
+                    extra_params: Vec::new(),
                     body,
                     block_style: block_style.clone(),
                 },
