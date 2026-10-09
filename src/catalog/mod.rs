@@ -866,6 +866,34 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
     },
+    // `#lock!` (`ActiveRecord::Locking::Pessimistic`) reloads with a
+    // row lock and answers the reloaded record — on sqlite (single
+    // writer, no `SELECT … FOR UPDATE` support) the runtime
+    // implements it as a plain `reload`, so it shares `reload`'s
+    // classification exactly: DbRead effect, `() -> Base` per the
+    // shared-runtime-method sidecar convention (see `save!` above;
+    // `lock!` is `Base#lock!`, not monomorphized per model).
+    CatalogedMethod {
+        name: "lock!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    // `#with_lock` runs `lock!` then yields inside a transaction,
+    // answering the block's value — same gradual escape as
+    // `ActiveRecord::Base.transaction` (`analyze/registry/ar.rs`):
+    // the return type isn't statically tracked, so `Untyped`. Its
+    // own direct effect (before the block's statements are visited
+    // and classified independently) is the `lock!` read; any writes
+    // the block performs attach to their own Send nodes.
+    CatalogedMethod {
+        name: "with_lock",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Untyped),
+    },
     // ---- Instance-method state predicates ----
     // Pure — query in-memory flags the record already carries.
     // `#persisted?` / `#new_record?` check loaded state;

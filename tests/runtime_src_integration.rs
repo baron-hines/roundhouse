@@ -816,7 +816,18 @@ fn every_runtime_method_body_concretely_typed() {
     // block/return gradual after `sec: Integer | Float` — polymorphic yield.
     // `AttachedMany#attachments` stays typed via raw SQL + ManyAttachment
     // (not Relation over the synthesized Attachment MODEL).
-    const CEILING: usize = 304;
+    // `ActiveRecord::Base#with_lock` (#644) adds 1: its block's return
+    // value is gradual, same `untyped` escape as `self.transaction`'s
+    // block value (`lock!` itself stays concretely typed — it's a
+    // plain `reload`).
+    // `with_lock`'s Rails 8.1 options split (#671) adds 5: the trailing
+    // transaction-options Hash this runtime doesn't carry
+    // `extract_options!` for is read by hand (`transaction_opts[:iso
+    // lation]`, `[:requires_new]`, `.key?(:joinable) ? [:joinable] :
+    // true`), and each `Hash[Symbol, untyped]` value read is gradual —
+    // same shape `connection.rb`'s other `opts`-style Hash call sites
+    // already carry.
+    const CEILING: usize = 310;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
