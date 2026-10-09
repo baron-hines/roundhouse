@@ -364,6 +364,50 @@ pub const RECORD_SNAPSHOT: Contract = Contract {
     store.read_multi("key")["key"] == "cached"
   end
 
+  def self.mutable_values
+    store = ActiveSupport::Cache::MemoryStore.new
+    original = { "items" => [ "cached" ] }
+    store.write("nested", original)
+    size = store.inspect
+    original["items"] << "caller mutation"
+    read = store.read("nested")
+    read["items"] << "read mutation"
+    [ store.read("nested"), store.inspect == size ]
+  end
+
+  def self.hash_defaults
+    store = ActiveSupport::Cache::MemoryStore.new
+    original = Hash.new([ "fallback" ])
+    store.write("default", original)
+    original.default << "caller mutation"
+    read = store.read("default")
+    read.default << "read mutation"
+    rejected_proc = begin
+      store.write("proc", Hash.new { |hash, key| hash[key] = key })
+      false
+    rescue ArgumentError
+      true
+    end
+    identity = {}.compare_by_identity
+    identity["same".dup] = 1
+    identity["same".dup] = 2
+    rejected_identity = begin
+      store.write("identity", identity)
+      false
+    rescue ArgumentError
+      true
+    end
+    cycle = []
+    cycle << cycle
+    rejected_cycle = begin
+      store.write("cycle", cycle)
+      false
+    rescue ArgumentError
+      true
+    end
+    [ store.read("default")["missing"], rejected_proc, rejected_identity, rejected_cycle ]
+  end
+
   def self.key
     ActiveSupport::Cache.expand_cache_key([ "record-snapshot-v1", [ "db", "ns", 3 ], [ "session", "abc" ] ])
   end
@@ -380,6 +424,8 @@ puts RecordSnapshotProbe.unknown_name
 puts RecordSnapshotProbe.bounds.inspect
 puts RecordSnapshotProbe.fetching.inspect
 puts RecordSnapshotProbe.read_multi_race
+puts RecordSnapshotProbe.mutable_values.inspect
+puts RecordSnapshotProbe.hash_defaults.inspect
 puts RecordSnapshotProbe.key
 "#
     ),
@@ -389,6 +435,8 @@ puts RecordSnapshotProbe.key
         "[true, false, true]\n",
         "[\"computed\", \"computed\", \"filed\", true, true]\n",
         "true\n",
+        "[{\"items\" => [\"cached\"]}, true]\n",
+        "[[\"fallback\"], true, true, true]\n",
         "record-snapshot-v1/db/ns/3/session/abc\n",
     ),
 };
@@ -474,8 +522,8 @@ end
 /// only from the block result for that same key. A manually seeded or
 /// colliding snapshot with a different shape is outside this contract.
 pub const CACHE_THROUGH: Contract = Contract {
-    path: "app/models/cache_through_probe.rb",
-    source: r##"class CacheThroughProbe
+    path: "app/models/record_cache.rb",
+    source: r##"class RecordCache
   STORE = ActiveSupport::Cache::MemoryStore.new
 
   def self.fetch(key)
@@ -513,11 +561,11 @@ end
         "end\n",
         r#"article = Article.create!(title: "Cached", body: "A sufficiently long article body.")
 Comment.create!(article_id: article.id, commenter: "Reader", body: "First comment")
-puts CacheThroughProbe.pair(article.id).inspect
+puts RecordCache.pair(article.id).inspect
 ActiveRecord::Base.connection.execute("UPDATE articles SET title = 'Renamed' WHERE id = #{article.id}")
-puts CacheThroughProbe.pair(article.id).inspect
-puts [ CacheThroughProbe.article_record(article.id).class.name, CacheThroughProbe.comment_record(article.id).class.name ].inspect
-puts [ CacheThroughProbe.article_record(article.id).class.name, CacheThroughProbe.comment_record(article.id).class.name ].inspect
+puts RecordCache.pair(article.id).inspect
+puts [ RecordCache.article_record(article.id).class.name, RecordCache.comment_record(article.id).class.name ].inspect
+puts [ RecordCache.article_record(article.id).class.name, RecordCache.comment_record(article.id).class.name ].inspect
 "#
     ),
     expected: concat!(

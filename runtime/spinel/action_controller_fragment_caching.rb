@@ -39,23 +39,25 @@
 module ActionController
   class Base
     def self.perform_caching
-      return @perform_caching if instance_variable_defined?(:@perform_caching)
+      return @perform_caching if @perform_caching_assigned
       return true if self == ActionController::Base
       superclass.perform_caching
     end
 
     def self.perform_caching=(value)
       @perform_caching = value
+      @perform_caching_assigned = true
     end
 
     def self.cache_store
-      return @cache_store if instance_variable_defined?(:@cache_store)
+      return @cache_store if @cache_store_assigned
       return Rails.cache if self == ActionController::Base
       superclass.cache_store
     end
 
     def self.cache_store=(store)
       @cache_store = store
+      @cache_store_assigned = true
     end
 
     def perform_caching

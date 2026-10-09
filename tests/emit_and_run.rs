@@ -2904,6 +2904,8 @@ fn assert_cached_collection_probe(n: i64, second: i64) {
 Article.delete_all
 {n}.times {{ |i| Article.create!(title: "row-#{{i}}", body: "long enough body") }}
 rows = ActiveRecord::Relation.new(Article).to_a.sort_by {{ |a| a.title }}
+ActionController::Base.perform_caching = true
+ActionController::Current.controller = ActionController::Base.new
 Article.reset_render_count
 a = Views::Articles.probe(rows)
 raise "first #{{Article.render_count}}: #{{a}}" unless Article.render_count == {n}

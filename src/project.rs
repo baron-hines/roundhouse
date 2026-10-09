@@ -4534,6 +4534,36 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
 /// hold.
 const RUBY_SPINEL_ONLY_INSTANCE_METHODS: &[&str] = &["attributes_before_type_cast"];
 
+/// True only for an application model instance (including nullable model
+/// unions) that does not define its own method with this spelling.
+fn is_unported_model_instance_method(
+    recv: &crate::expr::Expr,
+    method: &str,
+    app: &App,
+) -> bool {
+    fn model_ids(ty: &crate::ty::Ty, out: &mut Vec<crate::ident::ClassId>) {
+        match ty {
+            crate::ty::Ty::Class { id, .. } => out.push(id.clone()),
+            crate::ty::Ty::Union { variants } => {
+                for variant in variants {
+                    model_ids(variant, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    if matches!(&*recv.node, crate::expr::ExprNode::Const { .. }) {
+        return false;
+    }
+    let Some(ty) = &recv.ty else { return false };
+    let mut ids = Vec::new();
+    model_ids(ty, &mut ids);
+    ids.iter().any(|id| {
+        app.models.iter().any(|model| model.name == *id)
+            && !crate::analyze::source_instance_method(app, id, method)
+        })
+}
+
 /// True when the app already defines `id` as a class/module value, so
 /// the availability gate must not ledger it as a missing runtime stub.
 fn app_defines_class(app: &App, id: &crate::ident::ClassId) -> bool {
@@ -4606,11 +4636,12 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
             }
         }
-        if let crate::expr::ExprNode::Send { recv: Some(_), method, .. } = &*expr.node
+        if let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
             && target != "spinel"
             && target != "jruby"
             && !expr.span.is_synthetic()
             && RUBY_SPINEL_ONLY_INSTANCE_METHODS.contains(&method.as_str())
+            && is_unported_model_instance_method(recv, method.as_str(), app)
         {
             emit::diagnostics::report_unsupported(
                 expr.span,
@@ -5808,6 +5839,7 @@ const GEM_REQUIRES: &[&str] = &[
     "parslet",
     "typeid",
     "rqrcode",
+    "rqrcode_core",
     "SVG/Graph/TimeSeries",
     "sentry-ruby",
     "rails-html-sanitizer",
@@ -6091,7 +6123,7 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 15] = [
+    const RUNTIME_GEMS: [(Marker, &str); 16] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6101,6 +6133,7 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
         (Marker::Constant("Parslet"), "parslet"),
         (Marker::Constant("TypeID"), "typeid"),
         (Marker::Constant("RQRCode"), "rqrcode"),
+        (Marker::Constant("RQRCodeCore"), "rqrcode_core"),
         // campfire's web push builds one `Net::HTTP::Persistent` pool
         // per process (`WebPush::Pool`), and the gem went undeclared
         // exactly as bcrypt did — the façade names the constant and
@@ -8058,6 +8091,59 @@ fn walk_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_instance_method_gate_is_scoped_to_model_receivers() {
+        use crate::expr::{Expr, ExprNode};
+        use crate::ident::{ClassId, Symbol};
+        use crate::span::Span;
+        use crate::ty::Ty;
+
+        let tree = [
+            ("app/models/article.rb", "class Article < ApplicationRecord; end\n"),
+            ("app/models/custom.rb", "class Custom < ApplicationRecord\n  def attributes_before_type_cast; {}; end\nend\n"),
+            ("app/models/parent.rb", "class Parent < ApplicationRecord\n  def attributes_before_type_cast; {}; end\nend\n"),
+            ("app/models/child.rb", "class Child < Parent; end\n"),
+            ("app/models/concerns/raw_values.rb", "module RawValues\n  def attributes_before_type_cast; {}; end\nend\n"),
+            ("app/models/included.rb", "class Included < ApplicationRecord\n  include RawValues\nend\n"),
+            ("app/services/probe.rb", "class Probe; end\n"),
+        ].into_iter().map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec())).collect();
+        let mut app = crate::ingest::ingest_app_from_tree(tree).unwrap();
+        let mut empty_reopen = app.library_classes.iter()
+            .find(|class| class.name.0.as_str() == "RawValues")
+            .unwrap().clone();
+        empty_reopen.methods.clear();
+        app.library_classes.insert(0, empty_reopen);
+        let receiver = |node, ty| {
+            let mut expr = Expr::new(Span::synthetic(), node);
+            expr.ty = Some(ty);
+            expr
+        };
+        let receiver_for = |name: &str| {
+            receiver(ExprNode::Var {
+                id: crate::ident::VarId(0),
+                name: Symbol::new("receiver"),
+            }, Ty::Class { id: ClassId(Symbol::new(name)), args: vec![] })
+        };
+
+        assert!(is_unported_model_instance_method(&receiver_for("Article"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Probe"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Custom"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Child"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Included"), "attributes_before_type_cast", &app));
+        assert!(is_unported_model_instance_method(
+            &receiver(ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::new("receiver") },
+                Ty::Union { variants: vec![Ty::Class { id: ClassId(Symbol::new("Article")), args: vec![] }, Ty::Nil] }),
+            "attributes_before_type_cast",
+            &app,
+        ));
+        assert!(!is_unported_model_instance_method(
+            &receiver(ExprNode::Const { path: vec![Symbol::new("Article")] },
+                Ty::Class { id: ClassId(Symbol::new("Article")), args: vec![] }),
+            "attributes_before_type_cast",
+            &app,
+        ));
+    }
 
     #[test]
     fn bundled_constant_gate_covers_auxiliary_emitted_roots() {

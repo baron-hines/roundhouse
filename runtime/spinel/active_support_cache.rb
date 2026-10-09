@@ -22,9 +22,11 @@
 # NOT HERE: entry options (`expires_in:`, `version:`, `race_condition_ttl:`,
 # `namespace:`) — a call passing one raises ArgumentError rather than
 # being cached with the option ignored; `increment`/`decrement`;
-# instrumentation (`cache_read.active_support`). A non-String value is
-# counted by its `to_s` bytes, where Rails counts its Marshal dump, and is
-# stored as itself rather than as a Marshal copy.
+# instrumentation (`cache_read.active_support`). Non-String values are
+# limited to recursively copied Arrays/Hashes and immutable scalars; other
+# object types fail closed rather than being retained by reference. Rails
+# counts a Marshal dump for non-Strings; this port counts the copied value's
+# `to_s` bytes.
 #
 # A SUBCLASS OF `Rails::Cache`, so one stands wherever the runtime's own
 # store does: campfire's caching tests assign a fresh MemoryStore to
@@ -156,8 +158,30 @@ module ActiveSupport
         "#<ActiveSupport::Cache::MemoryStore entries=#{@data.size}, size=#{@cache_size}>"
       end
 
-      def self.copy(value)
-        value.is_a?(String) ? value.dup : value
+      def self.copy(value, ancestors = [])
+        return value.dup if value.instance_of?(String)
+        if value.instance_of?(Array)
+          raise ArgumentError, "MemoryStore cannot safely copy a recursive value" if ancestors.any? { |ancestor| ancestor.equal?(value) }
+          ancestors << value
+          out = value.map { |item| MemoryStore.copy(item, ancestors) }
+          ancestors.pop
+          return out
+        end
+        if value.instance_of?(Hash)
+          raise ArgumentError, "MemoryStore cannot safely copy a recursive value" if ancestors.any? { |ancestor| ancestor.equal?(value) }
+          raise ArgumentError, "MemoryStore cannot safely copy an identity Hash" if value.compare_by_identity?
+          raise ArgumentError, "MemoryStore cannot safely copy a Hash with a default proc" if value.default_proc
+          ancestors << value
+          out = Hash.new(MemoryStore.copy(value.default, ancestors))
+          value.each do |key, item|
+            out[MemoryStore.copy(key, ancestors)] = MemoryStore.copy(item, ancestors)
+          end
+          ancestors.pop
+          return out
+        end
+        return value if value.nil? || value.equal?(true) || value.equal?(false)
+        return value if value.instance_of?(Integer) || value.instance_of?(Float) || value.instance_of?(Symbol)
+        raise ArgumentError, "MemoryStore cannot safely copy this value type"
       end
 
       def self.bytes(value)

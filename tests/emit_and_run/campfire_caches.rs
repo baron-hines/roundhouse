@@ -219,6 +219,6 @@ fn a_cache_through_method_answers_its_blocks_value_on_hit_and_miss() {
     let run = contract::CACHE_THROUGH.overlay().run_ruby(contract::CACHE_THROUGH.script);
     run.assert_passes();
     assert_eq!(run.stdout, contract::CACHE_THROUGH.expected, "stderr:\n{}", run.stderr);
-    let rbs = std::fs::read_to_string(run.emitted.join("sig/app/models/cache_through_probe.rbs")).unwrap();
+    let rbs = std::fs::read_to_string(run.emitted.join("sig/app/models/record_cache.rbs")).unwrap();
     contract::assert_cache_through_signature(&rbs);
 }

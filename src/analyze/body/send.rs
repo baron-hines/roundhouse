@@ -251,6 +251,21 @@ impl<'a> BodyTyper<'a> {
                 }
             }
         }
+        // `Thread.new(state) { |state| ... }` forwards constructor
+        // arguments to the block. Unlike iterator methods, the yielded
+        // values come from this call's positional arguments rather than
+        // from the receiver's element type.
+        if class_object_receiver
+            && matches!(method.as_str(), "new")
+            && matches!(recv_ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "Thread")
+        {
+            for (name, arg) in params.iter().zip(args.iter()) {
+                if let Some(ty) = &arg.ty {
+                    new_ctx.local_bindings.insert(name.clone(), ty.clone());
+                }
+            }
+            return new_ctx;
+        }
         // Untyped receiver: bind every block param to `Untyped` (the
         // gradual choice extends to the destructured params). Without
         // this, `untyped_hash.each { |k, v| ... }` would give k=Untyped

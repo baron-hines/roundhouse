@@ -4651,7 +4651,7 @@ impl Analyzer {
         for model in &app.models {
             for method in model.methods() {
                 let bp = method.block_param.as_ref().map(|p| &p.name);
-                if self.returns_block_value(&model.name, &method.body, bp) {
+                if self.returns_block_value(&model.name, &method.name, &method.body, bp) {
                     found.push((model.name.clone(), method.name.clone()));
                 }
             }
@@ -4659,14 +4659,19 @@ impl Analyzer {
         for lc in &app.library_classes {
             for method in &lc.methods {
                 let bp = method.block_param.as_ref().map(|p| &p.name);
-                if self.returns_block_value(&lc.name, &method.body, bp) {
+                if self.returns_block_value(&lc.name, &method.name, &method.body, bp) {
                     found.push((lc.name.clone(), method.name.clone()));
                 }
             }
         }
         for controller in &app.controllers {
             for action in controller.actions() {
-                if self.returns_block_value(&controller.name, &action.body, action.block_param.as_ref()) {
+                if self.returns_block_value(
+                    &controller.name,
+                    &action.name,
+                    &action.body,
+                    action.block_param.as_ref(),
+                ) {
                     found.push((controller.name.clone(), action.name.clone()));
                 }
             }
@@ -5102,9 +5107,15 @@ impl Analyzer {
     /// value (see `ClassInfo::block_value_methods`). A raising arm
     /// returns nothing and does not count against it; a `return` off
     /// the tail must pass the same test, or the walk declines.
-    fn returns_block_value(&self, owner: &ClassId, body: &Expr, block_param: Option<&Symbol>) -> bool {
+    fn returns_block_value(
+        &self,
+        owner: &ClassId,
+        method: &Symbol,
+        body: &Expr,
+        block_param: Option<&Symbol>,
+    ) -> bool {
         let leaves = return_leaves(body);
-        // A cache-through method (campfire's `RecordCache.fetch`) answers
+        // Only campfire's explicit `RecordCache#fetch` contract answers
         // its block's value, a local that only ever holds it, or — on a
         // hit — the records a snapshot of that value rebuilds:
         // `….map { |name, attrs| name.constantize.instantiate(attrs) }`
@@ -5120,7 +5131,10 @@ impl Analyzer {
         // cache-through contract test exercises miss/hit reconstruction,
         // ordering, and distinct Article/Comment keys.
         let yield_locals = yield_only_locals(body);
+        let record_cache_fetch = method.as_str() == "fetch"
+            && matches!(owner.0.as_str(), "RecordCache" | "Campfire::RecordCache");
         let rebuild = |leaf: &Expr| {
+            record_cache_fetch &&
             matches!(&*leaf.node, ExprNode::Send { method, block: Some(b), .. }
                 if method.as_str() == "map"
                     && matches!(&*b.node, ExprNode::Lambda { body, .. }
@@ -7294,6 +7308,48 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
         }
     }
     out
+}
+
+/// Whether an application-defined instance method is available on a source
+/// class through its own definition, parent chain, or included modules.
+pub(crate) fn source_instance_method(app: &App, owner: &ClassId, name: &str) -> bool {
+    fn lookup(app: &App, owner: &ClassId, name: &str, seen: &mut BTreeSet<ClassId>) -> bool {
+        if !seen.insert(owner.clone()) {
+            return false;
+        }
+        if let Some(model) = app.models.iter().find(|model| &model.name == owner) {
+            if model.methods().any(|method| {
+                method.receiver == crate::dialect::MethodReceiver::Instance
+                    && method.name.as_str() == name
+            }) {
+                return true;
+            }
+            return model
+                .parent
+                .as_ref()
+                .is_some_and(|parent| lookup(app, parent, name, seen))
+                || model_includes(model)
+                    .iter()
+                    .any(|include| lookup(app, include, name, seen));
+        }
+        app.library_classes
+            .iter()
+            .filter(|class| &class.name == owner)
+            .any(|class| {
+                class.methods.iter().any(|method| {
+                    method.receiver == crate::dialect::MethodReceiver::Instance
+                        && method.name.as_str() == name
+                }) || class
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| lookup(app, parent, name, seen))
+                    || class
+                        .includes
+                        .iter()
+                        .any(|include| lookup(app, include, name, seen))
+            })
+    }
+    lookup(app, owner, name, &mut BTreeSet::new())
 }
 
 /// `**{k: v, …}.merge(h)`, `h` a `Hash[Symbol, V]` and the literal's
