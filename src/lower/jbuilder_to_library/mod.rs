@@ -769,11 +769,10 @@ fn emit_object_filled(raw_stmts: &[&Expr], ctx: &Ctx) -> (Vec<Expr>, bool) {
 /// the walker writes as an empty append (`JbStmt::Unknown`).
 fn has_unlowered(stmts: &[&Expr], ctx: &Ctx) -> bool {
     stmts.iter().any(|s| match classify(s) {
-        JbStmt::Unknown
-        | JbStmt::ArrayPartial { .. }
-        | JbStmt::ArrayBlock { .. }
-        | JbStmt::Partial { .. }
-        | JbStmt::PartialRecord { .. } => true,
+        JbStmt::Unknown | JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } => true,
+        JbStmt::PartialRecord { arg, as_name } => {
+            record_partial_path(arg, as_name.as_ref(), &ctx.resource_dir, &ctx.models).is_none()
+        }
         JbStmt::Cond { then_branch, else_branch, .. } => {
             has_unlowered(&branch_stmts(then_branch), ctx) || has_unlowered(&branch_stmts(else_branch), ctx)
         }
@@ -826,6 +825,48 @@ fn push_separator(out: &mut Vec<Expr>, ctx: &Ctx, sep: Sep) {
             ));
         }
     }
+}
+
+/// The pairs of a partial rendered inside an object, merged into it:
+///
+///   io_part0 = Views::Widgets.gadget_json(gadget)
+///   if io_part0.length > 2
+///     io << "," if !(io.end_with?("{"))
+///     io << io_part0[1, io_part0.length - 2]
+///   end
+///
+/// The partial's object without its braces is its pairs; a partial that
+/// sets nothing renders `{}` and adds none. Answers the comma state
+/// after it.
+fn emit_merged_partial(call: Expr, ctx: &Ctx, out: &mut Vec<Expr>, sep: Sep) -> Sep {
+    let n = ctx.key_marks.get();
+    ctx.key_marks.set(n + 1);
+    let part = Symbol::from(format!("{}_part{n}", ctx.accumulator));
+    out.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign { target: LValue::Var { id: VarId(0), name: part.clone() }, value: call },
+    ));
+    let length = || send(Some(var_ref(part.clone())), "length", Vec::new(), None, false);
+    let int = |value: i64| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value } });
+    let mut then = Vec::new();
+    push_separator(&mut then, ctx, sep);
+    let inner = send(
+        Some(var_ref(part.clone())),
+        "[]",
+        vec![int(1), send(Some(length()), "-", vec![int(2)], None, false)],
+        None,
+        false,
+    );
+    then.push(io_append_call(&ctx.accumulator, inner));
+    out.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send(Some(length()), ">", vec![int(2)], None, false),
+            then_branch: seq(then),
+            else_branch: seq(Vec::new()),
+        },
+    ));
+    if sep == Sep::After { Sep::After } else { Sep::Unknown }
 }
 
 /// A statement the lowering cannot write, carrying the report: the
@@ -993,13 +1034,29 @@ fn emit_pairs(
                 out.extend(emit_array_block(collection, item_var, body, ctx));
                 sep = Sep::After;
             }
-            JbStmt::ArrayPartial { .. }
-            | JbStmt::Partial { .. }
-            | JbStmt::ArrayBlock { .. }
-            | JbStmt::PartialRecord { .. } => {
-                // These shouldn't appear in an object template, but if
-                // they do (mixed with pair-emitting stmts), drop a
-                // TODO marker rather than emit malformed JSON.
+            // `json.partial!` next to pairs, or under a condition: the
+            // partial renders into the same object, so its pairs join
+            // this one's.
+            JbStmt::Partial { partial_path, locals } => {
+                let locals = locals
+                    .iter()
+                    .map(|(k, v)| (k.clone(), rewrite_h_escape(&rewrite_route_helpers(v, ctx))))
+                    .collect();
+                sep = emit_merged_partial(partial_call(partial_path, locals, ctx), ctx, out, sep);
+            }
+            JbStmt::PartialRecord { arg, as_name } => {
+                match record_partial_path(arg, as_name.as_ref(), &ctx.resource_dir, &ctx.models) {
+                    Some((partial_path, local)) => {
+                        let call = partial_call(&partial_path, vec![(local, (*arg).clone())], ctx);
+                        sep = emit_merged_partial(call, ctx, out, sep);
+                    }
+                    None => out.push(io_append_lit(&ctx.accumulator, "")),
+                }
+            }
+            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } => {
+                // An array is not merged into an object (jbuilder raises
+                // a MergeError once the object has a pair): drop a
+                // marker rather than emit malformed JSON.
                 out.push(io_append_lit(&ctx.accumulator, ""));
             }
             JbStmt::Cond { cond, then_branch, else_branch } => {
@@ -1257,9 +1314,6 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
             // `partial:` before it looks at a block.
             if args.len() == 1 {
                 if let Some((item_var, body)) = item_block(block) {
-                    if !element_body_supported(body) {
-                        return JbStmt::Unknown;
-                    }
                     return JbStmt::ArrayBlock { collection, item_var, body };
                 }
             }
@@ -1414,9 +1468,6 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
             let Some((item_var, body)) = item_block(block) else {
                 return JbStmt::Unknown;
             };
-            if !element_body_supported(body) {
-                return JbStmt::Unknown;
-            }
             JbStmt::PairBlock {
                 key: Symbol::from(key),
                 collection: &args[0],
@@ -1466,45 +1517,6 @@ fn item_block(block: &Option<Expr>) -> Option<(Symbol, &Expr)> {
         return None;
     };
     Some((item_var.clone(), body))
-}
-
-/// Whether a collection block's body lowers to the element Jbuilder
-/// builds. A lone `json.partial!` is the element; a partial next to
-/// other statements (or under a branch) renders into the same element
-/// in Jbuilder, which the object walker cannot do yet: it writes a
-/// partial there as an empty append and the element would lose the
-/// partial's fields. Such a body is reported as unsupported and the
-/// statement stays Unknown, rather than lowered without them. The same
-/// holds for a partial inside a nested `json.<key> do … end` object of
-/// the element, which the object walker writes the same way.
-fn element_body_supported(body: &Expr) -> bool {
-    fn has_partial(stmts: &[&Expr]) -> bool {
-        stmts.iter().any(|s| match classify(s) {
-            JbStmt::Partial { .. } => true,
-            JbStmt::Cond { then_branch, else_branch, .. } => {
-                has_partial(&branch_stmts(then_branch)) || has_partial(&branch_stmts(else_branch))
-            }
-            JbStmt::Nested { body, .. } => has_partial(&flatten_cache_blocks(stmts_of(body))),
-            JbStmt::Guarded { body, rescues } => {
-                has_partial(&branch_stmts(body))
-                    || rescues.iter().any(|r| has_partial(&branch_stmts(&r.body)))
-            }
-            _ => false,
-        })
-    }
-    let stmts = flatten_cache_blocks(stmts_of(body));
-    if stmts.len() == 1 && matches!(classify(stmts[0]), JbStmt::Partial { .. }) {
-        return true;
-    }
-    if !has_partial(&stmts) {
-        return true;
-    }
-    crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
-        file: String::new(),
-        message: "jbuilder: a collection block that mixes `json.partial!` with other statements is not compiled"
-            .to_string(),
-    });
-    false
 }
 
 /// `json` parsed as a bare method call: `Send { recv: None, method:
