@@ -36,6 +36,8 @@ mod delegate_association;
 mod io_process_constants_contract;
 #[path = "emit_and_run/io_process_constants.rs"]
 mod io_process_constants;
+#[path = "emit_and_run/helper_anonymous_rest.rs"]
+mod helper_anonymous_rest;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
 
