@@ -261,6 +261,90 @@ end
 }
 
 #[test]
+fn a_nested_filter_macro_is_not_inlined_when_an_included_concern_overrides_it() {
+    let tree = [
+        (
+            "app/controllers/concerns/authentication.rb",
+            r#"
+module Authentication
+  extend ActiveSupport::Concern
+  class_methods do
+    def require_unauthenticated_access(**options)
+      allow_unauthenticated_access **options
+      before_action :redirect_signed_in_user_to_root, **options
+    end
+    def allow_unauthenticated_access(**options)
+      skip_before_action :require_authentication, **options
+    end
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/concerns/locked_down_policy.rb",
+            r#"
+module LockedDownPolicy
+  extend ActiveSupport::Concern
+  class_methods do
+    def allow_unauthenticated_access(**options)
+      before_action :require_authentication, **options
+    end
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ActionController::Base\n include Authentication\n include LockedDownPolicy\n require_unauthenticated_access only: :new\nend\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+
+    let app = ingest_app_from_tree(tree).expect("ambiguous macro stays an ingest gap");
+    assert!(filters(&app).is_empty(), "refusal must not inline either policy: {:?}", filters(&app));
+    assert!(app.controllers[0].body.iter().any(|item| matches!(
+        item,
+        ControllerBodyItem::Unknown { expr, .. }
+            if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
+                if method.as_str() == "require_unauthenticated_access")
+    )));
+}
+
+#[test]
+fn nested_filter_macro_expansion_has_a_total_work_budget() {
+    let mut methods = String::from("def macro_0\n before_action :authenticate\nend\n");
+    for index in 1..15 {
+        methods.push_str(&format!(
+            "def macro_{index}\n macro_{}\n macro_{}\nend\n",
+            index - 1,
+            index - 1
+        ));
+    }
+    let concern = format!(
+        "module ExpandingConcern\n extend ActiveSupport::Concern\n class_methods do\n{methods} end\nend\n"
+    );
+    let controller = "class ThingsController < ActionController::Base\n include ExpandingConcern\n macro_14\nend\n";
+    let tree = [
+        ("app/controllers/concerns/expanding_concern.rb", concern.as_str()),
+        ("app/controllers/things_controller.rb", controller),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+
+    let app = ingest_app_from_tree(tree).expect("over-budget macro stays an ingest gap");
+    assert!(filters(&app).is_empty(), "refusal must not partially expand");
+    assert!(app.controllers[0].body.iter().any(|item| matches!(
+        item,
+        ControllerBodyItem::Unknown { expr, .. }
+            if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
+                if method.as_str() == "macro_14")
+    )));
+}
+
+#[test]
 fn a_controller_without_the_macro_keeps_the_filter() {
     let app = app_with(
         r#"

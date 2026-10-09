@@ -204,6 +204,43 @@ impl<'a> BodyTyper<'a> {
         self.classes().get(model)?.instance_methods.get(col).cloned()
     }
 
+    /// Schema-indexed type for `minimum(:column)` / `maximum(:column)`.
+    /// Scalar extrema can return nil for an empty relation; grouped extrema
+    /// return a Hash keyed by the recognized group column instead.
+    pub(super) fn relation_extreme_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+    ) -> Option<Ty> {
+        if !matches!(method.as_str(), "minimum" | "maximum") {
+            return None;
+        }
+        let model = match recv_ty? {
+            Ty::Relation { of } => of,
+            Ty::Array { elem } => match &**elem {
+                Ty::Class { id, .. } => id,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let [column_arg] = args else { return None };
+        let column = match &*column_arg.node {
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => value.clone(),
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
+                Symbol::from(value.as_str())
+            }
+            _ => return None,
+        };
+        let value_ty = self.classes().get(model)?.instance_methods.get(&column)?.clone();
+        if let Some(group_args) = recv.and_then(Self::group_args_in_count_chain) {
+            let key_ty = self.grouped_key_ty(model, group_args).unwrap_or(Ty::Untyped);
+            return Some(Ty::Hash { key: Box::new(key_ty), value: Box::new(value_ty) });
+        }
+        Some(union_of(value_ty, Ty::Nil))
+    }
+
     /// Build the Ctx used to analyze a block passed to `recv.method(...) { |p1, p2| ... }`.
     /// Seeds the block's local_bindings with parameter types derived from the receiver
     /// and method (e.g. `array.each { |x| }` binds `x` to the array's element type).

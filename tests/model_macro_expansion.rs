@@ -582,7 +582,7 @@ fn emitted_positioning_runs_reorder_block_move_lock_and_rebalance() {
     let run = emit_and_run::real_blog()
         .write("app/models/concerns/positioning_concern.rb", POSITIONING_CONCERN)
         .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.integer \"order\"\n    t.date \"archived_on\"\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
-        .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active")
+        .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active\n\n  def minimum_created_at_iso8601\n    (Comment.where(article_id: article_id).minimum(:created_at) || Time.current).iso8601\n  end\n\n  def active_extrema_keys\n    Comment.where(article_id: article_id).group(:active).minimum(:position_score).keys\n  end")
         .run_ruby(r#"
 article = Article.create!(title: "Positioning owner", body: "A sufficiently long article body")
 other_article = Article.create!(title: "Other owner", body: "A sufficiently long article body")
@@ -614,6 +614,8 @@ date_keys = siblings.call(article).group(:archived_on).minimum(:position_score).
 raise "grouped date key type: #{date_keys.map { |key| [key, key.class] }.inspect}" unless date_keys.all? { |key| key.nil? || key.is_a?(Date) }
 raise "time extrema type" unless siblings.call(article).minimum(:created_at).is_a?(Time)
 raise "grouped time key type" unless siblings.call(article).group(:created_at).minimum(:position_score).keys.all? { |key| key.is_a?(Time) }
+raise "schema-typed scalar extrema in app source" unless items[0].minimum_created_at_iso8601.is_a?(String)
+raise "schema-typed grouped extrema in app source" unless items[0].active_extrema_keys.sort_by(&:to_s) == [false, true]
 raise "quoted boolean group" unless siblings.call(article).group('"comments"."active"').minimum(:position_score) == { true => 1.0, false => 5.0 }
 having_alias = siblings.call(article).select("COUNT(*) AS n").group(:article_id).having("n > 1")
 raise "having select alias" unless having_alias.minimum(:position_score) == { article.id => 1.0 }

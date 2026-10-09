@@ -3196,6 +3196,23 @@ fn expand_class_body_macros(app: &mut App) {
         if includes.is_empty() {
             continue;
         }
+        let surface = &surfaces.controllers[&controller.name];
+        let mut macro_definitions = HashMap::<crate::ident::Symbol, usize>::new();
+        for included in &surface.includes {
+            if let Some(methods) = macros.get(included) {
+                for method in methods {
+                    *macro_definitions.entry(method.name.clone()).or_default() += 1;
+                }
+            }
+        }
+        let mut shadowed_macros: std::collections::HashSet<_> = macro_definitions
+            .into_iter()
+            .filter_map(|(name, definitions)| (definitions > 1).then_some(name))
+            .collect();
+        shadowed_macros.extend(controller.body.iter().filter_map(|item| match item {
+            ControllerBodyItem::ClassMethod { method, .. } => Some(method.name.clone()),
+            _ => None,
+        }));
         let mut expanded: Vec<ControllerBodyItem> = Vec::new();
         for item in std::mem::take(&mut controller.body) {
             let ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } = &item
@@ -3256,7 +3273,13 @@ fn expand_class_body_macros(app: &mut App) {
                 }
             }
             let body = substitute_params(&macro_def, args);
-            let Some(body) = expand_nested_filter_macros(&body, &module, &macros, &mut Vec::new())
+            let Some(body) = expand_nested_filter_macros(
+                &body,
+                &module,
+                &macros,
+                &shadowed_macros,
+                &mut Vec::new(),
+            )
             else {
                 survey::record(&IngestError::Unsupported {
                     file: format!("{}", controller.name.0.as_str()),
@@ -3330,15 +3353,20 @@ fn expand_nested_filter_macros(
     body: &crate::expr::Expr,
     module: &crate::ident::ClassId,
     macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+    shadowed: &std::collections::HashSet<crate::ident::Symbol>,
     stack: &mut Vec<crate::ident::Symbol>,
 ) -> Option<crate::expr::Expr> {
     use crate::expr::{Expr, ExprNode};
+
+    const MAX_EXPANSION_STATEMENTS: usize = 4096;
 
     fn expand_statements(
         body: &Expr,
         module: &crate::ident::ClassId,
         macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+        shadowed: &std::collections::HashSet<crate::ident::Symbol>,
         stack: &mut Vec<crate::ident::Symbol>,
+        remaining: &mut usize,
     ) -> Option<Vec<Expr>> {
         let statements: Vec<&Expr> = match &*body.node {
             ExprNode::Seq { exprs } => exprs.iter().collect(),
@@ -3346,6 +3374,10 @@ fn expand_nested_filter_macros(
         };
         let mut out = Vec::new();
         for statement in statements {
+            if *remaining == 0 {
+                return None;
+            }
+            *remaining -= 1;
             let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node
             else {
                 out.push(statement.clone());
@@ -3358,19 +3390,25 @@ fn expand_nested_filter_macros(
                 out.push(statement.clone());
                 continue;
             };
-            if stack.len() >= 32 || stack.contains(method) {
+            // A call in a class method runs with the including controller
+            // as `self`; another concern or the controller itself may
+            // override this name. Inlining the lexical concern's version
+            // would change Ruby's lookup result, so refuse the whole macro.
+            if shadowed.contains(method) || stack.len() >= 32 || stack.contains(method) {
                 return None;
             }
             stack.push(method.clone());
             let nested = substitute_params(def, args);
-            let expanded = expand_statements(&nested, module, macros, stack);
+            let expanded =
+                expand_statements(&nested, module, macros, shadowed, stack, remaining);
             stack.pop();
             out.extend(expanded?);
         }
         Some(out)
     }
 
-    let exprs = expand_statements(body, module, macros, stack)?;
+    let mut remaining = MAX_EXPANSION_STATEMENTS;
+    let exprs = expand_statements(body, module, macros, shadowed, stack, &mut remaining)?;
     Some(Expr::new(body.span, ExprNode::Seq { exprs }))
 }
 
