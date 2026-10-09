@@ -1023,14 +1023,26 @@ pub const HTTP_AUTH_CHALLENGES: &[&str] = &[
 pub fn is_response_terminal(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Send { recv: None, method, .. } => RESPONSE_TERMINALS.contains(&method.as_str()),
-        ExprNode::Send { recv: Some(r), method, .. } => {
-            matches!(&*r.node, ExprNode::SelfRef) && method.as_str() == "response_body="
+        // `self.render …` / `self.redirect_to …` are the same terminals.
+        ExprNode::Send { recv: Some(r), method, args, .. } => {
+            matches!(&*r.node, ExprNode::SelfRef)
+                && (RESPONSE_TERMINALS.contains(&method.as_str())
+                    || (method.as_str() == "response_body="
+                        && !args.first().is_some_and(is_nil_literal)))
         }
-        ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, .. } => {
-            matches!(&*recv.node, ExprNode::SelfRef) && name.as_str() == "response_body"
+        // `self.response_body = nil` clears the body and performs
+        // nothing, so the action's implicit render still runs.
+        ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, value } => {
+            matches!(&*recv.node, ExprNode::SelfRef)
+                && name.as_str() == "response_body"
+                && !is_nil_literal(value)
         }
         _ => false,
     }
+}
+
+fn is_nil_literal(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { value: Literal::Nil })
 }
 
 fn contains_terminal(body: &Expr) -> bool {
