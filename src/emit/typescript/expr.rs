@@ -2987,6 +2987,18 @@ fn js_send_inner(
                 };
             }
         }
+        // Ruby `Array#==` compares elements; JS `===` on two arrays
+        // compares references, so `[2, 4] == xs` was false for every
+        // `xs` and every `assert_equal [..], …` raised. When either
+        // side is an Array, compare lengths and elements instead.
+        // Element comparison stays `===`: right for the scalar arrays
+        // these comparisons carry.
+        if matches!(method, "==" | "!=")
+            && (matches!(r.ty, Some(Ty::Array { .. })) || matches!(arg.ty, Some(Ty::Array { .. })))
+        {
+            let eq = array_eq(span, js_expr(r), js_expr(arg));
+            return if method == "==" { eq } else { Js::unary(span, "!", eq) };
+        }
         if let Some(op) = ts_binop(method) {
             return Js::binary(span, op, js_expr(r), js_expr(arg));
         }
@@ -3324,6 +3336,17 @@ fn translate_ruby_regex_anchors(pattern: &str) -> String {
     out
 }
 
+/// Element-wise Array equality, each operand evaluated once. Nested
+/// arrays recurse (Ruby `[[2]] == [[2]]`), and a non-array operand
+/// (scalar, `nil`) compares with `===` instead of reading `.length`.
+const ARRAY_EQ_FN: &str = "(function eq(a: any, b: any): boolean { \
+return Array.isArray(a) && Array.isArray(b) \
+? a.length === b.length && a.every((x, i) => eq(x, b[i])) : a === b; })";
+
+fn array_eq(span: Span, l: Js, r: Js) -> Js {
+    Js::call(span, Js::synth(JsExpr::Raw(ARRAY_EQ_FN.into())), vec![l, r])
+}
+
 fn ts_binop(method: &str) -> Option<&'static str> {
     Some(match method {
         "==" => "===",
@@ -3515,6 +3538,54 @@ mod async_hof_tests {
             !out.starts_with("await (async () => {"),
             "sync profile must not rewrite, got: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod array_eq_tests {
+    //! `assert_equal [2, 4], xs` lowers to `[2, 4] != xs`; `!==` on two
+    //! JS arrays compares references, so it raised for every `xs`.
+
+    use super::*;
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::{Symbol, VarId};
+    use crate::span::Span;
+
+    fn ints() -> Ty {
+        Ty::Array { elem: Box::new(Ty::Int) }
+    }
+
+    fn cmp(method: &str, actual_ty: Option<Ty>) -> String {
+        let lit = |v| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: v } });
+        let mut expected = Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![lit(2), lit(4)], style: Default::default() });
+        expected.ty = Some(ints());
+        let mut actual = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from("xs") });
+        actual.ty = actual_ty;
+        emit_expr(&Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(expected),
+                method: Symbol::from(method),
+                args: vec![actual],
+                block: None,
+                parenthesized: false,
+            },
+        ))
+    }
+
+    #[test]
+    fn array_equality_compares_elements() {
+        let eq = format!("{ARRAY_EQ_FN}([2, 4], xs)");
+        assert_eq!(cmp("==", Some(ints())), eq);
+        assert_eq!(cmp("!=", Some(ints())), format!("!{eq}"));
+        // The literal alone is enough: the actual is often a call the
+        // test typer leaves untyped.
+        assert_eq!(cmp("!=", None), format!("!{eq}"));
+        // Nested arrays recurse; a non-array operand (nil) is `===`
+        // rather than a `.length` read.
+        assert!(ARRAY_EQ_FN.contains("eq(x, b[i])"));
+        assert!(ARRAY_EQ_FN.contains("Array.isArray(a) && Array.isArray(b)"));
+        assert!(ARRAY_EQ_FN.contains(": a === b"));
     }
 }
 
