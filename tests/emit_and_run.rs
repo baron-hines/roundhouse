@@ -159,6 +159,36 @@ puts "later delegate ordering passed"
     assert!(run.stdout.contains("later delegate ordering passed"));
 }
 
+/// `to_sql` renders a relation as SQL another query can embed: the
+/// subquery runs, and selects exactly the commented article.
+#[test]
+fn a_relations_to_sql_runs_as_a_subquery() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.commented
+    where(\"articles.id IN (#{Comment.select(:article_id).to_sql})\")
+  end
+",
+        )
+        .run_ruby(
+            r#"commented = Article.create!(title: "Commented", body: "A sufficiently long body.")
+Article.create!(title: "Quiet", body: "A sufficiently long body.")
+Comment.create!(article: commented, commenter: "Reader", body: "Comment body")
+sql = Article.where(title: "Quiet").to_sql
+raise "to_sql: #{sql}" unless sql.start_with?("SELECT") && sql.include?("articles")
+ids = Article.commented.map(&:id)
+raise "subquery: #{ids.inspect}" unless ids == [commented.id]
+puts "to_sql subquery passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("to_sql subquery passed"));
+}
+
 /// A class object and its instances that define the same names: each
 /// side's call types and runs as that side's method.
 #[test]
