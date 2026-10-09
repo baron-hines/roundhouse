@@ -278,8 +278,9 @@ fn floor_int_div(span: Span, lhs: Js, rhs: Js) -> Js {
 /// Ruby Int % Int takes the divisor's sign (`-7 % 3 == 2`); JS `%`
 /// takes the dividend's. Add the divisor only when the signs differ
 /// (`((a % b) + b) % b` can round the intermediate sum past 2**53); a
-/// zero remainder returns a literal `0` so JS's `-0` never leaks. The
-/// IIFE evaluates each operand once.
+/// zero remainder returns a literal `0` so JS's `-0` never leaks.
+/// Operands are call arguments (not consts inside a sync IIFE) so an
+/// `await` in either side stays in the enclosing async method.
 fn floor_int_mod(span: Span, lhs: Js, rhs: Js) -> Js {
     let b = || synth_ident("__b");
     let m = || synth_ident("__m");
@@ -299,17 +300,20 @@ fn floor_int_mod(span: Span, lhs: Js, rhs: Js) -> Js {
             else_: m(),
         }),
     });
-    iife(
+    Js::call(
         span,
-        vec![
-            const_decl("__a", lhs),
-            const_decl("__b", rhs),
-            const_decl(
-                "__m",
-                Js::binary(span, "%", synth_ident("__a"), synth_ident("__b")),
-            ),
-            JsStmt::synth(JsStmtNode::Return(Some(floored))),
-        ],
+        Js::synth(JsExpr::Arrow {
+            params: vec![js_param("__a"), js_param("__b")],
+            body: ArrowBody::Block(vec![
+                const_decl(
+                    "__m",
+                    Js::binary(span, "%", synth_ident("__a"), synth_ident("__b")),
+                ),
+                JsStmt::synth(JsStmtNode::Return(Some(floored))),
+            ]),
+            is_async: false,
+        }),
+        vec![lhs, rhs],
     )
 }
 

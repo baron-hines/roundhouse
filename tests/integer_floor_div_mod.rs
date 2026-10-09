@@ -50,6 +50,11 @@ fn typescript_floors_int_div_and_mod() {
     let out = emitted(BuildTarget::Typescript, "app/models/article.ts");
     assert!(out.contains("Math.floor(a / 2)"), "Int / Int not floored:\n{out}");
     assert!(out.contains("const __m = __a % __b"), "Int % Int not floored:\n{out}");
+    // Operands are IIFE call args so `await` stays outside the sync arrow.
+    assert!(
+        out.contains("((__a, __b) =>") || out.contains("(__a, __b) =>"),
+        "Int % Int must take operands as IIFE params:\n{out}"
+    );
     // Add the divisor only on a sign mismatch: a second `% __b` over
     // `__m + __b` would round sums past 2**53. Rem-vs-divisor (not
     // "negative rem only") so `7 % -3` stays `-2`.
@@ -60,7 +65,7 @@ fn typescript_floors_int_div_and_mod() {
         "Int % Int must compare rem and divisor signs:\n{out}"
     );
     assert!(!out.contains("+ __b) % __b"), "Int % Int sums before flooring:\n{out}");
-    assert!(out.contains("const __b = -3"), "neg-divisor mod missing:\n{out}");
+    assert!(out.contains(", -3)") || out.contains(",-3)"), "neg-divisor mod missing:\n{out}");
     assert!(!out.contains("Math.floor(7.0 / 2.0)") && !out.contains("Math.floor(7 / 2)"),
         "Float / Float must not floor:\n{out}");
 }
