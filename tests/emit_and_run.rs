@@ -9387,7 +9387,9 @@ end
 
 /// Active Storage's "was it made?" questions, as campfire's
 /// presentation asks them so a view never makes a preview: a variant is
-/// `processed?` once its record exists (looked up, not made);
+/// `processed?` once its record exists, and its `image` is that record's
+/// (both looked up, not made — asked of a file that cannot be decoded,
+/// `image` used to raise the decode error again);
 /// `preview(:poster)` names a variant the owner's `has_one_attached`
 /// block declares; and `url_for` of a Preview held in a typed local is
 /// the preview's representation URL, not the object.
@@ -9417,12 +9419,16 @@ end
 doc = Doc.create!(name: "first", file: { io: StringIO.new("bytes"), filename: "a.mov", content_type: "video/quicktime" })
 thumb = doc.file.representation(:thumb)
 raise "processed before any record" if thumb.processed?
+raise "image made a variant of bytes that are no image" unless thumb.image.nil?
+raise "variant records: #{ActiveStorage::VariantRecord.count}" unless ActiveStorage::VariantRecord.count == 0
 image = ActiveStorage::Blob.create_and_upload!("png", "a.png", "image/png")
 connection = ActiveRecord::Base.connection
 connection.execute("INSERT INTO active_storage_variant_records (blob_id, variation_digest) VALUES (#{doc.file.blob.id}, '#{thumb.variation.digest}')")
 record_id = connection.select_value("SELECT max(id) FROM active_storage_variant_records")
 connection.execute("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES ('image', 'ActiveStorage::VariantRecord', #{record_id}, #{image.id}, '2026-01-01')")
 raise "not processed once its record exists" unless doc.file.representation(:thumb).processed?
+raise "variant records: #{ActiveStorage::VariantRecord.count}" unless ActiveStorage::VariantRecord.count == 1
+raise "no image once its record exists" if doc.file.representation(:thumb).image.nil?
 preview = doc.file.preview(:poster)
 raise "preview named #{preview.variation&.name.inspect}" unless preview.variation.name == "poster"
 url = doc.poster_url

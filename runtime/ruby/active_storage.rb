@@ -795,6 +795,12 @@ module ActiveStorage
       nil
     end
 
+    # Rails' `blob.variant(transformations)`: the blob under a
+    # Variation (`lower::attached` builds one from an inline hash).
+    def variant(variation)
+      VariantWithRecord.new(self, variation)
+    end
+
     # Rails' `purge_later`: the purge as an `ActiveStorage::PurgeJob`.
     def purge_later
       PurgeJob.perform_later(self)
@@ -1095,11 +1101,13 @@ module ActiveStorage
     end
 
     # Rails: the variant record's `image` attachment — an `Attached`
-    # proxy over the transformed blob, or nil before there is a record
-    # (the identity variant, or nothing attached).
+    # proxy over the transformed blob, or nil while there is no record
+    # (the identity variant, nothing attached, or not made yet). A
+    # lookup, as Rails' `record&.image` is: it makes nothing, so asking
+    # it of a file that cannot be decoded answers nil instead of raising
+    # the decode error again (campfire keeps such an image unpreviewed).
     def image
-      process
-      @record_id == 0 ? nil : Attached.new("ActiveStorage::VariantRecord", @record_id, "image", [])
+      processed? ? Attached.new("ActiveStorage::VariantRecord", @record_id, "image", []) : nil
     end
 
     # The transformed blob, once processed; the original for the
@@ -1502,6 +1510,12 @@ module ActiveStorage
       out
     end
 
+    # Rails' `Attached::Many` delegates the collection reads to its
+    # attachments: `message.body.embeds.first.blob`.
+    def first
+      attachments.first
+    end
+
     # The batch loader's setter: the rows one `IN` query found for this
     # record, in attachment order.
     def _preload_rows(rows)
@@ -1594,6 +1608,18 @@ module ActiveStorage
 
     def destroy
       purge
+    end
+  end
+
+  # Rails' `ActiveStorage::VariantRecord`, the model behind
+  # `active_storage_variant_records`, as far as a test reads it:
+  # campfire asserts that serving a poster made when the message was
+  # posted makes no further variant (`assert_no_difference ->
+  # { ActiveStorage::VariantRecord.count }`).
+  class VariantRecord
+    def self.count
+      rows = ActiveRecord.adapter.select_rows("SELECT count(*) AS n FROM active_storage_variant_records")
+      rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
   end
 
