@@ -392,7 +392,15 @@ module ActiveRecord
     # ROLLBACK + re-raise on any exception. Flat transactions only: the
     # corpus never nests (a nested BEGIN would error in SQLite rather
     # than silently join, which is the honest failure).
-    def self.transaction
+    #
+    # `isolation:`, `requires_new:`, and `joinable:` are Rails'
+    # `DatabaseStatements#transaction` keyword options (the same three
+    # `with_lock` forwards — see base.rb). All three are accepted and
+    # ignored: no isolation levels, and no SAVEPOINT-backed nesting
+    # under this flat implementation. They exist on the signature so a
+    # call that passes them (directly, or via `with_lock`) doesn't
+    # raise `ArgumentError`.
+    def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       Db.exec("BEGIN")
       begin
         result = yield
@@ -402,6 +410,15 @@ module ActiveRecord
         Db.exec("ROLLBACK")
         raise e
       end
+    end
+
+    # `Model.delete_all` for a model without the lowerer-emitted
+    # override: the rows the DELETE removed, read off the statement
+    # rather than counted beforehand. Ruby-family-only because
+    # `changes` is — see base.rb's default.
+    def self.delete_all
+      ActiveRecord.adapter.delete_all(table_name)
+      ActiveRecord.adapter.changes
     end
 
     # `Model.update_counters(id, col: delta, …)` — atomic column
@@ -557,6 +574,16 @@ module ActiveRecord
     # survive); non-Hash inputs raise rather than reach Relation's SQL path.
     def self.find_by(conditions)
       ActiveRecord::Relation.new(self).find_by(conditions.to_h)
+    end
+
+    # `Model.find_sole_by(attrs)` — Rails' `where(attrs).sole`; see
+    # Relation#find_sole_by. `Model.sole` is the same on the whole table.
+    def self.find_sole_by(conditions)
+      ActiveRecord::Relation.new(self).find_sole_by(conditions.to_h)
+    end
+
+    def self.sole
+      ActiveRecord::Relation.new(self).sole
     end
 
     # Rails-shape `all` fallback, same story as `where` above: a lazy

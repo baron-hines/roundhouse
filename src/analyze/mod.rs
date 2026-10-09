@@ -40,12 +40,17 @@ mod registry;
 mod test_module;
 mod render;
 mod ivar_set;
+pub(crate) use ivar_set::controller_name_of;
 mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;
 mod filter_targets;
 pub mod graphql;
 mod harvest_return;
+mod fixpoint_bound;
+mod fixpoint_check;
+mod fixpoint_rounds;
+pub use fixpoint_rounds::{FixpointRounds, LoopEnd};
 mod dirty_retype;
 mod typing_mode;
 mod inferred_types;
@@ -155,6 +160,10 @@ pub struct Analyzer {
     /// `analyze_expr` walks.
     controller_action_meta_cache:
         HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
+    /// How the last [`Self::analyze`]'s fixpoint loops ended.
+    fixpoint_rounds: FixpointRounds,
+    /// What the opt-in fixpoint canaries saw (`fixpoint_check`).
+    fixpoint_checks: fixpoint_check::Checks,
 }
 
 use dirty_retype::{DirtyHints, InferenceSig, dirty_classes_for_retype};
@@ -597,6 +606,42 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+                cls.instance_methods.entry(attr).or_insert(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
+                    args: vec![],
+                });
+            }
+            // `ActiveStorage::Attachment` helpers synthesized by
+            // `lower::attachment_model::push_attachment_record_methods`
+            // at the emit seam — register here so `attachment.url` /
+            // `.filename` resolve in check the same way the reader
+            // macros do.
+            if crate::lower::attachment_model::is_attachment_model(model) {
+                let blob = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Blob")),
+                    args: vec![],
+                };
+                let filename = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Filename")),
+                    args: vec![],
+                };
+                let nilable = |ty: Ty| Ty::Union {
+                    variants: vec![ty, Ty::Nil],
+                };
+                cls.instance_methods
+                    .entry(Symbol::from("blob"))
+                    .or_insert(nilable(blob));
+                cls.instance_methods
+                    .entry(Symbol::from("url"))
+                    .or_insert(Ty::Str);
+                cls.instance_methods
+                    .entry(Symbol::from("filename"))
+                    .or_insert(nilable(filename));
+                cls.instance_methods
+                    .entry(Symbol::from("content_type"))
+                    .or_insert(nilable(Ty::Str));
+            }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
             // reader/writer pair is synthesized by
@@ -716,6 +761,14 @@ impl Analyzer {
                             .entry((name.clone(), m.name.clone()))
                             .or_insert(Ty::Untyped);
                     }
+                    // Flat `<name>_loaded?` — same Bool `model_to_library`
+                    // synthesizes for emit. Registered here so `check`
+                    // (no post-analyze lower) can type
+                    // `message.boosts.loaded?` via `assoc_loaded_ty`
+                    // without cataloguing Relation `#loaded?`.
+                    cls.instance_methods
+                        .entry(Symbol::from(format!("{}_loaded?", name.as_str())))
+                        .or_insert(Ty::Bool);
                 }
                 cls.instance_methods.insert(name, ty.clone());
                 cls.instance_methods.entry(writer).or_insert(ty);
@@ -753,6 +806,17 @@ impl Analyzer {
                             ModelBodyItem::Association { assoc, .. } => {
                                 let (name, ty) = association_member_ty(assoc);
                                 let writer = Symbol::from(format!("{}=", name.as_str()));
+                                if matches!(
+                                    assoc,
+                                    crate::dialect::Association::HasMany { .. }
+                                ) {
+                                    cls.instance_methods
+                                        .entry(Symbol::from(format!(
+                                            "{}_loaded?",
+                                            name.as_str()
+                                        )))
+                                        .or_insert(Ty::Bool);
+                                }
                                 cls.instance_methods.entry(name).or_insert(ty.clone());
                                 cls.instance_methods.entry(writer).or_insert(ty);
                                 for (name, ty) in association_builder_members(assoc) {
@@ -967,6 +1031,8 @@ impl Analyzer {
             view_seeds: None,
             callers_by_target: HashMap::new(),
             controller_action_meta_cache: HashMap::new(),
+            fixpoint_rounds: FixpointRounds::default(),
+            fixpoint_checks: fixpoint_check::Checks::default(),
         }
     }
 
@@ -1000,6 +1066,12 @@ impl Analyzer {
         self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
     }
 
+    /// How the fixpoint loops of the last [`Self::analyze`] ended; all
+    /// [`LoopEnd::NotRun`] before it.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
+    }
+
     /// Walk the app, annotating every expression's `ty` field, then
     /// populating the owning construct's `effects` by visiting the typed tree.
     ///
@@ -1010,6 +1082,7 @@ impl Analyzer {
     /// the refined registry. Iterates to a fixed point (capped; see
     /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
     pub fn analyze(&mut self, app: &mut App) {
+        self.fixpoint_checks = fixpoint_check::Checks::start();
         // An unresolvable include is a load-time error, not an open method
         // surface. Keep it in the class-body ledger even when no method is called.
         for class in &mut app.library_classes {
@@ -1098,6 +1171,11 @@ impl Analyzer {
             )
         });
 
+        let mut rounds = FixpointRounds {
+            production: LoopEnd::RanToCap,
+            views_and_tests: LoopEnd::RanToCap,
+            absorb: LoopEnd::NotRun,
+        };
         // Whole-program fixpoint: harvest returns + unify params, re-type,
         // repeat until the registry signature stabilizes. Each round
         // carries a fact one link further, so the cap bounds the longest
@@ -1125,6 +1203,7 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.production = LoopEnd::Settled(round);
                 break;
             }
             // Re-type with the refined registry. Idempotent BodyTyper
@@ -1150,6 +1229,17 @@ impl Analyzer {
                     TypingMode::Production { dirty: dirty.as_ref() },
                 )
             });
+        }
+        let round_inputs = fixpoint_check::RoundInputs {
+            dynamic_render_ivars: &dynamic_render_ivars,
+            existing_view_names: &existing_view_names,
+            module_methods: &module_methods,
+            module_includes: &module_includes,
+            parent_link_by_name: &parent_link_by_name,
+        };
+        if fixpoint_check::verify_on() {
+            self.verify_round(app, &round_inputs, fixpoint_check::Loop::Production, None);
+            prev_hints = self.capture_dirty_hints();
         }
 
         // Intermediate rounds skip views/tests: production does not
@@ -1217,11 +1307,21 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.views_and_tests = LoopEnd::Settled(round);
                 break;
             }
             prev_hints = self.capture_dirty_hints();
         }
+        if fixpoint_check::verify_on() {
+            self.verify_round(
+                app,
+                &round_inputs,
+                fixpoint_check::Loop::ViewsAndTests,
+                production_view_params.as_mut(),
+            );
+        }
         if !self.inference_matches(&production_sig) {
+            rounds.absorb = LoopEnd::RanToCap;
             let mut absorb_hints = self.capture_dirty_hints();
             // The view/test rounds above moved signatures that
             // production bodies read, and the last production pass
@@ -1257,6 +1357,7 @@ impl Analyzer {
                 if self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
+                    rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
                 absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
@@ -1296,6 +1397,15 @@ impl Analyzer {
                 )
             });
         }
+        if fixpoint_check::verify_on() {
+            self.verify_round(
+                app,
+                &round_inputs,
+                fixpoint_check::Loop::Absorb,
+                production_view_params.as_mut(),
+            );
+        }
+        self.fixpoint_rounds = rounds;
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
         // returns therefore settle only after the absorb/harvest above.
@@ -1375,6 +1485,7 @@ impl Analyzer {
         self.type_rails_application_body(app);
 
         self.stamp_inferred_method_signatures(app);
+        self.report_fixpoint_checks(app);
     }
 
     /// Type the bodies of `direct :name do |…| … end` helpers, with the
@@ -1531,7 +1642,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
-                in_view: false, class_side: false, claimed_macro_template: false,
+                in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
             self.body_typer().analyze_expr(&mut helper.body, &ctx);
         }
@@ -1749,7 +1860,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     constants: shared.clone(),
                     annotate_self_dispatch: false,
-                    in_view: false, class_side: false, claimed_macro_template: false,
+                    in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                 };
                 let ty = typer.analyze_expr(value, &ctx);
                 if matches!(ty, Ty::Var { .. }) {
@@ -2018,7 +2129,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
             for item in model.body.iter_mut() {
                 if let ModelBodyItem::Unknown { expr, .. } = item {
@@ -2034,7 +2145,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
 
             // Pass A: type every method body with only `@attributes`
@@ -2094,7 +2205,7 @@ impl Analyzer {
                     local_bindings: HashMap::new(),
                     class_objects: Default::default(),
                     constants: class_constants.clone(),
-                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                 };
 
                 for scope in model.scopes_mut() {
@@ -2142,7 +2253,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
             if retype {
                 for item in controller.body.iter_mut() {
@@ -2162,7 +2273,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
 
             // Snapshot this controller's own segment of the filter chain
@@ -2712,7 +2823,7 @@ impl Analyzer {
                             local_bindings: HashMap::new(),
                             class_objects: Default::default(),
                             constants: meta.class_constants.clone(),
-                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                         };
                         // Seed helper-method params from the inferred-params
                         // table too, so `period(query)`'s body resolves on
@@ -3220,7 +3331,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false, class_side: false, claimed_macro_template: false,
+                        in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                     };
                     let origin = app
                         .concern_spliced_actions
@@ -3399,7 +3510,7 @@ impl Analyzer {
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
-                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
 
             if retype {
@@ -3543,7 +3654,7 @@ impl Analyzer {
                     ivar_bindings: reseeded,
                     local_bindings: HashMap::new(),
                     class_objects: Default::default(),
-                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
@@ -3699,6 +3810,12 @@ impl Analyzer {
             let mut targets = Vec::new();
             extract_partial_render_sites(&view.body, &view.name, &mut throwaway, &mut targets);
             record_render_edges(&mut render_edges, &view.name, targets);
+        }
+        // A jbuilder template renders its partials through
+        // `json.partial!` / `json.array!` and the `partial:` option, not
+        // `render`, and its partials read its ivars all the same.
+        for (renderer, targets) in crate::lower::jbuilder_to_library::jbuilder_render_edges(app) {
+            record_render_edges(&mut render_edges, &renderer, targets);
         }
 
         // Propagate each renderer's ivar context onto the partials it
@@ -4011,6 +4128,7 @@ impl Analyzer {
         let observed = self.inferred_params.get(&key);
         let mut ctx = base.clone();
         ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
+        ctx.instance_body = !ctx.class_side;
         // Class-method bodies named after a first-class model DSL
         // (`has_markdown`, `has_rich_text`, …) are macro templates —
         // association/`scope` leftovers inside them are claimed at
@@ -4023,6 +4141,7 @@ impl Analyzer {
                 method.name.as_str(),
                 "generates_token_for"
                     | "has_one_attached"
+                    | "has_many_attached"
                     | "has_rich_text"
                     | "has_markdown"
                     | "has_secure_token"
@@ -4087,6 +4206,7 @@ impl Analyzer {
         let from_origin =
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
         let mut ctx = base.clone();
+        ctx.instance_body = true;
         for (i, name) in params.fields.keys().enumerate() {
             if self.declared_untyped_param(class_id, action_name, Some(i), name) {
                 ctx.local_bindings.insert(name.clone(), Ty::Untyped);
@@ -5113,7 +5233,7 @@ impl Analyzer {
                 entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
@@ -5279,6 +5399,12 @@ impl Analyzer {
             })
             .filter(|(_, includes)| !includes.is_empty())
             .collect();
+        // `self.classes` is a HashMap: without a fixed order the
+        // includers' observations reach the module's slot in a
+        // different order every run, and a union's variant order (or
+        // any order-sensitive join) leaks into the emitted signature.
+        let mut targets = targets;
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<((ClassId, Symbol), Vec<Ty>)> = Vec::new();
         for (id, includes) in targets {
             let mut queue = includes;
@@ -5321,7 +5447,7 @@ impl Analyzer {
                 entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
@@ -5439,7 +5565,7 @@ impl Analyzer {
         mut arg_tys: Vec<Ty>,
         kw: SiteKeywords,
     ) -> Vec<Ty> {
-        if let Some(shape) = shape.filter(|s| s.keywords_by_kind) {
+        if let Some(shape) = shape.filter(|s| s.keywords_by_kind || kw.anonymous_forward) {
             if kw.group {
                 if let Some(placed) =
                     Self::bind_keyword_group(shape, &arg_tys, &kw.keys, kw.splat.as_ref())
@@ -5611,7 +5737,7 @@ impl Analyzer {
                 // chases — the reverse call graph now decides retype,
                 // so Class-only receivers would leave callers of
                 // `records.first.foo` off the frontier.
-                let recv_classes: Vec<ClassId> = match recv {
+                let mut recv_classes: Vec<ClassId> = match recv {
                     Some(r) => r
                         .ty
                         .as_ref()
@@ -5626,6 +5752,25 @@ impl Analyzer {
                         .into_iter()
                         .collect(),
                 };
+                // The params table keys by (class, name) with no side, so
+                // `self.class.get(url, opts)` (HTTParty's class-side `get`)
+                // would feed an instance `def get` — and still would when
+                // the class also defines `def self.get`. Drop an `x.class`
+                // site for any receiver that has that name as an instance
+                // method. Constant receivers stay: `UserMailer.welcome(user)`
+                // and an `extend self` module's `GlobalPath.cdn_path(p)` are
+                // how their instance methods run.
+                let via_dot_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method: m, args, .. }
+                        if m.as_str() == "class" && args.is_empty())
+                });
+                if via_dot_class {
+                    recv_classes.retain(|c| {
+                        !self.classes.get(c).is_some_and(|k| {
+                            k.instance_methods.contains_key(method)
+                        })
+                    });
+                }
                 if !recv_classes.is_empty() {
                     let arg_tys: Vec<Ty> = args
                         .iter()
@@ -5680,6 +5825,10 @@ impl Analyzer {
                             }
                             if all_sym { pairs } else { Vec::new() }
                         }
+                        // The anonymous packet is merged after these
+                        // pairs, so it can overwrite every explicit key.
+                        // Keep the group as unknown keyword evidence below
+                        // instead of inferring the explicit values as final.
                         _ => Vec::new(),
                     };
                     // Whether the last argument is the call's keyword
@@ -5687,7 +5836,10 @@ impl Analyzer {
                     // `**splat`, never a positional `{…}` literal.
                     let group = matches!(
                         args.last().map(|a| &*a.node),
-                        Some(ExprNode::Hash { kwargs: true, .. } | ExprNode::KeywordSplat { .. })
+                        Some(ExprNode::Hash { kwargs: true, .. }
+                            | ExprNode::KeywordSplat { .. }
+                            | ExprNode::ForwardKeywords
+                            | ExprNode::ForwardKeywordsWithPairs { .. })
                     );
                     // The splat merges over the literal, so each literal
                     // key may take the splat's value too.
@@ -5700,9 +5852,20 @@ impl Analyzer {
                                     .collect();
                                 (joined, Some(v))
                             }),
+                        Some(ExprNode::ForwardKeywordsWithPairs { .. }) => {
+                            // The opaque forwarded packet merges after the
+                            // literal entries and can override each key.
+                            // Its values are unavailable, so the signature
+                            // binder leaves named parameters uninferred.
+                            (Vec::new(), None)
+                        }
                         _ => (keys, None),
                     };
-                    let kw_tys = SiteKeywords { group, keys, splat };
+                    let anonymous_forward = matches!(
+                        args.last().map(|a| &*a.node),
+                        Some(ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. })
+                    );
+                    let kw_tys = SiteKeywords { group, keys, splat, anonymous_forward };
                     // `Klass.new(a, b)` hands its arguments to
                     // `initialize` — that is all `Class#new` does with
                     // them — so the site is evidence for the
@@ -5739,6 +5902,12 @@ impl Analyzer {
                 for (k, v) in entries {
                     self.collect_send_sites(k, self_class, helpers, out);
                     self.collect_send_sites(v, self_class, helpers, out);
+                }
+            }
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries {
+                    self.collect_send_sites(key, self_class, helpers, out);
+                    self.collect_send_sites(value, self_class, helpers, out);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
@@ -6714,7 +6883,8 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
 /// joinrules at a higher level — we operate on `Ty` directly, so the
 /// rules are:
 /// - same type → keep
-/// - one side is `Ty::Var` (no info yet) → take the other
+/// - one side is `Ty::Var` (no info yet) → take the other, including
+///   when the other is `Untyped` (`Var` is the bottom of the join)
 /// - one side is `Untyped` (an argument nobody could type) → take the
 ///   other: an untyped observation says nothing about the value, and
 ///   letting it into the union turns every concrete observation into
@@ -6729,10 +6899,23 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     if stored == observed {
         return stored;
     }
-    if matches!(stored, Ty::Var { .. } | Ty::Untyped) {
+    // `Var` is checked on both sides before `Untyped` so the join is
+    // commutative: `Var` (no observation) is below `Untyped` (an
+    // observed argument nobody could type), and `Untyped` is below a
+    // concrete type. Testing `Var | Untyped` together on `stored`
+    // first made `unify(Untyped, Var) = Var` but `unify(Var, Untyped)
+    // = Untyped`, so the result depended on the order call sites
+    // arrived in (#209).
+    if matches!(stored, Ty::Var { .. }) {
         return observed;
     }
-    if matches!(observed, Ty::Var { .. } | Ty::Untyped) {
+    if matches!(observed, Ty::Var { .. }) {
+        return stored;
+    }
+    if matches!(stored, Ty::Untyped) {
+        return observed;
+    }
+    if matches!(observed, Ty::Untyped) {
         return stored;
     }
     // T + Nil → Union<T, Nil>; same for the symmetric case. Skip
@@ -7022,6 +7205,9 @@ struct SiteKeywords {
     /// keyword the literal does not name can receive. `keys` then holds
     /// the literal's pairs.
     splat: Option<Ty>,
+    /// The opaque final `**` can override the explicit pairs, so they are
+    /// not type evidence for the receiving named parameters.
+    anonymous_forward: bool,
 }
 
 /// A method's declared parameter slots, in declaration order, as
@@ -7455,7 +7641,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // Short-circuit compound assignment to an ivar (`@x ||= y`,
@@ -7468,7 +7654,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // `@a, @b = expr` — destructuring assignment. Each ivar target
@@ -7487,7 +7673,7 @@ pub(crate) fn extract_ivar_assignments_in(
                             Some(prev) => crate::analyze::body::union_of(prev, ty),
                             None => ty,
                         };
-                        out.insert(name.clone(), merged);
+                        out.insert(name.clone(), fixpoint_bound::bound(merged));
                     }
                 }
             }
@@ -7646,7 +7832,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // the Crystal collector's "fresh entry" branch.
         out.insert(
             name.clone(),
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) },
+            fixpoint_bound::bound(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) }),
         );
         return;
     };
@@ -7664,7 +7850,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // The general widening is exactly the canonical type join.
         Box::new(crate::analyze::body::union_of((**value).clone(), incoming.clone()))
     };
-    out.insert(name.clone(), Ty::Hash { key, value });
+    out.insert(name.clone(), fixpoint_bound::bound(Ty::Hash { key, value }));
 }
 
 // Diagnostic emission -----------------------------------------------------
