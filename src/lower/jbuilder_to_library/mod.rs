@@ -283,6 +283,7 @@ fn build_library_class(
             .collect(),
         models: known_models.iter().cloned().collect(),
         temps: Default::default(),
+        key_marks: Default::default(),
         partials: partials.clone(),
         partial_key,
     };
@@ -544,6 +545,10 @@ struct Ctx {
     /// (`__col0`, `__col1`, …), shared by every clone of the template's
     /// `Ctx` so two collection blocks never bind the same name.
     temps: std::rc::Rc<std::cell::Cell<usize>>,
+    /// Counter for the marks of keys that may be taken back
+    /// (`io_key0`, …), shared the same way. Separate from `temps` so a
+    /// template's collection locals keep their names.
+    key_marks: std::rc::Rc<std::cell::Cell<usize>>,
     /// Every jbuilder partial's parameters, for the calls this template
     /// makes to them.
     partials: std::rc::Rc<PartialParams>,
@@ -675,6 +680,15 @@ fn cache_block_body(stmt: &Expr) -> Option<&Expr> {
 }
 
 fn emit_object(raw_stmts: &[&Expr], ctx: &Ctx) -> Vec<Expr> {
+    emit_object_filled(raw_stmts, ctx).0
+}
+
+/// `emit_object`, and whether every run of it writes at least one pair.
+/// `false` when that is only known at run time: a pair under a
+/// condition, a whole-template partial (whose own pairs may be
+/// conditional), or no pair at all. A whole-template array is always a
+/// value.
+fn emit_object_filled(raw_stmts: &[&Expr], ctx: &Ctx) -> (Vec<Expr>, bool) {
     let classified: Vec<JbStmt<'_>> = raw_stmts.iter().map(|s| classify(s)).collect();
 
     // Whole-template DSL forms (single stmt covers the entire JSON
@@ -689,6 +703,10 @@ fn emit_object(raw_stmts: &[&Expr], ctx: &Ctx) -> Vec<Expr> {
         // Synthesis choke point (whole-template forms): everything
         // emitted for the single DSL statement attributes back to it.
         let src_span = raw_stmts[index].span;
+        // An array is a value even when it is empty (`_array` sets
+        // `[]`); a partial's object is empty when the partial sets
+        // nothing.
+        let filled = matches!(only, JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. });
         let whole = match only {
             JbStmt::ArrayPartial { collection, partial_path, item_var } => {
                 Some(emit_array_partial(collection, partial_path, item_var, ctx))
@@ -720,7 +738,7 @@ fn emit_object(raw_stmts: &[&Expr], ctx: &Ctx) -> Vec<Expr> {
                     out.push(emit_local(src, ctx));
                 }
             }
-            return out;
+            return (out, filled);
         }
     }
 
@@ -730,9 +748,32 @@ fn emit_object(raw_stmts: &[&Expr], ctx: &Ctx) -> Vec<Expr> {
     // that may or may not have emitted one (`Sep::Unknown`).
     let mut out: Vec<Expr> = Vec::new();
     out.push(io_append_lit(&ctx.accumulator, "{"));
-    emit_pairs(&classified, raw_stmts, ctx, &mut out, Sep::First);
+    let end = emit_pairs(&classified, raw_stmts, ctx, &mut out, Sep::First);
     out.push(io_append_lit(&ctx.accumulator, "}"));
-    out
+    // A statement the walker could not lower is written as nothing, so
+    // an empty object there says nothing about what Jbuilder sets:
+    // such an object is left as it was, not taken for BLANK.
+    (out, end == Sep::After || has_unlowered(raw_stmts, ctx))
+}
+
+/// Whether an object's statements, or a branch of them, include one
+/// the walker writes as an empty append (`JbStmt::Unknown`).
+fn has_unlowered(stmts: &[&Expr], ctx: &Ctx) -> bool {
+    stmts.iter().any(|s| match classify(s) {
+        JbStmt::Unknown
+        | JbStmt::ArrayPartial { .. }
+        | JbStmt::ArrayBlock { .. }
+        | JbStmt::Partial { .. }
+        | JbStmt::PartialRecord { .. } => true,
+        JbStmt::Cond { then_branch, else_branch, .. } => {
+            has_unlowered(&branch_stmts(then_branch), ctx) || has_unlowered(&branch_stmts(else_branch), ctx)
+        }
+        JbStmt::Guarded { body, rescues } => {
+            has_unlowered(&branch_stmts(body), ctx)
+                || rescues.iter().any(|r| has_unlowered(&branch_stmts(&r.body), ctx))
+        }
+        _ => false,
+    })
 }
 
 /// Whether the next pair of an object takes a `,` before it.
@@ -774,6 +815,27 @@ fn push_separator(out: &mut Vec<Expr>, ctx: &Ctx, sep: Sep) {
             ));
         }
     }
+}
+
+/// `io.length`.
+fn io_length(ctx: &Ctx) -> Expr {
+    send(Some(var_ref(Symbol::from(ctx.accumulator.as_str()))), "length", Vec::new(), None, false)
+}
+
+/// `io.slice!(mark, io.length) if io.end_with?("{}")`: drop what was
+/// appended since `mark` when it ends in an empty object. Only the
+/// object just written can end there: a non-empty object ends in a
+/// value and its `}`, never in `{}`.
+fn drop_blank_object(mark: Symbol, ctx: &Ctx) -> Expr {
+    let io = || var_ref(Symbol::from(ctx.accumulator.as_str()));
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send(Some(io()), "end_with?", vec![lit_str("{}".to_string())], None, true),
+            then_branch: send(Some(io()), "slice!", vec![var_ref(mark), io_length(ctx)], None, true),
+            else_branch: seq(Vec::new()),
+        },
+    )
 }
 
 /// The statements of an `if` branch. A missing `else` (and the empty
@@ -865,16 +927,39 @@ fn emit_pairs(
                 sep = Sep::After;
             }
             JbStmt::Nested { key, body } => {
+                let (object, filled) =
+                    emit_object_filled(&flatten_cache_blocks(stmts_of(body)), ctx);
+                // Jbuilder leaves a key out when its block sets nothing
+                // (`_merge_block` answers BLANK, `_set_value` skips it).
+                // When the lowerer cannot tell that the block always
+                // sets a pair, the key, its comma and its `{}` are
+                // taken back at run time.
+                let mark = (!filled).then(|| {
+                    let n = ctx.key_marks.get();
+                    ctx.key_marks.set(n + 1);
+                    let mark = Symbol::from(format!("{}_key{n}", ctx.accumulator));
+                    out.push(Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Assign {
+                            target: LValue::Var { id: VarId(0), name: mark.clone() },
+                            value: io_length(ctx),
+                        },
+                    ));
+                    mark
+                });
                 push_separator(out, ctx, sep);
                 out.push(io_append_lit(
                     &ctx.accumulator,
                     &format!("\"{}\":", key.as_str()),
                 ));
-                out.extend(emit_object(
-                    &flatten_cache_blocks(stmts_of(body)),
-                    ctx,
-                ));
-                sep = Sep::After;
+                out.extend(object);
+                sep = match mark {
+                    None => Sep::After,
+                    Some(mark) => {
+                        out.push(drop_blank_object(mark, ctx));
+                        if sep == Sep::After { Sep::After } else { Sep::Unknown }
+                    }
+                };
             }
             JbStmt::PairBlock { key, collection, item_var, body } => {
                 push_separator(out, ctx, sep);
