@@ -553,7 +553,10 @@ module Main
     # controller's type unconditionally (ruby_overlay/main.rb); this is
     # the same contract. RSS keeps its fixed feed type, matching what
     # that overlay dispatch returns for the same routes.
-    if request_format == :rss
+    if controller.content_type.empty?
+      # Head responses in Rails omit Content-Type for statuses that do
+      # not permit a body (1xx, 204, 205, and 304).
+    elsif request_format == :rss
       res.headers["Content-Type"] = "application/rss+xml; charset=utf-8"
     elsif controller.content_type != "text/html; charset=utf-8"
       res.headers["Content-Type"] = controller.content_type
