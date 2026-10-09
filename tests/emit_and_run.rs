@@ -42,6 +42,8 @@ mod controller_response_body;
 mod render_to_string_partial_ivar;
 #[path = "emit_and_run/request_optional_port.rs"]
 mod request_optional_port;
+#[path = "emit_and_run/assoc_pluck_typed.rs"]
+mod assoc_pluck_typed;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
 
