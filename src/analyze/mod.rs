@@ -5230,7 +5230,14 @@ impl Analyzer {
         defined: &BTreeSet<ParamKey>,
     ) {
         for (class_id, method, arg_tys, kw_tys, recv) in sites {
-            let class_id = self.inherited_param_owner(defined, class_id, &method);
+            let want = if recv == SiteRecv::Instance { MethodReceiver::Instance } else { MethodReceiver::Class };
+            let on_side = self.inherited_param_owner(defined, class_id.clone(), &method, Some(want));
+            // Not the nearest `def` of either side: `Child.fetch` reaches `Grand.fetch` past a `Base#fetch`.
+            let class_id = if defined.contains(&(on_side.clone(), method.clone(), want)) {
+                on_side
+            } else {
+                self.inherited_param_owner(defined, class_id, &method, None)
+            };
             let Some(side) = Self::param_side(defined, &class_id, &method, recv) else { continue };
             let key = (class_id, method, side);
             let arg_tys = Self::place_keyword_args(params_by_method.get(&key), arg_tys, kw_tys);
@@ -5302,11 +5309,13 @@ impl Analyzer {
         defined: &BTreeSet<ParamKey>,
         class: ClassId,
         method: &Symbol,
+        side: Option<MethodReceiver>,
     ) -> ClassId {
         let defines = |c: &ClassId| {
             [MethodReceiver::Instance, MethodReceiver::Class]
                 .into_iter()
-                .any(|side| defined.contains(&(c.clone(), method.clone(), side)))
+                .filter(|s| side.is_none_or(|want| want == *s))
+                .any(|s| defined.contains(&(c.clone(), method.clone(), s)))
         };
         let mut cur = class.clone();
         for _ in 0..32 {

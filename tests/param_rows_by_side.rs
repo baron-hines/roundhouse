@@ -117,3 +117,30 @@ fn a_class_method_called_only_on_the_class_is_unaffected() {
     );
     assert_eq!(params, vec![Ty::Str]);
 }
+
+/// Ruby finds a class method up the class-side chain: `Child.fetch`
+/// reaches `Grand.fetch` past `Base`'s instance `fetch`, and
+/// `Child.new.fetch` reaches `Base#fetch`.
+#[test]
+fn an_inherited_def_is_found_on_the_calls_side() {
+    let files = [
+        ("app/services/grand.rb", "class Grand\n  def self.fetch(id)\n    id\n  end\nend\n"),
+        ("app/services/base.rb", "class Base < Grand\n  def fetch(key)\n    key\n  end\nend\n"),
+        ("app/services/child.rb", "class Child < Base\nend\n"),
+        ("app/services/caller.rb", "class Caller\n  def run\n    Child.fetch(1)\n    Child.new.fetch(\"k\")\n  end\nend\n"),
+    ];
+    assert_eq!(params_of(&files, "Grand", "fetch", MethodReceiver::Class), vec![Ty::Int]);
+    assert_eq!(params_of(&files, "Base", "fetch", MethodReceiver::Instance), vec![Ty::Str]);
+}
+
+#[test]
+fn an_instance_call_passes_a_class_method_on_the_way_up() {
+    let files = [
+        ("app/services/grand.rb", "class Grand\n  def fetch(key)\n    key\n  end\nend\n"),
+        ("app/services/base.rb", "class Base < Grand\n  def self.fetch(id)\n    id\n  end\nend\n"),
+        ("app/services/child.rb", "class Child < Base\nend\n"),
+        ("app/services/caller.rb", "class Caller\n  def run\n    Child.fetch(1)\n    Child.new.fetch(\"k\")\n  end\nend\n"),
+    ];
+    assert_eq!(params_of(&files, "Base", "fetch", MethodReceiver::Class), vec![Ty::Int]);
+    assert_eq!(params_of(&files, "Grand", "fetch", MethodReceiver::Instance), vec![Ty::Str]);
+}
