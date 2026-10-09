@@ -2562,7 +2562,7 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 // optionals and the keywords; a required positional
                 // AFTER it has no slot, and the loop below would move it
                 // in front. Ledger that on the module's own def instead
-                // (see the end).
+                // (see the end), and splice no misbound copy.
                 if method
                     .params
                     .iter()
@@ -2571,6 +2571,7 @@ fn splice_concerns_into_controllers(app: &mut App) {
                     .any(|p| !p.keyword && !p.rest && !p.forwarding && !p.from_kwrest && !p.from_keyword)
                 {
                     posts_spliced.insert((module.clone(), method.name.clone()));
+                    continue;
                 }
                 let mut params = Row::closed();
                 let mut opt_params = Vec::new();

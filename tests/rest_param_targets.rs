@@ -218,6 +218,8 @@ fn a_concern_positional_after_a_rest_spliced_into_a_controller_is_ledgered() {
         ),
     ]))
     .expect("ingest");
+    // No copy whose `last` would bind ahead of `*keys`.
+    assert!(gauges(&app).actions().all(|a| a.name.as_str() != "pick"), "the misbound copy must not be spliced");
     // The `check` path: analyze without the post-analyze lowerings.
     let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
     analyzer.analyze(&mut app);
