@@ -1346,6 +1346,31 @@ module ActiveRecord
       rows.length == 0 ? 0.0 : rows[0]["n"].to_f
     end
 
+    # `minimum(:column)` / `maximum(:column)` — SQL extrema over the
+    # current relation. The subquery preserves the relation scope without
+    # loading records; its projection is replaced with the requested column
+    # so a caller's unrelated `select` cannot hide the aggregate input.
+    def minimum(expr)
+      extreme(expr, "MIN")
+    end
+
+    def maximum(expr)
+      extreme(expr, "MAX")
+    end
+
+    def extreme(expr, function)
+      column = expr.to_s.to_sym
+      raise ArgumentError, "unknown aggregate column: #{expr}" unless @model.schema_columns.include?(column)
+      term = "active_record_extreme.#{column}"
+      scoped = spawn
+      scoped.select(column)
+      rows = ActiveRecord.adapter.select_rows(
+        "SELECT #{function}(#{term}) AS value FROM (#{scoped.to_sql}) AS active_record_extreme"
+      )
+      rows.length == 0 ? nil : rows[0]["value"]
+    end
+    private :extreme
+
     # `group(:col).count` — Rails hands back a Hash of group-key =>
     # COUNT. The group_count lowering renames the grouped chain's
     # terminal to this method, so the scalar `count` keeps its

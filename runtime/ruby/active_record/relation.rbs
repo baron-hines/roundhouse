@@ -209,6 +209,9 @@ module ActiveRecord
     def last_n: (Integer | Float | String n) -> Array[Base]
     def count: () -> Integer
     def sum: (String | Symbol expr) -> Float
+    def minimum: (String | Symbol expr) -> untyped
+    def maximum: (String | Symbol expr) -> untyped
+    private def extreme: (String | Symbol expr, String function) -> untyped
     def group_count: () -> Hash[untyped, Integer]
     def empty?: () -> bool
     def any?: () -> bool

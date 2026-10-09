@@ -844,6 +844,10 @@ fn every_runtime_method_body_concretely_typed() {
     // `Relation#in_batches` and in the class-side fallback in
     // connection.rb, whose value is the block's — gradual, as
     // `find_in_batches`' `yield records` already is.
+    // `Relation#minimum` / `#maximum` add 2, MEASURED: the two indexed
+    // reads of the SQL aggregate's column-dependent scalar. The adapter
+    // contract intentionally keeps raw SQL result values `untyped`;
+    // coercing them would break Rails' column-dependent return type.
     // MEASURED 2026-10-09 (against origin/main a28539b6): `haml_class`
     // (the HAML shortcut-class + hash `class:` merge) adds 2 on top of
     // the above — its `value` param is `untyped` (a scalar the HAML
@@ -851,7 +855,7 @@ fn every_runtime_method_body_concretely_typed() {
     // conditional/ternary result), and the body reads it twice
     // (`value.nil?`, `value.to_s`).
     // Rebased onto main after `in_batches`: MEASURED 317 with haml_class, under main's 318.
-    const CEILING: usize = 317;
+    const CEILING: usize = 319;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

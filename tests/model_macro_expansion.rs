@@ -30,6 +30,90 @@ const POSITIONABLE: &str = r#"module Positionable
 end
 "#;
 
+const POSITIONING_CONCERN: &str = r#"module PositioningConcern
+  REBALANCE_THRESHOLD = 1e-10
+  ELEMENT_GAP = 1
+
+  included do
+    scope :positioned, -> { order(:position_score, :id) }
+    scope :active, -> { where(active: true) }
+    scope :before, ->(other) { positioned.where("position_score < ?", other.position_score) }
+    scope :after, ->(other) { positioned.where("position_score > ?", other.position_score) }
+    after_save_commit :rebalance_positions, if: :rebalance_required?
+  end
+
+  class_methods do
+    def positioned_within(parent, association:, filter:)
+      define_method :positioning_parent do
+        send(parent)
+      end
+      define_method :all_positioned_siblings do
+        positioning_parent.send(association).send(filter).positioned
+      end
+      define_method :other_positioned_siblings do
+        all_positioned_siblings.excluding(self)
+      end
+      private :positioning_parent, :all_positioned_siblings, :other_positioned_siblings
+    end
+  end
+
+  def previous
+    other_positioned_siblings.before(self).last
+  end
+
+  def next
+    other_positioned_siblings.after(self).first
+  end
+
+  def move_to_position(offset, followed_by: [])
+    with_positioning_lock do
+      all_to_move = [self, *followed_by]
+      before, after = before_and_after_for(offset: offset, moving: all_to_move)
+      gap = (after - before) / (all_to_move.count + 1)
+      all_to_move.each.with_index(1) do |item, index|
+        item.update!(position_score: before + (index * gap))
+      end
+      remember_to_rebalance_positions if gap < REBALANCE_THRESHOLD
+    end
+  end
+
+  private
+    def before_and_after_for(offset:, moving:)
+      other_items = all_positioned_siblings.excluding(moving)
+      if offset < 1
+        after = all_positioned_siblings.minimum(:position_score) || (2 * ELEMENT_GAP)
+        before = after - ELEMENT_GAP
+      else
+        before, after = other_items.offset(offset - 1).limit(2).pluck(:position_score)
+        before ||= all_positioned_siblings.maximum(:position_score)
+        after ||= before + (moving.count.succ * ELEMENT_GAP)
+      end
+      [before, after]
+    end
+
+    def remember_to_rebalance_positions
+      @rebalance_required = true
+    end
+
+    def rebalance_required?
+      @rebalance_required
+    end
+
+    def rebalance_positions
+      with_positioning_lock do
+        ordered = all_positioned_siblings.select("row_number() over (order by position_score, id) as new_score, id")
+        sql = "update #{self.class.table_name} set position_score = new_score from (#{ordered.to_sql}) as ordered where #{self.class.table_name}.id = ordered.id"
+        self.class.connection.execute(sql)
+      end
+      @rebalance_required = false
+    end
+
+    def with_positioning_lock(&block)
+      positioning_parent.with_lock(&block)
+    end
+end
+"#;
+
 fn app(concern: &str, leaf_body: &str, other_body: &str) -> roundhouse::App {
     app_with_prefix(concern, "", leaf_body, other_body)
 }
@@ -491,4 +575,51 @@ puts "macro runtime parity passed"
 "#);
     run.assert_passes();
     assert!(run.stdout.contains("macro runtime parity passed"));
+}
+
+#[test]
+fn emitted_positioning_runs_reorder_block_move_lock_and_rebalance() {
+    let run = emit_and_run::real_blog()
+        .write("app/models/concerns/positioning_concern.rb", POSITIONING_CONCERN)
+        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.boolean \"active\", default: true, null: false")
+        .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active")
+        .run_ruby(r#"
+article = Article.create!(title: "Positioning owner", body: "A sufficiently long article body")
+other_article = Article.create!(title: "Other owner", body: "A sufficiently long article body")
+make = ->(owner, score, active = true) { Comment.create!(article_id: owner.id, commenter: "Position", body: "Text", position_score: score, active: active) }
+items = 4.times.map { |index| make.call(article, index + 1) }
+siblings = ->(owner) { Comment.where(article_id: owner.id) }
+raise "initial sibling order" unless siblings.call(article).positioned.ids == items.map(&:id)
+raise "default score sequence: #{items.map(&:position_score).inspect}" unless items.map(&:position_score) == [1.0, 2.0, 3.0, 4.0]
+projected = siblings.call(article).active.positioned.select(:id)
+raise "minimum ignored the relation scope/projection" unless projected.minimum(:position_score) == 1.0
+raise "maximum ignored the relation scope/projection" unless projected.maximum(:position_score) == 4.0
+raise "empty minimum should be nil" unless siblings.call(article).where(id: -1).minimum(:position_score).nil?
+begin
+  siblings.call(article).minimum("position_score) FROM active_record_extreme; DROP TABLE comments; --")
+  raise "aggregate accepted an SQL expression as a column"
+rescue ArgumentError
+end
+inactive = make.call(article, 5, false)
+foreign = make.call(other_article, 1)
+items[3].move_to_position(0)
+raise "move to first" unless siblings.call(article).active.positioned.ids == [items[3].id, items[0].id, items[1].id, items[2].id]
+items[3].move_to_position(99)
+raise "move beyond end" unless siblings.call(article).active.positioned.ids == [items[0].id, items[1].id, items[2].id, items[3].id]
+items[0].move_to_position(1, [items[1], items[2]])
+raise "contiguous block move" unless siblings.call(article).active.positioned.ids == [items[3].id, items[0].id, items[1].id, items[2].id]
+raise "neighbors" unless items[1].previous.id == items[0].id && items[1].next.id == items[2].id
+items[0].update!(position_score: 1e-11)
+items[1].update!(position_score: 2e-11)
+items[2].move_to_position(1)
+raise "rebalance order" unless siblings.call(article).active.positioned.ids == [items[0].id, items[2].id, items[1].id, items[3].id]
+raise "rebalance threshold" unless items[2].send(:rebalance_required?)
+items[2].send(:rebalance_positions)
+raise "rebalance scores: #{siblings.call(article).active.positioned.pluck(:position_score).inspect}" unless siblings.call(article).active.positioned.pluck(:position_score) == [1.0, 2.0, 3.0, 4.0]
+raise "active sibling exclusion" unless siblings.call(article).active.positioned.count == 4 && !siblings.call(article).active.positioned.ids.include?(inactive.id)
+raise "owner isolation" unless !siblings.call(article).active.positioned.ids.include?(foreign.id)
+puts "positioning semantics passed"
+"#);
+    run.assert_passes();
+    assert!(run.stdout.contains("positioning semantics passed"));
 }
