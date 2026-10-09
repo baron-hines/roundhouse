@@ -393,6 +393,14 @@ fn rewrite_write_here(
 
 /// Rewrite this node if it is a lifted config read; `false` when it is
 /// not, and the caller then descends.
+/// `Rails.application.config.<key>` for framework keys whose default
+/// Rails defines as a constant, read when no `config.<key> = …` was
+/// lifted. `content_security_policy_nonce_generator` is nil unless an app
+/// configures one; campfire's `CachedResponses` reuses a page only then.
+const UNASSIGNED_FRAMEWORK_DEFAULTS: &[(&str, fn() -> Literal)] = &[
+    ("content_security_policy_nonce_generator", || Literal::Nil),
+];
+
 fn rewrite_here(
     expr: &mut Expr,
     lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
@@ -402,6 +410,17 @@ fn rewrite_here(
     };
     let key = crate::ident::Symbol::from(segments.join("_"));
     let Some((_, reader_ty)) = lifted.iter().find(|(name, _)| name == &key) else {
+        // A framework key the app never assigns reads Rails' own default,
+        // when that default is a constant (`UNASSIGNED_FRAMEWORK_DEFAULTS`).
+        // Anything else stays the unmodelled chain it was.
+        if let [only] = segments.as_slice()
+            && let Some((_, value)) = UNASSIGNED_FRAMEWORK_DEFAULTS.iter().find(|(k, _)| k == only)
+        {
+            let span = expr.span;
+            *expr = Expr::new(span, ExprNode::Lit { value: value() });
+            expr.ty = Some(crate::ty::Ty::Nil);
+            return true;
+        }
         return false;
     };
     let span = expr.span;

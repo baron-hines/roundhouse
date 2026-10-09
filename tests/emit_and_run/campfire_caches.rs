@@ -70,6 +70,7 @@ end
     response.headers["ETag"] = %(W/"#{Digest::SHA256.hexdigest(body).byteslice(0, 32)}")
     response.headers["X-Page-Key"] = page_key(encoding)
     response.headers["X-Snapshot-Same"] = (snapshot == session.to_hash).to_s
+    response.headers["X-No-Nonce"] = (!Rails.application.config.content_security_policy_nonce_generator).to_s
     response.headers["Content-Encoding"] = "gzip" if encoding == "gzip"
     render plain: body
   end
@@ -88,6 +89,7 @@ class CachedPagesControllerTest < ActionDispatch::IntegrationTest
     assert_equal "<p>cached page</p>", Zlib.gunzip(response.body)
     assert_match(/\AW\/"[0-9a-f]{32}"\z/, response.headers["ETag"])
     assert_equal "true", response.headers["X-Snapshot-Same"]
+    assert_equal "true", response.headers["X-No-Nonce"]
     key = ActiveSupport::JSON.decode(response.headers["X-Page-Key"])
     assert_equal [ "cached_pages", "/cached", "gzip" ], key.first(3)
     assert_equal "1", key.last["visits"]

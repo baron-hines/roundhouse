@@ -1173,33 +1173,24 @@ module ActionText
       @html
     end
 
-    # Empty / whitespace-only markup is blank without scanning. Non-empty
-    # shells (`<div></div>`, `<div><br></div>`) still need to_plain_text —
-    # empty blockquotes become curly quotes and are not blank.
+    # Rails' `Content#blank?`, which is `to_html.blank?`
+    # (actiontext 8.1, `delegate :blank?, … to: :to_html`): the MARKUP is
+    # blank only when it is empty or whitespace. A body that is nothing
+    # but an attachment — campfire's unfurled link preview — is present,
+    # and `has_rich_text` saves it. This used to answer from
+    # `to_plain_text`, which an attachment-only body renders as "", so the
+    # body was never stored (campfire's rooms link-preview tests; they had
+    # passed only while the test env served the POST-time render from the
+    # fragment cache).
     def blank?
       html = @html
       return true if html.nil?
       n = html.length
-      return true if n == 0
       i = 0
       while i < n
         c = html[i, 1].to_s
         unless c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\f"
-          # Entity-decoded plain text (`&nbsp;` → " ") is blank when
-          # whitespace-only. Scan here: ActionText::Content must not
-          # resolve `ActiveSupport` through this class (emitted tests
-          # do not load the ActiveSupport module in this namespace).
-          text = to_plain_text
-          j = 0
-          m = text.length
-          while j < m
-            d = text[j, 1].to_s
-            unless d == " " || d == "\t" || d == "\n" || d == "\r" || d == "\f"
-              return false
-            end
-            j = j + 1
-          end
-          return true
+          return false
         end
         i = i + 1
       end
