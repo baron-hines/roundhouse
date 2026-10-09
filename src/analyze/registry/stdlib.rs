@@ -636,9 +636,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Timeout.timeout`, and `IO.popen` / `copy_stream` live in the
     // send special-cases (`body/send.rs`) — catalog entries would win
     // before those cases and kill unit-aware `clock_gettime` (Float for
-    // `:millisecond`). Nested value Consts (`IO::NULL`,
-    // `Process::CLOCK_MONOTONIC`) are empty ClassIds the way `URI::HTTP`
-    // is. Instance methods on an `IO` handle still belong here.
+    // `:millisecond`). Nested *namespace* Consts (`Process::CLOCK_*`)
+    // stay empty ClassIds the way `URI::HTTP` is. Value Consts
+    // (`IO::NULL` / `File::NULL`) are typed Strings via CORE_RBS — do
+    // not also register them here or the ClassId fallback disagrees.
+    // Instance methods on an `IO` handle still belong here. `winsize` /
+    // `winsize=` wait on carrying `require "io/console"` into the
+    // emitted tree; admitting them without that load is check-quiet /
+    // runtime `NoMethodError`.
     let io = Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![] };
     register_stdlib_class(classes, "IO", &[], &[
         ("pid", Ty::Int),
@@ -649,15 +654,17 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("rewind", Ty::Int),
         ("binmode", io.clone()),
         ("close", Ty::Nil),
-        // io/console, a default gem: `[rows, columns]`.
-        ("winsize", Ty::Array { elem: Box::new(Ty::Int) }),
-        ("winsize=", Ty::Array { elem: Box::new(Ty::Int) }),
     ]);
-    // `PTY.spawn` answers `[File, File, Integer]`; a File handle is an IO.
-    classes.entry(ClassId(Symbol::from("File"))).or_default().parent =
-        Some(ClassId(Symbol::from("IO")));
+    // `File < IO` — Ruby's hierarchy (not a PTY detail). File's class
+    // methods are registered earlier; the parent is set once `IO` exists
+    // so instance methods (`readpartial`, `closed?`, …) resolve on a
+    // File handle, including `PTY.spawn`'s reader/writer.
+    classes
+        .get_mut(&ClassId(Symbol::from("File")))
+        .expect("File registered above")
+        .parent = Some(ClassId(Symbol::from("IO")));
     // `require "pty"`. `PTY.spawn`'s return is a send special case: its
-    // block form answers nil.
+    // block form answers nil; block yields are typed in `block_params_for`.
     register_stdlib_class(classes, "PTY", &[], &[]);
     // A default gem a booted Rails app has already loaded; the BUNDLED
     // row emits its require.
@@ -666,7 +673,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("join", Ty::Str), ("shelljoin", Ty::Str),
         ("split", str_arr()), ("shellsplit", str_arr()), ("shellwords", str_arr()),
     ], &[]);
-    register_stdlib_class(classes, "IO::NULL", &[], &[]);
     register_stdlib_class(classes, "Process", &[], &[]);
     register_stdlib_class(classes, "Process::CLOCK_MONOTONIC", &[], &[]);
     register_stdlib_class(classes, "Process::CLOCK_REALTIME", &[], &[]);

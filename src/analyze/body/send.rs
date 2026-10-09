@@ -400,6 +400,16 @@ impl<'a> BodyTyper<'a> {
             Ty::Class { id, .. } if id.0.as_str() == "CSV" && method.as_str() == "generate" => {
                 Some(vec![recv_ty.clone()])
             }
+            // `PTY.spawn(...) { |r, w, pid| ... }` yields the same three
+            // values the non-block form answers as a Tuple.
+            Ty::Class { id, .. }
+                if class_object_receiver
+                    && id.0.as_str() == "PTY"
+                    && method.as_str() == "spawn" =>
+            {
+                let file = Ty::Class { id: ClassId(Symbol::from("File")), args: vec![] };
+                Some(vec![file.clone(), file, Ty::Int])
+            }
             // ActiveModel::Errors iteration yields an Error to the block.
             Ty::Class { id, .. } if id.0.as_str() == "ActiveModel::Errors" => {
                 match method.as_str() {

@@ -1,8 +1,8 @@
 //! One contract for the IO and process constants an app's terminal code
 //! names, shared by the interpreted (CRuby overlay) and native (spinel)
-//! lanes: `Errno::*`, `EOFError`, `File::NULL`, `Encoding::UTF_8`,
-//! `Shellwords` and `PTY`. Each used to stop `check` with "constant not
-//! supported (all targets)".
+//! lanes: `Errno::*`, `EOFError`, `File::NULL` / `IO::NULL`,
+//! `Encoding::UTF_8`, `Shellwords` and `PTY`. Each used to stop `check`
+//! with "constant not supported (all targets)".
 //!
 //! The expected lines are CRuby 4.0's output for the same code.
 
@@ -31,6 +31,10 @@ class TerminalProbe
     File.write(File::NULL, "noise")
   end
 
+  def self.null_devices
+    [File::NULL, IO::NULL]
+  end
+
   def self.quoted(text)
     "echo #{Shellwords.escape(text)}"
   end
@@ -54,7 +58,12 @@ class TerminalProbe
   end
 
   def self.spawn_with_block
-    PTY.spawn("true") { |r, w, _pid| r.close; w.close }
+    # Block yields are File handles; readpartial must type-check.
+    PTY.spawn("true") { |r, w, _pid|
+      r.readpartial(1) rescue nil
+      r.close
+      w.close
+    }
   end
 end
 "#;
@@ -63,6 +72,7 @@ pub const SCRIPT: &str = r#"
 puts TerminalProbe.missing_file
 puts TerminalProbe.missing_dir
 p TerminalProbe.discarded
+p TerminalProbe.null_devices
 puts TerminalProbe.quoted("a b'c")
 puts TerminalProbe.utf8("zaż")
 p TerminalProbe.terminal
@@ -73,6 +83,7 @@ puts "spawned"
 pub const EXPECTED: &str = r#"enoent
 Errno::ENOENT
 5
+["/dev/null", "/dev/null"]
 echo a\ b\'c
 UTF-8
 ["hi|end", true, true]

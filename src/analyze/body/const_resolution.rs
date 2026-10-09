@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rubydex::diagnostic::{Diagnostic as RubydexDiagnostic, Rule};
 use rubydex::indexing::local_graph::LocalGraph;
@@ -25,13 +25,13 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::{FileId, SourceFile, Span};
 use crate::ty::Ty;
 
-// Rubydex's minimal built-ins stop at Object/Module/Class. These are
-// Ruby core classes already modeled by Roundhouse's primitive dispatch,
-// declared as RBS so the source graph resolves them by Ruby name.
-const CORE_RBS: &str = "\
+// Rubydex's minimal built-ins stop at Object/Module/Class. Classes
+// without value Consts live in `CORE_RBS_BASE`; value Consts are one
+// table (`CORE_VALUE_CONSTS`) that builds both the RBS fields and the
+// typed answer — a second copy is how the type drifts from the graph.
+const CORE_RBS_BASE: &str = "\
 class Numeric < Object\nend\n\
 class Integer < Numeric\nend\n\
-class Float < Numeric\n  INFINITY: Float\n  NAN: Float\n  EPSILON: Float\n  MAX: Float\n  MIN: Float\nend\n\
 class String < Object\nend\n\
 class Array < Object\nend\n\
 class Hash < Object\nend\n\
@@ -42,23 +42,81 @@ class FalseClass < Object\nend\n\
 class NilClass < Object\nend\n\
 class Regexp < Object\nend\n\
 class Exception < Object\nend\n\
-class StandardError < Exception\nend\n\
-class IO < Object\n  NULL: String\nend\n\
-class File < IO\n  NULL: String\nend\n\
-class Encoding < Object\n  UTF_8: Encoding\n  BINARY: Encoding\n  ASCII_8BIT: Encoding\n  US_ASCII: Encoding\nend\n";
+class StandardError < Exception\nend\n";
 
-/// The type of a value constant `CORE_RBS` declares, as Ruby defines it.
-fn core_value_type(name: &str) -> Option<Ty> {
-    match name {
-        "Float::INFINITY" | "Float::NAN" | "Float::EPSILON" | "Float::MAX" | "Float::MIN" => {
-            Some(Ty::Float)
-        }
-        "IO::NULL" | "File::NULL" => Some(Ty::Str),
-        "Encoding::UTF_8" | "Encoding::BINARY" | "Encoding::ASCII_8BIT" | "Encoding::US_ASCII" => {
-            Some(Ty::Class { id: ClassId(Symbol::from("Encoding")), args: vec![] })
-        }
-        _ => None,
+/// `(owner, field, type)` — Ruby's `Owner::FIELD` value Consts.
+/// `core_rbs()` emits the RBS; `core_value_type` answers the type.
+const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
+    ("Float", "INFINITY", || Ty::Float),
+    ("Float", "NAN", || Ty::Float),
+    ("Float", "EPSILON", || Ty::Float),
+    ("Float", "MAX", || Ty::Float),
+    ("Float", "MIN", || Ty::Float),
+    ("IO", "NULL", || Ty::Str),
+    ("File", "NULL", || Ty::Str),
+    ("Encoding", "UTF_8", encoding_ty),
+    ("Encoding", "BINARY", encoding_ty),
+    ("Encoding", "ASCII_8BIT", encoding_ty),
+    ("Encoding", "US_ASCII", encoding_ty),
+];
+
+/// Classes that own rows in `CORE_VALUE_CONSTS`, with their RBS parents.
+const CORE_VALUE_CLASSES: &[(&str, &str)] = &[
+    ("Float", "Numeric"),
+    ("IO", "Object"),
+    ("File", "IO"),
+    ("Encoding", "Object"),
+];
+
+fn encoding_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("Encoding")), args: vec![] }
+}
+
+fn rbs_type_name(ty: &Ty) -> &'static str {
+    match ty {
+        Ty::Float => "Float",
+        Ty::Str => "String",
+        Ty::Class { id, .. } if id.0.as_str() == "Encoding" => "Encoding",
+        _ => "untyped",
     }
+}
+
+fn core_rbs() -> &'static str {
+    static RBS: OnceLock<String> = OnceLock::new();
+    RBS.get_or_init(|| {
+        let mut out = String::from(CORE_RBS_BASE);
+        for (class, parent) in CORE_VALUE_CLASSES {
+            out.push_str("class ");
+            out.push_str(class);
+            out.push_str(" < ");
+            out.push_str(parent);
+            out.push('\n');
+            for (owner, field, ty) in CORE_VALUE_CONSTS {
+                if owner == class {
+                    out.push_str("  ");
+                    out.push_str(field);
+                    out.push_str(": ");
+                    out.push_str(rbs_type_name(&ty()));
+                    out.push('\n');
+                }
+            }
+            out.push_str("end\n");
+        }
+        out
+    })
+    .as_str()
+}
+
+/// The type of a value constant `core_rbs()` declares, as Ruby defines it.
+fn core_value_type(name: &str) -> Option<Ty> {
+    CORE_VALUE_CONSTS.iter().find_map(|(owner, field, ty)| {
+        let need = owner.len() + 2 + field.len();
+        (name.len() == need
+            && name.as_bytes().get(..owner.len()) == Some(owner.as_bytes())
+            && name.as_bytes().get(owner.len()..owner.len() + 2) == Some(b"::".as_slice())
+            && name.as_bytes().get(owner.len() + 2..) == Some(field.as_bytes()))
+        .then(|| ty())
+    })
 }
 
 const CORE_URI: &str = "roundhouse-core:rbs";
@@ -516,7 +574,7 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
     let mut documents = vec![Document {
         uri_prefix: CORE_URI,
         path: "",
-        text: CORE_RBS,
+        text: core_rbs(),
         language: LanguageId::Rbs,
     }];
     documents.extend(
