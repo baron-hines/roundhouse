@@ -630,6 +630,15 @@ enum JbStmt<'a> {
         item_var: Symbol,
         body: &'a Expr,
     },
+    /// `Recv.call(args) do … end` on anything but `json`, whose block
+    /// reaches `json` — a tenant scope, `I18n.with_locale`, a gem
+    /// helper. The call stays as written; its block's pairs belong to
+    /// the enclosing object, as the block runs with the same builder.
+    Around { call: &'a Expr, body: &'a Expr },
+    /// The same, but with a block the lowerer cannot rebuild (a block
+    /// parameter named `json`, or a block argument that is not a
+    /// literal block). Reported, never dropped.
+    AroundUnlowered,
     /// Unrecognized DSL or non-Send statement. Surfaces as an empty io
     /// append so the lowered body stays well-formed.
     Unknown,
@@ -772,6 +781,8 @@ fn has_unlowered(stmts: &[&Expr], ctx: &Ctx) -> bool {
             has_unlowered(&branch_stmts(body), ctx)
                 || rescues.iter().any(|r| has_unlowered(&branch_stmts(&r.body), ctx))
         }
+        JbStmt::Around { body, .. } => has_unlowered(&branch_stmts(body), ctx),
+        JbStmt::AroundUnlowered => true,
         _ => false,
     })
 }
@@ -815,6 +826,18 @@ fn push_separator(out: &mut Vec<Expr>, ctx: &Ctx, sep: Sep) {
             ));
         }
     }
+}
+
+/// A statement the lowering cannot write, carrying the report: the
+/// survey lists it and the Ruby emit raises it where it stood.
+fn unsupported_stmt(span: Span, construct: &str, detail: &str) -> Expr {
+    let mut e = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    e.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+        target: None,
+        construct: Symbol::from(construct),
+        detail: detail.to_string(),
+    });
+    e
 }
 
 /// `io.length`.
@@ -1012,6 +1035,36 @@ fn emit_pairs(
             JbStmt::Local => {
                 out.push(emit_local(src, ctx));
             }
+            JbStmt::Around { call, body } => {
+                // The block may run any number of times: its first pair
+                // takes a comma unless one is already known, and so
+                // does the pair after the call.
+                let start = if sep == Sep::After { Sep::After } else { Sep::Unknown };
+                let stmts = branch_stmts(body);
+                let classified: Vec<JbStmt<'_>> = stmts.iter().map(|s| classify(s)).collect();
+                let mut appends = Vec::new();
+                emit_pairs(&classified, &stmts, ctx, &mut appends, start);
+                let mut call = (*call).clone();
+                if let ExprNode::Send { block: Some(block), .. } = &mut *call.node {
+                    if let ExprNode::Lambda { body, .. } = &mut *block.node {
+                        *body = seq(appends);
+                    }
+                }
+                out.push(call);
+                sep = start;
+            }
+            JbStmt::AroundUnlowered => {
+                crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
+                    file: String::new(),
+                    message: "jbuilder: a block on a non-json call reaches `json` but cannot be lowered"
+                        .to_string(),
+                });
+                out.push(unsupported_stmt(
+                    src.span,
+                    "jbuilder block on a non-json call",
+                    "the block reaches `json` but its parameters or form cannot be lowered",
+                ));
+            }
             JbStmt::Unknown => {
                 out.push(io_append_lit(&ctx.accumulator, ""));
             }
@@ -1138,6 +1191,23 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
     }
     if let ExprNode::Assign { target: LValue::Var { .. }, .. } = &*stmt.node {
         return JbStmt::Local;
+    }
+    if let ExprNode::Send { recv, block: Some(block), .. } = &*stmt.node {
+        // A block parameter named `json` shadows the builder: the
+        // block's `json.` calls go to whatever the call yields, which
+        // the lowering cannot follow.
+        let binds_json = matches!(&*block.node, ExprNode::Lambda { params, .. }
+            if params.iter().any(|p| p.as_str() == "json"));
+        if !recv.as_ref().is_some_and(is_json_receiver) && (binds_json || mentions_json(block)) {
+            return match &*block.node {
+                ExprNode::Lambda { params, rest_param: None, body, .. }
+                    if !params.iter().any(|p| p.as_str() == "json") =>
+                {
+                    JbStmt::Around { call: stmt, body }
+                }
+                _ => JbStmt::AroundUnlowered,
+            };
+        }
     }
     let ExprNode::Send {
         recv: Some(recv),
@@ -1439,6 +1509,19 @@ fn element_body_supported(body: &Expr) -> bool {
 
 /// `json` parsed as a bare method call: `Send { recv: None, method:
 /// "json", args: [] }`. Anything else fails the discriminator.
+/// Whether `e` reads the template's builder anywhere: a `json.<x>`
+/// call or a bare `json`.
+fn mentions_json(e: &Expr) -> bool {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+        if method.as_str() == "json" && args.is_empty() {
+            return true;
+        }
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || mentions_json(c));
+    found
+}
+
 fn is_json_receiver(recv: &Expr) -> bool {
     matches!(
         &*recv.node,
