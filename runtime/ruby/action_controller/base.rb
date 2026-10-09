@@ -1,6 +1,7 @@
 require_relative "../action_dispatch/flash"
 require_relative "../action_dispatch/session"
 require_relative "../action_view"
+require_relative "../mime"
 
 module AbstractController
   class DoubleRenderError < StandardError
@@ -612,9 +613,11 @@ module ActionController
     # Rails 8.1.4 ActionController::Head#head(status, options = nil).
     # Options are a header hash; :location and :content_type are special,
     # while all other entries become normalized, string-valued response
-    # headers. @performed—not the initially empty @body—is Rails'
-    # double-render guard: the first head is valid, but render-then-head
-    # raises AbstractController::DoubleRenderError.
+    # headers. Content-type symbols resolve through Mime; string media
+    # types retain their MIME type with charset removed. @performed—not
+    # the initially empty @body—is Rails' double-render guard: the first
+    # head is valid, but render-then-head raises
+    # AbstractController::DoubleRenderError.
     #
     # Rails source returns true (the API prose does not promise a return
     # value). Bodyless status classes omit Content-Type; other statuses
@@ -632,7 +635,7 @@ module ActionController
 
       unless options.nil?
         location = options.delete(:location)
-        content_type = options.delete(:content_type).to_s
+        content_type = head_option_content_type(options.delete(:content_type))
         options.each do |key, value|
           @headers[normalize_head_header_name(key.to_s)] = value.to_s
         end
@@ -671,12 +674,18 @@ module ActionController
     end
 
     def head_format_content_type
-      case @request_format
-      when :json then "application/json"
-      when :turbo_stream then "text/vnd.turbo-stream.html"
-      when :rss then "application/rss+xml"
-      when :js then "text/javascript"
-      else "text/html"
+      mime_type = Mime[@request_format]
+      return mime_type.to_s unless mime_type.nil?
+      Mime[:html].to_s
+    end
+
+    def head_option_content_type(content_type)
+      if content_type.is_a?(Symbol)
+        mime_type = Mime[content_type]
+        raise ArgumentError, "Unknown MIME type #{content_type}" if mime_type.nil?
+        mime_type.to_s
+      else
+        content_type.to_s
       end
     end
 

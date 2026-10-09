@@ -149,6 +149,11 @@ class ActionControllerBaseTest < Minitest::Test
     assert_equal({ "x-custom_header" => 17 }, options, "remaining options")
   end
 
+  def test_head_resolves_mime_symbol_content_type
+    @controller.head(:ok, { content_type: :json })
+    assert_equal "application/json", @controller.content_type
+  end
+
   def test_head_defaults_nil_status_to_ok
     assert_equal true, @controller.head(nil)
     assert_equal 200, @controller.status
@@ -166,6 +171,12 @@ class ActionControllerBaseTest < Minitest::Test
     @controller.content_type = ""
     @controller.head(:ok)
     assert_equal "text/html", @controller.content_type
+  end
+
+  def test_head_uses_the_registered_mime_for_the_negotiated_format
+    @controller.request_format = :xml
+    @controller.head(:ok)
+    assert_equal "application/xml", @controller.content_type
   end
 
   def test_head_accepts_integer_statuses

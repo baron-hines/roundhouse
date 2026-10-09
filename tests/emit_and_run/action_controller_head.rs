@@ -19,6 +19,28 @@ raise "body #{body.inspect}" unless body == [""]
 
 status, headers, body = Main.run_rack(
   "REQUEST_METHOD" => "GET",
+  "PATH_INFO" => "/head-probe/json",
+  "QUERY_STRING" => "",
+  "HTTP_HOST" => "localhost",
+  "rack.input" => StringIO.new("")
+)
+raise "symbol content type status #{status}" unless status == 200
+raise "symbol content type #{headers.inspect}" unless headers["content-type"] == "application/json"
+raise "symbol content type body #{body.inspect}" unless body == [""]
+
+status, headers, body = Main.run_rack(
+  "REQUEST_METHOD" => "GET",
+  "PATH_INFO" => "/head-probe/negotiated.xml",
+  "QUERY_STRING" => "",
+  "HTTP_HOST" => "localhost",
+  "rack.input" => StringIO.new("")
+)
+raise "negotiated status #{status}" unless status == 200
+raise "negotiated XML #{headers.inspect}" unless headers["content-type"] == "application/xml"
+raise "negotiated body #{body.inspect}" unless body == [""]
+
+status, headers, body = Main.run_rack(
+  "REQUEST_METHOD" => "GET",
   "PATH_INFO" => "/head-probe/empty",
   "QUERY_STRING" => "",
   "HTTP_HOST" => "localhost",
@@ -79,13 +101,21 @@ pub fn overlay() -> emit_and_run::Overlay {
         .edit(
             "config/routes.rb",
             "  root \"articles#index\"\n",
-            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n",
+            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/json\", to: \"head_probes#json\"\n  get \"/head-probe/negotiated\", to: \"head_probes#negotiated\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n",
         )
         .write(
             "app/controllers/head_probes_controller.rb",
             r#"class HeadProbesController < ApplicationController
   def created
-    head :created, { "x-custom_header" => 17, location: "/head-probe/created", content_type: "text/plain" }
+    head :created, { "x-custom_header" => 17, location: "/head-probe/created", content_type: "text/plain; charset=utf-8" }
+  end
+
+  def json
+    head :ok, content_type: :json
+  end
+
+  def negotiated
+    head :ok
   end
 
   def empty

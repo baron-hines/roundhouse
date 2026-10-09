@@ -139,6 +139,7 @@ module Main
     request_format = :json if path_format == "json"
     request_format = :turbo_stream if path_format == "turbo_stream"
     request_format = :rss if path_format == "rss"
+    request_format = :xml if path_format == "xml"
     # `/service-worker.js`: campfire's raw service-worker template.
     request_format = :js if path_format == "js"
     # A route-forced format (`get "/rss" => "home#index", :format =>

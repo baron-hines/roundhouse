@@ -180,7 +180,12 @@ not add generic class-object/Relation support to strict targets.
 options hash. Roundhouse supports registered status symbols, integer
 statuses, and `nil` (defaulting to 200); a Hash passed as the status and
 unknown status symbols raise. The special symbol keys `:location` and
-`:content_type` are removed from the options; other String/Symbol header
+`:content_type` are removed from the options. Content-type symbols resolve
+through Roundhouse's built-in MIME registry (`:json` → `application/json`);
+string content types retain their media type with charset removed. Without
+an explicit type, negotiated formats also resolve through that registry
+(`.xml` → `application/xml`). The registry is fixed; app-specific
+`Mime.register` extensions are not supported. Other String/Symbol header
 names are normalized and their values stringified. A path-string location
 is passed through, while a record in `location:` is lowered through its
 conventional singular route helper (`@article` → `article_path(@article.id)`);

@@ -10,13 +10,21 @@ fn head_options_are_observable_in_the_native_http_response() {
         .edit(
             "config/routes.rb",
             "  root \"articles#index\"\n",
-            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n",
+            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/json\", to: \"head_probes#json\"\n  get \"/head-probe/negotiated\", to: \"head_probes#negotiated\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n",
         )
         .write(
             "app/controllers/head_probes_controller.rb",
             r#"class HeadProbesController < ApplicationController
   def created
-    head :created, { "x-custom_header" => 17, location: "/head-probe/created", content_type: "text/plain" }
+    head :created, { "x-custom_header" => 17, location: "/head-probe/created", content_type: "text/plain; charset=utf-8" }
+  end
+
+  def json
+    head :ok, content_type: :json
+  end
+
+  def negotiated
+    head :ok
   end
 
   def empty
@@ -67,6 +75,22 @@ end
         Some("text/plain")
     );
     assert!(created.body.is_empty(), "body was {:?}", created.body);
+
+    let json = server.get("/head-probe/json");
+    assert_eq!(json.status, 200, "{}", server.log());
+    assert_eq!(
+        json.headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert!(json.body.is_empty(), "body was {:?}", json.body);
+
+    let negotiated = server.get("/head-probe/negotiated.xml");
+    assert_eq!(negotiated.status, 200, "{}", server.log());
+    assert_eq!(
+        negotiated.headers.get("content-type").map(String::as_str),
+        Some("application/xml")
+    );
+    assert!(negotiated.body.is_empty(), "body was {:?}", negotiated.body);
 
     let empty = server.get("/head-probe/empty");
     assert_eq!(empty.status, 204, "{}", server.log());
