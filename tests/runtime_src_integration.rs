@@ -827,7 +827,11 @@ fn every_runtime_method_body_concretely_typed() {
     // true`), and each `Hash[Symbol, untyped]` value read is gradual —
     // same shape `connection.rb`'s other `opts`-style Hash call sites
     // already carry.
-    const CEILING: usize = 310;
+    // `ActiveRecord::RecordNotFound#initialize` (model/primary_key/id)
+    // adds 1, MEASURED on the runtime after #671: the `@id = id` store
+    // of the id Rails passes through, whose RBS type is the flat
+    // `String | Integer | Array | nil` union.
+    const CEILING: usize = 311;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

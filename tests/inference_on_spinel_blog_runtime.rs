@@ -299,7 +299,12 @@ fn untyped_subexpressions_baseline() {
     // `joinable:` pass-through into `transaction`, all accepted and
     // ignored under SQLite. Its RBS-paired methods keep the gradual
     // `untyped` escape `self.transaction` already has.
-    const CEILING: usize = 529;
+    // RecordNotFound's model/primary_key/id: 529 -> 534, MEASURED on
+    // the runtime after #671. The five new sites are the finder inputs
+    // the raises now pass through: `id` in Base#find (x2), Relation#find
+    // and Relation#find_ids, and the ruby-family Base#find_by!'s
+    // `conditions`. Companion RBS probe stays at zero residual.
+    const CEILING: usize = 534;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

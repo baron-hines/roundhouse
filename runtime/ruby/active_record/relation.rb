@@ -1169,7 +1169,7 @@ module ActiveRecord
     # dispatch layer) instead of returning nil when the relation is empty.
     def first!
       record = first
-      raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
+      raise RecordNotFound.new("Couldn't find record in #{@model.table_name}", @model.name, @model.primary_key) if record.nil?
       record
     end
 
@@ -1657,7 +1657,7 @@ module ActiveRecord
         @wheres.pop
       end
       if record.nil?
-        raise RecordNotFound, "Couldn't find record in #{@model.table_name} with id=#{id}"
+        raise RecordNotFound.new("Couldn't find record in #{@model.table_name} with id=#{id}", @model.name, @model.primary_key, id)
       end
       record
     end
@@ -1700,7 +1700,7 @@ module ActiveRecord
         @wheres.pop
       end
       if rows.length != expected
-        raise RecordNotFound, "Couldn't find all records in #{@table} with ids=#{ids}"
+        raise RecordNotFound.new("Couldn't find all records in #{@table} with ids=#{ids}", @model.name, @model.primary_key, ids)
       end
       if @orders.empty?
         keys.map { |key| rows.find { |row| row.id == key } }
@@ -1732,7 +1732,7 @@ module ActiveRecord
     # `find_by!` — `find_by` that raises `RecordNotFound` on no match.
     def find_by!(conditions)
       record = find_by(conditions)
-      raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
+      raise RecordNotFound.new("Couldn't find record in #{@model.table_name}", @model.name, @model.primary_key) if record.nil?
       record
     end
 
@@ -1763,7 +1763,7 @@ module ActiveRecord
       loaded = @records
       unless loaded.nil?
         rows = loaded_sole_rows(loaded)
-        raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+        raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if rows.length == 0
         raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
         return rows[0]
       end
@@ -1772,7 +1772,7 @@ module ActiveRecord
       rows = to_a
       @limit = prior_limit
       @records = nil
-      raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if rows.length == 0
       raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
       rows[0]
     end
