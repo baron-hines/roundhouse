@@ -342,6 +342,19 @@ impl<'a> BodyTyper<'a> {
         self.classes
     }
 
+    fn has_unknown_ancestor(&self, id: &crate::ident::ClassId) -> bool {
+        let mut current = Some(id);
+        for step in 0..32 {
+            let Some(cid) = current else { return false };
+            let Some(cls) = self.classes.get(cid) else { return step > 0 };
+            if cls.open {
+                return true;
+            }
+            current = cls.parent.as_ref();
+        }
+        false
+    }
+
     /// Whether `self`'s class, its includes or its ancestors register
     /// `method` — an app definition, whatever type it answered.
     fn app_defines(&self, self_ty: Option<&Ty>, method: &Symbol) -> bool {
@@ -1562,7 +1575,16 @@ impl<'a> BodyTyper<'a> {
                         _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "as_json" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
-                    if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
+                    // Not an Object extension under an unseen ancestor: a gem likely defines it, and only a dispatch miss keeps the receiver attribution needs.
+                    let gem_ancestry = recv_ty
+                        .clone()
+                        .filter(|ty| gap == Some("Object extension") && matches!(ty, Ty::Class { id, .. } if self.has_unknown_ancestor(id)));
+                    if let Some(recv_ty) = gem_ancestry.filter(|_| expr.diagnostic.is_none()) {
+                        expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed {
+                            method: method.clone(),
+                            recv_ty,
+                        });
+                    } else if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
                         expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                             target: None,
                             construct: Symbol::from(owner),

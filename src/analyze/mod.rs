@@ -950,6 +950,14 @@ impl Analyzer {
                 info.app_declared = true;
             }
         }
+        // Not wholly the app's: declaring a constant an unmodeled gem defines reopens it.
+        if let Some(census) = app.gem_lock.as_ref().map(crate::gems::GemCensus::of) {
+            for (id, info) in classes.iter_mut() {
+                if info.app_declared && info.parent.is_none() && crate::gems::gem_defining_constant(&census, id.0.as_str()).is_some() {
+                    info.open = true;
+                }
+            }
+        }
 
         for (id, method) in app.models.iter()
             .flat_map(|model| model.methods().map(move |method| (&model.name, method)))
