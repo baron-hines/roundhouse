@@ -229,3 +229,32 @@ fn a_nested_transaction_joins_the_outer_one_on_cruby() {
     assert!(!out.contains("FAIL"), "{out}");
     assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 6, "{out}");
 }
+
+/// `Db.exec`'s bare-BEGIN case must reserve (and bind) the connection
+/// BEFORE running the BEGIN statement, not after. Reserving only once
+/// BEGIN has already executed leaves a window — between the statement
+/// completing and the reservation removing index 0 from the pool's
+/// free list — where a `with_connection` lease on another thread can
+/// still check that same connection out from under the transaction
+/// `pin_transaction` is about to protect. The window is too narrow to
+/// hit deterministically through real thread scheduling (CodeRabbit on
+/// #693 flagged it as a code-reading finding, not an observed failure),
+/// so this is the ordering check itself: `DbPool#reserve(0)` for the
+/// BEGIN branch must appear, in source, before the `write(conn, sql,
+/// false)` call it protects.
+#[test]
+fn exec_reserves_the_connection_before_running_a_bare_begin() {
+    let src = include_str!("../runtime/spinel/db.rb");
+    let start = src.find("def self.exec(sql)").expect("Db.exec not found in db.rb");
+    let end = src[start..].find("\n  def self.pin_transaction").expect("Db.pin_transaction not found after Db.exec");
+    let exec_body = &src[start..start + end];
+    let begin_branch_start =
+        exec_body.find("sql == \"BEGIN\"").expect("db.rb's Db.exec no longer special-cases a bare BEGIN");
+    let branch = &exec_body[begin_branch_start..];
+    let reserve_pos = branch.find("@pools[0].reserve(0)").expect("the BEGIN branch no longer reserves the connection");
+    let write_pos = branch.find("write(conn, sql, false)").expect("the BEGIN branch no longer writes the statement");
+    assert!(
+        reserve_pos < write_pos,
+        "Db.exec's BEGIN branch must reserve the connection before writing BEGIN, not after:\n{branch}"
+    );
+}

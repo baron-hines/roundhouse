@@ -1576,8 +1576,29 @@ module Db
   def self.exec(sql)
     record_query(sql)
     conn = current_conn
-    write(conn, sql, false)
-    pin_transaction(conn)
+    # A bare BEGIN reserves (and binds) the connection BEFORE it runs,
+    # not after: reserving only once the BEGIN has already executed
+    # left a window, between the statement completing and the
+    # reservation removing index 0 from the pool's free list, where a
+    # `with_connection` lease on another thread could still check that
+    # same connection out — same race `pin_transaction` otherwise
+    # closes, just narrowed to this one statement instead of the whole
+    # transaction. A failed BEGIN releases the reservation: no
+    # transaction opened, so there is nothing left to protect.
+    if sql == "BEGIN" && !conn.in_txn? && !in_lease?
+      @pools[0].reserve(0)
+      begin
+        write(conn, sql, false)
+      rescue Exception => e
+        @pools[0].release(0)
+        raise e
+      end
+      Thread.current[:db_conn] = conn
+      Thread.current[:db_txn_pin] = true
+    else
+      write(conn, sql, false)
+      pin_transaction(conn)
+    end
     # A value, not `nil`: spinel compiles a method ending in a bare nil
     # as void, and `Db.with_connection { Db.exec(...) }` assigns the
     # block's value (`result = yield`), which cannot hold a void.
@@ -1602,6 +1623,12 @@ module Db
   # unleased transaction — with pool_size 1 there is nowhere else for it
   # to come from. Its cleanup (`release_abandoned_write`) would then roll
   # this thread's still-open transaction back out from under it.
+  #
+  # `self.exec`'s own BEGIN case reserves and pins BEFORE running the
+  # statement (see its comment) rather than waiting for this method to
+  # notice `conn.in_txn?` afterward, so the `elsif !in_lease?` branch
+  # below is a defensive fallback for any OTHER path that might open a
+  # transaction, not the one BEGIN itself takes.
   def self.pin_transaction(conn)
     if !conn.in_txn?
       if Thread.current[:db_txn_pin] == true
