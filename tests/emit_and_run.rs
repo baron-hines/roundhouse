@@ -9206,3 +9206,28 @@ raise "PurgeJob not recorded" unless ActiveJob.performed.include?("ActiveStorage
 "#)
         .assert_passes();
 }
+
+/// Fixtures load the way Rails' `insert_fixtures_set` loads them: raw
+/// rows, no validations and no callbacks. A callback that raises would
+/// abort the load if it ran; campfire's Message `after_create_commit`
+/// marked memberships unread at load time, so the fixture users began
+/// with unread rooms Rails never gives them.
+#[test]
+fn fixture_rows_load_without_running_callbacks() {
+    emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", "class Comment < ApplicationRecord\n  before_save { raise \"a callback ran for a fixture row\" }\n  after_create_commit { raise \"a commit callback ran for a fixture row\" }\n")
+        .write(
+            "test/models/fixture_load_test.rb",
+            r#"require "test_helper"
+
+class FixtureLoadTest < ActiveSupport::TestCase
+  test "every comment fixture is in the table, stamped" do
+    assert_operator Comment.count, :>, 0
+    assert Comment.all.all? { |comment| comment.created_at && comment.updated_at }
+  end
+end
+"#,
+        )
+        .run_test("test/models/fixture_load_test.rb")
+        .assert_passes();
+}
