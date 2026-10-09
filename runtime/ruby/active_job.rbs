@@ -16,8 +16,15 @@ module ActiveJob
   def self.drain_registered: () -> bool
   def self.register_drain: () -> nil
   def self.enqueue: (^() -> nil work) -> nil
+  PAYLOADS: Array[String]
+  ORDER: Array[String]
+  def self.enqueue_payload: (String json) -> nil
   def self.pending_count: () -> Integer
+  def self.perform_payload: (String json) -> bool
   def self.drain: () -> Integer
+
+  class DeserializationError < StandardError
+  end
   HELD_NAMES: Array[String]
   HELD: Array[^() -> nil]
   def self.hold: (String job_name, ^() -> nil work) -> nil

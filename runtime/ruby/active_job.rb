@@ -148,11 +148,49 @@ module ActiveJob
   # gradually under both.
   def self.enqueue(work)
     PENDING << work
+    ORDER << "p"
+    nil
+  end
+
+  # ---- Serialized payloads --------------------------------------------
+  #
+  # The second kind of entry: an ActiveJob-format JSON payload (the
+  # `job.serialize` hash Rails hands to Sidekiq), built by
+  # `ActiveJob::Payload.build` on the Ruby-family lanes. A job whose
+  # arguments all serialize goes this way, and the drain looks its
+  # records up again when it runs, as Rails does. Every other job keeps
+  # the Proc above.
+  #
+  # TWO ARRAYS AND AN ORDER, NOT ONE ARRAY OF BOTH, for the reason the
+  # Proc queue gives: a strict target has one element type per Array.
+  # `ORDER` holds one "p" (Proc) or "j" (payload) per entry so FIFO holds
+  # across the two kinds. Writers push the entry before its ORDER mark
+  # and the drain takes the mark first, so a mark always has its entry.
+  PAYLOADS = []
+  ORDER = []
+
+  def self.enqueue_payload(json)
+    PAYLOADS << json
+    ORDER << "j"
     nil
   end
 
   def self.pending_count
-    PENDING.length
+    PENDING.length + PAYLOADS.length
+  end
+
+  # Run one payload and answer whether a job class took it. The default
+  # knows no job classes: only the Ruby-family lanes build payloads, and
+  # their job registry redefines this (a later definition wins, as in
+  # `thread_state`). A payload reaching this one is reported, not run.
+  def self.perform_payload(json)
+    warn "[job] no job registry for a queued payload"
+    false
+  end
+
+  # Raised when a payload names a record that is gone, as Rails' is.
+  # `discard_on ActiveJob::DeserializationError` drops the job quietly.
+  class DeserializationError < StandardError
   end
 
   # Run every job queued so far, FIFO, and answer how many ran.
@@ -168,11 +206,17 @@ module ActiveJob
   # Rails' behaviour for an inline drain too.
   def self.drain
     ran = 0
-    while PENDING.length > 0
-      work = PENDING.shift
+    while ORDER.length > 0
+      kind = ORDER.shift
       begin
-        work.call
-        ran = ran + 1
+        if kind == "p"
+          work = PENDING.shift
+          work.call
+          ran = ran + 1
+        else
+          json = PAYLOADS.shift
+          ran = ran + 1 if perform_payload(json)
+        end
       rescue StandardError => e
         warn "[job] a queued job raised: " + e.message
       end
