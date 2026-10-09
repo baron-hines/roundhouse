@@ -16,6 +16,7 @@ fn enumerable_many_and_destructive_squish_match_rails_814() {
 require "active_support"
 require "active_support/core_ext/enumerable"
 require "active_support/core_ext/string/filters"
+require "active_support/core_ext/string/output_safety"
 require "active_support/core_ext/array/conversions"
 load ARGV.fetch(0)
 
@@ -57,10 +58,31 @@ assert(runtime_many == rails_many && seen == rails_seen, "many? must match Rails
   assert(rails_result.equal?(rails_string), "Rails squish! returns receiver")
 end
 
+runtime_safe = "  <b>safe</b>  ".html_safe
+runtime_safe_result = ActiveSupport.squish!(runtime_safe)
+rails_safe = "  <b>safe</b>  ".html_safe
+rails_safe_result = rails_safe.squish!
+assert(runtime_safe_result.equal?(runtime_safe) && rails_safe_result.equal?(rails_safe), "SafeBuffer squish! returns its receiver")
+assert(runtime_safe == rails_safe && runtime_safe.html_safe? == rails_safe.html_safe?, "SafeBuffer squish! safety transition must match Rails 8.1.4")
+assert(!runtime_safe.html_safe?, "mutating squish! must clear SafeBuffer's safety mark")
+
+runtime_safe_noop = "already squished".html_safe
+runtime_safe_noop.squish!
+rails_safe_noop = "already squished".html_safe
+rails_safe_noop.squish!
+assert(runtime_safe_noop.html_safe? == rails_safe_noop.html_safe?, "no-op SafeBuffer squish! safety must match Rails 8.1.4")
+assert(!runtime_safe_noop.html_safe?, "no-op squish! must clear the SafeBuffer safety mark")
+
 load ARGV.fetch(1)
 overlay_string = "\u00a0overlay\u2003value\u2028"
 overlay_result = overlay_string.squish!
 assert(overlay_string == "overlay value" && overlay_result.equal?(overlay_string), "overlay String#squish! contract")
+overlay_safe = SafeString.new("  <b>safe</b>  ")
+overlay_safe.squish!
+assert(!overlay_safe.html_safe?, "mutating overlay squish! must clear SafeString's safety mark")
+overlay_safe_noop = SafeString.new("already squished")
+overlay_safe_noop.squish!
+assert(!overlay_safe_noop.html_safe?, "no-op overlay squish! must clear SafeString's safety mark")
 puts "ActiveSupport 8.1.4 core extension contracts passed"
 "#;
     let output = Command::new("ruby")
