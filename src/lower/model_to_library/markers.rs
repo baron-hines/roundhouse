@@ -1475,64 +1475,102 @@ fn block_callback_on(arg: &Expr) -> Option<crate::dialect::CallbackOn> {
 pub(super) fn block_defaults_bindable(block: &Expr) -> bool {
     match &*block.node {
         ExprNode::Lambda { params, rest_param, extra_params, .. } if !extra_params.is_empty() => {
+            // A default may read an earlier parameter (`|a: 1, b: a|`),
+            // which the hook binds first; a local of the enclosing
+            // scope (`|key: prefix|`) has no binding inside the hook.
+            let mut bound: Vec<&Symbol> = Vec::new();
             params.is_empty()
                 && rest_param.is_none()
-                && extra_params.iter().all(|p| p.default.is_some() && !p.rest)
+                && extra_params.iter().all(|p| {
+                    let ok = !p.rest
+                        && p.default.as_ref().is_some_and(|d| reads_only(d, &bound));
+                    bound.push(&p.name);
+                    ok
+                })
         }
         _ => true,
     }
 }
 
+/// The block-form / lambda-argument callback `push_block_callback`
+/// lowers, as (callback lambda, hook name, `on:` restriction), or `None`
+/// when it declines the shape. `model_to_library`'s unlowered-DSL report
+/// claims a callback exactly when this answers `Some`, so the two cannot
+/// disagree about which callbacks become hooks.
+pub(super) fn block_callback_shape(
+    expr: &Expr,
+) -> Option<(&Expr, &str, Option<crate::dialect::CallbackOn>)> {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        return None;
+    };
+    // The callback body is a BLOCK or a LAMBDA ARGUMENT (see the
+    // doc comment). Either way what follows it is the option hash,
+    // so both spellings share one `on:` parse below.
+    let (callback, opt_args): (&Expr, &[Expr]) = match (block.as_ref(), &args[..]) {
+        // A block declaring optional/keyword parameters binds names
+        // the spliced hook body has none for, unless every one has a
+        // default: Rails runs an arity-0 block with `instance_exec`
+        // and no argument, so `before_save { |key: 7| … }` sees
+        // `key == 7` (bound below). Anything else stays dynamic.
+        (Some(b), _) if !block_defaults_bindable(b) => return None,
+        (Some(b), rest) => (b, rest),
+        (None, [first, rest @ ..])
+            if matches!(&*first.node, ExprNode::Lambda { params, extra_params, .. } if params.is_empty() && extra_params.is_empty()) =>
+        {
+            (first, rest)
+        }
+        _ => return None,
+    };
+    // `before_validation on: :create do … end` — the block form
+    // carries its restriction as an option hash where the symbol
+    // form carries it as a keyword. Anything else in that hash
+    // (`if:`/`unless:`) drops the callback, matching ingest's
+    // rejection for the symbol form.
+    let on = match opt_args {
+        [] => None,
+        [opts] => Some(block_callback_on(opts)?),
+        _ => return None,
+    };
+    let hook = method.as_str();
+    if !BLOCK_CALLBACK_HOOKS.contains(&hook) {
+        return None;
+    }
+    // Same structural lowering as the symbol form: after_commit
+    // retargets the per-lifecycle hook, validation hooks keep
+    // their name and gain a `new_record?` guard below. Rails
+    // doesn't accept `on:` on the remaining hooks.
+    let hook_name = match (hook, on) {
+        (_, None) => hook,
+        ("after_commit", Some(crate::dialect::CallbackOn::Create)) => "after_create_commit",
+        ("after_commit", Some(crate::dialect::CallbackOn::Update)) => "after_update_commit",
+        ("after_commit", Some(crate::dialect::CallbackOn::Destroy)) => "after_destroy_commit",
+        ("before_validation" | "after_validation", Some(_)) => hook,
+        _ => return None,
+    };
+    Some((callback, hook_name, on))
+}
+
+/// Does `expr` read no local but those in `bound`? (A nested lambda's
+/// own parameters are locals it binds itself.)
+fn reads_only(expr: &Expr, bound: &[&Symbol]) -> bool {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => bound.contains(&name),
+        ExprNode::Lambda { .. } => false,
+        _ => {
+            let mut ok = true;
+            expr.node.for_each_child(&mut |c| ok = ok && reads_only(c, bound));
+            ok
+        }
+    }
+}
+
 fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr) {
     {
-        let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        let Some((callback, hook_name, on)) = block_callback_shape(expr) else {
             return;
         };
-        // The callback body is a BLOCK or a LAMBDA ARGUMENT (see the
-        // doc comment). Either way what follows it is the option hash,
-        // so both spellings share one `on:` parse below.
-        let (callback, opt_args): (&Expr, &[Expr]) = match (block.as_ref(), &args[..]) {
-            // A block declaring optional/keyword parameters binds names
-            // the spliced hook body has none for, unless every one has a
-            // default: Rails runs an arity-0 block with `instance_exec`
-            // and no argument, so `before_save { |key: 7| … }` sees
-            // `key == 7` (bound below). Anything else stays dynamic.
-            (Some(b), _) if !block_defaults_bindable(b) => return,
-            (Some(b), rest) => (b, rest),
-            (None, [first, rest @ ..])
-                if matches!(&*first.node, ExprNode::Lambda { params, extra_params, .. } if params.is_empty() && extra_params.is_empty()) =>
-            {
-                (first, rest)
-            }
-            _ => return,
-        };
-        // `before_validation on: :create do … end` — the block form
-        // carries its restriction as an option hash where the symbol
-        // form carries it as a keyword. Anything else in that hash
-        // (`if:`/`unless:`) drops the callback, matching ingest's
-        // rejection for the symbol form.
-        let on = match opt_args {
-            [] => None,
-            [opts] => match block_callback_on(opts) {
-                Some(on) => Some(on),
-                None => return,
-            },
-            _ => return,
-        };
-        let hook = method.as_str();
-        if !BLOCK_CALLBACK_HOOKS.contains(&hook) {
-            return;
-        }
-        // Same structural lowering as the symbol form: after_commit
-        // retargets the per-lifecycle hook, validation hooks keep
-        // their name and gain a `new_record?` guard below. Rails
-        // doesn't accept `on:` on the remaining hooks.
-        let hook_name = match (hook, on) {
-            (_, None) => hook,
-            ("after_commit", Some(crate::dialect::CallbackOn::Create)) => "after_create_commit",
-            ("after_commit", Some(crate::dialect::CallbackOn::Update)) => "after_update_commit",
-            ("after_commit", Some(crate::dialect::CallbackOn::Destroy)) => "after_destroy_commit",
-            ("before_validation" | "after_validation", Some(_)) => hook,
+        let hook = match &*expr.node {
+            ExprNode::Send { method, .. } => method.as_str(),
             _ => return,
         };
         let ExprNode::Lambda { body: lambda_body, extra_params, .. } = &*callback.node else {
