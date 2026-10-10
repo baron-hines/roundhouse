@@ -97,11 +97,13 @@ impl Server {
         self.token = rest[..rest.find('"').expect("unterminated csrf-token")].to_string();
     }
 
-    /// GET one path with the session cookie, returning status, headers, and body.
+    /// GET one path — with the session's cookie once `take_session` has
+    /// one — and return the actual HTTP status, headers, and body.
     pub fn get(&self, path: &str) -> Response {
-        let request_headers = [("Cookie", self.cookie.as_str())];
-        let (status, _, headers, body) = self.send("GET", path, &request_headers, "");
-        Response { status, headers, body }
+        if self.cookie.is_empty() {
+            return self.get_with_headers(path, &[]);
+        }
+        self.get_with_headers(path, &[("Cookie", self.cookie.as_str())])
     }
 
     /// A POST with the session's cookie and token.
