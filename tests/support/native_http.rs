@@ -114,6 +114,13 @@ impl Server {
         Response { status, body }
     }
 
+    /// A GET with one additional request header.
+    pub fn get_with_header(&self, path: &str, name: &str, value: &str) -> Response {
+        let headers = [(name, value)];
+        let (status, _, body) = self.send("GET", path, &headers, "");
+        Response { status, body }
+    }
+
     /// A POST with neither cookie nor token.
     pub fn post_without_session(&self, path: &str, content_type: &str, body: &str) -> Response {
         let headers = [("Content-Type", content_type), ("Accept", "application/json")];

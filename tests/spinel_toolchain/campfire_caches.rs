@@ -38,6 +38,35 @@ fn response_helpers_run_as_rails_runs_them_natively() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn dispatched_request_headers_are_visible_to_headers_api_natively() {
+    use super::native_http;
+
+    let (tree, errors) = super::emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/request-header\", to: \"request_headers#show\"\n",
+        )
+        .write(
+            "app/controllers/request_headers_controller.rb",
+            r#"class RequestHeadersController < ApplicationController
+  def show
+    render plain: request.headers["Accept-Encoding"].to_s
+  end
+end
+"#,
+        )
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    native_http::build(&tree);
+    let server = native_http::Server::start(&tree);
+    let response = server.get_with_header("/request-header", "Accept-Encoding", "br, gzip");
+    assert_eq!(response.status, 200, "{}\n{}", response.body, server.log());
+    assert_eq!(response.body, "br, gzip");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn sqlite_observer_and_checkpointer_surface_runs_natively() {
     assert_runs_natively(&contract::SQLITE_OBSERVER);
 }

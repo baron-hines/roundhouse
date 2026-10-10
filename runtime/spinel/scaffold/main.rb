@@ -450,6 +450,7 @@ module Main
     # asked. A 200 the whole time, which is why only reading the page
     # found it.
     request_obj.user_agent = user_agent
+    request_obj.env["HTTP_ACCEPT_ENCODING"] = req.req_headers.fetch("accept-encoding", "")
     request_obj.env["HTTP_X_REQUESTED_WITH"] = req.req_headers.fetch("x-requested-with", "")
     # The two headers the forgery check reads
     # (runtime/request_forgery_protection.rb): the token JavaScript
