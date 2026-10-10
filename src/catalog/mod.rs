@@ -1573,10 +1573,10 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Terminal,
         return_kind: Some(ReturnKind::Int),
     },
-    // sum/average/minimum/maximum approximate as Int — the same
-    // deliberate approximation the send.rs arm makes (float
-    // sums/averages are rare in controller code). The Class-context
-    // entries leave these None; here the arm is the spec.
+    // sum/average approximate as Int — the same deliberate approximation
+    // the send.rs arm makes (float sums/averages are rare in controller
+    // code). Extrema are schema-indexed at the call site; a catalog-wide
+    // Int would mis-type Date, Time, String, and grouped results.
     CatalogedMethod {
         name: "sum",
         receiver: ReceiverContext::Relation,
@@ -1596,14 +1596,14 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
         chain: ChainKind::Terminal,
-        return_kind: Some(ReturnKind::Int),
+        return_kind: None,
     },
     CatalogedMethod {
         name: "maximum",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
         chain: ChainKind::Terminal,
-        return_kind: Some(ReturnKind::Int),
+        return_kind: None,
     },
     CatalogedMethod {
         name: "exists?",
@@ -2078,6 +2078,11 @@ mod tests {
             let entry = lookup(m, ReceiverContext::Relation)
                 .unwrap_or_else(|| panic!("no Relation entry for `{m}`"));
             assert_eq!(entry.return_kind, Some(kind), "wrong return_kind for `{m}`");
+        }
+        for method in ["minimum", "maximum"] {
+            let entry = lookup(method, ReceiverContext::Relation)
+                .unwrap_or_else(|| panic!("no Relation entry for `{method}`"));
+            assert_eq!(entry.return_kind, None, "`{method}` is schema-indexed at its call site");
         }
     }
 
