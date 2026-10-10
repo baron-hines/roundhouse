@@ -421,6 +421,16 @@ class ActionTextFragmentTest < Minitest::Test
     assert_equal html, fragment.to_s
   end
 
+  def test_update_removes_malformed_nested_elements_in_reverse_order
+    out = ActionText::Fragment.new("<b><i></b></i>").update do |source|
+      nodes = source.css("*")
+      nodes[1].remove
+      nodes[0].remove
+    end
+
+    assert_equal "", out.to_s
+  end
+
   def test_replace_observes_a_pending_remove
     fragment = ActionText::Fragment.new("<script>gone</script><div>keep</div>")
     fragment.css("script")[0].remove

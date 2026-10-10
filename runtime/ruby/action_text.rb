@@ -786,8 +786,14 @@ module ActionText
       if !last_start.nil? && !last_finish.nil?
         return if last_start <= current_at && last_finish >= current_finish
       end
-      if @changes.empty? && (last_start.nil? || current_at >= last_start)
+      if @changes.empty?
         @pending_removals << [current_at, current_finish]
+        insertion_index = @pending_removals.length - 1
+        while insertion_index > 0 && @pending_removals[insertion_index - 1][0] > current_at
+          @pending_removals[insertion_index] = @pending_removals[insertion_index - 1]
+          insertion_index = insertion_index - 1
+        end
+        @pending_removals[insertion_index] = [current_at, current_finish]
         @last_pending_start = current_at
         @last_pending_finish = current_finish
       else

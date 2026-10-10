@@ -883,7 +883,10 @@ fn every_runtime_method_body_concretely_typed() {
     // ActionText::Fragment's revision-aware source-range ledger, rescan
     // mapping, ordered edits, and batched removal add 45 gradual sites to the
     // merged main baseline of 334; those paths remain concretely typed for Bar A.
-    const CEILING: usize = 379;
+    // Maintaining sorted pending ranges for reverse-order overlapping removals
+    // adds 2 gradual indexed-write sites; their element and index reads remain
+    // fully typed, and the native sanitizer regression exercises the behavior.
+    const CEILING: usize = 381;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
