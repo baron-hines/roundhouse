@@ -558,6 +558,13 @@ module ActionController
       @performed
     end
 
+    # Rails' head vs redirect_to: a 3xx from `head` is not a Location
+    # redirect body. Overlay `head` sets the flag; the shared keyword
+    # form does not, so this stays false there.
+    def head_response?
+      @head_response
+    end
+
     # Discard the current session (Rails' logout idiom). The dispatch
     # layer persists whatever the session holds after the action; an
     # empty replacement means the outbound session cookie is cleared

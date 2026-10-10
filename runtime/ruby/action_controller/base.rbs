@@ -86,6 +86,7 @@ module ActionController
     def path_parameters=: (Hash[String, String]) -> Hash[String, String]
     @headers: ActionController::HeaderStore
     @content_type_explicit: bool
+    @head_response: bool
     def action_name: () -> String
     def assign_action_name: (Symbol name) -> String
 
@@ -111,6 +112,7 @@ module ActionController
     # each filter that can render or redirect (Rails: a filter that
     # responds halts the chain and skips the action).
     def performed?: () -> bool
+    def head_response?: () -> bool
 
     def initialize: () -> void
 

@@ -147,6 +147,7 @@ class ActionControllerBaseTest < Minitest::Test
     assert_equal "", @controller.body
     assert_equal "", @controller.content_type
     assert @controller.performed?
+    refute @controller.head_response?
   end
 
   def test_head_uses_media_type_without_charset

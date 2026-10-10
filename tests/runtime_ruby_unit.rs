@@ -43,15 +43,17 @@ fn framework_ruby_tests_pass() {
         return;
     }
 
-    // Minitest's `autorun` runs every loaded test file at exit. Keep
-    // the suite in one process, except the Active Support differential:
-    // it needs to load Rails' I18n before test_helper loads the runtime's
-    // I18n shim, so it must run in a fresh process.
+    // Minitest's `autorun` runs every loaded test file at exit. Load
+    // every `runtime/ruby/test/**/*_test.rb` file with one Ruby
+    // process; cheaper than spawning per-file. The Rakefile's
+    // `Rake::TestTask` does the same shape when `rake test` runs;
+    // we replicate it here so the cargo gate doesn't depend on
+    // having `rake` installed.
     let output = Command::new("ruby")
         .arg("-Itest")
         .arg("-e")
         .arg(
-            "Dir[File.join('test', '**', '*_test.rb')].sort.reject { |f| f.end_with?('/active_support_inflections_test.rb') }.each { |f| require File.expand_path(f) }"
+            "Dir[File.join('test', '**', '*_test.rb')].sort.each { |f| require File.expand_path(f) }"
         )
         .current_dir(runtime_ruby)
         .output()
@@ -64,21 +66,5 @@ fn framework_ruby_tests_pass() {
          === stderr ===\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-    );
-
-    let inflections = Command::new("ruby")
-        .arg("-Itest")
-        .arg("test/active_support_inflections_test.rb")
-        .current_dir(runtime_ruby)
-        .output()
-        .expect("invoke isolated Active Support inflections test");
-
-    assert!(
-        inflections.status.success(),
-        "isolated Active Support inflections test failed:\n\
-         === stdout ===\n{}\n\
-         === stderr ===\n{}",
-        String::from_utf8_lossy(&inflections.stdout),
-        String::from_utf8_lossy(&inflections.stderr),
     );
 }
