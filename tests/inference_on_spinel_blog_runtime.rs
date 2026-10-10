@@ -349,7 +349,11 @@ fn untyped_subexpressions_baseline() {
     // messages_count trigger repair): 562 -> 569, MEASURED by removing
     // each — 4 for the former's `Db.query_cache_*` calls (the same escape
     // `uncached` takes), 3 for the latter's `Db.exec` calls.
-    const CEILING: usize = 569;
+    // `requires_new:` savepoints: 569 -> 578, MEASURED by removing them.
+    // All nine are the nested branch's new `Db.exec` SAVEPOINT / RELEASE /
+    // ROLLBACK TO calls (and the `if`/`unless` arms holding them) plus the
+    // `depth` read in the savepoint name, unmodeled here like the others.
+    const CEILING: usize = 578;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

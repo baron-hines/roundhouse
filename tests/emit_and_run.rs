@@ -379,6 +379,57 @@ puts "public_path passed"
     assert!(run.stdout.contains("public_path passed"));
 }
 
+/// A nested `transaction(requires_new: true)` is a savepoint: a Rollback
+/// or a rescued exception from it undoes only its own writes, and the
+/// outer transaction commits the rest; without an error it answers the
+/// block's value.
+#[test]
+fn requires_new_transactions_roll_back_to_their_savepoint() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.add(title)
+    Article.create!(title: title, body: \"A sufficiently long body.\")
+  end
+
+  def self.savepoints
+    Article.transaction do
+      add(\"outer\")
+      Article.transaction(requires_new: true) do
+        add(\"rolled-back\")
+        raise ActiveRecord::Rollback
+      end
+      begin
+        Article.transaction(requires_new: true) do
+          add(\"raised\")
+          raise ArgumentError, \"inner\"
+        end
+      rescue ArgumentError
+        nil
+      end
+      Article.transaction(requires_new: true) do
+        add(\"kept\")
+        \"kept\"
+      end
+    end
+  end
+",
+        )
+        .run_ruby(
+            r#"Article.delete_all
+raise "savepoints: #{Article.savepoints.inspect}" unless Article.savepoints == "kept"
+titles = Article.all.map(&:title).sort
+raise "titles: #{titles.inspect}" unless titles == ["kept", "outer"]
+puts "savepoints passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("savepoints passed"));
+}
+
 /// A Sidekiq worker's class-side entries run its `perform` inline, as an
 /// ActiveJob's `perform_later` does: `include Sidekiq::Job` (or `Worker`)
 /// and `sidekiq_options` leave the emitted class, `perform_in` /
