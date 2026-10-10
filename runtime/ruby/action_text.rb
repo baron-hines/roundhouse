@@ -481,6 +481,7 @@ module ActionText
     end
 
     def [](key)
+      refresh_from_owner
       @attributes.fetch(key, nil)
     end
 
@@ -496,13 +497,18 @@ module ActionText
     end
 
     def attributes
+      refresh_from_owner
       @attributes
     end
 
-    def inner_html
+    def refresh_from_owner
       owner = @owner
-      return @inner if owner.nil?
-      owner.read_inner_html(self, @at, @source_length, @revision, @close_tag.length)
+      owner.read_inner_html(self, @at, @source_length, @revision, @close_tag.length) unless owner.nil?
+    end
+
+    def inner_html
+      refresh_from_owner
+      @inner
     end
 
     # Nokogiri's `node.at_css(selector)`: the first descendant matching
@@ -512,7 +518,7 @@ module ActionText
     # `RemoveSoloUnfurledLinkText#remove_link_paragraphs` (the Lexxy
     # merge) keeps a `<p>` when `node.at_css("action-text-attachment")`.
     def at_css(selector)
-      found = Fragment.new(@inner).find_all(selector)
+      found = Fragment.new(inner_html).find_all(selector)
       found.empty? ? nil : found[0]
     end
 
@@ -537,6 +543,7 @@ module ActionText
     end
 
     def to_s
+      refresh_from_owner
       @open_tag + @inner + @close_tag
     end
 
@@ -797,12 +804,26 @@ module ActionText
     # still observe prior `remove` calls.
     def flush_pending_removals
       return if @pending_removals.empty?
+      removals = []
+      i = 0
+      while i < @pending_removals.length
+        range = @pending_removals[i]
+        at = range[0]
+        finish = range[1]
+        previous = removals.empty? ? nil : removals[removals.length - 1]
+        if !previous.nil? && at <= previous[1]
+          previous[1] = finish if finish > previous[1]
+        else
+          removals << [at, finish]
+        end
+        i = i + 1
+      end
       parts = []
       cursor = 0
       shift = 0
       i = 0
-      while i < @pending_removals.length
-        range = @pending_removals[i]
+      while i < removals.length
+        range = removals[i]
         at = range[0]
         finish = range[1]
         parts << @html[cursor, at - cursor].to_s if at > cursor

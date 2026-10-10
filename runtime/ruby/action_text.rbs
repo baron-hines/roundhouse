@@ -79,6 +79,7 @@ module ActionText
     def name: () -> String
     def []: (String key) -> String?
     def []=: (String key, String value) -> void
+    def refresh_from_owner: () -> void
     def at_css: (String selector) -> Node?
     def attributes: () -> Hash[String, String]
     def inner_html: () -> String

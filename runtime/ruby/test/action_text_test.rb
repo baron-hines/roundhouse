@@ -451,12 +451,27 @@ class ActionTextFragmentTest < Minitest::Test
     assert_equal "<div><span>keep</span><b>added</b></div>", out.to_s
   end
 
+  def test_overlapping_malformed_element_removals_keep_later_nodes_removable
+    fragment = ActionText::Fragment.new("<x><y>" + ("a" * 50) + "</x></y><script>alert(1)</script>")
+    nodes = fragment.css("*")
+
+    nodes[0].remove
+    nodes[1].remove
+    assert_equal "<script>alert(1)</script>", fragment.to_s
+
+    nodes[2].remove
+    assert_equal "", fragment.to_s
+  end
+
   def test_separately_scanned_nodes_preserve_each_others_attribute_writes
     fragment = ActionText::Fragment.new("<div>keep</div>")
     first = fragment.css("div")[0]
     second = fragment.css("div")[0]
 
     first["id"] = "one"
+    assert_equal "one", second["id"]
+    assert_equal "one", second.attributes["id"]
+    assert_equal "<div id=\"one\">keep</div>", second.to_s
     second["class"] = "two"
 
     assert_equal "<div id=\"one\" class=\"two\">keep</div>", fragment.to_s
