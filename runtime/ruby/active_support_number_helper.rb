@@ -156,10 +156,14 @@ module ActiveSupport
       supported_unit_keys = [:unit, :ten, :hundred, :thousand, :million, :billion,
                              :trillion, :quadrillion, :deci, :centi, :mili, :micro,
                              :nano, :pico, :femto]
-      unit_map.each_key do |key|
+      unit_keys = unit_map.keys
+      unit_index = 0
+      while unit_index < unit_keys.length
+        key = unit_keys[unit_index]
         unless supported_unit_keys.include?(key)
           raise ArgumentError, "unsupported number unit: #{key}"
         end
+        unit_index = unit_index + 1
       end
       exponent_names = { :unit => 0, :ten => 1, :hundred => 2, :thousand => 3,
                          :million => 6, :billion => 9, :trillion => 12, :quadrillion => 15,
@@ -167,12 +171,15 @@ module ActiveSupport
                          :nano => -9, :pico => -12, :femto => -15 }
       selected_key = :unit
       selected_exponent = actual_exponent < 0 ? -16 : 0
-      unit_map.each_key do |key|
+      unit_index = 0
+      while unit_index < unit_keys.length
+        key = unit_keys[unit_index]
         candidate = exponent_names[key]
         if !candidate.nil? && candidate <= actual_exponent && candidate >= selected_exponent
           selected_key = key
           selected_exponent = candidate
         end
+        unit_index = unit_index + 1
       end
       if selected_exponent == -16
         selected_key = :unit
@@ -283,11 +290,11 @@ module ActiveSupport
         digits = digits.gsub(pattern, "(\\1) \\2#{delimiter}\\3")
       else
         pattern = options.fetch(:pattern, /(\d{0,3})(\d{3})(\d{4})$/)
-        match = pattern.match(digits)
-        unless match.nil?
-          first = match[1].to_s
-          second = match[2].to_s
-          third = match[3].to_s
+        matched = digits[pattern, 0]
+        unless matched.nil?
+          first = digits[pattern, 1].to_s
+          second = digits[pattern, 2].to_s
+          third = digits[pattern, 3].to_s
           digits = first.empty? ? second + delimiter + third : first + delimiter + second + delimiter + third
         end
       end

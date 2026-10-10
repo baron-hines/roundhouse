@@ -12,9 +12,12 @@ module ActionView
           @number
         end
 
+        def message
+          "ActionView::Helpers::NumberHelper::InvalidNumberError"
+        end
+
         def initialize(number)
           @number = number
-          super("ActionView::Helpers::NumberHelper::InvalidNumberError")
         end
       end
 
