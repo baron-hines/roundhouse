@@ -748,6 +748,15 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ArrayOfUntyped),
     },
+    // The raising twin, inlined beside it to `ActiveRecord::Result
+    // .new(rows.map { … })` — Rails answers the same class.
+    CatalogedMethod {
+        name: "insert_all!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
     CatalogedMethod {
         name: "upsert",
         receiver: ReceiverContext::Class,

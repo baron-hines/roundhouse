@@ -311,6 +311,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("attach_blob", Ty::Nil),
             ("attach", Ty::Nil),
             ("purge", Ty::Nil),
+            ("purge_later", Ty::Nil),
             ("destroy", Ty::Nil),
         ] {
             attached.instance_methods.insert(Symbol::from(m), ty);
@@ -371,6 +372,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             many.instance_methods.insert(Symbol::from("attach_blob"), Ty::Nil);
             many.instance_methods.insert(Symbol::from("attach"), Ty::Nil);
             many.instance_methods.insert(Symbol::from("purge"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("purge_later"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("first"), nilable(class_ty(&many_row_id)));
             many.instance_methods.insert(Symbol::from("destroy"), Ty::Nil);
             classes.insert(many_id, many);
         }
@@ -386,6 +389,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("signed_id", Ty::Str),
             ("download", Ty::Str),
             ("purge", Ty::Nil),
+            ("purge_later", Ty::Nil),
+            // `ActionText::Attachable` — the ruby-family Blob reopen
+            // (runtime/spinel/active_storage_disk.rb) mints it.
+            ("attachable_sgid", Ty::Str),
             ("video?", Ty::Bool),
             ("image?", Ty::Bool),
             ("audio?", Ty::Bool),
@@ -433,6 +440,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         let mut variant = ClassInfo::default();
         for (m, ty) in [
             ("processed", class_ty(&variant_id)),
+            ("processed?", Ty::Bool),
             ("process", Ty::Nil),
             ("image", nilable(class_ty(&attached_id))),
             ("blob", nilable(class_ty(&blob_id))),
@@ -447,6 +455,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         variant.class_methods.insert(Symbol::from("record_select"), Ty::Str);
         variant.class_methods.insert(Symbol::from("purge_records_of"), Ty::Nil);
         classes.insert(variant_id, variant);
+        let mut variant_record = ClassInfo::default();
+        variant_record.class_methods.insert(Symbol::from("count"), Ty::Int);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::VariantRecord")), variant_record);
 
         // One `attachable.variant :name, resize_to_limit: [w, h],
         // format: :f` declaration, constructed into the reader by

@@ -190,7 +190,7 @@ fn fixture_population_does_not_add_a_constructor_phase_argument() {
     assert!(model.contains("after_initialize if !(attrs.equal? ActiveRecord::Base::HYDRATE_ATTRS)"), "{model}");
     let construction = fixture.find("instance = Article.new\n").expect("ordinary construction");
     let population = fixture.find("instance._write_severity_raw \"mild\"").expect("raw schema population");
-    let save = fixture.find("instance._insert_fixture").expect("callback-free fixture insert");
+    let save = fixture.find("instance._insert_row").expect("callback-free fixture insert");
     assert!(construction < population && population < save, "{fixture}");
 }
 

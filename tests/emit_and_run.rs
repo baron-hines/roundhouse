@@ -9283,7 +9283,9 @@ end
 
 /// Active Storage's "was it made?" questions, as campfire's
 /// presentation asks them so a view never makes a preview: a variant is
-/// `processed?` once its record exists (looked up, not made);
+/// `processed?` once its record exists, and its `image` is that record's
+/// (both looked up, not made — asked of a file that cannot be decoded,
+/// `image` used to raise the decode error again);
 /// `preview(:poster)` names a variant the owner's `has_one_attached`
 /// block declares; and `url_for` of a Preview held in a typed local is
 /// the preview's representation URL, not the object.
@@ -9313,16 +9315,54 @@ end
 doc = Doc.create!(name: "first", file: { io: StringIO.new("bytes"), filename: "a.mov", content_type: "video/quicktime" })
 thumb = doc.file.representation(:thumb)
 raise "processed before any record" if thumb.processed?
+raise "image made a variant of bytes that are no image" unless thumb.image.nil?
+raise "variant records: #{ActiveStorage::VariantRecord.count}" unless ActiveStorage::VariantRecord.count == 0
 image = ActiveStorage::Blob.create_and_upload!("png", "a.png", "image/png")
 connection = ActiveRecord::Base.connection
 connection.execute("INSERT INTO active_storage_variant_records (blob_id, variation_digest) VALUES (#{doc.file.blob.id}, '#{thumb.variation.digest}')")
 record_id = connection.select_value("SELECT max(id) FROM active_storage_variant_records")
 connection.execute("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES ('image', 'ActiveStorage::VariantRecord', #{record_id}, #{image.id}, '2026-01-01')")
 raise "not processed once its record exists" unless doc.file.representation(:thumb).processed?
+raise "variant records: #{ActiveStorage::VariantRecord.count}" unless ActiveStorage::VariantRecord.count == 1
+raise "no image once its record exists" if doc.file.representation(:thumb).image.nil?
 preview = doc.file.preview(:poster)
 raise "preview named #{preview.variation&.name.inspect}" unless preview.variation.name == "poster"
 url = doc.poster_url
 raise "url_for(preview) answered #{url.inspect}" unless url.is_a?(String) && url.include?("/representations/")
+"#)
+        .assert_passes();
+}
+
+/// `insert_all!` and `insert_all` are one raw INSERT per row in Rails:
+/// no validations, no callbacks, timestamps filled. `insert_all!`
+/// raises on a duplicate and answers an `ActiveRecord::Result` of the
+/// RETURNING columns, whose `rows` are Arrays of values (campfire's
+/// search test reads new ids with `.rows.flatten`); `insert_all` skips
+/// a duplicate. Both used to run the save callbacks, and `insert_all!`
+/// was undefined.
+#[test]
+fn bulk_inserts_skip_callbacks_and_insert_all_bang_returns_its_rows() {
+    emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", r#"class Comment < ApplicationRecord
+  after_create_commit { raise "a callback ran for a bulk insert" }
+
+  def self.bulk_ids(article, names)
+    rows = names.map { |name| { article_id: article.id, commenter: name, body: "Bulk body" } }
+    Comment.insert_all!(rows, returning: %w[ id commenter ]).rows
+  end
+
+  def self.bulk_skipping(article, names)
+    rows = names.map { |name| { article_id: article.id, commenter: name, body: "Bulk body" } }
+    Comment.insert_all(rows)
+  end
+"#)
+        .run_ruby(r#"
+article = Article.create!(title: "Bulk", body: "A sufficiently long article body.")
+rows = Comment.bulk_ids(article, ["a", "b"])
+raise "rows #{rows.inspect}" unless rows.map(&:last) == ["a", "b"] && rows.all? { |r| r.first.is_a?(Integer) }
+raise "timestamps" unless Comment.where(article_id: article.id).all? { |c| c.created_at && c.updated_at }
+Comment.bulk_skipping(article, ["c"])
+raise "count #{Comment.where(article_id: article.id).count}" unless Comment.where(article_id: article.id).count == 3
 "#)
         .assert_passes();
 }

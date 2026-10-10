@@ -3305,6 +3305,17 @@ fn apply_content_layout(files: &mut [(String, String)], app: &App) {
             }
         }
     }
+    // Action Text's own attachable, after the app's: a blob's node
+    // renders `active_storage/blobs/_blob` with the ATTACHMENT as `blob`
+    // (it delegates to the blob, as Rails' does), when the tree carries
+    // the app's copy of that partial. campfire overrides it to show an
+    // embedded file by name rather than making a preview on view.
+    if files.iter().any(|(path, _)| path.ends_with("app/views/active_storage/blobs/_blob.rb")) {
+        by_model.push_str(
+            "      when \"ActiveStorage::Blob\"\n        \
+             attachment.blob.nil? ? \"\" : Views::ActiveStorage::Blobs.blob(attachment)\n",
+        );
+    }
     let built = if built_by_content_type.is_empty() {
         None
     } else {

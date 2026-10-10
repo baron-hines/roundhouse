@@ -1262,6 +1262,7 @@ pub(crate) fn insert_framework_stubs(
         "render",
         "time_ago_in_words",
         "number_to_human",
+        "number_to_human_size",
         "number_with_delimiter",
         "pluralize",
         "raw",

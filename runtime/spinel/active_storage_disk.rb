@@ -64,6 +64,15 @@ module ActiveStorage
   end
 
   class Blob
+    # Rails' `ActiveStorage::Blob` is an `ActionText::Attachable`: the
+    # sgid a rich-text `<action-text-attachment>` node carries for an
+    # uploaded file (campfire's helper tests embed one). Here, not in
+    # the shared Blob, because the signing is ruby-family only, as
+    # `lower::attachable`'s per-model mint is.
+    def attachable_sgid
+      ActionText::SignedGlobalId.generate("ActiveStorage::Blob", @id)
+    end
+
     # Rails' attachable coercion: an `ActionDispatch::Http::UploadedFile`
     # (a multipart part, or the test harness's fixture) becomes a blob
     # by uploading it; a blob is itself; a String is a signed blob id
