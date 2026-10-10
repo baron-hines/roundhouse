@@ -340,7 +340,11 @@ fn untyped_subexpressions_baseline() {
     // `ensure`'s `if rolled_back then nil else … end` has to unify `nil`
     // against the unresolved `Db.exec("COMMIT")` call. Its RBS-paired
     // method stays at zero residual throughout.
-    const CEILING: usize = 561;
+    // `raise ActiveRecord::Rollback` (campfire's messages_count and
+    // creation tests): 561 -> 562, MEASURED by removing the one line.
+    // The new site is the Rollback arm's `Db.exec("ROLLBACK")`, read
+    // here without the Db contract like the other arm's.
+    const CEILING: usize = 562;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

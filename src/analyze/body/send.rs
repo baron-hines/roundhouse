@@ -1377,6 +1377,9 @@ impl<'a> BodyTyper<'a> {
                 // The compiler interprets every one of these in
                 // `lower::jbuilder_to_library`; the analyzer's answer is
                 // the value Jbuilder itself returns.
+                if id.0.as_str() == "BigDecimal" {
+                    return bigdecimal_method(method, call_args).unwrap_or_else(unknown);
+                }
                 if id.0.as_str() == "Jbuilder" {
                     return match method.as_str() {
                         "array!" => Ty::Array { elem: Box::new(Ty::Untyped) },
@@ -2038,6 +2041,13 @@ impl<'a> BodyTyper<'a> {
                 if method.as_str() == "in_time_zone" && args.len() > 1 =>
             {
                 unknown()
+            }
+            // Not the operand's own type: Integer and Float coerce a BigDecimal operand into a BigDecimal result.
+            Some(Ty::Int | Ty::Float)
+                if matches!(method.as_str(), "+" | "-" | "*" | "/")
+                    && matches!(args.first().and_then(|a| a.ty.as_ref()), Some(t) if is_bigdecimal(t)) =>
+            {
+                bigdecimal()
             }
             Some(Ty::Int) => int_method(method),
             Some(Ty::Float) => float_method(method),
@@ -3351,9 +3361,48 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
     }
 }
 
+pub(super) fn bigdecimal() -> Ty {
+    Ty::Class { id: crate::ident::ClassId(Symbol::from("BigDecimal")), args: vec![] }
+}
+
+pub(super) fn is_bigdecimal(ty: &Ty) -> bool {
+    matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "BigDecimal")
+}
+
+/// The BigDecimal surface both the CRuby library and spinel's
+/// `packages/bigdecimal` answer, plus the `floor`/`ceil` forms
+/// `lower::bigdecimal` rewrites onto `round`.
+fn bigdecimal_method(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
+    let numeric = |a: &crate::expr::Expr| match a.ty.as_ref() {
+        None | Some(Ty::Int | Ty::Float | Ty::Var { .. }) => true,
+        Some(t) => is_bigdecimal(t),
+    };
+    let int = |a: &crate::expr::Expr| matches!(a.ty.as_ref(), None | Some(Ty::Int | Ty::Var { .. }));
+    Some(match (method.as_str(), args) {
+        ("+" | "-" | "*" | "/", [a]) if numeric(a) => bigdecimal(),
+        ("<" | ">" | "<=" | ">=" | "==" | "!=", [a]) if numeric(a) => Ty::Bool,
+        ("<=>", [a]) if numeric(a) => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        ("-@" | "+@" | "abs" | "to_d", []) => bigdecimal(),
+        ("zero?" | "negative?" | "positive?", []) => Ty::Bool,
+        ("to_f", []) => Ty::Float,
+        ("to_i" | "to_int", []) => Ty::Int,
+        ("to_s" | "inspect", []) => Ty::Str,
+        ("round" | "floor" | "ceil", []) => Ty::Int,
+        ("floor" | "ceil", [n]) if int(n) => bigdecimal(),
+        // Not a BigDecimal for every digit count: `round(n)` answers an Integer below one digit, in CRuby and spinel alike.
+        ("round", [n]) => match &*n.node {
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Int { value } } if *value >= 1 => bigdecimal(),
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Int { .. } } => Ty::Int,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 pub(super) fn float_method(method: &Symbol) -> Ty {
     match method.as_str() {
         "to_s" | "inspect" => Ty::Str,
+        "to_d" => bigdecimal(),
         // No-arg rounding returns Int (the common shape); with a digits
         // arg it returns Float, but we don't see args here — Int is the
         // safer default for the bare call.

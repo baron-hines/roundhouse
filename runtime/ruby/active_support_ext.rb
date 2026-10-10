@@ -838,4 +838,26 @@ module ActiveSupport
     end
     sign + out + rest
   end
+
+  # Not `f.to_s` as it is: `Float#to_d` keeps the shortest digits but cuts them at 16 without rounding (bigdecimal's BIGDECIMAL_DOUBLE_FIGURES).
+  def self.float_decimal_text(f)
+    text = f.to_s
+    exp_at = text.index("e")
+    mantissa = exp_at.nil? ? text : text[0, exp_at].to_s
+    exp = exp_at.nil? ? 0 : text[exp_at + 1, text.length].to_s.to_i
+    negative = mantissa.start_with?("-")
+    mantissa = mantissa[1, mantissa.length].to_s if negative
+    dot = mantissa.index(".")
+    int_part = dot.nil? ? mantissa : mantissa[0, dot].to_s
+    frac_part = dot.nil? ? "" : mantissa[dot + 1, mantissa.length].to_s
+    digits = int_part + frac_part
+    lead = 0
+    while lead < digits.length && digits[lead] == "0"
+      lead = lead + 1
+    end
+    significant = digits[lead, digits.length].to_s
+    return text if significant.length <= 16
+    point = int_part.length - lead + exp
+    (negative ? "-" : "") + "0." + significant[0, 16].to_s + "e" + point.to_s
+  end
 end

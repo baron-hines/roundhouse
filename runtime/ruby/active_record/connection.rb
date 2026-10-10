@@ -12,6 +12,12 @@
 # columns), so a typed bag is the honest contract rather than an
 # avoidable erasure.
 module ActiveRecord
+  # `raise ActiveRecord::Rollback` inside `transaction { }` rolls it back
+  # quietly: the transaction rescues it and answers nil. Here beside
+  # `transaction`, which only the ruby family has.
+  class Rollback < StandardError
+  end
+
   # Integer finder inputs must be validated before entering a typed adapter.
   # Keep validity separate from the Integer payload: every signed 64-bit
   # value, including INT64_MIN, is a valid payload, never a nil sentinel.
@@ -455,12 +461,20 @@ module ActiveRecord
     # so it type-checked as the unresolved `Var` here, not the honest
     # gradual `Untyped` — `Db`'s own contract keeps this method
     # concretely typed the same way its `Db.exec` calls already are.
+    # `raise ActiveRecord::Rollback` inside the block rolls the
+    # transaction back without the exception escaping, and the call
+    # answers nil.
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       depth = Db._txn_depth
       if depth > 0
         Db._txn_depth = depth + 1
         begin
           result = yield
+        rescue ActiveRecord::Rollback
+          # Swallowed by the joined block that saw it, as in Rails: the
+          # outer transaction carries on and commits.
+          Db._txn_depth = depth
+          result = nil
         rescue Exception => e
           Db._txn_depth = depth
           raise e
@@ -473,6 +487,12 @@ module ActiveRecord
         rolled_back = false
         begin
           result = yield
+        rescue ActiveRecord::Rollback
+          # Rails' quiet way out: roll back, raise nothing, answer nil.
+          rolled_back = true
+          Db._txn_depth = 0
+          Db.exec("ROLLBACK")
+          result = nil
         rescue Exception => e
           rolled_back = true
           Db._txn_depth = 0
@@ -633,6 +653,23 @@ module ActiveRecord
       self[name] = value
       _adapter_update
       true
+    end
+
+    # `record.update_columns(a: 1, b: 2)` — several attributes at once,
+    # the same way: no validations, no callbacks, no timestamps.
+    def update_columns(attributes)
+      attributes.each { |name, value| self[name] = value }
+      _adapter_update
+      true
+    end
+
+    # `record.delete` — the row goes, with no callbacks (Rails'
+    # `Persistence#delete`, beside `destroy`, which runs them).
+    def delete
+      _adapter_delete if persisted?
+      @persisted = false
+      @destroyed = true
+      self
     end
 
     # Rails' `Base#as_json(only:)` attribute serializer, monomorphized:

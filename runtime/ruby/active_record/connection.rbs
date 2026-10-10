@@ -2,6 +2,9 @@
 # Hash[String, untyped] by design — raw SQL's row shape (aliased
 # aggregates, computed columns) is genuinely dynamic; see connection.rb.
 module ActiveRecord
+  class Rollback < StandardError
+  end
+
   class IntegerKeyCast
     @valid: bool
     @value: Integer
@@ -62,6 +65,8 @@ module ActiveRecord
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
     def update_column: (String | Symbol name, untyped value) -> bool
+    def update_columns: (Hash[Symbol | String, untyped] attributes) -> bool
+    def delete: () -> Base
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Nil and uncastable request keys reject before the scalar adapter.
     def self.exists?: (Integer | Float | String | nil id) -> bool

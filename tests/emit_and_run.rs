@@ -1503,6 +1503,56 @@ end
         .assert_passes();
 }
 
+/// `Float#to_d` / `Integer#to_d` build a BigDecimal without
+/// `bigdecimal/util`, and the decimal arithmetic after them runs:
+/// Float and Integer operands, comparison, `round`, and `floor`/`ceil`
+/// with and without digits. `0.1 + 0.2` keeps `Float#to_d`'s 16 digits,
+/// and exponent-form floats (`Float#to_s`'s `1.0e-05`) convert as well.
+/// Expected values are CRuby 3.4's with bigdecimal 4.1.
+#[test]
+fn float_to_d_and_decimal_arithmetic_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/decimal\", to: \"decimals#show\"\n",
+        )
+        .write(
+            "app/controllers/decimals_controller.rb",
+            r#"class DecimalsController < ApplicationController
+  def show
+    f = params[:f].to_s.to_f
+    i = params[:i].to_s.to_i
+    g = params[:a].to_s.to_f + params[:b].to_s.to_f
+    a = BigDecimal("1.555")
+    price = f.to_d * i.to_d
+    render plain: [
+      price.to_s, (price - a).to_s, (a / 7).floor(2).to_s, a.round(2).to_s, a.round, a.floor,
+      a.ceil(1).to_s, (f - a).to_s, (i * a).to_s, a.to_f, price > a, g.to_d.to_s, (-a).abs.to_s, a.round(0),
+      a.to_d.to_s,
+      params[:exps].to_s.split(",").map { |e| e.to_f.to_d.to_s }.join(",")
+    ].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/decimals_controller_test.rb",
+            r#"require "test_helper"
+
+class DecimalsControllerTest < ActionDispatch::IntegrationTest
+  test "decimal arithmetic matches CRuby" do
+    get "/decimal", params: { f: "2.5", i: "3", a: "0.1", b: "0.2", exps: "1.0e-5,1e20,-1.0e-10,1.2345678901234567e20,-1.2345678901234567e-20" }
+    assert_equal "0.75e1 0.5945e1 0.22e0 0.156e1 2 1 0.16e1 0.945e0 0.4665e1 1.555 true 0.3e0 0.1555e1 2 0.1555e1 " \
+      "0.1e-4,0.1e21,-0.1e-9,0.1234567890123456e21,-0.1234567890123456e-19", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/decimals_controller_test.rb")
+        .assert_passes();
+}
+
 /// An Integer range's Enumerable calls (`map`, `filter_map`, `select`,
 /// `reduce`, `flat_map`, `each_with_object`) run through `to_a`, on an
 /// inclusive and an exclusive range and a constant bound.
@@ -9711,5 +9761,191 @@ raise "timestamps" unless Comment.where(article_id: article.id).all? { |c| c.cre
 Comment.bulk_skipping(article, ["c"])
 raise "count #{Comment.where(article_id: article.id).count}" unless Comment.where(article_id: article.id).count == 3
 "#)
+        .assert_passes();
+}
+
+/// campfire's `MessagesController#create` from 2c53c46 on: the
+/// controller renders the message once, hands the markup to a concern
+/// method by keyword (`broadcast_create(html:)`), which broadcasts it
+/// with `**(html ? { html: html } : {})`, and the turbo-stream view
+/// appends the same String (`turbo_stream.append target, @html`). Its
+/// cache layer folds `I18n.locale` into keys and copies response headers
+/// by downcased name (`response.headers.slice(*CACHE_HEADERS)`).
+///
+/// Before: the keyword reached the flattened `broadcast_create(html =
+/// nil)` as a Hash, `broadcast_append_to` with that option was left
+/// unlowered (undefined on the record), the view looked for a
+/// `message_htmls/_message_html` partial, `I18n` was undefined, and
+/// `headers["ETag"]` / `headers["etag"]` were two headers.
+#[test]
+fn rendered_markup_reaches_the_broadcast_and_the_stream_as_given() {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  post \"/articles/:article_id/comments/:id/announce\", to: \"comments#announce\", as: :announce_article_comment\n  resources :articles do\n")
+        .edit("app/models/comment.rb", "  belongs_to :article\n", "  include Announces\n  belongs_to :article\n")
+        .write("app/models/comment/announces.rb", r##"module Comment::Announces
+  def announce(html: nil)
+    broadcast_append_to article, :announcements, target: [ article, :announcements ], **(html ? { html: html } : {})
+  end
+end
+"##)
+        .edit("app/controllers/comments_controller.rb", "  def destroy\n", r##"  def announce
+    @comment = @article.comments.find(params[:id])
+    @comment_html = render_to_string partial: "comments/comment", formats: :html, locals: { comment: @comment }
+    @comment.announce(html: @comment_html)
+    response.headers["X-Probe"] = "first"
+    response.headers["x-probe"] = "second"
+    response.headers["X-Gone"] = "soon"
+    response.headers.delete("x-gone")
+    response.headers["X-Copied"] = response.headers.slice("X-PROBE", "x-absent").map { |name, value| "#{name}=#{value}" }.join(",")
+    response.headers["X-Locale"] = I18n.locale.to_s
+  end
+
+  def destroy
+"##)
+        .write("app/views/comments/announce.turbo_stream.erb", "<%= turbo_stream.append dom_id(@comment.article, :announcements), @comment_html %>\n")
+        .write("test/controllers/announcements_controller_test.rb", r##"require "test_helper"
+
+class AnnouncementsControllerTest < ActionDispatch::IntegrationTest
+  setup do
+    @article = Article.create!(title: "Announced", body: "A sufficiently long article body.")
+    @comment = @article.comments.create!(commenter: "Ann", body: "Said <b>once</b>")
+    @stream = "#{@article.to_gid_param}:announcements"
+  end
+
+  test "the rendered comment is broadcast and streamed as given" do
+    post announce_article_comment_url(@article, @comment, format: :turbo_stream)
+    assert_response :success
+    assert_includes response.body, %(<turbo-stream action="append" target="announcements_article_#{@article.id}">)
+    assert_includes response.body, %(<div id="comment_#{@comment.id}")
+    assert_includes response.body, "Said &lt;b&gt;once&lt;/b&gt;"
+    assert_not_includes response.body, "&lt;div"
+
+    sent = ActionCable.server.pubsub.broadcasts(@stream).map { |broadcast| JSON.parse(broadcast) }
+    assert_equal 1, sent.size
+    assert_includes sent.first, %(<div id="comment_#{@comment.id}")
+    assert_not_includes sent.first, "&lt;div"
+  end
+
+  test "header names match without regard to case" do
+    post announce_article_comment_url(@article, @comment, format: :turbo_stream)
+    assert_equal "second", response.headers["X-Probe"]
+    assert_nil response.headers["X-Gone"]
+    assert_equal "x-probe=second", response.headers["X-Copied"]
+    assert_equal "en", response.headers["X-Locale"]
+  end
+
+  test "markup handed in replaces the partial, and without it the partial renders" do
+    @comment.announce(html: "<p>handed in</p>")
+    @comment.announce
+    sent = ActionCable.server.pubsub.broadcasts(@stream).map { |broadcast| JSON.parse(broadcast) }
+    assert_equal 2, sent.size
+    assert_includes sent.first, "<p>handed in</p>"
+    assert_includes sent.last, %(<div id="comment_#{@comment.id}")
+  end
+end
+"##)
+        .run_test("test/controllers/announcements_controller_test.rb")
+        .assert_passes();
+}
+
+/// Framework surface campfire main's tests and cache keys reach, each
+/// with Rails' behaviour:
+/// - `request.format.to_s` is the negotiated Mime string;
+/// - `Rails.application.env_config` keeps what a test sets in it;
+/// - a helper test's `controller` is a test controller, whose
+///   `perform_caching` is false in the test environment;
+/// - `update_columns` and `delete` skip callbacks;
+/// - `raise ActiveRecord::Rollback` undoes the transaction quietly;
+/// - `clear_enqueued_jobs`, `assert_nothing_raised`, `assert_dom_equal`.
+fn rails_surface_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  get \"/format\", to: \"articles#format_probe\"\n  resources :articles do\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", r##"class ArticlesController < ApplicationController
+  def format_probe
+    render plain: request.format.to_s
+  end
+
+"##)
+        .write("app/helpers/articles_helper.rb", r##"module ArticlesHelper
+  def caching_label
+    controller.perform_caching ? "cached" : "fresh"
+  end
+end
+"##)
+        .write("app/jobs/touch_job.rb", "class TouchJob < ApplicationJob\n  def perform(article)\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  SAVED = []\n  after_save { SAVED << title }\n\n")
+        .write("test/helpers/articles_helper_test.rb", r##"require "test_helper"
+
+class ArticlesHelperTest < ActionView::TestCase
+  test "a helper reads the test controller" do
+    assert_equal "fresh", caching_label
+  end
+
+  test "markup compares up to attribute order and the whitespace between tags" do
+    assert_dom_equal %(<p class="a" id="b">x</p>), %(<p id="b"  class="a">x</p>\n)
+    assert_nothing_raised { Article.count }
+  end
+end
+"##)
+        .write("test/controllers/format_probes_controller_test.rb", r##"require "test_helper"
+
+class FormatProbesControllerTest < ActionDispatch::IntegrationTest
+  include ActiveJob::TestHelper
+
+  test "the request format is its Mime string" do
+    get "/format"
+    assert_equal "text/html", response.body
+  end
+
+  test "env_config keeps what a test sets" do
+    previous = Rails.application.env_config["action_dispatch.show_exceptions"]
+    Rails.application.env_config["action_dispatch.show_exceptions"] = :rescuable
+    assert_equal :rescuable, Rails.application.env_config["action_dispatch.show_exceptions"]
+  ensure
+    Rails.application.env_config["action_dispatch.show_exceptions"] = previous
+  end
+
+  test "update_columns and delete skip callbacks" do
+    article = Article.create!(title: "Columns", body: "A sufficiently long article body.")
+    saved = Article::SAVED.size
+    article.update_columns(title: "Renamed")
+    assert_equal saved, Article::SAVED.size
+    assert_equal "Renamed", Article.find(article.id).title
+    article.delete
+    assert_nil Article.find_by(id: article.id)
+  end
+
+  test "a rollback undoes the transaction without raising" do
+    count = Article.count
+    result = Article.transaction do
+      Article.create!(title: "Gone", body: "A sufficiently long article body.")
+      raise ActiveRecord::Rollback
+    end
+    assert_nil result
+    assert_equal count, Article.count
+  end
+
+  test "clear_enqueued_jobs forgets what was enqueued" do
+    article = Article.create!(title: "Queued", body: "A sufficiently long article body.")
+    TouchJob.perform_later(article)
+    assert_enqueued_jobs 1, only: TouchJob
+    clear_enqueued_jobs
+    assert_no_enqueued_jobs only: TouchJob
+  end
+end
+"##)
+}
+
+#[test]
+fn rails_surface_for_cache_keys_rollbacks_and_jobs() {
+    rails_surface_app()
+        .run_test("test/controllers/format_probes_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn a_helper_test_has_a_test_controller_and_dom_assertions() {
+    rails_surface_app()
+        .run_test("test/helpers/articles_helper_test.rb")
         .assert_passes();
 }

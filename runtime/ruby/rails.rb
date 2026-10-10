@@ -468,6 +468,19 @@ module Rails
       {}
     end
 
+    # The Rack env defaults every request starts from
+    # (`Rails.application.env_config`). Held in a constant because
+    # `Rails.application` answers a fresh Application each call, and a
+    # test that sets a key has to read it back. No key is consulted yet:
+    # campfire's tests set `action_dispatch.show_exceptions` to
+    # `:rescuable`, and a forgery failure here always renders the 422
+    # that setting asks for.
+    ENV_CONFIG = {}
+
+    def env_config
+      ENV_CONFIG
+    end
+
     # The zone every ActiveRecord temporal value is PRESENTED in. Same
     # framework-default shape as `session_cookie_key` above: Rails always
     # has one (`config.time_zone` defaults to "UTC"), ingest lifts an

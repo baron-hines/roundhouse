@@ -261,19 +261,21 @@ module ActionController
     digits
   end
 
+  # `response.headers` — Rack 3's `Rack::Headers`: names match without
+  # regard to case (`headers["ETag"]` and `headers["etag"]` are one
+  # header), as HTTP says they do. The first spelling written is the one
+  # the wire carries; `@lower` holds each name downcased for matching.
   class HeaderStore
     def initialize
       @keys = []
+      @lower = []
       @vals = []
     end
 
     def [](key)
-      i = 0
-      while i < @keys.length
-        return @vals[i] if @keys[i] == key
-        i += 1
-      end
-      nil
+      i = index_of(key)
+      return nil if i < 0
+      @vals[i]
     end
 
     # Void: a writer that returns the stored value would leak a
@@ -281,20 +283,41 @@ module ActionController
     # `()` not `Option`.
     def []=(key, value)
       if ActionController.header_key_ok?(key) && ActionController.header_value_ok?(value)
-        i = 0
-        found = false
-        while i < @keys.length
-          if @keys[i] == key
-            @vals[i] = value
-            found = true
-          end
-          i += 1
-        end
-        unless found
+        i = index_of(key)
+        if i < 0
           @keys << key
+          @lower << key.downcase
           @vals << value
+        else
+          @vals[i] = value
         end
       end
+    end
+
+    # The named headers that are set, keyed by their downcased names —
+    # Rack::Headers stores them that way, so `slice` hands them back so.
+    def slice(*names)
+      out = {}
+      names.each do |name|
+        i = index_of(name)
+        out[@lower[i].to_s] = @vals[i].to_s if i >= 0
+      end
+      out
+    end
+
+    def merge!(other)
+      other.each { |key, value| self[key] = value }
+      self
+    end
+
+    def delete(key)
+      i = index_of(key)
+      return nil if i < 0
+      value = @vals[i]
+      @keys.delete_at(i)
+      @lower.delete_at(i)
+      @vals.delete_at(i)
+      value
     end
 
     def size
@@ -307,6 +330,16 @@ module ActionController
 
     def val_at(i)
       @vals[i].to_s
+    end
+
+    def index_of(key)
+      down = key.downcase
+      i = 0
+      while i < @lower.length
+        return i if @lower[i] == down
+        i += 1
+      end
+      -1
     end
   end
 
