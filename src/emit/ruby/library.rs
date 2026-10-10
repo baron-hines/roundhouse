@@ -370,12 +370,17 @@ fn splice_nested(
         while !pending.is_empty() {
             let before = pending.len();
             pending.retain(|k| {
+                // A superclass, and a module the class body `include`s:
+                // both are read the moment the body runs. (campfire's
+                // `class HTTP < Net::HTTP; include Stages; end` beside
+                // its `module Stages`.)
                 let waits_for = k
                     .parent
-                    .as_ref()
+                    .iter()
+                    .chain(k.includes.iter())
                     .map(|p| p.0.as_str())
-                    .filter(|p| names.contains(p) && !placed.contains(*p));
-                if waits_for.is_some() {
+                    .any(|p| names.contains(p) && !placed.contains(p));
+                if waits_for {
                     return true;
                 }
                 placed.insert(k.name.0.as_str().to_string());
@@ -420,22 +425,30 @@ fn splice_nested(
             if own_dir.is_some_and(|d| rebased.starts_with(&d)) {
                 continue;
             }
-            hoisted.push(format!("require_relative {rebased:?}"));
+            // The child requiring its parent names THIS file.
+            let own_file = crate::naming::underscore(parent.name.0.as_str());
+            let own_file = own_file.rsplit('/').next().unwrap_or(&own_file);
+            if rebased == own_file {
+                continue;
+            }
+            let line = format!("require_relative {rebased:?}");
+            if !hoisted.contains(&line) {
+                hoisted.push(line);
+            }
         }
         // A plain `require "x"` names a library, not a path, and is
         // carried as written.
-        hoisted.extend(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("require \""))
-                .map(|l| l.to_string()),
-        );
+        for l in lines.iter().filter(|l| l.starts_with("require \"")) {
+            if !hoisted.iter().any(|h| h == l) {
+                hoisted.push(l.to_string());
+            }
+        }
         let body: Vec<&str> = lines
             .iter()
             .copied()
             .filter(|l| !l.starts_with("require"))
             .collect();
-        let Some(block) = unwrapped(&body, depth) else { continue };
+        let Some(block) = child_block(&body, depth, kid.name.0.as_str()) else { continue };
         blocks.push(block);
         // The sidecar `emit_library_class_pair` would have written for
         // the child's own file, minus the same wrapper. Its type names
@@ -444,7 +457,7 @@ fn splice_nested(
         // it is spliced into.
         let sidecar = super::rbs::emit_library_class_rbs(kid, &rb_path);
         let lines: Vec<&str> = sidecar.content.lines().collect();
-        if let Some(block) = unwrapped(&lines, depth) {
+        if let Some(block) = child_block(&lines, depth, kid.name.0.as_str()) {
             sidecar_blocks.push(block);
         }
     }
@@ -455,9 +468,35 @@ fn splice_nested(
     let Some(rb) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rb")) else {
         return;
     };
-    let Some(spliced) = spliced_after_header(&rb.content, &own_header_indent, &blocks) else {
-        return;
+    // The parent opens either nested (`module WebPush` / `  class
+    // Connections`), its header `depth - 1` levels in, or compact
+    // (`class WebPush::Connections`) at the margin with a body one level
+    // in. The blocks are cut at the nested body's indentation, so the
+    // compact form takes them `depth - 1` levels shallower. Without this
+    // arm the splice found no header and the children, already left out
+    // of the tree as files of their own, were silently gone.
+    // The blocks are cut at column 0 (`child_block`); each header form
+    // wants them at its own body's indentation.
+    let compact = |blocks: &[String]| -> Vec<String> {
+        blocks.iter().map(|b| indent_lines(b, 1)).collect()
     };
+    let blocks: Vec<String> = blocks.iter().map(|b| indent_lines(b, depth)).collect();
+    let sidecar_blocks: Vec<String> = sidecar_blocks.iter().map(|b| indent_lines(b, depth)).collect();
+    let raw_blocks: Vec<String> = blocks.iter().map(|b| dedent_lines(b, depth)).collect();
+    let raw_sidecar: Vec<String> = sidecar_blocks.iter().map(|b| dedent_lines(b, depth)).collect();
+    let compact_header = format!("class {}", parent.name.0.as_str());
+    let (spliced, compact_form) = match spliced_after_header(&rb.content, &own_header_indent, &blocks) {
+        Some(spliced) => (spliced, false),
+        None if rb.content.lines().any(|l| l == compact_header || l.starts_with(&format!("{compact_header} "))) => {
+            match spliced_after_header(&rb.content, "", &compact(&raw_blocks)) {
+                Some(spliced) => (spliced, true),
+                None => return,
+            }
+        }
+        None => return,
+    };
+    // A require the parent's own file already carries is not repeated.
+    hoisted.retain(|r| !rb.content.lines().any(|l| l == r));
     let mut content = String::new();
     for r in &hoisted {
         content.push_str(r);
@@ -477,9 +516,58 @@ fn splice_nested(
     else {
         return;
     };
-    if let Some(spliced) = spliced_after_header(&rbs.content, &own_header_indent, &sidecar_blocks) {
+    let (indent, sidecar_blocks) = if compact_form {
+        (String::new(), compact(&raw_sidecar))
+    } else {
+        (own_header_indent, sidecar_blocks)
+    };
+    if let Some(spliced) = spliced_after_header(&rbs.content, &indent, &sidecar_blocks) {
         rbs.content = format!("{spliced}\n");
     }
+}
+
+/// A nested class's own declaration out of its standalone render, at
+/// column 0: `module Stages` … `end`. The render opens either with the
+/// parent's `depth` wrapper lines (`module WebPush` / `class
+/// Connections`) around the child's own header, or — when an outer
+/// segment is the runtime's — with ONE compact header naming the whole
+/// path (`module WebPush::Connections::Stages`), which is renamed to
+/// its last segment.
+fn child_block(body: &[&str], depth: usize, full_name: &str) -> Option<String> {
+    let first = body.iter().position(|l| !l.trim().is_empty())?;
+    let header = body[first];
+    for keyword in ["class ", "module "] {
+        let compact = format!("{keyword}{full_name}");
+        if header == compact || header.starts_with(&format!("{compact} ")) {
+            let last = body.iter().rposition(|l| l.trim() == "end")?;
+            let simple = full_name.rsplit("::").next().unwrap_or(full_name);
+            let renamed = format!("{keyword}{simple}{}", &header[compact.len()..]);
+            let mut out = vec![renamed];
+            out.extend(body[first + 1..=last].iter().map(|l| l.to_string()));
+            return Some(out.join("\n"));
+        }
+    }
+    unwrapped(body, depth).map(|b| dedent_lines(&b, depth))
+}
+
+fn indent_lines(block: &str, levels: usize) -> String {
+    let pad = "  ".repeat(levels);
+    block
+        .lines()
+        .map(|l| if l.is_empty() { String::new() } else { format!("{pad}{l}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `block` with `levels` two-space indents taken off each line that has
+/// them.
+fn dedent_lines(block: &str, levels: usize) -> String {
+    let cut = "  ".repeat(levels);
+    block
+        .lines()
+        .map(|l| l.strip_prefix(cut.as_str()).unwrap_or(l.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 use crate::facades::{Facade, EXTRAS_FACADES};

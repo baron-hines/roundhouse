@@ -9872,3 +9872,111 @@ fn a_helper_test_has_a_test_controller_and_dom_assertions() {
         .run_test("test/helpers/articles_helper_test.rb")
         .assert_passes();
 }
+
+/// Three ingest/emit shapes campfire main's web push pool reaches:
+/// - `@idle[address].pop&.first` evaluates the receiver ONCE (the `&.`
+///   desugar read it twice, popping two entries);
+/// - classes nested in a class under a runtime namespace
+///   (`class WebPush::Connections` with `class HTTP < Net::HTTP; include
+///   Stages; end`) are emitted, a module a sibling includes first;
+/// - each nested class keeps its own name inside the parent.
+#[test]
+fn a_safe_navigated_call_runs_once_and_nested_classes_survive_a_compact_parent() {
+    emit_and_run::real_blog()
+        .write("lib/web_push/probe_pool.rb", r##"class WebPush::ProbePool
+  class Lost < StandardError; end
+
+  module Stages
+    def stage
+      :checking
+    end
+  end
+
+  class HTTP < Net::HTTP
+    include Stages
+  end
+
+  def initialize
+    @idle = { "a" => [ [ :first, 1 ], [ :second, 2 ] ] }
+  end
+
+  def checkout(address)
+    @idle[address].pop&.first
+  end
+
+  def left(address)
+    @idle[address].size
+  end
+
+  def connection
+    HTTP.new("example.com", 443)
+  end
+end
+"##)
+        .run_ruby(r##"
+pool = WebPush::ProbePool.new
+taken = pool.checkout("a")
+raise "took #{taken.inspect}" unless taken == :second
+raise "popped #{2 - pool.left("a")}" unless pool.left("a") == 1
+raise "no stage" unless pool.connection.stage == :checking
+raise "HTTP is #{WebPush::ProbePool::HTTP.superclass}" unless WebPush::ProbePool::HTTP.superclass == Net::HTTP
+raise "Lost" unless WebPush::ProbePool::Lost.ancestors.include?(StandardError)
+"##)
+        .assert_passes();
+}
+
+/// A `test/test_helpers/` module that one test class includes itself
+/// (campfire's `include PushServiceTestHelper`), carried whole into the
+/// test's file: its nested class, its module methods, a constructor
+/// whose keywords stay keywords (`Server.new(**options)`), a duration in
+/// a module method, and `assert_not_kind_of`.
+#[test]
+fn a_test_helper_module_one_test_includes_is_carried_whole() {
+    emit_and_run::real_blog()
+        .write("test/test_helpers/probe_server_helper.rb", r##"module ProbeServerHelper
+  NAME = "probe"
+
+  class Server
+    attr_reader :status, :label
+
+    def initialize(status: "201 Created", label: -> { NAME })
+      @status, @label = status, label.call
+    end
+  end
+
+  class << self
+    def started_at
+      1.minute.ago
+    end
+  end
+
+  private
+    def with_server(**options)
+      yield Server.new(**options)
+    end
+end
+"##)
+        .write("test/models/probe_server_test.rb", r##"require "test_helper"
+
+class ProbeServerTest < ActiveSupport::TestCase
+  include ProbeServerHelper
+
+  test "the helper's class takes its keywords" do
+    with_server(status: "500 Oops") do |server|
+      assert_equal "500 Oops", server.status
+      assert_equal "probe", server.label
+      assert_not_kind_of String, server
+    end
+    with_server do |server|
+      assert_equal "201 Created", server.status
+    end
+  end
+
+  test "a module method reads a duration" do
+    assert ProbeServerHelper.started_at < Time.now
+  end
+end
+"##)
+        .run_test("test/models/probe_server_test.rb")
+        .assert_passes();
+}

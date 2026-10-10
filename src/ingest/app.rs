@@ -1451,6 +1451,11 @@ end
     // the mixin means, and it needs nothing from a target's mixin
     // semantics.
     let shared_test_helpers = ingest_test_helper_modules(vfs, dir)?;
+    // The rest of `test/test_helpers/`: modules one test class includes
+    // itself (campfire's `include PushServiceTestHelper` in two web push
+    // tests). Kept whole — nested classes and module methods too — and
+    // carried into each including test's file as inner classes.
+    let included_test_helpers = ingest_included_test_helper_files(vfs, dir, &shared_test_helpers)?;
     // The app-wide `setup` the same file declares — see
     // `ingest_test_case_setup`. Prepended to every test module's own.
     let test_case_setup: Option<crate::expr::Expr> = {
@@ -1502,6 +1507,7 @@ end
         {
             for mut tm in tms {
                 splice_test_helpers(&mut tm, &shared_test_helpers);
+                carry_included_test_helpers(&mut tm, &included_test_helpers);
                 if let Some(case_setup) = &test_case_setup {
                     splice_test_case_setup(&mut tm, case_setup);
                 }
@@ -7972,6 +7978,80 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
             .unwrap_or(usize::MAX)
     });
     Ok(out)
+}
+
+/// Each `test/test_helpers/` file that is not spliced into every test
+/// case, as (its top-level module, every class the file defines). The
+/// file is read whole because a helper module can carry what a method
+/// splice cannot: campfire's `PushServiceTestHelper` defines a nested
+/// `Server` class and module methods with their own state.
+fn ingest_included_test_helper_files<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    shared: &[LibraryClass],
+) -> IngestResult<Vec<(crate::ident::ClassId, Vec<LibraryClass>)>> {
+    let helpers_dir = dir.join("test/test_helpers");
+    if !vfs.is_dir(&helpers_dir) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in read_rb_files(vfs, &helpers_dir)? {
+        let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
+        let Some(classes) =
+            unwrap_or_record(ingest_library_classes(&source, &entry.display().to_string()))?
+        else {
+            continue;
+        };
+        let Some(top) = classes.iter().find(|c| c.is_module && !c.name.0.as_str().contains("::")) else {
+            continue;
+        };
+        if shared.iter().any(|lc| lc.name == top.name) {
+            continue;
+        }
+        let top = top.name.clone();
+        let mut classes = classes;
+        for lc in &mut classes {
+            for m in &mut lc.methods {
+                restore_source_keywords(&mut m.params);
+            }
+        }
+        out.push((top, classes));
+    }
+    Ok(out)
+}
+
+/// Undo the library-class flattening of keyword parameters: this code
+/// runs only as the test-side Ruby it was written as, called with the
+/// keywords its own source passes (`Server.new(**options)`,
+/// `server.hung_up?(within: 1)`), so the parameters stay keywords.
+fn restore_source_keywords(params: &mut [crate::dialect::Param]) {
+    for p in params {
+        if p.from_keyword {
+            p.from_keyword = false;
+            p.keyword = true;
+        } else if p.from_kwrest {
+            p.from_kwrest = false;
+            p.keyword = true;
+            p.rest = true;
+            p.default = None;
+        }
+    }
+}
+
+/// A test class that `include`s one of those modules gets the module's
+/// file as inner classes, so the include resolves in the test's own
+/// emitted file.
+fn carry_included_test_helpers(tm: &mut TestModule, helpers: &[(crate::ident::ClassId, Vec<LibraryClass>)]) {
+    for (module, classes) in helpers {
+        if !tm.includes.contains(module) {
+            continue;
+        }
+        for lc in classes {
+            if !tm.inner_classes.iter().any(|c| c.name == lc.name) {
+                tm.inner_classes.push(lc.clone());
+            }
+        }
+    }
 }
 
 /// Modules a file mixes into the test cases through a top-level

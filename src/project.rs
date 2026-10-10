@@ -5751,10 +5751,22 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
     // One require, in the helper every test file loads — the place the
     // app put it.
     if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
-        for (_, entry) in &needed {
+        for (gem, entry) in &needed {
             let line = format!("require {entry:?}");
-            if !helper.contains(&line) {
-                helper.insert_str(0, &format!("{line}\n"));
+            if helper.contains(&line) {
+                continue;
+            }
+            // WebMock AFTER the app has loaded, as Rails' test_helper
+            // orders it (`config/environment`, then `webmock/minitest`):
+            // the gem swaps `Net::HTTP` for its own subclass while it is
+            // enabled, so an app class that subclasses `Net::HTTP` at
+            // load (campfire's `WebPush::Connections::HTTP`) would
+            // otherwise inherit WebMock's, and once a test disables
+            // WebMock to reach a real server its `start` breaks.
+            const BOOT: &str = "require_relative \"../boot\"\n";
+            match helper.find(BOOT) {
+                Some(at) if *gem == "webmock" => helper.insert_str(at + BOOT.len(), &format!("{line}\n")),
+                _ => helper.insert_str(0, &format!("{line}\n")),
             }
         }
         let with_mocha = needed.iter().any(|(gem, _)| *gem == "mocha");
