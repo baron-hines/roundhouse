@@ -22,6 +22,8 @@ const NUMBER_HELPER_TEMPLATE: &str = r#"
 <p id="nh-delimited"><%= number_with_delimiter("1234567.89", delimiter: ".", separator: ",") %></p>
 <p id="nh-precision"><%= number_with_precision("-12.345", precision: 2, round_mode: :down) %></p>
 <p id="nh-html"><%= number_to_currency(1, unit: "<b>") %></p>
+<p id="nh-invalid-html"><%= number_to_currency("<script>") %></p>
+<p id="nh-invalid-currency"><%= number_to_currency("-abc") %></p>
 "#;
 
 const EXPECTED_HTML: &[&str] = &[
@@ -34,6 +36,8 @@ const EXPECTED_HTML: &[&str] = &[
     "id=\"nh-delimited\">1.234.567,89</p>",
     "id=\"nh-precision\">-12.34</p>",
     "id=\"nh-html\">&lt;b&gt;1.00</p>",
+    "id=\"nh-invalid-html\">$&lt;script&gt;</p>",
+    "id=\"nh-invalid-currency\">-$abc</p>",
 ];
 
 fn overlay() -> emit_and_run::Overlay {

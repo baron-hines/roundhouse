@@ -119,6 +119,7 @@ class ActiveSupportNumberHelperTest < Minitest::Test
     assert_nil helper.number_to_rounded(nil)
 
     assert_equal "$12x34", helper.number_to_currency("12x34")
+    assert_equal "-$abc", helper.number_to_currency("-abc")
     assert_equal "12x34", helper.number_to_delimited("12x34")
     assert_equal "12x34", helper.number_to_human("12x34")
     assert_equal "12x34", helper.number_to_human_size("12x34")
@@ -179,6 +180,10 @@ class ActiveSupportNumberHelperTest < Minitest::Test
     assert_equal "1234.50", view.number_with_precision(1234.5, precision: 2)
     assert_equal "&lt;b&gt;1.00",
       view.number_to_currency(1, unit: "<b>")
+    invalid_html = view.number_to_currency("<script>")
+    assert_equal "$<script>", invalid_html
+    assert_equal String, invalid_html.class
+    assert_equal "-$abc", view.number_to_currency("-abc")
     assert_equal "&lt;b&gt;", view.number_to_phone("<b>")
     assert_nil view.number_to_phone(nil)
 
