@@ -6,6 +6,7 @@ mod emit_and_run;
 const ASSERTIONS: &str = r#"
 inflector = ActiveSupport::Inflector
 raise "camelize" unless inflector.camelize("foo_bar") == "FooBar"
+raise "camelize word normalization" unless inflector.camelize("foo_BAR") == "FooBar"
 raise "lower camelize" unless inflector.camelize("foo/bar_baz", false) == "foo::BarBaz"
 raise "namespace camelize" unless inflector.camelize("/foo/bar") == "::Foo::Bar"
 raise "deconstantize" unless inflector.deconstantize("Admin::UsersController") == "Admin"
@@ -21,10 +22,9 @@ puts "ActiveSupport::Inflector caller contract passed"
 fn inflector_slice_runs_in_emitted_cruby_app() {
     let run = emit_and_run::real_blog().run_ruby(ASSERTIONS);
     run.assert_passes();
-    assert!(
-        run.stdout
-            .contains("ActiveSupport::Inflector caller contract passed")
-    );
+    assert!(run
+        .stdout
+        .contains("ActiveSupport::Inflector caller contract passed"));
 }
 
 #[test]
@@ -32,8 +32,7 @@ fn inflector_slice_runs_in_emitted_cruby_app() {
 fn inflector_slice_runs_in_native_spinel_app() {
     let run = emit_and_run::real_blog().run_spinel(ASSERTIONS);
     run.assert_passes();
-    assert!(
-        run.stdout
-            .contains("ActiveSupport::Inflector caller contract passed")
-    );
+    assert!(run
+        .stdout
+        .contains("ActiveSupport::Inflector caller contract passed"));
 }

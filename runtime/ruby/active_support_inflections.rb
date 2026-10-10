@@ -95,6 +95,7 @@ module ActiveSupport
       n = s.length
       i = 0
       capitalize = uppercase_first_letter
+      normalize_word = false
 
       if s.start_with?("::")
         out << "::"
@@ -104,6 +105,7 @@ module ActiveSupport
         out << "::"
         i = 1
         capitalize = true
+        normalize_word = true
       end
 
       while i < n
@@ -111,13 +113,15 @@ module ActiveSupport
         if c == "/"
           out << "::"
           capitalize = true
+          normalize_word = true
         elsif c == "_"
           capitalize = true
+          normalize_word = true
         else
           if i == 0 && !uppercase_first_letter
             out << c.downcase
           else
-            out << (capitalize ? c.upcase : c)
+            out << (capitalize ? c.upcase : (normalize_word ? c.downcase : c))
           end
           capitalize = false
         end
@@ -140,12 +144,14 @@ module ActiveSupport
       base + (separate_class_name_and_id_with_underscore ? "_id" : "id")
     end
 
+    # Uppercase only the first character; preserve the remainder unchanged.
     def self.upcase_first(text)
       s = text.to_s
       return s if s.empty?
       s[0].to_s.upcase + s[1, s.length - 1].to_s
     end
 
+    # Lowercase only the first character; preserve the remainder unchanged.
     def self.downcase_first(text)
       s = text.to_s
       return s if s.empty?
