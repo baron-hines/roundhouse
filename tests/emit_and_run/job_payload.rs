@@ -69,6 +69,71 @@ fn a_payload_job_round_trips_through_the_drain() {
     assert!(job.contains("ActiveJob.enqueue_payload(JobRegistry.payload_article_job("), "{job}");
 }
 
+const AFTER_COMMIT_JOB: &str = r#"class CommitJob < ApplicationJob
+  self.enqueue_after_transaction_commit = true
+
+  def perform(article)
+    puts "committed job saw #{article.title}"
+  end
+end
+"#;
+
+const AFTER_COMMIT_ENQUEUE: &str = r#"  validates :title, presence: true
+
+  def enqueue_commit_job
+    CommitJob.perform_later(self)
+  end
+"#;
+
+const AFTER_COMMIT_SCRIPT: &str = r#"ActiveJob.register_drain
+Article.transaction do
+  article = Article.create!(title: "Committed title", body: "A long enough article body.")
+  article.enqueue_commit_job
+  raise "queued inside the transaction" unless ActiveJob.pending_count == 0
+end
+raise "not queued at commit" unless ActiveJob.pending_count == 1
+raise "drain ran #{ActiveJob.pending_count}" unless ActiveJob.drain == 1
+
+begin
+  Article.transaction do
+    article = Article.create!(title: "Rolled back title", body: "Another long enough body.")
+    article.enqueue_commit_job
+    raise "roll back"
+  end
+rescue RuntimeError => e
+  raise e unless e.message == "roll back"
+end
+raise "a rolled-back enqueue was queued" unless ActiveJob.pending_count == 0
+
+article = Article.create!(title: "Outside title", body: "A third long enough body.")
+article.enqueue_commit_job
+raise "outside a transaction it queues at once" unless ActiveJob.pending_count == 1
+ActiveJob.drain
+puts "after commit passed"
+"#;
+
+/// `self.enqueue_after_transaction_commit = true` (Lobsters'
+/// `ApplicationJob`): a payload enqueued inside `Model.transaction` is
+/// queued at COMMIT, so the drain never looks for a row before it is
+/// visible, and one enqueued in a transaction that rolls back never runs.
+#[test]
+fn an_after_commit_job_waits_for_the_commit() {
+    let run = emit_and_run::real_blog()
+        .write("app/jobs/commit_job.rb", AFTER_COMMIT_JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", AFTER_COMMIT_ENQUEUE)
+        .run_ruby(AFTER_COMMIT_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("committed job saw Committed title"), "{}", run.stdout);
+    assert!(!run.stdout.contains("Rolled back title"), "{}", run.stdout);
+    assert!(run.stdout.contains("after commit passed"), "{}", run.stdout);
+    let job = std::fs::read_to_string(run.emitted.join("app/models/commit_job.rb"))
+        .expect("emitted job");
+    assert!(
+        job.contains("ActiveJob.enqueue_payload_after_commit(JobRegistry.payload_commit_job(article))"),
+        "{job}"
+    );
+}
+
 const STI_SCRIPT: &str = r#"ActiveJob.register_drain
 featured = Articles::Featured.create!(title: "Featured title", body: "A long enough article body.")
 row = Article.find(featured.id)

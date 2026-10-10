@@ -34,6 +34,63 @@ module JobRegistry
 end
 
 module ActiveJob
+  # ---- Enqueue after commit ------------------------------------------
+  #
+  # A job that sets `self.enqueue_after_transaction_commit = true` (on
+  # itself or `ApplicationJob`, as Lobsters does) is not queued while a
+  # transaction is open: the drain runs on its own connection and would
+  # look the record up before the COMMIT made it visible, then raise
+  # DeserializationError for a row that is about to exist. Rails holds
+  # it the same way. `Model.transaction` reports its edges here, through
+  # `ActiveRecord::TransactionHooks` (below); held payloads are queued at COMMIT and
+  # dropped at ROLLBACK. Rails 8.1's default for the setting is false,
+  # and a job that keeps it so is queued at once, as before.
+  #
+  # Per thread, because the transaction is: each request thread holds
+  # its own connection lease. Flat, because `Model.transaction` is.
+  def self.__held_until_commit
+    held = Thread.current[:aj_held_until_commit]
+    if held.nil?
+      held = [""]
+      held.clear
+      Thread.current[:aj_held_until_commit] = held
+    end
+    held
+  end
+
+  def self.in_transaction
+    Thread.current[:aj_in_transaction] == true
+  end
+
+  def self.enqueue_payload_after_commit(json)
+    if in_transaction
+      __held_until_commit << json
+    else
+      enqueue_payload(json)
+    end
+    nil
+  end
+
+  def self.transaction_began
+    Thread.current[:aj_in_transaction] = true
+    nil
+  end
+
+  def self.transaction_committed
+    Thread.current[:aj_in_transaction] = false
+    held = __held_until_commit
+    while held.length > 0
+      enqueue_payload(held.shift)
+    end
+    nil
+  end
+
+  def self.transaction_rolled_back
+    Thread.current[:aj_in_transaction] = false
+    __held_until_commit.clear
+    nil
+  end
+
   # The drain's payload arm (`ActiveJob.drain` in the shared runtime and
   # its locked twin in thread_state.rb). REPLACES the shared default,
   # which knows no jobs: a later definition wins, on spinel as on CRuby.
@@ -53,6 +110,24 @@ module ActiveJob
     rescue ActiveJob::DeserializationError => e
       warn "[job] " + name + ": " + e.message unless JobRegistry.discards_deserialization_error(name)
       false
+    end
+  end
+end
+
+# `Model.transaction`'s edges (no-ops in active_record/connection.rb),
+# routed to the enqueue-after-commit hold above.
+module ActiveRecord
+  module TransactionHooks
+    def self.began
+      ActiveJob.transaction_began
+    end
+
+    def self.committed
+      ActiveJob.transaction_committed
+    end
+
+    def self.rolled_back
+      ActiveJob.transaction_rolled_back
     end
   end
 end
