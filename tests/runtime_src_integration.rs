@@ -884,7 +884,11 @@ fn every_runtime_method_body_concretely_typed() {
     // additions contribute 39 more, primarily from generic JSON, deep_dup,
     // session and request-environment values. Keep those intentional dynamic
     // boundaries visible in the measured combined ceiling.
-    const CEILING: usize = 373;
+    // `transaction(requires_new: true)` savepoints add 3 in
+    // `self.transaction`, MEASURED 373 -> 376 on main 9d577c24: the
+    // `requires_new` option is `untyped` (as `with_lock` forwards it), and
+    // the nested block's value is now read back after its RELEASE.
+    const CEILING: usize = 376;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
