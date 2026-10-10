@@ -2434,6 +2434,14 @@ pooled push delivery there raises where it reaches the class.
 - **`Rails.application.env_config` holds what is set and is consulted
   for nothing**: a forgery failure always renders the 422 that
   `action_dispatch.show_exceptions = :rescuable` asks for.
+- **`save` writes the whole row; only `touch` writes what changed.**
+  Rails' partial writes UPDATE the changed columns; this runtime's
+  `_adapter_update` writes every column the record loaded. A bare
+  `touch` (and so `belongs_to … touch: true`) UPDATEs `updated_at`
+  alone (`_adapter_touch`), which is what keeps campfire's
+  trigger-maintained `rooms.messages_count` correct when a message
+  touches its room. A `save`/`update` of a record loaded before a
+  trigger moved one of its columns still writes the stale value back.
 
 ## Related docs
 
