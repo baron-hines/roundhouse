@@ -1752,6 +1752,21 @@ module RequestDispatch
     @__https == true
   end
 
+  # Rails' integration `reset!`: a fresh session — no cookies, session or
+  # flash carried over, the default host, plain http — as a new browser
+  # would bring (campfire's fetch-metadata test signs in once per
+  # `Sec-Fetch-Site` value).
+  def reset!
+    @__session = nil
+    @__flash = nil
+    @__cookies = nil
+    @__response = nil
+    @__host = nil
+    @__https = false
+    sync_url_origin
+    nil
+  end
+
   def dispatch_request(method, path, params, headers = {}, as = nil)
     path = integration_request_path(path)
     require_relative "../config/routes"
@@ -1782,6 +1797,15 @@ module RequestDispatch
     # a query string reaches a test path at all: a route helper renders
     # its non-segment options into one.
     match_path, _, query = path.partition("?")
+    # A form's hidden `_method` carries the real verb (Rack's
+    # MethodOverride), exactly as both production dispatchers apply it
+    # after the body parse. campfire's fetch-metadata test posts
+    # `_method: "delete"` cross-site and expects the DELETE route's
+    # forgery refusal, not "No route matches POST".
+    if method == "POST" && params.is_a?(Hash)
+      override = (params[:_method] || params["_method"]).to_s.upcase
+      method = override if override == "PUT" || override == "PATCH" || override == "DELETE"
+    end
     matched = ActionDispatch::Router.match(
       method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
     )

@@ -10166,3 +10166,61 @@ end
         .run_test("test/models/article_counting_test.rb")
         .assert_passes();
 }
+
+/// campfire main's header-only forgery protection, from the test side:
+/// - an app helper overriding `token_tag` to answer "" leaves every form
+///   without a token field (Rails' form helpers build it through that);
+/// - a POST carrying `_method: "delete"` is routed as the DELETE it says
+///   (Rack's MethodOverride, as both production dispatchers apply it);
+/// - the integration session's `reset!` starts a fresh one.
+#[test]
+fn a_blank_token_tag_override_method_override_and_session_reset() {
+    emit_and_run::real_blog()
+        .write("app/helpers/application_helper.rb", r##"module ApplicationHelper
+  private
+    def token_tag(*)
+      ""
+    end
+end
+"##)
+        .write("test/controllers/token_free_forms_controller_test.rb", r##"require "test_helper"
+
+class TokenFreeFormsControllerTest < ActionDispatch::IntegrationTest
+  setup do
+    @previous = ActionController::Base.allow_forgery_protection
+    ActionController::Base.allow_forgery_protection = true
+  end
+
+  teardown do
+    ActionController::Base.allow_forgery_protection = @previous
+  end
+
+  test "forms carry no token field" do
+    get new_article_url
+    assert_response :success
+    assert_select "form"
+    assert_select "input[name='authenticity_token']", count: 0
+  end
+
+  test "a POST with _method is the verb it names" do
+    ActionController::Base.allow_forgery_protection = false
+    article = Article.create!(title: "Overridden", body: "A sufficiently long article body.")
+    assert_difference "Article.count", -1 do
+      post article_url(article), params: { _method: "delete" }
+    end
+  end
+
+  test "reset! starts a fresh session" do
+    https!
+    host! "blog.example.test"
+    get articles_url
+    reset!
+    assert_not https?
+    assert_equal "www.example.com", host
+    assert_nil response
+  end
+end
+"##)
+        .run_test("test/controllers/token_free_forms_controller_test.rb")
+        .assert_passes();
+}

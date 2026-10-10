@@ -394,6 +394,14 @@ module Rails
       "header_or_legacy_token"
     end
 
+    # Whether forms carry no authenticity token field at all: an app
+    # helper overriding ActionView's `token_tag` to answer "" (the shape
+    # header-only forgery protection uses) makes it true; ingest
+    # synthesizes the override on the app's reopen.
+    def token_fields_omitted
+      false
+    end
+
     # `GlobalID.app` — the first segment of every `gid://<app>/<Model>/
     # <id>` URI this runtime mints. Rails derives it from the
     # application's railtie name (`campfire_application` minus the
