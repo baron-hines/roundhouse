@@ -96,6 +96,7 @@ pub mod as_json_super;
 pub mod parameterize;
 pub mod random_formatter;
 pub mod bigdecimal;
+pub mod range_enumerable;
 pub mod to_json;
 pub mod number_to_fs;
 pub mod string_inflections;
@@ -320,6 +321,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("string_inflections", &[]),
     ("to_json", &[]),
     ("bigdecimal", &[]),
+    ("range_enumerable", &[]),
     ("csv_generate", &[]),
     ("presence_in", &[]),
     ("enumerable_ext", &[]),
@@ -784,6 +786,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("string_inflections");
     ran!("to_json");
     ran!("bigdecimal");
+    ran!("range_enumerable");
     ran!("csv_generate");
     ran!("presence_in");
     ran!("enumerable_ext");

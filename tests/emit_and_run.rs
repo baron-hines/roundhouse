@@ -1553,6 +1553,114 @@ end
         .assert_passes();
 }
 
+/// An Integer range's Enumerable calls (`map`, `filter_map`, `select`,
+/// `reduce`, `flat_map`, `each_with_object`) run through `to_a`, on an
+/// inclusive and an exclusive range and a constant bound.
+#[test]
+fn integer_range_enumerable_calls_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/months\", to: \"months#show\"\n",
+        )
+        .write(
+            "app/controllers/months_controller.rb",
+            r#"class MonthsController < ApplicationController
+  MAX = 3
+
+  def show
+    a = (1..12).map { |m| "month#{m}" }
+    b = (1..MAX).filter_map { |i| i.even? ? i * 2 : nil }
+    c = (1..5).select { |i| i > 2 }
+    d = (1..4).reduce(0) { |s, i| s + i }
+    e = (1..3).flat_map { |i| [i, i] }
+    f = (1..3).each_with_object({}) { |i, h| h[i] = i * i }
+    g = (2...5).map { |i| i * 10 }
+    render plain: [a.first, a.size, b.sum, c.size, d, e.size, f[3], g.join("-")].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/months_controller_test.rb",
+            r#"require "test_helper"
+
+class MonthsControllerTest < ActionDispatch::IntegrationTest
+  test "range enumerable calls" do
+    get "/months"
+    assert_equal "month1 12 4 3 10 6 9 20-30-40", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/months_controller_test.rb")
+        .assert_passes();
+}
+
+/// The range reaches those calls as an Array, the shape every target
+/// answers: the emitted Ruby reads `(1..n).to_a.filter_map`, and a call
+/// that answers its receiver (`each_with_index`) is left on the range.
+#[test]
+fn integer_range_enumerable_calls_go_through_to_a() {
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .write(
+            "app/models/calendar.rb",
+            "class Calendar\n  def self.even_doubles(n)\n    (1..n).filter_map { |i| i.even? ? i * 2 : nil }\n  end\n\n  def self.walk\n    (1..3).each_with_index { |i, at| i + at }\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let source = walk_files(&emitted)
+        .into_iter()
+        .find(|text| text.contains("def self.even_doubles"))
+        .expect("Calendar emitted");
+    assert!(source.contains("(1..n).to_a.filter_map"), "{source}");
+    assert!(source.contains("(1..3).each_with_index"), "{source}");
+}
+
+/// A test body takes the same rewrites as app code: the analyzer types
+/// `(1..3).filter_map` and `2.5.to_d` there too, so without them the
+/// emitted test would call a range method or a `bigdecimal/util`
+/// reopen no target provides.
+#[test]
+fn range_and_to_d_rewrites_reach_test_bodies() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/rewrites_in_tests_test.rb",
+            r#"require "test_helper"
+
+class RewritesInTestsTest < ActiveSupport::TestCase
+  test "range and decimal calls in a test body" do
+    assert_equal [4], (1..3).filter_map { |i| i.even? ? i * 2 : nil }
+    assert_equal "0.25e1", 2.5.to_d.to_s
+  end
+end
+"#,
+        )
+        .run_test("test/models/rewrites_in_tests_test.rb")
+        .assert_passes();
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .write(
+            "test/models/rewrites_in_tests_test.rb",
+            "require \"test_helper\"\n\nclass RewritesInTestsTest < ActiveSupport::TestCase\n  test \"range\" do\n    assert_equal [4], (1..3).filter_map { |i| i.even? ? i * 2 : nil }\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let test = std::fs::read_to_string(emitted.join("test/models/rewrites_in_tests_test.rb")).expect("emitted test");
+    assert!(test.contains("(1..3).to_a.filter_map"), "{test}");
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else if path.extension().is_some_and(|e| e == "rb") {
+            out.extend(std::fs::read_to_string(&path).ok());
+        }
+    }
+    out
+}
+
 /// A job `perform_later` enqueues under the test adapter is held, not
 /// dropped, and a blockless `perform_enqueued_jobs only:` runs it
 /// (basecamp/once-campfire#296's tests). Its broadcast is JSON encoded

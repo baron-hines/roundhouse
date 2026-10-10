@@ -289,6 +289,12 @@ impl<'a> BodyTyper<'a> {
         class_object_receiver: bool,
         block: &Expr,
     ) -> Ctx {
+        if crate::lower::range_enumerable::THROUGH_ARRAY.contains(&method.as_str())
+            && crate::lower::range_enumerable::integer_range(recv_ty)
+        {
+            let array = Ty::Array { elem: Box::new(Ty::Int) };
+            return self.block_ctx_for(outer, Some(&array), method, args, class_object_receiver, block);
+        }
         let mut new_ctx = outer.clone();
         // Required parameters come first, so the extra ones (optional,
         // keyword, keyword rest) leave their positions alone; the Lambda
@@ -1240,6 +1246,13 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "Range" {
                     if let Some(ty) = range_method(method, args.first()) {
                         return ty;
+                    }
+                    // Not answered off the Range: `lower::range_enumerable` reads these through `to_a`.
+                    if crate::lower::range_enumerable::THROUGH_ARRAY.contains(&method.as_str())
+                        && crate::lower::range_enumerable::integer_range(recv_ty)
+                    {
+                        let array = Ty::Array { elem: Box::new(Ty::Int) };
+                        return self.dispatch(Some(&array), method, block_ret, call_args);
                     }
                 }
                 // `ActiveSupport.parse_db_time(<stored text>)` — the
