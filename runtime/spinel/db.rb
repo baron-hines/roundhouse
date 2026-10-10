@@ -67,6 +67,8 @@ module SQL
   # open_v2 flags: READWRITE | CREATE | URI. The first two are what plain
   # `sqlite3_open` uses, so a non-URI path opens identically either way.
   ffi_const :OPEN_URI_RWC, 70
+  # READONLY | URI, for `SQLite3::Database.new(path, readonly: true)`.
+  ffi_const :OPEN_URI_READONLY, 65
 
   ffi_func :sqlite3_open,              [:str, :ptr],                          :int
   # `sqlite3_open` honors a `file:` URI only on a build compiled with
@@ -129,6 +131,10 @@ module SQL
   # non-zero in autocommit — the "is a transaction open?" probe the
   # request read snapshot and the write permit ask before acting.
   ffi_func :sqlite3_get_autocommit,    [:ptr],                                :int
+  # `SQLite3::Database` (runtime/spinel/sqlite3_database.rb): a busy
+  # timeout per connection, and 64-bit integer columns.
+  ffi_func :sqlite3_busy_timeout,      [:ptr, :int],                          :int
+  ffi_func :sqlite3_column_int64,      [:ptr, :int],                          :long
 
   # Out-params — sqlite3_open writes the db handle here, prepare_v2
   # writes the stmt handle. 8 bytes is enough for a 64-bit pointer.
@@ -140,6 +146,10 @@ module SQL
   # The background checkpointer's own connection, opened from its thread
   # after the pool exists — its own buffer for the same reason as seed_out.
   ffi_buffer :ckpt_out, 8
+  # `SQLite3::Database`'s own out-params, so an app's connection never
+  # writes into a buffer the pool reads.
+  ffi_buffer :sq_db_out, 8
+  ffi_buffer :sq_stmt_out, 8
   ffi_read_ptr :read_ptr, 0
 end
 
@@ -1284,6 +1294,24 @@ module Db
   @prepare_lock = Mutex.new
   def self.prepare_lock
     @prepare_lock
+  end
+
+  # `ActiveRecord::Base.connection_db_config` answers from these
+  # (runtime/spinel/active_record_db_config.rb): the database this
+  # process configured, the adapter name Rails would report for it, and
+  # whether the holder is inside a transaction of its own — the request
+  # read snapshot is the shim's, not the app's, so it does not count.
+  def self.database_path
+    @db_path
+  end
+
+  def self.adapter_name
+    "sqlite3"
+  end
+
+  def self.transaction_open?
+    conn = current_conn
+    conn.in_txn? && conn.snap != 2
   end
 
   def self.current_conn

@@ -324,6 +324,21 @@ impl<'a> BodyTyper<'a> {
                 }
             }
         }
+        // `Thread.new(state) { |state| ... }` forwards constructor
+        // arguments to the block. Unlike iterator methods, the yielded
+        // values come from this call's positional arguments rather than
+        // from the receiver's element type.
+        if class_object_receiver
+            && matches!(method.as_str(), "new")
+            && matches!(recv_ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "Thread")
+        {
+            for (name, arg) in params.iter().zip(args.iter()) {
+                if let Some(ty) = &arg.ty {
+                    new_ctx.local_bindings.insert(name.clone(), ty.clone());
+                }
+            }
+            return new_ctx;
+        }
         // Untyped receiver: bind every block param to `Untyped` (the
         // gradual choice extends to the destructured params). Without
         // this, `untyped_hash.each { |k, v| ... }` would give k=Untyped
@@ -2586,6 +2601,10 @@ fn relation_return_on_array_repr(kind: crate::catalog::ReturnKind, elem: &Ty) ->
             key: Box::new(Ty::Sym),
             value: Box::new(Ty::Str),
         },
+        ReturnKind::HashStrUntyped => Ty::Hash {
+            key: Box::new(Ty::Str),
+            value: Box::new(Ty::Untyped),
+        },
         ReturnKind::ArrayOfSym => Ty::Array { elem: Box::new(Ty::Sym) },
         ReturnKind::Str => Ty::Str,
     }
@@ -2729,7 +2748,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
             variants: vec![elem.clone(), Ty::Nil],
         },
         "index" | "find_index" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
-        "dup" | "clone" => Ty::Array { elem: Box::new(elem.clone()) },
+        // ActiveSupport's `deep_dup` copies the elements too; the shape
+        // is the receiver's (`lower::symbolize_keys` grounds it).
+        "dup" | "clone" | "deep_dup" => Ty::Array { elem: Box::new(elem.clone()) },
         // `clear` empties in place and returns SELF, so it keeps the
         // element type — the array is empty, not differently-typed.
         // Reached by `Resolv.clear_getaddresses_stubs` resetting the
@@ -2904,7 +2925,7 @@ pub(super) fn hash_method(
         "to_a" => Ty::Array {
             elem: Box::new(Ty::Tuple { elems: vec![key.clone(), value.clone()] }),
         },
-        "dup" | "clone" => Ty::Hash {
+        "dup" | "clone" | "deep_dup" => Ty::Hash {
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
@@ -3149,6 +3170,10 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // `[]` below keeps Str: the readers index inside `bytesize` (the
         // verifier's constant-time `secure_compare`).
         "getbyte" => Ty::Int,
+        // `byteslice(start, length)` — the bytes in that range, or nil
+        // when `start` lies past the end. campfire truncates a SHA-256
+        // hex digest to its first 32 bytes for a weak ETag.
+        "byteslice" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
         // `=~` (regex-match operator, desugars to `str.=~(re)`) → the
         // match position or nil. `match` (below) is the MatchData form.
         "=~" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },

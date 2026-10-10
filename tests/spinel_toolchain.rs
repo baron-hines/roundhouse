@@ -61,6 +61,10 @@ mod io_process_constants_contract;
 mod io_process_constants;
 #[path = "spinel_toolchain/action_text_sanitize.rs"]
 mod action_text_sanitize;
+#[path = "support/campfire_caches.rs"]
+mod campfire_caches_contract;
+#[path = "spinel_toolchain/campfire_caches.rs"]
+mod campfire_caches;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]

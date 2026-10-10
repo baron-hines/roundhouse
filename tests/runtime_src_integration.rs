@@ -880,13 +880,11 @@ fn every_runtime_method_body_concretely_typed() {
     // adapter value is column-dependent, and its `to_f` conversion is the
     // schema-selected Ruby boundary that matches the model's Float contract.
     // The emitted regression covers scalar and grouped decimal extrema.
-    // ActionText::Fragment's revision-aware source-range ledger, rescan
-    // mapping, ordered edits, and batched removal add 45 gradual sites to the
-    // merged main baseline of 334; those paths remain concretely typed for Bar A.
-    // Maintaining sorted pending ranges for reverse-order overlapping removals
-    // adds 2 gradual indexed-write sites; their element and index reads remain
-    // fully typed, and the native sanitizer regression exercises the behavior.
-    const CEILING: usize = 381;
+    // Canonical main fd20c7cf measures 373 sites; this PR's ActionText
+    // additions contribute 47 on that exact baseline (45 for the range/edit
+    // machinery and 2 indexed writes for sorted pending removals). The merged
+    // tree was remeasured, not derived by adding counts across different bases.
+    const CEILING: usize = 420;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
