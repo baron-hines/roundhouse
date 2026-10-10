@@ -86,11 +86,11 @@ module ActiveSupport
 
     # Arithmetic with a number or another duration is a duration, as in
     # Rails (`7.seconds - 0.5 == 6.5.seconds`), and `divmod`, below, is
-    # how Ruby's C side converts an interval. Both are what a
-    # timeout handed to the stdlib needs: `TCPSocket.new(open_timeout:)`
-    # subtracts the time spent so far from it, so campfire's
-    # `Net::HTTP.start(…, open_timeout: TIMEOUT)` (TIMEOUT = 7.seconds)
-    # failed every fetch on `undefined method '-'`.
+    # how Ruby's C side converts an interval. `TCPSocket.new` uses that
+    # conversion for `connect_timeout:`; `Net::HTTP.start` subtracts
+    # elapsed time from `open_timeout: TIMEOUT` (TIMEOUT = 7.seconds).
+    # Without this arithmetic, campfire's fetch failed on
+    # `undefined method '-'`.
     def +(other) = Duration.new(@seconds + Duration.value_of(other))
     def -(other) = Duration.new(@seconds - Duration.value_of(other))
     def *(other) = Duration.new(@seconds * Duration.value_of(other))
@@ -98,7 +98,7 @@ module ActiveSupport
     def -@ = Duration.new(-@seconds)
     def to_r = @seconds.to_r
     # What Ruby's C side converts a non-numeric interval with (`IO.select`,
-    # `TCPSocket.new(open_timeout:)`): `divmod(1)` into whole and part.
+    # `TCPSocket.new(connect_timeout:)`): `divmod(1)` into whole and part.
     def divmod(other) = @seconds.divmod(Duration.value_of(other))
     def <=>(other) = @seconds <=> Duration.value_of(other)
     include Comparable

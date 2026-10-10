@@ -1509,6 +1509,14 @@ impl<'a> BodyTyper<'a> {
                 ) {
                     return t;
                 }
+                if let Some(t) = self.relation_extreme_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                ) {
+                    return t;
+                }
                 if let Some(t) =
                     self.column_attribute_access_ty(recv_ty.as_ref(), method, args)
                 {
