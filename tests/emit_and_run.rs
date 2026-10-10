@@ -228,6 +228,85 @@ puts "has_many to_sql passed"
     assert!(run.stdout.contains("has_many to_sql passed"));
 }
 
+/// `maximum` / `minimum` on a model class and on a has_many reader (of a
+/// possibly-nil owner too) run as SQL extrema of the column's type, nil
+/// over no rows: the reader alone answers an Array, which has neither.
+fn extrema_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().edit(
+        "app/models/article.rb",
+        "  validates :title, presence: true\n",
+        "  validates :title, presence: true
+
+  def self.newest_id
+    Article.maximum(:id)
+  end
+
+  def last_commenter
+    comments.maximum(:commenter)
+  end
+
+  def first_comment_id
+    self.comments.minimum(:id)
+  end
+
+  def self.first_articles_last_comment_id
+    Article.first.comments.maximum(:id)
+  end
+",
+    )
+}
+
+const EXTREMA_ASSERTIONS: &str = r#"Article.delete_all
+raise "empty newest_id: #{Article.newest_id.inspect}" unless Article.newest_id.nil?
+a = Article.create!(title: "One", body: "A sufficiently long body.")
+b = Article.create!(title: "Two", body: "A sufficiently long body.")
+raise "newest_id: #{Article.newest_id.inspect}" unless Article.newest_id == b.id
+raise "empty last_commenter: #{a.last_commenter.inspect}" unless a.last_commenter.nil?
+c1 = Comment.create!(article_id: a.id, commenter: "Ann", body: "first comment")
+Comment.create!(article_id: a.id, commenter: "Zed", body: "second comment")
+Comment.create!(article_id: b.id, commenter: "Zoe", body: "other article")
+raise "last_commenter: #{a.last_commenter.inspect}" unless a.last_commenter == "Zed"
+raise "first_comment_id: #{a.first_comment_id.inspect}" unless a.first_comment_id == c1.id
+raise "first_articles_last_comment_id: #{Article.first_articles_last_comment_id.inspect}" unless Article.first_articles_last_comment_id == Comment.where(article_id: a.id).last.id
+puts "extrema passed"
+"#;
+
+#[test]
+fn extrema_run_on_a_model_and_its_has_many_reader() {
+    let run = extrema_app().run_ruby(EXTREMA_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("extrema passed"));
+}
+
+/// The has_many readers `lower::scope_chain` does not seed — one off a
+/// call with arguments, or off a local holding the reader — stay
+/// unresolved: their Array has no `maximum`.
+#[test]
+fn extrema_on_an_unseeded_reader_stay_errors() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.by_title_last_comment_id(title)
+    Article.find_by!(title: title).comments.maximum(:id)
+  end
+
+  def held_last_comment_id
+    held = comments
+    held.maximum(:id)
+  end
+",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert_eq!(
+        errors.iter().filter(|e| e.contains("`maximum`")).count(),
+        2,
+        "both unseeded readers keep their error: {errors:?}"
+    );
+}
+
 /// `in_batches` with a block hands each batch as a relation; without
 /// one, `update_all` and `touch_all` reach every row.
 #[test]

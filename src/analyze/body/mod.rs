@@ -246,6 +246,9 @@ pub struct ClassInfo {
     /// which is the same two hops the emit-time flattening reads
     /// (`room.memberships.grant_to(u)` → `room.memberships_grant_to(u)`).
     pub assoc_extensions: HashMap<(Symbol, Symbol), Ty>,
+    /// has_many readers without `through:` — the ones `lower::scope_chain`
+    /// roots onto a relation, so a relation terminal on them runs as SQL.
+    pub direct_has_many: std::collections::HashSet<Symbol>,
     /// Modules mixed in via `include` (e.g. a controller's
     /// `include IntervalHelper`). A mixed-in module's instance methods
     /// become instance methods of the includer, so dispatch consults
@@ -1523,6 +1526,7 @@ impl<'a> BodyTyper<'a> {
                     recv_ty.as_ref(),
                     method,
                     args,
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
                 ) {
                     return t;
                 }

@@ -1346,7 +1346,7 @@ fn self_qualified_assoc_read(r: Expr, ctx: &Ctx) -> Expr {
 /// `order`, which decides what `.first`/`.last` mean) is treated as
 /// row-changing: the list is an allowlist so an unrecognized method
 /// declines rather than being assumed harmless.
-fn scope_is_row_preserving(scope: &Expr) -> bool {
+pub(crate) fn scope_is_row_preserving(scope: &Expr) -> bool {
     fn walk(e: &Expr) -> bool {
         match &*e.node {
             ExprNode::Send { recv, method, .. } => {
@@ -1892,6 +1892,8 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             | "touch_all"
                             | "to_sql"
                             | "in_batches"
+                            | "maximum"
+                            | "minimum"
                     )
             {
                 if let ExprNode::Send { method: aname, args: aargs, block: None, .. } = &*r.node {
@@ -2374,7 +2376,10 @@ fn thread_rel(mut args: Vec<Expr>, rel: Expr, leading: Option<&Vec<Param>>, span
 /// `Push::Subscription.destroy_by(endpoint:, user_id:)` reached nothing
 /// at all, with the analyzer saying so (`send_dispatch_failed: no known
 /// method `destroy_by` on Class { Push::Subscription }`).
-const CLASS_ROOT_TERMINALS: &[&str] = &["pluck", "ids", "destroy_by", "delete_by"];
+///
+/// `maximum` / `minimum` likewise: `Base` defines neither, and the arel
+/// pass leaves them to `Relation`'s SQL extrema.
+const CLASS_ROOT_TERMINALS: &[&str] = &["pluck", "ids", "destroy_by", "delete_by", "maximum", "minimum"];
 
 /// Relation TERMINALS our runtime implements — a seeded association
 /// chain may end in one (`@story.merged_stories.ids`). Deliberately
@@ -2411,6 +2416,8 @@ fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool
                 | "touch_all"
                 | "to_sql"
                 | "in_batches"
+                | "maximum"
+                | "minimum"
                 // Reads the relation and, on a miss, WRITES through it —
                 // so it is a terminal on both counts. Listing it here is
                 // what lets `assoc_scope_shape` see a class method whose
@@ -2532,7 +2539,7 @@ pub fn assoc_read_target(
 /// (`Current.user`, `@message.creator`, `user.account`) qualifies; a
 /// send taking arguments, a block, or a deeper chain does not — those
 /// keep their source shape rather than being duplicated into a query.
-fn owner_reads_once(owner: &Expr) -> bool {
+pub(crate) fn owner_reads_once(owner: &Expr) -> bool {
     let ExprNode::Send { recv, args, block: None, .. } = &*owner.node else { return false };
     if !args.is_empty() {
         return false;
