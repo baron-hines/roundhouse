@@ -23,7 +23,8 @@ class ActiveSupportInflectionsTest < Minitest::Test
       ["HTMLParser", false], ["foo/bar", true], ["foo/bar", false],
       ["/foo/bar", true], ["::foo", true], ["foo__bar", true],
       ["_foo", false], ["foo_1", true], ["foo-foo", true],
-      ["foo_BAR", true], ["foo/BAR", true], ["HTML_PARSER", true], ["", true]
+      ["foo_BAR", true], ["foo/BAR", true], ["HTML_PARSER", true],
+      ["foo_BAR-Baz", true], ["", true]
     ].each do |text, uppercase_first_letter|
       expected = ActiveSupport::Inflector.rails_814_camelize(text, uppercase_first_letter)
       assert_equal expected, ActiveSupport::Inflector.camelize(text, uppercase_first_letter),

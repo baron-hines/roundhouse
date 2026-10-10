@@ -118,6 +118,8 @@ module ActiveSupport
           capitalize = true
           normalize_word = true
         else
+          ascii_word_character = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
+          normalize_word = false if normalize_word && !ascii_word_character
           if i == 0 && !uppercase_first_letter
             out << c.downcase
           else

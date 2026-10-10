@@ -7,6 +7,7 @@ const ASSERTIONS: &str = r#"
 inflector = ActiveSupport::Inflector
 raise "camelize" unless inflector.camelize("foo_bar") == "FooBar"
 raise "camelize word normalization" unless inflector.camelize("foo_BAR") == "FooBar"
+raise "camelize punctuation boundary" unless inflector.camelize("foo_BAR-Baz") == "FooBar-Baz"
 raise "lower camelize" unless inflector.camelize("foo/bar_baz", false) == "foo::BarBaz"
 raise "namespace camelize" unless inflector.camelize("/foo/bar") == "::Foo::Bar"
 raise "deconstantize" unless inflector.deconstantize("Admin::UsersController") == "Admin"
