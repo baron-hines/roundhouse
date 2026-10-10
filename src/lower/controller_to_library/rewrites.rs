@@ -2152,16 +2152,17 @@ pub(super) fn rewrite_redirect_to(
     })
 }
 
-/// `render(:show, …, location: @article)` — Rails' POST-201 idiom.
+/// `render(:show, …, location: @article)` or
+/// `head :created, location: @article` — Rails' POST-201 idioms.
 /// The kwarg value is a polymorphic record reference; rewrite to
 /// `RouteHelpers.<singular>_path(@x.id)` so the runtime's
-/// `render(body, location: <string>)` sees a path string. Mirrors
-/// the `redirect_to @x` polymorphic rewrite below; runs over render
+/// response location handling sees a path string. Mirrors the
+/// `redirect_to @x` polymorphic rewrite below; runs over render/head
 /// Sends specifically (not redirect_to, which has its own pass).
-pub(super) fn rewrite_render_location_kwarg(expr: &Expr) -> Expr {
+pub(super) fn rewrite_response_location_kwarg(expr: &Expr) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, parenthesized }
-            if method.as_str() == "render" && !args.is_empty() =>
+            if (method.as_str() == "render" || method.as_str() == "head") && !args.is_empty() =>
         {
             let new_args: Vec<Expr> = args
                 .iter()

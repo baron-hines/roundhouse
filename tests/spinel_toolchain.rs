@@ -51,6 +51,8 @@ mod lambda_signatures_contract;
 mod lambda_signatures;
 #[path = "support/native_http.rs"]
 mod native_http;
+#[path = "spinel_toolchain/action_controller_head.rs"]
+mod action_controller_head;
 #[path = "spinel_toolchain/strong_params.rs"]
 mod strong_params;
 #[path = "spinel_toolchain/params_wrapper.rs"]
