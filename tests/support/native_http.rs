@@ -79,13 +79,6 @@ impl Server {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// A standalone GET for rendered-page contracts that do not need to
-    /// retain the session cookie or CSRF token.
-    pub fn get(&self, path: &str) -> Response {
-        let (status, _, body) = self.send("GET", path, &[], "");
-        Response { status, body }
-    }
-
     /// GET `path` and keep the session cookie and the page's
     /// `csrf-token` meta for the requests that follow.
     pub fn take_session(&mut self, path: &str) {
