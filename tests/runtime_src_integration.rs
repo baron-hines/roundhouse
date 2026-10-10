@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use roundhouse::analyze::ClassInfo;
 use roundhouse::dialect::MethodDef;
@@ -81,6 +82,95 @@ fn inflector_pluralize_lives_in_runtime_python() {
 fn inflector_pluralize_lives_in_runtime_rust() {
     let emitted = roundhouse::emit::rust::emit_method(&pluralize_method());
     assert_emitted_lives_in(&emitted, "runtime/rust/view_helpers.rs");
+}
+
+#[test]
+fn active_support_squish_bang_emits_for_rust() {
+    let methods = load_typed("active_support_ext");
+    let method = methods
+        .into_iter()
+        .find(|m| m.name.as_str() == "squish!")
+        .expect("active_support_ext.rb defines squish!");
+    let emitted = roundhouse::emit::rust::emit_method(&method);
+    assert!(
+        emitted.starts_with("pub fn squish_bang(text: &mut String) -> &mut String"),
+        "ActiveSupport.squish! must emit a mutating Rust function:\n{emitted}"
+    );
+
+    let scratch = std::env::temp_dir().join(format!(
+        "roundhouse-runtime-rust-squish-bang-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&scratch).expect("create generated Rust scratch directory");
+    let source = format!(
+        r#"{emitted}
+#[test]
+fn squish_bang_mutates_and_returns_the_receiver() {{
+    let mut value = "  foo\tbar \n baz  ".to_string();
+    let receiver = &value as *const String;
+    let result = squish_bang(&mut value);
+    assert_eq!(result, "foo bar baz");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(value, "foo bar baz");
+}}
+
+#[test]
+fn squish_bang_handles_unicode_and_noop_values() {{
+    let mut unicode = "\u{{00a0}}foo\u{{2003}}bar\u{{2028}}".to_string();
+    let receiver = &unicode as *const String;
+    let result = squish_bang(&mut unicode);
+    assert_eq!(result, "foo bar");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(unicode, "foo bar");
+    let mut unchanged = "already squished".to_string();
+    let receiver = &unchanged as *const String;
+    let result = squish_bang(&mut unchanged);
+    assert_eq!(result, "already squished");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(unchanged, "already squished");
+}}
+
+#[test]
+fn squish_bang_strips_rails_nul_boundaries() {{
+    let mut trailing_nul = "foo\0".to_string();
+    let receiver = &trailing_nul as *const String;
+    let result = squish_bang(&mut trailing_nul);
+    assert_eq!(result, "foo");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(trailing_nul, "foo");
+
+    let mut space_then_nul = "foo \0".to_string();
+    let receiver = &space_then_nul as *const String;
+    let result = squish_bang(&mut space_then_nul);
+    assert_eq!(result, "foo");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(space_then_nul, "foo");
+}}
+"#
+    );
+    let source_path = scratch.join("squish_bang.rs");
+    let binary_path = scratch.join("squish_bang");
+    fs::write(&source_path, source).expect("write emitted Rust test");
+    let compile = Command::new("rustc")
+        .args(["--test"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary_path)
+        .output()
+        .expect("compile emitted Rust test");
+    assert!(
+        compile.status.success(),
+        "emitted ActiveSupport.squish! did not compile:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&binary_path)
+        .output()
+        .expect("run emitted Rust test");
+    assert!(
+        run.status.success(),
+        "emitted ActiveSupport.squish! behavior failed:\n{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
 }
 
 // Phase D3 (2026-06-05) retired runtime/elixir/view_helpers.ex — the v2
@@ -884,11 +974,43 @@ fn every_runtime_method_body_concretely_typed() {
     // additions contribute 39 more, primarily from generic JSON, deep_dup,
     // session and request-environment values. Keep those intentional dynamic
     // boundaries visible in the measured combined ceiling.
-    const CEILING: usize = 373;
+    // `transaction(requires_new: true)` savepoints add 3 in
+    // `self.transaction`, MEASURED 373 -> 376 on main 9d577c24: the
+    // `requires_new` option is `untyped` (as `with_lock` forwards it), and
+    // the nested block's value is now read back after its RELEASE.
+    const CEILING: usize = 376;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
     );
+}
+
+#[test]
+fn active_support_inflector_slice_adds_no_bar_b_sites() {
+    let methods = load_typed("active_support_inflections");
+    for name in [
+        "camelize",
+        "deconstantize",
+        "foreign_key",
+        "upcase_first",
+        "downcase_first",
+    ] {
+        let method = methods
+            .iter()
+            .find(|method| {
+                method.name.as_str() == name
+                    && method
+                        .enclosing_class
+                        .as_ref()
+                        .is_some_and(|class| class.as_str() == "Inflector")
+            })
+            .unwrap_or_else(|| panic!("ActiveSupport::Inflector.{name} exists in runtime source"));
+        assert_eq!(
+            count_gradual(&method.body),
+            0,
+            "ActiveSupport::Inflector.{name} introduces no Ty::Untyped Bar B sites",
+        );
+    }
 }
 
 #[test]
