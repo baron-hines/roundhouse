@@ -213,6 +213,7 @@ impl<'a> BodyTyper<'a> {
         recv_ty: Option<&Ty>,
         method: &Symbol,
         args: &[Expr],
+        instance_self: Option<&Ty>,
     ) -> Option<Ty> {
         if !matches!(method.as_str(), "minimum" | "maximum") {
             return None;
@@ -223,6 +224,7 @@ impl<'a> BodyTyper<'a> {
                 Ty::Class { id, .. } => id,
                 _ => return None,
             },
+            Ty::Class { id, .. } if recv.is_some_and(|r| matches!(&*r.node, ExprNode::Const { .. })) => id,
             _ => return None,
         };
         let [column_arg] = args else { return None };
@@ -241,7 +243,7 @@ impl<'a> BodyTyper<'a> {
         // A local variable or named scope may already represent a grouped
         // relation. Without retained grouping provenance, do not guess that
         // it is scalar; the catalog deliberately supplies no fallback type.
-        if !recv.is_some_and(|expr| Self::direct_relation_chain(expr, model)) {
+        if !recv.is_some_and(|expr| self.direct_relation_chain(expr, model, instance_self)) {
             return None;
         }
         Some(union_of(value_ty, Ty::Nil))
@@ -255,8 +257,25 @@ impl<'a> BodyTyper<'a> {
         self.classes().get(model)?.attributes.fields.get(col).cloned()
     }
 
-    fn direct_relation_chain(expr: &Expr, model: &ClassId) -> bool {
+    fn direct_relation_chain(&self, expr: &Expr, model: &ClassId, instance_self: Option<&Ty>) -> bool {
         match &*expr.node {
+            // An association reader carries no grouping, unlike a named scope or a local.
+            ExprNode::Send { recv, method, args, block: None, .. }
+                if args.is_empty()
+                    && recv.as_ref().is_none_or(|owner| {
+                        matches!(&*owner.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
+                            || crate::lower::scope_chain::owner_reads_once(owner)
+                    })
+                    && self.has_many_reader(
+                        match recv {
+                            Some(owner) => owner.ty.as_ref(),
+                            None => instance_self,
+                        },
+                        method,
+                    ) =>
+            {
+                true
+            }
             ExprNode::Const { path } => {
                 path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::")
                     == model.0.as_str()
@@ -271,7 +290,44 @@ impl<'a> BodyTyper<'a> {
                     )
                     .is_some_and(|entry| entry.chain == crate::catalog::ChainKind::Builder) =>
             {
-                Self::direct_relation_chain(recv, model)
+                self.direct_relation_chain(recv, model, instance_self)
+            }
+            _ => false,
+        }
+    }
+
+    /// `owner.<assoc>` where `<assoc>` is a has_many of the owner's model
+    /// that `lower::scope_chain` can seed as a relation (`direct_has_many`;
+    /// the owner's shape is checked by the caller, as `assoc_read_target`
+    /// and `owner_reads_once` admit it).
+    fn has_many_reader(&self, owner_ty: Option<&Ty>, assoc: &Symbol) -> bool {
+        let declares = |id: &ClassId| -> bool {
+            let mut current = Some(id);
+            for _ in 0..32 {
+                let Some(cid) = current else { return false };
+                let Some(cls) = self.classes().get(cid) else { return false };
+                if cls.direct_has_many.contains(assoc) {
+                    return true;
+                }
+                current = cls.parent.as_ref();
+            }
+            false
+        };
+        match owner_ty {
+            Some(Ty::Class { id, .. }) => declares(id),
+            // A nil owner fails on the reader itself, which is that call's diagnostic, not this one's.
+            Some(Ty::Union { variants }) => {
+                let owners: Vec<&ClassId> = variants
+                    .iter()
+                    .filter_map(|v| match v {
+                        Ty::Class { id, .. } => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                !owners.is_empty()
+                    && owners.len() + 1 >= variants.len()
+                    && variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
+                    && owners.iter().all(|id| declares(id))
             }
             _ => false,
         }
@@ -289,6 +345,12 @@ impl<'a> BodyTyper<'a> {
         class_object_receiver: bool,
         block: &Expr,
     ) -> Ctx {
+        if crate::lower::range_enumerable::THROUGH_ARRAY.contains(&method.as_str())
+            && crate::lower::range_enumerable::integer_range(recv_ty)
+        {
+            let array = Ty::Array { elem: Box::new(Ty::Int) };
+            return self.block_ctx_for(outer, Some(&array), method, args, class_object_receiver, block);
+        }
         let mut new_ctx = outer.clone();
         // Required parameters come first, so the extra ones (optional,
         // keyword, keyword rest) leave their positions alone; the Lambda
@@ -1241,6 +1303,13 @@ impl<'a> BodyTyper<'a> {
                     if let Some(ty) = range_method(method, args.first()) {
                         return ty;
                     }
+                    // Not answered off the Range: `lower::range_enumerable` reads these through `to_a`.
+                    if crate::lower::range_enumerable::THROUGH_ARRAY.contains(&method.as_str())
+                        && crate::lower::range_enumerable::integer_range(recv_ty)
+                    {
+                        let array = Ty::Array { elem: Box::new(Ty::Int) };
+                        return self.dispatch(Some(&array), method, block_ret, call_args);
+                    }
                 }
                 // `ActiveSupport.parse_db_time(<stored text>)` — the
                 // synthesized temporal-column reader intrinsic (see
@@ -1364,6 +1433,9 @@ impl<'a> BodyTyper<'a> {
                 // The compiler interprets every one of these in
                 // `lower::jbuilder_to_library`; the analyzer's answer is
                 // the value Jbuilder itself returns.
+                if id.0.as_str() == "BigDecimal" {
+                    return bigdecimal_method(method, call_args).unwrap_or_else(unknown);
+                }
                 if id.0.as_str() == "Jbuilder" {
                     return match method.as_str() {
                         "array!" => Ty::Array { elem: Box::new(Ty::Untyped) },
@@ -2025,6 +2097,13 @@ impl<'a> BodyTyper<'a> {
                 if method.as_str() == "in_time_zone" && args.len() > 1 =>
             {
                 unknown()
+            }
+            // Not the operand's own type: Integer and Float coerce a BigDecimal operand into a BigDecimal result.
+            Some(Ty::Int | Ty::Float)
+                if matches!(method.as_str(), "+" | "-" | "*" | "/")
+                    && matches!(args.first().and_then(|a| a.ty.as_ref()), Some(t) if is_bigdecimal(t)) =>
+            {
+                bigdecimal()
             }
             Some(Ty::Int) => int_method(method),
             Some(Ty::Float) => float_method(method),
@@ -3338,9 +3417,48 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
     }
 }
 
+pub(super) fn bigdecimal() -> Ty {
+    Ty::Class { id: crate::ident::ClassId(Symbol::from("BigDecimal")), args: vec![] }
+}
+
+pub(super) fn is_bigdecimal(ty: &Ty) -> bool {
+    matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "BigDecimal")
+}
+
+/// The BigDecimal surface both the CRuby library and spinel's
+/// `packages/bigdecimal` answer, plus the `floor`/`ceil` forms
+/// `lower::bigdecimal` rewrites onto `round`.
+fn bigdecimal_method(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
+    let numeric = |a: &crate::expr::Expr| match a.ty.as_ref() {
+        None | Some(Ty::Int | Ty::Float | Ty::Var { .. }) => true,
+        Some(t) => is_bigdecimal(t),
+    };
+    let int = |a: &crate::expr::Expr| matches!(a.ty.as_ref(), None | Some(Ty::Int | Ty::Var { .. }));
+    Some(match (method.as_str(), args) {
+        ("+" | "-" | "*" | "/", [a]) if numeric(a) => bigdecimal(),
+        ("<" | ">" | "<=" | ">=" | "==" | "!=", [a]) if numeric(a) => Ty::Bool,
+        ("<=>", [a]) if numeric(a) => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        ("-@" | "+@" | "abs" | "to_d", []) => bigdecimal(),
+        ("zero?" | "negative?" | "positive?", []) => Ty::Bool,
+        ("to_f", []) => Ty::Float,
+        ("to_i" | "to_int", []) => Ty::Int,
+        ("to_s" | "inspect", []) => Ty::Str,
+        ("round" | "floor" | "ceil", []) => Ty::Int,
+        ("floor" | "ceil", [n]) if int(n) => bigdecimal(),
+        // Not a BigDecimal for every digit count: `round(n)` answers an Integer below one digit, in CRuby and spinel alike.
+        ("round", [n]) => match &*n.node {
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Int { value } } if *value >= 1 => bigdecimal(),
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Int { .. } } => Ty::Int,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 pub(super) fn float_method(method: &Symbol) -> Ty {
     match method.as_str() {
         "to_s" | "inspect" => Ty::Str,
+        "to_d" => bigdecimal(),
         // No-arg rounding returns Int (the common shape); with a digits
         // arg it returns Float, but we don't see args here — Int is the
         // safer default for the bare call.

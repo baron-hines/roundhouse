@@ -246,6 +246,9 @@ pub struct ClassInfo {
     /// which is the same two hops the emit-time flattening reads
     /// (`room.memberships.grant_to(u)` → `room.memberships_grant_to(u)`).
     pub assoc_extensions: HashMap<(Symbol, Symbol), Ty>,
+    /// has_many readers without `through:` — the ones `lower::scope_chain`
+    /// roots onto a relation, so a relation terminal on them runs as SQL.
+    pub direct_has_many: std::collections::HashSet<Symbol>,
     /// Modules mixed in via `include` (e.g. a controller's
     /// `include IntervalHelper`). A mixed-in module's instance methods
     /// become instance methods of the includer, so dispatch consults
@@ -742,11 +745,20 @@ impl<'a> BodyTyper<'a> {
                         if !keep_bare_splice {
                             qualify_resolved_path(path, name);
                         }
-                        self.typed_constants
+                        let value = self.typed_constants
                             .and_then(|values| values.get(declaration))
                             .cloned()
-                            .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
-                            .unwrap_or_else(unknown)
+                            .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
+                        let id: crate::ident::ClassId = (**name).clone();
+                        match value {
+                            Some(ty) => ty,
+                            // Not left unknown: ingest turned `Result = Struct.new(…)` into the class it defines.
+                            None if self.classes().get(&id).is_some_and(|c| c.app_declared) => {
+                                expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
+                                Ty::Class { id, args: vec![] }
+                            }
+                            None => unknown(),
+                        }
                     }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
@@ -1514,6 +1526,7 @@ impl<'a> BodyTyper<'a> {
                     recv_ty.as_ref(),
                     method,
                     args,
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
                 ) {
                     return t;
                 }
@@ -1576,6 +1589,14 @@ impl<'a> BodyTyper<'a> {
                 // have already dispatched above and must win.
                 // RBS declares it `(untyped) -> Array[untyped]`; the
                 // argument says more.
+                // Not a Float argument: CRuby's `BigDecimal(Float)` needs a precision and spinel's package has none.
+                if recv.is_none() && method.as_str() == "BigDecimal" && args.len() == 1 && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(args[0].ty.as_ref(), Some(Ty::Str | Ty::Int))
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                {
+                    return send::bigdecimal();
+                }
                 if recv.is_none() && method.as_str() == "Array" && args.len() == 1
                     && block.is_none()
                     && (matches!(dispatched, Ty::Var { .. })

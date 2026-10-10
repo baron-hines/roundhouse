@@ -84,11 +84,25 @@ end
 # label threaded through an app helper's parameter into `link_to`, or
 # a model method that ends in `.html_safe` (lobsters' Hat#to_html_label).
 class SafeString < String
+  def initialize(value)
+    super(value)
+    @html_safe = true
+  end
+
   def html_safe?
-    true
+    @html_safe
   end
 
   def html_safe
+    @html_safe = true
+    self
+  end
+
+  # Rails' SafeBuffer marks itself unsafe when squish! invokes gsub! or
+  # strip!, even when neither call changes the contents.
+  def squish!
+    super
+    @html_safe = false
     self
   end
 
@@ -103,6 +117,13 @@ class String
   # AS specializes String#blank? to treat whitespace-only as blank.
   def blank?
     empty? || match?(/\A[[:space:]]*\z/)
+  end
+
+  # Rails' destructive form returns the receiver even when unchanged.
+  def squish!
+    gsub!(/[[:space:]]+/, " ")
+    strip!
+    self
   end
 
   # `html_safe` promotes to the marked type; plain strings answer
