@@ -742,11 +742,20 @@ impl<'a> BodyTyper<'a> {
                         if !keep_bare_splice {
                             qualify_resolved_path(path, name);
                         }
-                        self.typed_constants
+                        let value = self.typed_constants
                             .and_then(|values| values.get(declaration))
                             .cloned()
-                            .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
-                            .unwrap_or_else(unknown)
+                            .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
+                        let id: crate::ident::ClassId = (**name).clone();
+                        match value {
+                            Some(ty) => ty,
+                            // Not left unknown: ingest turned `Result = Struct.new(…)` into the class it defines.
+                            None if self.classes().get(&id).is_some_and(|c| c.app_declared) => {
+                                expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
+                                Ty::Class { id, args: vec![] }
+                            }
+                            None => unknown(),
+                        }
                     }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
