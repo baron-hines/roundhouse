@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
-use ruby_prism::parse;
+use ruby_prism::{parse, Node};
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, Param};
 use crate::effect::EffectSet;
@@ -68,9 +68,11 @@ pub fn ingest_library_classes(
         if let Some(base) = struct_base {
             out.push(base);
         }
-        let structs = struct_constant_classes(&lc.name, class.body(), file)?;
+        let owner = lc.name.clone();
+        let structs = struct_constant_classes(&owner, class.body(), file)?;
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         out.push(lc);
+        out.extend(data_block_classes(class.body(), &owner, file)?);
         // Not before the owner: the struct is named under it, so the owner has to exist first.
         out.extend(structs.into_iter().map(|(_, s)| s));
     }
@@ -85,9 +87,11 @@ pub fn ingest_library_classes(
             continue;
         }
         let mut lc = library_class_from_module_node_with_scope(&module, &scope, file)?;
-        let structs = struct_constant_classes(&lc.name, module.body(), file)?;
+        let owner = lc.name.clone();
+        let structs = struct_constant_classes(&owner, module.body(), file)?;
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         out.push(lc);
+        out.extend(data_block_classes(module.body(), &owner, file)?);
         out.extend(structs.into_iter().map(|(_, s)| s));
     }
     // Constants written at FILE level, outside any class — lobsters'
@@ -110,6 +114,83 @@ pub fn ingest_library_classes(
             file_constants.extend(std::mem::take(&mut first.constants));
             first.constants = file_constants;
         }
+    }
+    Ok(out)
+}
+
+/// The block of `NAME = Data.define(:a, :b) do def … end end`, when that
+/// is what `value` is: `Data` (or `::Data`) receiving `define` with
+/// Symbol members only, a parameterless block, and a body containing
+/// only method definitions and bare visibility markers. Any other block
+/// stays with the constant's own ingest, where a `def` is not an expression.
+pub(super) fn data_define_block<'pr>(value: &Node<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
+    let call = value.as_call_node()?;
+    if constant_id_str(&call.name()) != "define" {
+        return None;
+    }
+    if constant_path_of(&call.receiver()?)?.iter().filter(|s| !s.is_empty()).ne(["Data"].iter().copied()) {
+        return None;
+    }
+    if call
+        .arguments()
+        .is_some_and(|args| args.arguments().iter().any(|arg| arg.as_symbol_node().is_none()))
+    {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let body = block.body()?;
+    body.as_statements_node()?;
+    flatten_statements(body)
+        .iter()
+        .all(|stmt| {
+            stmt.as_def_node().is_some()
+                || stmt.as_call_node().is_some_and(|call| {
+                    matches!(constant_id_str(&call.name()), "public" | "protected" | "private")
+                        && call.receiver().is_none()
+                        && call.arguments().is_none()
+                        && call.block().is_none()
+                })
+        })
+        .then_some(block)
+}
+
+/// `ContentKey = Data.define(:digest) do def cache_key = digest end` —
+/// the block is `class_eval`ed on the new class, so its `def`s are that
+/// class's methods, exactly as a later `class ContentKey; def …; end`
+/// reopen would define them. Each such constant becomes a library class
+/// of its own, `Owner::ContentKey`, carrying those methods; the constant
+/// keeps the block-less factory (see `walk_decl_body`), and the Ruby
+/// emitter renders the methods back into the block.
+fn data_block_classes(
+    body: Option<Node<'_>>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<Vec<LibraryClass>> {
+    let mut out = Vec::new();
+    let Some(body) = body else { return Ok(out) };
+    for stmt in flatten_statements(body) {
+        let Some(cw) = stmt.as_constant_write_node() else { continue };
+        let Some(block) = data_define_block(&cw.value()) else { continue };
+        let name = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), constant_id_str(&cw.name()))));
+        let DeclBody { includes, methods, constants, unknown_calls, class_initializers, class_attributes: _ } =
+            walk_decl_body(block.body(), &name, file, DeclBodyMode::Instance)?;
+        debug_assert!(includes.is_empty() && constants.is_empty() && unknown_calls.is_empty());
+        out.push(LibraryClass {
+            name,
+            is_module: false,
+            parent: None,
+            parent_span: Span::synthetic(),
+            includes,
+            methods,
+            nullable_columns: Vec::new(),
+            origin: None,
+            constants,
+            unknown_calls,
+            class_ivar_initializers: class_initializers,
+        });
     }
     Ok(out)
 }
@@ -1716,7 +1797,14 @@ fn walk_decl_body_with_visibility<'pr>(
                 continue;
             }
             let name = Symbol::from(constant_id_str(&cw.name()));
-            let value = ingest_expr(&cw.value(), file)?;
+            let mut value = ingest_expr(&cw.value(), file)?;
+            // The block's `def`s are `data_block_classes`' class; the
+            // factory the constant holds is the block-less call.
+            if data_define_block(&cw.value()).is_some() {
+                if let ExprNode::Send { block, .. } = &mut *value.node {
+                    *block = None;
+                }
+            }
             out.constants.push((name, value));
             continue;
         }

@@ -4657,7 +4657,7 @@ impl Analyzer {
         for model in &app.models {
             for method in model.methods() {
                 let bp = method.block_param.as_ref().map(|p| &p.name);
-                if self.returns_block_value(&model.name, &method.body, bp) {
+                if self.returns_block_value(&model.name, &method.name, &method.body, bp) {
                     found.push((model.name.clone(), method.name.clone()));
                 }
             }
@@ -4665,20 +4665,28 @@ impl Analyzer {
         for lc in &app.library_classes {
             for method in &lc.methods {
                 let bp = method.block_param.as_ref().map(|p| &p.name);
-                if self.returns_block_value(&lc.name, &method.body, bp) {
+                if self.returns_block_value(&lc.name, &method.name, &method.body, bp) {
                     found.push((lc.name.clone(), method.name.clone()));
                 }
             }
         }
         for controller in &app.controllers {
             for action in controller.actions() {
-                if self.returns_block_value(&controller.name, &action.body, action.block_param.as_ref()) {
+                if self.returns_block_value(
+                    &controller.name,
+                    &action.name,
+                    &action.body,
+                    action.block_param.as_ref(),
+                ) {
                     found.push((controller.name.clone(), action.name.clone()));
                 }
             }
         }
         for info in self.classes.values_mut() {
             info.block_value_methods.clear();
+        }
+        for (class, method) in registry::stdlib::BUILTIN_BLOCK_VALUE_METHODS {
+            found.push((ClassId(Symbol::from(*class)), Symbol::from(*method)));
         }
         for (class_id, method) in found {
             self.classes.entry(class_id).or_default().block_value_methods.insert(method);
@@ -5105,11 +5113,51 @@ impl Analyzer {
     /// value (see `ClassInfo::block_value_methods`). A raising arm
     /// returns nothing and does not count against it; a `return` off
     /// the tail must pass the same test, or the walk declines.
-    fn returns_block_value(&self, owner: &ClassId, body: &Expr, block_param: Option<&Symbol>) -> bool {
+    fn returns_block_value(
+        &self,
+        owner: &ClassId,
+        method: &Symbol,
+        body: &Expr,
+        block_param: Option<&Symbol>,
+    ) -> bool {
         let leaves = return_leaves(body);
+        // Only campfire's explicit `RecordCache#fetch` contract answers
+        // its block's value, a local that only ever holds it, or — on a
+        // hit — the records a snapshot of that value rebuilds:
+        // `….map { |name, attrs| name.constantize.instantiate(attrs) }`
+        // (analysis sees the source; `lower::record_snapshot` later makes
+        // it `ActiveRecord::Base.instantiate_named`, accepted too). The rebuild is typed as the
+        // block's value on the claim that the snapshot under a key was
+        // taken from what this block returned for that key: the same
+        // records, in order, of the same classes. That is the contract the
+        // cache relies on in Rails too; a snapshot of anything else would
+        // be the app's bug under either runtime. This is a domain contract,
+        // not a fact recoverable from arbitrary serialized data: callers
+        // must not reuse a key for a different result shape. The
+        // cache-through contract test exercises miss/hit reconstruction,
+        // ordering, and distinct Article/Comment keys.
+        let yield_locals = yield_only_locals(body);
+        let record_cache_fetch = method.as_str() == "fetch"
+            && matches!(owner.0.as_str(), "RecordCache" | "Campfire::RecordCache");
+        let rebuild = |leaf: &Expr| {
+            record_cache_fetch &&
+            matches!(&*leaf.node, ExprNode::Send { method, block: Some(b), .. }
+                if method.as_str() == "map"
+                    && matches!(&*b.node, ExprNode::Lambda { body, .. }
+                        if return_leaves(body).iter().all(|l| snapshot_rebuild(l))))
+        };
+        // The rebuild is only ever the block's value AGAIN: some path must
+        // answer the block's value itself.
+        let direct = leaves.iter().any(|leaf| match &*leaf.node {
+            ExprNode::Yield { .. } => true,
+            ExprNode::Var { name, .. } => yield_locals.contains(name),
+            _ => false,
+        });
         !leaves.is_empty()
             && leaves.iter().all(|leaf| match &*leaf.node {
                 ExprNode::Yield { .. } => true,
+                ExprNode::Var { name, .. } => yield_locals.contains(name),
+                _ if direct && rebuild(leaf) => true,
                 ExprNode::Send { recv, method, block: Some(b), .. } => {
                     let forwards = matches!(
                         (&*b.node, block_param),
@@ -6418,6 +6466,10 @@ pub(crate) fn instantiate_return_kind(
             key: Box::new(Ty::Sym),
             value: Box::new(Ty::Str),
         },
+        ReturnKind::HashStrUntyped => Ty::Hash {
+            key: Box::new(Ty::Str),
+            value: Box::new(Ty::Untyped),
+        },
         ReturnKind::ArrayOfSym => Ty::Array { elem: Box::new(Ty::Sym) },
         ReturnKind::Str => Ty::Str,
         ReturnKind::ClassRef(path) => Ty::Class {
@@ -7265,6 +7317,48 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
         }
     }
     out
+}
+
+/// Whether an application-defined instance method is available on a source
+/// class through its own definition, parent chain, or included modules.
+pub(crate) fn source_instance_method(app: &App, owner: &ClassId, name: &str) -> bool {
+    fn lookup(app: &App, owner: &ClassId, name: &str, seen: &mut BTreeSet<ClassId>) -> bool {
+        if !seen.insert(owner.clone()) {
+            return false;
+        }
+        if let Some(model) = app.models.iter().find(|model| &model.name == owner) {
+            if model.methods().any(|method| {
+                method.receiver == crate::dialect::MethodReceiver::Instance
+                    && method.name.as_str() == name
+            }) {
+                return true;
+            }
+            return model
+                .parent
+                .as_ref()
+                .is_some_and(|parent| lookup(app, parent, name, seen))
+                || model_includes(model)
+                    .iter()
+                    .any(|include| lookup(app, include, name, seen));
+        }
+        app.library_classes
+            .iter()
+            .filter(|class| &class.name == owner)
+            .any(|class| {
+                class.methods.iter().any(|method| {
+                    method.receiver == crate::dialect::MethodReceiver::Instance
+                        && method.name.as_str() == name
+                }) || class
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| lookup(app, parent, name, seen))
+                    || class
+                        .includes
+                        .iter()
+                        .any(|include| lookup(app, include, name, seen))
+            })
+    }
+    lookup(app, owner, name, &mut BTreeSet::new())
 }
 
 /// `**{k: v, …}.merge(h)`, `h` a `Hash[Symbol, V]` and the literal's
@@ -8787,6 +8881,110 @@ pub fn register_stdlib_classes(
 /// through `if`/`case`/`begin`-`rescue` arms, plus the value of each
 /// `return` anywhere in the body outside a block. A raising arm returns
 /// nothing and contributes no leaf.
+/// `name.constantize.instantiate(attrs)`, or what `lower::record_snapshot`
+/// makes of it: a record rebuilt from a class NAME and raw attributes.
+fn snapshot_rebuild(e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "instantiate_named" => args.len() == 2,
+        "instantiate" => args.len() == 1
+            && matches!(&*recv.node, ExprNode::Send { method, args, .. }
+                if method.as_str() == "constantize" && args.is_empty()),
+        _ => false,
+    }
+}
+
+/// Locals every assignment of which in `body` is a bare `yield` — a
+/// method's own copy of its block's value (`records = yield; …; records`).
+fn yield_only_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
+    fn walk(
+        e: &Expr,
+        yields: &mut std::collections::HashSet<Symbol>,
+        other: &mut std::collections::HashSet<Symbol>,
+        shadowed: &std::collections::HashSet<Symbol>,
+    ) {
+        match &*e.node {
+            ExprNode::Lambda { extra_params, params, rest_param, body, .. } => {
+                let mut lambda_locals = shadowed.clone();
+                lambda_locals.extend(params.iter().cloned());
+                lambda_locals.extend(extra_params.iter().map(|param| param.name.clone()));
+                if let Some(param) = rest_param {
+                    lambda_locals.insert(param.clone());
+                }
+                walk(body, yields, other, &lambda_locals);
+            }
+            ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
+                if !shadowed.contains(name) {
+                    if matches!(&*value.node, ExprNode::Yield { args, .. } if args.is_empty()) {
+                        yields.insert(name.clone());
+                    } else {
+                        other.insert(name.clone());
+                    }
+                }
+                walk(value, yields, other, shadowed);
+            }
+            ExprNode::MultiAssign { targets, value } => {
+                for t in targets {
+                    if let crate::expr::LValue::Var { name, .. } = t {
+                        if !shadowed.contains(name) {
+                            other.insert(name.clone());
+                        }
+                    }
+                }
+                walk(value, yields, other, shadowed);
+            }
+            _ => e.node.for_each_child(&mut |c| walk(c, yields, other, shadowed)),
+        }
+    }
+    let mut yields = std::collections::HashSet::new();
+    let mut other = std::collections::HashSet::new();
+    walk(body, &mut yields, &mut other, &std::collections::HashSet::new());
+    yields.retain(|n| !other.contains(n));
+    yields
+}
+
+#[cfg(test)]
+mod yield_only_local_tests {
+    use super::*;
+    use crate::span::Span;
+
+    #[test]
+    fn captured_writes_in_lambdas_disqualify_yield_only_locals() {
+        let name = Symbol::from("records");
+        let assign = |value| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() },
+                    value,
+                },
+            )
+        };
+        let yield_value = Expr::new(Span::synthetic(), ExprNode::Yield { args: vec![] });
+        let replacement = Expr::new(
+            Span::synthetic(),
+            ExprNode::Array { elements: vec![], style: Default::default() },
+        );
+        let lambda = Expr::new(
+            Span::synthetic(),
+            ExprNode::Lambda {
+                extra_params: vec![],
+                rest_param: None,
+                params: vec![],
+                block_param: None,
+                body: assign(replacement),
+                block_style: Default::default(),
+            },
+        );
+        let body = Expr::new(
+            Span::synthetic(),
+            ExprNode::Seq { exprs: vec![assign(yield_value), lambda] },
+        );
+
+        assert!(!yield_only_locals(&body).contains(&name));
+    }
+}
+
 pub(crate) fn return_leaves(body: &Expr) -> Vec<&Expr> {
     fn tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match &*e.node {
