@@ -844,6 +844,10 @@ fn every_runtime_method_body_concretely_typed() {
     // `Relation#in_batches` and in the class-side fallback in
     // connection.rb, whose value is the block's — gradual, as
     // `find_in_batches`' `yield records` already is.
+    // `Relation#minimum` / `#maximum` add 2, MEASURED: the two indexed
+    // reads of the SQL aggregate's column-dependent scalar. The adapter
+    // contract intentionally keeps raw SQL result values `untyped`;
+    // coercing them would break Rails' column-dependent return type.
     // MEASURED 2026-10-09 (against origin/main a28539b6): `haml_class`
     // (the HAML shortcut-class + hash `class:` merge) adds 2 on top of
     // the above — its `value` param is `untyped` (a scalar the HAML
@@ -863,10 +867,23 @@ fn every_runtime_method_body_concretely_typed() {
     // summed from either side's base, since unrelated main changes
     // shift base.rb/connection.rb's own counts independently
     // (spinel-txn-pin #693) — 321, MEASURED after rebasing past #705/#709.
+    // `Relation#minimum` / `#maximum` add 2, MEASURED: the two indexed
+    // reads of the SQL aggregate's column-dependent scalar. The adapter
+    // contract intentionally keeps raw SQL result values `untyped`;
+    // coercing them would break Rails' column-dependent return type. The
+    // merged tree measures 323 after the transaction-runtime change above.
+    // Schema-driven extrema deserialization adds 9 measured gradual sites
+    // in Relation: aggregate values and group keys cross the raw SQL boundary
+    // as column-dependent Boolean/Date/Time values. The concrete method-body
+    // gate still requires every call and body to resolve.
+    // Decimal extrema normalization adds 2 measured gradual sites: the raw
+    // adapter value is column-dependent, and its `to_f` conversion is the
+    // schema-selected Ruby boundary that matches the model's Float contract.
+    // The emitted regression covers scalar and grouped decimal extrema.
     // ActionText::Fragment's revision-aware source-range ledger, rescan
-    // mapping, ordered edits, and batched removal add 50 gradual sites on this
-    // tree; those paths remain concretely typed for Bar A.
-    const CEILING: usize = 371;
+    // mapping, ordered edits, and batched removal add 45 gradual sites to the
+    // merged main baseline of 334; those paths remain concretely typed for Bar A.
+    const CEILING: usize = 379;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

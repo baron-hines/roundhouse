@@ -6231,6 +6231,7 @@ fn emit_library_class_decl_inner(
     // class-definition time — unlike body const-refs (request-time), so we
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
+    let mut nested_include_requires = BTreeSet::new();
     for inc in &lc.includes {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
@@ -6240,7 +6241,15 @@ fn emit_library_class_decl_inner(
         let path: Vec<String> = inc.0.as_str().split("::").map(str::to_string).collect();
         if let Some(anchor) = require_path_for_body_const(&path, app, name) {
             if anchor != self_anchor {
-                requires.push(relpath(&out_dir, &anchor));
+                let nested_prefix = format!("{self_anchor}/");
+                if anchor.starts_with(&nested_prefix) {
+                    // Nested constants such as `Account::Joinable` reopen
+                    // their containing class. Load them after that class is
+                    // declared, otherwise the nested file runs too early.
+                    nested_include_requires.insert(relpath(&out_dir, &anchor));
+                } else {
+                    requires.push(relpath(&out_dir, &anchor));
+                }
             }
         }
     }
@@ -6492,6 +6501,13 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s);
+
+    for require in &nested_include_requires {
+        writeln!(s, "{body_pad}require_relative {require:?}").unwrap();
+    }
+    if !nested_include_requires.is_empty() {
+        writeln!(s).unwrap();
+    }
 
     for inc in &lc.includes {
         writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
