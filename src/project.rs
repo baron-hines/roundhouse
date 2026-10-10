@@ -5216,6 +5216,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         // Listed before active_support_ext so require_relative resolves.
         "active_support_inflections",
         "active_support_ext",
+        "hash_deep_merge",
         "security_utils",
         "params",
         "action_text",

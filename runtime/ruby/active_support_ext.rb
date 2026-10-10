@@ -10,6 +10,7 @@
 # so the scaffold ActiveSupport module is one constant with both
 # surfaces.
 require_relative "active_support_inflections"
+require_relative "hash_deep_merge"
 #
 # `src/lower/blank.rs` grounds `blank?`/`present?`/`presence` by the
 # receiver's static type and every target compiles the result. What it
