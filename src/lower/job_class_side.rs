@@ -58,6 +58,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     }
     let workers = sidekiq_workers(app);
     let wrapped = workers_with_positional_perform(app, &workers);
+    let delay_folds = without_delayed_enqueue_overrides(app, &wrapped);
     if jobs.is_empty() && workers.is_empty() {
         return diags;
     }
@@ -74,7 +75,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     let mut delayed: Vec<crate::span::Span> = Vec::new();
     super::for_each_hook_body(app, &mut |body| {
         fold_set_chains(body, &jobs, &mut unfolded, &mut folded);
-        fold_delayed_enqueues(body, &wrapped, &mut delayed);
+        fold_delayed_enqueues(body, &delay_folds, &mut delayed);
     });
     for span in delayed {
         diags.push(crate::lower::residue_diagnostic(
@@ -533,7 +534,8 @@ fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTr
                 m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform"
             });
             if let Some(m) = perform {
-                if m.block_param.is_none() && !m.params.iter().any(|p| p.forwarding || p.keyword) {
+                // A rest parameter is excluded because the wrapper forwards it as one Array argument, not splatted.
+                if m.block_param.is_none() && !m.params.iter().any(|p| p.forwarding || p.keyword || p.rest) {
                     out.insert(name.clone());
                 }
                 break;
@@ -542,6 +544,29 @@ fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTr
         }
     }
     out
+}
+
+fn without_delayed_enqueue_overrides(app: &App, wrapped: &BTreeSet<String>) -> BTreeSet<String> {
+    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+    wrapped
+        .iter()
+        .filter(|name| {
+            let mut cur = by_name.get(name.as_str()).copied();
+            for _ in 0..32 {
+                let Some(c) = cur else { break };
+                if c.methods.iter().any(|m| {
+                    m.receiver == crate::dialect::MethodReceiver::Class
+                        && matches!(m.name.as_str(), "perform_in" | "perform_at")
+                }) {
+                    return false;
+                }
+                cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
+            }
+            true
+        })
+        .cloned()
+        .collect()
 }
 
 /// Fold `Worker.perform_in(delay, args)` / `perform_at(time, args)` to

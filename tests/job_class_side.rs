@@ -252,3 +252,38 @@ fn a_sidekiq_worker_without_a_positional_perform_keeps_its_include_and_errors() 
     let body = format!("{:?}", app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Caller").unwrap().methods);
     assert!(body.contains("perform_in"), "perform_in is not folded for an unwrapped worker: {body}");
 }
+
+#[test]
+fn a_sidekiq_worker_with_a_rest_perform_is_not_wrapped() {
+    let mut app = app_from(vec![(
+        "app/workers/rest_worker.rb",
+        "class RestWorker\n  include Sidekiq::Job\n\n  def perform(first, *rest)\n    first\n  end\nend\n",
+    )]);
+    let diags = roundhouse::lower::job_class_side::apply_job_class_side(&mut app);
+    let worker = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "RestWorker").unwrap();
+    assert!(
+        !worker.methods.iter().any(|m| m.name.as_str() == "perform_async"),
+        "a wrapper would pass the rest as one Array"
+    );
+    assert!(
+        diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error),
+        "an unwrapped worker is an error: {diags:?}"
+    );
+}
+
+#[test]
+fn a_sidekiq_workers_own_perform_in_is_not_folded() {
+    let mut app = app_from(vec![
+        (
+            "app/workers/timed_worker.rb",
+            "class TimedWorker\n  include Sidekiq::Job\n\n  def self.perform_in(delay, title)\n    perform_async(title)\n  end\n\n  def perform(title)\n    title\n  end\nend\n",
+        ),
+        (
+            "app/models/caller.rb",
+            "class Caller\n  def self.go\n    TimedWorker.perform_in(5, \"x\")\n  end\nend\n",
+        ),
+    ]);
+    let _ = roundhouse::lower::job_class_side::apply_job_class_side(&mut app);
+    let body = format!("{:?}", app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Caller").unwrap().methods);
+    assert!(body.contains("perform_in"), "the worker's own perform_in is called: {body}");
+}
