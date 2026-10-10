@@ -1624,7 +1624,8 @@ jobs:
       # The spinel emit refuses `(...)` into super, and spinel's
       # `packages/net` has neither method — not yet, not a boundary
       # (docs/pipeline/runtime.md, "Pooled web push connections do not
-      # track their stage on spinel"). Lower it back to 0 when both land.
+      # track their stage on spinel"). Lower it back to 0 when both land,
+      # with campfire-archive-build's CAMPFIRE_CEILING_ERRORS.
       - name: Enforce the strict-emit ceiling
         env:
           CEILING_ERRORS: 2
@@ -2980,6 +2981,10 @@ jobs:
           mkdir -p /tmp/campfire
           tar -xzf /tmp/campfire.tar.gz -C /tmp/campfire --strip-components=1
       - name: Build campfire/spinel.tgz + campfire/docker.tgz
+        env:
+          # The same ledgered gap as campfire-conformance's CEILING_ERRORS
+          # (WebPush Stages on spinel); keep the two equal.
+          CAMPFIRE_CEILING_ERRORS: 2
         run: scripts/build-campfire-archive --out _site /tmp/campfire
       - name: Record archive producer evidence
         if: always()
