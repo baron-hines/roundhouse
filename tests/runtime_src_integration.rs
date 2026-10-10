@@ -876,7 +876,11 @@ fn every_runtime_method_body_concretely_typed() {
     // in Relation: aggregate values and group keys cross the raw SQL boundary
     // as column-dependent Boolean/Date/Time values. The concrete method-body
     // gate still requires every call and body to resolve.
-    const CEILING: usize = 332;
+    // Decimal extrema normalization adds 2 measured gradual sites: the raw
+    // adapter value is column-dependent, and its `to_f` conversion is the
+    // schema-selected Ruby boundary that matches the model's Float contract.
+    // The emitted regression covers scalar and grouped decimal extrema.
+    const CEILING: usize = 334;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
