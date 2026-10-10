@@ -57,6 +57,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         }
     }
     let workers = sidekiq_workers(app);
+    let wrapped = workers_with_positional_perform(app, &workers);
     if jobs.is_empty() && workers.is_empty() {
         return diags;
     }
@@ -73,7 +74,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     let mut delayed: Vec<crate::span::Span> = Vec::new();
     super::for_each_hook_body(app, &mut |body| {
         fold_set_chains(body, &jobs, &mut unfolded, &mut folded);
-        fold_delayed_enqueues(body, &workers, &mut delayed);
+        fold_delayed_enqueues(body, &wrapped, &mut delayed);
     });
     for span in delayed {
         diags.push(crate::lower::residue_diagnostic(
@@ -101,6 +102,17 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             continue;
         }
         if is_worker {
+            // The include and options stay on a worker no wrapper is generated for, so it reads as the unsupported class it is.
+            if !wrapped.contains(lc.name.0.as_str()) {
+                let span = lc
+                    .methods
+                    .iter()
+                    .find(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform")
+                    .map_or(lc.parent_span, |m| m.name_span);
+                diags.push(Diagnostic::unsupported(span, None, "Sidekiq worker without a positional perform",
+                    "the inline perform_async wrapper forwards positional arguments only"));
+                continue;
+            }
             lc.includes.retain(|inc| !SIDEKIQ_MODULES.contains(&inc.0.as_str()));
             let before = lc.unknown_calls.len();
             lc.unknown_calls.retain(|call| {
@@ -501,6 +513,29 @@ fn sidekiq_workers(app: &App) -> BTreeSet<String> {
             let Some(c) = cur else { break };
             if c.includes.iter().any(|inc| SIDEKIQ_MODULES.contains(&inc.0.as_str())) {
                 out.insert(lc.name.0.as_str().to_string());
+                break;
+            }
+            cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
+        }
+    }
+    out
+}
+
+fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<String> {
+    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+    let mut out = BTreeSet::new();
+    for name in workers {
+        let mut cur = by_name.get(name.as_str()).copied();
+        for _ in 0..32 {
+            let Some(c) = cur else { break };
+            let perform = c.methods.iter().find(|m| {
+                m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform"
+            });
+            if let Some(m) = perform {
+                if m.block_param.is_none() && !m.params.iter().any(|p| p.forwarding || p.keyword) {
+                    out.insert(name.clone());
+                }
                 break;
             }
             cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
