@@ -261,6 +261,85 @@ puts "has_many to_sql passed"
     assert!(run.stdout.contains("has_many to_sql passed"));
 }
 
+/// `maximum` / `minimum` on a model class and on a has_many reader (of a
+/// possibly-nil owner too) run as SQL extrema of the column's type, nil
+/// over no rows: the reader alone answers an Array, which has neither.
+fn extrema_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().edit(
+        "app/models/article.rb",
+        "  validates :title, presence: true\n",
+        "  validates :title, presence: true
+
+  def self.newest_id
+    Article.maximum(:id)
+  end
+
+  def last_commenter
+    comments.maximum(:commenter)
+  end
+
+  def first_comment_id
+    self.comments.minimum(:id)
+  end
+
+  def self.first_articles_last_comment_id
+    Article.first.comments.maximum(:id)
+  end
+",
+    )
+}
+
+const EXTREMA_ASSERTIONS: &str = r#"Article.delete_all
+raise "empty newest_id: #{Article.newest_id.inspect}" unless Article.newest_id.nil?
+a = Article.create!(title: "One", body: "A sufficiently long body.")
+b = Article.create!(title: "Two", body: "A sufficiently long body.")
+raise "newest_id: #{Article.newest_id.inspect}" unless Article.newest_id == b.id
+raise "empty last_commenter: #{a.last_commenter.inspect}" unless a.last_commenter.nil?
+c1 = Comment.create!(article_id: a.id, commenter: "Ann", body: "first comment")
+Comment.create!(article_id: a.id, commenter: "Zed", body: "second comment")
+Comment.create!(article_id: b.id, commenter: "Zoe", body: "other article")
+raise "last_commenter: #{a.last_commenter.inspect}" unless a.last_commenter == "Zed"
+raise "first_comment_id: #{a.first_comment_id.inspect}" unless a.first_comment_id == c1.id
+raise "first_articles_last_comment_id: #{Article.first_articles_last_comment_id.inspect}" unless Article.first_articles_last_comment_id == Comment.where(article_id: a.id).last.id
+puts "extrema passed"
+"#;
+
+#[test]
+fn extrema_run_on_a_model_and_its_has_many_reader() {
+    let run = extrema_app().run_ruby(EXTREMA_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("extrema passed"));
+}
+
+/// The has_many readers `lower::scope_chain` does not seed — one off a
+/// call with arguments, or off a local holding the reader — stay
+/// unresolved: their Array has no `maximum`.
+#[test]
+fn extrema_on_an_unseeded_reader_stay_errors() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.by_title_last_comment_id(title)
+    Article.find_by!(title: title).comments.maximum(:id)
+  end
+
+  def held_last_comment_id
+    held = comments
+    held.maximum(:id)
+  end
+",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert_eq!(
+        errors.iter().filter(|e| e.contains("`maximum`")).count(),
+        2,
+        "both unseeded readers keep their error: {errors:?}"
+    );
+}
+
 /// `in_batches` with a block hands each batch as a relation; without
 /// one, `update_all` and `touch_all` reach every row.
 #[test]
@@ -331,6 +410,57 @@ puts "public_path passed"
         );
     run.assert_passes();
     assert!(run.stdout.contains("public_path passed"));
+}
+
+/// A nested `transaction(requires_new: true)` is a savepoint: a Rollback
+/// or a rescued exception from it undoes only its own writes, and the
+/// outer transaction commits the rest; without an error it answers the
+/// block's value.
+#[test]
+fn requires_new_transactions_roll_back_to_their_savepoint() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.add(title)
+    Article.create!(title: title, body: \"A sufficiently long body.\")
+  end
+
+  def self.savepoints
+    Article.transaction do
+      add(\"outer\")
+      Article.transaction(requires_new: true) do
+        add(\"rolled-back\")
+        raise ActiveRecord::Rollback
+      end
+      begin
+        Article.transaction(requires_new: true) do
+          add(\"raised\")
+          raise ArgumentError, \"inner\"
+        end
+      rescue ArgumentError
+        nil
+      end
+      Article.transaction(requires_new: true) do
+        add(\"kept\")
+        \"kept\"
+      end
+    end
+  end
+",
+        )
+        .run_ruby(
+            r#"Article.delete_all
+raise "savepoints: #{Article.savepoints.inspect}" unless Article.savepoints == "kept"
+titles = Article.all.map(&:title).sort
+raise "titles: #{titles.inspect}" unless titles == ["kept", "outer"]
+puts "savepoints passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("savepoints passed"));
 }
 
 /// A Sidekiq worker's class-side entries run its `perform` inline, as an

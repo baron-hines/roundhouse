@@ -485,11 +485,11 @@ module ActiveRecord
     #
     # `isolation:`, `requires_new:`, and `joinable:` are Rails'
     # `DatabaseStatements#transaction` keyword options (the same three
-    # `with_lock` forwards — see base.rb). All three are accepted and
-    # ignored: no isolation levels, and no SAVEPOINT-backed `requires_new:`
-    # under this joined-by-default implementation. They exist on the
-    # signature so a call that passes them (directly, or via `with_lock`)
-    # doesn't raise `ArgumentError`.
+    # `with_lock` forwards — see base.rb). `isolation:` and `joinable:`
+    # are accepted and ignored (no isolation levels). A nested
+    # `requires_new: true` runs inside a SAVEPOINT, as Rails' does: an
+    # exception or `ActiveRecord::Rollback` from it undoes only its own
+    # writes, and the outer transaction carries on.
     #
     # The depth reset on an exception is explicit, in the `rescue`
     # itself, rather than left to the `ensure` below: Spinel
@@ -518,16 +518,38 @@ module ActiveRecord
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       depth = Db._txn_depth
       if depth > 0
+        savepoint = requires_new ? "rh_savepoint_#{depth}" : nil
+        Db.exec("SAVEPOINT #{savepoint}") unless savepoint.nil?
         Db._txn_depth = depth + 1
         begin
           result = yield
+          Db.exec("RELEASE SAVEPOINT #{savepoint}") unless savepoint.nil?
+          result
         rescue ActiveRecord::Rollback
           # Swallowed by the joined block that saw it, as in Rails: the
           # outer transaction carries on and commits.
           Db._txn_depth = depth
+          unless savepoint.nil?
+            begin
+              Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
+              Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            rescue StandardError
+              # SQLite may already have ended the whole transaction; the
+              # Rollback still answers nil, as the outer ROLLBACK's does.
+            end
+          end
           result = nil
         rescue Exception => e
           Db._txn_depth = depth
+          unless savepoint.nil?
+            begin
+              Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
+              Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            rescue StandardError
+              # SQLite may already have ended the whole transaction (see
+              # the outer ROLLBACK below); that must not hide `e`.
+            end
+          end
           raise e
         ensure
           Db._txn_depth = depth
