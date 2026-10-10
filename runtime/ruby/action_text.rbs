@@ -129,11 +129,11 @@ module ActionText
     def read_inner_html: (Node node, Integer at, Integer length, Integer revision, Integer close_length) -> String
     def write_inner_html: (Node node, Integer at, Integer length, Integer revision, Integer close_length, String markup) -> void
     def write_attribute: (Node node, Integer at, Integer length, Integer revision, Integer close_length, String key, String value) -> void
-    def apply_edit: (Integer at, Integer length, String text, bool preserves_descendants) -> Integer
     def remove_node: (Node node, Integer at, Integer length, Integer revision) -> void
-    def flush_pending_removals: () -> void
-    def current_range: (Integer at, Integer length, Integer revision) -> Array[Integer]?
-    def current_node_range: (String name, Integer original_at, Integer revision) -> Array[Integer]?
+    private def apply_edit: (Integer at, Integer length, String text, bool preserves_descendants) -> Integer
+    private def flush_pending_removals: () -> void
+    private def current_range: (Integer at, Integer length, Integer revision) -> Array[Integer]?
+    private def current_node_range: (String name, Integer original_at, Integer revision) -> Array[Integer]?
     def scan_elements: (String selector, bool bound) -> Array[ActionText::Node]
     def node_at: (String name, Hash[String, String] attrs, Integer open_at, Integer tag_end, Integer stop) -> ActionText::Node
     def replace: (String selector) { (ActionText::Node node) -> untyped } -> Fragment

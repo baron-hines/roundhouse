@@ -701,7 +701,7 @@ module ActionText
     def update
       copy = Fragment.new(to_s)
       yield copy
-      copy.flush_pending_removals
+      copy.to_s
       copy
     end
 
@@ -807,6 +807,8 @@ module ActionText
       end
     end
 
+    private
+
     # Apply document-order removals as one linear rewrite. Fragment#update
     # flushes after its block; reads and writes flush early so their results
     # still observe prior `remove` calls.
@@ -890,6 +892,8 @@ module ActionText
       finish = Fragment.element_end(@html, at, tag_end, name, raw)
       [at, finish - at]
     end
+
+    public
 
     # `scan_elements`, not `scan`: `scan` is a builtin-owned name on
     # spinel (String#scan), and a class method of that name conflicts
