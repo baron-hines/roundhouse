@@ -99,7 +99,12 @@ impl Server {
 
     /// GET one path and return the actual HTTP status, headers, and body.
     pub fn get(&self, path: &str) -> Response {
-        let (status, _, headers, body) = self.send("GET", path, &[], "");
+        let headers = if self.cookie.is_empty() {
+            Vec::new()
+        } else {
+            vec![("Cookie", self.cookie.as_str())]
+        };
+        let (status, _, headers, body) = self.send("GET", path, &headers, "");
         Response { status, headers, body }
     }
 
@@ -115,17 +120,10 @@ impl Server {
         Response { status, headers, body }
     }
 
-    /// A GET with the session's cookie.
-    pub fn get(&self, path: &str) -> Response {
-        let headers = [("Cookie", self.cookie.as_str())];
-        let (status, _, body) = self.send("GET", path, &headers, "");
-        Response { status, body }
-    }
-
     /// A GET with additional request headers.
     pub fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Response {
-        let (status, _, body) = self.send("GET", path, headers, "");
-        Response { status, body }
+        let (status, _, response_headers, body) = self.send("GET", path, headers, "");
+        Response { status, headers: response_headers, body }
     }
 
     /// A POST with neither cookie nor token.
