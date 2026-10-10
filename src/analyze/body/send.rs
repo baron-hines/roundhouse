@@ -204,6 +204,79 @@ impl<'a> BodyTyper<'a> {
         self.classes().get(model)?.instance_methods.get(col).cloned()
     }
 
+    /// Schema-indexed type for `minimum(:column)` / `maximum(:column)`.
+    /// Scalar extrema can return nil for an empty relation; grouped extrema
+    /// return a Hash keyed by the recognized group column instead.
+    pub(super) fn relation_extreme_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+    ) -> Option<Ty> {
+        if !matches!(method.as_str(), "minimum" | "maximum") {
+            return None;
+        }
+        let model = match recv_ty? {
+            Ty::Relation { of } => of,
+            Ty::Array { elem } => match &**elem {
+                Ty::Class { id, .. } => id,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let [column_arg] = args else { return None };
+        let column = match &*column_arg.node {
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => value.clone(),
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
+                Symbol::from(value.as_str())
+            }
+            _ => return None,
+        };
+        let value_ty = self.classes().get(model)?.attributes.fields.get(&column)?.clone();
+        if let Some(group_args) = recv.and_then(Self::group_args_in_count_chain) {
+            let key_ty = self.schema_grouped_key_ty(model, group_args).unwrap_or(Ty::Untyped);
+            return Some(Ty::Hash { key: Box::new(key_ty), value: Box::new(value_ty) });
+        }
+        // A local variable or named scope may already represent a grouped
+        // relation. Without retained grouping provenance, do not guess that
+        // it is scalar; the catalog deliberately supplies no fallback type.
+        if !recv.is_some_and(|expr| Self::direct_relation_chain(expr, model)) {
+            return None;
+        }
+        Some(union_of(value_ty, Ty::Nil))
+    }
+
+    fn schema_grouped_key_ty(&self, model: &ClassId, args: &[Expr]) -> Option<Ty> {
+        let [arg] = args else { return None };
+        let ExprNode::Lit { value: crate::expr::Literal::Sym { value: col } } = &*arg.node else {
+            return None;
+        };
+        self.classes().get(model)?.attributes.fields.get(col).cloned()
+    }
+
+    fn direct_relation_chain(expr: &Expr, model: &ClassId) -> bool {
+        match &*expr.node {
+            ExprNode::Const { path } => {
+                path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::")
+                    == model.0.as_str()
+            }
+            ExprNode::Send { method, .. } if method.as_str() == "group" => false,
+            ExprNode::Send { recv: Some(recv), method, block: None, .. }
+                if method.as_str() == "all"
+                    || method.as_str() == "unscoped"
+                    || crate::catalog::lookup(
+                        method.as_str(),
+                        crate::catalog::ReceiverContext::Relation,
+                    )
+                    .is_some_and(|entry| entry.chain == crate::catalog::ChainKind::Builder) =>
+            {
+                Self::direct_relation_chain(recv, model)
+            }
+            _ => false,
+        }
+    }
+
     /// Build the Ctx used to analyze a block passed to `recv.method(...) { |p1, p2| ... }`.
     /// Seeds the block's local_bindings with parameter types derived from the receiver
     /// and method (e.g. `array.each { |x| }` binds `x` to the array's element type).

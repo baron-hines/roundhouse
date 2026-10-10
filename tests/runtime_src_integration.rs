@@ -844,11 +844,47 @@ fn every_runtime_method_body_concretely_typed() {
     // `Relation#in_batches` and in the class-side fallback in
     // connection.rb, whose value is the block's — gradual, as
     // `find_in_batches`' `yield records` already is.
-    // Canonical main a63bf7ba measured 321 gradual sites. The #720 Ruby
-    // runtime additions contribute 39 more, primarily from generic JSON,
-    // deep_dup, session and request-environment values; keep those
-    // intentional dynamic boundaries visible in this measured ceiling.
-    const CEILING: usize = 360;
+    // `Relation#minimum` / `#maximum` add 2, MEASURED: the two indexed
+    // reads of the SQL aggregate's column-dependent scalar. The adapter
+    // contract intentionally keeps raw SQL result values `untyped`;
+    // coercing them would break Rails' column-dependent return type.
+    // MEASURED 2026-10-09 (against origin/main a28539b6): `haml_class`
+    // (the HAML shortcut-class + hash `class:` merge) adds 2 on top of
+    // the above — its `value` param is `untyped` (a scalar the HAML
+    // compiler could not narrow further: String, Symbol, nil, or a
+    // conditional/ternary result), and the body reads it twice
+    // (`value.nil?`, `value.to_s`).
+    // Rebased onto main after `in_batches`: MEASURED 317 with haml_class, under main's 318.
+    // `self.transaction`'s `ensure`-based depth/commit restore on a
+    // non-local exit (spinel-txn-pin #693, CodeRabbit): the nested
+    // branch's `ensure` (a second `Db._txn_depth = depth`, alongside the
+    // `rescue`'s own copy, now folded into the `begin`'s value position)
+    // adds 1; the outer branch's `ensure` adds 3 — its `if rolled_back
+    // then nil else … end` has to unify `nil` against `Db.exec("COMMIT")`'s
+    // declared `void` return, the same kind of escape this file's other
+    // `opts`-style branches already carry. Rebased onto main's
+    // `in_batches` (#713): re-measured fresh on this tree rather than
+    // summed from either side's base, since unrelated main changes
+    // shift base.rb/connection.rb's own counts independently
+    // (spinel-txn-pin #693) — 321, MEASURED after rebasing past #705/#709.
+    // `Relation#minimum` / `#maximum` add 2, MEASURED: the two indexed
+    // reads of the SQL aggregate's column-dependent scalar. The adapter
+    // contract intentionally keeps raw SQL result values `untyped`;
+    // coercing them would break Rails' column-dependent return type. The
+    // merged tree measures 323 after the transaction-runtime change above.
+    // Schema-driven extrema deserialization adds 9 measured gradual sites
+    // in Relation: aggregate values and group keys cross the raw SQL boundary
+    // as column-dependent Boolean/Date/Time values. The concrete method-body
+    // gate still requires every call and body to resolve.
+    // Decimal extrema normalization adds 2 measured gradual sites: the raw
+    // adapter value is column-dependent, and its `to_f` conversion is the
+    // schema-selected Ruby boundary that matches the model's Float contract.
+    // The emitted regression covers scalar and grouped decimal extrema.
+    // Canonical main ae7bf6cf measures 334 sites; #720's Ruby runtime
+    // additions contribute 39 more, primarily from generic JSON, deep_dup,
+    // session and request-environment values. Keep those intentional dynamic
+    // boundaries visible in the measured combined ceiling.
+    const CEILING: usize = 373;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
