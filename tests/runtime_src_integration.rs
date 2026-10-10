@@ -892,6 +892,34 @@ fn every_runtime_method_body_concretely_typed() {
 }
 
 #[test]
+fn active_support_inflector_slice_adds_no_bar_b_sites() {
+    let methods = load_typed("active_support_inflections");
+    for name in [
+        "camelize",
+        "deconstantize",
+        "foreign_key",
+        "upcase_first",
+        "downcase_first",
+    ] {
+        let method = methods
+            .iter()
+            .find(|method| {
+                method.name.as_str() == name
+                    && method
+                        .enclosing_class
+                        .as_ref()
+                        .is_some_and(|class| class.as_str() == "Inflector")
+            })
+            .unwrap_or_else(|| panic!("ActiveSupport::Inflector.{name} exists in runtime source"));
+        assert_eq!(
+            count_gradual(&method.body),
+            0,
+            "ActiveSupport::Inflector.{name} introduces no Ty::Untyped Bar B sites",
+        );
+    }
+}
+
+#[test]
 fn empty_html_opts_emits_string_keyed_maps_on_csharp_and_kotlin() {
     let src = include_str!("../runtime/ruby/action_view/view_helpers.rb");
     let consts = roundhouse::runtime_src::parse_module_constant_exprs(src).unwrap();
