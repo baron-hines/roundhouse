@@ -10088,3 +10088,81 @@ end
         .run_test("test/models/probe_server_test.rb")
         .assert_passes();
 }
+
+/// campfire main keeps `rooms.messages_count` with SQLite triggers it
+/// installs itself, and repairs the count once fixtures are loaded:
+/// - a `load_fixtures` override on the app's `ActiveSupport::TestCase`
+///   (`fixtures = super; …; fixtures`) runs its statements after the
+///   fixtures, ahead of the tests' own setup;
+/// - `connection.data_source_exists?` / `column_exists?` read SQLite's
+///   catalog, `raw_connection.transaction(:immediate)` is a write
+///   transaction below ActiveRecord, `connection_pool.release_connection`
+///   answers;
+/// - `clear_query_caches_for_current_thread` leaves the cache on.
+#[test]
+fn a_fixture_hook_and_trigger_maintenance_run_as_rails_runs_them() {
+    emit_and_run::real_blog()
+        .edit("test/test_helper.rb", "    # Add more helper methods to be used by all tests here...\n", r##"    def load_fixtures(config)
+      fixtures = super
+      Article::Counting.ensure!
+      fixtures
+    end
+"##)
+        .edit("db/schema.rb", "    t.string \"title\"\n", "    t.string \"title\"\n    t.integer \"comments_total\", default: 0, null: false\n")
+        .write("app/models/article/counting.rb", r##"class Article::Counting
+  TRIGGER = "comments_ai_articles_total"
+
+  def self.ensure!(connection = ActiveRecord::Base.connection)
+    return unless connection.adapter_name.match?(/sqlite/i)
+    return unless connection.data_source_exists?(:articles)
+    return unless connection.column_exists?(:articles, :comments_total)
+    return if installed?(connection)
+
+    connection.raw_connection.transaction(:immediate) do
+      connection.execute("UPDATE articles SET comments_total = (SELECT COUNT(*) FROM comments WHERE comments.article_id = articles.id)")
+      connection.execute("CREATE TRIGGER #{TRIGGER} AFTER INSERT ON comments BEGIN UPDATE articles SET comments_total = comments_total + 1 WHERE id = NEW.article_id; END")
+    end
+  end
+
+  def self.installed?(connection = ActiveRecord::Base.connection)
+    connection.select_value("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = #{connection.quote(TRIGGER)}").present?
+  end
+end
+"##)
+        .write("test/models/article_counting_test.rb", r##"require "test_helper"
+
+class ArticleCountingTest < ActiveSupport::TestCase
+  test "the fixture hook installed the trigger and backfilled the counts" do
+    assert Article::Counting.installed?
+    article = articles(:one)
+    assert_equal article.comments.count, article.comments_total
+    article.comments.create!(commenter: "Ann", body: "Counted by the trigger")
+    assert_equal article.comments.count, article.reload.comments_total
+  end
+
+  test "schema questions read the catalog" do
+    connection = ActiveRecord::Base.connection
+    assert connection.data_source_exists?(:comments)
+    assert_not connection.data_source_exists?(:nothing_here)
+    assert connection.column_exists?(:articles, :comments_total)
+    assert_not connection.column_exists?(:articles, :missing)
+    assert_nil ActiveRecord::Base.connection_pool.release_connection
+    assert_nil ActiveRecord::Base.clear_query_caches_for_current_thread
+  end
+
+  test "a raw write transaction rolls back when its block raises" do
+    connection = ActiveRecord::Base.connection
+    count = Article.count
+    assert_raises(RuntimeError) do
+      connection.raw_connection.transaction(:immediate) do
+        connection.execute("DELETE FROM articles")
+        raise "abandon"
+      end
+    end
+    assert_equal count, Article.count
+  end
+end
+"##)
+        .run_test("test/models/article_counting_test.rb")
+        .assert_passes();
+}

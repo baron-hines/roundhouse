@@ -164,6 +164,28 @@ module ActiveRecord
     end
   end
 
+  # `connection.raw_connection` — see `Connection#raw_connection`.
+  class RawConnection
+    # SQLite3::Database#transaction: BEGIN in the given mode, the block,
+    # COMMIT; ROLLBACK and re-raise on an exception. Like the gem's, it
+    # sits below ActiveRecord, so `transaction_open?` does not see it.
+    def transaction(mode = :deferred)
+      Db.exec("BEGIN #{mode.to_s.upcase} TRANSACTION")
+      begin
+        result = yield
+      rescue Exception => e
+        begin
+          Db.exec("ROLLBACK")
+        rescue StandardError
+          # SQLite may have ended the transaction itself already.
+        end
+        raise e
+      end
+      Db.exec("COMMIT")
+      result
+    end
+  end
+
   class Connection
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.
@@ -212,6 +234,24 @@ module ActiveRecord
     # (campfire's room test counts FTS rows this way).
     def select_value(sql)
       select_rows(sql).dig(0, 0)
+    end
+
+    # Schema questions the app asks before touching a table (campfire's
+    # `Room::MessagesCount.ensure!` checks both before installing its
+    # triggers), answered from SQLite's own catalog.
+    def data_source_exists?(name)
+      !select_value("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = #{quote(name.to_s)}").nil?
+    end
+
+    def column_exists?(table, column)
+      select_rows("PRAGMA table_info(#{quote(table.to_s)})").any? { |row| row[1].to_s == column.to_s }
+    end
+
+    # The sqlite3 gem's connection under the adapter. Only its
+    # `transaction(mode)` is reached: campfire repairs its counters in one
+    # `BEGIN IMMEDIATE` write transaction.
+    def raw_connection
+      RawConnection.new
     end
 
     def exec_query(sql)
@@ -423,6 +463,17 @@ module ActiveRecord
       ensure
         Db.query_cache_begin if was
       end
+    end
+
+    # Rails' `clear_query_caches_for_current_thread`: the replay cache
+    # forgets what it holds and stays on (campfire's caching tests clear
+    # it between two renders so the second one's queries are counted).
+    def self.clear_query_caches_for_current_thread
+      if Db.query_cache_enabled?
+        Db.query_cache_end
+        Db.query_cache_begin
+      end
+      nil
     end
 
     # `Model.transaction { ... }` — the block inside BEGIN/COMMIT, with

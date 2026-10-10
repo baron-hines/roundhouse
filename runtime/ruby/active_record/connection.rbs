@@ -28,6 +28,10 @@ module ActiveRecord
     def each: () { (Hash[String, untyped]) -> void } -> Array[Hash[String, untyped]]
   end
 
+  class RawConnection
+    def transaction: (?Symbol mode) { () -> untyped } -> untyped
+  end
+
   class Connection
     def adapter_name: () -> String
     def quote: (String | Symbol | Integer | Float | bool | nil value) -> String
@@ -35,6 +39,9 @@ module ActiveRecord
     def execute: (String sql) -> Result
     def select_rows: (String sql) -> Array[Array[untyped]]
     def select_value: (String sql) -> untyped
+    def data_source_exists?: (String | Symbol name) -> bool
+    def column_exists?: (String | Symbol table, String | Symbol column) -> bool
+    def raw_connection: () -> RawConnection
     def exec_query: (String sql) -> Result
     def select_all: (String sql) -> Result
     def exec_update: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
@@ -55,6 +62,7 @@ module ActiveRecord
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
     def self.uncached: () { () -> untyped } -> untyped
+    def self.clear_query_caches_for_current_thread: () -> nil
     def self.transaction: (?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def self.delete_all: () -> Integer

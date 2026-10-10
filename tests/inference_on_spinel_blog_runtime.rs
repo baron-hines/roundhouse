@@ -344,7 +344,12 @@ fn untyped_subexpressions_baseline() {
     // creation tests): 561 -> 562, MEASURED by removing the one line.
     // The new site is the Rollback arm's `Db.exec("ROLLBACK")`, read
     // here without the Db contract like the other arm's.
-    const CEILING: usize = 562;
+    // `clear_query_caches_for_current_thread` and `raw_connection.
+    // transaction(:immediate)` (campfire's caching tests and its
+    // messages_count trigger repair): 562 -> 569, MEASURED by removing
+    // each — 4 for the former's `Db.query_cache_*` calls (the same escape
+    // `uncached` takes), 3 for the latter's `Db.exec` calls.
+    const CEILING: usize = 569;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\
