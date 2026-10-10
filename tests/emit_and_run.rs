@@ -9720,3 +9720,105 @@ end
         .run_test("test/controllers/announcements_controller_test.rb")
         .assert_passes();
 }
+
+/// Framework surface campfire main's tests and cache keys reach, each
+/// with Rails' behaviour:
+/// - `request.format.to_s` is the negotiated Mime string;
+/// - `Rails.application.env_config` keeps what a test sets in it;
+/// - a helper test's `controller` is a test controller, whose
+///   `perform_caching` is false in the test environment;
+/// - `update_columns` and `delete` skip callbacks;
+/// - `raise ActiveRecord::Rollback` undoes the transaction quietly;
+/// - `clear_enqueued_jobs`, `assert_nothing_raised`, `assert_dom_equal`.
+fn rails_surface_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  get \"/format\", to: \"articles#format_probe\"\n  resources :articles do\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", r##"class ArticlesController < ApplicationController
+  def format_probe
+    render plain: request.format.to_s
+  end
+
+"##)
+        .write("app/helpers/articles_helper.rb", r##"module ArticlesHelper
+  def caching_label
+    controller.perform_caching ? "cached" : "fresh"
+  end
+end
+"##)
+        .write("app/jobs/touch_job.rb", "class TouchJob < ApplicationJob\n  def perform(article)\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  SAVED = []\n  after_save { SAVED << title }\n\n")
+        .write("test/helpers/articles_helper_test.rb", r##"require "test_helper"
+
+class ArticlesHelperTest < ActionView::TestCase
+  test "a helper reads the test controller" do
+    assert_equal "fresh", caching_label
+  end
+
+  test "markup compares up to attribute order and the whitespace between tags" do
+    assert_dom_equal %(<p class="a" id="b">x</p>), %(<p id="b"  class="a">x</p>\n)
+    assert_nothing_raised { Article.count }
+  end
+end
+"##)
+        .write("test/controllers/format_probes_controller_test.rb", r##"require "test_helper"
+
+class FormatProbesControllerTest < ActionDispatch::IntegrationTest
+  include ActiveJob::TestHelper
+
+  test "the request format is its Mime string" do
+    get "/format"
+    assert_equal "text/html", response.body
+  end
+
+  test "env_config keeps what a test sets" do
+    previous = Rails.application.env_config["action_dispatch.show_exceptions"]
+    Rails.application.env_config["action_dispatch.show_exceptions"] = :rescuable
+    assert_equal :rescuable, Rails.application.env_config["action_dispatch.show_exceptions"]
+  ensure
+    Rails.application.env_config["action_dispatch.show_exceptions"] = previous
+  end
+
+  test "update_columns and delete skip callbacks" do
+    article = Article.create!(title: "Columns", body: "A sufficiently long article body.")
+    saved = Article::SAVED.size
+    article.update_columns(title: "Renamed")
+    assert_equal saved, Article::SAVED.size
+    assert_equal "Renamed", Article.find(article.id).title
+    article.delete
+    assert_nil Article.find_by(id: article.id)
+  end
+
+  test "a rollback undoes the transaction without raising" do
+    count = Article.count
+    result = Article.transaction do
+      Article.create!(title: "Gone", body: "A sufficiently long article body.")
+      raise ActiveRecord::Rollback
+    end
+    assert_nil result
+    assert_equal count, Article.count
+  end
+
+  test "clear_enqueued_jobs forgets what was enqueued" do
+    article = Article.create!(title: "Queued", body: "A sufficiently long article body.")
+    TouchJob.perform_later(article)
+    assert_enqueued_jobs 1, only: TouchJob
+    clear_enqueued_jobs
+    assert_no_enqueued_jobs only: TouchJob
+  end
+end
+"##)
+}
+
+#[test]
+fn rails_surface_for_cache_keys_rollbacks_and_jobs() {
+    rails_surface_app()
+        .run_test("test/controllers/format_probes_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn a_helper_test_has_a_test_controller_and_dom_assertions() {
+    rails_surface_app()
+        .run_test("test/helpers/articles_helper_test.rb")
+        .assert_passes();
+}

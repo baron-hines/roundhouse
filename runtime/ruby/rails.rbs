@@ -67,6 +67,8 @@ module Rails
     def domain: () -> String
     def protocol: () -> String
     def credentials: () -> Hash[Symbol, untyped]
+    ENV_CONFIG: Hash[String, Symbol?]
+    def env_config: () -> Hash[String, Symbol?]
     def config_time_zone: () -> String
     def active_storage_excluded_content_types: () -> Array[String]
     def active_storage_video_preview_arguments: () -> String
