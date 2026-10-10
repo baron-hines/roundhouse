@@ -1585,6 +1585,14 @@ impl<'a> BodyTyper<'a> {
                 // have already dispatched above and must win.
                 // RBS declares it `(untyped) -> Array[untyped]`; the
                 // argument says more.
+                // Not a Float argument: CRuby's `BigDecimal(Float)` needs a precision and spinel's package has none.
+                if recv.is_none() && method.as_str() == "BigDecimal" && args.len() == 1 && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(args[0].ty.as_ref(), Some(Ty::Str | Ty::Int))
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                {
+                    return send::bigdecimal();
+                }
                 if recv.is_none() && method.as_str() == "Array" && args.len() == 1
                     && block.is_none()
                     && (matches!(dispatched, Ty::Var { .. })
