@@ -56,7 +56,8 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             break;
         }
     }
-    if jobs.is_empty() {
+    let workers = sidekiq_workers(app);
+    if jobs.is_empty() && workers.is_empty() {
         return diags;
     }
 
@@ -69,9 +70,20 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     // C returned an `sp_Class` through it: 13 cc errors on lobsters).
     let mut unfolded: BTreeSet<String> = BTreeSet::new();
     let mut folded: Vec<crate::span::Span> = Vec::new();
+    let mut delayed: Vec<crate::span::Span> = Vec::new();
     super::for_each_hook_body(app, &mut |body| {
-        fold_set_chains(body, &jobs, &mut unfolded, &mut folded)
+        fold_set_chains(body, &jobs, &mut unfolded, &mut folded);
+        fold_delayed_enqueues(body, &workers, &mut delayed);
     });
+    for span in delayed {
+        diags.push(crate::lower::residue_diagnostic(
+            "job_class_side",
+            "worker-delay",
+            span,
+            "inline job semantics",
+            "`perform_in`/`perform_at` delays are dropped under inline job semantics".to_string(),
+        ));
+    }
     for span in folded {
         diags.push(crate::lower::residue_diagnostic(
             "job_class_side",
@@ -84,9 +96,31 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     }
 
     for lc in app.library_classes.iter_mut() {
-        if !jobs.contains(lc.name.0.as_str()) {
+        let is_worker = workers.contains(lc.name.0.as_str());
+        if !is_worker && !jobs.contains(lc.name.0.as_str()) {
             continue;
         }
+        if is_worker {
+            lc.includes.retain(|inc| !SIDEKIQ_MODULES.contains(&inc.0.as_str()));
+            let before = lc.unknown_calls.len();
+            lc.unknown_calls.retain(|call| {
+                !matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
+                    if SIDEKIQ_CLASS_MACROS.contains(&method.as_str()))
+            });
+            if lc.unknown_calls.len() != before {
+                diags.push(crate::lower::residue_diagnostic(
+                    "job_class_side",
+                    "worker-options",
+                    crate::span::Span::synthetic(),
+                    "inline job semantics",
+                    format!(
+                        "job_class_side: `{}` — sidekiq_options / retry hooks are dropped under inline job semantics",
+                        lc.name.0.as_str()
+                    ),
+                ));
+            }
+        }
+        let entries: &[&str] = if is_worker { &["perform_async"] } else { &["perform_later", "perform_now"] };
         let class_side: BTreeSet<&str> = lc
             .methods
             .iter()
@@ -128,7 +162,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
 
         let span = perform.body.span;
         let mut wrappers: Vec<crate::dialect::MethodDef> = Vec::new();
-        for entry in ["perform_later", "perform_now"] {
+        for &entry in entries {
             if class_side.contains(entry) {
                 continue;
             }
@@ -177,7 +211,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             // them, and `perform_later` is the only entry that
             // enqueues (`perform_now` runs without one, in Rails as
             // here).
-            let body = if entry == "perform_later" {
+            let body = if matches!(entry, "perform_later" | "perform_async") {
                 let mut record = Expr::new(
                     span,
                     ExprNode::Send {
@@ -379,7 +413,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         // proxy kept in a variable, say). Its value is the class object,
         // which `Ty` cannot name, so the signature says `untyped` rather
         // than claim an instance it does not return.
-        if !class_side.contains("set") && unfolded.contains(lc.name.0.as_str()) {
+        if !is_worker && !class_side.contains("set") && unfolded.contains(lc.name.0.as_str()) {
             let mut body = Expr::new(span, ExprNode::SelfRef);
             body.ty = Some(Ty::Untyped);
             let mut w = perform.clone();
@@ -446,6 +480,48 @@ fn fold_set_chains(
         }
     }
     e.node.for_each_child_mut(&mut |c| fold_set_chains(c, jobs, unfolded, folded));
+}
+
+/// The modules whose `include` makes a class a Sidekiq worker.
+const SIDEKIQ_MODULES: &[&str] = &["Sidekiq::Worker", "Sidekiq::Job"];
+
+/// Class-body calls a worker makes to configure the queue, which
+/// inline semantics has none of.
+const SIDEKIQ_CLASS_MACROS: &[&str] = &["sidekiq_options", "sidekiq_retry_in", "sidekiq_retries_exhausted"];
+
+/// Library classes that include a Sidekiq worker module, or descend from
+/// one that does (mastodon's `UpdateDistributionWorker < RawDistributionWorker`).
+fn sidekiq_workers(app: &App) -> BTreeSet<String> {
+    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+    let mut out = BTreeSet::new();
+    for lc in &app.library_classes {
+        let mut cur = Some(lc);
+        for _ in 0..32 {
+            let Some(c) = cur else { break };
+            if c.includes.iter().any(|inc| SIDEKIQ_MODULES.contains(&inc.0.as_str())) {
+                out.insert(lc.name.0.as_str().to_string());
+                break;
+            }
+            cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
+        }
+    }
+    out
+}
+
+/// Fold `Worker.perform_in(delay, args)` / `perform_at(time, args)` to
+/// `Worker.perform_async(args)`; the delay is what inline semantics drops.
+fn fold_delayed_enqueues(e: &mut Expr, workers: &BTreeSet<String>, delayed: &mut Vec<crate::span::Span>) {
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *e.node {
+        let is_worker = matches!(&*r.node, ExprNode::Const { path }
+            if workers.contains(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")));
+        if is_worker && matches!(method.as_str(), "perform_in" | "perform_at") && !args.is_empty() {
+            args.remove(0);
+            *method = Symbol::from("perform_async");
+            delayed.push(e.span);
+        }
+    }
+    e.node.for_each_child_mut(&mut |c| fold_delayed_enqueues(c, workers, delayed));
 }
 
 fn residue(m: &crate::dialect::MethodDef, reason: &str) -> Diagnostic {
