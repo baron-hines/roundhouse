@@ -169,6 +169,13 @@ module ActiveJob
     nil })
   end
 
+  # A payload whose job asks to be enqueued after commit. This default
+  # holds nothing; the Ruby-family job registry redefines it to hold the
+  # payload while `Model.transaction` is open.
+  def self.enqueue_payload_after_commit(json)
+    enqueue_payload(json)
+  end
+
   def self.pending_count
     PENDING.length
   end
