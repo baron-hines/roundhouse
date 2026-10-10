@@ -530,8 +530,13 @@ module ActiveRecord
           # outer transaction carries on and commits.
           Db._txn_depth = depth
           unless savepoint.nil?
-            Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
-            Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            begin
+              Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
+              Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            rescue StandardError
+              # SQLite may already have ended the whole transaction; the
+              # Rollback still answers nil, as the outer ROLLBACK's does.
+            end
           end
           result = nil
         rescue Exception => e
