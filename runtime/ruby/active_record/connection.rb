@@ -537,8 +537,13 @@ module ActiveRecord
         rescue Exception => e
           Db._txn_depth = depth
           unless savepoint.nil?
-            Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
-            Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            begin
+              Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
+              Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            rescue StandardError
+              # SQLite may already have ended the whole transaction (see
+              # the outer ROLLBACK below); that must not hide `e`.
+            end
           end
           raise e
         ensure
