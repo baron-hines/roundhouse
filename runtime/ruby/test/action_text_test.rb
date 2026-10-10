@@ -427,6 +427,18 @@ class ActionTextFragmentTest < Minitest::Test
     assert_equal "", out.to_s
   end
 
+  def test_update_removes_stale_crossing_element_after_serialization
+    html = "<script><iframe></script></iframe>alert(1)</script><p>keep</p>"
+    out = ActionText::Fragment.new(html).update do |source|
+      nodes = source.css("*")
+      nodes[1].remove
+      assert_equal "<script>alert(1)</script><p>keep</p>", source.to_s
+      nodes[0].remove
+    end
+
+    assert_equal "<p>keep</p>", out.to_s
+  end
+
   def test_replace_observes_a_pending_remove
     fragment = ActionText::Fragment.new("<script>gone</script><div>keep</div>")
     fragment.css("script")[0].remove
