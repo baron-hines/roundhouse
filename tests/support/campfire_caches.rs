@@ -72,8 +72,16 @@ pub const DATA_BLOCK_METHODS: Contract = Contract {
     source: r#"class DataBlockProbe
   ContentKey = Data.define(:digest) do
     def cache_key
-      "key-" + digest
+      "key-" + private_digest
     end
+
+    private
+
+    def private_digest
+      digest
+    end
+
+    public
 
     def encoded_digest
       DataKeySupportController.encode(digest)

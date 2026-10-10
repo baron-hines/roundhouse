@@ -113,9 +113,9 @@ pub fn ingest_library_classes(
 
 /// The block of `NAME = Data.define(:a, :b) do def … end end`, when that
 /// is what `value` is: `Data` (or `::Data`) receiving `define` with
-/// Symbol members only, a parameterless block, and a body of `def`s and
-/// nothing else. Any other block stays with the constant's own ingest,
-/// where a `def` is not an expression.
+/// Symbol members only, a parameterless block, and a body containing
+/// only method definitions and bare visibility markers. Any other block
+/// stays with the constant's own ingest, where a `def` is not an expression.
 pub(super) fn data_define_block<'pr>(value: &Node<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
     let call = value.as_call_node()?;
     if constant_id_str(&call.name()) != "define" {
@@ -138,7 +138,15 @@ pub(super) fn data_define_block<'pr>(value: &Node<'pr>) -> Option<ruby_prism::Bl
     body.as_statements_node()?;
     flatten_statements(body)
         .iter()
-        .all(|stmt| stmt.as_def_node().is_some())
+        .all(|stmt| {
+            stmt.as_def_node().is_some()
+                || stmt.as_call_node().is_some_and(|call| {
+                    matches!(constant_id_str(&call.name()), "public" | "protected" | "private")
+                        && call.receiver().is_none()
+                        && call.arguments().is_none()
+                        && call.block().is_none()
+                })
+        })
         .then_some(block)
 }
 
