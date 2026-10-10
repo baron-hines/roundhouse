@@ -223,19 +223,20 @@ module ActiveSupport
     h
   end
 
-  # AS `Enumerable#many?`, no-block form: MORE THAN ONE element. Rails
-  # writes it as a short-circuiting `any?` with a counter so it stops at
-  # the second hit; the receivers that reach here are already
-  # materialized, so `length` answers the same question without the
-  # block. Another core_ext reopen the transpiled runtimes cannot host —
-  # same home and same rule as `index_by` above, the receiver evaluated
+  # AS `Enumerable#many?`: the materialized no-block form is a length
+  # check; the block form counts matches and stops at the second hit.
+  # Another core_ext reopen the transpiled runtimes cannot host — same
+  # home and same rule as `index_by` above, the receiver is evaluated
   # exactly once.
-  #
-  # The block form (`many? { … }`) is NOT here: it counts matches
-  # instead, and no corpus app writes it. `lower::enumerable_ext`
-  # rewrites only the bare call, so the block form stays visible.
   def self.many?(list)
-    list.length > 1
+    return list.length > 1 unless block_given?
+
+    count = 0
+    list.each do |item|
+      count = count + 1 if yield item
+      return true if count > 1
+    end
+    false
   end
 
   # AS `String#squish`: runs of whitespace collapsed to one space, and
@@ -243,8 +244,8 @@ module ActiveSupport
   # `gsub(/[[:space:]]+/, " ").strip` on a `String` reopen — a core_ext
   # the transpiled runtimes cannot host, and a REGEX the targets do not
   # all lower, so the scan is spelled out the way `to_sentence` below
-  # is. `[[:space:]]` is the six ASCII whitespace characters; a corpus
-  # that needs Unicode spaces would widen this test, not the shape.
+  # is. Match each character against Rails' POSIX whitespace class,
+  # including Unicode whitespace.
   #
   # campfire's `content_filters_test` writes `<<~HTML.squish` to put a
   # multi-line fixture body on one line before handing it to a filter.
@@ -254,7 +255,7 @@ module ActiveSupport
     i = 0
     while i < text.length
       c = text[i]
-      if c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\f" || c == "\v"
+      if c.match?(/[[:space:]]/)
         pending_space = !out.empty?
       else
         out = out + " " if pending_space
@@ -264,6 +265,14 @@ module ActiveSupport
       i = i + 1
     end
     out
+  end
+
+  # Rails' destructive form always returns the same receiver, including
+  # when its contents were already squished.
+  def self.squish!(text)
+    text.gsub!(/[[:space:]]+/, " ")
+    text.strip!
+    text
   end
 
   # AS `Enumerable#sole`: THE one element, and a raise for any other
