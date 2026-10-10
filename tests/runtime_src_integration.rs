@@ -971,10 +971,10 @@ fn every_runtime_method_body_concretely_typed() {
     // schema-selected Ruby boundary that matches the model's Float contract.
     // The emitted regression covers scalar and grouped decimal extrema.
     // Canonical main 99dd482b measures 374 sites. The ActionText fragment
-    // mutation runtime adds 63 measured sites on that baseline (45 range/edit,
-    // 2 pending-index writes, 16 stale-position remapping); the merged tree
-    // measures 437. Bar A still requires zero untyped method bodies.
-    const CEILING: usize = 437;
+    // mutation runtime adds 47 measured sites on that baseline (45 range/edit
+    // and 2 pending-index writes); the merged tree measures 421. Bar A still
+    // requires zero untyped method bodies.
+    const CEILING: usize = 421;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -879,32 +879,16 @@ module ActionText
     # is no longer mappable, so recover the live element boundary from
     # that still-bound opening tag rather than leaving it behind.
     def current_node_range(name, original_at, revision)
-      at = current_position(original_at, revision)
-      return nil if at.nil? || at < 0 || at >= @html.length
+      position = current_range(original_at, 0, revision)
+      return nil if position.nil?
+      at = position[0]
+      return nil if at < 0 || at >= @html.length
       return nil unless @html[at, 1].to_s == "<"
       tag_end = Fragment.tag_end(@html, at)
       raw = @html[at + 1, tag_end - at - 1].to_s
       return nil unless Content.tag_name_of(raw) == name
       finish = Fragment.element_end(@html, at, tag_end, name, raw)
       [at, finish - at]
-    end
-
-    def current_position(at, revision)
-      i = revision
-      while i < @changes.length
-        change = @changes[i]
-        change_finish = change.at + change.length
-        if change_finish <= at
-          at = at + change.delta
-        elsif change.at < at && change_finish > at
-          return nil unless change.preserves_descendants
-          at = at + change.delta
-        elsif change.at == at
-          return nil unless change.preserves_descendants
-        end
-        i = i + 1
-      end
-      at
     end
 
     # `scan_elements`, not `scan`: `scan` is a builtin-owned name on

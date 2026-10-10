@@ -134,7 +134,6 @@ module ActionText
     def flush_pending_removals: () -> void
     def current_range: (Integer at, Integer length, Integer revision) -> Array[Integer]?
     def current_node_range: (String name, Integer original_at, Integer revision) -> Array[Integer]?
-    def current_position: (Integer at, Integer revision) -> Integer?
     def scan_elements: (String selector, bool bound) -> Array[ActionText::Node]
     def node_at: (String name, Hash[String, String] attrs, Integer open_at, Integer tag_end, Integer stop) -> ActionText::Node
     def replace: (String selector) { (ActionText::Node node) -> untyped } -> Fragment
