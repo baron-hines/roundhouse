@@ -1,5 +1,5 @@
-require_relative "test_helper"
 require "active_support/inflector"
+require_relative "test_helper"
 
 # Rails 8.1.4 default-config differential only. Custom acronym tables,
 # `classify`/`tableize`, locale mutation, constantization, transliteration,
