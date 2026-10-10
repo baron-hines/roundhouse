@@ -1,0 +1,13 @@
+module ActionView
+  module Helpers
+    module NumberHelper
+      def number_to_currency: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def number_to_human: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def number_to_human_size: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def number_to_percentage: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def number_to_phone: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def number_with_delimiter: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def number_with_precision: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+    end
+  end
+end

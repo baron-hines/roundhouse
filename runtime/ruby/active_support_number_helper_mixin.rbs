@@ -1,0 +1,11 @@
+module ActiveSupport
+  module NumberHelper
+    def number_to_currency: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+    def number_to_delimited: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+    def number_to_human: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+    def number_to_human_size: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+    def number_to_percentage: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+    def number_to_phone: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+    def number_to_rounded: (Integer | Float | Rational | String? number, ?Hash[Symbol, untyped] options) -> String?
+  end
+end

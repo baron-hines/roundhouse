@@ -5047,6 +5047,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         // scaffold (strict targets literalize controller_name/path).
         // Listed before active_support_ext so require_relative resolves.
         "active_support_inflections",
+        "active_support_number_helper",
+        "active_support_number_helper_mixin",
+        "action_view_number_helper",
+        "action_view_number_helper_mixin",
         "active_support_ext",
         "security_utils",
         "params",

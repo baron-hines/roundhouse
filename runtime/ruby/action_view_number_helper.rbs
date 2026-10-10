@@ -1,0 +1,22 @@
+module ActionView
+  module Helpers
+    module NumberHelper
+      class InvalidNumberError < StandardError
+        def number: () -> untyped
+        def initialize: (untyped number) -> void
+      end
+      def self.valid_float_string?: (String text) -> bool
+      def self.valid_number?: (untyped number) -> bool
+      def self.escape_html: (untyped text) -> String
+      def self.delegate_number_helper_method: (Symbol method, untyped number, ?Hash[Symbol, untyped] options, ?bool escape_output) -> String?
+      def self.template_number_helper: (Symbol method, untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_to_currency: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_to_human: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_to_human_size: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_to_percentage: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_to_phone: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_with_delimiter: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+      def self.number_with_precision: (untyped number, ?Hash[Symbol, untyped] options) -> String?
+    end
+  end
+end

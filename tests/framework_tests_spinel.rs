@@ -195,6 +195,7 @@ fn build_and_run(test_file: &Path, tag: &str) {
 require_relative "../runtime/base64"
 require_relative "../runtime/json_impl"
 require_relative "../runtime/inflector"
+require_relative "../runtime/active_support_number_helper"
 require_relative "../runtime/active_record"
 require_relative "../runtime/action_view/view_helpers"
 require_relative "../runtime/action_view/view_helpers_ext"
@@ -502,5 +503,14 @@ fn view_helpers_ext_test_passes_spinel() {
     build_and_run(
         Path::new("runtime/ruby/test/action_view/view_helpers_ext_test.rb"),
         "view_helpers_ext",
+    );
+}
+
+#[test]
+#[ignore]
+fn active_support_number_helper_test_passes_under_spinel() {
+    build_and_run(
+        Path::new("runtime/ruby/test/active_support/number_helper_test.rb"),
+        "active_support_number_helper",
     );
 }

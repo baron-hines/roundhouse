@@ -1,0 +1,28 @@
+module ActiveSupport
+  module NumberHelper
+    DEFAULT_LOCALE: Symbol
+    def self.register_locale: (Symbol | String locale, String separator, String delimiter, ?Hash[Symbol, untyped] translations) -> Hash[Symbol, untyped]
+    def self.symbolize_options: (Hash[Symbol | String, untyped] options) -> Hash[Symbol, untyped]
+    def self.locale_profile: (Hash[Symbol, untyped] options) -> Hash[Symbol, untyped]
+    def self.locale_format: (Hash[Symbol, untyped] options) -> Hash[Symbol, untyped]
+    def self.translated_option: (Hash[Symbol, untyped] profile, Symbol namespace, Symbol key, untyped fallback) -> untyped
+    def self.validate_options: (Hash[Symbol, untyped] options, Array[Symbol] allowed) -> Hash[Symbol, untyped]
+    def self.number_to_currency: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.number_to_delimited: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.number_to_human: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.number_to_human_size: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.number_to_percentage: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.number_to_phone: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.number_to_rounded: (Integer | Float | Rational | String? number, ?Hash[Symbol | String, untyped] options) -> String?
+    def self.registered_units: (Hash[Symbol, untyped] profile, String | Symbol scope) -> Hash[Symbol, untyped]?
+    def self.valid_decimal_string?: (String text) -> bool
+    def self.numeric_text: (Integer | Float | Rational | String number, ?Integer digits_after_point) -> String
+    def self.expand_decimal: (String text) -> String
+    def self.divide_decimal: (String text, Integer divisor, Integer digits_after_point) -> String
+    def self.shift_decimal: (String text, Integer places) -> String
+    def self.decimal_digit_count: (String text) -> Integer
+    def self.round_decimal: (String text, Integer precision, Symbol mode) -> String
+    def self.should_increment: (String discarded, String kept, String sign, Symbol mode) -> bool
+    def self.increment_digits: (String digits) -> String
+  end
+end
