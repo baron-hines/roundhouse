@@ -1443,7 +1443,8 @@ end
 /// `Float#to_d` / `Integer#to_d` build a BigDecimal without
 /// `bigdecimal/util`, and the decimal arithmetic after them runs:
 /// Float and Integer operands, comparison, `round`, and `floor`/`ceil`
-/// with and without digits. `0.1 + 0.2` keeps `Float#to_d`'s 16 digits.
+/// with and without digits. `0.1 + 0.2` keeps `Float#to_d`'s 16 digits,
+/// and exponent-form floats (`Float#to_s`'s `1.0e-05`) convert as well.
 /// Expected values are CRuby 3.4's with bigdecimal 4.1.
 #[test]
 fn float_to_d_and_decimal_arithmetic_run() {
@@ -1465,7 +1466,8 @@ fn float_to_d_and_decimal_arithmetic_run() {
     render plain: [
       price.to_s, (price - a).to_s, (a / 7).floor(2).to_s, a.round(2).to_s, a.round, a.floor,
       a.ceil(1).to_s, (f - a).to_s, (i * a).to_s, a.to_f, price > a, g.to_d.to_s, (-a).abs.to_s, a.round(0),
-      a.to_d.to_s
+      a.to_d.to_s,
+      params[:exps].to_s.split(",").map { |e| e.to_f.to_d.to_s }.join(",")
     ].join(" ")
   end
 end
@@ -1477,8 +1479,9 @@ end
 
 class DecimalsControllerTest < ActionDispatch::IntegrationTest
   test "decimal arithmetic matches CRuby" do
-    get "/decimal", params: { f: "2.5", i: "3", a: "0.1", b: "0.2" }
-    assert_equal "0.75e1 0.5945e1 0.22e0 0.156e1 2 1 0.16e1 0.945e0 0.4665e1 1.555 true 0.3e0 0.1555e1 2 0.1555e1", response.body
+    get "/decimal", params: { f: "2.5", i: "3", a: "0.1", b: "0.2", exps: "1.0e-5,1e20,-1.0e-10,1.2345678901234567e20,-1.2345678901234567e-20" }
+    assert_equal "0.75e1 0.5945e1 0.22e0 0.156e1 2 1 0.16e1 0.945e0 0.4665e1 1.555 true 0.3e0 0.1555e1 2 0.1555e1 " \
+      "0.1e-4,0.1e21,-0.1e-9,0.1234567890123456e21,-0.1234567890123456e-19", response.body
   end
 end
 "#,
