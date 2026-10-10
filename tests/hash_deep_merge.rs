@@ -35,6 +35,9 @@ const SOURCE: &str = r#"class HashDeepMergeProbe
     raise "empty-left merge changed content" unless ({}).deep_merge(right) == right
     raise "empty merge changed content" unless ({}).deep_merge({}) == {}
     raise "merge returned receiver" if left.deep_merge(right).equal?(left)
+    defaulted_left = Hash.new({ nested: { default: true } })
+    defaulted_right = { missing: { nested: { right: true } } }
+    raise "merged an absent key's default" unless defaulted_left.deep_merge(defaulted_right) == defaulted_right
     puts "Hash#deep_merge caller contract passed"
   end
 end

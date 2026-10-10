@@ -5,8 +5,8 @@ module ActiveSupport
   def self.deep_merge(left, other_hash)
     merged = left.dup
     other_hash.each do |key, other_value|
-      current_value = left[key]
-      if current_value.is_a?(Hash) && other_value.is_a?(Hash)
+      if left.key?(key) && left[key].is_a?(Hash) && other_value.is_a?(Hash)
+        current_value = left[key]
         merged[key] = ActiveSupport.deep_merge(current_value, other_value)
       else
         merged[key] = other_value

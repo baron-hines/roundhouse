@@ -45,4 +45,11 @@ class HashDeepMergeTest < Minitest::Test
     assert_equal right, ActiveSupport.deep_merge({}, right)
     assert_equal({}, ActiveSupport.deep_merge({}, {}))
   end
+
+  def test_absent_keys_do_not_merge_hash_defaults
+    left = Hash.new({ nested: { default: true } })
+    right = { missing: { nested: { right: true } } }
+
+    assert_equal right, ActiveSupport.deep_merge(left, right)
+  end
 end
