@@ -89,6 +89,8 @@ corpus pin and the manual inventory are unchanged.
    not Positionable's complete locking/rebalancing behavior or native Writebook.
    A second emitted probe exercises scoped SQL extrema, first/end and block
    reordering, neighbor lookup, SQLite `with_lock`, and explicit rebalance SQL.
+   Scalar and grouped extrema cast decimal columns to the model's `Float`
+   contract, alongside schema-backed boolean and temporal conversions.
    Extrema analysis uses schema types for visible relation chains; locals and
    named scopes whose grouping state is not visible remain an inference gap.
    It deliberately does not claim deferred `after_save_commit` timing inside

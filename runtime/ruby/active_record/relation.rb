@@ -1434,9 +1434,11 @@ module ActiveRecord
     # Raw aggregate rows need the same schema-selected conversions as
     # hydrated model fields; otherwise SQLite returns temporal values as text.
     def cast_schema_value(value, column)
+      return nil if value.nil?
       return ActiveSupport.cast_boolean(value) if @model.schema_boolean_columns.include?(column)
       return ActiveSupport.parse_db_time(value) if @model.schema_time_columns.include?(column)
       return ActiveSupport.parse_db_date(value) if @model.schema_date_columns.include?(column)
+      return value.to_f if @model.schema_decimal_columns.include?(column)
       value
     end
     private :cast_schema_value

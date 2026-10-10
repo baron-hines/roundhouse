@@ -583,7 +583,7 @@ puts "macro runtime parity passed"
 fn emitted_positioning_runs_reorder_block_move_lock_and_rebalance() {
     let run = emit_and_run::real_blog()
         .write("app/models/concerns/positioning_concern.rb", POSITIONING_CONCERN)
-        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.integer \"order\"\n    t.date \"archived_on\"\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
+        .edit("db/schema.rb", "t.string \"commenter\"", "t.string \"commenter\"\n    t.float \"position_score\", default: 0.0, null: false\n    t.decimal \"decimal_score\", precision: 8, scale: 3\n    t.integer \"order\"\n    t.date \"archived_on\"\n    t.boolean \"active\", default: true, null: false\n    t.boolean \"featured\"")
         .edit("app/models/comment.rb", "  belongs_to :article", "  belongs_to :article\n  include PositioningConcern\n  positioned_within :article, association: :comments, filter: :active\n\n  def created_at\n    \"display timestamp\"\n  end\n\n  def minimum_created_at_iso8601\n    (Comment.where(article_id: article_id).minimum(:created_at) || Time.current).iso8601\n  end\n\n  def active_extrema_keys\n    Comment.where(article_id: article_id).group(:active).minimum(:position_score).keys\n  end")
         .run_ruby(r#"
 article = Article.create!(title: "Positioning owner", body: "A sufficiently long article body")
@@ -606,6 +606,11 @@ raise "composite boolean keys" unless siblings.call(article).group(:article_id, 
 raise "grouped extrema ignores ordering" unless siblings.call(article).order(:position_score).group(:article_id).minimum(:position_score) == { article.id => 1.0 }
 raise "nullable boolean group key" unless siblings.call(article).group(:featured).minimum(:position_score) == { nil => 1.0 }
 raise "boolean extrema" unless siblings.call(article).minimum(:active) == false && siblings.call(article).maximum(:active) == true
+items[0].update!(decimal_score: 2.125)
+inactive.update!(decimal_score: 5.5)
+raise "decimal extrema type/value" unless siblings.call(article).minimum(:decimal_score) == 2.125 && siblings.call(article).maximum(:decimal_score) == 5.5
+raise "decimal extrema should be Float" unless siblings.call(article).minimum(:decimal_score).is_a?(Float)
+raise "grouped decimal extrema type/value" unless siblings.call(article).group(:active).minimum(:decimal_score) == { true => 2.125, false => 5.5 }
 items[0].update!(order: 7)
 items[1].update!(order: 2)
 raise "reserved aggregate column" unless siblings.call(article).minimum(:order) == 2 && siblings.call(article).maximum(:order) == 7
