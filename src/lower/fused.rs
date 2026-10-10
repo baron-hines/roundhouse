@@ -523,6 +523,8 @@ fn rewrite_view_node(
 
 fn rewrite_test_node(e: &mut Expr, skip_full_messages: bool) {
     super::save_without_validation::rewrite_node(e);
+    super::bigdecimal::rewrite_node(e);
+    super::range_enumerable::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
     super::byte_size::rewrite_node(e);
     super::dirty_predicate_kwargs::rewrite_node(e);

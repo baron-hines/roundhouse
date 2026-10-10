@@ -1617,6 +1617,37 @@ fn integer_range_enumerable_calls_go_through_to_a() {
     assert!(source.contains("(1..3).each_with_index"), "{source}");
 }
 
+/// A test body takes the same rewrites as app code: the analyzer types
+/// `(1..3).filter_map` and `2.5.to_d` there too, so without them the
+/// emitted test would call a range method or a `bigdecimal/util`
+/// reopen no target provides.
+#[test]
+fn range_and_to_d_rewrites_reach_test_bodies() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/rewrites_in_tests_test.rb",
+            r#"require "test_helper"
+
+class RewritesInTestsTest < ActiveSupport::TestCase
+  test "range and decimal calls in a test body" do
+    assert_equal [4], (1..3).filter_map { |i| i.even? ? i * 2 : nil }
+    assert_equal "0.25e1", 2.5.to_d.to_s
+  end
+end
+"#,
+        )
+        .run_test("test/models/rewrites_in_tests_test.rb")
+        .assert_passes();
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .write(
+            "test/models/rewrites_in_tests_test.rb",
+            "require \"test_helper\"\n\nclass RewritesInTestsTest < ActiveSupport::TestCase\n  test \"range\" do\n    assert_equal [4], (1..3).filter_map { |i| i.even? ? i * 2 : nil }\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let test = std::fs::read_to_string(emitted.join("test/models/rewrites_in_tests_test.rb")).expect("emitted test");
+    assert!(test.contains("(1..3).to_a.filter_map"), "{test}");
+}
+
 fn walk_files(dir: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
