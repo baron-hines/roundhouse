@@ -1440,6 +1440,53 @@ end
         .assert_passes();
 }
 
+/// `Float#to_d` / `Integer#to_d` build a BigDecimal without
+/// `bigdecimal/util`, and the decimal arithmetic after them runs:
+/// Float and Integer operands, comparison, `round`, and `floor`/`ceil`
+/// with and without digits. `0.1 + 0.2` keeps `Float#to_d`'s 16 digits.
+/// Expected values are CRuby 3.4's with bigdecimal 4.1.
+#[test]
+fn float_to_d_and_decimal_arithmetic_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/decimal\", to: \"decimals#show\"\n",
+        )
+        .write(
+            "app/controllers/decimals_controller.rb",
+            r#"class DecimalsController < ApplicationController
+  def show
+    f = params[:f].to_s.to_f
+    i = params[:i].to_s.to_i
+    g = params[:a].to_s.to_f + params[:b].to_s.to_f
+    a = BigDecimal("1.555")
+    price = f.to_d * i.to_d
+    render plain: [
+      price.to_s, (price - a).to_s, (a / 7).floor(2).to_s, a.round(2).to_s, a.round, a.floor,
+      a.ceil(1).to_s, (f - a).to_s, (i * a).to_s, a.to_f, price > a, g.to_d.to_s, (-a).abs.to_s, a.round(0),
+      a.to_d.to_s
+    ].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/decimals_controller_test.rb",
+            r#"require "test_helper"
+
+class DecimalsControllerTest < ActionDispatch::IntegrationTest
+  test "decimal arithmetic matches CRuby" do
+    get "/decimal", params: { f: "2.5", i: "3", a: "0.1", b: "0.2" }
+    assert_equal "0.75e1 0.5945e1 0.22e0 0.156e1 2 1 0.16e1 0.945e0 0.4665e1 1.555 true 0.3e0 0.1555e1 2 0.1555e1", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/decimals_controller_test.rb")
+        .assert_passes();
+}
+
 /// A job `perform_later` enqueues under the test adapter is held, not
 /// dropped, and a blockless `perform_enqueued_jobs only:` runs it
 /// (basecamp/once-campfire#296's tests). Its broadcast is JSON encoded
