@@ -659,7 +659,7 @@ fn grouped_extrema_in_a_local_relation_do_not_get_a_scalar_type() {
         .edit(
             "app/models/comment.rb",
             "  belongs_to :article",
-            "  belongs_to :article\n\n  def grouped_position_score_keys\n    grouped = Comment.where(article_id: article_id).group(:active)\n    grouped.minimum(:position_score).keys\n  end",
+            "  belongs_to :article\n\n  def grouped_position_score_keys\n    grouped = Comment.where(article_id: article_id).group(:active)\n    grouped.minimum(:position_score).keys\n    Comment.where(article_id: article_id).group(:active).load.minimum(:position_score)\n    Comment.where(article_id: article_id).group(:active).load.maximum(:position_score)\n  end",
         )
         .emit_with_app(BuildTarget::Ruby);
 
@@ -669,22 +669,24 @@ fn grouped_extrema_in_a_local_relation_do_not_get_a_scalar_type() {
         .expect("grouped extrema probe method ingested");
     let mut extrema_types = Vec::new();
     fn collect_extrema_types(expr: &roundhouse::expr::Expr, out: &mut Vec<Option<Ty>>) {
-        if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "minimum") {
+        if matches!(&*expr.node, ExprNode::Send { method, .. } if matches!(method.as_str(), "minimum" | "maximum")) {
             out.push(expr.ty.clone());
         }
         expr.node.for_each_child(&mut |child| collect_extrema_types(child, out));
     }
     collect_extrema_types(&method.body, &mut extrema_types);
-    assert_eq!(extrema_types.len(), 1, "expected one minimum call");
-    let has_schema_scalar_type = match &extrema_types[0] {
-        Some(Ty::Int | Ty::Float | Ty::Time | Ty::Date | Ty::Str | Ty::Bool) => true,
-        Some(Ty::Union { variants }) => variants
-            .iter()
-            .any(|ty| matches!(ty, Ty::Int | Ty::Float | Ty::Time | Ty::Date | Ty::Str | Ty::Bool)),
-        _ => false,
-    };
-    assert!(
-        !has_schema_scalar_type,
-        "grouping stored in a local must remain untyped until relation grouping provenance exists: {extrema_types:?}"
-    );
+    assert_eq!(extrema_types.len(), 3, "expected local, minimum, and maximum calls");
+    for ty in extrema_types {
+        let has_schema_scalar_type = match &ty {
+            Some(Ty::Int | Ty::Float | Ty::Time | Ty::Date | Ty::Str | Ty::Bool) => true,
+            Some(Ty::Union { variants }) => variants
+                .iter()
+                .any(|ty| matches!(ty, Ty::Int | Ty::Float | Ty::Time | Ty::Date | Ty::Str | Ty::Bool)),
+            _ => false,
+        };
+        assert!(
+            !has_schema_scalar_type,
+            "grouping hidden in a local or unrecognized refiner must not produce a scalar type: {ty:?}"
+        );
+    }
 }

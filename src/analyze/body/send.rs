@@ -261,6 +261,7 @@ impl<'a> BodyTyper<'a> {
                 path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::")
                     == model.0.as_str()
             }
+            ExprNode::Send { method, .. } if method.as_str() == "group" => false,
             ExprNode::Send { recv: Some(recv), method, block: None, .. }
                 if method.as_str() == "all"
                     || method.as_str() == "unscoped"
