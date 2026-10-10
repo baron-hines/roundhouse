@@ -154,6 +154,26 @@ class ActionControllerBaseTest < Minitest::Test
     assert_equal "application/json", @controller.content_type
   end
 
+  def test_head_invalid_mime_symbol_does_not_mutate_controller_or_options
+    options = {
+      location: "/articles/7",
+      content_type: :unknown_head_mime,
+      "x-custom" => "value",
+    }
+
+    assert_raises(ArgumentError) { @controller.head(:created, options) }
+
+    assert_equal 200, @controller.status
+    assert_nil @controller.location
+    assert_equal 0, @controller.headers.size
+    refute @controller.performed?
+    assert_equal({
+      location: "/articles/7",
+      content_type: :unknown_head_mime,
+      "x-custom" => "value",
+    }, options)
+  end
+
   def test_head_defaults_nil_status_to_ok
     assert_equal true, @controller.head(nil)
     assert_equal 200, @controller.status

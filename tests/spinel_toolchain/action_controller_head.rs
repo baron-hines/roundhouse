@@ -10,7 +10,7 @@ fn head_options_are_observable_in_the_native_http_response() {
         .edit(
             "config/routes.rb",
             "  root \"articles#index\"\n",
-            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/json\", to: \"head_probes#json\"\n  get \"/head-probe/negotiated\", to: \"head_probes#negotiated\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n  get \"/head-probe/unsafe-location\", to: \"head_probes#unsafe_location\"\n",
+            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/json\", to: \"head_probes#json\"\n  get \"/head-probe/negotiated\", to: \"head_probes#negotiated\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n  get \"/head-probe/unsafe-location\", to: \"head_probes#unsafe_location\"\n  get \"/head-probe/invalid-mime\", to: \"head_probes#invalid_mime\"\n",
         )
         .write(
             "app/controllers/head_probes_controller.rb",
@@ -50,6 +50,20 @@ fn head_options_are_observable_in_the_native_http_response() {
 
   def unsafe_location
     head :found, location: "/next\r\nSet-Cookie: pwned=1"
+  end
+
+  def invalid_mime
+    options = { location: "/head-probe/unchanged", content_type: :unknown_head_mime, "x-custom" => "value" }
+    begin
+      head :created, options
+    rescue ArgumentError
+      head :accepted, {
+        "x-original-status" => status.to_s,
+        "x-options-preserved" => (options[:location] == "/head-probe/unchanged" && options[:content_type] == :unknown_head_mime && options["x-custom"] == "value").to_s,
+        "x-extra-headers-empty" => (headers.size == 0).to_s,
+        "x-location-empty" => location.nil?.to_s,
+      }
+    end
   end
 end
 "#,
@@ -158,5 +172,41 @@ end
         unsafe_location.body.is_empty(),
         "body was {:?}",
         unsafe_location.body
+    );
+
+    let invalid_mime = server.get("/head-probe/invalid-mime");
+    assert_eq!(invalid_mime.status, 202, "{}", server.log());
+    assert_eq!(
+        invalid_mime
+            .headers
+            .get("x-original-status")
+            .map(String::as_str),
+        Some("200")
+    );
+    assert_eq!(
+        invalid_mime
+            .headers
+            .get("x-options-preserved")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        invalid_mime
+            .headers
+            .get("x-extra-headers-empty")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        invalid_mime
+            .headers
+            .get("x-location-empty")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        invalid_mime.body.is_empty(),
+        "body was {:?}",
+        invalid_mime.body
     );
 }

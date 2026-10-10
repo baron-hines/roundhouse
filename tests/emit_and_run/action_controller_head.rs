@@ -94,6 +94,21 @@ raise "model location status #{status}" unless status == 201
 raise "model location #{headers.inspect}" unless headers["location"] == "/articles/1"
 raise "model location body #{body.inspect}" unless body == [""]
 puts "head Rack response passed"
+
+status, headers, body = Main.run_rack(
+  "REQUEST_METHOD" => "GET",
+  "PATH_INFO" => "/head-probe/invalid-mime",
+  "QUERY_STRING" => "",
+  "HTTP_HOST" => "localhost",
+  "rack.input" => StringIO.new("")
+)
+raise "invalid MIME recovery status #{status}" unless status == 202
+raise "pre-failure status #{headers.inspect}" unless headers["x-original-status"] == "200"
+raise "options mutation #{headers.inspect}" unless headers["x-options-preserved"] == "true"
+raise "headers mutated #{headers.inspect}" unless headers["x-extra-headers-empty"] == "true"
+raise "location mutated #{headers.inspect}" unless headers["x-location-empty"] == "true"
+raise "invalid MIME body #{body.inspect}" unless body == [""]
+puts "head invalid MIME state passed"
 "#;
 
 pub fn overlay() -> emit_and_run::Overlay {
@@ -101,7 +116,7 @@ pub fn overlay() -> emit_and_run::Overlay {
         .edit(
             "config/routes.rb",
             "  root \"articles#index\"\n",
-            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/json\", to: \"head_probes#json\"\n  get \"/head-probe/negotiated\", to: \"head_probes#negotiated\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n",
+            "  root \"articles#index\"\n  get \"/head-probe\", to: \"head_probes#created\"\n  get \"/head-probe/json\", to: \"head_probes#json\"\n  get \"/head-probe/negotiated\", to: \"head_probes#negotiated\"\n  get \"/head-probe/empty\", to: \"head_probes#empty\"\n  get \"/head-probe/reset\", to: \"head_probes#reset\"\n  get \"/head-probe/not-modified\", to: \"head_probes#not_modified\"\n  get \"/head-probe/defaulted\", to: \"head_probes#defaulted\"\n  get \"/head-probe/model-location\", to: \"head_probes#model_location\"\n  get \"/head-probe/invalid-mime\", to: \"head_probes#invalid_mime\"\n",
         )
         .write(
             "app/controllers/head_probes_controller.rb",
@@ -138,6 +153,20 @@ pub fn overlay() -> emit_and_run::Overlay {
     @article = Article.create(title: "Head location", body: "A body long enough for validation.")
     head :created, location: @article
   end
+
+  def invalid_mime
+    options = { location: "/head-probe/unchanged", content_type: :unknown_head_mime, "x-custom" => "value" }
+    begin
+      head :created, options
+    rescue ArgumentError
+      head :accepted, {
+        "x-original-status" => status.to_s,
+        "x-options-preserved" => (options[:location] == "/head-probe/unchanged" && options[:content_type] == :unknown_head_mime && options["x-custom"] == "value").to_s,
+        "x-extra-headers-empty" => (headers.size == 0).to_s,
+        "x-location-empty" => location.nil?.to_s,
+      }
+    end
+  end
 end
 "#,
         )
@@ -148,4 +177,5 @@ fn head_options_are_emitted_in_the_rack_response() {
     let run = overlay().run_ruby(ASSERTIONS);
     run.assert_passes();
     assert!(run.stdout.contains("head Rack response passed"));
+    assert!(run.stdout.contains("head invalid MIME state passed"));
 }

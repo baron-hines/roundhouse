@@ -630,12 +630,14 @@ module ActionController
       raise AbstractController::DoubleRenderError if @performed
 
       status = :ok if status.nil?
-      @status = head_status_code(status)
+      status_code = head_status_code(status)
       content_type = +""
+      content_type = head_option_content_type(options[:content_type]) unless options.nil?
 
+      @status = status_code
       unless options.nil?
         location = options.delete(:location)
-        content_type = head_option_content_type(options.delete(:content_type))
+        options.delete(:content_type)
         options.each do |key, value|
           @headers[normalize_head_header_name(key.to_s)] = value.to_s
         end
