@@ -300,6 +300,69 @@ puts "public_path passed"
     assert!(run.stdout.contains("public_path passed"));
 }
 
+/// A Sidekiq worker's class-side entries run its `perform` inline, as an
+/// ActiveJob's `perform_later` does: `include Sidekiq::Job` (or `Worker`)
+/// and `sidekiq_options` leave the emitted class, `perform_in` /
+/// `perform_at` drop their delay, and a subclass of a worker is one too.
+#[test]
+fn sidekiq_workers_perform_inline() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/workers/title_worker.rb",
+            "class TitleWorker
+  include Sidekiq::Job
+  sidekiq_options queue: :low_priority, retry: 3
+
+  def perform(title)
+    Article.create!(title: title, body: \"A sufficiently long body.\")
+  end
+end
+",
+        )
+        .write(
+            "app/workers/loud_title_worker.rb",
+            "class LoudTitleWorker < TitleWorker
+  def perform(title)
+    Article.create!(title: title.upcase, body: \"A sufficiently long body.\")
+  end
+end
+",
+        )
+        .write(
+            "app/workers/legacy_title_worker.rb",
+            "class LegacyTitleWorker
+  include Sidekiq::Worker
+
+  def perform(title)
+    Article.create!(title: title + \"?\", body: \"A sufficiently long body.\")
+  end
+end
+",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.enqueue_all
+    TitleWorker.perform_async(\"now\")
+    TitleWorker.perform_in(5.minutes, \"later\")
+    LoudTitleWorker.perform_async(\"loud\")
+    LegacyTitleWorker.perform_at(1.hour.from_now, \"legacy\")
+  end
+",
+        )
+        .run_ruby(
+            r#"Article.enqueue_all
+titles = Article.all.map(&:title).sort
+raise "titles: #{titles.inspect}" unless titles == ["LOUD", "later", "legacy?", "now"]
+puts "sidekiq passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("sidekiq passed"));
+}
+
 /// A class object and its instances that define the same names: each
 /// side's call types and runs as that side's method.
 #[test]
