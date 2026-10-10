@@ -746,6 +746,11 @@ impl<'a> BodyTyper<'a> {
                             .and_then(|values| values.get(declaration))
                             .cloned()
                             .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
+                            // Not left unknown: ingest turned `Result = Struct.new(…)` into the class it defines.
+                            .or_else(|| {
+                                let id: crate::ident::ClassId = (**name).clone();
+                                self.classes().get(&id).is_some_and(|c| c.app_declared).then_some(Ty::Class { id, args: vec![] })
+                            })
                             .unwrap_or_else(unknown)
                     }
                     // An unresolved source reference may still name an

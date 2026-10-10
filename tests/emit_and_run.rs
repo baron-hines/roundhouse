@@ -1349,6 +1349,69 @@ end
         .assert_passes();
 }
 
+/// `Result = Struct.new(…)` in a class body is the class it defines:
+/// keyword members, positional members with their nil default, and the
+/// methods its block adds. Expected values are Ruby's own.
+#[test]
+fn a_struct_constant_runs_as_its_class() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/render\", to: \"renders#show\"\n",
+        )
+        .write(
+            "app/services/renderer.rb",
+            r#"class Renderer
+  Result = Struct.new(:title, :html, keyword_init: true)
+  Pair = Struct.new(:left, :right) do
+    def total
+      left + right
+    end
+  end
+
+  def call(text)
+    Result.new(title: text, html: "<p>#{text}</p>")
+  end
+
+  def pair
+    Pair.new(1, 2)
+  end
+
+  def half
+    Pair.new(3)
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/renders_controller.rb",
+            r#"class RendersController < ApplicationController
+  def show
+    result = Renderer.new.call(params[:text].to_s)
+    result.title = result.title.upcase
+    pair = Renderer.new.pair
+    render plain: [result.title, result.html, pair.total, pair.left, Renderer.new.half.right.nil?].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/renders_controller_test.rb",
+            r#"require "test_helper"
+
+class RendersControllerTest < ActionDispatch::IntegrationTest
+  test "struct constants build their classes" do
+    get "/render", params: { text: "hi" }
+    assert_equal "HI <p>hi</p> 3 1 true", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/renders_controller_test.rb")
+        .assert_passes();
+}
+
 /// A job `perform_later` enqueues under the test adapter is held, not
 /// dropped, and a blockless `perform_enqueued_jobs only:` runs it
 /// (basecamp/once-campfire#296's tests). Its broadcast is JSON encoded

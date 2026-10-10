@@ -62,13 +62,17 @@ pub fn ingest_library_classes(
     let root = result.node();
     let mut out = Vec::new();
     for (scope, class) in find_all_classes_with_scope(&root) {
-        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)?;
+        let (mut lc, struct_base) = library_class_and_struct_base(&class, &scope, file)?;
         // BEFORE the class it serves: a superclass has to be defined
         // when the `class X < Y` line runs, and these two share a file.
         if let Some(base) = struct_base {
             out.push(base);
         }
+        let structs = struct_constant_classes(&lc.name, class.body(), file)?;
+        lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         out.push(lc);
+        // Not before the owner: the struct is named under it, so the owner has to exist first.
+        out.extend(structs.into_iter().map(|(_, s)| s));
     }
     for (scope, module) in find_all_modules_with_scope(&root) {
         // A nested `ClassMethods` is not a namespace of its own — it's
@@ -80,9 +84,11 @@ pub fn ingest_library_classes(
         {
             continue;
         }
-        out.push(library_class_from_module_node_with_scope(
-            &module, &scope, file,
-        )?);
+        let mut lc = library_class_from_module_node_with_scope(&module, &scope, file)?;
+        let structs = struct_constant_classes(&lc.name, module.body(), file)?;
+        lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
+        out.push(lc);
+        out.extend(structs.into_iter().map(|(_, s)| s));
     }
     // Constants written at FILE level, outside any class — lobsters'
     // `search_parser.rb` opens with `MYISAM_STOPWORDS = %w[…]` and the
@@ -995,7 +1001,23 @@ fn struct_base_id(owner: &ClassId) -> ClassId {
 /// Every parameter defaults to nil, matching Struct: `Point.new(1)`
 /// leaves `y` nil rather than raising.
 fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
-    let base = struct_base_id(owner);
+    struct_class(
+        struct_base_id(owner),
+        members,
+        false,
+        crate::dialect::LibraryClassOrigin::StructSuperclass {
+            owner: owner.0.clone(),
+            members: members.to_vec(),
+        },
+    )
+}
+
+fn struct_class(
+    base: ClassId,
+    members: &[Symbol],
+    keyword_init: bool,
+    origin: crate::dialect::LibraryClassOrigin,
+) -> LibraryClass {
     let mut methods = Vec::new();
     for m in members {
         methods.push(synth_attr_reader(&base, m, MethodReceiver::Instance));
@@ -1004,9 +1026,12 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
     let params: Vec<Param> = members
         .iter()
         .map(|m| {
-            let mut p = Param::positional(m.clone());
-            p.default = Some(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }));
-            p
+            let nil = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil });
+            if keyword_init {
+                Param::keyword(m.clone(), Some(nil))
+            } else {
+                Param::with_default(m.clone(), nil)
+            }
         })
         .collect();
     let assigns: Vec<Expr> = members
@@ -1049,14 +1074,114 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
-        origin: Some(crate::dialect::LibraryClassOrigin::StructSuperclass {
-            owner: owner.0.clone(),
-            members: members.to_vec(),
-        }),
+        origin: Some(origin),
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
+}
+
+/// `Result = Struct.new(:a, :b, keyword_init: true) do … end` written
+/// directly in a class or module body, read as the class it defines.
+struct StructConstant<'pr> {
+    name: Symbol,
+    members: Vec<Symbol>,
+    keyword_init: bool,
+    body: Option<ruby_prism::Node<'pr>>,
+}
+
+fn struct_constants<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<StructConstant<'pr>> {
+    let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) else {
+        return Vec::new();
+    };
+    statements
+        .body()
+        .iter()
+        .filter_map(|stmt| {
+            let write = stmt.as_constant_write_node()?;
+            let spec = struct_constant_spec(&write.value())?;
+            Some(StructConstant { name: Symbol::from(constant_id_str(&write.name())), ..spec })
+        })
+        .collect()
+}
+
+fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructConstant<'pr>> {
+    let call = value.as_call_node()?;
+    if call.name().as_slice() != b"new" || constant_path_of(&call.receiver()?)? != vec!["Struct".to_string()] {
+        return None;
+    }
+    let mut members = Vec::new();
+    let mut keyword_init = false;
+    for arg in call.arguments()?.arguments().iter() {
+        if let Some(options) = arg.as_keyword_hash_node() {
+            let elements: Vec<_> = options.elements().iter().collect();
+            let [pair] = elements.as_slice() else { return None };
+            let pair = pair.as_assoc_node()?;
+            if symbol_value(&pair.key()).as_deref() != Some("keyword_init") || pair.value().as_true_node().is_none() {
+                return None;
+            }
+            keyword_init = true;
+            continue;
+        }
+        let member = symbol_value(&arg)?;
+        // Not `success?` / `valid!`: the member is also the ivar and the constructor's parameter, which cannot carry the suffix.
+        if !member.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            || !member.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        members.push(Symbol::from(member));
+    }
+    if members.is_empty() {
+        return None;
+    }
+    let body = match call.block() {
+        None => None,
+        Some(block) => {
+            let block = block.as_block_node()?;
+            if block.parameters().is_some() {
+                return None;
+            }
+            let body = block.body();
+            // Not a general block body: only `def`s become the class's methods without running anything at definition time.
+            if let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) {
+                if !statements.body().iter().all(|stmt| stmt.as_def_node().is_some()) {
+                    return None;
+                }
+            } else if body.is_some() {
+                return None;
+            }
+            body
+        }
+    };
+    Some(StructConstant { name: Symbol::from(""), members, keyword_init, body })
+}
+
+/// The classes `owner`'s body defines through `X = Struct.new(…)`, with
+/// the constant names they replace.
+fn struct_constant_classes(
+    owner: &ClassId,
+    body: Option<ruby_prism::Node<'_>>,
+    file: &str,
+) -> IngestResult<Vec<(Symbol, LibraryClass)>> {
+    let mut out = Vec::new();
+    for spec in struct_constants(body) {
+        let id = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), spec.name.as_str())));
+        let mut class = struct_class(
+            id.clone(),
+            &spec.members,
+            spec.keyword_init,
+            crate::dialect::LibraryClassOrigin::StructConstant {
+                members: spec.members.clone(),
+                keyword_init: spec.keyword_init,
+            },
+        );
+        if spec.body.is_some() {
+            class.methods.extend(walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?.methods);
+        }
+        out.push((spec.name, class));
+    }
+    Ok(out)
 }
 
 /// Same as `library_class_from_node` but for module-as-namespace
