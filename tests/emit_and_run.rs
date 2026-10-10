@@ -276,6 +276,30 @@ puts "in_batches passed"
     assert!(run.stdout.contains("in_batches passed"));
 }
 
+/// `Rails.public_path` runs as `Rails.root` does: the runtime's AppPath
+/// answers `join` and `to_s`.
+#[test]
+fn rails_public_path_joins() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.logo_path
+    Rails.public_path.join(\"images\", \"logo.png\").to_s
+  end
+",
+        )
+        .run_ruby(
+            r#"raise "logo_path: #{Article.logo_path}" unless Article.logo_path == "public/images/logo.png"
+puts "public_path passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("public_path passed"));
+}
+
 /// A class object and its instances that define the same names: each
 /// side's call types and runs as that side's method.
 #[test]
