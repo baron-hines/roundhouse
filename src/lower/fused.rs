@@ -445,6 +445,7 @@ fn rewrite_hook_node(
     super::number_to_fs::rewrite_node(e);
     super::string_inflections::rewrite_node(e);
     super::to_json::rewrite_node(e);
+    super::range_enumerable::rewrite_node(e);
     super::csv_generate::rewrite_node(e);
     super::presence_in::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
@@ -491,6 +492,7 @@ fn rewrite_view_node(
     super::number_to_fs::rewrite_node(e);
     super::string_inflections::rewrite_node(e);
     super::to_json::rewrite_node(e);
+    super::range_enumerable::rewrite_node(e);
     super::csv_generate::rewrite_node(e);
     super::presence_in::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
