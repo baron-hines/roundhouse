@@ -48,6 +48,8 @@ assert(runtime_many == rails_many && seen == rails_seen, "many? must match Rails
   ["already squished", "already squished"],
   [" \t\n ", ""],
   ["\u00a0wide\u2003spacing\u2028", "wide spacing"],
+  ["foo\0", "foo"],
+  ["foo \0", "foo"],
 ].each do |input, expected|
   runtime_string = input.dup
   runtime_result = ActiveSupport.squish!(runtime_string)

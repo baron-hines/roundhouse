@@ -100,6 +100,7 @@ fn emit_squish_bang(m: &MethodDef) -> String {
                  out.push(ch);\n\
              }}\n\
          }}\n\
+         out = out.trim_matches(|ch| ch == '\\0' || ch == ' ').to_owned();\n\
          *{name} = out;\n\
          {name}\n\
          }}\n"

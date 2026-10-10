@@ -97,7 +97,10 @@ fn active_support_squish_bang_emits_for_rust() {
         "ActiveSupport.squish! must emit a mutating Rust function:\n{emitted}"
     );
 
-    let scratch = std::env::temp_dir().join("roundhouse-runtime-rust-squish-bang");
+    let scratch = std::env::temp_dir().join(format!(
+        "roundhouse-runtime-rust-squish-bang-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&scratch).expect("create generated Rust scratch directory");
     let source = format!(
         r#"{emitted}
@@ -125,6 +128,23 @@ fn squish_bang_handles_unicode_and_noop_values() {{
     assert_eq!(result, "already squished");
     assert_eq!(result as *const String, receiver);
     assert_eq!(unchanged, "already squished");
+}}
+
+#[test]
+fn squish_bang_strips_rails_nul_boundaries() {{
+    let mut trailing_nul = "foo\0".to_string();
+    let receiver = &trailing_nul as *const String;
+    let result = squish_bang(&mut trailing_nul);
+    assert_eq!(result, "foo");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(trailing_nul, "foo");
+
+    let mut space_then_nul = "foo \0".to_string();
+    let receiver = &space_then_nul as *const String;
+    let result = squish_bang(&mut space_then_nul);
+    assert_eq!(result, "foo");
+    assert_eq!(result as *const String, receiver);
+    assert_eq!(space_then_nul, "foo");
 }}
 "#
     );
