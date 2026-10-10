@@ -5277,6 +5277,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         // previewer capture. Port for Spinel; CRuby/JRuby swap to the
         // default gem below. BUNDLED also lists Timeout → "timeout".
         "timeout",
+        // `I18n.locale` / `default_locale` — the locale campfire folds
+        // into its cache keys. Rails' default, `:en`; setting one is
+        // not modeled (see the file's header).
+        "i18n",
     ] {
         let rb = format!("runtime/ruby/{stem}.rb");
         let content = crate::runtime_files::read_to_string(&rb)?;

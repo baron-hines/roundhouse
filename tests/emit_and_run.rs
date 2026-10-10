@@ -9636,3 +9636,87 @@ raise "count #{Comment.where(article_id: article.id).count}" unless Comment.wher
 "#)
         .assert_passes();
 }
+
+/// campfire's `MessagesController#create` from 2c53c46 on: the
+/// controller renders the message once, hands the markup to a concern
+/// method by keyword (`broadcast_create(html:)`), which broadcasts it
+/// with `**(html ? { html: html } : {})`, and the turbo-stream view
+/// appends the same String (`turbo_stream.append target, @html`). Its
+/// cache layer folds `I18n.locale` into keys and copies response headers
+/// by downcased name (`response.headers.slice(*CACHE_HEADERS)`).
+///
+/// Before: the keyword reached the flattened `broadcast_create(html =
+/// nil)` as a Hash, `broadcast_append_to` with that option was left
+/// unlowered (undefined on the record), the view looked for a
+/// `message_htmls/_message_html` partial, `I18n` was undefined, and
+/// `headers["ETag"]` / `headers["etag"]` were two headers.
+#[test]
+fn rendered_markup_reaches_the_broadcast_and_the_stream_as_given() {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  post \"/articles/:article_id/comments/:id/announce\", to: \"comments#announce\", as: :announce_article_comment\n  resources :articles do\n")
+        .edit("app/models/comment.rb", "  belongs_to :article\n", "  include Announces\n  belongs_to :article\n")
+        .write("app/models/comment/announces.rb", r##"module Comment::Announces
+  def announce(html: nil)
+    broadcast_append_to article, :announcements, target: [ article, :announcements ], **(html ? { html: html } : {})
+  end
+end
+"##)
+        .edit("app/controllers/comments_controller.rb", "  def destroy\n", r##"  def announce
+    @comment = @article.comments.find(params[:id])
+    @comment_html = render_to_string partial: "comments/comment", formats: :html, locals: { comment: @comment }
+    @comment.announce(html: @comment_html)
+    response.headers["X-Probe"] = "first"
+    response.headers["x-probe"] = "second"
+    response.headers["X-Gone"] = "soon"
+    response.headers.delete("x-gone")
+    response.headers["X-Copied"] = response.headers.slice("X-PROBE", "x-absent").map { |name, value| "#{name}=#{value}" }.join(",")
+    response.headers["X-Locale"] = I18n.locale.to_s
+  end
+
+  def destroy
+"##)
+        .write("app/views/comments/announce.turbo_stream.erb", "<%= turbo_stream.append dom_id(@comment.article, :announcements), @comment_html %>\n")
+        .write("test/controllers/announcements_controller_test.rb", r##"require "test_helper"
+
+class AnnouncementsControllerTest < ActionDispatch::IntegrationTest
+  setup do
+    @article = Article.create!(title: "Announced", body: "A sufficiently long article body.")
+    @comment = @article.comments.create!(commenter: "Ann", body: "Said <b>once</b>")
+    @stream = "#{@article.to_gid_param}:announcements"
+  end
+
+  test "the rendered comment is broadcast and streamed as given" do
+    post announce_article_comment_url(@article, @comment, format: :turbo_stream)
+    assert_response :success
+    assert_includes response.body, %(<turbo-stream action="append" target="announcements_article_#{@article.id}">)
+    assert_includes response.body, %(<div id="comment_#{@comment.id}")
+    assert_includes response.body, "Said &lt;b&gt;once&lt;/b&gt;"
+    assert_not_includes response.body, "&lt;div"
+
+    sent = ActionCable.server.pubsub.broadcasts(@stream).map { |broadcast| JSON.parse(broadcast) }
+    assert_equal 1, sent.size
+    assert_includes sent.first, %(<div id="comment_#{@comment.id}")
+    assert_not_includes sent.first, "&lt;div"
+  end
+
+  test "header names match without regard to case" do
+    post announce_article_comment_url(@article, @comment, format: :turbo_stream)
+    assert_equal "second", response.headers["X-Probe"]
+    assert_nil response.headers["X-Gone"]
+    assert_equal "x-probe=second", response.headers["X-Copied"]
+    assert_equal "en", response.headers["X-Locale"]
+  end
+
+  test "markup handed in replaces the partial, and without it the partial renders" do
+    @comment.announce(html: "<p>handed in</p>")
+    @comment.announce
+    sent = ActionCable.server.pubsub.broadcasts(@stream).map { |broadcast| JSON.parse(broadcast) }
+    assert_equal 2, sent.size
+    assert_includes sent.first, "<p>handed in</p>"
+    assert_includes sent.last, %(<div id="comment_#{@comment.id}")
+  end
+end
+"##)
+        .run_test("test/controllers/announcements_controller_test.rb")
+        .assert_passes();
+}

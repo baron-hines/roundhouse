@@ -7517,6 +7517,10 @@ fn require_path_for_body_const(
         // constant is actionpack's, not the stdlib's, so no bare
         // `require` reaches it on the ruby family either.
         "Mime" => Some("runtime/mime".to_string()),
+        // `I18n` — the i18n gem's locale accessors, in
+        // `runtime/ruby/i18n.rb`. No Rails is loaded on these trees, so
+        // nothing else defines the constant.
+        "I18n" => Some("runtime/i18n".to_string()),
         // `useragent` + `platform_agent`, PORTED into
         // `runtime/ruby/user_agent.rb` — they were façades that raised
         // until campfire's room page turned out to render all three PWA
