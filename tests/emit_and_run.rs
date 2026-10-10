@@ -1353,9 +1353,9 @@ end
         .assert_passes();
 }
 
-/// `Result = Struct.new(…)` in a class body is the class it defines:
-/// keyword members, positional members with their nil default, and the
-/// methods its block adds. Expected values are Ruby's own.
+/// `Result = Struct.new(…, keyword_init: true)` in a class body is the
+/// class it defines: its members, their nil default, and the methods
+/// its block adds. Expected values are Ruby's own.
 #[test]
 fn a_struct_constant_runs_as_its_class() {
     emit_and_run::real_blog()
@@ -1368,7 +1368,7 @@ fn a_struct_constant_runs_as_its_class() {
             "app/services/renderer.rb",
             r#"class Renderer
   Result = Struct.new(:title, :html, keyword_init: true)
-  Pair = Struct.new(:left, :right) do
+  Pair = Struct.new(:left, :right, keyword_init: true) do
     def total
       left + right
     end
@@ -1379,11 +1379,11 @@ fn a_struct_constant_runs_as_its_class() {
   end
 
   def pair
-    Pair.new(1, 2)
+    Pair.new(left: 1, right: 2)
   end
 
   def half
-    Pair.new(3)
+    Pair.new(left: 3)
   end
 end
 "#,

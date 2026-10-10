@@ -1208,12 +1208,14 @@ fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructCons
         // Not `success?` / `valid!`: the member is also the ivar and the constructor's parameter, which cannot carry the suffix.
         if !member.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
             || !member.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || crate::emit::ruby::expr::is_ruby_keyword(&member)
         {
             return None;
         }
         members.push(Symbol::from(member));
     }
-    if members.is_empty() {
+    // Not the positional form: since Ruby 3.2 it takes keywords too, which a positional constructor would bind to its first member.
+    if members.is_empty() || !keyword_init {
         return None;
     }
     let body = match call.block() {
