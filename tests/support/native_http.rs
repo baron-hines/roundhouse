@@ -114,10 +114,9 @@ impl Server {
         Response { status, body }
     }
 
-    /// A GET with one additional request header.
-    pub fn get_with_header(&self, path: &str, name: &str, value: &str) -> Response {
-        let headers = [(name, value)];
-        let (status, _, body) = self.send("GET", path, &headers, "");
+    /// A GET with additional request headers.
+    pub fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Response {
+        let (status, _, body) = self.send("GET", path, headers, "");
         Response { status, body }
     }
 

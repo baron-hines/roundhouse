@@ -51,7 +51,12 @@ fn dispatched_request_headers_are_visible_to_headers_api_natively() {
             "app/controllers/request_headers_controller.rb",
             r#"class RequestHeadersController < ApplicationController
   def show
-    render plain: request.headers["Accept-Encoding"].to_s
+    render plain: [
+      request.headers["Accept-Encoding"].to_s,
+      request.headers["If-None-Match"].to_s,
+      request.headers["If-Modified-Since"].to_s,
+      request.headers["Turbo-Frame"].to_s
+    ].join("|")
   end
 end
 "#,
@@ -60,9 +65,18 @@ end
     assert!(errors.is_empty(), "{errors:?}");
     native_http::build(&tree);
     let server = native_http::Server::start(&tree);
-    let response = server.get_with_header("/request-header", "Accept-Encoding", "br, gzip");
+    let headers = [
+        ("Accept-Encoding", "br, gzip"),
+        ("If-None-Match", "W/\"etag\""),
+        ("If-Modified-Since", "Sat, 10 Oct 2026 00:00:00 GMT"),
+        ("Turbo-Frame", "room_messages"),
+    ];
+    let response = server.get_with_headers("/request-header", &headers);
     assert_eq!(response.status, 200, "{}\n{}", response.body, server.log());
-    assert_eq!(response.body, "br, gzip");
+    assert_eq!(
+        response.body,
+        "br, gzip|W/\"etag\"|Sat, 10 Oct 2026 00:00:00 GMT|room_messages"
+    );
 }
 
 #[test]

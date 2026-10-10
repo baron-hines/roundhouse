@@ -442,6 +442,9 @@ if __FILE__ == $PROGRAM_NAME
     # dispatch depends on has to be named here.
     "HTTP_ACCEPT"    => ENV["HTTP_ACCEPT"],
     "HTTP_ACCEPT_ENCODING" => ENV["HTTP_ACCEPT_ENCODING"],
+    "HTTP_IF_NONE_MATCH" => ENV["HTTP_IF_NONE_MATCH"],
+    "HTTP_IF_MODIFIED_SINCE" => ENV["HTTP_IF_MODIFIED_SINCE"],
+    "HTTP_TURBO_FRAME" => ENV["HTTP_TURBO_FRAME"],
     # The forgery check's two headers (runtime/request_forgery_protection.rb).
     "HTTP_X_CSRF_TOKEN" => ENV["HTTP_X_CSRF_TOKEN"],
     "HTTP_ORIGIN"       => ENV["HTTP_ORIGIN"],
