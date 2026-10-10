@@ -56,6 +56,10 @@ mod controller_super_ivars;
 mod assoc_pluck_typed;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
+#[path = "support/campfire_caches.rs"]
+mod campfire_caches_contract;
+#[path = "emit_and_run/campfire_caches.rs"]
+mod campfire_caches;
 #[path = "emit_and_run/action_text_markdown.rs"]
 mod action_text_markdown;
 
@@ -3016,6 +3020,8 @@ fn assert_cached_collection_probe(n: i64, second: i64) {
 Article.delete_all
 {n}.times {{ |i| Article.create!(title: "row-#{{i}}", body: "long enough body") }}
 rows = ActiveRecord::Relation.new(Article).to_a.sort_by {{ |a| a.title }}
+ActionController::Base.perform_caching = true
+ActionController::Current.controller = ActionController::Base.new
 Article.reset_render_count
 a = Views::Articles.probe(rows)
 raise "first #{{Article.render_count}}: #{{a}}" unless Article.render_count == {n}
@@ -9209,12 +9215,19 @@ class TestEnvironmentsControllerTest < ActionDispatch::IntegrationTest
     subscriber = ActiveSupport::Notifications.subscribe(/\Acache_(read|write)\.active_support\z/) do |*, payload|
       keys << payload[:key]
     end
-    get articles_url
-    assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
-    ActiveSupport::Notifications.unsubscribe(subscriber)
-    heard = keys.size
-    get articles_url
-    assert_equal heard, keys.size
+    previous_caching = ActionController::Base.perform_caching
+    ActionController::Base.perform_caching = true
+    begin
+      get articles_url
+      assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
+      heard = keys.size
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+      get articles_url
+      assert_equal heard, keys.size
+    ensure
+      ActionController::Base.perform_caching = previous_caching
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
   end
 
   test "freeze_time stops Time.current on the instant records are stamped with" do
@@ -9286,6 +9299,9 @@ class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
     server.close
     assert_nil IO.select(nil, nil, nil, 0.01.seconds)
     assert_equal :ok, Timeout.timeout(1.second) { :ok }
+    http = Net::HTTP.new("127.0.0.1", 80)
+    http.open_timeout = 1.second
+    assert_equal 1.0, http.open_timeout
     assert_equal 1.5, (2.seconds - 0.5).to_f
     assert_equal 1.5, (2.seconds - 0.5.seconds).to_f
     assert_operator 1.second, :<, 2

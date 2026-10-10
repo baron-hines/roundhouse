@@ -829,21 +829,12 @@ end
 # a memory store and turns caching on around one block, through Rails'
 # four knobs, then asserts a cached page runs no presentation queries.
 # The runtime fragment-caches message partials in its own store; these
-# give the test the settings it reads and restores. `MemoryStore` is the
-# store class `Rails.cache` already answers with on this tree.
+# give the test the settings it reads and restores. A fresh
+# `ActiveSupport::Cache::MemoryStore` (runtime/active_support_cache.rb) is
+# a `Rails::Cache`, so it can stand in for `Rails.cache` here.
 module Rails
   def self.cache=(store)
     @cache_store = store
-  end
-end
-
-module ActiveSupport
-  module Cache
-    class MemoryStore
-      def self.new
-        Rails.cache.class.new
-      end
-    end
   end
 end
 
@@ -859,25 +850,11 @@ module ActionView
   end
 end
 
-module ActionController
-  class Base
-    def self.cache_store
-      @cache_store
-    end
-
-    def self.cache_store=(store)
-      @cache_store = store
-    end
-
-    def self.perform_caching
-      @perform_caching
-    end
-
-    def self.perform_caching=(value)
-      @perform_caching = value
-    end
-  end
-end
+# Rails' test environment does not cache fragments
+# (`config.action_controller.perform_caching = false` in a generated
+# `config/environments/test.rb`); a test turns it on around a block. The
+# knob itself is runtime/action_controller_fragment_caching.rb's.
+ActionController::Base.perform_caching = false
 
 # ---- Query assertions ------------------------------------------------
 #

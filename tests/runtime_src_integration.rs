@@ -880,7 +880,11 @@ fn every_runtime_method_body_concretely_typed() {
     // adapter value is column-dependent, and its `to_f` conversion is the
     // schema-selected Ruby boundary that matches the model's Float contract.
     // The emitted regression covers scalar and grouped decimal extrema.
-    const CEILING: usize = 334;
+    // Canonical main ae7bf6cf measures 334 sites; #720's Ruby runtime
+    // additions contribute 39 more, primarily from generic JSON, deep_dup,
+    // session and request-environment values. Keep those intentional dynamic
+    // boundaries visible in the measured combined ceiling.
+    const CEILING: usize = 373;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

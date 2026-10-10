@@ -166,6 +166,10 @@ pub enum ReturnKind {
     /// another Hash shape enters the catalog, generalize to a
     /// `HashOf(PrimKind, PrimKind)` variant.
     HashSymStr,
+    /// Returns `Hash<Str, untyped>`. Example:
+    /// `#attributes_before_type_cast` — each column's raw stored value,
+    /// String-keyed as Rails keys it.
+    HashStrUntyped,
     /// Returns `Array<Sym>`. Example: `.schema_column_names` on
     /// an ActiveRecord class — the schema column list the lowerer
     /// will emit per-model once `Base`'s `attr_accessor` override
@@ -962,6 +966,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::HashSymStr),
+    },
+    CatalogedMethod {
+        name: "attributes_before_type_cast",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
     },
     CatalogedMethod {
         name: "errors",
