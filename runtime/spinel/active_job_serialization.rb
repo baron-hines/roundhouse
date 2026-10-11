@@ -7,7 +7,7 @@
 # JSON primitives as themselves; `Payload.build` writes the hash
 # `ActiveJob::Core#serialize` returns (activejob 8.1.3). That is the
 # shape Rails hands Sidekiq, so a payload built here is one a Rails
-# worker could run. `tests/active_job_rails_conformance.rs` holds both
+# worker could run. `tests/active_job_payload.rs` holds both
 # halves to Rails' own output.
 #
 # WRITERS ANSWER JSON TEXT, NOT VALUES. A job's arguments are
