@@ -3240,8 +3240,20 @@ fn ruby_family_runtime_files(
     // time — campfire's suite went 219/240 to 0/240, every file dying
     // on the same line.
     let sidekiq = needs_redis(app);
+    // On these lanes the redis gem is required at the first push, not at
+    // boot: a tree whose tests record pushes through `SidekiqPush`'s seam
+    // then boots without the gem installed. Spinel resolves requires at
+    // compile time, so its tree keeps the file's top-level require.
     let sidekiq_client = if sidekiq {
-        crate::runtime_files::read_to_string(SIDEKIQ_REDIS_CLIENT)?
+        let client = crate::runtime_files::read_to_string(SIDEKIQ_REDIS_CLIENT)?;
+        const AT_LOAD: &str = "require \"redis\"\n";
+        const OPEN: &str = "    conn = password == \"\" ? Redis.new(url: url) : Redis.new(url: url, password: password)\n";
+        if !client.contains(AT_LOAD) || !client.contains(OPEN) {
+            return Err(format!("{SIDEKIQ_REDIS_CLIENT}: the require or the connect line moved"));
+        }
+        client
+            .replacen(AT_LOAD, "# `require \"redis\"` is at the first connect on this lane.\n", 1)
+            .replacen(OPEN, &format!("    require \"redis\"\n{OPEN}"), 1)
     } else {
         String::new()
     };
