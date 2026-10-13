@@ -982,3 +982,33 @@ fn read_rest(codec: &Codec, from: usize) -> String {
         }
     }
 }
+
+/// The one warning a target that doesn't honor `queue_adapter :sidekiq`
+/// files for an app on it: the strict targets have no Sidekiq push, so
+/// the app's jobs run in process there. Only for an app with ActiveJob
+/// jobs; one whose background work is all native Sidekiq workers has
+/// nothing to say it about. Decided by the host, which knows the target
+/// (`src/bin/roundhouse.rs`), as `elevate_nested_params_for_target` is.
+pub fn sidekiq_adapter_target_warning(
+    app: &App,
+    target: crate::project::BuildTarget,
+) -> Option<crate::diagnostic::Diagnostic> {
+    use crate::project::BuildTarget;
+    if app.queue_adapter.as_deref() != Some("sidekiq") || app.job_plans.is_empty() {
+        return None;
+    }
+    if matches!(target, BuildTarget::Spinel | BuildTarget::Ruby | BuildTarget::Jruby) {
+        return None;
+    }
+    Some(crate::lower::residue_diagnostic(
+        "job_payload",
+        "sidekiq-adapter-not-honored",
+        crate::span::Span::synthetic(),
+        "adapter not modeled on this target",
+        format!(
+            "job_payload: queue_adapter :sidekiq is honored on ruby, jruby and spinel; \
+             on {} the app's jobs run in process",
+            target.as_str()
+        ),
+    ))
+}

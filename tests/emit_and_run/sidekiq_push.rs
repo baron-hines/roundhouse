@@ -309,3 +309,59 @@ fn an_unplannable_job_is_an_error_only_under_sidekiq() {
     let (_, errors) = overlay().emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
 }
+
+/// The targets with no Sidekiq push say so once per app on `:sidekiq`,
+/// and only when the app has jobs; the Ruby family says nothing. A
+/// strict target's tree is the same with or without the adapter.
+#[test]
+fn strict_targets_warn_once_and_emit_the_same_tree() {
+    use roundhouse::lower::job_payload::sidekiq_adapter_target_warning;
+    let (_, app, _) = on_sidekiq().emit_with_app(BuildTarget::Ruby);
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        assert!(sidekiq_adapter_target_warning(&app, target).is_none(), "{}", target.as_str());
+    }
+    let strict = [BuildTarget::Go, BuildTarget::Rust, BuildTarget::Typescript, BuildTarget::Elixir, BuildTarget::Crystal];
+    for target in strict {
+        let w = sidekiq_adapter_target_warning(&app, target).expect("a warning");
+        assert_eq!(w.severity, roundhouse::diagnostic::Severity::Warning);
+        assert!(w.message.contains(target.as_str()), "{}", w.message);
+    }
+
+    let (_, no_jobs, _) = emit_and_run::real_blog()
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit_with_app(BuildTarget::Ruby);
+    assert!(sidekiq_adapter_target_warning(&no_jobs, BuildTarget::Go).is_none());
+
+    let tree = |overlay: emit_and_run::Overlay| {
+        let (emitted, errors) = overlay.emit(BuildTarget::Go);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let mut files = Vec::new();
+        let mut stack = vec![emitted.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(emitted.as_path()).unwrap().display().to_string();
+                    files.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        files.sort();
+        files
+    };
+    let plain = emit_and_run::real_blog()
+        .write("app/jobs/article_job.rb", JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", ENQUEUE);
+    let with = tree(on_sidekiq());
+    let without = tree(plain);
+    assert_eq!(with.len(), without.len(), "file count");
+    for ((p1, c1), (p2, c2)) in with.iter().zip(&without) {
+        assert_eq!(p1, p2);
+        if p1.contains("production") {
+            continue;
+        }
+        assert!(c1 == c2, "{p1} differs with :sidekiq on go");
+    }
+}
