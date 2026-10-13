@@ -272,3 +272,99 @@ fn strict_targets_warn_once_and_emit_the_same_tree() {
         assert!(c1 == c2, "{p1} differs with :sidekiq on go");
     }
 }
+
+const SET_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_job
+    ArticleJob.perform_later(self)
+  end
+
+  def enqueue_variants
+    ArticleJob.set(wait: 5.minutes).perform_later(self)
+    ArticleJob.set(wait: 90).perform_later(self)
+    ArticleJob.set(wait_until: Time.now + 3600).perform_later(self)
+    ArticleJob.set(wait_until: Time.now - 60).perform_later(self)
+    ArticleJob.set(queue: :low).perform_later(self)
+    ArticleJob.set(queue: "critical", wait: 30.seconds).perform_later(self)
+  end
+"##;
+
+const SET_SCRIPT: &str = r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+article = Article.create!(title: "Scheduled title", body: "A long enough article body.")
+t0 = Time.now.to_f
+article.enqueue_variants
+lines = SidekiqPush.recorded
+def env(line)
+  JSON.parse(line.split(" ", 4).last)
+end
+zadds = lines.select { |l| l.start_with?("zadd ") }
+lpushes = lines.select { |l| l.start_with?("lpush ") }
+raise "zadds #{zadds.length} #{lines.inspect}" unless zadds.length == 4
+raise "lpushes #{lpushes.length}" unless lpushes.length == 2
+score = ->(l) { l.split(" ", 4)[2].to_f }
+raise "5.minutes #{score.(zadds[0]) - t0}" unless (score.(zadds[0]) - t0 - 300).abs < 5
+raise "90 #{score.(zadds[1]) - t0}" unless (score.(zadds[1]) - t0 - 90).abs < 5
+raise "wait_until #{score.(zadds[2]) - t0}" unless (score.(zadds[2]) - t0 - 3600).abs < 5
+raise "queue+wait #{score.(zadds[3]) - t0}" unless (score.(zadds[3]) - t0 - 30).abs < 5
+raise "queue+wait queue" unless env(zadds[3])["queue"] == "critical" && env(zadds[3])["args"][0]["queue_name"] == "critical"
+raise "scheduled_at" unless env(zadds[0])["args"][0]["scheduled_at"].is_a?(String) && !env(zadds[0]).key?("enqueued_at")
+due = lpushes[0]
+raise "due #{due}" unless due.start_with?("lpush queue:default ") && env(due)["args"][0]["scheduled_at"].is_a?(String)
+low = lpushes[1]
+raise "low #{low}" unless low.start_with?("lpush queue:low ") && env(low)["args"][0]["queue_name"] == "low"
+raise "queues" unless lines.include?("sadd queues low") && lines.include?("sadd queues default")
+puts "set options passed"
+"##;
+
+/// `set(wait:, wait_until:, queue:)` under `:sidekiq`: a wait or a
+/// future time is a ZADD at the right score, a time already past is
+/// pushed at once with its `scheduled_at`, and `queue:` sets both the
+/// envelope's queue and the ActiveJob `queue_name`. The sites are
+/// honored, so they file no `job-set-options` warning.
+#[test]
+fn set_options_schedule_and_route_the_push() {
+    let run = on_sidekiq()
+        .edit("app/models/article.rb", ENQUEUE, SET_ENQUEUE)
+        .run_ruby(SET_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("set options passed"), "{}", run.stdout);
+    let job = read(&run.emitted, "app/models/article_job.rb");
+    assert!(job.contains("def self.perform_later_with(at, queue, article)"), "{job}");
+    assert!(job.contains("JobRegistry.push_article_job(queue, at, article)"), "{job}");
+}
+
+const PRIORITY_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_job
+    ArticleJob.set(priority: 10, queue: :low).perform_later(self)
+  end
+"##;
+
+const DYNAMIC_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_job(options)
+    ArticleJob.set(options).perform_later(self)
+  end
+"##;
+
+/// `priority:` is dropped with a warning (Sidekiq ignores it); a
+/// `set(...)` that isn't literal options is an error under `:sidekiq`,
+/// because the job would run early or on the wrong queue.
+#[test]
+fn priority_warns_and_a_computed_set_is_an_error() {
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/jobs/article_job.rb", JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", PRIORITY_ENQUEUE)
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/jobs/article_job.rb", JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", DYNAMIC_ENQUEUE)
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit(BuildTarget::Ruby);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].contains("can't be honored"), "{errors:#?}");
+}
