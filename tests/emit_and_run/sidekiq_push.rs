@@ -9,21 +9,21 @@ use roundhouse::project::BuildTarget;
 
 use super::emit_and_run;
 
-const JOB: &str = r#"class ArticleJob < ApplicationJob
+const JOB: &str = r##"class ArticleJob < ApplicationJob
   queue_as :default
 
   def perform(article)
     article.title
   end
 end
-"#;
+"##;
 
-const ENQUEUE: &str = r#"  validates :title, presence: true
+const ENQUEUE: &str = r##"  validates :title, presence: true
 
   def enqueue_job
     ArticleJob.perform_later(self)
   end
-"#;
+"##;
 
 const SIDEKIQ: &str = "  config.active_job.queue_adapter = :sidekiq\n";
 
@@ -190,4 +190,122 @@ fn application_job_on_sidekiq_gets_a_redis_client() {
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(read(&emitted, "Gemfile").contains("gem \"redis\""));
     assert!(read(&emitted, "runtime/job_registry.rb").contains("  def self.sidekiq?\n    true\n  end\n"));
+}
+
+const PUSH_SCRIPT: &str = r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+article = Article.create!(title: "Pushed title", body: "A long enough article body.")
+article.enqueue_job
+got = SidekiqPush.recorded
+raise "recorded #{got.inspect}" unless got.length == 2 && got[0] == "sadd queues default"
+verb, key, json = got[1].split(" ", 3)
+raise "#{verb} #{key}" unless verb == "lpush" && key == "queue:default"
+env = JSON.parse(json)
+raise "class #{env["class"]}" unless env["class"] == "Sidekiq::ActiveJob::Wrapper"
+raise "wrapped #{env["wrapped"]}" unless env["wrapped"] == "ArticleJob" && env["queue"] == "default"
+aj = env["args"][0]
+gid = "gid://#{Rails.application.global_id_app}/Article/#{article.id}"
+raise "arguments #{aj["arguments"]}" unless aj["arguments"] == [{ "_aj_globalid" => gid }]
+raise "queue_name #{aj["queue_name"]}" unless aj["queue_name"] == "default" && aj["scheduled_at"].nil?
+raise "queued in process too" unless ActiveJob.pending_count == 0
+puts "sidekiq push passed"
+"##;
+
+/// Under `:sidekiq` the job's `perform_later` pushes its payload in
+/// Sidekiq's envelope, recorded here through `SidekiqPush`'s seam (no
+/// Redis, no redis gem), and nothing is queued in process.
+#[test]
+fn perform_later_pushes_the_payload_to_redis() {
+    let run = on_sidekiq().run_ruby(PUSH_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("sidekiq push passed"), "{}", run.stdout);
+    let job = read(&run.emitted, "app/models/article_job.rb");
+    assert!(job.contains("JobRegistry.push_article_job(\"default\", 0.0, "), "{job}");
+    let registry = read(&run.emitted, "runtime/job_registry.rb");
+    assert!(registry.contains("def self.push_article_job(queue, at, article)"), "{registry}");
+}
+
+const COMMIT_JOB: &str = r##"class CommitJob < ApplicationJob
+  self.enqueue_after_transaction_commit = true
+
+  def perform(article)
+    article.title
+  end
+end
+"##;
+
+const COMMIT_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_commit_job
+    CommitJob.perform_later(self)
+  end
+"##;
+
+const COMMIT_SCRIPT: &str = r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+Article.transaction do
+  article = Article.create!(title: "Committed title", body: "A long enough article body.")
+  article.enqueue_commit_job
+  raise "pushed inside the transaction" unless SidekiqPush.recorded.empty?
+end
+raise "not pushed at commit: #{SidekiqPush.recorded.inspect}" unless SidekiqPush.recorded.length == 2
+SidekiqPush.start_recording
+begin
+  Article.transaction do
+    article = Article.create!(title: "Rolled back title", body: "Another long enough body.")
+    article.enqueue_commit_job
+    raise "roll back"
+  end
+rescue RuntimeError => e
+  raise e unless e.message == "roll back"
+end
+raise "a rolled-back push went out" unless SidekiqPush.recorded.empty?
+puts "after commit push passed"
+"##;
+
+/// An after-commit job is pushed at COMMIT and dropped at ROLLBACK, the
+/// same hold Phase 1's in-process queue has.
+#[test]
+fn an_after_commit_job_is_pushed_at_commit() {
+    let run = emit_and_run::real_blog()
+        .write("app/jobs/commit_job.rb", COMMIT_JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", COMMIT_ENQUEUE)
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .run_ruby(COMMIT_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("after commit push passed"), "{}", run.stdout);
+}
+
+const HASH_JOB: &str = r##"class OptionsJob < ApplicationJob
+  def perform(options)
+    options
+  end
+end
+"##;
+
+const HASH_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_options_job
+    OptionsJob.perform_later({ "title" => title })
+  end
+"##;
+
+/// A job whose arguments can't be serialized keeps its Proc with a
+/// warning on the in-process queue, and is an error under `:sidekiq`,
+/// where a Proc can't be pushed to Redis.
+#[test]
+fn an_unplannable_job_is_an_error_only_under_sidekiq() {
+    let overlay = || {
+        emit_and_run::real_blog()
+            .write("app/jobs/options_job.rb", HASH_JOB)
+            .edit("app/models/article.rb", "  validates :title, presence: true\n", HASH_ENQUEUE)
+    };
+    let (_, errors) = overlay()
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit(BuildTarget::Ruby);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].contains("OptionsJob") && errors[0].contains("queue_adapter :sidekiq"), "{errors:#?}");
+
+    let (_, errors) = overlay().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
 }

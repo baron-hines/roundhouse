@@ -4656,7 +4656,7 @@ fn apply_job_registry(files: &mut [(String, String)], app: &App) {
     );
     let generated = format!(
         "{HEAD}{}\n{flag}{redis}{TAIL}",
-        crate::lower::job_payload::registry_source(&app.job_plans)
+        crate::lower::job_payload::registry_source(&app.job_plans, needs_redis(app))
     );
     for (path, content) in files.iter_mut() {
         if !path.ends_with("job_registry.rb") {
