@@ -245,12 +245,14 @@ fn find_dynamic_enqueues(e: &Expr, app: &App, jobs: &BTreeSet<String>, out: &mut
 
 fn collect_sites(e: &Expr, jobs: &BTreeSet<String>, out: &mut BTreeMap<String, Vec<Site>>) {
     if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node {
-        if matches!(method.as_str(), "perform_later" | "perform_now") {
+        if matches!(method.as_str(), "perform_later" | "perform_now" | "perform_later_with") {
             if let ExprNode::Const { path } = &*r.node {
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                 if jobs.contains(&name) {
+                    let skip = if method.as_str() == "perform_later_with" { 2 } else { 0 };
                     let site = args
                         .iter()
+                        .skip(skip)
                         .map(|a| match &*a.node {
                             ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. } => None,
                             ExprNode::Hash { .. } => None,
@@ -546,6 +548,26 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
     for lc in lcs.iter_mut() {
         let own_name = lc.name.0.as_str().to_string();
         let Some(plan) = app.job_plans.iter().find(|p| p.job == own_name) else { continue };
+        if sidekiq && plan.is_payload() {
+            if let Some(with) = lc.methods.iter_mut().find(|m| {
+                m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "perform_later_with"
+            }) {
+                let span = with.name_span;
+                let (lead, args) = wrapper_vars(with, 2);
+                if !rewrite_enqueue(&mut with.body, plan, args, Some(lead)) {
+                    crate::emit::diagnostics::push(fallback_diagnostic(
+                        plan,
+                        &JobFallback {
+                            param: None,
+                            reason: "the generated perform_later_with is not the shape this pass rewrites"
+                                .to_string(),
+                        },
+                        span,
+                        sidekiq,
+                    ));
+                }
+            }
+        }
         let Some(wrapper) = lc.methods.iter_mut().find(|m| {
             m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "perform_later"
         }) else {
@@ -556,23 +578,16 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
             crate::emit::diagnostics::push(fallback_diagnostic(plan, f, span, sidekiq));
             continue;
         }
-        let args: Vec<Expr> = wrapper
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let mut v = Expr::new(
-                    wrapper.body.span,
-                    ExprNode::Var { id: crate::ident::VarId(i as u32), name: p.name.clone() },
-                );
-                v.ty = match &wrapper.signature {
-                    Some(Ty::Fn { params, .. }) => params.get(i).map(|tp| (*tp.ty).clone()),
-                    _ => None,
-                };
-                v
-            })
-            .collect();
-        if !rewrite_enqueue(&mut wrapper.body, plan, args, sidekiq) {
+        let (_, args) = wrapper_vars(wrapper, 0);
+        let sidekiq_lead = sidekiq.then(|| {
+            let span = wrapper.body.span;
+            let mut queue = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: plan.queue.clone() } });
+            queue.ty = Some(Ty::Str);
+            let mut at = Expr::new(span, ExprNode::Lit { value: Literal::Float { value: 0.0 } });
+            at.ty = Some(Ty::Float);
+            vec![queue, at]
+        });
+        if !rewrite_enqueue(&mut wrapper.body, plan, args, sidekiq_lead) {
             crate::emit::diagnostics::push(fallback_diagnostic(
                 plan,
                 &JobFallback {
@@ -589,6 +604,32 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
 /// The ledger line for a job that keeps its Proc. Under `queue_adapter
 /// :sidekiq` it is an error: a Proc can't be pushed to Redis, so the job
 /// would silently run in process instead of where the app sends it.
+/// A wrapper's parameters as typed reads: the first `lead` of them, then
+/// the job's own arguments.
+fn wrapper_vars(wrapper: &crate::dialect::MethodDef, lead: usize) -> (Vec<Expr>, Vec<Expr>) {
+    let mut vars: Vec<Expr> = wrapper
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut v = Expr::new(
+                wrapper.body.span,
+                ExprNode::Var { id: crate::ident::VarId(i as u32), name: p.name.clone() },
+            );
+            v.ty = match &wrapper.signature {
+                Some(Ty::Fn { params, .. }) => params.get(i).map(|tp| (*tp.ty).clone()),
+                _ => None,
+            };
+            v
+        })
+        .collect();
+    let args = vars.split_off(lead.min(vars.len()));
+    // `push_<job>(queue, at, …)` takes the queue first; the wrapper has
+    // `at` first.
+    vars.reverse();
+    (vars, args)
+}
+
 fn fallback_diagnostic(
     plan: &JobPlan,
     f: &JobFallback,
@@ -628,10 +669,11 @@ fn fallback_diagnostic(
 /// is a contract with that pass; anything else is left alone and
 /// answers false.
 ///
-/// Under `queue_adapter :sidekiq` the arm is
-/// `JobRegistry.push_<job>("<queue_as>", 0.0, args)` instead, which pushes
-/// the payload to Redis in Sidekiq's format (`runtime/sidekiq_push.rb`).
-fn rewrite_enqueue(body: &mut Expr, plan: &JobPlan, args: Vec<Expr>, sidekiq: bool) -> bool {
+/// Under `queue_adapter :sidekiq` (`sidekiq` holds the queue and `at`
+/// to push with) the arm is `JobRegistry.push_<job>(queue, at, args)`
+/// instead, which pushes the payload to Redis in Sidekiq's format
+/// (`runtime/sidekiq_push.rb`).
+fn rewrite_enqueue(body: &mut Expr, plan: &JobPlan, args: Vec<Expr>, sidekiq: Option<Vec<Expr>>) -> bool {
     let ExprNode::Seq { exprs } = &mut *body.node else { return false };
     for e in exprs.iter_mut() {
         let ExprNode::If { then_branch, .. } = &mut *e.node else { continue };
@@ -643,12 +685,7 @@ fn rewrite_enqueue(body: &mut Expr, plan: &JobPlan, args: Vec<Expr>, sidekiq: bo
             continue;
         }
         let span = enqueue.span;
-        if sidekiq {
-            let mut queue = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: plan.queue.clone() } });
-            queue.ty = Some(Ty::Str);
-            let mut at = Expr::new(span, ExprNode::Lit { value: Literal::Float { value: 0.0 } });
-            at.ty = Some(Ty::Float);
-            let mut push_args = vec![queue, at];
+        if let Some(mut push_args) = sidekiq {
             push_args.extend(args);
             let mut call = Expr::new(
                 span,
@@ -812,8 +849,10 @@ pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
             };
             let push = if plan.enqueue_after_commit { "enqueue_after_commit" } else { "enqueue" };
             s.push_str(&format!("  def self.push_{}{params}\n", plan.suffix()));
+            // "" is a `set(...)` with no `queue:`: the job's `queue_as`.
+            s.push_str(&format!("    q = queue == \"\" ? {} : queue\n", ruby_str(&plan.queue)));
             s.push_str(&format!(
-                "    SidekiqPush.{push}({job}, queue, at,\n      ActiveJob::Payload.build_at({job}, queue, at, ActiveJob::Arguments.list({list})))\n",
+                "    SidekiqPush.{push}({job}, q, at,\n      ActiveJob::Payload.build_at({job}, q, at, ActiveJob::Arguments.list({list})))\n",
                 job = ruby_str(&plan.job),
             ));
             s.push_str("  end\n\n");
