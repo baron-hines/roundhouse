@@ -9,21 +9,21 @@ use roundhouse::project::BuildTarget;
 
 use super::emit_and_run;
 
-const JOB: &str = r#"class ArticleJob < ApplicationJob
+const JOB: &str = r##"class ArticleJob < ApplicationJob
   queue_as :default
 
   def perform(article)
     article.title
   end
 end
-"#;
+"##;
 
-const ENQUEUE: &str = r#"  validates :title, presence: true
+const ENQUEUE: &str = r##"  validates :title, presence: true
 
   def enqueue_job
     ArticleJob.perform_later(self)
   end
-"#;
+"##;
 
 const SIDEKIQ: &str = "  config.active_job.queue_adapter = :sidekiq\n";
 
@@ -97,4 +97,178 @@ fn an_app_on_sidekiq_with_no_jobs_gets_no_redis() {
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(read(&emitted, "runtime/sidekiq_redis.rb").contains("this tree has no Redis client"));
     assert!(!read(&emitted, "spin.toml").contains("spinel-redis"));
+}
+
+const PUSH_SCRIPT: &str = r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+article = Article.create!(title: "Pushed title", body: "A long enough article body.")
+article.enqueue_job
+got = SidekiqPush.recorded
+raise "recorded #{got.inspect}" unless got.length == 2 && got[0] == "sadd queues default"
+verb, key, json = got[1].split(" ", 3)
+raise "#{verb} #{key}" unless verb == "lpush" && key == "queue:default"
+env = JSON.parse(json)
+raise "class #{env["class"]}" unless env["class"] == "Sidekiq::ActiveJob::Wrapper"
+raise "wrapped #{env["wrapped"]}" unless env["wrapped"] == "ArticleJob" && env["queue"] == "default"
+aj = env["args"][0]
+gid = "gid://#{Rails.application.global_id_app}/Article/#{article.id}"
+raise "arguments #{aj["arguments"]}" unless aj["arguments"] == [{ "_aj_globalid" => gid }]
+raise "queue_name #{aj["queue_name"]}" unless aj["queue_name"] == "default" && aj["scheduled_at"].nil?
+raise "queued in process too" unless ActiveJob.pending_count == 0
+puts "sidekiq push passed"
+"##;
+
+/// Under `:sidekiq` the job's `perform_later` pushes its payload in
+/// Sidekiq's envelope, recorded here through `SidekiqPush`'s seam (no
+/// Redis, no redis gem), and nothing is queued in process.
+#[test]
+fn perform_later_pushes_the_payload_to_redis() {
+    let run = on_sidekiq().run_ruby(PUSH_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("sidekiq push passed"), "{}", run.stdout);
+    let job = read(&run.emitted, "app/models/article_job.rb");
+    assert!(job.contains("JobRegistry.push_article_job(\"default\", 0.0, "), "{job}");
+    let registry = read(&run.emitted, "runtime/job_registry.rb");
+    assert!(registry.contains("def self.push_article_job(queue, at, article)"), "{registry}");
+}
+
+const COMMIT_JOB: &str = r##"class CommitJob < ApplicationJob
+  self.enqueue_after_transaction_commit = true
+
+  def perform(article)
+    article.title
+  end
+end
+"##;
+
+const COMMIT_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_commit_job
+    CommitJob.perform_later(self)
+  end
+"##;
+
+const COMMIT_SCRIPT: &str = r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+Article.transaction do
+  article = Article.create!(title: "Committed title", body: "A long enough article body.")
+  article.enqueue_commit_job
+  raise "pushed inside the transaction" unless SidekiqPush.recorded.empty?
+end
+raise "not pushed at commit: #{SidekiqPush.recorded.inspect}" unless SidekiqPush.recorded.length == 2
+SidekiqPush.start_recording
+begin
+  Article.transaction do
+    article = Article.create!(title: "Rolled back title", body: "Another long enough body.")
+    article.enqueue_commit_job
+    raise "roll back"
+  end
+rescue RuntimeError => e
+  raise e unless e.message == "roll back"
+end
+raise "a rolled-back push went out" unless SidekiqPush.recorded.empty?
+puts "after commit push passed"
+"##;
+
+/// An after-commit job is pushed at COMMIT and dropped at ROLLBACK, the
+/// same hold Phase 1's in-process queue has.
+#[test]
+fn an_after_commit_job_is_pushed_at_commit() {
+    let run = emit_and_run::real_blog()
+        .write("app/jobs/commit_job.rb", COMMIT_JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", COMMIT_ENQUEUE)
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .run_ruby(COMMIT_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("after commit push passed"), "{}", run.stdout);
+}
+
+const HASH_JOB: &str = r##"class OptionsJob < ApplicationJob
+  def perform(options)
+    options
+  end
+end
+"##;
+
+const HASH_ENQUEUE: &str = r##"  validates :title, presence: true
+
+  def enqueue_options_job
+    OptionsJob.perform_later({ "title" => title })
+  end
+"##;
+
+/// A job whose arguments can't be serialized keeps its Proc with a
+/// warning on the in-process queue, and is an error under `:sidekiq`,
+/// where a Proc can't be pushed to Redis.
+#[test]
+fn an_unplannable_job_is_an_error_only_under_sidekiq() {
+    let overlay = || {
+        emit_and_run::real_blog()
+            .write("app/jobs/options_job.rb", HASH_JOB)
+            .edit("app/models/article.rb", "  validates :title, presence: true\n", HASH_ENQUEUE)
+    };
+    let (_, errors) = overlay()
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit(BuildTarget::Ruby);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].contains("OptionsJob") && errors[0].contains("queue_adapter :sidekiq"), "{errors:#?}");
+
+    let (_, errors) = overlay().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+/// The targets with no Sidekiq push say so once per app on `:sidekiq`,
+/// and only when the app has jobs; the Ruby family says nothing. A
+/// strict target's tree is the same with or without the adapter.
+#[test]
+fn strict_targets_warn_once_and_emit_the_same_tree() {
+    use roundhouse::lower::job_payload::sidekiq_adapter_target_warning;
+    let (_, app, _) = on_sidekiq().emit_with_app(BuildTarget::Ruby);
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        assert!(sidekiq_adapter_target_warning(&app, target).is_none(), "{}", target.as_str());
+    }
+    let strict = [BuildTarget::Go, BuildTarget::Rust, BuildTarget::Typescript, BuildTarget::Elixir, BuildTarget::Crystal];
+    for target in strict {
+        let w = sidekiq_adapter_target_warning(&app, target).expect("a warning");
+        assert_eq!(w.severity, roundhouse::diagnostic::Severity::Warning);
+        assert!(w.message.contains(target.as_str()), "{}", w.message);
+    }
+
+    let (_, no_jobs, _) = emit_and_run::real_blog()
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit_with_app(BuildTarget::Ruby);
+    assert!(sidekiq_adapter_target_warning(&no_jobs, BuildTarget::Go).is_none());
+
+    let tree = |overlay: emit_and_run::Overlay| {
+        let (emitted, errors) = overlay.emit(BuildTarget::Go);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let mut files = Vec::new();
+        let mut stack = vec![emitted.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(emitted.as_path()).unwrap().display().to_string();
+                    files.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        files.sort();
+        files
+    };
+    let plain = emit_and_run::real_blog()
+        .write("app/jobs/article_job.rb", JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", ENQUEUE);
+    let with = tree(on_sidekiq());
+    let without = tree(plain);
+    assert_eq!(with.len(), without.len(), "file count");
+    for ((p1, c1), (p2, c2)) in with.iter().zip(&without) {
+        assert_eq!(p1, p2);
+        if p1.contains("production") {
+            continue;
+        }
+        assert!(c1 == c2, "{p1} differs with :sidekiq on go");
+    }
 }
