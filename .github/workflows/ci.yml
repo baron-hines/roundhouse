@@ -61,13 +61,10 @@ env:
   # (runtime/spinel/db_pg.rb) is tested against in spinel-framework.
   # Pinned like the apps above; bump deliberately.
   SPINEL_PG_SHA: f48735c91aa8cde258299e1189957972667a0d1f
-  # spinel-redis, the Redis client the Sidekiq push runs on in a Spinel
-  # tree, tested against a live Redis in sidekiq-live. The same repository
-  # and tag the emitted spin.toml pins (src/project.rs); bump both together.
-  # The baron-hines fork until rubys/spinel-redis#3 (connect_timeout: and
-  # read_timeout:) is merged and tagged.
-  SPINEL_REDIS_REPO: baron-hines/spinel-redis
-  SPINEL_REDIS_REF: redis-timeouts-1
+  # rubys/spinel-redis, the Redis client the Sidekiq push runs on in a
+  # Spinel tree, tested against a live Redis in sidekiq-live. A tag, the
+  # same ref the emitted spin.toml pins (src/project.rs); bump both together.
+  SPINEL_REDIS_REF: v0.3.0
 
 jobs:
   plan:
@@ -1079,7 +1076,7 @@ jobs:
       - name: Check out spinel-redis (pinned)
         uses: actions/checkout@v7
         with:
-          repository: ${{ env.SPINEL_REDIS_REPO }}
+          repository: rubys/spinel-redis
           ref: ${{ env.SPINEL_REDIS_REF }}
           path: spinel-redis
       - uses: ruby/setup-ruby@v1
