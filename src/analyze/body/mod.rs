@@ -6791,6 +6791,48 @@ fn expect_hash_arg_ty(recv: Option<&Expr>, recv_ty: Option<&Ty>, method: &str, a
             value: send::param_value_ty().into(),
         }.into() });
     }
+    if elements.iter().any(|field| matches!(&*field.node, ExprNode::Hash { .. }))
+        && matches!(&*resource.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } })
+        && recv.is_some_and(|expr| matches!(&*expr.node,
+            ExprNode::Send { recv: None, method, args, .. }
+                if method.as_str() == "params" && args.is_empty()))
+    {
+        let mut fields = indexmap::IndexMap::new();
+        for field in elements {
+            match &*field.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => { fields.insert(value.clone(), Ty::Str); }
+                ExprNode::Hash { entries, .. } => {
+                    for (name, filter) in entries {
+                        let name = match &*name.node {
+                            ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
+                            ExprNode::Lit { value: Literal::Str { value } } => Symbol::from(value.as_str()),
+                            _ => return None,
+                        };
+                        let ExprNode::Array { elements: filters, .. } = &*filter.node else { return None };
+                        let ty = if filters.is_empty() {
+                            Ty::Array { elem: Ty::Str.into() }
+                        } else if let [inner] = filters.as_slice()
+                            && let ExprNode::Array { elements: nested, .. } = &*inner.node
+                            && nested.iter().all(|f| matches!(&*f.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }))
+                        {
+                            let record = Ty::Hash { key: Ty::Str.into(), value: send::param_value_ty().into() };
+                            Ty::Union { variants: vec![
+                                Ty::Array { elem: record.clone().into() },
+                                Ty::Hash { key: Ty::Str.into(), value: record.into() },
+                                Ty::Nil,
+                            ].into() }
+                        } else {
+                            return None;
+                        };
+                        fields.insert(name, ty);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        return Some(Ty::Record { row: Row { fields: fields.into(), rest: None } });
+
+    }
     if elements.is_empty() || !elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } })) {
         return None;
     }
