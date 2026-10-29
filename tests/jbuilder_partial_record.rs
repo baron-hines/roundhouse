@@ -1,6 +1,7 @@
 //! `json.partial! @record` (#322), and the record with options,
 //! `json.partial!(@record, partial: "…", as: :x)` or
-//! `json.partial!(@record, cached: true)`.
+//! `json.partial!(@record, cached: true)`, and a record with a literal
+//! local its partial never reads (`cache: true`, `label: "x"`).
 //!
 //! Jbuilder's `partial!` with one Active Model argument renders the
 //! record's own partial, `record.to_partial_path` (`widgets/_widget`
@@ -27,6 +28,9 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
     t.string "name"
     t.integer "size"
   end
+  create_table "gizmos", force: :cascade do |t|
+    t.string "name"
+  end
 end
 "#;
 
@@ -40,6 +44,13 @@ const ROUTES: &str = r#"Rails.application.routes.draw do
   get "widgets/:id/cached", to: "widgets#cached", defaults: { format: :json }
   get "widgets/:id/aliased_cached", to: "widgets#aliased_cached", defaults: { format: :json }
   get "widgets/:id/unknown", to: "widgets#unknown", defaults: { format: :json }
+  get "widgets/:id/cache_option", to: "widgets#cache_option", defaults: { format: :json }
+  get "widgets/:id/other_path", to: "widgets#other_path", defaults: { format: :json }
+  get "widgets/items_cache", to: "widgets#items_cache", defaults: { format: :json }
+  get "widgets/items_cached", to: "widgets#items_cached", defaults: { format: :json }
+  get "widgets/:id/gizmo_cache", to: "widgets#gizmo_cache", defaults: { format: :json }
+  get "widgets/:id/layout_option", to: "widgets#layout_option", defaults: { format: :json }
+  get "widgets/:id/dynamic_cache", to: "widgets#dynamic_cache", defaults: { format: :json }
   namespace :admin do
     get "widgets/:id", to: "widgets#show", defaults: { format: :json }
   end
@@ -91,6 +102,42 @@ const CONTROLLER: &str = r#"class WidgetsController < ApplicationController
     @thing = params[:id]
     render :unknown
   end
+
+  def cache_option
+    @widget = Widget.find(params[:id])
+    render :cache_option
+  end
+
+  def other_path
+    @widget = Widget.find(params[:id])
+    render :other_path
+  end
+
+  def items_cache
+    @widgets = Widget.all
+    render :items_cache
+  end
+
+  def items_cached
+    @widgets = Widget.all
+    render :items_cached
+  end
+
+  def gizmo_cache
+    @gizmo = Gizmo.find(params[:id])
+    render :gizmo_cache
+  end
+
+  def layout_option
+    @widget = Widget.find(params[:id])
+    render :layout_option
+  end
+
+  def dynamic_cache
+    @widget = Widget.find(params[:id])
+    @flag = params[:flag]
+    render :dynamic_cache
+  end
 end
 "#;
 
@@ -122,8 +169,39 @@ const STRAY: &str = "json.partial! @gadget\n";
 /// A value of no model: its partial cannot be named.
 const UNKNOWN: &str = "json.partial!(@thing)\n";
 
-/// A local for the partial besides the record.
+/// A local for the partial besides the record. `widgets/_widget`
+/// never reads `label`, so it renders the same partial with the same
+/// output as without it.
 const EXTRA: &str = "json.partial! @widget, as: :widget, label: \"x\"\n";
+
+/// `cache: true` is not a Jbuilder option: `partial!` passes every key
+/// but `partial`, `as`, `collection` and `cached` to the partial as a
+/// local, so this is a local `cache` the partial never reads.
+const CACHE_OPTION: &str =
+    "json.partial!(@widget, partial: \"widgets/widget\", as: :widget, cache: true)\n";
+
+/// A `partial:` other than the record's own: `partial!` overwrites it
+/// with the record, and Action View renders `to_partial_path`.
+const OTHER_PATH: &str =
+    "json.partial!(@widget, partial: \"widgets/card\", as: :widget, cache: true)\n";
+
+/// The same calls once per element of a key's collection.
+const ITEMS_CACHE: &str = "json.items(@widgets) { |w| json.partial!(w, partial: \"widgets/widget\", as: :widget, cache: true) }\n";
+const ITEMS_CACHED: &str = "json.items(@widgets) { |w| json.partial!(w, partial: \"widgets/widget\", as: :widget, cached: true) }\n";
+
+/// A partial that reads the local the call passes: its output depends
+/// on it (`{"id":3,"fresh":true}` from Rails), and a call that dropped
+/// it would read Action View's `cache` helper instead.
+const GIZMO_CACHE: &str =
+    "json.partial!(@gizmo, partial: \"gizmos/gizmo\", as: :gizmo, cache: true)\n";
+const GIZMO_PARTIAL: &str = "json.id gizmo.id\njson.fresh cache\n";
+
+/// `layout:` is an Action View render option, not a local: Rails looks
+/// for `widgets/_frame` and raises when it is missing.
+const LAYOUT_OPTION: &str = "json.partial!(@widget, as: :widget, layout: \"widgets/frame\")\n";
+
+/// A local whose value is not a literal.
+const DYNAMIC_CACHE: &str = "json.partial!(@widget, as: :widget, cache: @flag)\n";
 
 /// `as:` names the partial's local something other than `widget`.
 const ENTRY: &str = "json.partial! @widget, as: :entry\n";
@@ -155,6 +233,7 @@ fn emitted() -> Vec<(String, String)> {
         ("config/routes.rb", ROUTES),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
         ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
+        ("app/models/gizmo.rb", "class Gizmo < ApplicationRecord\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         ("app/controllers/widgets_controller.rb", CONTROLLER),
         ("app/views/widgets/_widget.json.jbuilder", PARTIAL),
@@ -170,6 +249,14 @@ fn emitted() -> Vec<(String, String)> {
         ("app/views/widgets/entry_string.json.jbuilder", ENTRY_STRING),
         ("app/views/widgets/widget_string.json.jbuilder", WIDGET_STRING),
         ("app/views/widgets/dynamic_as.json.jbuilder", DYNAMIC_AS),
+        ("app/views/widgets/cache_option.json.jbuilder", CACHE_OPTION),
+        ("app/views/widgets/other_path.json.jbuilder", OTHER_PATH),
+        ("app/views/widgets/items_cache.json.jbuilder", ITEMS_CACHE),
+        ("app/views/widgets/items_cached.json.jbuilder", ITEMS_CACHED),
+        ("app/views/widgets/gizmo_cache.json.jbuilder", GIZMO_CACHE),
+        ("app/views/gizmos/_gizmo.json.jbuilder", GIZMO_PARTIAL),
+        ("app/views/widgets/layout_option.json.jbuilder", LAYOUT_OPTION),
+        ("app/views/widgets/dynamic_cache.json.jbuilder", DYNAMIC_CACHE),
         ("app/controllers/admin/widgets_controller.rb", ADMIN_CONTROLLER),
         ("app/views/admin/widgets/show.json.jbuilder", ADMIN_SHOW),
         ("app/views/admin/widgets/_widget.json.jbuilder", ADMIN_PARTIAL),
@@ -244,27 +331,71 @@ fn a_record_renders_its_models_partial() {
     );
 }
 
-/// A local for the partial (`label:`) has no way through a positional
-/// call, and stays unrecognized: refused where it stands (#1539), not
-/// written as nothing. An `as:` other than `widget` names a
-/// local the lowered partial does not take its record under: refused
-/// with the reason, rather than calling a partial that would miss its
-/// local or rendering nothing.
+/// An `as:` other than `widget` names a local the lowered partial does
+/// not take its record under: refused with the reason, rather than
+/// calling a partial that would miss its local or rendering nothing.
 #[test]
-fn a_record_with_extra_locals_is_left_alone_and_another_as_is_refused() {
+fn another_as_is_refused() {
     let files = emitted();
-    let src = view(&files, "widgets/extra_json.rb");
-    assert!(
-        !src.contains("Views::Widgets.")
-            && !src.contains("io << \"\"")
-            && src.contains("jbuilder call with unrecognised arguments not supported"),
-        "extra: no partial call is emitted, and the statement is refused:\n{src}"
-    );
     let src = view(&files, "widgets/entry_json.rb");
     assert!(
         !src.contains("Views::Widgets.") && src.contains("partial! of a record not supported"),
         "entry: refused with its reason:\n{src}"
     );
+}
+
+/// A literal local the record's partial never reads (`label: "x"`,
+/// `cache: true`) changes nothing Rails renders, so the call renders
+/// the partial as it does without it. `cached: true` was already taken
+/// out of the locals. A `partial:` that names another path is
+/// overwritten by the record. The same holds per element of a key's
+/// collection.
+#[test]
+fn a_record_with_an_unread_literal_local_renders_its_partial() {
+    let files = emitted();
+    for template in ["extra", "cache_option", "other_path"] {
+        let src = view(&files, &format!("widgets/{template}_json.rb"));
+        assert!(
+            src.contains("io << Views::Widgets.widget_json(widget)") && !src.contains("not supported"),
+            "{template}: the record's partial, with the record only:\n{src}"
+        );
+    }
+    for template in ["items_cache", "items_cached"] {
+        let src = view(&files, &format!("widgets/{template}_json.rb"));
+        assert!(
+            src.contains("Views::Widgets.widget_json(w)") && !src.contains("not supported"),
+            "{template}: each element's partial:\n{src}"
+        );
+    }
+}
+
+/// A local the partial reads is refused with the reason: the lowered
+/// partial has no parameter for it, and its output depends on it. An
+/// Action View render option (`layout:`) and a non-literal value stay
+/// unrecognised, refused where they stand (#1539).
+#[test]
+fn a_record_with_a_local_it_reads_or_a_render_option_is_refused() {
+    roundhouse::ingest::survey::activate();
+    let files = emitted();
+    let gaps = roundhouse::ingest::survey::drain();
+    let src = view(&files, "widgets/gizmo_cache_json.rb");
+    assert!(
+        !src.contains("Views::Gizmos.") && src.contains("partial! of a record not supported"),
+        "gizmo_cache: refused:\n{src}"
+    );
+    assert!(
+        gaps.iter().any(|g| g.to_string().contains("`gizmos/gizmo` reads the local `cache`")),
+        "gizmo_cache: the gap names the local the partial reads: {gaps:?}"
+    );
+    for template in ["layout_option", "dynamic_cache"] {
+        let src = view(&files, &format!("widgets/{template}_json.rb"));
+        assert!(
+            !src.contains("Views::Widgets.")
+                && !src.contains("io << \"\"")
+                && src.contains("jbuilder call with unrecognised arguments not supported"),
+            "{template}: no partial call is emitted, and the statement is refused:\n{src}"
+        );
+    }
 }
 
 /// A record whose class is not statically known has no partial to
@@ -328,7 +459,18 @@ fn the_templates_render_what_jbuilder_renders() {
     }
     std::fs::write(dir.join("app/views.rb"), "").unwrap();
     let mut requires = String::new();
-    for name in ["_widget_json.rb", "detail_json.rb", "wrapped_json.rb", "aliased_json.rb", "cached_json.rb"] {
+    for name in [
+        "_widget_json.rb",
+        "detail_json.rb",
+        "wrapped_json.rb",
+        "aliased_json.rb",
+        "cached_json.rb",
+        "extra_json.rb",
+        "cache_option_json.rb",
+        "other_path_json.rb",
+        "items_cache_json.rb",
+        "items_cached_json.rb",
+    ] {
         let file = dir.join("app/views/widgets").join(name);
         requires.push_str(&format!("require {:?}\n", file.display().to_string()));
     }
@@ -339,11 +481,17 @@ fn the_templates_render_what_jbuilder_renders() {
 require "json"
 Widget = Struct.new(:id, :name, :size)
 widget = Widget.new(1, "b", 5)
+widgets = [widget, Widget.new(2, "c", 7)]
 puts JSON.generate(
   "detail" => JSON.parse(Views::Widgets.detail_json(widget)),
   "wrapped" => JSON.parse(Views::Widgets.wrapped_json(widget)),
   "aliased" => JSON.parse(Views::Widgets.aliased_json(widget)),
   "cached" => JSON.parse(Views::Widgets.cached_json(widget)),
+  "extra" => JSON.parse(Views::Widgets.extra_json(widget)),
+  "cache_option" => JSON.parse(Views::Widgets.cache_option_json(widget)),
+  "other_path" => JSON.parse(Views::Widgets.other_path_json(widget)),
+  "items_cache" => JSON.parse(Views::Widgets.items_cache_json(widgets)),
+  "items_cached" => JSON.parse(Views::Widgets.items_cached_json(widgets)),
 )
 "#,
         runtime = runtime.display().to_string()
@@ -361,7 +509,12 @@ puts JSON.generate(
         r#"{"detail":{"id":1,"name":"b"},"#,
         r#""wrapped":{"kind":"wrapped","widget":{"id":1,"name":"b"}},"#,
         r#""aliased":{"id":1,"name":"b"},"#,
-        r#""cached":{"id":1,"name":"b"}}"#,
+        r#""cached":{"id":1,"name":"b"},"#,
+        r#""extra":{"id":1,"name":"b"},"#,
+        r#""cache_option":{"id":1,"name":"b"},"#,
+        r#""other_path":{"id":1,"name":"b"},"#,
+        r#""items_cache":{"items":[{"id":1,"name":"b"},{"id":2,"name":"c"}]},"#,
+        r#""items_cached":{"items":[{"id":1,"name":"b"},{"id":2,"name":"c"}]}}"#,
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
 }
