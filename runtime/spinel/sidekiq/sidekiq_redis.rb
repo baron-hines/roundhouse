@@ -181,6 +181,12 @@ module SidekiqRedis
     nil
   end
 
+  # ZADD retry: the failed job, due at `at` (a Float epoch).
+  def self.write_retry(conn, at, json)
+    conn.zadd("retry", at, json)
+    nil
+  end
+
   # ZADD dead, then the trims by age (scores up to `oldest`) and by
   # count (ranks 0..`keep`, a negative String).
   def self.write_dead(conn, now, json, oldest, keep)

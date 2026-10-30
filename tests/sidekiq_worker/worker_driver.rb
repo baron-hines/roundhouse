@@ -6,7 +6,8 @@
 # requires, writes popped.txt (the oracle's strict-scenario jobs), and
 # runs it under CRuby and, compiled by spinel, as a binary. It prints
 # one `ok`/`FAIL` line per check and the writes, with per-run values
-# masked, then `done`.
+# masked, then a `rule` line for each of the retry oracle's failures
+# (failures.txt), then `done`.
 require "json"
 require "securerandom"
 require "time"
@@ -123,6 +124,16 @@ module SidekiqRedis
 
   def self.requeue(conn, keys, jobs)
     L.synchronize { LOG.push("requeue " + keys.join(",") + " " + jobs.join(" | ")) }
+    nil
+  end
+
+  # The delay is checked against Sidekiq's backoff for the record's
+  # retry_count, then dropped: it has jitter in it.
+  def self.write_retry(conn, at, json)
+    count = JSON.parse(json)["retry_count"].to_i
+    delay = at - Time.now.to_f
+    ok = delay > count**4 + 14 && delay < count**4 + 16 + 10 * (count + 1)
+    L.synchronize { LOG.push("retry " + (ok ? "delay ok " : "delay " + delay.to_s + " ") + mask(json)) }
     nil
   end
 
@@ -280,4 +291,16 @@ SidekiqWorker::THREADS.each { |t| t.join }
 SidekiqRedis::QUIET_ON_FETCH[0] = false
 log = SidekiqRedis.take_log
 check("a job popped while quiet is pushed back", log == ["requeue queue:default " + slow], log.join(" / "))
+
+# ---- Sidekiq's retry rules on the jobs Sidekiq failed ------------------------
+# failures.txt: the oracle's failed jobs, one per line, as
+# "queue<TAB>error class<TAB>message<TAB>popped text". Each prints
+# `rule` and what the worker wrote for it, or `rule nothing`.
+File.read("failures.txt").split("\n").each do |line|
+  parts = line.split("\t", 4)
+  raw = parts[3]
+  SidekiqWorker.fail_job(JSON.parse(raw), raw, parts[0], "class=Job", parts[1], parts[2], SidekiqWorker.clock)
+  log = SidekiqRedis.take_log
+  puts "rule " + (log.length == 0 ? "nothing" : log.join(" / "))
+end
 puts "done"

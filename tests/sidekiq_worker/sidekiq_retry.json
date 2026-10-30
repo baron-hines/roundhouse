@@ -1933,6 +1933,576 @@
       }
     ]
   },
+  "failures": {
+    "flaky": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":true,\"queue\":\"default\",\"wrapped\":\"FlakyJob\",\"args\":[{\"job_class\":\"FlakyJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"flaky\",2],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "flaky attempt 1",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count"
+        ],
+        "record": {
+          "retry": true,
+          "queue": "default",
+          "wrapped": "FlakyJob",
+          "args": [
+            {
+              "job_class": "FlakyJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "flaky",
+                2
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "flaky attempt 1",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 0
+        }
+      },
+      {
+        "queue": "default",
+        "popped": "{\"retry\":true,\"queue\":\"default\",\"wrapped\":\"FlakyJob\",\"args\":[{\"job_class\":\"FlakyJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"flaky\",2],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124,\"error_message\":\"flaky attempt 1\",\"error_class\":\"Sticky\",\"failed_at\":1792632725000,\"retry_count\":0}",
+        "error_class": "Sticky",
+        "error_message": "flaky attempt 2",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count",
+          "retried_at"
+        ],
+        "record": {
+          "retry": true,
+          "queue": "default",
+          "wrapped": "FlakyJob",
+          "args": [
+            {
+              "job_class": "FlakyJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "flaky",
+                2
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "flaky attempt 2",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 1,
+          "retried_at": "<ms>"
+        }
+      }
+    ],
+    "two_retries": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":2,\"queue\":\"default\",\"wrapped\":\"TwoRetriesJob\",\"args\":[{\"job_class\":\"TwoRetriesJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"two\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "two attempt 1",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count"
+        ],
+        "record": {
+          "retry": 2,
+          "queue": "default",
+          "wrapped": "TwoRetriesJob",
+          "args": [
+            {
+              "job_class": "TwoRetriesJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "two"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "two attempt 1",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 0
+        }
+      },
+      {
+        "queue": "default",
+        "popped": "{\"retry\":2,\"queue\":\"default\",\"wrapped\":\"TwoRetriesJob\",\"args\":[{\"job_class\":\"TwoRetriesJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"two\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124,\"error_message\":\"two attempt 1\",\"error_class\":\"Sticky\",\"failed_at\":1792632725000,\"retry_count\":0}",
+        "error_class": "Sticky",
+        "error_message": "two attempt 2",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count",
+          "retried_at"
+        ],
+        "record": {
+          "retry": 2,
+          "queue": "default",
+          "wrapped": "TwoRetriesJob",
+          "args": [
+            {
+              "job_class": "TwoRetriesJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "two"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "two attempt 2",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 1,
+          "retried_at": "<ms>"
+        }
+      },
+      {
+        "queue": "default",
+        "popped": "{\"retry\":2,\"queue\":\"default\",\"wrapped\":\"TwoRetriesJob\",\"args\":[{\"job_class\":\"TwoRetriesJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"two\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124,\"error_message\":\"two attempt 2\",\"error_class\":\"Sticky\",\"failed_at\":1792632725000,\"retry_count\":1,\"retried_at\":1792632729000}",
+        "error_class": "Sticky",
+        "error_message": "two attempt 3",
+        "wrote": "dead",
+        "record_keys": [
+          "retry",
+          "queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count",
+          "retried_at"
+        ],
+        "record": {
+          "retry": 2,
+          "queue": "default",
+          "wrapped": "TwoRetriesJob",
+          "args": [
+            {
+              "job_class": "TwoRetriesJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "two"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "two attempt 3",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 2,
+          "retried_at": "<ms>"
+        }
+      }
+    ],
+    "no_retry": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":false,\"queue\":\"default\",\"wrapped\":\"NoRetryJob\",\"args\":[{\"job_class\":\"NoRetryJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"never\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "dropped",
+        "wrote": "nothing"
+      }
+    ],
+    "zero_retry": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":0,\"queue\":\"default\",\"wrapped\":\"ZeroRetryJob\",\"args\":[{\"job_class\":\"ZeroRetryJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"zero\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "zero attempt 1",
+        "wrote": "dead",
+        "record_keys": [
+          "retry",
+          "queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count"
+        ],
+        "record": {
+          "retry": 0,
+          "queue": "default",
+          "wrapped": "ZeroRetryJob",
+          "args": [
+            {
+              "job_class": "ZeroRetryJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "zero"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "zero attempt 1",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 0
+        }
+      }
+    ],
+    "retry_queue": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":3,\"queue\":\"default\",\"retry_queue\":\"low\",\"wrapped\":\"LowRetryJob\",\"args\":[{\"job_class\":\"LowRetryJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"low\",1],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "low attempt 1",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "retry_queue",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count"
+        ],
+        "record": {
+          "retry": 3,
+          "queue": "low",
+          "retry_queue": "low",
+          "wrapped": "LowRetryJob",
+          "args": [
+            {
+              "job_class": "LowRetryJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "low",
+                1
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "low attempt 1",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 0
+        }
+      }
+    ],
+    "retry_for": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":true,\"queue\":\"default\",\"retry_for\":1,\"wrapped\":\"RetryForJob\",\"args\":[{\"job_class\":\"RetryForJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"for\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "for attempt 1",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "retry_for",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count"
+        ],
+        "record": {
+          "retry": true,
+          "queue": "default",
+          "retry_for": 1,
+          "wrapped": "RetryForJob",
+          "args": [
+            {
+              "job_class": "RetryForJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "for"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "for attempt 1",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 0
+        }
+      },
+      {
+        "queue": "default",
+        "popped": "{\"retry\":true,\"queue\":\"default\",\"retry_for\":1,\"wrapped\":\"RetryForJob\",\"args\":[{\"job_class\":\"RetryForJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"for\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124,\"error_message\":\"for attempt 1\",\"error_class\":\"Sticky\",\"failed_at\":1792632725000,\"retry_count\":0}",
+        "error_class": "Sticky",
+        "error_message": "for attempt 2",
+        "wrote": "dead",
+        "record_keys": [
+          "retry",
+          "queue",
+          "retry_for",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count",
+          "retried_at"
+        ],
+        "record": {
+          "retry": true,
+          "queue": "default",
+          "retry_for": 1,
+          "wrapped": "RetryForJob",
+          "args": [
+            {
+              "job_class": "RetryForJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "for"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "for attempt 2",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 1,
+          "retried_at": "<ms>"
+        }
+      }
+    ],
+    "not_dead": [
+      {
+        "queue": "default",
+        "popped": "{\"retry\":1,\"queue\":\"default\",\"dead\":false,\"wrapped\":\"NotDeadJob\",\"args\":[{\"job_class\":\"NotDeadJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"notdead\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124}",
+        "error_class": "Sticky",
+        "error_message": "notdead attempt 1",
+        "wrote": "retry",
+        "record_keys": [
+          "retry",
+          "queue",
+          "dead",
+          "wrapped",
+          "args",
+          "class",
+          "jid",
+          "created_at",
+          "enqueued_at",
+          "error_message",
+          "error_class",
+          "failed_at",
+          "retry_count"
+        ],
+        "record": {
+          "retry": 1,
+          "queue": "default",
+          "dead": false,
+          "wrapped": "NotDeadJob",
+          "args": [
+            {
+              "job_class": "NotDeadJob",
+              "job_id": "<uuid>",
+              "provider_job_id": null,
+              "queue_name": "default",
+              "priority": null,
+              "arguments": [
+                "notdead"
+              ],
+              "executions": 0,
+              "exception_executions": {},
+              "locale": "en",
+              "timezone": null,
+              "enqueued_at": "<iso8601(9)>",
+              "scheduled_at": null
+            }
+          ],
+          "class": "Sidekiq::ActiveJob::Wrapper",
+          "jid": "<jid>",
+          "created_at": "<ms>",
+          "enqueued_at": "<ms>",
+          "error_message": "notdead attempt 1",
+          "error_class": "Sticky",
+          "failed_at": "<ms>",
+          "retry_count": 0
+        }
+      },
+      {
+        "queue": "default",
+        "popped": "{\"retry\":1,\"queue\":\"default\",\"dead\":false,\"wrapped\":\"NotDeadJob\",\"args\":[{\"job_class\":\"NotDeadJob\",\"job_id\":\"00000000-0000-4000-8000-000000000000\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[\"notdead\"],\"executions\":0,\"exception_executions\":{},\"locale\":\"en\",\"timezone\":null,\"enqueued_at\":\"2026-10-23T00:00:00.000000000Z\",\"scheduled_at\":null}],\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"jid\":\"0123456789abcdef01234567\",\"created_at\":1792632730123,\"enqueued_at\":1792632730124,\"error_message\":\"notdead attempt 1\",\"error_class\":\"Sticky\",\"failed_at\":1792632725000,\"retry_count\":0}",
+        "error_class": "Sticky",
+        "error_message": "dropped",
+        "wrote": "nothing"
+      }
+    ],
+    "scheduled": []
+  },
   "schedule_entry": {
     "envelope_keys": [
       "retry",

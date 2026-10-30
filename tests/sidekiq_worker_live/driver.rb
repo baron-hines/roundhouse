@@ -8,7 +8,7 @@
 # way the web role does, runs two processor threads until they have
 # taken them all, then shuts down with a slow job still running, as
 # TERM does. reader.rb then reads what is left through Sidekiq's own
-# API: the dead set, and the slow job back on its queue.
+# API: the retry set, and the slow job back on its queue.
 require_relative "stubs"
 
 module JobRegistry
@@ -65,7 +65,7 @@ probe = SidekiqRedis.worker_open(SidekiqPush.url)
 SidekiqWorker.parse(["sidekiq", "-q", "default", "-q", "low", "-c", "2", "-t", "1"])
 SidekiqWorker.install_traps
 SidekiqWorker.start(2)
-wait_until("the first jobs", 20.0) { ran.length == 3 && probe.zcard("dead") == 2 }
+wait_until("the first jobs", 20.0) { ran.length == 3 && probe.zcard("retry") == 2 }
 puts "ran " + ran.sort.join(",")
 
 push("SlowJob", "default", "s1")

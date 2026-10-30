@@ -6204,7 +6204,9 @@ fn redis_setting_source(setting: Option<&crate::app::RedisSetting>) -> String {
 
 /// `JobRegistry`'s `config/sidekiq.yml` defaults for the worker:
 /// concurrency 0 and timeout -1 when the file gives none, and the queues
-/// as one String of `name` or `name,weight` words, `""` for none.
+/// as one String of `name` or `name,weight` words, `""` for none. The
+/// retry limit, the dead set's trims and the poller's intervals are -1
+/// (-1.0) when the file gives none, so the worker keeps Sidekiq's.
 fn worker_defaults_source(defaults: &crate::app::SidekiqWorkerDefaults) -> String {
     use crate::emit::ruby::expr::ruby_str_literal;
     let queues: Vec<String> = defaults
@@ -6212,12 +6214,22 @@ fn worker_defaults_source(defaults: &crate::app::SidekiqWorkerDefaults) -> Strin
         .iter()
         .map(|(name, weight)| if *weight == 0 { name.clone() } else { format!("{name},{weight}") })
         .collect();
-    format!(
-        "\n  def self.sidekiq_worker_concurrency\n    {}\n  end\n\n  def self.sidekiq_worker_timeout\n    {}\n  end\n\n  def self.sidekiq_worker_queues\n    {}\n  end\n",
-        defaults.concurrency.unwrap_or(0),
-        defaults.timeout.unwrap_or(-1),
-        ruby_str_literal(&queues.join(" ")),
-    )
+    let float = |v: Option<f64>| {
+        let v = v.unwrap_or(-1.0);
+        if v.fract() == 0.0 { format!("{v:.1}") } else { format!("{v}") }
+    };
+    let method = |name: &str, body: String| format!("\n  def self.{name}\n    {body}\n  end\n");
+    [
+        method("sidekiq_worker_concurrency", defaults.concurrency.unwrap_or(0).to_string()),
+        method("sidekiq_worker_timeout", defaults.timeout.unwrap_or(-1).to_string()),
+        method("sidekiq_worker_queues", ruby_str_literal(&queues.join(" "))),
+        method("sidekiq_worker_max_retries", defaults.max_retries.unwrap_or(-1).to_string()),
+        method("sidekiq_worker_dead_max_jobs", defaults.dead_max_jobs.unwrap_or(-1).to_string()),
+        method("sidekiq_worker_dead_timeout", defaults.dead_timeout_in_seconds.unwrap_or(-1).to_string()),
+        method("sidekiq_worker_poll_interval_average", float(defaults.poll_interval_average)),
+        method("sidekiq_worker_scheduled_poll_interval", float(defaults.average_scheduled_poll_interval)),
+    ]
+    .concat()
 }
 
 /// Whether the tree sends broadcasts through Redis: on `:sidekiq`

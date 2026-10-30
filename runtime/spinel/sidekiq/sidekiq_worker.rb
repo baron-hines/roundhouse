@@ -15,7 +15,7 @@
 # and loops:
 #
 #   BRPOP queue:a queue:b ... 2       # [] after 2 s, then check QUIET
-#   run the job, writing it to the dead set if it fails
+#   run the job, writing it to the retry or dead set if it fails
 #
 # Strict order (no weights) sends the queues as given. With weights,
 # each fetch shuffles the expanded list (a weight-3 queue three times)
@@ -26,12 +26,15 @@
 # its older alias) can run here; the payload goes to
 # `ActiveJob.perform_parsed`. A job that raises, a job class this binary
 # doesn't have, and a native Sidekiq job all fail the way Sidekiq fails
-# them, and with no retries until the retry set lands, a failed job
-# goes straight to the dead set (`SidekiqEnvelope.with_error`), unless
-# it says `retry: false` or `dead: false`. Malformed JSON goes to the
-# dead set as it is. The dead write is a pipeline of ZADD and the two
-# trims Sidekiq sends (Sidekiq wraps them in MULTI; spinel-redis has no
-# MULTI yet).
+# them, through Sidekiq's retry rules (`fail_job`): `retry: false` drops
+# the job; otherwise the failure is recorded on it
+# (`SidekiqEnvelope.with_error`) and it goes to the retry set, scored
+# `count**4 + 15` seconds plus jitter from now, until its `retry` limit
+# (`max_retries`, 25 by default) or `retry_for` runs out. Then it goes
+# to the dead set, unless it says `dead: false`. Malformed JSON goes to
+# the dead set as it is. The dead write is a pipeline of ZADD and the
+# two trims Sidekiq sends (Sidekiq wraps them in MULTI; spinel-redis has
+# no MULTI yet).
 #
 # SIGNALS. TSTP sets QUIET: threads finish their job and stop fetching,
 # and a job popped after that is pushed straight back. TERM or INT also
@@ -51,6 +54,7 @@ module SidekiqWorker
   FETCH_TIMEOUT = 2
   DEAD_TIMEOUT_SECONDS = 15_552_000
   DEAD_MAX_JOBS = 10_000
+  MAX_RETRIES = 25
   POLL_SECONDS = 0.5
   RECONNECT_SECONDS = 1.0
 
@@ -76,8 +80,8 @@ module SidekiqWorker
   RUNNING = [0]
   THREADS = []
 
-  # The control connection (requeue and dead writes), opened lazily and
-  # shared under CONTROL_LOCK.
+  # The control connection (requeue, retry and dead writes), opened
+  # lazily and shared under CONTROL_LOCK.
   CONTROL = []
   CONTROL_LOCK = Mutex.new
 
@@ -453,23 +457,59 @@ module SidekiqWorker
     nil
   end
 
+  # Sidekiq's retry rules for a job that failed (`JobRetry#process_retry`).
   def self.fail_job(env, raw, queue, label, error_class, message, started)
     log("WARN", label + " fail: " + elapsed(started) + " sec: " + error_class + ": " + message)
-    if SidekiqEnvelope.dead?(env)
-      write_dead(SidekiqEnvelope.with_error(raw, queue, error_class, message, now_ms))
-    else
+    unless SidekiqEnvelope.retries?(env)
       log("INFO", label + " dropped: retry is off")
+      return nil
+    end
+    now = now_ms
+    count = SidekiqEnvelope.next_retry_count(env)
+    failed = SidekiqEnvelope.with_error(raw, queue, error_class, message, now)
+    if SidekiqEnvelope.exhausted?(env, count, max_retries, now)
+      if SidekiqEnvelope.discard_when_exhausted?(env)
+        log("INFO", label + " discarded: retries exhausted")
+      else
+        write_dead(failed)
+      end
+    else
+      delay = SidekiqEnvelope.retry_delay(count)
+      write_retry(Time.now.to_f + delay, failed)
     end
     nil
   end
 
-  # ZADD dead now <job>, then Sidekiq's trims by age and by count. A
-  # Redis error loses the job, logged in full, as Sidekiq loses it.
+  # `max_retries` from config/sidekiq.yml, else Sidekiq's 25.
+  def self.max_retries
+    n = JobRegistry.sidekiq_worker_max_retries
+    n >= 0 ? n : MAX_RETRIES
+  end
+
+  # ZADD retry <when> <job>, one command, as Sidekiq writes it. A Redis
+  # error loses the job, logged in full, as Sidekiq loses it.
+  def self.write_retry(at, json)
+    begin
+      with_control { |conn| SidekiqRedis.write_retry(conn, at, json) }
+    rescue StandardError => e
+      log("WARN", "Failed to write a job to the retry set: " + e.message + ": " + json)
+    end
+    nil
+  end
+
+  # ZADD dead now <job>, then Sidekiq's trims by age and by count
+  # (`dead_timeout_in_seconds` and `dead_max_jobs` from
+  # config/sidekiq.yml, else 180 days and 10,000). A Redis error loses
+  # the job, logged in full, as Sidekiq loses it.
   def self.write_dead(json)
     now = Time.now.to_f
+    timeout = JobRegistry.sidekiq_worker_dead_timeout
+    timeout = DEAD_TIMEOUT_SECONDS if timeout < 0
+    keep = JobRegistry.sidekiq_worker_dead_max_jobs
+    keep = DEAD_MAX_JOBS if keep < 0
     begin
       with_control do |conn|
-        SidekiqRedis.write_dead(conn, now, json, (now - DEAD_TIMEOUT_SECONDS).to_s, (0 - DEAD_MAX_JOBS).to_s)
+        SidekiqRedis.write_dead(conn, now, json, (now - timeout).to_s, (0 - keep).to_s)
       end
     rescue StandardError => e
       log("WARN", "Failed to write a job to the dead set: " + e.message + ": " + json)

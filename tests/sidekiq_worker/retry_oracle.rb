@@ -29,6 +29,8 @@
 # the worker itself must send are kept: fetches that popped a job, the
 # poller's pops that found one, the pushes, and the retry and dead
 # writes. Values that change per run are checked for shape and masked.
+# `failures` pairs each job that failed, as it was popped (per-run
+# values pinned), with what Sidekiq wrote for it.
 require "json"
 require "rbconfig"
 require "tmpdir"
@@ -175,13 +177,49 @@ def describe_trips(trips)
   end
 end
 
+# The scenarios whose last run raises and writes nothing.
+SILENT_LAST_FAILURE = %w[no_retry not_dead].freeze
+
+# Each job the server popped and failed, pinned, with the error it
+# raised and what it wrote after: the retry or dead record, or nothing.
+# The worker's tests feed these to the runtime's retry rules.
+def failures(name, trips)
+  pops = []
+  trips.each do |trip|
+    argv = trip["commands"][0]
+    if argv[0].casecmp?("brpop") && trip["reply"]
+      pops << { "queue" => trip["reply"][0].delete_prefix("queue:"), "popped" => pin(trip["reply"][1], failures: true) }
+      next
+    end
+    next if pops.empty?
+    trip["commands"].each do |c|
+      next unless c[0].casecmp?("zadd") && %w[retry dead].include?(c[1])
+      pops.last["wrote"] = c[1]
+      pops.last["record"] = c[3]
+    end
+  end
+  failed = pops.select { |p| p["wrote"] }
+  failed << pops.last.merge("wrote" => "nothing") if SILENT_LAST_FAILURE.include?(name)
+  failed.map do |p|
+    raw = p["record"]
+    entry = { "queue" => p["queue"], "popped" => p["popped"],
+      "error_class" => raw ? JSON.parse(raw)["error_class"] : "Sticky",
+      "error_message" => raw ? JSON.parse(raw)["error_message"] : "dropped",
+      "wrote" => p["wrote"] }
+    raw ? entry.merge("record_keys" => top_level_keys(raw), "record" => mask_envelope(raw)) : entry
+  end
+end
+
 SCENARIOS = {}
+FAILURES = {}
 
 def scenario(name, settle: 0.5)
   start = log_lines
   yield
   sleep settle
-  SCENARIOS[name] = describe_trips(trips_since(start))
+  trips = trips_since(start)
+  SCENARIOS[name] = describe_trips(trips)
+  FAILURES[name] = failures(name, trips)
 end
 
 scenario("flaky") do
@@ -282,6 +320,7 @@ puts JSON.pretty_generate(
     "noscript" => noscript
   },
   "scenarios" => SCENARIOS,
+  "failures" => FAILURES,
   "schedule_entry" => {
     "envelope_keys" => top_level_keys(schedule_entry),
     "envelope" => mask_envelope(schedule_entry)

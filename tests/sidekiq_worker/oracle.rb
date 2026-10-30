@@ -92,31 +92,6 @@ def kept(trips)
   end
 end
 
-# A job's text with its per-run values pinned to fixed ones, keys and
-# formatting as Sidekiq wrote them, so a test can feed the same text to
-# the runtime and compare what it writes with what Sidekiq wrote.
-# Malformed JSON is returned as it is.
-PINNED = {
-  "jid" => "0123456789abcdef01234567",
-  "created_at" => 1_792_632_730_123,
-  "enqueued_at" => 1_792_632_730_124,
-  "job_id" => "00000000-0000-4000-8000-000000000000",
-  "aj_enqueued_at" => "2026-10-23T00:00:00.000000000Z"
-}.freeze
-
-def pin(raw)
-  env = JSON.parse(raw)
-  env["jid"] = PINNED["jid"]
-  env["created_at"] = PINNED["created_at"] if env.key?("created_at")
-  env["enqueued_at"] = PINNED["enqueued_at"] if env.key?("enqueued_at")
-  env["args"] = env["args"].map do |aj|
-    aj.merge("job_id" => PINNED["job_id"], "enqueued_at" => PINNED["aj_enqueued_at"])
-  end
-  JSON.generate(env)
-rescue JSON::ParserError
-  raw
-end
-
 # One command, with its per-run values masked. `now` is the dead write's
 # score, which the trim commands that follow it are relative to.
 def describe(argv, now)

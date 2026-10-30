@@ -55,3 +55,36 @@ def mask_envelope(raw)
   end
   env
 end
+
+# A job's text with its per-run values pinned to fixed ones, keys and
+# formatting as Sidekiq wrote them, so a test can feed the same text to
+# the runtime and compare what it writes with what Sidekiq wrote.
+# Malformed JSON is returned as it is. With `failures`, a failed job's
+# `failed_at` and `retried_at` are pinned too; oracle.rb keeps its
+# seeded ones, which are from 2001.
+PINNED = {
+  "jid" => "0123456789abcdef01234567",
+  "created_at" => 1_792_632_730_123,
+  "enqueued_at" => 1_792_632_730_124,
+  "job_id" => "00000000-0000-4000-8000-000000000000",
+  "aj_enqueued_at" => "2026-10-23T00:00:00.000000000Z",
+  "failed_at" => 1_792_632_725_000,
+  "retried_at" => 1_792_632_729_000
+}.freeze
+
+def pin(raw, failures: false)
+  env = JSON.parse(raw)
+  if failures
+    env["failed_at"] = PINNED["failed_at"] if env.key?("failed_at")
+    env["retried_at"] = PINNED["retried_at"] if env.key?("retried_at")
+  end
+  env["jid"] = PINNED["jid"]
+  env["created_at"] = PINNED["created_at"] if env.key?("created_at")
+  env["enqueued_at"] = PINNED["enqueued_at"] if env.key?("enqueued_at")
+  env["args"] = env["args"].map do |aj|
+    aj.merge("job_id" => PINNED["job_id"], "enqueued_at" => PINNED["aj_enqueued_at"])
+  end
+  JSON.generate(env)
+rescue JSON::ParserError
+  raw
+end

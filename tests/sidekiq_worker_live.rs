@@ -6,8 +6,8 @@
 //! it. It pushes jobs as the web role does, lets two processor threads
 //! run them, then shuts down with a job still running.
 //! `tests/sidekiq_worker_live/reader.rb` reads what is left through
-//! Sidekiq's public API (`Sidekiq::DeadSet`, `Sidekiq::Queue`): the two
-//! failed jobs in the dead set with Sidekiq's error fields, and the
+//! Sidekiq's public API (`Sidekiq::RetrySet`, `Sidekiq::Queue`): the two
+//! failed jobs in the retry set with Sidekiq's error fields, and the
 //! running job back on its queue, unchanged. `tests/sidekiq_worker.rs`
 //! holds the bytes against Sidekiq's own; this gate proves the clients
 //! deliver them and Sidekiq reads them.
