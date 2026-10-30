@@ -62,7 +62,7 @@ pub fn build_unique_keys(models: &[Model], schema: &crate::schema::Schema) -> Un
         let not_null = |name: &Symbol| {
             table.columns.iter().any(|c| &c.name == name && !c.nullable)
         };
-        let keys: Vec<UniqueKey> = table
+        let mut keys: Vec<UniqueKey> = table
             .indexes
             .iter()
             .filter(|i| i.unique && !i.columns.is_empty())
@@ -74,6 +74,17 @@ pub fn build_unique_keys(models: &[Model], schema: &crate::schema::Schema) -> Un
                     .map(str::to_string),
             })
             .collect();
+        // The primary key conflicts too: a row that supplies its key
+        // (`insert_all([{ id: 910, … }])`) writes it, and Rails skips one
+        // already taken. A row without one reads `nil`, which matches none.
+        let primary: Vec<Symbol> = if table.primary_key_columns.is_empty() {
+            table.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect()
+        } else {
+            table.primary_key_columns.clone()
+        };
+        if !primary.is_empty() && !keys.iter().any(|k| k.columns == primary && k.predicate.is_none()) {
+            keys.push(UniqueKey { columns: primary, predicate: None });
+        }
         if !keys.is_empty() {
             out.insert(m.name.clone(), keys);
         }
@@ -2739,6 +2750,47 @@ pub fn mentions_model_chain_start(expr: &Expr, models: &HashSet<ClassId>) -> boo
     found
 }
 
+/// The columns `<Model>.insert_all!(rows, returning: …)` reads back, when
+/// `returning:` is left out (the primary key) or is a literal column list.
+/// `None` declines the inlining.
+fn insert_all_bang_returning(arg: Option<&Expr>) -> Option<Vec<String>> {
+    match arg.map(|a| &*a.node) {
+        None => Some(vec!["id".to_string()]),
+        Some(ExprNode::Hash { entries, .. }) if entries.len() == 1 => {
+            let (k, v) = &entries[0];
+            let key_ok = matches!(&*k.node,
+                ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "returning");
+            match (&*v.node, key_ok) {
+                (ExprNode::Array { elements, .. }, true) => elements
+                    .iter()
+                    .map(|e| match &*e.node {
+                        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+                        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// True when `scope_chain` inlines `<recv>.insert_all(args)` /
+/// `insert_all!(args)`: `recv` names a model, as `const_model` reads it,
+/// and the call has the shape the inlining takes. The strict-target
+/// survey reports only the forms this declines, which reach the
+/// Ruby-family runtime's methods.
+pub fn inlines_insert_all(recv: &Expr, method: &str, args: &[Expr], has_block: bool, models: &HashSet<ClassId>) -> bool {
+    !has_block
+        && const_model(recv, models).is_some()
+        && match method {
+            "insert_all" => args.len() == 1,
+            "insert_all!" => (1..=2).contains(&args.len()) && insert_all_bang_returning(args.get(1)).is_some(),
+            _ => false,
+        }
+}
+
 /// True when `expr` calls `<Model>.insert_all(rows)` (or `insert_all!`). Gate for the
 /// call-site expansion in `rewrite_send`.
 pub fn mentions_model_insert_all(expr: &Expr, models: &HashSet<ClassId>) -> bool {
@@ -4602,26 +4654,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 // Only a literal column list (Strings or Symbols) lowers;
                 // anything else declines.
                 if method.as_str() == "insert_all!" && !args.is_empty() && args.len() <= 2 && block.is_none() {
-                    let returning: Option<Vec<String>> = match args.get(1).map(|a| &*a.node) {
-                        None => Some(vec!["id".to_string()]),
-                        Some(ExprNode::Hash { entries, .. }) if entries.len() == 1 => {
-                            let (k, v) = &entries[0];
-                            let key_ok = matches!(&*k.node,
-                                ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "returning");
-                            match (&*v.node, key_ok) {
-                                (ExprNode::Array { elements, .. }, true) => elements
-                                    .iter()
-                                    .map(|e| match &*e.node {
-                                        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-                                        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
-                                        _ => None,
-                                    })
-                                    .collect(),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    };
+                    let returning = insert_all_bang_returning(args.get(1));
                     if let Some(columns) = returning {
                         let attrs = Symbol::from("__attrs");
                         let rec = Symbol::from("__rec");

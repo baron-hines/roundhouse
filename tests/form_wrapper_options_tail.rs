@@ -175,6 +175,21 @@ fn a_call_with_splatted_literal_option_keys_produces_a_form() {
     }
 }
 
+#[test]
+fn a_string_option_key_does_not_override_a_symbol_key() {
+    let src = show_view(", **{ \"method\" => :delete }");
+    assert!(src.contains("<form"), "{src}");
+    assert!(src.contains("form_method = :patch"), "{src}");
+    assert!(!src.contains("form_method = :delete"), "{src}");
+}
+
+#[test]
+fn a_splatted_symbol_option_key_overrides_a_symbol_key() {
+    let src = show_view(", **{ method: :delete }");
+    assert!(src.contains("<form"), "{src}");
+    assert!(src.contains("form_method = :delete"), "{src}");
+}
+
 /// Bare call — the options parameter binds its own `{}` default.
 #[test]
 fn a_call_with_no_options_binds_the_default() {

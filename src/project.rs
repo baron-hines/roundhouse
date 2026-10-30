@@ -2770,6 +2770,9 @@ fn target_files_inner(
     for d in crate::lower::relation_residue::default_scope_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
+    for d in crate::lower::model_to_library::select_aliases::select_alias_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
     report_mailers(app, target);
     report_sqlite_index_predicates(app, target);
     report_array_columns(app, target);
@@ -4518,10 +4521,10 @@ fn ruby_family_runtime_files(
         push_jruby_markly_shim(&mut files)?;
     }
 
-    // Same reasoning for the extras façades (Sponge): CRuby has the real
-    // net/https / resolv / ipaddr stdlib and the vendored source runs as
-    // written, so put the verbatim source-shape emit back over the
-    // scaffold base's raising façade.
+    // Same reasoning for the extras façades (Markdowner and the rest of
+    // `facades::EXTRAS_FACADES`): CRuby has the real gems and stdlib and
+    // the vendored source runs as written, so put the verbatim
+    // source-shape emit back over the scaffold base's raising façade.
     emit::ruby::restore_extras_facades(&mut files, app);
 
     crate::runtime_files::walk_into("runtime/spinel/scaffold/ruby_overlay",
@@ -8075,16 +8078,31 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 format!("the SQLite locking relation is supplied by the Ruby-family runtime; the {target} runtime ships none"),
             );
         }
-        // `runtime/ruby/active_record/connection.rb` carries `upsert_all`; no strict runtime transpiles it.
+        // `runtime/ruby/active_record/connection.rb` carries `upsert_all` and the
+        // `insert_all` forms the lowering does not inline; no strict runtime transpiles it.
+        let answers_result = matches!(&expr.ty, Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActiveRecord::Result");
+        let answers_rows = matches!(&expr.ty, Some(crate::ty::Ty::Array { elem }) if **elem == crate::ty::Ty::Untyped);
         if !matches!(target, "jruby" | "spinel")
-            && let crate::expr::ExprNode::Send { recv: Some(_), method, .. } = &*expr.node
-            && matches!(method.as_str(), "upsert" | "upsert_all")
-            && expr.ty == Some(crate::ty::Ty::Int)
+            && let crate::expr::ExprNode::Send { recv, method, args, block, .. } = &*expr.node
+            && ((matches!(method.as_str(), "upsert" | "upsert_all" | "insert" | "insert!" | "insert_all!") && answers_result)
+                || (method.as_str() == "insert_all" && answers_rows))
+            // This walk runs before lowering: a call `scope_chain` inlines compiles
+            // everywhere. A receiverless call in a model's class method is never inlined.
+            && !recv.as_ref().is_some_and(|recv| {
+                crate::lower::scope_chain::inlines_insert_all(
+                    recv,
+                    method.as_str(),
+                    args,
+                    block.is_some(),
+                    &crate::lower::scope_chain::model_set(&app.models),
+                )
+            })
         {
+            let construct = if method.as_str().starts_with("upsert") { "upsert" } else { "insert_all" };
             emit::diagnostics::report_unsupported(
                 expr.span,
                 target,
-                "upsert",
+                construct,
                 format!("`{}` is the Ruby-family runtime's; the {target} runtime ships none", method.as_str()),
             );
         }
@@ -9073,11 +9091,11 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     // the strict whole-graph check, which is the point (spinel as
     // completeness oracle).
     files.extend(sort_files(emit::ruby::emit_library(app)));
-    // Vendored extras whose bodies drive un-modeled stdlib (Sponge →
-    // Net::HTTP/Resolv/IPAddr/OpenSSL) get raising façades at the same
+    // Vendored extras whose bodies drive surface no spinel package
+    // carries (`facades::EXTRAS_FACADES`) get raising façades at the same
     // require path — spinel AOT prices every reachable body and the
-    // verbatim ones can't compile until the stdlib spin packages land.
-    // The CRuby tree restores the verbatim emit (real stdlib there).
+    // verbatim ones can't compile. The CRuby tree restores the verbatim
+    // emit (real gems and stdlib there).
     emit::ruby::apply_extras_facades(&mut files, app);
 
     let js = fixture.join("app/javascript");
@@ -11762,7 +11780,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # on Debian/Ubuntu, `brew install vips` on macOS) and loadable\n\
              # at run time (`libvips42`). Git form for the reason bcrypt\n\
              # gives above: matz/spin-index#7 is the registration.\n\
-             ruby-vips = { git = \"https://github.com/rubys/spinel-ruby-vips\", ref = \"v0.2.0\" }\n",
+             ruby-vips = { git = \"https://github.com/rubys/spinel-ruby-vips\", ref = \"v0.3.0\" }\n",
         );
     }
     if needs_rqrcode {

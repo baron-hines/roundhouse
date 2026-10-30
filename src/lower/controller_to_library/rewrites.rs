@@ -130,7 +130,15 @@ pub(super) fn partial_view_call_with_record(
                 ),
             }),
             "path_parameters" => Some(ivar("path_parameters", span)),
-            _ => None,
+            // The request's flash, as the action's own view gets it
+            // (`flash_lookup`): a `render partial: "shared/flash"` in a
+            // turbo-stream response reads `notice`. By slot
+            // (`flash_slot_of`): the partial may spell it `notice_`, and
+            // a `local_assigns[:notice_]` it reads is no slot. A
+            // strict-locals partial takes no flash.
+            _ => crate::lower::view_to_library::flash_slot_of(&contract.extras, name)
+                .filter(|_| !contract.keyword_extras)
+                .map(|slot| flash_lookup(span, slot)),
         }
     };
     view_args.extend(contract.extras_args(lookup, request_value, None, || nil_expr(span), span));
