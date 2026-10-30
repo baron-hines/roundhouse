@@ -169,3 +169,67 @@ end
     assert!(!emitted.contains("3.to_s"), "the direct helper's options were stringified:\n{emitted}");
     assert!(emitted.contains("account_logo_path(preview: false.to_s)"), "the generated helper's option:\n{emitted}");
 }
+
+/// A helper call nested in another's arguments is projected too. The
+/// projection replaces the outer call without visiting the replacement,
+/// so the nested call's own options are projected first. Checked on the
+/// shared test lowering every target runs; the Ruby emit's own pass
+/// visits children first and hid this there. A direct helper keeps its
+/// options at any depth, inside a generated helper or around one.
+#[test]
+fn a_nested_helper_call_in_a_test_body_is_projected_too() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let routes = "Rails.application.routes.draw do
+  resource :account do
+    scope module: \"accounts\" do
+      resource :logo, only: :show
+    end
+  end
+  direct :fresh_account_logo do |options|
+    route_for :account_logo
+  end
+end
+";
+    let test = "require \"test_helper\"
+
+class AccountTest < ActiveSupport::TestCase
+  test \"paths\" do
+    a = account_logo_path(preview: false, next: account_logo_path(preview: true))
+    b = account_logo_path(preview: false, next: fresh_account_logo_path(preview: true))
+    c = fresh_account_logo_path(preview: false, next: account_logo_path(preview: true))
+  end
+end
+";
+    let files: HashMap<PathBuf, Vec<u8>> = [
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+        ("config/routes.rb", routes),
+        ("test/models/account_test.rb", test),
+    ]
+    .into_iter()
+    .map(|(p, s)| (PathBuf::from(p), s.as_bytes().to_vec()))
+    .collect();
+    let app = roundhouse::ingest::ingest_app_from_tree(files).expect("ingest");
+    let lcs = roundhouse::lower::lower_test_modules_to_library_classes(
+        &app.test_modules,
+        &app.fixtures,
+        &app.models,
+        Vec::new(),
+        &roundhouse::lower::routes::helper_id_segments(&app),
+        &roundhouse::lower::routes::direct_helper_names(&app),
+    );
+    let body = lcs
+        .iter()
+        .flat_map(|lc| lc.methods.iter())
+        .find(|m| m.name.as_str() == "test_paths")
+        .map(roundhouse::emit::ruby::emit_method)
+        .expect("test_paths lowered");
+    for expected in [
+        "RouteHelpers.account_logo_path(preview: false.to_s, next: RouteHelpers.account_logo_path(preview: true.to_s))",
+        "RouteHelpers.account_logo_path(preview: false.to_s, next: RouteHelpers.fresh_account_logo_path(preview: true))",
+        "RouteHelpers.fresh_account_logo_path(preview: false, next: RouteHelpers.account_logo_path(preview: true.to_s))",
+    ] {
+        assert!(body.contains(expected), "{expected}:\n{body}");
+    }
+}

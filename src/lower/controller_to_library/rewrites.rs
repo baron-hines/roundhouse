@@ -3102,7 +3102,13 @@ fn project_route_helper_ids_node(e: &Expr, direct_helpers: &crate::det::HashSet<
     if !args.iter().any(arg_carries_a_model) && (direct || !args.iter().any(query_carries_a_scalar)) {
         return None;
     }
-    let projected: Vec<Expr> = args.iter().map(|a| project_arg(a, direct)).collect();
+    // A helper call nested in an argument (`next: inner_path(flag: true)`)
+    // is projected first: the walk doesn't revisit a replacement, so once
+    // this call is rebuilt the nested one would keep its own options.
+    let projected: Vec<Expr> = args
+        .iter()
+        .map(|a| project_arg(&project_route_helper_ids(a, direct_helpers), direct))
+        .collect();
     Some(Expr::new(
         e.span,
         ExprNode::Send {
