@@ -30,7 +30,8 @@
 # poller's pops that found one, the pushes, and the retry and dead
 # writes. Values that change per run are checked for shape and masked.
 # `failures` pairs each job that failed, as it was popped (per-run
-# values pinned), with what Sidekiq wrote for it.
+# values pinned), with what Sidekiq wrote for it, and `moves` each job
+# the poller popped with the push that put it back on its queue.
 require "json"
 require "rbconfig"
 require "tmpdir"
@@ -210,8 +211,28 @@ def failures(name, trips)
   end
 end
 
+# Each job the poller popped, pinned, and the push that followed: the
+# queue and the job's text with enqueued_at set.
+def moves(trips)
+  out = []
+  trips.each do |trip|
+    argv = trip["commands"][0]
+    if argv[0].casecmp?("evalsha") && trip["reply"]
+      out << { "set" => argv[3], "popped" => pin(trip["reply"], failures: true) }
+      next
+    end
+    next if out.empty? || out.last.key?("pushed")
+    lpush = trip["commands"].find { |c| c[0].casecmp?("lpush") && !c[1].start_with?("oracle:") }
+    next unless lpush
+    out.last.merge!("queue" => lpush[1].delete_prefix("queue:"),
+      "pushed_keys" => top_level_keys(lpush[2]), "pushed" => mask_envelope(lpush[2]))
+  end
+  out
+end
+
 SCENARIOS = {}
 FAILURES = {}
+MOVES = {}
 
 def scenario(name, settle: 0.5)
   start = log_lines
@@ -220,6 +241,7 @@ def scenario(name, settle: 0.5)
   trips = trips_since(start)
   SCENARIOS[name] = describe_trips(trips)
   FAILURES[name] = failures(name, trips)
+  MOVES[name] = moves(trips)
 end
 
 scenario("flaky") do
@@ -321,6 +343,7 @@ puts JSON.pretty_generate(
   },
   "scenarios" => SCENARIOS,
   "failures" => FAILURES,
+  "moves" => MOVES,
   "schedule_entry" => {
     "envelope_keys" => top_level_keys(schedule_entry),
     "envelope" => mask_envelope(schedule_entry)

@@ -18,5 +18,6 @@ module SidekiqEnvelope
   def self.retry_delay: (Integer count) -> Integer
   def self.requeue_text: (String raw) -> String
   def self.with_error: (String raw, String queue, String error_class, String message, Integer now_ms) -> String
+  def self.with_enqueued_at: (String raw, Integer now_ms) -> String
   def self.truncate: (String message) -> String
 end

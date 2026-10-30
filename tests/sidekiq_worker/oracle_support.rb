@@ -68,6 +68,7 @@ PINNED = {
   "enqueued_at" => 1_792_632_730_124,
   "job_id" => "00000000-0000-4000-8000-000000000000",
   "aj_enqueued_at" => "2026-10-23T00:00:00.000000000Z",
+  "aj_scheduled_at" => "2026-10-23T00:00:05.000000000Z",
   "failed_at" => 1_792_632_725_000,
   "retried_at" => 1_792_632_729_000
 }.freeze
@@ -82,7 +83,9 @@ def pin(raw, failures: false)
   env["created_at"] = PINNED["created_at"] if env.key?("created_at")
   env["enqueued_at"] = PINNED["enqueued_at"] if env.key?("enqueued_at")
   env["args"] = env["args"].map do |aj|
-    aj.merge("job_id" => PINNED["job_id"], "enqueued_at" => PINNED["aj_enqueued_at"])
+    aj = aj.merge("job_id" => PINNED["job_id"], "enqueued_at" => PINNED["aj_enqueued_at"])
+    aj["scheduled_at"] = PINNED["aj_scheduled_at"] unless aj["scheduled_at"].nil?
+    aj
   end
   JSON.generate(env)
 rescue JSON::ParserError

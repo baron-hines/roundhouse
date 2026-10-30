@@ -23,7 +23,8 @@
 //! under each of its retry settings, as popped, and what it wrote for
 //! each (the retry or dead record, or nothing). The worker driver runs
 //! the same failures through the worker's retry rules, which must write
-//! the same thing.
+//! the same thing, and the jobs Sidekiq's poller moved back to their
+//! queues through the worker's scheduler, which must push the same.
 //!
 //! The spinel tests compile the same drivers and require the same
 //! output as CRuby. Marked `#[ignore]`, as the other spinel tests are;
@@ -97,7 +98,18 @@ fn scratch(name: &str) -> PathBuf {
         })
         .collect();
     std::fs::write(dir.join("failures.txt"), lines.join("\n") + "\n").expect("write failures.txt");
+    let moves: Vec<String> = retry_moves(&retry_oracle())
+        .iter()
+        .map(|m| format!("{}\t{}", m["set"].as_str().unwrap(), m["popped"].as_str().unwrap()))
+        .collect();
+    std::fs::write(dir.join("moves.txt"), moves.join("\n") + "\n").expect("write moves.txt");
     dir
+}
+
+/// The retry oracle's moves (each job Sidekiq's poller popped and pushed
+/// back), scenario by scenario.
+fn retry_moves(oracle: &Value) -> Vec<&Value> {
+    oracle["moves"].as_object().unwrap().values().flat_map(|v| v.as_array().unwrap()).collect()
 }
 
 fn retry_oracle() -> Value {
@@ -341,4 +353,43 @@ fn the_spinel_binary_writes_what_cruby_writes() {
 #[ignore]
 fn the_spinel_worker_runs_as_cruby_does() {
     spinel_twin("roundhouse-sidekiq-worker-role", "worker_driver.rb");
+}
+
+/// Sidekiq's poller: one cycle moves every due job from `retry`, then
+/// from `schedule`, and pushes each onto the queue Sidekiq pushed it to,
+/// with the same text but for `enqueued_at` (set in place for a retry,
+/// appended for a scheduled job).
+#[test]
+fn the_scheduler_moves_due_jobs_as_sidekiq_does() {
+    let stdout = run_cruby(&scratch("roundhouse-sidekiq-worker-scheduler-cruby"), "worker_driver.rb");
+    assert_no_failures(&stdout);
+    let oracle = retry_oracle();
+    let mut want = retry_moves(&oracle);
+    // Retry first, then schedule, each in the order they were due.
+    want.sort_by_key(|m| m["set"].as_str() != Some("retry"));
+    let lines: Vec<&str> = stdout.lines().filter_map(|l| l.strip_prefix("sched ")).collect();
+    assert_eq!(lines.first().copied(), Some("script load zpopbyscore"), "{lines:#?}");
+    let pushes: Vec<&str> = lines[1..].iter().map(|l| l.strip_prefix("push ").unwrap_or_else(|| panic!("{l}"))).collect();
+    assert_eq!(pushes.len(), want.len(), "{pushes:#?}");
+    for (push, w) in pushes.iter().zip(&want) {
+        let (queue, record) = push.split_once(' ').unwrap();
+        assert_eq!(queue, w["queue"].as_str().unwrap(), "{push}");
+        assert_eq!(
+            top_level_keys(record),
+            w["pushed_keys"].as_array().unwrap().iter().map(|k| k.as_str().unwrap()).collect::<Vec<_>>(),
+            "pushed key order differs from Sidekiq's: {record}"
+        );
+        let mut got = mask(record);
+        for key in ["failed_at", "retried_at"] {
+            if matches!(got.get(key).and_then(Value::as_i64), Some(1_792_632_725_000 | 1_792_632_729_000)) {
+                got[key] = "<ms>".into();
+            }
+        }
+        for aj in got["args"].as_array_mut().unwrap() {
+            if !aj["scheduled_at"].is_null() {
+                aj["scheduled_at"] = "<iso8601(9)>".into();
+            }
+        }
+        assert_eq!(got, w["pushed"], "pushed job differs from Sidekiq's: {record}");
+    }
 }

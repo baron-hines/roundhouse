@@ -133,6 +133,16 @@ module SidekiqEnvelope
     JSON.generate(env)
   end
 
+  # The job's text with `enqueued_at` set to `now_ms`, in place when it
+  # has one (a retry) and appended when it doesn't (a job from the
+  # schedule set, which Sidekiq's push wrote without one), as
+  # Sidekiq's client does when the scheduler pushes the job again.
+  def self.with_enqueued_at(raw, now_ms)
+    env = JSON.parse(raw)
+    env["enqueued_at"] = now_ms
+    JSON.generate(env)
+  end
+
   def self.truncate(message)
     return message if message.length <= ERROR_MESSAGE_LIMIT
     message[0, ERROR_MESSAGE_LIMIT]

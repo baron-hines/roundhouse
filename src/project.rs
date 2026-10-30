@@ -3253,7 +3253,10 @@ fn with_sidekiq_readme(mut files: Vec<(String, String)>, target: BuildTarget, ap
          connection, and the database pool is sized to the threads plus headroom \
          unless `DATABASE_POOL_SIZE` is set. TSTP stops fetching; TERM or INT \
          waits for running jobs up to the timeout and pushes the rest back. A job \
-         that raises goes to the dead set; there are no retries yet.\n\n\
+         that raises is retried with Sidekiq's backoff (up to config/sidekiq.yml's \
+         `:max_retries:`, then 25), then goes to the dead set, and the worker moves \
+         due retries and scheduled jobs back onto their queues, as Sidekiq's \
+         scheduler does.\n\n\
          {cable}\n\n"
     );
     if let Some((_, readme)) = files.iter_mut().find(|(p, _)| p == "README.md") {
