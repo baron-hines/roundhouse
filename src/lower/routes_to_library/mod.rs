@@ -1448,8 +1448,12 @@ fn string_segment_demand(
                         .unwrap_or_else(|| method.as_str().to_string());
                     for (i, arg) in positional.iter().enumerate() {
                         let Some(seg) = segments.get(i) else { break };
-                        let string_record = matches!(&arg.ty, Some(Ty::Class { id, .. }) if string_keyed.contains(id.0.as_str()));
-                        if matches!(arg.ty, Some(Ty::Str)) || string_record {
+                        // A String that can be nil (a nullable column read off a
+                        // record that can be nil, `note.route_param`) is the same
+                        // evidence: Rails writes either with `to_param`.
+                        let arg_ty = arg.ty.as_ref().map(Ty::peel_nilable);
+                        let string_record = matches!(arg_ty, Some(Ty::Class { id, .. }) if string_keyed.contains(id.0.as_str()));
+                        if matches!(arg_ty, Some(Ty::Str)) || string_record {
                             out.entry(helper.clone()).or_default().insert(seg.clone());
                         }
                     }
@@ -1511,7 +1515,7 @@ fn route_for_string_segments(
                         .enumerate()
                     {
                         let Some(seg) = segments.get(i) else { break };
-                        if matches!(arg.ty, Some(Ty::Str)) {
+                        if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) {
                             out.entry(helper.clone()).or_default().insert(seg.clone());
                         }
                     }
