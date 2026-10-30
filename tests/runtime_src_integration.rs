@@ -1281,7 +1281,11 @@ fn every_runtime_method_body_concretely_typed() {
     // active_record/relation.rb).
     // MEASURED 911 on 2026-10-30 after merging main dfd6a874 (899): the
     // same bulk-write and Relation-bind sites, +12 on main's count.
-    const CEILING: usize = 911;
+    // MEASURED 918 on 2026-10-30 (on 911): a hash condition's boolean is
+    // cast through its column's type (`column_bound_value`), reading the
+    // condition's value and the model's column types untyped (+7 in
+    // active_record/relation.rb).
+    const CEILING: usize = 918;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

@@ -900,9 +900,15 @@ literal column list lowers; anything else declines.
 `INSERT`, `ON CONFLICT … DO NOTHING` for the skipping forms (on the
 `unique_by:` columns, or the columns of the unique index it names),
 `RETURNING` the primary key unless `returning:` says otherwise, and
-Rails' `ActiveRecord::Result` as its value. The per-row inlining keeps
-one gap there: an integer key a row supplies is still the database's to
-assign, as in `_insert_row`.
+Rails' `ActiveRecord::Result` as its value.
+
+**A supplied integer key is written, on the Ruby family.** The per-row
+inlining writes through `_adapter_insert`, which leaves an integer key
+to the database and reads it back. Under the Ruby family's runtime
+(`RuntimeRelation::Present`) that method writes the key too when the
+record holds one (`@id.to_i != 0`): `create(id: 900)`, an `insert_all`
+row's `id:`, or the key column of a table that has no database default
+for it. A strict target still leaves every integer key to the database.
 
 **What it costs.** N statements instead of one, plus, for `insert_all`,
 one SELECT per row for the conflict check.
