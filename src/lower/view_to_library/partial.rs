@@ -62,10 +62,10 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // .article(a)`. The inner `io << ...` uses the active
         // accumulator so a `render @articles` inside a form_with
         // capture appends to `body` rather than the outer `io`.
-        RenderPartial::Collection { name, .. } => {
+        RenderPartial::Collection { name, locals, .. } => {
             let plural = *name;
             let collection_recv = var_ref(Symbol::from(plural));
-            Some(emit_partial_each(&collection_recv, plural, ctx))
+            Some(emit_partial_each(&collection_recv, plural, *locals, ctx))
         }
         // `render @message` (one record) — a single append, not an
         // `each`. Rails resolves the partial through the record's
@@ -73,13 +73,13 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // `messages/_message`. Spelled here exactly as
         // `render_partial_key` spells the graph edge, so the partial's
         // closure args line up with the call.
-        RenderPartial::Record { name, .. } => {
+        RenderPartial::Record { name, locals, .. } => {
             let singular = (*name).to_string();
             let plural_camel = camelize_path(&crate::naming::pluralize_snake(&singular));
             let stem = ctx.partial_stems.stem(&plural_camel, &singular);
             let mut call_args = vec![var_ref(Symbol::from(crate::naming::safe_local(&singular)))];
             call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
-            call_args.extend(locals_extra_args(None, &plural_camel, &stem, ctx));
+            call_args.extend(locals_extra_args(*locals, &plural_camel, &stem, ctx));
             let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
             let call = send(
                 Some(Expr::new(
@@ -119,7 +119,7 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // .<singular>(c) }`. No has_many table lookup needed: the
         // method dispatch on `receiver` resolves to whatever the
         // model's lowered association method returns at runtime.
-        RenderPartial::Association { receiver, method } => {
+        RenderPartial::Association { receiver, method, locals } => {
             let assoc_recv = send(
                 Some((*receiver).clone()),
                 method,
@@ -127,14 +127,14 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
                 None,
                 false,
             );
-            Some(emit_partial_each(&assoc_recv, method, ctx))
+            Some(emit_partial_each(&assoc_recv, method, *locals, ctx))
         }
         // `render @author.posts.order(:title)` — the chain itself is the
         // each receiver, and the element class's partial renders each
         // record, exactly as `render partial: "posts/post", collection:
         // <chain>` does.
-        RenderPartial::TypedCollection { collection, partial } => {
-            emit_named_collection_each(collection, partial, None, None, ctx)
+        RenderPartial::TypedCollection { collection, partial, locals } => {
+            emit_named_collection_each(collection, partial, None, *locals, ctx)
         }
         // `render partial: "stories/listdetail", collection: stories, as:
         // :story` — iterate `collection`, calling the explicitly-named
@@ -896,8 +896,14 @@ const MAX_UNCACHED_COLLECTION_LENGTH: i64 = super::MAX_UNCACHED_COLLECTION_LENGT
 /// `plural_name` is the resource name in plural form
 /// (`articles` / `comments`); the partial-fn name is its singular
 /// (`article` / `comment`); the variable name is the singular's first
-/// letter (`a` / `c`).
-fn emit_partial_each(recv: &Expr, plural_name: &str, ctx: &ViewCtx) -> Expr {
+/// letter (`a` / `c`). `locals` binds the partial's extra params as an
+/// explicit `locals:` does (`locals_extra_args`).
+fn emit_partial_each(
+    recv: &Expr,
+    plural_name: &str,
+    locals: Option<&[(Expr, Expr)]>,
+    ctx: &ViewCtx,
+) -> Expr {
     let singular = singularize(plural_name);
     let plural_camel = camelize_path(&snake_case(plural_name));
     let stem = ctx.partial_stems.stem(&plural_camel, &singular);
@@ -905,7 +911,7 @@ fn emit_partial_each(recv: &Expr, plural_name: &str, ctx: &ViewCtx) -> Expr {
 
     let mut call_args = vec![var_ref(var_name.clone())];
     call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
-    call_args.extend(locals_extra_args(None, &plural_camel, &stem, ctx));
+    call_args.extend(locals_extra_args(locals, &plural_camel, &stem, ctx));
     let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
     let render_call = send(
         Some(Expr::new(
@@ -1155,13 +1161,26 @@ fn locals_extra_args(
     ctx: &ViewCtx,
 ) -> Vec<Expr> {
     let entries = locals.unwrap_or_default();
-    let strict = ctx.strict_locals.contains_key(&(module_camel.to_string(), method_sym.to_string()));
     let Some(extras) = ctx
         .partial_extras
         .get(&(module_camel.to_string(), method_sym.to_string()))
     else {
         return Vec::new();
     };
+    // A strict-locals partial takes every local after its record as a
+    // keyword, as `named_partial_call_with_record` binds them, and no
+    // flash. At their extra positions the locals were an arity error.
+    if let Some(decl) = ctx.strict_locals.get(&(module_camel.to_string(), method_sym.to_string())) {
+        let lookup = |name: &str| {
+            entries.iter().find_map(|(k, v)| match &*k.node {
+                ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name => Some(v.clone()),
+                _ => None,
+            })
+        };
+        return strict_kwargs(&decl[1..], &lookup, context_kwargs(ctx, module_camel, method_sym))
+            .into_iter()
+            .collect();
+    }
     // Rails renders a partial in its caller's view context, so a bare
     // `notice` in `shared/_flash` reads the same flash the layout does.
     // Here the flash is a param of every template, so the caller passes
@@ -1187,29 +1206,20 @@ fn locals_extra_args(
                 })
                 // The request context a run-time url Hash reads passes on from the rendering view (`request_context_views`).
                 .or_else(|| {
-                    (!strict
-                        && matches!(name.as_str(), "action_name" | "controller_name" | "path_parameters")
+                    (matches!(name.as_str(), "action_name" | "controller_name" | "path_parameters")
                         && ctx.locals.iter().any(|l| l == name))
                     .then(|| var_ref(Symbol::from(name.as_str())))
                 })
-                // A strict-locals partial takes no flash (`flash_locals`).
                 .or_else(|| {
-                    let slot = flash.iter().position(|f| *f == Some(name.as_str())).filter(|_| !strict)?;
+                    let slot = flash.iter().position(|f| *f == Some(name.as_str()))?;
                     ctx.own_flash[slot].as_deref().map(|n| var_ref(Symbol::from(n)))
                 })
         })
         .collect();
-    let mut out: Vec<Expr> = match bound.iter().rposition(|b| b.is_some()) {
+    match bound.iter().rposition(|b| b.is_some()) {
         Some(last) => bound.into_iter().take(last + 1).map(|b| b.unwrap_or_else(nil_lit)).collect(),
         None => Vec::new(),
-    };
-    if strict {
-        let context = context_kwargs(ctx, module_camel, method_sym);
-        if !context.is_empty() {
-            out.push(Expr::new(Span::synthetic(), ExprNode::Hash { entries: context, kwargs: true }));
-        }
     }
-    out
 }
 
 /// The request context a strict-locals partial takes as keywords
