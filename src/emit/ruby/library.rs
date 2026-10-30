@@ -6084,37 +6084,8 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             if wants_opt_str_here
                 && (matches!(arg.ty, Some(crate::ty::Ty::Int)) || int_or_nil || is_integer_column_read(arg, sig))
             {
-                let span = arg.span;
-                let value = std::mem::replace(arg, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
-                // A name the method doesn't already bind: the `Let` assigns in
-                // the method's own scope.
-                let name = loop {
-                    let n = sig.next_local.get();
-                    sig.next_local.set(n + 1);
-                    let candidate = Symbol::from(format!("route_segment_{n}"));
-                    if sig.taken_locals.borrow_mut().insert(candidate.clone()) {
-                        break candidate;
-                    }
-                };
-                let value_ty = value.ty.clone().unwrap_or(crate::ty::Ty::Untyped);
-                let typed = |node: ExprNode, ty: crate::ty::Ty| Expr { ty: Some(ty), ..Expr::new(span, node) };
-                let read = || typed(ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() }, value_ty.clone());
-                let send = |method: &str, ty: crate::ty::Ty| {
-                    typed(
-                        ExprNode::Send { recv: Some(read()), method: Symbol::from(method), args: vec![], block: None, parenthesized: false },
-                        ty,
-                    )
-                };
-                let opt_str = crate::ty::Ty::Union { variants: vec![crate::ty::Ty::Str, crate::ty::Ty::Nil].into() };
-                let check = typed(
-                    ExprNode::If {
-                        cond: send("nil?", crate::ty::Ty::Bool),
-                        then_branch: typed(ExprNode::Lit { value: crate::expr::Literal::Nil }, crate::ty::Ty::Nil),
-                        else_branch: send("to_s", crate::ty::Ty::Str),
-                    },
-                    opt_str.clone(),
-                );
-                *arg = typed(ExprNode::Let { id: crate::ident::VarId(0), name, value, body: check }, opt_str);
+                let value = std::mem::replace(arg, Expr::new(arg.span, ExprNode::Seq { exprs: vec![] }));
+                *arg = to_s_keeping_nil(value, sig);
                 continue;
             }
             if wants_str_here
@@ -6175,24 +6146,100 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
     // Rails renders a record there with `to_param` too. The helper's
     // query key is typed to match (routes_to_library::query_param_demand
     // types a record-valued key `String` for a slug model, else `Integer`).
-    // An Integer under any other key (`page: page + 1`) goes through
-    // `to_s`, as `project_route_helper_ids` does in test bodies.
-    if let ExprNode::Send { args, .. } = &mut *expr.node {
-        use crate::lower::controller_to_library::rewrites::{int_in_query_slot, to_s_of};
+    // A scalar under any other key (`page: page + 1`, `featured: true`,
+    // `ratio: 1.5`) goes through `to_s`, as `project_route_helper_ids`
+    // does in test bodies; one that can be nil keeps the nil, so the
+    // helper leaves the key out as Rails does.
+    if let ExprNode::Send { args, method: helper, .. } = &mut *expr.node {
+        use crate::lower::controller_to_library::rewrites::{scalar_in_query_slot, to_s_of, QueryScalar};
         if let Some(last) = args.last_mut() {
             if let ExprNode::Hash { entries, kwargs: true } = &mut *last.node {
                 for (k, v) in entries.iter_mut() {
                     if let Some(model) = arg_record_model(v, sig) {
                         project_record_arg(v, &model, sig, false);
-                    } else if int_in_query_slot(k, v) {
-                        let mut to_s = to_s_of(v.clone());
-                        to_s.ty = Some(Ty::Str);
-                        *v = to_s;
+                    } else {
+                        match scalar_in_query_slot(k, v) {
+                            Some(QueryScalar::Text) => {
+                                let mut to_s = to_s_of(v.clone());
+                                to_s.ty = Some(Ty::Str);
+                                *v = to_s;
+                            }
+                            Some(QueryScalar::TextOrNil) => *v = to_s_keeping_nil(v.clone(), sig),
+                            None => push_hash_query_option(helper, k, v),
+                        }
                     }
                 }
             }
         }
     }
+}
+
+/// A Hash under a route helper's query key. Rails writes it as nested
+/// parameters (`filter: { a: 1 }` is `?filter%5Ba%5D=1`); the generated
+/// helper types the key `String?` and writes the value's `to_s`. The
+/// call is left as it is and ledgered, so the survey lists it.
+fn push_hash_query_option(helper: &Symbol, k: &Expr, v: &Expr) {
+    use crate::diagnostic::{Diagnostic, DiagnosticKind};
+    if !matches!(v.ty.as_ref().map(crate::ty::Ty::peel_nilable), Some(crate::ty::Ty::Hash { .. })) {
+        return;
+    }
+    let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
+        return;
+    };
+    let kind = DiagnosticKind::LowerResidue {
+        pass: Symbol::from("route_query_option"),
+        construct: Symbol::from(format!("{}({}:)", helper.as_str(), key.as_str())),
+        reason: Symbol::from("hash value"),
+    };
+    crate::emit::diagnostics::push(Diagnostic {
+        span: v.span,
+        severity: Diagnostic::default_severity(&kind),
+        kind,
+        message: format!(
+            "`{}` query option `{}` is a Hash: Rails writes nested `{}[…]=` parameters, \
+             the generated helper writes the Hash's `to_s`",
+            helper.as_str(),
+            key.as_str(),
+            key.as_str()
+        ),
+    });
+}
+
+/// `value`'s `to_s`, or nil when it is nil: the value bound once to a
+/// fresh `route_segment_<n>` local, then `nil? ? nil : to_s`. Rails
+/// leaves a nil segment or query value out, and `nil.to_s` would keep
+/// an empty one.
+fn to_s_keeping_nil(value: Expr, sig: &RecordSignals<'_>) -> Expr {
+    let span = value.span;
+    // A name the method doesn't already bind: the `Let` assigns in
+    // the method's own scope.
+    let name = loop {
+        let n = sig.next_local.get();
+        sig.next_local.set(n + 1);
+        let candidate = Symbol::from(format!("route_segment_{n}"));
+        if sig.taken_locals.borrow_mut().insert(candidate.clone()) {
+            break candidate;
+        }
+    };
+    let value_ty = value.ty.clone().unwrap_or(crate::ty::Ty::Untyped);
+    let typed = |node: ExprNode, ty: crate::ty::Ty| Expr { ty: Some(ty), ..Expr::new(span, node) };
+    let read = || typed(ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() }, value_ty.clone());
+    let send = |method: &str, ty: crate::ty::Ty| {
+        typed(
+            ExprNode::Send { recv: Some(read()), method: Symbol::from(method), args: vec![], block: None, parenthesized: false },
+            ty,
+        )
+    };
+    let opt_str = crate::ty::Ty::Union { variants: vec![crate::ty::Ty::Str, crate::ty::Ty::Nil].into() };
+    let check = typed(
+        ExprNode::If {
+            cond: send("nil?", crate::ty::Ty::Bool),
+            then_branch: typed(ExprNode::Lit { value: crate::expr::Literal::Nil }, crate::ty::Ty::Nil),
+            else_branch: send("to_s", crate::ty::Ty::Str),
+        },
+        opt_str.clone(),
+    );
+    typed(ExprNode::Let { id: crate::ident::VarId(0), name, value, body: check }, opt_str)
 }
 
 /// A record in a route helper's argument, as Rails renders it: the
