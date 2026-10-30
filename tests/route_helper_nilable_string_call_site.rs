@@ -138,3 +138,38 @@ fn a_nilable_string_segment_runs_on_spinel_with_rbs() {
     );
     run_example().run_spinel_with_rbs(&script).assert_passes();
 }
+
+/// The same evidence through a `direct` helper's `route_for`: the block
+/// parameter is seeded from the helper's call site, `Note.first`, so
+/// `note.route_param` there is `String | nil` too.
+#[test]
+fn a_nilable_string_in_a_direct_helpers_route_for_retypes_the_segment() {
+    let tree = vec![
+        ("db/schema.rb", SCHEMA),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  \
+               resources :strikes, only: :show\n  \
+               direct :fresh_strike do |note, options|\n    \
+                 route_for :strike, note.route_param\n  \
+               end\nend\n",
+        ),
+        ("app/models/note.rb", "class Note < ApplicationRecord\nend\n"),
+        ("app/models/strike.rb", "class Strike < ApplicationRecord\nend\n"),
+        ("app/helpers/note_helper.rb", "module NoteHelper\n  def note_link\n    fresh_strike_path(Note.first)\n  end\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest tree");
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let sig = lower_routes_to_library_functions(&app)
+        .into_iter()
+        .find(|f| f.name.as_str() == "strike_path")
+        .expect("strike_path not generated")
+        .signature
+        .expect("helper signature");
+    let Ty::Fn { params, .. } = sig else { panic!("not Ty::Fn") };
+    assert_eq!(params[0].name.as_str(), "id");
+    assert!(matches!(*params[0].ty, Ty::Str), "got {:?}", params[0].ty);
+}
