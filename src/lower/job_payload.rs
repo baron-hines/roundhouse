@@ -70,6 +70,43 @@ pub struct JobFallback {
     pub reason: String,
 }
 
+/// How long `retry_on` waits before the next try.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RetryWait {
+    /// A literal number of seconds (`wait: 5`, `wait: 5.minutes`).
+    Seconds(f64),
+    /// `wait: :polynomially_longer`: `n**4 + 2` for the n-th try.
+    PolynomiallyLonger,
+}
+
+/// One `retry_on` or `discard_on` of a job, as ActiveJob searches them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum JobHandler {
+    Retry {
+        /// The exception classes, as written (`Sticky`, `Net::ReadTimeout`).
+        exceptions: Vec<String>,
+        wait: RetryWait,
+        /// `attempts:`, 0 for `:unlimited`.
+        attempts: i64,
+        /// `queue:`, "" to keep the job's own.
+        queue: String,
+        priority: Option<i64>,
+        /// `jitter:`, `None` for the job's `retry_jitter`.
+        jitter: Option<f64>,
+    },
+    Discard {
+        exceptions: Vec<String>,
+    },
+}
+
+impl JobHandler {
+    pub fn exceptions(&self) -> &[String] {
+        match self {
+            JobHandler::Retry { exceptions, .. } | JobHandler::Discard { exceptions } => exceptions,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobPlan {
     /// `Room::PushMessageJob`.
@@ -88,6 +125,20 @@ pub struct JobPlan {
     pub params: Vec<JobParam>,
     /// Set when the job keeps its Proc; `params` is then empty.
     pub fallback: Option<JobFallback>,
+    /// Under `queue_adapter :sidekiq`, the job's `retry_on` and
+    /// `discard_on` handlers in the order ActiveJob searches them: the
+    /// job's own, last declared first, then each ancestor's the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<JobHandler>,
+    /// `self.retry_jitter =` on the job or a job ancestor, else the
+    /// app's `config.active_job.retry_jitter`.
+    #[serde(default)]
+    pub retry_jitter: f64,
+    /// Under `queue_adapter :sidekiq`, the job's `sidekiq_options`,
+    /// ancestors' first and a later key replacing an earlier one in
+    /// place: each key and its value as JSON text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidekiq_options: Vec<(String, String)>,
 }
 
 impl JobPlan {
@@ -114,6 +165,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
     let sites = call_site_types(app, jobs);
     let unattributed = unattributed_jobs(app, jobs);
     let sti = crate::lower::sti_scope::sti_bases(app);
+    let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
     let mut plans = Vec::new();
     for name in wrapped {
         let Some(lc) = app.library_classes.iter().find(|lc| lc.name.0.as_str() == name) else {
@@ -148,6 +200,9 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
             enqueue_after_commit: enqueues_after_commit(app, lc),
             params,
             fallback,
+            handlers: if sidekiq { handlers(app, lc) } else { Vec::new() },
+            retry_jitter: retry_jitter(app, lc),
+            sidekiq_options: if sidekiq { sidekiq_options(app, lc) } else { Vec::new() },
         });
     }
     plans
@@ -496,15 +551,225 @@ fn is_literal_queue_as(call: &Expr) -> bool {
         && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } })
 }
 
+/// The exception classes `rescue` can name in an emitted tree without
+/// the app defining them.
+const RUNTIME_EXCEPTIONS: &[&str] = &[
+    "StandardError",
+    "RuntimeError",
+    "ArgumentError",
+    "ActiveJob::DeserializationError",
+    "ActiveRecord::RecordNotFound",
+    "ActiveRecord::RecordInvalid",
+];
+
+fn handlers(app: &App, lc: &LibraryClass) -> Vec<JobHandler> {
+    let mut out = Vec::new();
+    for class in ancestry(app, lc) {
+        for call in class.unknown_calls.iter().rev() {
+            if let Some(h) = handler_literal(app, class, call) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// A `retry_on` or `discard_on` the runtime can carry: constant
+/// exception classes it can rescue, no block, and literal options.
+/// Anything else stays a dropped class-body call, reported as one.
+fn handler_literal(app: &App, owner: &LibraryClass, call: &Expr) -> Option<JobHandler> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return None };
+    let retry = match method.as_str() {
+        "retry_on" => true,
+        "discard_on" => false,
+        _ => return None,
+    };
+    let (opts, classes): (&[(Expr, Expr)], &[Expr]) = match args.split_last() {
+        Some((last, rest)) => match &*last.node {
+            ExprNode::Hash { entries, .. } => (entries.as_slice(), rest),
+            _ => (&[], args.as_slice()),
+        },
+        None => return None,
+    };
+    if classes.is_empty() {
+        return None;
+    }
+    let mut exceptions = Vec::new();
+    for c in classes {
+        exceptions.push(exception_class(app, owner, c)?);
+    }
+    if !retry {
+        return opts.is_empty().then_some(JobHandler::Discard { exceptions });
+    }
+    // ActiveJob's defaults: `wait: 3.seconds, attempts: 5`.
+    let mut wait = RetryWait::Seconds(3.0);
+    let mut attempts = 5;
+    let mut queue = String::new();
+    let mut priority = None;
+    let mut jitter = None;
+    for (k, v) in opts {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
+        match key.as_str() {
+            "wait" => {
+                wait = match &*v.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "polynomially_longer" => {
+                        RetryWait::PolynomiallyLonger
+                    }
+                    ExprNode::Lit { value: Literal::Float { value } } => RetryWait::Seconds(*value),
+                    _ => RetryWait::Seconds(super::duration::literal_seconds(v)? as f64),
+                }
+            }
+            "attempts" => {
+                attempts = match &*v.node {
+                    ExprNode::Lit { value: Literal::Int { value } } if *value > 0 => *value,
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "unlimited" => 0,
+                    _ => return None,
+                }
+            }
+            "queue" => {
+                queue = match &*v.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+                    ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+                    _ => return None,
+                }
+            }
+            "priority" => {
+                let ExprNode::Lit { value: Literal::Int { value } } = &*v.node else { return None };
+                priority = Some(*value);
+            }
+            "jitter" => jitter = Some(literal_number(v)?),
+            // Reports the error before the retry; the push is the same.
+            "report" if matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } }) => {}
+            _ => return None,
+        }
+    }
+    Some(JobHandler::Retry { exceptions, wait, attempts, queue, priority, jitter })
+}
+
+/// The exception class a handler names, as written, when the emitted
+/// tree defines it: one of the app's classes (looked up from the
+/// handler's class outward, as Ruby resolves a constant) or one the
+/// runtime raises.
+fn exception_class(app: &App, owner: &LibraryClass, e: &Expr) -> Option<String> {
+    let ExprNode::Const { path } = &*e.node else { return None };
+    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let name = name.trim_start_matches("::").to_string();
+    if RUNTIME_EXCEPTIONS.contains(&name.as_str()) {
+        return Some(name);
+    }
+    let mut scope: Vec<&str> = owner.name.0.as_str().split("::").collect();
+    loop {
+        scope.pop();
+        let candidate =
+            if scope.is_empty() { name.clone() } else { format!("{}::{}", scope.join("::"), name) };
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == candidate) {
+            return Some(candidate);
+        }
+        if scope.is_empty() {
+            return None;
+        }
+    }
+}
+
+fn literal_number(e: &Expr) -> Option<f64> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Float { value } } => Some(*value),
+        ExprNode::Lit { value: Literal::Int { value } } => Some(*value as f64),
+        _ => None,
+    }
+}
+
+/// `self.retry_jitter = <number>`, nearest class first and the last
+/// assignment in a class winning; else the app's.
+fn retry_jitter(app: &App, lc: &LibraryClass) -> f64 {
+    for class in ancestry(app, lc) {
+        for call in class.unknown_calls.iter().rev() {
+            if let Some(v) = retry_jitter_literal(call) {
+                return v;
+            }
+        }
+    }
+    app.active_job_retry_jitter
+}
+
+fn retry_jitter_literal(call: &Expr) -> Option<f64> {
+    let ExprNode::Send { method, args, .. } = &*call.node else { return None };
+    if method.as_str() != "retry_jitter=" || args.len() != 1 {
+        return None;
+    }
+    literal_number(&args[0])
+}
+
+/// The `sidekiq_options` keys Sidekiq's retry rules read, which the
+/// worker honors. `queue` is left out: the ActiveJob queue wins over it.
+const SIDEKIQ_OPTION_KEYS: &[&str] = &["retry", "retry_queue", "retry_for", "dead"];
+
+fn sidekiq_options(app: &App, lc: &LibraryClass) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for class in ancestry(app, lc).iter().rev() {
+        for call in &class.unknown_calls {
+            for (k, v) in sidekiq_options_literal(call).unwrap_or_default() {
+                match out.iter_mut().find(|(key, _)| *key == k) {
+                    Some(slot) => slot.1 = v,
+                    None => out.push((k, v)),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `sidekiq_options` whose keys are all ones the worker honors, with
+/// literal values: each key and its value as JSON text.
+fn sidekiq_options_literal(call: &Expr) -> Option<Vec<(String, String)>> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return None };
+    if method.as_str() != "sidekiq_options" {
+        return None;
+    }
+    let [opts] = args.as_slice() else { return None };
+    let ExprNode::Hash { entries, .. } = &*opts.node else { return None };
+    let mut out = Vec::new();
+    for (k, v) in entries {
+        let key = match &*k.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+            ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+            _ => return None,
+        };
+        if !SIDEKIQ_OPTION_KEYS.contains(&key.as_str()) {
+            return None;
+        }
+        let json = match &*v.node {
+            ExprNode::Lit { value: Literal::Bool { value } } => value.to_string(),
+            ExprNode::Lit { value: Literal::Int { value } } => value.to_string(),
+            ExprNode::Lit { value: Literal::Sym { value } } => json_str(value.as_str()),
+            ExprNode::Lit { value: Literal::Str { value } } => json_str(value),
+            _ => return None,
+        };
+        out.push((key, json));
+    }
+    Some(out)
+}
+
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Whether a class-body call of a job is carried by the payload plan
-/// rather than dropped: a literal `queue_as`, or `discard_on
-/// ActiveJob::DeserializationError`, on a job that has a payload — or on
+/// rather than dropped: a literal `queue_as`, `discard_on
+/// ActiveJob::DeserializationError` or `retry_jitter`, and under
+/// `:sidekiq` a `retry_on`, `discard_on` or `sidekiq_options` the plan
+/// carries, on a job that has a payload — or on
 /// an ancestor (`ApplicationJob`) every one of whose job descendants
 /// does. The Ruby emitter skips its "dropped" ledger line for these.
 pub fn modelled_class_body_call(app: &App, lc: &LibraryClass, call: &Expr) -> bool {
+    let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
+    let carried_by_sidekiq =
+        sidekiq && (handler_literal(app, lc, call).is_some() || sidekiq_options_literal(call).is_some());
     if !is_literal_queue_as(call)
         && !is_discard_on_deserialization(call)
         && enqueue_after_commit_literal(call).is_none()
+        && retry_jitter_literal(call).is_none()
+        && !carried_by_sidekiq
     {
         return false;
     }
@@ -820,9 +1085,10 @@ fn arguments_list(plan: &JobPlan) -> String {
 
 /// The text between the `job-registry` markers in
 /// `runtime/job_registry.rb`: the payload writers, `perform`,
-/// `discards_deserialization_error`, and the record locators. Valid
-/// Ruby for an app with no payload jobs too: `perform` answers false
-/// and nothing else is written.
+/// `discards_deserialization_error`, the handler table and push options
+/// ([`retry_source`]), and the record locators. Valid Ruby for an app
+/// with no payload jobs too: `perform` answers false and the rest their
+/// defaults.
 ///
 /// With `sidekiq` (the app is on `queue_adapter :sidekiq`), each payload
 /// job also gets `push_<job>(queue, at, args)`, which the job's
@@ -900,6 +1166,8 @@ pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
     }
     s.push_str("  end\n");
 
+    s.push_str(&retry_source(&payload, sidekiq));
+
     // One locator per record model a payload job reads, and a list
     // reader where a rest or Array parameter reads several.
     let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -945,6 +1213,88 @@ pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
         }
     }
     s
+}
+
+/// The handler table and the push options, read by `ActiveJob.perform_parsed_from`
+/// and `SidekiqPush.enqueue`:
+///
+/// - `handler_for(job_class, e)`: the first of the job's handlers that
+///   matches `e`, in ActiveJob's search order. A `retry_on`'s rule id
+///   (from 1), the negated id of a `discard_on`, 0 for none.
+/// - `retry_rule(id)`: the `retry_on`'s options as an
+///   `ActiveJob::RetryRule`, its jitter resolved against the job's
+///   `retry_jitter`.
+/// - `sidekiq_retry(job_class)` and `sidekiq_extra(job_class)`: the
+///   envelope's `retry` value and the job's other `sidekiq_options`, as
+///   JSON text, in the place Sidekiq writes them.
+///
+/// Off `:sidekiq` every job has no handlers and the defaults.
+fn retry_source(payload: &[&JobPlan], sidekiq: bool) -> String {
+    let mut s = String::new();
+    let mut rules: Vec<String> = Vec::new();
+    s.push_str("\n  def self.handler_for(job_class, e)\n");
+    for plan in payload.iter().filter(|p| sidekiq && !p.handlers.is_empty()) {
+        s.push_str(&format!("    if job_class == {}\n", ruby_str(&plan.job)));
+        for h in &plan.handlers {
+            let id = match h {
+                JobHandler::Retry { exceptions, wait, attempts, queue, priority, jitter } => {
+                    let (seconds, poly) = match wait {
+                        RetryWait::Seconds(n) => (*n, false),
+                        RetryWait::PolynomiallyLonger => (0.0, true),
+                    };
+                    rules.push(format!(
+                        "ActiveJob::RetryRule.new({}, {}, {poly}, {attempts}, {}, {}, {}, {})",
+                        ruby_str(&format!("[{}]", exceptions.join(", "))),
+                        ruby_float(seconds),
+                        ruby_str(queue),
+                        priority.is_some(),
+                        priority.unwrap_or(0),
+                        ruby_float(jitter.unwrap_or(plan.retry_jitter)),
+                    ));
+                    rules.len() as i64
+                }
+                JobHandler::Discard { .. } => -1,
+            };
+            let test: Vec<String> = h.exceptions().iter().map(|e| format!("e.is_a?({e})")).collect();
+            s.push_str(&format!("      return {id} if {}\n", test.join(" || ")));
+        }
+        s.push_str("    end\n");
+    }
+    s.push_str("    0\n  end\n");
+
+    s.push_str("\n  def self.retry_rule(id)\n");
+    for (i, rule) in rules.iter().enumerate() {
+        s.push_str(&format!("    return {rule} if id == {}\n", i + 1));
+    }
+    s.push_str("    ActiveJob::RetryRule.new(\"\", 0.0, false, 0, \"\", false, 0, 0.0)\n  end\n");
+
+    let mut retry_arms = String::new();
+    let mut extra_arms = String::new();
+    for plan in payload.iter().filter(|_| sidekiq) {
+        let mut extra = String::new();
+        for (k, v) in &plan.sidekiq_options {
+            if k == "retry" {
+                retry_arms.push_str(&format!("    return {} if job_class == {}\n", ruby_str(v), ruby_str(&plan.job)));
+            } else {
+                extra.push_str(&format!(",{}:{v}", json_str(k)));
+            }
+        }
+        if !extra.is_empty() {
+            extra_arms.push_str(&format!(
+                "    return {} if job_class == {}\n",
+                ruby_str(&extra),
+                ruby_str(&plan.job)
+            ));
+        }
+    }
+    s.push_str(&format!("\n  def self.sidekiq_retry(job_class)\n{retry_arms}    \"true\"\n  end\n"));
+    s.push_str(&format!("\n  def self.sidekiq_extra(job_class)\n{extra_arms}    \"\"\n  end\n"));
+    s
+}
+
+fn ruby_float(v: f64) -> String {
+    let s = v.to_string();
+    if s.contains('.') || s.contains('e') { s } else { format!("{s}.0") }
 }
 
 /// `(room, message)`, or nothing for a job without parameters. A rest

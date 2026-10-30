@@ -259,8 +259,96 @@ fn an_app_without_jobs_keeps_an_empty_registry() {
     let src = registry_source(&[], false);
     assert_eq!(
         src,
-        "  def self.perform(job_class, args)\n    false\n  end\n\n  def self.discards_deserialization_error(job_class)\n    false\n  end\n"
+        "  def self.perform(job_class, args)\n    false\n  end\n\n  def self.discards_deserialization_error(job_class)\n    false\n  end\n\n  def self.handler_for(job_class, e)\n    0\n  end\n\n  def self.retry_rule(id)\n    ActiveJob::RetryRule.new(\"\", 0.0, false, 0, \"\", false, 0, 0.0)\n  end\n\n  def self.sidekiq_retry(job_class)\n    \"true\"\n  end\n\n  def self.sidekiq_extra(job_class)\n    \"\"\n  end\n"
     );
+}
+
+fn handler_app(adapter: &str) -> App {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "config/environments/production.rb",
+            &format!("Rails.application.configure do\n  config.active_job.queue_adapter = :{adapter}\nend\n"),
+        ),
+        ("app/models/flaky.rb", "class Flaky < StandardError\nend\n\nclass Slow < StandardError\nend\n"),
+        (
+            "app/models/user.rb",
+            "class User < ActiveRecord::Base\n  def later\n    HandledJob.perform_later(name.to_s)\n  end\nend\n",
+        ),
+        (
+            "app/jobs/application_job.rb",
+            "class ApplicationJob < ActiveJob::Base\n  discard_on ActiveJob::DeserializationError\n  sidekiq_options retry: 5, retry_queue: \"slow\"\n  self.retry_jitter = 0.25\nend\n",
+        ),
+        (
+            "app/jobs/handled_job.rb",
+            r#"class HandledJob < ApplicationJob
+  sidekiq_options retry: 2
+  retry_on Flaky, Slow, wait: :polynomially_longer, attempts: :unlimited
+  retry_on Unknown, wait: 1
+  retry_on Flaky, wait: ->(n) { n * 2 }
+  retry_on Slow, wait: 2.minutes, attempts: 3, queue: :low, priority: 1, jitter: 0.5
+  discard_on Flaky
+
+  def perform(name)
+    nil
+  end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest handler app");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+/// Under `:sidekiq` a job's handlers are planned in ActiveJob's search
+/// order: its own, last declared first, then its ancestors'. A handler
+/// naming a class the tree doesn't define, or with a computed option,
+/// isn't carried.
+#[test]
+fn handlers_are_planned_in_search_order() {
+    use roundhouse::lower::job_payload::{JobHandler, RetryWait};
+    let app = handler_app("sidekiq");
+    let p = plan(&app, "HandledJob");
+    assert!(p.is_payload(), "{p:#?}");
+    assert_eq!(
+        p.handlers,
+        vec![
+            JobHandler::Discard { exceptions: vec!["Flaky".into()] },
+            JobHandler::Retry {
+                exceptions: vec!["Slow".into()],
+                wait: RetryWait::Seconds(120.0),
+                attempts: 3,
+                queue: "low".into(),
+                priority: Some(1),
+                jitter: Some(0.5),
+            },
+            JobHandler::Retry {
+                exceptions: vec!["Flaky".into(), "Slow".into()],
+                wait: RetryWait::PolynomiallyLonger,
+                attempts: 0,
+                queue: String::new(),
+                priority: None,
+                jitter: None,
+            },
+            JobHandler::Discard { exceptions: vec!["ActiveJob::DeserializationError".into()] },
+        ]
+    );
+    assert_eq!(p.retry_jitter, 0.25);
+    assert_eq!(
+        p.sidekiq_options,
+        vec![("retry".to_string(), "2".to_string()), ("retry_queue".to_string(), "\"slow\"".to_string())]
+    );
+
+    let src = registry_source(&app.job_plans, true);
+    assert!(src.contains("      return -1 if e.is_a?(Flaky)\n      return 1 if e.is_a?(Slow)\n      return 2 if e.is_a?(Flaky) || e.is_a?(Slow)\n"), "{src}");
+    assert!(src.contains("ActiveJob::RetryRule.new(\"[Flaky, Slow]\", 0.0, true, 0, \"\", false, 0, 0.25)"), "{src}");
+    assert!(src.contains("return \"2\" if job_class == \"HandledJob\""), "{src}");
+    assert!(src.contains(r#"return ",\"retry_queue\":\"slow\"" if job_class == "HandledJob""#), "{src}");
+
+    let off = handler_app("solid_queue");
+    let p = plan(&off, "HandledJob");
+    assert!(p.handlers.is_empty() && p.sidekiq_options.is_empty(), "{p:#?}");
 }
 
 /// A job that enqueues itself without naming its class, and a job that
