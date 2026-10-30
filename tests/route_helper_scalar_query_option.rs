@@ -119,3 +119,53 @@ end
         .expect("the emitted controller");
     assert!(source.contains("RouteHelpers.widgets_path(filter: {"), "{source}");
 }
+
+/// A `direct` helper receives its options hash as written — its block
+/// reads `options[:preview]`, and `"false"` is truthy — so a test body's
+/// call to one keeps its option values. A generated helper's query
+/// option in the same body still reaches it as text.
+#[test]
+fn a_direct_helper_keeps_its_options_in_a_test_body() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let routes = "Rails.application.routes.draw do
+  resource :account do
+    scope module: \"accounts\" do
+      resource :logo, only: :show
+    end
+  end
+  direct :fresh_account_logo do |options|
+    route_for :account_logo
+  end
+end
+";
+    let test = "require \"test_helper\"
+
+class AccountTest < ActiveSupport::TestCase
+  test \"paths\" do
+    assert_equal \"/account/logo\", fresh_account_logo_path(preview: false, width: 3)
+    assert_equal \"/account/logo?preview=false\", account_logo_path(preview: false)
+  end
+end
+";
+    let files: HashMap<PathBuf, Vec<u8>> = [
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+        ("config/routes.rb", routes),
+        ("test/models/account_test.rb", test),
+    ]
+    .into_iter()
+    .map(|(p, s)| (PathBuf::from(p), s.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(files).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let emitted = roundhouse::emit::ruby::emit_spinel(&app)
+        .iter()
+        .find(|f| f.path.ends_with("account_test.rb"))
+        .expect("no account_test.rb emitted")
+        .content
+        .clone();
+    assert!(!emitted.contains("false.to_s, width"), "the direct helper's options were stringified:\n{emitted}");
+    assert!(!emitted.contains("3.to_s"), "the direct helper's options were stringified:\n{emitted}");
+    assert!(emitted.contains("account_logo_path(preview: false.to_s)"), "the generated helper's option:\n{emitted}");
+}

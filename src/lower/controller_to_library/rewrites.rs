@@ -3071,17 +3071,22 @@ fn params_option_value(arg: &Expr) -> Option<&Expr> {
 /// body-typer. A route helper's segment parameter is an id; an argument
 /// that types to a class is a record standing where its id belongs.
 /// Idempotent — a projected argument types `Integer`, not a class.
-pub fn project_route_helper_ids(expr: &Expr) -> Expr {
-    map_expr(expr, &project_route_helper_ids_node)
+///
+/// `direct_helpers` (`routes::direct_helper_names`) are the app's
+/// `direct` helpers: a block that receives its options hash as written
+/// (`options[:preview]`, where `"false"` would be truthy), so a scalar
+/// under one of their keys is left as it is.
+pub fn project_route_helper_ids(expr: &Expr, direct_helpers: &crate::det::HashSet<String>) -> Expr {
+    map_expr(expr, &|e: &Expr| project_route_helper_ids_node(e, direct_helpers))
 }
 
 /// In-place twin. Returns whether any argument was projected so the
 /// test lowerer can skip a follow-up typing pass.
-pub fn project_route_helper_ids_in_place(expr: &mut Expr) -> bool {
-    map_expr_mut(expr, &project_route_helper_ids_node)
+pub fn project_route_helper_ids_in_place(expr: &mut Expr, direct_helpers: &crate::det::HashSet<String>) -> bool {
+    map_expr_mut(expr, &|e: &Expr| project_route_helper_ids_node(e, direct_helpers))
 }
 
-fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
+fn project_route_helper_ids_node(e: &Expr, direct_helpers: &crate::det::HashSet<String>) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else {
         return None;
     };
@@ -3093,10 +3098,11 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
     if !(method.as_str().ends_with("_path") || method.as_str().ends_with("_url")) {
         return None;
     }
-    if !args.iter().any(arg_carries_a_model) && !args.iter().any(query_carries_a_scalar) {
+    let direct = direct_helpers.contains(method.as_str());
+    if !args.iter().any(arg_carries_a_model) && (direct || !args.iter().any(query_carries_a_scalar)) {
         return None;
     }
-    let projected: Vec<Expr> = args.iter().map(project_arg).collect();
+    let projected: Vec<Expr> = args.iter().map(|a| project_arg(a, direct)).collect();
     Some(Expr::new(
         e.span,
         ExprNode::Send {
@@ -3121,9 +3127,10 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
 /// at all — campfire's `messages_controller_test` pages this way twice.
 ///
 /// Only the VALUES move. A key is a Symbol by construction.
-fn project_arg(a: &Expr) -> Expr {
+fn project_arg(a: &Expr, direct: bool) -> Expr {
+    let query_text = |k: &Expr, v: &Expr| !direct && query_text_in_slot(k, v);
     if let ExprNode::Hash { entries, kwargs } = &*a.node {
-        if entries.iter().any(|(k, v)| records_a_model(v) || query_text_in_slot(k, v)) {
+        if entries.iter().any(|(k, v)| records_a_model(v) || query_text(k, v)) {
             // `to_param`, not `id`: a query value is a String on the
             // wire and the helper's option is typed `String?` (the
             // name-based rule in `routes_to_library::param_ty` — only
@@ -3138,7 +3145,7 @@ fn project_arg(a: &Expr) -> Expr {
                 .map(|(k, v)| {
                     let v = if records_a_model(v) {
                         to_s_of(id_of(v))
-                    } else if query_text_in_slot(k, v) {
+                    } else if query_text(k, v) {
                         to_s_of(v.clone())
                     } else {
                         v.clone()
