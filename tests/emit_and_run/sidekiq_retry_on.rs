@@ -379,3 +379,36 @@ fn load_defaults_sets_the_retry_jitter() {
     );
     assert!(registry.contains("ActiveJob::RetryRule.new(\"[Sticky]\", 10.0, false, 2, \"\", false, 0, 0.5)"));
 }
+
+const UNCARRIED: &str = r##"class UncarriedJob < ApplicationJob
+  retry_on Sticky, wait: ->(n) { n * 2 }
+  retry_on Net::ReadTimeout
+  discard_on(Gone) { |job, error| job.title }
+
+  def perform(name)
+    name
+  end
+end
+"##;
+
+/// Under `:sidekiq` a handler the runtime can't carry is an error at
+/// its call, naming why; on the in-process queue it stays a dropped
+/// call, as before.
+#[test]
+fn an_uncarried_handler_is_an_error_only_under_sidekiq() {
+    let overlay = || {
+        jobs()
+            .write("app/jobs/uncarried_job.rb", UNCARRIED)
+            .edit("app/models/article.rb", "  def enqueue_retry_jobs\n", "  def enqueue_retry_jobs\n    UncarriedJob.perform_later(title.to_s)\n")
+    };
+    let (_, errors) = overlay()
+        .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .emit(BuildTarget::Ruby);
+    assert_eq!(errors.len(), 3, "{errors:#?}");
+    assert!(errors.iter().any(|e| e.contains("`retry_on`'s `wait:` isn't a literal")), "{errors:#?}");
+    assert!(errors.iter().any(|e| e.contains("`Net::ReadTimeout` isn't an exception class")), "{errors:#?}");
+    assert!(errors.iter().any(|e| e.contains("a block on `discard_on` isn't supported")), "{errors:#?}");
+
+    let (_, errors) = overlay().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
