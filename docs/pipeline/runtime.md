@@ -893,6 +893,23 @@ of the RETURNING columns (the primary key when `returning:` is left
 out, SQLite's default), whose `rows` are Arrays of values. Only a
 literal column list lowers; anything else declines.
 
+**The other forms are one statement.** A call the lowering declines
+(`insert_all(rows, unique_by: …)`, `insert(attrs)`, `insert!(attrs)`,
+`insert_all!` with `returning:` SQL or `record_timestamps:`) reaches
+`connection.rb`'s Ruby-family `insert_all` family: one multi-row
+`INSERT`, `ON CONFLICT … DO NOTHING` for the skipping forms (on the
+`unique_by:` columns, or the columns of the unique index it names),
+`RETURNING` the primary key unless `returning:` says otherwise, and
+Rails' `ActiveRecord::Result` as its value.
+
+**A supplied integer key is written, on the Ruby family.** The per-row
+inlining writes through `_adapter_insert`, which leaves an integer key
+to the database and reads it back. Under the Ruby family's runtime
+(`RuntimeRelation::Present`) that method writes the key too when the
+record holds one (`@id.to_i != 0`): `create(id: 900)`, an `insert_all`
+row's `id:`, or the key column of a table that has no database default
+for it. A strict target still leaves every integer key to the database.
+
 **What it costs.** N statements instead of one, plus, for `insert_all`,
 one SELECT per row for the conflict check.
 
@@ -907,16 +924,21 @@ UNKNOWN method name does, so campfire's `Membership.insert_all(…)`
 reported `no known method insert_all on Class { Membership }` while the
 emitted code was the inlined loop, correct all along.
 
-### `upsert` / `upsert_all` answer the affected-row count
+### `upsert` / `upsert_all` answer an `ActiveRecord::Result`
 
 `runtime/ruby/active_record/connection.rb`'s `upsert_all` issues one
-`INSERT … ON CONFLICT (target) DO UPDATE SET …` and answers the
-affected-row count, where Rails answers an `ActiveRecord::Result`; the
-catalog types the call `Integer`, what the emitted code returns.
-Timestamps are stamped as Rails 8.1's SQLite adapter stamps them
-(`STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')`, `updated_at` moved only when
-an assigned column changed). No strict runtime transpiles
-`connection.rb`; the call is reported there.
+`INSERT … ON CONFLICT (target) DO UPDATE SET …` and answers Rails'
+`ActiveRecord::Result`, empty, its `affected_rows` the count. The target
+is `unique_by:`'s columns, or those of the unique index it names
+(`_unique_index_columns`, synthesized per model), else the primary key;
+`update_only:` narrows the SET to the columns it names. Timestamps are
+stamped with the database's clock as Rails 8.1 stamps them (SQLite's
+`STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')`, PostgreSQL's `CURRENT_TIMESTAMP`
+in UTC), `updated_at` moved only when an assigned column changed.
+`returning:` is not supported: given rows, `upsert_all` (and `upsert`,
+which calls it) raises `NotImplementedError` where Rails answers the
+returned columns. No strict runtime transpiles `connection.rb`; the call
+is reported there.
 
 ### A failed statement raises Rails' class, and SQLite enforces foreign keys
 
