@@ -33,7 +33,13 @@ pub(super) fn emit_flagged_collection_render(
         | RenderPartial::CollectionNamed { cached: false, cached_key: None, .. } => {}
         _ => return None,
     }
-    let mut each = emit_render_partial(rp, ctx)?;
+    let render = emit_render_partial(rp, ctx)?;
+    // After the locals `bind_locals_once` binds, the `each` is last.
+    let mut stmts = match &*render.node {
+        ExprNode::Seq { exprs } => exprs.clone(),
+        _ => vec![render],
+    };
+    let mut each = stmts.pop()?;
     let ExprNode::Send { method, block: Some(block), .. } = &mut *each.node else {
         return None;
     };
@@ -51,7 +57,11 @@ pub(super) fn emit_flagged_collection_render(
         },
     );
     *body = seq(vec![set, body.clone()]);
-    Some(each)
+    if stmts.is_empty() {
+        return Some(each);
+    }
+    stmts.push(each);
+    Some(seq(stmts))
 }
 
 pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Option<Expr> {
@@ -62,10 +72,12 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // .article(a)`. The inner `io << ...` uses the active
         // accumulator so a `render @articles` inside a form_with
         // capture appends to `body` rather than the outer `io`.
-        RenderPartial::Collection { name, locals, .. } => {
+        RenderPartial::Collection { collection, name, locals } => {
             let plural = *name;
             let collection_recv = var_ref(Symbol::from(plural));
-            Some(emit_partial_each(&collection_recv, plural, *locals, ctx))
+            bind_locals_once(collection_recv, *locals, collection.span, ctx, |recv, locals| {
+                Some(emit_partial_each(recv, plural, locals, ctx))
+            })
         }
         // `render @message` (one record) — a single append, not an
         // `each`. Rails resolves the partial through the record's
@@ -127,14 +139,18 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
                 None,
                 false,
             );
-            Some(emit_partial_each(&assoc_recv, method, *locals, ctx))
+            bind_locals_once(assoc_recv, *locals, receiver.span, ctx, |recv, locals| {
+                Some(emit_partial_each(recv, method, locals, ctx))
+            })
         }
         // `render @author.posts.order(:title)` — the chain itself is the
         // each receiver, and the element class's partial renders each
         // record, exactly as `render partial: "posts/post", collection:
         // <chain>` does.
         RenderPartial::TypedCollection { collection, partial, locals } => {
-            emit_named_collection_each(collection, partial, None, *locals, ctx)
+            bind_locals_once((*collection).clone(), *locals, collection.span, ctx, |recv, locals| {
+                emit_named_collection_each(recv, partial, None, locals, ctx)
+            })
         }
         // `render partial: "stories/listdetail", collection: stories, as:
         // :story` — iterate `collection`, calling the explicitly-named
@@ -149,15 +165,15 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
             locals,
             cached,
             cached_key,
-        } => {
+        } => bind_locals_once((*collection).clone(), *locals, collection.span, ctx, |recv, locals| {
             if let Some(key) = cached_key {
-                wrap_keyed_cached_collection(collection, partial, *as_name, *locals, key, KeyedCache::Callable, ctx)
+                wrap_keyed_cached_collection(recv, partial, *as_name, locals, key, KeyedCache::Callable, ctx)
             } else if *cached {
-                wrap_cached_true_collection(collection, partial, *as_name, *locals, ctx)
+                wrap_cached_true_collection(recv, partial, *as_name, locals, ctx)
             } else {
-                emit_named_collection_each(collection, partial, *as_name, *locals, ctx)
+                emit_named_collection_each(recv, partial, *as_name, locals, ctx)
             }
-        }
+        }),
         // `render partial: @above` — the name is a runtime value. Emit a
         // `case @above` whose arms are the pooled candidate partials (the
         // string literals controllers assign to `@above`), each resolving
@@ -276,6 +292,81 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
                 ExprNode::Case { scrutinee: (*name).clone(), arms },
             ))
         }
+    }
+}
+
+/// Rails evaluates a render's hash once, before the first record renders
+/// and when there is none, but a collection render passes its locals to
+/// each record's partial from inside the `each`. So `render @posts, flag:
+/// advance!` binds `__local_<site>_flag = advance!` before the loop and
+/// passes the temp, in source order; a local that only reads
+/// (`reads_without_effect`) stays inline, and without any other local
+/// `emit` gets the render as written. The collection, which Ruby
+/// evaluates before the hash, is bound first when it is more than a read;
+/// not when an explicit `locals:` is written before its `collection:`,
+/// which the `each` then evaluates after them, as Ruby does. `site` is
+/// the collection's source span, which names the temps apart from those
+/// of another render in the view.
+fn bind_locals_once(
+    collection: Expr,
+    locals: Option<&[(Expr, Expr)]>,
+    site: Span,
+    ctx: &ViewCtx,
+    emit: impl FnOnce(&Expr, Option<&[(Expr, Expr)]>) -> Option<Expr>,
+) -> Option<Expr> {
+    let entries = locals.unwrap_or_default();
+    let Some((_, first)) = entries.iter().find(|(_, v)| !reads_without_effect(v, ctx)) else {
+        return emit(&collection, locals);
+    };
+    let assign = |name: &Symbol, value: Expr| {
+        Expr::new(
+            value.span,
+            ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value },
+        )
+    };
+    let temp = |name: Symbol, span: Span| Expr { span, ..var_ref(name) };
+    let mut binds = Vec::new();
+    let collection_first =
+        site.is_synthetic() || first.span.is_synthetic() || site.start < first.span.start;
+    let collection = if collection_first && !reads_without_effect(&collection, ctx) {
+        let name = Symbol::from(format!("__collection_{}", site.start));
+        let span = collection.span;
+        binds.push(assign(&name, collection));
+        temp(name, span)
+    } else {
+        collection
+    };
+    let bound: Vec<(Expr, Expr)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| {
+            if reads_without_effect(v, ctx) {
+                return (k.clone(), v.clone());
+            }
+            let key = local_key_name(k)
+                .filter(|n| n.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()))
+                .unwrap_or_else(|| i.to_string());
+            let name = Symbol::from(format!("__local_{}_{key}", site.start));
+            binds.push(assign(&name, v.clone()));
+            (k.clone(), temp(name, v.span))
+        })
+        .collect();
+    binds.push(emit(&collection, Some(&bound))?);
+    Some(seq(binds))
+}
+
+/// A literal, or a read of a local, an ivar or a constant: evaluating it
+/// once per record is the same as once. Narrower than the walker's
+/// `is_pure_read`, which takes every zero-arg bare send for a template
+/// local: here one is a read only when the view knows the name as a
+/// local, so `advance!` is not.
+fn reads_without_effect(v: &Expr, ctx: &ViewCtx) -> bool {
+    match &*v.node {
+        ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. } => true,
+        ExprNode::Send { recv: None, method, args, block: None, .. } => {
+            args.is_empty() && ctx.is_local(method.as_str())
+        }
+        _ => false,
     }
 }
 

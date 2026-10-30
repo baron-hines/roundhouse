@@ -4,7 +4,10 @@
 //! (`as:` included). The same calls without the hash already rendered;
 //! with it they stayed a bare `render`. A strict-locals partial takes
 //! the locals as keywords, from this form and from an explicit
-//! `collection:` with `locals:` alike.
+//! `collection:` with `locals:` alike. Rails evaluates the hash once,
+//! after the collection and before any record renders, so a local
+//! with a side effect (`(n += 1).to_s`) runs once for a collection of
+//! three and once for an empty one.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -27,6 +30,59 @@ const ACTIONS: &[(&str, &str, &str)] = &[
         "<%= render partial: \"articles/article\", collection: @articles, locals: { mark: \"!\" } %>",
     ),
     ("plain_articles", "@articles = Article.order(:title)", "<%= render @articles %>"),
+    (
+        "once_listed",
+        "@posts = Post.order(:title)",
+        "<% n = 0 %><%= render @posts, flag: (n += 1).to_s, as: \"kept\" %>|<%= n %>",
+    ),
+    (
+        "once_listed_empty",
+        "@posts = Post.where(title: \"none\")",
+        "<% n = 0 %><%= render @posts, flag: (n += 1).to_s, as: \"kept\" %>|<%= n %>",
+    ),
+    ("once_by_author", "@author = Author.first", "<% n = 0 %><%= render @author.posts, flag: (n += 1).to_s %>|<%= n %>"),
+    (
+        "once_by_title",
+        "@author = Author.first",
+        "<% n = 0 %><%= render @author.posts.order(:title), flag: (n += 1).to_s %>|<%= n %>",
+    ),
+    (
+        "once_by_title_empty",
+        "@author = Author.first",
+        "<% n = 0 %><%= render @author.posts.where(title: \"none\"), flag: (n += 1).to_s %>|<%= n %>",
+    ),
+    (
+        "once_named",
+        "@posts = Post.order(:title)",
+        "<% n = 0 %><%= render partial: \"posts/post\", collection: @posts, locals: { flag: (n += 1).to_s } %>|<%= n %>",
+    ),
+    (
+        "once_named_empty",
+        "@posts = Post.where(title: \"none\")",
+        "<% n = 0 %><%= render partial: \"posts/post\", collection: @posts, locals: { flag: (n += 1).to_s } %>|<%= n %>",
+    ),
+    ("once_or", "@posts = Post.order(:title)", "<% n = 0 %><%= render(@posts, flag: (n += 1).to_s) || \"empty\" %>|<%= n %>"),
+    (
+        "once_or_empty",
+        "@posts = Post.where(title: \"none\")",
+        "<% n = 0 %><%= render(@posts, flag: (n += 1).to_s) || \"empty\" %>|<%= n %>",
+    ),
+    ("once_articles", "@articles = Article.order(:title)", "<% n = 0 %><%= render @articles, mark: (n += 1).to_s %>|<%= n %>"),
+    (
+        "once_articles_empty",
+        "@articles = Article.where(title: \"none\")",
+        "<% n = 0 %><%= render @articles, mark: (n += 1).to_s %>|<%= n %>",
+    ),
+    (
+        "once_in_order",
+        "@posts = Post.order(:title)",
+        "<% n = 0 %><%= render @posts, flag: (n += 1).to_s, as: (n *= 10).to_s %>|<%= n %>",
+    ),
+    (
+        "once_after_collection",
+        "@author = Author.first",
+        "<% n = 0 %><%= render @author.posts.limit(n += 1), flag: (n *= 10).to_s %>|<%= n %>",
+    ),
 ];
 
 fn app() -> emit_and_run::Overlay {
@@ -85,6 +141,19 @@ const WANT: &str = r#"want = {
   "article" => "<ul><li>+p</li>\n</ul>\n",
   "named_articles" => "<ul><li>!p</li>\n<li>!q</li>\n</ul>\n",
   "plain_articles" => "<ul><li>-p</li>\n<li>-q</li>\n</ul>\n",
+  "once_listed" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|1</ul>\n",
+  "once_listed_empty" => "<ul>|1</ul>\n",
+  "once_by_author" => "<ul><li>b:1</li>\n<li>a:1</li>\n<li>c:1</li>\n|1</ul>\n",
+  "once_by_title" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|1</ul>\n",
+  "once_by_title_empty" => "<ul>|1</ul>\n",
+  "once_named" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|1</ul>\n",
+  "once_named_empty" => "<ul>|1</ul>\n",
+  "once_or" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|1</ul>\n",
+  "once_or_empty" => "<ul>empty|1</ul>\n",
+  "once_articles" => "<ul><li>1p</li>\n<li>1q</li>\n|1</ul>\n",
+  "once_articles_empty" => "<ul>|1</ul>\n",
+  "once_in_order" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|10</ul>\n",
+  "once_after_collection" => "<ul><li>b:10</li>\n|10</ul>\n",
 }
 "#;
 
@@ -115,6 +184,13 @@ fn an_object_render_with_locals_emits_the_partial_call() {
         view("listed").contains("      posts.each { |p| Views::Posts.post_into(io, p, notice, alert, nil, \"no\") }\n"),
         "{}",
         view("listed")
+    );
+    assert!(
+        view("once_listed").contains(
+            "      __local_26_flag = (n += 1).to_s\n      posts.each { |p| Views::Posts.post_into(io, p, notice, alert, \"kept\", __local_26_flag) }\n"
+        ),
+        "{}",
+        view("once_listed")
     );
     assert!(
         view("first").contains("      Views::Posts.post_into(io, post, notice, alert, nil, \"one\")\n"),
@@ -170,6 +246,19 @@ got = {{
   "article" => Views::Authors.article(articles.first),
   "named_articles" => Views::Authors.named_articles(articles),
   "plain_articles" => Views::Authors.plain_articles(articles),
+  "once_listed" => Views::Authors.once_listed(by_title),
+  "once_listed_empty" => Views::Authors.once_listed_empty(empty),
+  "once_by_author" => Views::Authors.once_by_author(author),
+  "once_by_title" => Views::Authors.once_by_title(author),
+  "once_by_title_empty" => Views::Authors.once_by_title_empty(author),
+  "once_named" => Views::Authors.once_named(by_title),
+  "once_named_empty" => Views::Authors.once_named_empty(empty),
+  "once_or" => Views::Authors.once_or(by_title),
+  "once_or_empty" => Views::Authors.once_or_empty(empty),
+  "once_articles" => Views::Authors.once_articles(articles),
+  "once_articles_empty" => Views::Authors.once_articles_empty(ActiveRecord::Relation.new(Article).where(title: "none")),
+  "once_in_order" => Views::Authors.once_in_order(by_title),
+  "once_after_collection" => Views::Authors.once_after_collection(author),
 }}
 want.each do |action, html|
   raise "#{{action}}: #{{got[action].inspect}}" unless got[action] == html
