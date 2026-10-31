@@ -574,6 +574,30 @@ fn emit_named_collection_each(
     ))
 }
 
+/// The name for a collection render's block param: `name`, or `name`
+/// with `_` appended until no other argument of the per-record call
+/// reads it. Those arguments are the caller's locals, which the block
+/// param would otherwise shadow: `<% p = 5 %><%= render @posts, depth:
+/// p %>` must hand the partial the view's `p`, not the record. A
+/// strict-locals partial's keywords are one kwargs Hash.
+fn unshadowed(name: String, args: &[Expr]) -> Symbol {
+    fn reads(a: &Expr, n: &str) -> bool {
+        match &*a.node {
+            ExprNode::Var { name, .. } => name.as_str() == n,
+            ExprNode::Send { recv: None, method, args, block: None, .. } => {
+                args.is_empty() && method.as_str() == n
+            }
+            ExprNode::Hash { entries, kwargs: true } => entries.iter().any(|(_, v)| reads(v, n)),
+            _ => false,
+        }
+    }
+    let mut name = name;
+    while args.iter().any(|a| reads(a, &name)) {
+        name.push('_');
+    }
+    Symbol::from(name)
+}
+
 /// The element local and the `Views::<Module>.<partial>(element, …)` call
 /// one collection element renders through.
 fn named_collection_item_render(
@@ -591,15 +615,19 @@ fn named_collection_item_render(
     }
     let module_camel = camelize_path(&snake_case(&module_dir));
     let method_sym = ctx.partial_stems.stem(&module_camel, &base_name);
-    let var_name = Symbol::from(crate::naming::safe_local(
-        &as_name
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| base_name.trim_start_matches('_').to_string()),
-    ));
+    let mut extra = partial_extra_args(ctx, &module_camel, &method_sym);
+    extra.extend(locals_extra_args(locals, &module_camel, &method_sym, ctx));
+    let var_name = unshadowed(
+        crate::naming::safe_local(
+            &as_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| base_name.trim_start_matches('_').to_string()),
+        ),
+        &extra,
+    );
 
     let mut call_args = vec![var_ref(var_name.clone())];
-    call_args.extend(partial_extra_args(ctx, &module_camel, &method_sym));
-    call_args.extend(locals_extra_args(locals, &module_camel, &method_sym, ctx));
+    call_args.extend(extra);
     let method = ctx.render_method(ViewKind::Partial, &module_camel, &method_sym);
     let render_call = send(
         Some(Expr::new(
@@ -1106,11 +1134,12 @@ fn emit_partial_each(
     let singular = singularize(plural_name);
     let plural_camel = camelize_path(&snake_case(plural_name));
     let stem = ctx.partial_stems.stem(&plural_camel, &singular);
-    let var_name = Symbol::from(singular.chars().next().unwrap_or('x').to_string());
+    let mut extra = partial_extra_args(ctx, &plural_camel, &stem);
+    extra.extend(locals_extra_args(locals, &plural_camel, &stem, ctx));
+    let var_name = unshadowed(singular.chars().next().unwrap_or('x').to_string(), &extra);
 
     let mut call_args = vec![var_ref(var_name.clone())];
-    call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
-    call_args.extend(locals_extra_args(locals, &plural_camel, &stem, ctx));
+    call_args.extend(extra);
     let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
     let render_call = send(
         Some(Expr::new(

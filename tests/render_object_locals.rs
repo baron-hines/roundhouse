@@ -115,7 +115,13 @@ const ACTIONS: &[(&str, &str, &str)] = &[
         "named_article_in_order",
         "@article = Article.order(:title).first",
         "<% n = 0 %><%= render \"articles/article\", article: @article, tail: (n += 1).to_s, mark: (n *= 10).to_s %>|<%= n %>",
+    ),    ("shadowed", "@posts = Post.order(:title)", "<% p = \"five\" %><%= render @posts, flag: p %>"),
+    (
+        "shadowed_named",
+        "@posts = Post.order(:title)",
+        "<% post = \"x\" %><%= render partial: \"posts/post\", collection: @posts, locals: { flag: post } %>",
     ),
+    ("shadowed_strict", "@articles = Article.order(:title)", "<% a = \"!\" %><%= render @articles, mark: a %>"),
 ];
 
 fn app() -> emit_and_run::Overlay {
@@ -193,6 +199,9 @@ const WANT: &str = r#"want = {
   "article_in_order" => "<ul><li>10p1</li>\n|10</ul>\n",
   "named_in_order" => "<ul><li>a:1</li>\n|10</ul>\n",
   "named_article_in_order" => "<ul><li>10p1</li>\n|10</ul>\n",
+  "shadowed" => "<ul><li>a:five</li>\n<li>b:five</li>\n<li>c:five</li>\n</ul>\n",
+  "shadowed_named" => "<ul><li>a:x</li>\n<li>b:x</li>\n<li>c:x</li>\n</ul>\n",
+  "shadowed_strict" => "<ul><li>!p</li>\n<li>!q</li>\n</ul>\n",
 }
 "#;
 
@@ -333,6 +342,9 @@ got = {{
   "article_in_order" => Views::Authors.article_in_order(articles.first),
   "named_in_order" => Views::Authors.named_in_order(by_title.first),
   "named_article_in_order" => Views::Authors.named_article_in_order(articles.first),
+  "shadowed" => Views::Authors.shadowed(by_title),
+  "shadowed_named" => Views::Authors.shadowed_named(by_title),
+  "shadowed_strict" => Views::Authors.shadowed_strict(articles),
 }}
 want.each do |action, html|
   raise "#{{action}}: #{{got[action].inspect}}" unless got[action] == html
