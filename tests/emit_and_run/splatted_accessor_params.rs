@@ -168,3 +168,45 @@ fn spinel_gate_splatted_accessor_params() {
         ))
         .assert_passes();
 }
+
+fn merge_app(key: &str) -> emit_and_run::Overlay {
+    app()
+        .write("app/models/entry_builder.rb", &format!(r#"class EntryBuilder
+  def self.build(entry_params)
+    Entry.new(entry_params.merge({key}: "merged"))
+  end
+end
+"#))
+        .edit("app/controllers/entries_controller.rb", "Entry.new(entry_params)", "EntryBuilder.build(entry_params)")
+}
+
+#[test]
+fn params_merge_declines_private_accessor_writers() {
+    for key in ["secret_note", "literal_secret_note"] {
+        let (emitted, errors) = merge_app(key).emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(errors.is_empty(), "{errors:?}");
+        let builder = std::fs::read_to_string(emitted.join("app/models/entry_builder.rb")).unwrap();
+        assert!(builder.contains("entry_params.merge("), "{builder}");
+        assert!(!builder.contains("_pm0"), "{builder}");
+    }
+}
+
+#[test]
+fn params_merge_keeps_public_accessor_writers_and_columns() {
+    for key in ["note", "literal_note", "writer_note", "title"] {
+        merge_app(key).run_ruby(&format!(r#"
+params = EntryParams.from_raw({{"entry" => {{"title" => "Title"}}}})
+entry = EntryBuilder.build(params)
+raise entry.{key}.inspect unless entry.{key} == "merged"
+"#)).assert_passes();
+    }
+}
+
+#[test]
+fn params_merge_keeps_columns_with_private_writers() {
+    let (emitted, _, _) = merge_app("title")
+        .edit("app/models/entry.rb", "  private\n", "  private\n\n  def title=(value)\n    raise value\n  end\n")
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    let builder = std::fs::read_to_string(emitted.join("app/models/entry_builder.rb")).unwrap();
+    assert!(builder.contains("_pm0.title = \"merged\""), "{builder}");
+}

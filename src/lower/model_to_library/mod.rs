@@ -1158,10 +1158,7 @@ fn writable_permit_fields(
         .iter()
         .filter(|field| {
             let public_writer = model_defines_public_writer(model, field);
-            let is_column = table.is_some_and(|t| t.columns.iter().any(|c| c.name == **field));
-            let private_override =
-                !is_column && model_defines_writer(model, field) && !public_writer;
-            if (writable.contains(*field) && !private_override) || public_writer {
+            if writable.contains(*field) || public_writer {
                 return true;
             }
             let private = model_defines_writer(model, field);
@@ -1284,6 +1281,10 @@ fn writable_field_set_for_table(
     // writer yet (Many appends via the proxy, not mass-assign), so the
     // attrs stay OUT of the writable set — putting them in would make
     // `update(uploads: …)` / permit emit a missing writer (inv. 6).
+    writable.retain(|field| {
+        let is_column = table.is_some_and(|t| t.columns.iter().any(|c| c.name == *field));
+        is_column || !model_defines_writer(model, field) || model_defines_public_writer(model, field)
+    });
     writable
 }
 
