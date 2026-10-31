@@ -11840,7 +11840,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # never a commit SHA (`git clone --branch <sha>` fails with\n\
              # `Remote branch ... not found`). It names the release tag, so\n\
              # a build doesn't pick up whatever lands on `main` next.\n\
-             bcrypt = { git = \"https://github.com/rubys/spinel-bcrypt\", ref = \"v0.1.1\" }\n",
+             bcrypt = { git = \"https://github.com/roundhouse-rb/spinel-bcrypt\", ref = \"v0.1.1\" }\n",
         );
     }
     if needs_vips {
@@ -11854,7 +11854,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # on Debian/Ubuntu, `brew install vips` on macOS) and loadable\n\
              # at run time (`libvips42`). Git form for the reason bcrypt\n\
              # gives above: matz/spin-index#7 is the registration.\n\
-             ruby-vips = { git = \"https://github.com/rubys/spinel-ruby-vips\", ref = \"v0.3.0\" }\n",
+             ruby-vips = { git = \"https://github.com/roundhouse-rb/spinel-ruby-vips\", ref = \"v0.3.0\" }\n",
         );
     }
     if needs_rqrcode {
@@ -11866,7 +11866,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # matrix and exporter over Nayuki's qrcodegen, carried in the\n\
              # package — no system library. Git form for the reason bcrypt\n\
              # gives above: matz/spin-index#8 is the registration.\n\
-             rqrcode = { git = \"https://github.com/rubys/spinel-rqrcode\", ref = \"v0.1.0\" }\n",
+             rqrcode = { git = \"https://github.com/roundhouse-rb/spinel-rqrcode\", ref = \"v0.1.0\" }\n",
         );
     }
     if needs_nokogiri {
@@ -11877,7 +11877,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             "# HTML parsing, CSS/XPath and serialization: the nokogiri gem's\n\
              # surface over libxml2 2.13.9 with Nokogiri's patches, carried in\n\
              # the package. Git form until matz/spin-index#14 lands.\n\
-             nokogiri = { git = \"https://github.com/rubys/spinel-nokogiri\", ref = \"v0.3.1\" }\n",
+             nokogiri = { git = \"https://github.com/roundhouse-rb/spinel-nokogiri\", ref = \"v0.3.1\" }\n",
         );
     }
     if needs_commonmarker {
@@ -11888,7 +11888,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             "# Markdown: the commonmarker gem's surface over cmark-gfm\n\
              # 0.29.0.gfm.13, carried in the package. Git form until\n\
              # matz/spin-index#9 lands.\n\
-             commonmarker = { git = \"https://github.com/rubys/spinel-commonmarker\", ref = \"v0.1.0\" }\n",
+             commonmarker = { git = \"https://github.com/roundhouse-rb/spinel-commonmarker\", ref = \"v0.1.0\" }\n",
         );
     }
     if needs_redis {
@@ -11902,7 +11902,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # or tag, never a SHA. 0.3.0 adds the connect_timeout: and\n\
              # read_timeout: this push sets to 0.2.0's url:, AUTH, zadd and\n\
              # pipelined.\n\
-             redis = { git = \"https://github.com/rubys/spinel-redis\", ref = \"v0.3.1\" }\n",
+             redis = { git = \"https://github.com/roundhouse-rb/spinel-redis\", ref = \"v0.3.1\" }\n",
         );
     }
     files.push(("spin.toml".to_string(), manifest));
@@ -13959,7 +13959,7 @@ mod tests {
         assert!(!with.iter().any(|(p, _)| p == "sig/runtime/rqrcode_facade.rbs"), "sidecar must drop");
         let manifest = get(&with, "spin.toml");
         assert!(
-            manifest.contains("rqrcode = { git = \"https://github.com/rubys/spinel-rqrcode\""),
+            manifest.contains("rqrcode = { git = \"https://github.com/roundhouse-rb/spinel-rqrcode\""),
             "{manifest}"
         );
 
@@ -14020,7 +14020,7 @@ mod tests {
         let manifest = get(&with, "spin.toml");
         assert!(manifest.contains("[dependencies]\n"), "{manifest}");
         assert!(
-            manifest.contains("ruby-vips = { git = \"https://github.com/rubys/spinel-ruby-vips\""),
+            manifest.contains("ruby-vips = { git = \"https://github.com/roundhouse-rb/spinel-ruby-vips\""),
             "{manifest}"
         );
 
