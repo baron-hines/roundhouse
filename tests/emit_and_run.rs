@@ -160,6 +160,8 @@ mod job_rest_params;
 mod regexp_constants;
 #[path = "emit_and_run/upsert.rs"]
 mod upsert;
+#[path = "emit_and_run/relation_parts.rs"]
+mod relation_parts;
 #[path = "support/relation_fork.rs"]
 mod relation_fork_contract;
 #[path = "emit_and_run/relation_fork.rs"]
@@ -415,6 +417,8 @@ mod uniqueness_association_attribute;
 mod default_scope_static;
 #[path = "emit_and_run/default_scope_dynamic.rs"]
 mod default_scope_dynamic;
+#[path = "emit_and_run/acts_as_tenant.rs"]
+mod acts_as_tenant;
 #[path = "emit_and_run/validates_integer_constants.rs"]
 mod validates_integer_constants;
 #[path = "emit_and_run/validation_callback_on.rs"]
@@ -20558,6 +20562,10 @@ mod find_each_mailer;
 
 #[path = "emit_and_run/model_class_attribute.rs"]
 mod model_class_attribute;
+#[path = "support/record_slice_app.rs"]
+mod record_slice_app;
+#[path = "emit_and_run/record_slice.rs"]
+mod record_slice;
 
 #[path = "emit_and_run/csrf_meta_tag_alias.rs"]
 mod csrf_meta_tag_alias;
