@@ -3361,11 +3361,17 @@ fn collect_local_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
 
 /// Every name `e` reads as a local or calls without a receiver, with
 /// or without arguments: a local of that name would be read, or would
-/// shadow the method, at any of them.
+/// shadow the method, at any of them. A `READS_ANY_LOCAL` name called
+/// on `self` (`self.binding`) counts too: it reads the same locals.
 fn collect_mentioned_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
     match &*e.node {
         ExprNode::Var { name, .. } | ExprNode::Send { recv: None, method: name, .. } => {
             out.insert(name.clone());
+        }
+        ExprNode::Send { recv: Some(recv), method, .. }
+            if matches!(&*recv.node, ExprNode::SelfRef) && READS_ANY_LOCAL.contains(&method.as_str()) =>
+        {
+            out.insert(method.clone());
         }
         _ => {}
     }

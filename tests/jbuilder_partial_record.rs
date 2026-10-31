@@ -31,6 +31,12 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
   create_table "gizmos", force: :cascade do |t|
     t.string "name"
   end
+  create_table "sprockets", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "cogs", force: :cascade do |t|
+    t.string "name"
+  end
 end
 "#;
 
@@ -49,6 +55,8 @@ const ROUTES: &str = r#"Rails.application.routes.draw do
   get "widgets/items_cache", to: "widgets#items_cache", defaults: { format: :json }
   get "widgets/items_cached", to: "widgets#items_cached", defaults: { format: :json }
   get "widgets/:id/gizmo_cache", to: "widgets#gizmo_cache", defaults: { format: :json }
+  get "widgets/:id/sprocket_cache", to: "widgets#sprocket_cache", defaults: { format: :json }
+  get "widgets/:id/cog_cache", to: "widgets#cog_cache", defaults: { format: :json }
   get "widgets/:id/layout_option", to: "widgets#layout_option", defaults: { format: :json }
   get "widgets/:id/dynamic_cache", to: "widgets#dynamic_cache", defaults: { format: :json }
   namespace :admin do
@@ -128,6 +136,16 @@ const CONTROLLER: &str = r#"class WidgetsController < ApplicationController
     render :gizmo_cache
   end
 
+  def sprocket_cache
+    @sprocket = Sprocket.find(params[:id])
+    render :sprocket_cache
+  end
+
+  def cog_cache
+    @cog = Cog.find(params[:id])
+    render :cog_cache
+  end
+
   def layout_option
     @widget = Widget.find(params[:id])
     render :layout_option
@@ -196,6 +214,14 @@ const GIZMO_CACHE: &str =
     "json.partial!(@gizmo, partial: \"gizmos/gizmo\", as: :gizmo, cache: true)\n";
 const GIZMO_PARTIAL: &str = "json.id gizmo.id\njson.fresh cache\n";
 
+/// Partials that read the local the call passes through `binding`
+/// without naming it, receiverless and with an explicit `self`.
+const SPROCKET_CACHE: &str = "json.partial!(@sprocket, as: :sprocket, cache: true)\n";
+const SPROCKET_PARTIAL: &str =
+    "json.id sprocket.id\njson.fresh binding.local_variable_get(:cache)\n";
+const COG_CACHE: &str = "json.partial!(@cog, as: :cog, cache: true)\n";
+const COG_PARTIAL: &str = "json.id cog.id\njson.fresh self.binding.local_variable_get(:cache)\n";
+
 /// `layout:` is an Action View render option, not a local: Rails looks
 /// for `widgets/_frame` and raises when it is missing.
 const LAYOUT_OPTION: &str = "json.partial!(@widget, as: :widget, layout: \"widgets/frame\")\n";
@@ -234,6 +260,8 @@ fn emitted() -> Vec<(String, String)> {
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
         ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
         ("app/models/gizmo.rb", "class Gizmo < ApplicationRecord\nend\n"),
+        ("app/models/sprocket.rb", "class Sprocket < ApplicationRecord\nend\n"),
+        ("app/models/cog.rb", "class Cog < ApplicationRecord\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         ("app/controllers/widgets_controller.rb", CONTROLLER),
         ("app/views/widgets/_widget.json.jbuilder", PARTIAL),
@@ -255,6 +283,10 @@ fn emitted() -> Vec<(String, String)> {
         ("app/views/widgets/items_cached.json.jbuilder", ITEMS_CACHED),
         ("app/views/widgets/gizmo_cache.json.jbuilder", GIZMO_CACHE),
         ("app/views/gizmos/_gizmo.json.jbuilder", GIZMO_PARTIAL),
+        ("app/views/widgets/sprocket_cache.json.jbuilder", SPROCKET_CACHE),
+        ("app/views/sprockets/_sprocket.json.jbuilder", SPROCKET_PARTIAL),
+        ("app/views/widgets/cog_cache.json.jbuilder", COG_CACHE),
+        ("app/views/cogs/_cog.json.jbuilder", COG_PARTIAL),
         ("app/views/widgets/layout_option.json.jbuilder", LAYOUT_OPTION),
         ("app/views/widgets/dynamic_cache.json.jbuilder", DYNAMIC_CACHE),
         ("app/controllers/admin/widgets_controller.rb", ADMIN_CONTROLLER),
@@ -394,6 +426,29 @@ fn a_record_with_a_local_it_reads_or_a_render_option_is_refused() {
                 && !src.contains("io << \"\"")
                 && src.contains("jbuilder call with unrecognised arguments not supported"),
             "{template}: no partial call is emitted, and the statement is refused:\n{src}"
+        );
+    }
+}
+
+/// A partial that reads its locals through `binding` may read the one
+/// the call passes without naming it, with or without a `self.`
+/// receiver, so both calls are refused as `gizmo_cache` is.
+#[test]
+fn a_record_whose_partial_reads_locals_through_binding_is_refused() {
+    roundhouse::ingest::survey::activate();
+    let files = emitted();
+    let gaps = roundhouse::ingest::survey::drain();
+    for (template, partial) in [("sprocket_cache", "sprockets/sprocket"), ("cog_cache", "cogs/cog")] {
+        let src = view(&files, &format!("widgets/{template}_json.rb"));
+        assert!(
+            !src.contains("Views::Sprockets.")
+                && !src.contains("Views::Cogs.")
+                && src.contains("partial! of a record not supported"),
+            "{template}: refused:\n{src}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.to_string().contains(&format!("`{partial}` reads the local `cache`"))),
+            "{template}: the gap names the local the partial may read: {gaps:?}"
         );
     }
 }
