@@ -1158,9 +1158,7 @@ fn writable_permit_fields(
         .iter()
         .filter(|field| {
             let public_writer = model_defines_public_writer(model, field);
-            let private_override =
-                table.is_none() && model_defines_writer(model, field) && !public_writer;
-            if (writable.contains(*field) && !private_override) || public_writer {
+            if writable.contains(*field) || public_writer {
                 return true;
             }
             let private = model_defines_writer(model, field);
@@ -1220,7 +1218,7 @@ fn writable_field_set_for_table(
     table: Option<&crate::schema::Table>,
 ) -> std::collections::BTreeSet<crate::ident::Symbol> {
     use crate::dialect::{Association, ModelBodyItem};
-    use crate::expr::{ExprNode, Literal};
+    use crate::expr::ExprNode;
     use crate::ident::Symbol;
 
     let mut writable: std::collections::BTreeSet<Symbol> = std::collections::BTreeSet::new();
@@ -1232,8 +1230,6 @@ fn writable_field_set_for_table(
             writable.insert(name.clone());
         }
     }
-    // `attr_accessor` / `attr_writer` virtuals (mirrors the scan in
-    // markers::push_attr_accessor_methods).
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
@@ -1242,11 +1238,7 @@ fn writable_field_set_for_table(
         if !matches!(method.as_str(), "attr_accessor" | "attr_writer") {
             continue;
         }
-        for arg in args {
-            if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
-                writable.insert(value.clone());
-            }
-        }
+        writable.extend(self::markers::accessor_names(model, args));
     }
     for (_store, attrs) in crate::lower::typed_store::typed_store_decls(&model.body) {
         for attr in attrs {
@@ -1289,6 +1281,10 @@ fn writable_field_set_for_table(
     // writer yet (Many appends via the proxy, not mass-assign), so the
     // attrs stay OUT of the writable set — putting them in would make
     // `update(uploads: …)` / permit emit a missing writer (inv. 6).
+    writable.retain(|field| {
+        let is_column = table.is_some_and(|t| t.columns.iter().any(|c| c.name == *field));
+        is_column || !model_defines_writer(model, field) || model_defines_public_writer(model, field)
+    });
     writable
 }
 
