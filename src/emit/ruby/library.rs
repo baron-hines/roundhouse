@@ -4454,11 +4454,13 @@ fn rewrite_helper_calls(
         )
     });
 
-    // Not left on `self`: a helper or controller helper_method reached as `self.x` is the bare `x` below, and the module function has no such method.
+    // Not left on `self` in a view or helper module: a helper reached as `self.x` is the bare `x` below, and the module function has no such method. A same-named param keeps `self`, which a bare call would read instead.
     if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node {
-        if matches!(&*r.node, ExprNode::SelfRef)
+        if rewrite_request
+            && matches!(&*r.node, ExprNode::SelfRef)
             && (index.contains_key(method) || view_visible.contains(method))
             && !own_methods.contains(method)
+            && !own_params.contains(method)
         {
             let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };
             *recv = None;
