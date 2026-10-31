@@ -11901,8 +11901,9 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # sp_net. Git form, pinned to a tag because `ref` takes a branch\n\
              # or tag, never a SHA. 0.3.0 adds the connect_timeout: and\n\
              # read_timeout: this push sets to 0.2.0's url:, AUTH, zadd and\n\
-             # pipelined.\n\
-             redis = { git = \"https://github.com/roundhouse-rb/spinel-redis\", ref = \"v0.3.1\" }\n",
+             # pipelined; 0.3.2 adds the script and evalsha the worker's\n\
+             # scheduler runs.\n\
+             redis = { git = \"https://github.com/roundhouse-rb/spinel-redis\", ref = \"v0.3.2\" }\n",
         );
     }
     files.push(("spin.toml".to_string(), manifest));

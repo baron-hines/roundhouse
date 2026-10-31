@@ -65,7 +65,7 @@ env:
   # tree, tested against a live Redis in sidekiq-live. The same repository
   # and tag the emitted spin.toml pins (src/project.rs); bump both together.
   SPINEL_REDIS_REPO: roundhouse-rb/spinel-redis
-  SPINEL_REDIS_REF: v0.3.1
+  SPINEL_REDIS_REF: v0.3.2
 
 jobs:
   plan:
