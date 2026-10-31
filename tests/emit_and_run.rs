@@ -7,6 +7,10 @@
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/time_change_usec.rs"]
+mod time_change_usec_contract;
+#[path = "emit_and_run/time_change_usec.rs"]
+mod time_change_usec;
 #[path = "support/i18n_locales_app.rs"]
 #[allow(dead_code)]
 mod i18n_locales_app;
