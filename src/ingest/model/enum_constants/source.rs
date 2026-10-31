@@ -280,7 +280,7 @@ impl EnumConstants {
                     && self.parents.iter().all(|parent| {
                         matches!(parent, Node::ProgramNode { .. } | Node::StatementsNode { .. })
                     });
-                if (direct || boot_top_level) && node.as_constant_write_node().is_some() {
+                if (direct || boot_top_level || matches!(self.kind, SourceKind::Mutations)) && node.as_constant_write_node().is_some() {
                     self.direct_writes.insert(node.location().start_offset());
                 }
                 // `const_set(:X, …)` / `self.send(:remove_const, :X)` in a

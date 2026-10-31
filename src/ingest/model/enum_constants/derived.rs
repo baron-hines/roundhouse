@@ -270,6 +270,9 @@ impl EnumConstants {
                 {
                     return Some(Value::List(mapping.iter().map(|(label, _)| label.clone()).collect()));
                 }
+                if !self.snapshot_constant_is_stable(path, owners) {
+                    return None;
+                }
                 let (_, member, table) = self.owner_constant(path, owners)?;
                 if let Some(labels) = table.labels.get(&member) {
                     return Some(Value::List(labels.clone()));

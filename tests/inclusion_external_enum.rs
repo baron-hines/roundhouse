@@ -8,13 +8,17 @@ mod emit_and_run;
 mod contract;
 
 fn ingest(form: &str, extra: Option<(&str, &str)>) -> (roundhouse::App, Vec<String>) {
+    ingest_with_extras(form, &extra.into_iter().collect::<Vec<_>>())
+}
+
+fn ingest_with_extras(form: &str, extras: &[(&str, &str)]) -> (roundhouse::App, Vec<String>) {
     let mut tree: std::collections::HashMap<PathBuf, Vec<u8>> = [
         ("app/models/application_record.rb", contract::BASE),
         ("app/models/pty_session.rb", contract::PROVIDER),
         ("app/models/session_start.rb", form),
         ("db/schema.rb", contract::SCHEMA),
     ].into_iter().map(|(path, source)| (PathBuf::from(path), source.as_bytes().to_vec())).collect();
-    if let Some((path, source)) = extra { tree.insert(PathBuf::from(path), source.as_bytes().to_vec()); }
+    for (path, source) in extras { tree.insert(PathBuf::from(path), source.as_bytes().to_vec()); }
     roundhouse::ingest::survey::activate();
     let (app, diagnostics) = roundhouse::ingest::prism::scope(|| roundhouse::ingest::ingest_app_from_tree(tree));
     let mut messages: Vec<_> = diagnostics.into_iter().map(|d| d.message).collect();
@@ -78,6 +82,41 @@ fn consumed_enum_overrides_keep_validation_reported() {
     ] {
         let (_, diagnostics) = ingest(contract::FORM, Some(("config/initializers/enum_patch.rb", patch)));
         assert!(diagnostics.iter().any(|d| d.contains("enum-derived inclusion list changed") || d.contains("inclusion: in")), "{patch}: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn consumed_constant_mutation_invalidates_a_merged_enum_list() {
+    let form = contract::FORM.replace(
+        "in: PtySession.drivers.keys",
+        "in: PtySession.drivers.merge(ExtraChoices::OTHER).keys",
+    );
+    let other = (
+        "app/models/extra_choices.rb",
+        "class ExtraChoices\n  OTHER = { \"other\" => \"other\" }\nend\n",
+    );
+    let (app, diagnostics) = ingest_with_extras(&form, &[other]);
+    assert!(!diagnostics.iter().any(|d| d.contains("inclusion: in")), "{diagnostics:?}");
+    let model = app.models.iter().find(|m| m.name.0.as_str() == "SessionStart").unwrap();
+    assert!(model.validations().flat_map(|v| &v.rules).any(|rule| {
+        matches!(rule, ValidationRule::Inclusion { values, .. } if values.contains(&Literal::Str { value: "other".into() }))
+    }));
+    let (_, diagnostics) = ingest_with_extras(&form, &[other, (
+        "app/controllers/snapshot_patch_controller.rb",
+        "class SnapshotPatchController\n  ExtraChoices::OTHER[\"custom\"] = \"custom\"\nend\n",
+    )]);
+    assert!(diagnostics.iter().any(|d| d.contains("enum-derived inclusion list changed")), "{diagnostics:?}");
+}
+
+#[test]
+fn consumed_alias_mutation_invalidates_an_enum_snapshot() {
+    let form = contract::FORM.replace("keys.freeze", "keys");
+    for patch in [
+        "class SnapshotPatchController\n  SNAPSHOT_ALIAS = SessionStart::APPROVAL_POLICIES\n  SNAPSHOT_ALIAS << \"custom\"\nend\n",
+        "class SnapshotPatchController\n  if true\n    SNAPSHOT_ALIAS = SessionStart::APPROVAL_POLICIES\n    SNAPSHOT_ALIAS << \"custom\"\n  end\nend\n",
+    ] {
+        let (_, diagnostics) = ingest(&form, Some(("app/controllers/snapshot_patch_controller.rb", patch)));
+        assert!(diagnostics.iter().any(|d| d.contains("enum-derived inclusion list changed")), "{patch}: {diagnostics:?}");
     }
 }
 
