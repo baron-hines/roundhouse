@@ -52,6 +52,38 @@ fn complex_expect_records_keep_arrays_numbered_hashes_and_nil() {
     app().run_ruby(CONTRACT).assert_passes();
 }
 
+fn unsupported_filter_errors(filter: &str) -> Vec<String> {
+    app().write("app/controllers/entries_controller.rb", &format!(r#"class EntriesController < ApplicationController
+  def create
+    values = params.expect({filter})
+    render json: values[:tags].map(&:to_s)
+  end
+end
+"#)).check_errors()
+}
+
+#[test]
+fn string_resource_keys_keep_the_source_error() {
+    let errors = unsupported_filter_errors(r#""entry" => [:body, {tags: []}]"#);
+    assert!(errors.iter().any(|error| error.contains("map") && error.contains("String")), "{errors:?}");
+}
+
+#[test]
+fn nonfinal_nested_hashes_keep_the_source_error() {
+    for filter in ["entry: [{tags: []}, :body]", "entry: [{records: [[:name]]}, {tags: []}]"] {
+        let errors = unsupported_filter_errors(filter);
+        assert!(errors.iter().any(|error| error.contains("map") && error.contains("String")), "{filter}: {errors:?}");
+    }
+}
+
+#[test]
+fn unlowered_nested_fields_keep_the_source_error() {
+    for filter in [r#"entry: [:body, {"tags" => []}]"#, "entry: [:body, {tags: [], records: [[]]}]", r#"entry: [:body, {tags: [], records: [["name"]]}]"#] {
+        let errors = unsupported_filter_errors(filter);
+        assert!(errors.iter().any(|error| error.contains("map") && error.contains("String")), "{filter}: {errors:?}");
+    }
+}
+
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn complex_expect_fields_run_with_emitted_rbs() {

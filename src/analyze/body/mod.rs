@@ -6791,21 +6791,20 @@ fn expect_hash_arg_ty(recv: Option<&Expr>, recv_ty: Option<&Ty>, method: &str, a
             value: send::param_value_ty().into(),
         }.into() });
     }
-    if elements.iter().any(|field| matches!(&*field.node, ExprNode::Hash { .. }))
-        && matches!(&*resource.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } })
+    if elements.last().is_some_and(|field| matches!(&*field.node, ExprNode::Hash { entries, .. } if !entries.is_empty()))
+        && matches!(&*resource.node, ExprNode::Lit { value: Literal::Sym { .. } })
         && recv.is_some_and(|expr| matches!(&*expr.node,
-            ExprNode::Send { recv: None, method, args, .. }
+            ExprNode::Send { recv: None, method, args, block: None, .. }
                 if method.as_str() == "params" && args.is_empty()))
     {
         let mut fields = indexmap::IndexMap::new();
-        for field in elements {
+        for (index, field) in elements.iter().enumerate() {
             match &*field.node {
                 ExprNode::Lit { value: Literal::Sym { value } } => { fields.insert(value.clone(), Ty::Str); }
-                ExprNode::Hash { entries, .. } => {
+                ExprNode::Hash { entries, .. } if index + 1 == elements.len() => {
                     for (name, filter) in entries {
                         let name = match &*name.node {
                             ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
-                            ExprNode::Lit { value: Literal::Str { value } } => Symbol::from(value.as_str()),
                             _ => return None,
                         };
                         let ExprNode::Array { elements: filters, .. } = &*filter.node else { return None };
@@ -6813,7 +6812,8 @@ fn expect_hash_arg_ty(recv: Option<&Expr>, recv_ty: Option<&Ty>, method: &str, a
                             Ty::Array { elem: Ty::Str.into() }
                         } else if let [inner] = filters.as_slice()
                             && let ExprNode::Array { elements: nested, .. } = &*inner.node
-                            && nested.iter().all(|f| matches!(&*f.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }))
+                            && !nested.is_empty()
+                            && nested.iter().all(|f| matches!(&*f.node, ExprNode::Lit { value: Literal::Sym { .. } }))
                         {
                             let record = Ty::Hash { key: Ty::Str.into(), value: send::param_value_ty().into() };
                             Ty::Union { variants: vec![
