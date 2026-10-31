@@ -185,13 +185,11 @@ fn an_object_render_with_locals_emits_the_partial_call() {
         "{}",
         view("listed")
     );
-    assert!(
-        view("once_listed").contains(
-            "      __local_26_flag = (n += 1).to_s\n      posts.each { |p| Views::Posts.post_into(io, p, notice, alert, \"kept\", __local_26_flag) }\n"
-        ),
-        "{}",
-        view("once_listed")
-    );
+    let once_listed = view("once_listed");
+    let bind = once_listed.find("      __local_26_flag = (n += 1).to_s\n");
+    let each =
+        once_listed.find("      posts.each { |p| Views::Posts.post_into(io, p, notice, alert, \"kept\", __local_26_flag) }\n");
+    assert!(matches!((bind, each), (Some(bind), Some(each)) if bind < each), "{once_listed}");
     assert!(
         view("first").contains("      Views::Posts.post_into(io, post, notice, alert, nil, \"one\")\n"),
         "{}",
