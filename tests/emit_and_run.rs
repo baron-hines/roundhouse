@@ -12,6 +12,8 @@ mod emit_and_run;
 mod i18n_locales_app;
 #[path = "support/pundit_app.rs"]
 mod pundit_app;
+#[path = "emit_and_run/render_notifications.rs"]
+mod render_notifications;
 #[path = "emit_and_run/session_cookie_key.rs"]
 mod session_cookie_key;
 #[path = "emit_and_run/inertia_runtime_props.rs"]
@@ -158,6 +160,8 @@ mod job_rest_params;
 mod regexp_constants;
 #[path = "emit_and_run/upsert.rs"]
 mod upsert;
+#[path = "emit_and_run/relation_parts.rs"]
+mod relation_parts;
 #[path = "support/relation_fork.rs"]
 mod relation_fork_contract;
 #[path = "emit_and_run/relation_fork.rs"]
@@ -413,6 +417,8 @@ mod uniqueness_association_attribute;
 mod default_scope_static;
 #[path = "emit_and_run/default_scope_dynamic.rs"]
 mod default_scope_dynamic;
+#[path = "emit_and_run/acts_as_tenant.rs"]
+mod acts_as_tenant;
 #[path = "emit_and_run/validates_integer_constants.rs"]
 mod validates_integer_constants;
 #[path = "emit_and_run/validation_callback_on.rs"]
@@ -20527,6 +20533,9 @@ mod reopened_class_constructor;
 #[path = "emit_and_run/flash_any_key.rs"]
 mod flash_any_key;
 
+#[path = "emit_and_run/select_alias_attributes.rs"]
+mod select_alias_attributes;
+
 #[path = "emit_and_run/route_arg_column_named_like_association.rs"]
 mod route_arg_column_named_like_association;
 
@@ -20542,6 +20551,9 @@ mod polymorphic_source_through;
 #[path = "emit_and_run/namespaced_controller_symbol.rs"]
 mod namespaced_controller_symbol;
 
+#[path = "emit_and_run/route_format_lookahead.rs"]
+mod route_format_lookahead;
+
 #[path = "emit_and_run/params_write_assign.rs"]
 mod params_write_assign;
 
@@ -20550,3 +20562,7 @@ mod find_each_mailer;
 
 #[path = "emit_and_run/model_class_attribute.rs"]
 mod model_class_attribute;
+#[path = "support/record_slice_app.rs"]
+mod record_slice_app;
+#[path = "emit_and_run/record_slice.rs"]
+mod record_slice;

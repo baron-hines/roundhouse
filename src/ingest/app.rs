@@ -787,6 +787,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     }
     // Last, so a file a support root already reached is ingested once.
     support_batches.push((String::new(), dir.to_path_buf(), boot_required.clone()));
+    let mut held_aliases: Vec<super::inherited_alias::Held> = Vec::new();
     for (sub, support_dir, entries) in support_batches {
         let sub = sub.as_str();
         for entry in entries {
@@ -859,7 +860,9 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                     }
                 }
             }
-            match ingest_library_classes(&source, &path_str) {
+            let (ingested, mut aliases) =
+                super::inherited_alias::capturing(|| ingest_library_classes(&source, &path_str));
+            match ingested {
                 Ok(mut classes) => {
                     // A gem's file runs more than its declarations when it
                     // loads (`file_program`).
@@ -877,7 +880,15 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         }
                     }
                     if gem_libs.iter().any(|lib| entry.starts_with(lib)) {
-                        if let Ok(branched) = super::library_class::ingest_file_branch_classes(&source, &path_str) {
+                        let (branched, branch_aliases) = super::inherited_alias::capturing(|| {
+                            super::library_class::ingest_file_branch_classes(&source, &path_str)
+                        });
+                        for span in branch_aliases {
+                            if !aliases.contains(&span) {
+                                aliases.push(span);
+                            }
+                        }
+                        if let Ok(branched) = branched {
                             let branched: Vec<_> = branched.into_iter().filter(|m| !classes.iter().any(|c| c.name == m.name)).collect();
                             classes.extend(branched);
                         }
@@ -909,7 +920,15 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                     let unconditional =
                         classes.iter().map(|c| c.name.clone()).filter(|name| !conditional.contains(name)).collect();
                     app.library_class_files.push((path_str.clone(), unconditional));
+                    let start = app.library_classes.len();
                     app.library_classes.extend(classes);
+                    if !aliases.is_empty() {
+                        held_aliases.push(super::inherited_alias::Held {
+                            path: path_str.clone(),
+                            classes: start..app.library_classes.len(),
+                            spans: aliases,
+                        });
+                    }
                     // A Concern here runs its `included do` in a model that
                     // includes it, as one under app/models/concerns does.
                     let (concern_items, concern_enum_decls, concern_guarded) =
@@ -942,6 +961,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
         }
     }
+
+    super::inherited_alias::settle(&mut app, held_aliases);
 
     // `app/helpers/*.rb` — ingested as library classes like the support
     // dirs above, but ALSO registered in `helper_method_index` so the
@@ -2581,6 +2602,9 @@ end
     // `Other.include(M)` written in another body: `Other`'s include,
     // before the concern splices read the includes.
     super::external_include::carry(&mut app);
+    // After the passes that make methods an alias may name, and before
+    // the concern splices copy a class's methods into its includers.
+    super::inherited_alias::resolve(&mut app);
     // Channels, before the concern splices for the same reason `Current`
     // is: this turns a class-body macro into real methods, and every
     // later pass reads methods.
@@ -2597,6 +2621,20 @@ end
     super::acts_as_votable::expand_acts_as_votable(&mut app)?;
     // After the splice: `include Discard::Model` can arrive through a concern.
     super::discard::expand_discard_models(&mut app)?;
+    // After the splice for the same reason; reads the initializers for an
+    // `ActsAsTenant.configure` it does not model.
+    {
+        let init_dir = dir.join("config/initializers");
+        let mut initializers = Vec::new();
+        if app.gem_lock.as_ref().is_some_and(|l| l.has("acts_as_tenant")) && vfs.is_dir(&init_dir) {
+            for entry in read_rb_files(vfs, &init_dir)? {
+                if let Ok(text) = vfs.read_to_string(&entry) {
+                    initializers.push((entry.display().to_string(), text));
+                }
+            }
+        }
+        super::acts_as_tenant::expand_acts_as_tenant(&mut app, &initializers)?;
+    }
     // Before the macros: a macro's `extend Owner::ClassMethods` names the module this surfaces.
     super::referenced_carriers::surface_referenced_carriers(&mut app, &sources);
     super::conditional_permit::apply(&mut app);
@@ -2697,6 +2735,8 @@ end
     // `numericality:` on an untyped attribute is decided per target
     // (`refuse_numericality_allow_on_untyped`, `session::analyze_and_lower_for`).
     gap_acceptance_on_undeclared(&mut app);
+    // Not at model ingest: the `select` naming a model's aliases can sit in another model, class, controller or view.
+    super::select_aliases::stamp(&mut app);
     gap_uniqueness_on_polymorphic_attribute(&mut app);
     // After every model and library class: a custom `validates` key is
     // kept only when it names an app `EachValidator`.
@@ -2706,6 +2746,8 @@ end
     // including declarations contributed by either kind of Concern,
     // and reuses the prepared resolver rather than rebuilding it.
     super::concern_accessors::validate(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
+    // After every model and reopen: a model may declare its key anywhere.
+    key_composite_tables(&mut app)?;
     // Model-to-database ownership reads every model, concern splice and
     // library module, so it runs once they all exist.
     super::database_ownership::resolve(&mut app);
@@ -2772,6 +2814,63 @@ end
 /// is a concern's method) keeps the dynamic path, which is still what
 /// Rails runs, and the clone the lowering gives it goes unused. An entry
 /// a helper module owns is left as it is.
+/// A table whose primary key spans several columns
+/// (`Table.primary_key_columns`) keys its records on the column its
+/// models declare (`self.primary_key = "cityhash"`), which is then the
+/// table's key column. A model that declares none — itself or through a
+/// model ancestor — is refused, as the composite key was before: Rails
+/// keys such a model on every column of it, and this compiler does not
+/// yet.
+fn key_composite_tables(app: &mut App) -> IngestResult<()> {
+    let declared = |model: &crate::dialect::Model| -> Option<crate::ident::Symbol> {
+        let mut current = Some(model);
+        let mut seen = 0;
+        while let Some(m) = current {
+            // A reopen (`app/models/event/mentioned.rb`) is the same class:
+            // any of its definitions may carry the declaration.
+            if let Some(key) = app.models.iter().filter(|o| o.name == m.name).find_map(|o| o.primary_key.clone()) {
+                return Some(key);
+            }
+            seen += 1;
+            if seen > app.models.len() {
+                return None;
+            }
+            current = m.parent.as_ref().and_then(|p| app.models.iter().find(|o| &o.name == p));
+        }
+        None
+    };
+    let mut keyed: Vec<(crate::ident::Symbol, crate::ident::Symbol)> = Vec::new();
+    for model in &app.models {
+        let Some(table) = app.schema.tables.get(&model.table.0) else { continue };
+        if table.primary_key_columns.is_empty() {
+            continue;
+        }
+        match declared(model) {
+            Some(key) if table.columns.iter().any(|c| c.name == key) => keyed.push((table.name.clone(), key)),
+            _ => {
+                let columns = table.primary_key_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
+                let refusal = super::IngestError::Unsupported {
+                    file: "db/structure.sql".into(),
+                    message: format!(
+                        "primary key dropped: composite key ({}({columns})): `{}` declares no `self.primary_key` naming one of its columns",
+                        table.name.as_str(),
+                        model.name.0.as_str()
+                    ),
+                };
+                super::survey::unwrap_or_record::<()>(Err(refusal))?;
+            }
+        }
+    }
+    for (table, key) in keyed {
+        if let Some(table) = app.schema.tables.get_mut(&table) {
+            for column in &mut table.columns {
+                column.primary_key = column.name == key;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_controller_helper_methods(app: &mut App) {
     let owners: HashSet<&crate::ident::ClassId> = app.helper_method_index.values().collect();
     let mut still_pure: HashMap<crate::ident::ClassId, Vec<Symbol>> = HashMap::default();

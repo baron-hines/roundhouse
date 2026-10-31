@@ -584,8 +584,7 @@ fn fold_static_merge(e: &Expr) -> Option<Expr> {
         return None;
     };
     let key_of = |k: &Expr| match &*k.node {
-        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
-        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        ExprNode::Lit { value: value @ (Literal::Sym { .. } | Literal::Str { .. }) } => Some(value.clone()),
         _ => None,
     };
     if base_entries.iter().chain(over.iter()).any(|(k, _)| key_of(k).is_none()) {
