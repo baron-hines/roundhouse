@@ -859,6 +859,10 @@ pub fn dot_span(src: &str) -> Option<DotSpan> {
     if !end || (lazy && exts.is_empty()) {
         return None;
     }
+    // Not any word: a lazy span leaves the listed extension to the router's peel, which takes only these.
+    if lazy && exts.iter().any(|ext| !ROUTER_FORMATS.split(' ').any(|f| f == ext)) {
+        return None;
+    }
     if !lazy {
         exts.clear();
     }
@@ -925,6 +929,8 @@ mod tests {
         assert_eq!(dot_span(r"(.+?)(?=$|\/)"), None);
         assert_eq!(dot_span(r"([^\/]+?)(?=\.json|\.rss|$|\/)"), None);
         assert_eq!(dot_span(r".*"), None);
+        assert_eq!(dot_span(r"(.+?)(?=\.foo|$)"), None);
+        assert_eq!(dot_span(r"(.+)(?=\.foo|$)"), span(&[], false));
     }
 
     #[test]

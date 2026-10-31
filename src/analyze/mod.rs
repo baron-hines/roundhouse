@@ -7093,8 +7093,10 @@ fn body_tail_terminal_kind(
 /// and no feeder, and the dead-view walk called them dead.
 fn helper_rendered_partials(app: &App, body: &Expr, renderer: &Symbol) -> Vec<Symbol> {
     fn bare_calls(e: &Expr, out: &mut Vec<Symbol>) {
-        if let ExprNode::Send { recv: None, method, .. } = &*e.node {
-            out.push(method.clone());
+        if let ExprNode::Send { recv, method, .. } = &*e.node {
+            if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+                out.push(method.clone());
+            }
         }
         e.node.for_each_child(&mut |c| bare_calls(c, out));
     }

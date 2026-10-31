@@ -19,7 +19,7 @@ fn overlay() -> emit_and_run::Overlay {
         .edit(
             "app/views/articles/index.html.erb",
             "<%= turbo_stream_from \"articles\" %>\n",
-            "<%= turbo_stream_from \"articles\" %>\n<%= render @above if @above %>\n<%= viewer_badge(\"not-the-viewer\") %>\n",
+            "<%= turbo_stream_from \"articles\" %>\n<%= render @above if @above %>\n<%= viewer_badge(\"not-the-viewer\") %>\n<%= self.viewer_flag(\"nested\") %>\n",
         )
         .write(
             "app/views/articles/_banner.html.erb",
@@ -29,10 +29,14 @@ fn overlay() -> emit_and_run::Overlay {
             "app/views/articles/_badge.html.erb",
             "<%# locals: (label:) -%>\n<p id=\"badge\"><%= label %> / <%= @viewer.upcase %></p>\n",
         )
+        .write(
+            "app/views/admin/articles/_flag.html.erb",
+            "<%# locals: (label:) -%>\n<p id=\"flag\"><%= label %> / <%= @viewer.upcase %></p>\n",
+        )
         .edit(
             "app/helpers/articles_helper.rb",
             "module ArticlesHelper\n",
-            "module ArticlesHelper\n  def viewer_badge(viewer)\n    render partial: \"articles/badge\", locals: {label: viewer}\n  end\n",
+            "module ArticlesHelper\n  def viewer_badge(viewer)\n    render partial: \"articles/badge\", locals: {label: viewer}\n  end\n\n  def viewer_flag(label)\n    render partial: \"admin/articles/flag\", locals: {label: label}\n  end\n",
         )
 }
 
@@ -49,7 +53,7 @@ fn ivars_reached_through_dynamic_partials_helpers_and_never_assigned_run() {
             CONTROLLER_TEST,
             INDEX_ASSERTION,
             &format!(
-                "{INDEX_ASSERTION}    assert_includes response.body, \"<p id=\\\"banner\\\">Latest for ALICE</p>\"\n    assert_includes response.body, \"<p id=\\\"badge\\\">not-the-viewer / ALICE</p>\"\n"
+                "{INDEX_ASSERTION}    assert_includes response.body, \"<p id=\\\"banner\\\">Latest for ALICE</p>\"\n    assert_includes response.body, \"<p id=\\\"badge\\\">not-the-viewer / ALICE</p>\"\n    assert_includes response.body, \"<p id=\\\"flag\\\">nested / ALICE</p>\"\n"
             ),
         )
         .run_test(CONTROLLER_TEST)

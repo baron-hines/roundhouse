@@ -1062,7 +1062,7 @@ fn library_partial_render(expr: &Expr) -> Option<(String, Vec<(Symbol, Expr)>)> 
 fn library_partial_key(pname: &str) -> Option<(String, String)> {
     let (dir, base) = pname.rsplit_once('/')?;
     Some((
-        crate::naming::camelize(&crate::naming::snake_case(dir)),
+        crate::naming::camelize_path(&crate::naming::snake_case(dir)),
         base.trim_start_matches('_').to_string(),
     ))
 }
@@ -4453,6 +4453,17 @@ fn rewrite_helper_calls(
             view_visible,
         )
     });
+
+    // Not left on `self`: a helper or controller helper_method reached as `self.x` is the bare `x` below, and the module function has no such method.
+    if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node {
+        if matches!(&*r.node, ExprNode::SelfRef)
+            && (index.contains_key(method) || view_visible.contains(method))
+            && !own_methods.contains(method)
+        {
+            let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };
+            *recv = None;
+        }
+    }
 
     // Destructive `<lvalue>.<m>!(args)` on a frozen string raises under
     // spinel (frozen literals) — lobsters' link_to_different_page does
