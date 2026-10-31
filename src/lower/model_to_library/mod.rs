@@ -1439,7 +1439,7 @@ fn build_methods_with_finder_inputs(
             methods.push(adapter_emit::synth_find_primary_key_input(&model.name, table));
             methods.push(adapter_emit::synth_exists_primary_key_input(&model.name, table));
         }
-        push_adapter_methods(&mut methods, model, table, schema, param_binds);
+        push_adapter_methods(&mut methods, model, table, schema, param_binds, runtime_relation == RuntimeRelation::Present);
         match crate::lower::default_scope::default_scope(model) {
             Some(crate::lower::default_scope::DefaultScope::Static(scope)) => {
                 methods.push(crate::lower::default_scope::synth_default_scope_where(model, &scope));
@@ -1616,7 +1616,7 @@ fn build_methods_with_finder_inputs(
     // AFTER push_user_methods, unlike the macros above: its skip guard
     // reads the accumulated list, so a model's own `to_param` (already
     // pushed) wins over the synthesized `@id.to_s`.
-    self::markers::push_to_param_method(&mut methods, model);
+    self::markers::push_to_param_method(&mut methods, model, schema.tables.get(&model.table.0));
     // Not before push_user_methods: its skip guard has to see the model's own methods.
     self::select_aliases::push_select_alias_methods(&mut methods, model, runtime_relation);
     // Also after push_user_methods: its BODY branches on whether the
