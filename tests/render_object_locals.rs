@@ -7,7 +7,10 @@
 //! `collection:` with `locals:` alike. Rails evaluates the hash once,
 //! after the collection and before any record renders, so a local
 //! with a side effect (`(n += 1).to_s`) runs once for a collection of
-//! three and once for an empty one.
+//! three and once for an empty one, and one that reassigns the
+//! collection's local leaves the records it renders alone. A single
+//! render, record or named, runs its locals in source order, which is
+//! not the order of the partial's params.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -83,6 +86,36 @@ const ACTIONS: &[(&str, &str, &str)] = &[
         "@author = Author.first",
         "<% n = 0 %><%= render @author.posts.limit(n += 1), flag: (n *= 10).to_s %>|<%= n %>",
     ),
+    (
+        "reassigned",
+        "@posts = Post.order(:title)",
+        "<% posts = @posts %><%= render posts, flag: (posts = Post.where(title: \"c\")).size.to_s %>|<%= posts.size %>",
+    ),
+    (
+        "reassigned_empty",
+        "@posts = Post.where(title: \"none\")",
+        "<% posts = @posts %><%= render posts, flag: (posts = Post.where(title: \"c\")).size.to_s %>|<%= posts.size %>",
+    ),
+    (
+        "first_in_order",
+        "@post = Post.order(:title).first",
+        "<% n = 0 %><%= render @post, flag: (n += 1).to_s, as: (n *= 10).to_s %>|<%= n %>",
+    ),
+    (
+        "article_in_order",
+        "@article = Article.order(:title).first",
+        "<% n = 0 %><%= render @article, tail: (n += 1).to_s, mark: (n *= 10).to_s %>|<%= n %>",
+    ),
+    (
+        "named_in_order",
+        "@post = Post.order(:title).first",
+        "<% n = 0 %><%= render \"posts/post\", post: @post, flag: (n += 1).to_s, as: (n *= 10).to_s %>|<%= n %>",
+    ),
+    (
+        "named_article_in_order",
+        "@article = Article.order(:title).first",
+        "<% n = 0 %><%= render \"articles/article\", article: @article, tail: (n += 1).to_s, mark: (n *= 10).to_s %>|<%= n %>",
+    ),
 ];
 
 fn app() -> emit_and_run::Overlay {
@@ -113,7 +146,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/models/article.rb", "class Article < ApplicationRecord\nend\n")
         .write(
             "app/views/articles/_article.html.erb",
-            "<%# locals: (article:, mark: \"-\") -%>\n<li><%= mark %><%= article.title %></li>\n",
+            "<%# locals: (article:, mark: \"-\", tail: \"\") -%>\n<li><%= mark %><%= article.title %><%= tail %></li>\n",
         )
 }
 
@@ -154,6 +187,12 @@ const WANT: &str = r#"want = {
   "once_articles_empty" => "<ul>|1</ul>\n",
   "once_in_order" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|10</ul>\n",
   "once_after_collection" => "<ul><li>b:10</li>\n|10</ul>\n",
+  "reassigned" => "<ul><li>a:1</li>\n<li>b:1</li>\n<li>c:1</li>\n|1</ul>\n",
+  "reassigned_empty" => "<ul>|1</ul>\n",
+  "first_in_order" => "<ul><li>a:1</li>\n|10</ul>\n",
+  "article_in_order" => "<ul><li>10p1</li>\n|10</ul>\n",
+  "named_in_order" => "<ul><li>a:1</li>\n|10</ul>\n",
+  "named_article_in_order" => "<ul><li>10p1</li>\n|10</ul>\n",
 }
 "#;
 
@@ -185,11 +224,42 @@ fn an_object_render_with_locals_emits_the_partial_call() {
         "{}",
         view("listed")
     );
+    // Each line, after the one before it; the collection event may sit between them.
+    let in_order = |text: &str, lines: &[&str]| {
+        let mut rest = text;
+        lines.iter().all(|line| match rest.find(line) {
+            Some(at) => {
+                rest = &rest[at + line.len()..];
+                true
+            }
+            None => false,
+        })
+    };
     let once_listed = view("once_listed");
-    let bind = once_listed.find("      __local_26_flag = (n += 1).to_s\n");
-    let each =
-        once_listed.find("      posts.each { |p| Views::Posts.post_into(io, p, notice, alert, \"kept\", __local_26_flag) }\n");
-    assert!(matches!((bind, each), (Some(bind), Some(each)) if bind < each), "{once_listed}");
+    assert!(
+        in_order(
+            &once_listed,
+            &[
+                "      __collection_26 = posts\n",
+                "      __local_26_flag = (n += 1).to_s\n",
+                "      __collection_26.each { |p| Views::Posts.post_into(io, p, notice, alert, \"kept\", __local_26_flag) }\n",
+            ]
+        ),
+        "{once_listed}"
+    );
+    let first_in_order = view("first_in_order");
+    assert!(
+        in_order(
+            &first_in_order,
+            &[
+                "      __record_26 = post\n",
+                "      __local_26_flag = (n += 1).to_s\n",
+                "      __local_26_as = (n *= 10).to_s\n",
+                "      Views::Posts.post_into(io, __record_26, notice, alert, __local_26_as, __local_26_flag)\n",
+            ]
+        ),
+        "{first_in_order}"
+    );
     assert!(
         view("first").contains("      Views::Posts.post_into(io, post, notice, alert, nil, \"one\")\n"),
         "{}",
@@ -257,6 +327,12 @@ got = {{
   "once_articles_empty" => Views::Authors.once_articles_empty(ActiveRecord::Relation.new(Article).where(title: "none")),
   "once_in_order" => Views::Authors.once_in_order(by_title),
   "once_after_collection" => Views::Authors.once_after_collection(author),
+  "reassigned" => Views::Authors.reassigned(by_title),
+  "reassigned_empty" => Views::Authors.reassigned_empty(empty),
+  "first_in_order" => Views::Authors.first_in_order(by_title.first),
+  "article_in_order" => Views::Authors.article_in_order(articles.first),
+  "named_in_order" => Views::Authors.named_in_order(by_title.first),
+  "named_article_in_order" => Views::Authors.named_article_in_order(articles.first),
 }}
 want.each do |action, html|
   raise "#{{action}}: #{{got[action].inspect}}" unless got[action] == html

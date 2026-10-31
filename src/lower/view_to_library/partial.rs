@@ -84,14 +84,26 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // `to_partial_path`: its own name in its PLURAL directory,
         // `messages/_message`. Spelled here exactly as
         // `render_partial_key` spells the graph edge, so the partial's
-        // closure args line up with the call.
-        RenderPartial::Record { name, locals, .. } => {
+        // closure args line up with the call. Its locals are bound
+        // before the call when it would run them out of source order
+        // (`evaluated_out_of_order`).
+        RenderPartial::Record { record, name, locals } => {
             let singular = (*name).to_string();
             let plural_camel = camelize_path(&crate::naming::pluralize_snake(&singular));
             let stem = ctx.partial_stems.stem(&plural_camel, &singular);
-            let mut call_args = vec![var_ref(Symbol::from(crate::naming::safe_local(&singular)))];
+            let mut record_ref = var_ref(Symbol::from(crate::naming::safe_local(&singular)));
+            let mut binds = Vec::new();
+            let bound;
+            let mut locals = *locals;
+            let entries = locals.unwrap_or_default();
+            if evaluated_out_of_order(entries, call_position(&plural_camel, &stem, None, ctx), ctx) {
+                record_ref = bind_if_first(record_ref, "record", record.span, entries, ctx, &mut binds);
+                bound = bind_effectful_locals(entries, record.span, ctx, &mut binds);
+                locals = Some(&bound);
+            }
+            let mut call_args = vec![record_ref];
             call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
-            call_args.extend(locals_extra_args(*locals, &plural_camel, &stem, ctx));
+            call_args.extend(locals_extra_args(locals, &plural_camel, &stem, ctx));
             let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
             let call = send(
                 Some(Expr::new(
@@ -105,7 +117,12 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
                 None,
                 true,
             );
-            Some(accumulator_append_call(call, ctx))
+            let append = accumulator_append_call(call, ctx);
+            if binds.is_empty() {
+                return Some(append);
+            }
+            binds.push(append);
+            Some(seq(binds))
         }
         // `render "form", article: @article` — explicit-name partial.
         // Rewrites to `<accumulator> << Views::<Plural>.<method>(arg)`
@@ -115,10 +132,25 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // names (`"form"`) resolve to the current resource_dir's
         // module. The arg is the first hash entry's value (Rails
         // convention; additional hash entries get dropped today —
-        // matches existing classifier policy).
+        // matches existing classifier policy). Its locals are bound as a
+        // record render's are.
         RenderPartial::Named { partial, arg, locals } => {
-            let call = named_partial_call(partial, *arg, *locals, ctx)?;
-            Some(accumulator_append_call(call, ctx))
+            let entries = locals.unwrap_or_default();
+            let (module, stem) = super::partial_name_to_key(partial, &ctx.resource_dir, &ctx.partial_stems);
+            let record = match ctx.strict_locals.get(&(module.clone(), stem.clone())) {
+                Some(decl) => decl[0].name.as_str().to_string(),
+                None => singularize(&snake_case(last_segment(&module))),
+            };
+            if !evaluated_out_of_order(entries, call_position(&module, &stem, Some(&record), ctx), ctx) {
+                let call = named_partial_call(partial, *arg, *locals, ctx)?;
+                return Some(accumulator_append_call(call, ctx));
+            }
+            // The temps are named after the first local's value, as a
+            // collection's are after the collection.
+            let mut binds = Vec::new();
+            let bound = bind_effectful_locals(entries, entries[0].1.span, ctx, &mut binds);
+            binds.push(accumulator_append_call(named_partial_call(partial, *arg, Some(&bound), ctx)?, ctx));
+            Some(seq(binds))
         }
         // `render layout: "x" do … end` needs MULTIPLE statements (the
         // capture local, then the call), so the walker routes it to
@@ -302,11 +334,12 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
 /// passes the temp, in source order; a local that only reads
 /// (`reads_without_effect`) stays inline, and without any other local
 /// `emit` gets the render as written. The collection, which Ruby
-/// evaluates before the hash, is bound first when it is more than a read;
-/// not when an explicit `locals:` is written before its `collection:`,
-/// which the `each` then evaluates after them, as Ruby does. `site` is
-/// the collection's source span, which names the temps apart from those
-/// of another render in the view.
+/// evaluates before the hash, is bound first then, even when it only
+/// reads, since a local may reassign what it reads (`render posts, flag:
+/// (posts = others)`); not when an explicit `locals:` is written before
+/// its `collection:`, which the `each` then evaluates after them, as Ruby
+/// does. `site` is the collection's source span, which names the temps
+/// apart from those of another render in the view.
 fn bind_locals_once(
     collection: Expr,
     locals: Option<&[(Expr, Expr)]>,
@@ -315,28 +348,48 @@ fn bind_locals_once(
     emit: impl FnOnce(&Expr, Option<&[(Expr, Expr)]>) -> Option<Expr>,
 ) -> Option<Expr> {
     let entries = locals.unwrap_or_default();
-    let Some((_, first)) = entries.iter().find(|(_, v)| !reads_without_effect(v, ctx)) else {
+    if entries.iter().all(|(_, v)| reads_without_effect(v, ctx)) {
         return emit(&collection, locals);
-    };
-    let assign = |name: &Symbol, value: Expr| {
-        Expr::new(
-            value.span,
-            ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value },
-        )
-    };
-    let temp = |name: Symbol, span: Span| Expr { span, ..var_ref(name) };
+    }
     let mut binds = Vec::new();
-    let collection_first =
-        site.is_synthetic() || first.span.is_synthetic() || site.start < first.span.start;
-    let collection = if collection_first && !reads_without_effect(&collection, ctx) {
-        let name = Symbol::from(format!("__collection_{}", site.start));
-        let span = collection.span;
-        binds.push(assign(&name, collection));
-        temp(name, span)
-    } else {
-        collection
-    };
-    let bound: Vec<(Expr, Expr)> = entries
+    let collection = bind_if_first(collection, "collection", site, entries, ctx, &mut binds);
+    let bound = bind_effectful_locals(entries, site, ctx, &mut binds);
+    binds.push(emit(&collection, Some(&bound))?);
+    Some(seq(binds))
+}
+
+/// The render's first argument, bound to `__<kind>_<site>` when it is
+/// written before the first local `bind_effectful_locals` binds, so that
+/// local cannot change what it reads; otherwise as it is.
+fn bind_if_first(
+    subject: Expr,
+    kind: &str,
+    site: Span,
+    entries: &[(Expr, Expr)],
+    ctx: &ViewCtx,
+    binds: &mut Vec<Expr>,
+) -> Expr {
+    let first = entries.iter().find(|(_, v)| !reads_without_effect(v, ctx)).map(|(_, v)| v.span);
+    let written_first = first.is_none_or(|first| site.is_synthetic() || first.is_synthetic() || site.start < first.start);
+    if !written_first {
+        return subject;
+    }
+    let name = Symbol::from(format!("__{kind}_{}", site.start));
+    let span = subject.span;
+    binds.push(bind_temp(&name, subject));
+    Expr { span, ..var_ref(name) }
+}
+
+/// Binds each local that is more than a read (`reads_without_effect`) to
+/// `__local_<site>_<key>`, in source order, and answers the locals with
+/// the temps in their place.
+fn bind_effectful_locals(
+    entries: &[(Expr, Expr)],
+    site: Span,
+    ctx: &ViewCtx,
+    binds: &mut Vec<Expr>,
+) -> Vec<(Expr, Expr)> {
+    entries
         .iter()
         .enumerate()
         .map(|(i, (k, v))| {
@@ -347,12 +400,67 @@ fn bind_locals_once(
                 .filter(|n| n.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()))
                 .unwrap_or_else(|| i.to_string());
             let name = Symbol::from(format!("__local_{}_{key}", site.start));
-            binds.push(assign(&name, v.clone()));
-            (k.clone(), temp(name, v.span))
+            binds.push(bind_temp(&name, v.clone()));
+            (k.clone(), Expr { span: v.span, ..var_ref(name) })
         })
-        .collect();
-    binds.push(emit(&collection, Some(&bound))?);
-    Some(seq(binds))
+        .collect()
+}
+
+fn bind_temp(name: &Symbol, value: Expr) -> Expr {
+    Expr::new(
+        value.span,
+        ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value },
+    )
+}
+
+/// Whether the call a single render emits passes a local that is more
+/// than a read after a local written after it, which then runs, or
+/// reads, before it. The call orders its locals by the partial's
+/// params (`call_position`), and `render @post, z: (n += 1), a: (n +=
+/// 1)` would run `a` first where Ruby runs `z` first. A literal is the
+/// same wherever it is evaluated.
+fn evaluated_out_of_order(
+    entries: &[(Expr, Expr)],
+    position: impl Fn(&str) -> Option<usize>,
+    ctx: &ViewCtx,
+) -> bool {
+    let at = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => position(value.as_str()),
+        _ => None,
+    };
+    entries.iter().enumerate().any(|(i, (k, v))| {
+        !reads_without_effect(v, ctx)
+            && at(k).is_some_and(|p| {
+                entries[i + 1..]
+                    .iter()
+                    .any(|(k, v)| !matches!(&*v.node, ExprNode::Lit { .. }) && at(k).is_some_and(|q| q < p))
+            })
+    })
+}
+
+/// Where the call a single render emits passes each local: the local a
+/// named render takes its record from (`record`) first, then the
+/// partial's extras (`locals_extra_args`), or a strict-locals partial's
+/// keywords in its header's order (`strict_kwargs`). `None` for a local
+/// the call leaves out.
+fn call_position<'a>(
+    module: &str,
+    stem: &str,
+    record: Option<&'a str>,
+    ctx: &'a ViewCtx,
+) -> impl Fn(&str) -> Option<usize> + 'a {
+    let key = (module.to_string(), stem.to_string());
+    let params: Vec<String> = match ctx.strict_locals.get(&key) {
+        Some(decl) => decl[1..].iter().map(|p| p.name.as_str().to_string()).collect(),
+        None => ctx.partial_extras.get(&key).cloned().unwrap_or_default(),
+    };
+    move |name| {
+        if record == Some(name) {
+            Some(0)
+        } else {
+            params.iter().position(|p| p == name).map(|i| i + 1)
+        }
+    }
 }
 
 /// A literal, or a read of a local, an ivar or a constant: evaluating it
