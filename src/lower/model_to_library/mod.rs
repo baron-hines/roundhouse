@@ -1158,8 +1158,9 @@ fn writable_permit_fields(
         .iter()
         .filter(|field| {
             let public_writer = model_defines_public_writer(model, field);
+            let is_column = table.is_some_and(|t| t.columns.iter().any(|c| c.name == **field));
             let private_override =
-                table.is_none() && model_defines_writer(model, field) && !public_writer;
+                !is_column && model_defines_writer(model, field) && !public_writer;
             if (writable.contains(*field) && !private_override) || public_writer {
                 return true;
             }

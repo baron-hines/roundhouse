@@ -24,7 +24,22 @@ fn app() -> emit_and_run::Overlay {
 end
 "#)
         .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
-        .write("app/models/entry.rb", &format!("class Entry < ApplicationRecord\n{ACCESSORS}end\n"))
+        .write("app/models/entry.rb", &format!(r#"class Entry < ApplicationRecord
+{ACCESSORS}
+  PRIVATE_ATTRIBUTES = %i[secret_note]
+  attr_accessor :literal_secret_note, *PRIVATE_ATTRIBUTES
+
+  private
+
+  def secret_note=(value)
+    raise "private splatted writer called"
+  end
+
+  def literal_secret_note=(value)
+    raise "private literal writer called"
+  end
+end
+"#))
         .write("app/models/delivery_form.rb", &format!(r#"class DeliveryForm
   include ActiveModel::Model
   include ActiveModel::Attributes
@@ -50,7 +65,7 @@ end
   private
 
   def entry_params
-    params.expect(entry: %i[title note literal_note writer_note readonly_note])
+    params.expect(entry: %i[title note literal_note writer_note readonly_note secret_note literal_secret_note])
   end
 end
 "#)
@@ -87,13 +102,15 @@ puts "tableless splatted accessor params passed"
 "#;
 
 const SCHEMA_FACTORY: &str = r#"
-params = EntryParams.from_raw({"entry" => {"title" => "Title", "note" => "entry note", "literal_note" => "literal", "writer_note" => "writer", "readonly_note" => "ignored"}})
+params = EntryParams.from_raw({"entry" => {"title" => "Title", "note" => "entry note", "literal_note" => "literal", "writer_note" => "writer", "readonly_note" => "ignored", "secret_note" => "ignored", "literal_secret_note" => "ignored"}})
 entry = Entry.from_params(params)
 raise entry.title.inspect unless entry.title == "Title"
 raise entry.note.inspect unless entry.note == "entry note"
 raise entry.literal_note.inspect unless entry.literal_note == "literal"
 raise entry.writer_note.inspect unless entry.writer_note == "writer"
 raise entry.readonly_note.inspect unless entry.readonly_note == "fixed"
+raise entry.secret_note.inspect unless entry.secret_note.nil?
+raise entry.literal_secret_note.inspect unless entry.literal_secret_note.nil?
 puts "schema splatted accessor params passed"
 "#;
 
@@ -104,8 +121,22 @@ raise entry.note.inspect unless entry.note == "updated note"
 raise entry.literal_note.inspect unless entry.literal_note == "literal"
 raise entry.writer_note.inspect unless entry.writer_note == "writer"
 raise entry.readonly_note.inspect unless entry.readonly_note == "fixed"
+raise entry.secret_note.inspect unless entry.secret_note.nil?
+raise entry.literal_secret_note.inspect unless entry.literal_secret_note.nil?
 raise "title not saved" unless Entry.find(entry.id).title == "Updated"
 puts "schema splatted accessor update passed"
+"#;
+
+const SCHEMA_PARAMS_UPDATE: &str = r#"
+entry = Entry.create!(title: "Initial")
+params = EntryParams.from_raw({"entry" => {"title" => "Updated params", "note" => "updated note", "literal_note" => "literal", "secret_note" => "ignored", "literal_secret_note" => "ignored"}})
+raise "update failed" unless entry.update_from_entry_params(params)
+raise entry.note.inspect unless entry.note == "updated note"
+raise entry.literal_note.inspect unless entry.literal_note == "literal"
+raise entry.secret_note.inspect unless entry.secret_note.nil?
+raise entry.literal_secret_note.inspect unless entry.literal_secret_note.nil?
+raise "title not saved" unless Entry.find(entry.id).title == "Updated params"
+puts "schema params update skips private accessor writers"
 "#;
 
 #[test]
@@ -124,11 +155,16 @@ fn schema_update_assigns_splatted_accessor_and_writer_values() {
 }
 
 #[test]
+fn schema_params_update_skips_private_accessor_writers() {
+    app().run_ruby(SCHEMA_PARAMS_UPDATE).assert_passes();
+}
+
+#[test]
 #[ignore = "requires the Spinel toolchain"]
 fn spinel_gate_splatted_accessor_params() {
     app()
         .run_spinel_with_rbs(&format!(
-            "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{TABLELESS}\n{SCHEMA_FACTORY}\n{SCHEMA_UPDATE}"
+            "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{TABLELESS}\n{SCHEMA_FACTORY}\n{SCHEMA_UPDATE}\n{SCHEMA_PARAMS_UPDATE}"
         ))
         .assert_passes();
 }
