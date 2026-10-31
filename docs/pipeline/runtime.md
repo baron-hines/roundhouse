@@ -1332,7 +1332,7 @@ raising façade on spinel (`runtime/ruby/rqrcode_facade.rb`, the
 write-path rule every gem façade follows) and the real gem on CRuby and
 JRuby. It is now real on spinel too: when an app names `RQRCode`,
 `spin_shape` swaps the façade file for `require "rqrcode"` and declares
-the spinel-rqrcode spin package (github.com/rubys/spinel-rqrcode;
+the spinel-rqrcode spin package (github.com/roundhouse-rb/spinel-rqrcode;
 matz/spin-index#8 is the registration, so the manifest uses the git form
 until it merges), the same seam bcrypt and ruby-vips use.
 
