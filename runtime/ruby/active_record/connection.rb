@@ -240,7 +240,8 @@ module ActiveRecord
     end
 
     def map
-      @rows.map { |row| yield row }
+      mapped = @rows.map { |row| yield row }
+      mapped
     end
   end
 
