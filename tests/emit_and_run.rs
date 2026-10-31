@@ -40,6 +40,8 @@ mod active_model_attributes_form;
 mod association_query_arguments;
 #[path = "emit_and_run/tableless_params.rs"]
 mod tableless_params;
+#[path = "emit_and_run/splatted_accessor_params.rs"]
+mod splatted_accessor_params;
 #[path = "emit_and_run/active_model_superclass.rs"]
 mod active_model_superclass;
 #[path = "emit_and_run/arel_nodes.rs"]

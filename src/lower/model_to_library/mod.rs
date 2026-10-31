@@ -1220,7 +1220,7 @@ fn writable_field_set_for_table(
     table: Option<&crate::schema::Table>,
 ) -> std::collections::BTreeSet<crate::ident::Symbol> {
     use crate::dialect::{Association, ModelBodyItem};
-    use crate::expr::{ExprNode, Literal};
+    use crate::expr::ExprNode;
     use crate::ident::Symbol;
 
     let mut writable: std::collections::BTreeSet<Symbol> = std::collections::BTreeSet::new();
@@ -1232,8 +1232,6 @@ fn writable_field_set_for_table(
             writable.insert(name.clone());
         }
     }
-    // `attr_accessor` / `attr_writer` virtuals (mirrors the scan in
-    // markers::push_attr_accessor_methods).
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
@@ -1242,11 +1240,7 @@ fn writable_field_set_for_table(
         if !matches!(method.as_str(), "attr_accessor" | "attr_writer") {
             continue;
         }
-        for arg in args {
-            if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
-                writable.insert(value.clone());
-            }
-        }
+        writable.extend(self::markers::accessor_names(model, args));
     }
     for (_store, attrs) in crate::lower::typed_store::typed_store_decls(&model.body) {
         for attr in attrs {

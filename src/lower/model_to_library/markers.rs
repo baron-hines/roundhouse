@@ -362,7 +362,7 @@ fn const_symbol_array(model: &Model, path: &[Symbol]) -> Vec<Symbol> {
 /// `ModelBodyItem::Unknown`), so the fold reads the assignment where it
 /// sits. Unexpanded, the class emitted NO accessors at all and every
 /// read of `title` was a NoMethodError.
-fn accessor_names(model: &Model, args: &[Expr]) -> Vec<Symbol> {
+pub(super) fn accessor_names(model: &Model, args: &[Expr]) -> Vec<Symbol> {
     let mut names: Vec<Symbol> = Vec::new();
     for arg in args {
         match &*arg.node {
