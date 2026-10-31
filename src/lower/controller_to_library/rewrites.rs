@@ -3192,7 +3192,6 @@ pub(crate) enum QueryScalar {
 }
 
 pub(crate) fn scalar_in_query_slot(k: &Expr, v: &Expr) -> Option<QueryScalar> {
-    use crate::ty::Ty;
     let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
         return None;
     };
@@ -3200,6 +3199,13 @@ pub(crate) fn scalar_in_query_slot(k: &Expr, v: &Expr) -> Option<QueryScalar> {
     if key == "id" || key.ends_with("_id") || key == "format" {
         return None;
     }
+    scalar_value(v)
+}
+
+/// What a scalar value needs to reach a `String?` query slot: its
+/// `to_s`, or its `to_s` with nil kept. `None` for anything else.
+pub(crate) fn scalar_value(v: &Expr) -> Option<QueryScalar> {
+    use crate::ty::Ty;
     let scalar = |t: &Ty| matches!(t, Ty::Int | Ty::Float | Ty::Bool);
     match v.ty.as_ref()? {
         t if scalar(t) => Some(QueryScalar::Text),

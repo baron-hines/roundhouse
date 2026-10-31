@@ -233,3 +233,58 @@ end
         assert!(body.contains(expected), "{expected}:\n{body}");
     }
 }
+
+/// An `id` / `*_id` query key is Integer by name, but a record whose
+/// model answers a slug `to_param` makes the helper declare it
+/// `String?`. Another call's Integer under that key then has to be text
+/// too, nil kept nil (actionpack 8.1.4: `items_path(widget_id: widget)`
+/// is `/items?widget_id=acme`, `widget_id: 3` is `/items?widget_id=3`,
+/// `widget_id: nil` is `/items`). The key name had kept the Integer as
+/// it was, which Spinel's `--rbs .` refused against `String?`.
+const SLUG_ID_CONTROLLER: &str = "class ItemsController < ApplicationController
+  def index
+    render plain: id_paths(Widget.new(slug: \"acme\"), 3).join(\" \")
+  end
+
+  def id_paths(widget, n)
+    [
+      items_path(widget_id: widget),
+      items_path(widget_id: n > 0 ? n : nil),
+      items_path(widget_id: n > 5 ? n : nil)
+    ]
+  end
+end
+";
+
+const SLUG_ID_ASSERTIONS: &str = r#"
+require_relative "app/controllers/items_controller"
+
+paths = ItemsController.new.id_paths(Widget.new(slug: "acme"), 3)
+raise paths.inspect unless paths == ["/items?widget_id=acme", "/items?widget_id=3", "/items"]
+puts "slug id paths passed"
+"#;
+
+fn slug_id_example() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"slug\"\n  end\nend\n")
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\n  def to_param\n    slug\n  end\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("app/controllers/items_controller.rb", SLUG_ID_CONTROLLER)
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  resources :items, only: :index\nend\n")
+}
+
+#[test]
+fn an_integer_under_a_slug_typed_id_key_runs_in_ruby() {
+    slug_id_example().run_ruby(SLUG_ID_ASSERTIONS).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_integer_under_a_slug_typed_id_key_runs_on_spinel_with_rbs() {
+    slug_id_example()
+        .run_spinel_with_rbs(&format!(
+            "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{SLUG_ID_ASSERTIONS}"
+        ))
+        .assert_passes();
+}
