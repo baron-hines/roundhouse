@@ -311,7 +311,7 @@ pub(crate) fn rewrite_node(
                             .collect(),
                     },
                 )),
-                method: Symbol::from(stem),
+                method: contract.method.clone(),
                 args,
                 block: None,
                 parenthesized: true,

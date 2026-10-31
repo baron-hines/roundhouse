@@ -10,10 +10,49 @@ use crate::span::Span;
 
 use crate::lower::view::RenderPartial;
 
+use super::extra_params::flash_params;
 use super::{
     accumulator_append_call, assign_accumulator_string_new, lit_sym, nil_lit, send, seq,
     var_ref, view_helpers_call, ViewCtx, ViewKind,
 };
+
+/// A collection render whose `each` sets `flag` before each record
+/// renders, so `render(x) || fallback` can tell whether anything
+/// rendered without evaluating the collection a second time. `None`
+/// for the renders of one partial and for the cached collections,
+/// whose records render through several loops, hits from the store.
+pub(super) fn emit_flagged_collection_render(
+    rp: &RenderPartial<'_>,
+    flag: &Symbol,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    match rp {
+        RenderPartial::Collection { .. }
+        | RenderPartial::Association { .. }
+        | RenderPartial::TypedCollection { .. }
+        | RenderPartial::CollectionNamed { cached: false, cached_key: None, .. } => {}
+        _ => return None,
+    }
+    let mut each = emit_render_partial(rp, ctx)?;
+    let ExprNode::Send { method, block: Some(block), .. } = &mut *each.node else {
+        return None;
+    };
+    if method.as_str() != "each" {
+        return None;
+    }
+    let ExprNode::Lambda { body, .. } = &mut *block.node else {
+        return None;
+    };
+    let set = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var { id: VarId(0), name: flag.clone() },
+            value: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } }),
+        },
+    );
+    *body = seq(vec![set, body.clone()]);
+    Some(each)
+}
 
 pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Option<Expr> {
     match rp {
@@ -37,10 +76,11 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         RenderPartial::Record { name, .. } => {
             let singular = (*name).to_string();
             let plural_camel = camelize_path(&crate::naming::pluralize_snake(&singular));
+            let stem = ctx.partial_stems.stem(&plural_camel, &singular);
             let mut call_args = vec![var_ref(Symbol::from(crate::naming::safe_local(&singular)))];
-            call_args.extend(partial_extra_args(ctx, &plural_camel, &singular));
-            call_args.extend(locals_extra_args(None, &plural_camel, &singular, ctx));
-            let method = ctx.render_method(ViewKind::Partial, &plural_camel, &singular);
+            call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
+            call_args.extend(locals_extra_args(None, &plural_camel, &stem, ctx));
+            let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
             let call = send(
                 Some(Expr::new(
                     Span::synthetic(),
@@ -89,6 +129,13 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
             );
             Some(emit_partial_each(&assoc_recv, method, ctx))
         }
+        // `render @author.posts.order(:title)` — the chain itself is the
+        // each receiver, and the element class's partial renders each
+        // record, exactly as `render partial: "posts/post", collection:
+        // <chain>` does.
+        RenderPartial::TypedCollection { collection, partial } => {
+            emit_named_collection_each(collection, partial, None, None, ctx)
+        }
         // `render partial: "stories/listdetail", collection: stories, as:
         // :story` — iterate `collection`, calling the explicitly-named
         // partial once per element with the element bound to the `as:`
@@ -120,7 +167,7 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // value). Empty pool → None (leaves the original render unresolved).
         RenderPartial::Template { name } => {
             let (module_camel, method_sym) =
-                super::partial_name_to_key(name, &ctx.resource_dir);
+                super::template_name_to_key(name, &ctx.resource_dir);
             if module_camel.is_empty() {
                 return None;
             }
@@ -162,7 +209,7 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
             for entry in &entries {
                 let pname = &entry.name;
                 let (module_camel, method_sym) =
-                    super::partial_name_to_key(pname, &ctx.resource_dir);
+                    super::partial_name_to_key(pname, &ctx.resource_dir, &ctx.partial_stems);
                 if module_camel.is_empty() {
                     continue;
                 }
@@ -344,7 +391,7 @@ fn named_collection_item_render(
         return None;
     }
     let module_camel = camelize_path(&snake_case(&module_dir));
-    let method_sym = base_name.trim_start_matches('_').to_string();
+    let method_sym = ctx.partial_stems.stem(&module_camel, &base_name);
     let var_name = Symbol::from(crate::naming::safe_local(
         &as_name
             .map(|s| s.to_string())
@@ -490,7 +537,8 @@ fn wrap_keyed_cached_collection(
     // variant the render resolves to names it, as the block's view
     // does (`fragment_template_path`): html and turbo_stream renders of
     // one collection would otherwise serve each other's markup.
-    let (module, stem) = super::partial_name_to_key(partial, &ctx.resource_dir);
+    let (module, stem) =
+        super::partial_name_to_key(partial, &ctx.resource_dir, &ctx.partial_stems);
     let format = ctx.render_format(ViewKind::Partial, &module, &stem);
     let template = crate::lower::view::fragment_template_path(
         &match partial.rsplit_once('/') {
@@ -714,7 +762,7 @@ fn wrap_cached_true_collection(
         return emit_named_collection_each(collection, partial, as_name, locals, ctx);
     }
     let module_camel = camelize_path(&snake_case(&module_dir));
-    let method_sym = base_name.trim_start_matches('_').to_string();
+    let method_sym = ctx.partial_stems.stem(&module_camel, &base_name);
     let mut named_inputs: Vec<(String, Expr)> = Vec::new();
     if let Some(entries) = locals {
         for (k, v) in entries {
@@ -852,12 +900,13 @@ const MAX_UNCACHED_COLLECTION_LENGTH: i64 = super::MAX_UNCACHED_COLLECTION_LENGT
 fn emit_partial_each(recv: &Expr, plural_name: &str, ctx: &ViewCtx) -> Expr {
     let singular = singularize(plural_name);
     let plural_camel = camelize_path(&snake_case(plural_name));
+    let stem = ctx.partial_stems.stem(&plural_camel, &singular);
     let var_name = Symbol::from(singular.chars().next().unwrap_or('x').to_string());
 
     let mut call_args = vec![var_ref(var_name.clone())];
-    call_args.extend(partial_extra_args(ctx, &plural_camel, &singular));
-    call_args.extend(locals_extra_args(None, &plural_camel, &singular, ctx));
-    let method = ctx.render_method(ViewKind::Partial, &plural_camel, &singular);
+    call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
+    call_args.extend(locals_extra_args(None, &plural_camel, &stem, ctx));
+    let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
     let render_call = send(
         Some(Expr::new(
             Span::synthetic(),
@@ -951,7 +1000,7 @@ pub(super) fn named_partial_call_with_record(
                 return None;
             }
             let module_camel = camelize_path(&snake_case(&module_dir));
-            let method_sym = base_name.trim_start_matches('_').to_string();
+            let method_sym = ctx.partial_stems.stem(&module_camel, &base_name);
 
             // An explicit `locals:` hash binds by NAME: the entry matching
             // the partial's record-arg convention (singular of its dir)
@@ -1089,7 +1138,8 @@ pub(super) fn emit_layout_block(
 }
 
 /// The trailing extra-param arguments an explicit `locals:` hash binds,
-/// in the partial's declared extra order.
+/// and the caller's flash for the flash slots it leaves out, in the
+/// partial's declared extra order.
 ///
 /// A partial's non-record params are positional with nil defaults, so a
 /// provided local has to land at its declared index; only the tail up to
@@ -1112,6 +1162,18 @@ fn locals_extra_args(
     else {
         return Vec::new();
     };
+    // Rails renders a partial in its caller's view context, so a bare
+    // `notice` in `shared/_flash` reads the same flash the layout does.
+    // Here the flash is a param of every template, so the caller passes
+    // its own (`ViewCtx::own_flash`): the layout's `notice`, or its
+    // `notice_` when an `@notice` ivar took the plain name
+    // (`flash_locals`). Without it every partial got nil. A partial
+    // caller whose `notice` may be a local (a render hands it `notice:`,
+    // or its strict locals declare it) passes nil: Rails does not hand
+    // a partial's locals on, and no other flash is in reach here. So
+    // does a render under a block param or after an assignment that
+    // rebinds `notice` (`ViewCtx::shadow_flash`).
+    let flash = flash_params(extras);
     let bound: Vec<Option<Expr>> = extras
         .iter()
         .map(|name| {
@@ -1129,6 +1191,11 @@ fn locals_extra_args(
                         && matches!(name.as_str(), "action_name" | "controller_name" | "path_parameters")
                         && ctx.locals.iter().any(|l| l == name))
                     .then(|| var_ref(Symbol::from(name.as_str())))
+                })
+                // A strict-locals partial takes no flash (`flash_locals`).
+                .or_else(|| {
+                    let slot = flash.iter().position(|f| *f == Some(name.as_str())).filter(|_| !strict)?;
+                    ctx.own_flash[slot].as_deref().map(|n| var_ref(Symbol::from(n)))
                 })
         })
         .collect();

@@ -135,6 +135,12 @@ pub enum RenderPartial<'a> {
     /// `render @post.comments` — iterate an association method on
     /// a receiver Var/Ivar, calling a partial per element.
     Association { receiver: &'a Expr, method: &'a str },
+    /// `render @author.posts.order(:title)` — any other call the
+    /// analyzer typed as a collection of a class. No name in the
+    /// expression says which partial it renders (`order` is not a
+    /// model), so `partial` is the element class's `to_partial_path`
+    /// (`posts/post`), as Rails picks it per record.
+    TypedCollection { collection: &'a Expr, partial: String },
     /// `render "posts/post", post: @post` — call a named partial
     /// with the first hash entry's value as its argument. When the
     /// kwarg form carries an explicit `locals:` hash (`render partial:
@@ -305,6 +311,23 @@ pub fn classify_render_partial<'a>(
             // Explicit kwarg form: `render partial: "x/y", collection: c,
             // as: :item` / `render partial: "x/y", item: rec`.
             ExprNode::Hash { entries, .. } => classify_render_kwargs(entries),
+            // `render @author.posts.order(:title)`, `render
+            // @author.posts.published.limit(2)` — a chain longer than the
+            // one hop `Association` reads, or a call with arguments. Left
+            // unclassified, the bare `render` reached the emit and called
+            // a method no view module has. Only the analyzed type knows
+            // the records' class here.
+            ExprNode::Send { .. } => {
+                let Some(crate::ty::Ty::Class { id, .. }) =
+                    arg.ty.as_ref().and_then(|ty| ty.collection_elem())
+                else {
+                    return None;
+                };
+                Some(RenderPartial::TypedCollection {
+                    collection: arg,
+                    partial: model_partial_path(id.0.as_str()),
+                })
+            }
             _ => None,
         },
         [a, b] => {
@@ -331,6 +354,17 @@ pub fn classify_render_partial<'a>(
         }
         _ => None,
     }
+}
+
+/// A model's `to_partial_path`: its `model_name.collection` and its
+/// element, `Post` → `posts/post`, `Admin::Post` → `admin/posts/post`.
+fn model_partial_path(class_name: &str) -> String {
+    let segs: Vec<&str> = class_name.split("::").collect();
+    let (last, ns) = segs.split_last().expect("a class name");
+    let mut parts: Vec<String> = ns.iter().map(|s| crate::naming::snake_case(s)).collect();
+    parts.push(crate::naming::pluralize_snake(last));
+    parts.push(crate::naming::snake_case(last));
+    parts.join("/")
 }
 
 /// The formats a `render partial: "x", formats: [:xml, :html]` names, in
