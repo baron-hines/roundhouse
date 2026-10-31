@@ -539,7 +539,11 @@ fn untyped_subexpressions_baseline() {
     // `structurally_incompatible_with` reads the other relation's parts
     // (+10), `and!` its HAVINGs and the check (+6), and `structural_values`
     // its own list (+1). relation.rbs types them for the RBS-paired gate.
-    const CEILING: usize = 1209;
+    // MEASURED 1210 on 2026-10-31 (on 1209): the ruby-family Base#slice
+    // parses a temporal column's stored text into the Time its reader
+    // answers, reading the untyped `[]` value a second time (+1 in
+    // active_record/connection.rb), as `_as_json_only` does.
+    const CEILING: usize = 1210;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
