@@ -49,6 +49,12 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
   create_table "spindles", force: :cascade do |t|
     t.string "name"
   end
+  create_table "cams", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "pawls", force: :cascade do |t|
+    t.string "name"
+  end
 end
 "#;
 
@@ -76,6 +82,8 @@ const ROUTES: &str = r#"Rails.application.routes.draw do
   get "widgets/:id/ratchet_cache", to: "widgets#ratchet_cache", defaults: { format: :json }
   get "widgets/:id/lever_cache", to: "widgets#lever_cache", defaults: { format: :json }
   get "widgets/:id/spindle_cache", to: "widgets#spindle_cache", defaults: { format: :json }
+  get "widgets/:id/cam_cache", to: "widgets#cam_cache", defaults: { format: :json }
+  get "widgets/:id/pawl_cache", to: "widgets#pawl_cache", defaults: { format: :json }
   namespace :admin do
     get "widgets/:id", to: "widgets#show", defaults: { format: :json }
   end
@@ -198,6 +206,16 @@ const CONTROLLER: &str = r#"class WidgetsController < ApplicationController
     @spindle = Spindle.find(params[:id])
     render :spindle_cache
   end
+
+  def cam_cache
+    @cam = Cam.find(params[:id])
+    render :cam_cache
+  end
+
+  def pawl_cache
+    @pawl = Pawl.find(params[:id])
+    render :pawl_cache
+  end
 end
 "#;
 
@@ -265,8 +283,9 @@ const COG_CACHE: &str = "json.partial!(@cog, as: :cog, cache: true)\n";
 const COG_PARTIAL: &str = "json.id cog.id\njson.fresh self.binding.local_variable_get(:cache)\n";
 
 /// The same read reached through dynamic dispatch: `send(:binding)`,
-/// `self.public_send(:binding)`, `method(:binding).call`, and a `send`
-/// whose method name is only known at run time.
+/// `self.public_send(:binding)`, `method(:binding).call`, a block
+/// argument `&method(:binding)`, and a `send` or `method` whose method
+/// name is only known at run time.
 const PINION_CACHE: &str = "json.partial!(@pinion, as: :pinion, cache: true)\n";
 const PINION_PARTIAL: &str =
     "json.id pinion.id\njson.fresh send(:binding).local_variable_get(:cache)\n";
@@ -279,6 +298,12 @@ const LEVER_PARTIAL: &str =
 const SPINDLE_CACHE: &str = "json.partial!(@spindle, as: :spindle, cache: true)\n";
 const SPINDLE_PARTIAL: &str =
     "json.id spindle.id\njson.fresh __send__(@reader).local_variable_get(:cache)\n";
+const CAM_CACHE: &str = "json.partial!(@cam, as: :cam, cache: true)\n";
+const CAM_PARTIAL: &str =
+    "json.id cam.id\njson.fresh proc(&method(:binding)).call.local_variable_get(:cache)\n";
+const PAWL_CACHE: &str = "json.partial!(@pawl, as: :pawl, cache: true)\n";
+const PAWL_PARTIAL: &str =
+    "json.id pawl.id\njson.fresh method(@reader).call.local_variable_get(:cache)\n";
 
 /// `layout:` is an Action View render option, not a local: Rails looks
 /// for `widgets/_frame` and raises when it is missing.
@@ -329,6 +354,8 @@ fn emitted() -> Vec<(String, String)> {
         ("app/models/ratchet.rb", "class Ratchet < ApplicationRecord\nend\n"),
         ("app/models/lever.rb", "class Lever < ApplicationRecord\nend\n"),
         ("app/models/spindle.rb", "class Spindle < ApplicationRecord\nend\n"),
+        ("app/models/cam.rb", "class Cam < ApplicationRecord\nend\n"),
+        ("app/models/pawl.rb", "class Pawl < ApplicationRecord\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         ("app/controllers/widgets_controller.rb", CONTROLLER),
         ("app/views/widgets/_widget.json.jbuilder", PARTIAL),
@@ -365,6 +392,10 @@ fn emitted() -> Vec<(String, String)> {
         ("app/views/levers/_lever.json.jbuilder", LEVER_PARTIAL),
         ("app/views/widgets/spindle_cache.json.jbuilder", SPINDLE_CACHE),
         ("app/views/spindles/_spindle.json.jbuilder", SPINDLE_PARTIAL),
+        ("app/views/widgets/cam_cache.json.jbuilder", CAM_CACHE),
+        ("app/views/cams/_cam.json.jbuilder", CAM_PARTIAL),
+        ("app/views/widgets/pawl_cache.json.jbuilder", PAWL_CACHE),
+        ("app/views/pawls/_pawl.json.jbuilder", PAWL_PARTIAL),
         ("app/controllers/admin/widgets_controller.rb", ADMIN_CONTROLLER),
         ("app/views/admin/widgets/show.json.jbuilder", ADMIN_SHOW),
         ("app/views/admin/widgets/_widget.json.jbuilder", ADMIN_PARTIAL),
@@ -529,9 +560,10 @@ fn a_record_whose_partial_reads_locals_through_binding_is_refused() {
     }
 }
 
-/// The same read through `send`, `public_send`, `method` and a
-/// `__send__` of a name only known at run time: each may reach
-/// `binding`, so each call is refused as `sprocket_cache` is.
+/// The same read through `send`, `public_send`, `method`, a block
+/// argument `&method(:binding)`, and a `__send__` or `method` of a name
+/// only known at run time: each may reach `binding`, so each call is
+/// refused as `sprocket_cache` is.
 #[test]
 fn a_record_whose_partial_reads_locals_through_dispatch_is_refused() {
     roundhouse::ingest::survey::activate();
@@ -542,6 +574,8 @@ fn a_record_whose_partial_reads_locals_through_dispatch_is_refused() {
         ("ratchet_cache", "ratchets/ratchet", "Views::Ratchets."),
         ("lever_cache", "levers/lever", "Views::Levers."),
         ("spindle_cache", "spindles/spindle", "Views::Spindles."),
+        ("cam_cache", "cams/cam", "Views::Cams."),
+        ("pawl_cache", "pawls/pawl", "Views::Pawls."),
     ] {
         let src = view(&files, &format!("widgets/{template}_json.rb"));
         assert!(

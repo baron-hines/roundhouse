@@ -3367,9 +3367,10 @@ fn collect_local_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
 /// shadow the method, at any of them. A `READS_ANY_LOCAL` name called
 /// on `self` (`self.binding`) counts too: it reads the same locals.
 /// So does one reached by dispatch, with no receiver or on `self`:
-/// `send(:binding)`, `public_send`/`__send__` alike, `method(:binding)`,
-/// and a `send` of a name that is not a literal, which may be any of
-/// them.
+/// `send(:binding)`, `public_send`/`__send__` alike, `method(:binding)`
+/// (a Send, or a `MethodRef` as a block argument `&method(:binding)`),
+/// and a `send` or `method` of a name that is not a literal, which may
+/// be any of them.
 fn collect_mentioned_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
     match &*e.node {
         ExprNode::Var { name, .. } | ExprNode::Send { recv: None, method: name, .. } => {
@@ -3379,6 +3380,12 @@ fn collect_mentioned_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
             if matches!(&*recv.node, ExprNode::SelfRef) && READS_ANY_LOCAL.contains(&method.as_str()) =>
         {
             out.insert(method.clone());
+        }
+        ExprNode::MethodRef { recv, name }
+            if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && READS_ANY_LOCAL.contains(&name.as_str()) =>
+        {
+            out.insert(name.clone());
         }
         _ => {}
     }
@@ -3390,11 +3397,10 @@ fn collect_mentioned_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
                 Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.as_str()),
                 Some(ExprNode::Lit { value: Literal::Str { value } }) => Some(value.as_str()),
                 Some(ExprNode::Lit { .. }) => None,
-                _ if dispatch => {
+                _ => {
                     out.extend(READS_ANY_LOCAL.iter().map(|n| Symbol::from(*n)));
                     None
                 }
-                _ => None,
             };
             if let Some(name) = name.filter(|n| READS_ANY_LOCAL.contains(n)) {
                 out.insert(Symbol::from(name));
