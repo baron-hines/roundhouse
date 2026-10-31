@@ -108,6 +108,7 @@ pub fn lower_jbuilder_to_library_classes(
     extras: Vec<(ClassId, crate::analyze::ClassInfo)>,
 ) -> Vec<LibraryClass> {
     let partials = std::rc::Rc::new(partial_params(app));
+    let direct_helpers = crate::lower::routes::direct_helper_names(app);
     let mut lcs: Vec<LibraryClass> = views
         .iter()
         .filter(|v| v.jbuilder && !v.analysis_only)
@@ -187,7 +188,7 @@ pub fn lower_jbuilder_to_library_classes(
             // the follow-up type when the projection is a no-op — the
             // cloning entry re-walked every jbuilder body twice.
             if crate::lower::controller_to_library::rewrites::
-                project_route_helper_ids_in_place(&mut method.body)
+                project_route_helper_ids_in_place(&mut method.body, &direct_helpers)
             {
                 crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
             }
