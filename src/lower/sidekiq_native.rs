@@ -84,6 +84,9 @@ pub struct NativePlan {
     pub params: Vec<NativeParam>,
     /// Set when the worker can't be pushed: why. `params` is then empty.
     pub fallback: Option<String>,
+    /// The call site the fallback is about, when one is: where its error is filed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_site: Option<Span>,
 }
 
 impl NativePlan {
@@ -740,8 +743,12 @@ fn lead_names(own: &[crate::dialect::Param]) -> Vec<String> {
 
 // ---- Planning ---------------------------------------------------------
 
-/// One call site's argument types after the lead: `None` for unknown.
-type Site = Vec<Option<Ty>>;
+/// One call site: where it is, and its argument types after the lead
+/// (`None` for unknown).
+struct Site {
+    span: Span,
+    args: Vec<Option<Ty>>,
+}
 
 fn collect_sites(
     e: &Expr,
@@ -757,7 +764,7 @@ fn collect_sites(
         if workers.contains(&name) {
             match method.as_str() {
                 "perform_async_with" => {
-                    let site = args.iter().skip(LEAD).map(|a| a.ty.clone()).collect();
+                    let site = Site { span: e.span, args: args.iter().skip(LEAD).map(|a| a.ty.clone()).collect() };
                     out.entry(name).or_default().push(site);
                 }
                 // Left standing by the fold: a splat, whose types aren't known.
@@ -818,17 +825,17 @@ pub fn plan_workers(
             c.methods.iter().filter(|m| m.name.as_str() != "perform_async_with").any(|m| self_enqueues(&m.body))
         });
         let planned = if self_called {
-            Err("an enqueue in the worker's own methods doesn't name its class, so its argument types are unknown".to_string())
+            Err(("an enqueue in the worker's own methods doesn't name its class, so its argument types are unknown".to_string(), None))
         } else if unfolded.contains(name) {
-            Err("an enqueue splats its arguments, so their types are unknown".to_string())
+            Err(("an enqueue splats its arguments, so their types are unknown".to_string(), None))
         } else {
             plan_params(&perform.params, sites.get(name).map(Vec::as_slice).unwrap_or(&[]))
         };
-        let (params, fallback) = match planned {
-            Ok(p) => (p, None),
-            Err(reason) => (Vec::new(), Some(reason)),
+        let (params, fallback, fallback_site) = match planned {
+            Ok(p) => (p, None, None),
+            Err((reason, site)) => (Vec::new(), Some(reason), site),
         };
-        plans.push(NativePlan { worker: name.clone(), retry, queue, extra, params, fallback });
+        plans.push(NativePlan { worker: name.clone(), retry, queue, extra, params, fallback, fallback_site });
     }
     plans
 }
@@ -837,39 +844,46 @@ pub fn plan_workers(
 /// keeping its Proc is a ledger line, not an error.
 const NO_SITES: &str = "no call site enqueues it, so its argument types are unknown";
 
-fn plan_params(params: &[crate::dialect::Param], sites: &[Site]) -> Result<Vec<NativeParam>, String> {
+/// The codecs for `perform`'s parameters, or why there are none and the
+/// call site that shows it, when one does.
+fn plan_params(params: &[crate::dialect::Param], sites: &[Site]) -> Result<Vec<NativeParam>, (String, Option<Span>)> {
     if params.iter().any(|p| p.rest || p.keyword || p.forwarding) {
-        return Err("perform takes a rest, keyword or forwarding parameter".to_string());
+        return Err(("perform takes a rest, keyword or forwarding parameter".to_string(), None));
     }
     if sites.is_empty() && !params.is_empty() {
-        return Err(NO_SITES.to_string());
+        return Err((NO_SITES.to_string(), None));
     }
     let required = params.iter().filter(|p| p.default.is_none()).count();
     for site in sites {
-        if site.len() < required {
-            return Err(format!("a call site passes {} arguments; perform needs {required}", site.len()));
+        let n = site.args.len();
+        if n < required {
+            return Err((format!("a call site passes {n} arguments; perform needs {required}"), Some(site.span)));
         }
-        if site.len() > params.len() {
-            return Err(format!("a call site passes {} arguments; perform takes {}", site.len(), params.len()));
+        if n > params.len() {
+            return Err((format!("a call site passes {n} arguments; perform takes {}", params.len()), Some(site.span)));
         }
     }
     let mut out = Vec::new();
     for (i, p) in params.iter().enumerate() {
         let mut codec: Option<NativeCodec> = None;
         for site in sites {
-            let Some(slot) = site.get(i) else { continue };
+            let Some(slot) = site.args.get(i) else { continue };
+            let at = Some(site.span);
             let Some(ty) = slot else {
-                return Err(format!("`{}`: an argument's type is unknown", p.name.as_str()));
+                return Err((format!("`{}`: an argument's type is unknown", p.name.as_str()), at));
             };
             let c = codec_of(ty).map_err(|what| {
-                format!(
-                    "`{}` is {what}; Sidekiq arguments must be native JSON (a String, Integer, Float, true, false, nil, Array, or Hash with String keys)",
-                    p.name.as_str()
+                (
+                    format!(
+                        "`{}` is {what}; Sidekiq arguments must be native JSON (a String, Integer, Float, true, false, nil, Array, or Hash with String keys)",
+                        p.name.as_str()
+                    ),
+                    at,
                 )
             })?;
             codec = Some(match codec {
                 None => c,
-                Some(prev) => join(prev, c).ok_or_else(|| format!("`{}`: call sites disagree on its type", p.name.as_str()))?,
+                Some(prev) => join(prev, c).ok_or_else(|| (format!("`{}`: call sites disagree on its type", p.name.as_str()), at))?,
             });
         }
         // A position some site passes, with a default: the default's type
@@ -879,11 +893,13 @@ fn plan_params(params: &[crate::dialect::Param], sites: &[Site]) -> Result<Vec<N
         if let (Some(c), Some(default)) = (codec.clone(), p.default.as_ref())
             && let Ok(d) = default_codec(default)
         {
-            codec = Some(join(c, d).ok_or_else(|| format!("`{}`: its default and its call sites disagree on its type", p.name.as_str()))?);
+            codec = Some(join(c, d).ok_or_else(|| {
+                (format!("`{}`: its default and its call sites disagree on its type", p.name.as_str()), None)
+            })?);
         }
         let codec = codec.unwrap_or(NativeCodec::Omitted);
         if contains_unknown(&codec) {
-            return Err(format!("`{}`: the type of an empty Array's or Hash's elements is unknown", p.name.as_str()));
+            return Err((format!("`{}`: the type of an empty Array's or Hash's elements is unknown", p.name.as_str()), None));
         }
         out.push(NativeParam { name: p.name.clone(), codec });
     }
@@ -916,15 +932,42 @@ fn codec_of(ty: &Ty) -> Result<NativeCodec, String> {
                 let c = codec_of(v)?;
                 acc = Some(match acc {
                     None => c,
-                    Some(prev) => join(prev, c).ok_or_else(|| "a value of several types".to_string())?,
+                    Some(prev) => join(prev, c).ok_or_else(|| {
+                        let names: Vec<String> = variants.iter().map(type_name).collect();
+                        format!("a value of several types ({})", names.join(" or "))
+                    })?,
                 });
             }
             acc.ok_or_else(|| "of no type".to_string())?
         }
         Ty::Untyped => return Err("of unknown type".to_string()),
         Ty::Class { id, .. } => return Err(format!("a {}", id.0.as_str())),
-        _ => return Err("not a JSON type".to_string()),
+        other => return Err(type_name(other)),
     })
+}
+
+/// A type as the diagnostics name it.
+fn type_name(ty: &Ty) -> String {
+    match ty {
+        Ty::Int => "an Integer".to_string(),
+        Ty::Float => "a Float".to_string(),
+        Ty::Str => "a String".to_string(),
+        Ty::Bool => "a Boolean".to_string(),
+        Ty::Nil => "nil".to_string(),
+        Ty::Sym => "a Symbol".to_string(),
+        Ty::Time | Ty::Date => "a Time".to_string(),
+        Ty::Array { .. } => "an Array".to_string(),
+        Ty::Hash { .. } => "a Hash".to_string(),
+        Ty::Relation { of } => format!("a relation of {}", of.0.as_str()),
+        Ty::Record { .. } => "a record row".to_string(),
+        Ty::Tuple { .. } => "a tuple".to_string(),
+        Ty::Class { id, .. } => format!("a {}", id.0.as_str()),
+        Ty::Var { .. } => "of a type not inferred".to_string(),
+        Ty::Untyped => "of unknown type".to_string(),
+        Ty::Fn { .. } => "a block".to_string(),
+        Ty::Union { .. } => "a union".to_string(),
+        _ => "not a JSON type".to_string(),
+    }
 }
 
 /// A default's codec: from its type when the analyzer gave one, else from
@@ -1025,10 +1068,12 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                         "sidekiq_native: `{}`: {reason}; under queue_adapter :sidekiq the job must be pushed to Redis in Sidekiq's envelope",
                         plan.worker
                     );
+                    // At the call site that shows it, when one does.
+                    let span = plan.fallback_site.unwrap_or(m.name_span);
                     let d = if reason == NO_SITES {
-                        warning(m.name_span, "job-closure-fallback", "argument not serializable", message)
+                        warning(span, "job-closure-fallback", "argument not serializable", message)
                     } else {
-                        error(m.name_span, "job-closure-fallback", "argument not serializable", message)
+                        error(span, "job-closure-fallback", "argument not serializable", message)
                     };
                     crate::emit::diagnostics::push(d);
                 }
