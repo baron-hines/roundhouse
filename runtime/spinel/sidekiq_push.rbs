@@ -24,6 +24,7 @@ module SidekiqPush
   end
 
   def self.enqueue_native: (String job_class, String retry_json, String queue, String extra, Float at, bool class_side, String args_json) -> nil
+  def self.native_value: (String | Integer | Float | bool | nil value) -> String
   def self.bulk_begin: (Integer limit) -> nil
   def self.bulk_end: () -> nil
   def self.bulk_limit: () -> Array[Integer]

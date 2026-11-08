@@ -140,6 +140,26 @@ module SidekiqPush
     nil
   end
 
+  # A native job's argument whose JSON kind is known only now: a call
+  # site passes a String here and a Boolean there, or a Hash's values
+  # are of different kinds. Written as Sidekiq's `JSON.generate` writes
+  # each kind.
+  def self.native_value(value)
+    if value.nil?
+      "null"
+    elsif value == true
+      "true"
+    elsif value == false
+      "false"
+    elsif value.is_a?(Integer)
+      value.to_s
+    elsif value.is_a?(Float)
+      ActiveJob::Arguments.float(value)
+    else
+      ActiveJob::Arguments.str(value.to_s)
+    end
+  end
+
   # One native job of a bulk push, held until its batch is full.
   class HeldNative
     def initialize(job_class, retry_json, queue, extra, args_json)

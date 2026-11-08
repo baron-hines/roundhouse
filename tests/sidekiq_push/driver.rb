@@ -213,5 +213,13 @@ SidekiqPush.start_recording
 SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, false, "[4]")
 check("after bulk_end: pushed at once", SidekiqPush.recorded.length == 2, SidekiqPush.recorded.length.to_s)
 
+# A native argument of mixed JSON kinds, as JSON.generate writes each.
+mixed = { "s" => "a\"b", "i" => 2, "f" => 1.5, "t" => true, "u" => false, "n" => nil }
+check("native_value: a String-keyed Hash of mixed scalars",
+  "{" + mixed.map { |k, v| ActiveJob::Arguments.str(k) + ":" + SidekiqPush.native_value(v) }.join(",") + "}" ==
+    "{\"s\":\"a\\\"b\",\"i\":2,\"f\":1.5,\"t\":true,\"u\":false,\"n\":null}", "mixed")
+check("native_value: a String", SidekiqPush.native_value("x") == "\"x\"", SidekiqPush.native_value("x"))
+check("native_value: true", SidekiqPush.native_value(true) == "true", SidekiqPush.native_value(true))
+
 SidekiqPush.stop_recording
 puts "done"

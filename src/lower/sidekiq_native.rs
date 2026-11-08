@@ -57,6 +57,11 @@ pub enum NativeCodec {
     Array(Box<NativeCodec>),
     /// A Hash with String keys.
     Hash(Box<NativeCodec>),
+    /// Any JSON scalar, its kind known only when it is written: a
+    /// String, Integer, Float, true, false or nil. Call sites that pass
+    /// different scalars here, or a Hash whose values are different
+    /// scalars, as Sidekiq accepts.
+    Scalar,
     /// No call site passes this (optional) parameter, so it is never
     /// written: the argument list stops before it. Inside an Array or a
     /// Hash while planning, an element type still unknown (an empty
@@ -345,14 +350,92 @@ pub fn fold_sites(
     async_workers: &BTreeSet<String>,
     delay_workers: &BTreeSet<String>,
     folds: &mut NativeFolds,
+    models: &NativeModels,
 ) {
+    let mut env = Vec::new();
+    fold_in(e, async_workers, delay_workers, folds, models, &mut env);
+}
+
+/// Each model's column types, for typing a bulk push's item.
+#[derive(Default)]
+pub struct NativeModels {
+    columns: BTreeMap<String, BTreeMap<String, Ty>>,
+}
+
+pub fn native_models(app: &App) -> NativeModels {
+    let mut columns = BTreeMap::new();
+    for m in &app.models {
+        let mut cols: BTreeMap<String, Ty> =
+            m.attributes.fields.iter().map(|(k, v)| (k.as_str().to_string(), v.clone())).collect();
+        cols.entry("id".to_string()).or_insert(Ty::Int);
+        columns.insert(m.name.0.as_str().to_string(), cols);
+    }
+    NativeModels { columns }
+}
+
+/// The methods that keep a query's or a list's model: the chain from
+/// `Status.where(…)` or `account.follow_requests` through to a batch.
+const MODEL_CHAIN: &[&str] = &[
+    "where", "not", "or", "order", "reorder", "preload", "includes", "eager_load", "joins", "left_joins", "limit",
+    "offset", "all", "unscoped", "select", "filter", "reject", "to_a", "distinct", "merge", "sort_by", "uniq", "compact",
+];
+
+/// The model whose records `list` holds: from its type (an Array of a
+/// model's records, or a relation), a local bound to one, a
+/// `find_in_batches` batch, or a query chain on a model class.
+fn list_model(list: &Expr, models: &NativeModels, env: &[(Symbol, String)]) -> Option<String> {
+    let known = |id: &str| models.columns.contains_key(id).then(|| id.to_string());
+    match &list.ty {
+        Some(Ty::Array { elem }) => {
+            if let Ty::Class { id, .. } = &**elem
+                && let Some(m) = known(id.0.as_str())
+            {
+                return Some(m);
+            }
+        }
+        Some(Ty::Relation { of }) => {
+            if let Some(m) = known(of.0.as_str()) {
+                return Some(m);
+            }
+        }
+        _ => {}
+    }
+    match &*list.node {
+        ExprNode::Var { name, .. } => env.iter().rev().find(|(n, _)| n == name).map(|(_, m)| m.clone()),
+        ExprNode::Const { path } => {
+            let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            known(name.trim_start_matches("::"))
+        }
+        ExprNode::Send { recv: Some(r), method, .. } if MODEL_CHAIN.contains(&method.as_str()) => list_model(r, models, env),
+        _ => None,
+    }
+}
+
+fn fold_in(
+    e: &mut Expr,
+    async_workers: &BTreeSet<String>,
+    delay_workers: &BTreeSet<String>,
+    folds: &mut NativeFolds,
+    models: &NativeModels,
+    env: &mut Vec<(Symbol, String)>,
+) {
+    let mark = env.len();
+    // `<list>.find_in_batches do |batch|`: the batch holds the list's records.
+    if let ExprNode::Send { recv: Some(r), method, block: Some(b), .. } = &*e.node
+        && matches!(method.as_str(), "find_in_batches" | "in_batches")
+        && let ExprNode::Lambda { params, .. } = &*b.node
+        && let Some(p) = params.first()
+        && let Some(m) = list_model(r, models, env)
+    {
+        env.push((p.clone(), m));
+    }
     let worker_of = |r: &Expr, set: &BTreeSet<String>| -> Option<String> {
         let ExprNode::Const { path } = &*r.node else { return None };
         let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         let name = name.trim_start_matches("::").to_string();
         set.contains(&name).then_some(name)
     };
-    let mut replacement: Option<Expr> = fold_bulk(e, async_workers, folds);
+    let mut replacement: Option<Expr> = fold_bulk(e, async_workers, folds, models, env);
     if replacement.is_none()
         && let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node
         && matches!(method.as_str(), "perform_async" | "perform_in" | "perform_at")
@@ -413,7 +496,15 @@ pub fn fold_sites(
     if let Some(r) = replacement {
         *e = r;
     }
-    e.node.for_each_child_mut(&mut |c| fold_sites(c, async_workers, delay_workers, folds));
+    e.node.for_each_child_mut(&mut |c| fold_in(c, async_workers, delay_workers, folds, models, env));
+    env.truncate(mark);
+    // `kept = Status.where(…).reject { … }`: later reads of `kept` hold
+    // the same model's records.
+    if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node
+        && let Some(m) = list_model(value, models, env)
+    {
+        env.push((name.clone(), m));
+    }
 }
 
 /// `perform_async_with(0.0, <queue>, <retry>, false, argc, row…)` on
@@ -468,7 +559,13 @@ fn bulk_limit(args: &mut Vec<Expr>, name: &str) -> Result<Option<i64>, ()> {
 /// On a target without the push the jobs run one by one, inline.
 /// Anything else is left as written and filed as an error
 /// (`rejected_bulk`): Sidekiq would push those jobs.
-fn fold_bulk(e: &Expr, workers: &BTreeSet<String>, folds: &mut NativeFolds) -> Option<Expr> {
+fn fold_bulk(
+    e: &Expr,
+    workers: &BTreeSet<String>,
+    folds: &mut NativeFolds,
+    models: &NativeModels,
+    env: &[(Symbol, String)],
+) -> Option<Expr> {
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { return None };
     let push_bulk = match method.as_str() {
         "push_bulk" => true,
@@ -534,8 +631,15 @@ fn fold_bulk(e: &Expr, workers: &BTreeSet<String>, folds: &mut NativeFolds) -> O
                 // `push_bulk` is no method the analyzer knows, so the
                 // block's parameter is untyped: it is each item of `list`.
                 let mut body = body.clone();
-                if let Some(Ty::Array { elem }) = &list.ty {
-                    retype_var(&mut body, &params[0], elem);
+                // When `list` holds a model's records, each item is one,
+                // and its attribute reads take the model's column types.
+                match list_model(list, models, env) {
+                    Some(model) => retype_item(&mut body, &params[0], &model, models),
+                    None => {
+                        if let Some(Ty::Array { elem }) = &list.ty {
+                            retype_var(&mut body, &params[0], elem);
+                        }
+                    }
                 }
                 let mut stmts: Vec<Expr> = match &*body.node {
                     ExprNode::Seq { exprs } => exprs.clone(),
@@ -630,6 +734,29 @@ fn retype_var(e: &mut Expr, name: &Symbol, ty: &Ty) {
         e.ty = Some(ty.clone());
     }
     e.node.for_each_child_mut(&mut |c| retype_var(c, name, ty));
+}
+
+/// A bulk block's item as a record of `model`: the parameter itself, and
+/// each `item.<column>` read the analyzer left untyped, typed from the
+/// model's columns (`item.id`, `item.account_id`).
+fn retype_item(e: &mut Expr, name: &Symbol, model: &str, models: &NativeModels) {
+    let untyped = |ty: &Option<Ty>| ty.as_ref().is_none_or(|t| codec_of(t).is_err());
+    match &*e.node {
+        ExprNode::Var { name: n, .. } if n == name && untyped(&e.ty) => {
+            e.ty = Some(Ty::Class { id: crate::ident::ClassId(Symbol::from(model)), args: vec![].into() });
+        }
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if args.is_empty()
+                && matches!(&*r.node, ExprNode::Var { name: n, .. } if n == name)
+                && untyped(&e.ty) =>
+        {
+            if let Some(ty) = models.columns.get(model).and_then(|c| c.get(method.as_str())) {
+                e.ty = Some(ty.clone());
+            }
+        }
+        _ => {}
+    }
+    e.node.for_each_child_mut(&mut |c| retype_item(c, name, model, models));
 }
 
 /// `push_bulk_begin(limit)` and `push_bulk_end`: nothing on a target
@@ -997,11 +1124,33 @@ fn element(ty: &Ty) -> Result<NativeCodec, String> {
     codec_of(ty)
 }
 
+/// A codec every value of which is a JSON scalar.
+fn is_scalar(c: &NativeCodec) -> bool {
+    use NativeCodec::*;
+    match c {
+        Bool | Int | Float | Str | Null | Scalar => true,
+        Nullable(inner) => is_scalar(inner),
+        _ => false,
+    }
+}
+
 fn join(a: NativeCodec, b: NativeCodec) -> Option<NativeCodec> {
     use NativeCodec::*;
     Some(match (a, b) {
         (x, y) if x == y => x,
         (Omitted, x) | (x, Omitted) => x,
+        // `Scalar` already holds nil.
+        (Null, Scalar) | (Scalar, Null) => Scalar,
+        // Different scalars: written by kind when the job is pushed.
+        (x, y) if is_scalar(&x) && is_scalar(&y) && !matches!((&x, &y), (Null, _) | (_, Null)) => {
+            match (x, y) {
+                (Nullable(x), y) | (y, Nullable(x)) => match join(*x, y)? {
+                    Scalar => Scalar,
+                    j => Nullable(Box::new(j)),
+                },
+                _ => Scalar,
+            }
+        }
         (Null, Nullable(x)) | (Nullable(x), Null) => Nullable(x),
         (Null, x) | (x, Null) => Nullable(Box::new(x)),
         (Nullable(x), y) | (y, Nullable(x)) => Nullable(Box::new(join(*x, y)?)),
@@ -1211,6 +1360,7 @@ fn write_expr(codec: &NativeCodec, v: &str, depth: usize) -> String {
         NativeCodec::Float => format!("{a}.float({v})"),
         NativeCodec::Str => format!("{a}.str({v})"),
         NativeCodec::Null => format!("{a}.null"),
+        NativeCodec::Scalar => format!("SidekiqPush.native_value({v})"),
         NativeCodec::Omitted => "\"\"".to_string(),
         NativeCodec::Nullable(inner) => format!("({v}.nil? ? {a}.null : {})", write_expr(inner, v, depth)),
         NativeCodec::Array(inner) => {

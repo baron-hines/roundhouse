@@ -108,13 +108,14 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     let mut delayed: Vec<crate::span::Span> = Vec::new();
     let mut scheduled = SetFolds::default();
     let mut native = super::sidekiq_native::NativeFolds::default();
+    let native_models = super::sidekiq_native::native_models(app);
     super::for_each_hook_body(app, &mut |body| {
         fold_set_chains(body, &jobs, &mut unfolded, &mut folded, (sidekiq || solid_queue).then_some(&mut scheduled));
         // Under `:sidekiq` a worker's enqueues keep their delay, queue
         // and retry, folded to `perform_async_with`; what's left (a
         // splat) drops its delay below, as before.
         if sidekiq {
-            super::sidekiq_native::fold_sites(body, &wrapped, &delay_folds, &mut native);
+            super::sidekiq_native::fold_sites(body, &wrapped, &delay_folds, &mut native, &native_models);
         }
         fold_delayed_enqueues(body, &delay_folds, &mut delayed);
     });

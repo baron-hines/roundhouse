@@ -59,6 +59,52 @@ const BULK_SCENARIOS: &[(&str, &str)] = &[
     ("push_bulk_all_options", "OptionsWorker.push_bulk([1, 2])"),
 ];
 
+/// `push_bulk` over a relation's records, as Mastodon pushes them: a
+/// `find_in_batches` batch, a `where(...)` chain filtered with `reject`,
+/// and an association filtered with `select`. Each block reads the
+/// record's `id`, which `push_bulk` (a gem method the analyzer doesn't
+/// know) would otherwise leave untyped. The setup makes the pushed ids
+/// 1, 2 and 3, so each push is the oracle's `push_bulk_no_block`
+/// (`PlainWorker.push_bulk([1, 2, 3])`) byte for byte.
+const RELATION_SCENARIOS: &[(&str, &str)] = &[
+    (
+        "relation_find_in_batches",
+        // Ordered, as Mastodon's batches are (`reorder(nil)`): a bare
+        // `where(...).find_in_batches` is folded to SQL and answers an
+        // Array, which has no `find_in_batches` in the runtime (a gap
+        // apart from this push).
+        r##"Article.where(body: "A long enough article body.").order(:id).find_in_batches do |batch|
+      PlainWorker.push_bulk(batch) { |article| [article.id] }
+    end"##,
+    ),
+    (
+        "relation_where_reject",
+        // Through `to_a`: the runtime's Relation has no `reject` (a gap
+        // apart from this push).
+        r##"kept = Article.where(id: [1, 2, 3, 4]).to_a
+    kept = kept.reject { |article| article.title == "Skipped" }
+    PlainWorker.push_bulk(kept, limit: 1_000) do |article|
+      [article.id]
+    end"##,
+    ),
+    (
+        "association_select",
+        r##"article = Article.find(1)
+    PlainWorker.push_bulk(article.comments.select { |comment| comment.body.length > 0 }) { |comment| [comment.id] }"##,
+    ),
+];
+
+const RELATION_SETUP: &str = r##"SidekiqPush.start_recording
+3.times { |i| Article.create!(title: "Article #{i}", body: "A long enough article body.") }
+Article.create!(title: "Skipped", body: "Another long enough body.")
+3.times { |i| Comment.create!(article_id: 1, commenter: "c#{i}", body: "Comment body #{i}") }
+"##;
+
+/// The oracle scenario a scenario here is held to, when not its own name.
+fn oracle_name(name: &str) -> &str {
+    if RELATION_SCENARIOS.iter().any(|(n, _)| *n == name) { "push_bulk_no_block" } else { name }
+}
+
 /// Each oracle scenario this covers, and its call as app code. The
 /// arguments strict mode rejects are compile errors instead (below).
 const SCENARIOS: &[(&str, &str)] = &[
@@ -120,9 +166,14 @@ fn on_sidekiq(scenarios: &[(&str, &str)]) -> emit_and_run::Overlay {
 }
 
 fn script(scenarios: &[(&str, &str)]) -> String {
+    script_after(scenarios, "")
+}
+
+/// [`script`], after `setup` (records the scenarios read).
+fn script_after(scenarios: &[(&str, &str)], setup: &str) -> String {
     let names: Vec<String> = scenarios.iter().map(|(n, _)| format!("\"{n}\"")).collect();
     format!(
-        "ActiveJob.register_drain\n\
+        "ActiveJob.register_drain\n{setup}\
          [{}].each do |name|\n\
          \x20 SidekiqPush.start_recording\n\
          \x20 t = Time.now.to_f\n\
@@ -213,7 +264,7 @@ fn check_against_oracle(run: &emit_and_run::Run, scenarios: &[(&str, &str)]) {
             .as_array()
             .unwrap()
             .iter()
-            .find(|s| s["name"] == name.as_str())
+            .find(|s| s["name"] == oracle_name(name))
             .unwrap_or_else(|| panic!("{name}: not in the oracle"));
         let wcmds: Vec<&Value> = want["round_trips"]
             .as_array()
@@ -299,6 +350,53 @@ fn bulk_pushes_match_sidekiq() {
     check_against_oracle(&run, BULK_SCENARIOS);
 }
 
+/// A bulk push over a relation's records types each item as the model,
+/// so `item.id` is an Integer and the push is Sidekiq's.
+#[test]
+fn bulk_pushes_over_relations_match_sidekiq() {
+    let run = on_sidekiq(RELATION_SCENARIOS).run_ruby(&script_after(RELATION_SCENARIOS, RELATION_SETUP));
+    run.assert_passes();
+    assert!(run.stdout.contains("native pushes recorded"), "{}", run.stdout);
+    check_against_oracle(&run, RELATION_SCENARIOS);
+}
+
+const MIXED_WORKER: &str = "class MixedWorker\n  include Sidekiq::Job\n\n  def perform(label, opts = {})\n    nil\n  end\nend\n";
+
+const MIXED_SCENARIOS: &[(&str, &str)] = &[
+    ("mixed_hash", r##"MixedWorker.perform_async("x", { "s" => "a\"b", "i" => 2, "f" => 1.5, "t" => true, "u" => false, "n" => nil })"##),
+    ("mixed_label", "MixedWorker.perform_async(true)"),
+];
+
+/// A String-keyed Hash whose values are different JSON scalars, and a
+/// parameter that is a String at one call site and a Boolean at another,
+/// are written as Sidekiq writes them: its envelope's `args` is
+/// `JSON.generate` of the arguments. No oracle scenario has these, so
+/// this holds them to `JSON.generate` itself.
+#[test]
+fn mixed_scalar_arguments_write_what_json_generate_writes() {
+    let run = on_sidekiq(MIXED_SCENARIOS).write("app/workers/mixed_worker.rb", MIXED_WORKER).run_ruby(
+        r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+Article.native_mixed_hash
+Article.native_mixed_label
+envs = SidekiqPush.recorded.select { |l| l.start_with?("lpush ") }
+raise "pushes: #{SidekiqPush.recorded.inspect}" unless envs.length == 2
+want = [
+  JSON.generate(["x", { "s" => "a\"b", "i" => 2, "f" => 1.5, "t" => true, "u" => false, "n" => nil }]),
+  JSON.generate([true]),
+]
+want.each_with_index do |w, i|
+  raise "#{envs[i]} doesn't write #{w}" unless envs[i].include?("\"args\":" + w + ",\"class\":\"MixedWorker\"")
+end
+puts "mixed passed"
+"##,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("mixed passed"), "{}", run.stdout);
+    let registry = std::fs::read_to_string(run.emitted.join("runtime/job_registry.rb")).unwrap();
+    assert!(registry.contains("SidekiqPush.native_value(label)"), "{registry}");
+}
+
 /// An app not on `:sidekiq` keeps #746's inline workers: no
 /// `perform_async_with`, no native writer, and the same tree with or
 /// without this pass's planning.
@@ -339,6 +437,8 @@ fn non_json_arguments_are_errors_under_sidekiq() {
         ("NoRetryWorker.perform_async(:sym)", "`n` is a Symbol"),
         ("NoRetryWorker.perform_async({ a: 1 })", "`n` is a Hash with Symbol keys"),
         ("NoRetryWorker.perform_async(Time.at(0))", "`n` is a Time"),
+        // A non-JSON value among a Hash's mixed scalars.
+        ("NoRetryWorker.perform_async({ \"a\" => 1, \"b\" => :x })", "`n` is a Symbol"),
         ("NoRetryWorker.set(priority: 3).perform_async(1)", "must be literal `queue:`"),
     ] {
         let errors = rejected(call);
