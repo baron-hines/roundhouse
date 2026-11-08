@@ -181,5 +181,37 @@ end
 check("an empty configure_client url: raises, REDIS_URL is no fallback", raised, "no ArgumentError")
 check("no configure_client password", SidekiqPush.password == "", SidekiqPush.password)
 
+# Native Sidekiq jobs (classes that include Sidekiq::Job): the envelope's
+# key order for each call form, and a bulk push's batches.
+# tests/emit_and_run/sidekiq_native_push.rs holds the bytes to Sidekiq's
+# own; these lines hold the spinel binary to the same runtime.
+SidekiqPush.start_recording
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, false, "[1,{\"a\":\"b\"}]")
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", ",\"dead\":false", 300.0, true, "[2]")
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, true, "[3]")
+lines = SidekiqPush.recorded
+check("native: sadd", lines.length == 5 && lines[0] == "sadd queues pull", lines.length.to_s)
+check("native: args before class through the Setter",
+  lines[1].to_s.start_with?("lpush queue:pull {\"retry\":5,\"queue\":\"pull\",\"args\":[1,{\"a\":\"b\"}],\"class\":\"OkWorker\",\"jid\":\""), lines[1].to_s)
+check("native: class before args for a class-side perform_in",
+  lines[2].to_s.start_with?("zadd schedule ") && lines[2].to_s.include?(" {\"retry\":5,\"queue\":\"pull\",\"dead\":false,\"class\":\"OkWorker\",\"args\":[2],\"jid\":\"") && !lines[2].to_s.include?("enqueued_at"), lines[2].to_s)
+check("native: class before args for a class-side perform_in(0)",
+  lines[4].to_s.start_with?("lpush queue:pull {\"retry\":5,\"queue\":\"pull\",\"class\":\"OkWorker\",\"args\":[3],\"jid\":\"") && lines[4].to_s.include?("\"enqueued_at\":"), lines[4].to_s)
+
+SidekiqPush.start_recording
+SidekiqPush.bulk_begin(2)
+[1, 2, 3].each do |i|
+  SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, false, "[" + i.to_s + "]")
+end
+SidekiqPush.bulk_end
+lines = SidekiqPush.recorded
+check("bulk: one sadd and one lpush per batch", lines.length == 4 && lines[0] == "sadd queues pull" && lines[2] == "sadd queues pull", lines.length.to_s)
+check("bulk: a full batch of two", lines[1].to_s.split("\"jid\":").length == 3, lines[1].to_s)
+check("bulk: the rest at bulk_end", lines[3].to_s.split("\"jid\":").length == 2 && lines[3].to_s.include?("\"class\":\"OkWorker\",\"args\":[3]"), lines[3].to_s)
+check("bulk: limit cleared", SidekiqPush.bulk_limit[0] == 0, SidekiqPush.bulk_limit[0].to_s)
+SidekiqPush.start_recording
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, false, "[4]")
+check("after bulk_end: pushed at once", SidekiqPush.recorded.length == 2, SidekiqPush.recorded.length.to_s)
+
 SidekiqPush.stop_recording
 puts "done"
