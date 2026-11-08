@@ -110,8 +110,9 @@ module SidekiqPush
   # an epoch, and 0.0 is no delay. A time that isn't in the future is
   # pushed at once, as Sidekiq does. `class_side` says the call was a
   # bare class-side `perform_in` / `perform_at`: Sidekiq builds that
-  # item itself, with `class` before `args`, when it schedules it; every
-  # other call goes through its `Setter`, which writes `args` first.
+  # item itself, with `class` before `args`, whether or not it ends up
+  # scheduled; every other call goes through its `Setter`, which writes
+  # `args` first.
   def self.enqueue_native(job_class, retry_json, queue, extra, at, class_side, args_json)
     if bulk_limit[0] > 0
       bulk.push(HeldNative.new(job_class, retry_json, queue, extra, args_json))
@@ -121,7 +122,7 @@ module SidekiqPush
     now = Time.now.to_f
     ts = at < 1_000_000_000.0 ? now + at : at
     scheduled = ts > now
-    body = if class_side && scheduled
+    body = if class_side
       ",\"class\":" + ActiveJob::Arguments.str(job_class) + ",\"args\":" + args_json
     else
       ",\"args\":" + args_json + ",\"class\":" + ActiveJob::Arguments.str(job_class)
