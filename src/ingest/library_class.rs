@@ -5491,13 +5491,10 @@ fn framework_shadow_scopes(
     ruby_prism::Visit::visit(&mut Shadows { scope: Vec::new(), out }, node);
 }
 
-pub fn ingest_concern_filters(
-    source: &[u8],
-    file: &str,
-) -> super::IngestResult<Vec<(ClassId, Vec<crate::dialect::Filter>)>> {
+pub fn ingest_concern_filters(source: &[u8], file: &str) -> ConcernFilterScan {
     let result = super::prism::parse_silent(source);
     let root = result.node();
-    let mut out = Vec::new();
+    let mut out = ConcernFilterScan::default();
     for (scope, module) in find_all_modules_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
         let mut full_path: Vec<String> = scope.clone();
@@ -5507,6 +5504,16 @@ pub fn ingest_concern_filters(
         let Some(body) = module.body() else { continue };
         let mut filters = Vec::new();
         for stmt in flatten_statements(body) {
+            if let Some(name) = visibility::definition(&stmt).and_then(|def| included_hook_callback_macro(&def)) {
+                out.refusals.push((
+                    id.clone(),
+                    file.to_string(),
+                    format!(
+                        "controller concern `{name}` in a `self.included` hook is not modelled (its effect is dropped from the output)"
+                    ),
+                ));
+                continue;
+            }
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
                 continue;
@@ -5514,34 +5521,46 @@ pub fn ingest_concern_filters(
             let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
             let Some(block_body) = block.body() else { continue };
             for inner in flatten_statements(block_body) {
-                ingest_included_filter_statement(&inner, file, &mut filters)?;
+                ingest_included_filter_statement(&inner, file, &mut filters, &id, &mut out.refusals);
             }
         }
         if !filters.is_empty() {
-            out.push((id, filters));
+            out.filters.push((id, filters));
         }
     }
-    Ok(out)
+    out
+}
+
+/// What one file's `included do` blocks declare for controllers.
+#[derive(Default)]
+pub struct ConcernFilterScan {
+    pub filters: Vec<(ClassId, Vec<crate::dialect::Filter>)>,
+    /// `(module, file, message)`, for [`crate::App::concern_filter_refusals`].
+    pub refusals: Vec<(ClassId, String, String)>,
 }
 
 fn ingest_included_filter_statement(
     inner: &Node<'_>,
     file: &str,
     filters: &mut Vec<crate::dialect::Filter>,
-) -> super::IngestResult<()> {
+    module: &ClassId,
+    refusals: &mut Vec<(ClassId, String, String)>,
+) {
+    let refusal = |message: String| (module.clone(), file.to_string(), message);
     match super::controller::parse_filter_call(inner, file) {
         Ok(Some(fs)) => filters.extend(fs),
         // `parse_filter_call` itself only returns `Err` for a
         // non-literal `only:`/`except:` (refused rather than
-        // silently applied to every action — that function's
-        // doc comment). Strict mode must fail ingest the same
-        // way a controller's own `only:`/`except:` would;
-        // survey mode records the gap and keeps scanning.
-        Err(err) => super::survey::continue_or_fail(err)?,
+        // silently applied to every action -- that function's
+        // doc comment).
+        Err(err) => refusals.push(refusal(match err {
+            IngestError::Unsupported { message, .. } => message,
+            other => other.to_string(),
+        })),
         Ok(None) => {
             if let Some(guarded) = controller_callback_guarded_body(inner) {
                 for stmt in guarded {
-                    ingest_included_filter_statement(&stmt, file, filters)?;
+                    ingest_included_filter_statement(&stmt, file, filters, module, refusals);
                 }
             } else if let Some(f) = content_security_policy_filter(inner, file) {
                 filters.push(f);
@@ -5551,32 +5570,79 @@ fn ingest_included_filter_statement(
                 // A callback macro `parse_filter_call` does not model
                 // (`append_before_action`, `self.before_action`, a forgery
                 // declaration with `prepend:` or a custom `store:`) changes
-                // how every includer handles requests. The `included` block
-                // is otherwise dropped, so it would vanish without a trace
-                // where the same line in a controller is a survey gap; name
-                // it the same way.
-                super::survey::record(&super::IngestError::Unsupported {
-                    file: file.to_string(),
-                    message: format!(
-                        "controller concern macro not recognized: `{name}` (its effect is dropped from the output)"
-                    ),
-                });
+                // how every includer handles requests.
+                refusals.push(refusal(format!(
+                    "controller concern macro not recognized: `{name}` (its effect is dropped from the output)"
+                )));
             } else if let Some(name) = conditional_callback_macro_name(inner) {
-                // A filter behind a guard ingest cannot decide would otherwise
-                // vanish with the rest of the `included` block, so the
-                // includer's actions would run unfiltered without a trace.
-                super::survey::record(&super::IngestError::Unsupported {
-                    file: file.to_string(),
-                    message: format!(
-                        "controller concern `{name}` under a condition is not modelled (its effect is dropped from the output)"
-                    ),
-                });
+                // Whether a filter behind this guard registers is decided
+                // as the class loads, and ingest cannot decide it.
+                refusals.push(refusal(format!(
+                    "controller concern `{name}` under a condition is not modelled (its effect is dropped from the output)"
+                )));
+            } else if let Some(name) = nested_callback_macro_name(inner) {
+                // `%i[a b].each { |f| before_action f }`, `with_options`, ...
+                refusals.push(refusal(format!(
+                    "controller concern `{name}` inside another statement is not modelled (its effect is dropped from the output)"
+                )));
             } else {
                 record_concern_csp_divergence(inner, file);
             }
         }
     }
-    Ok(())
+}
+
+/// A callback macro a `def self.included(base)` hook registers on `base`,
+/// directly or from a `base.class_eval` block.
+fn included_hook_callback_macro(def: &ruby_prism::DefNode<'_>) -> Option<&'static str> {
+    struct Finder {
+        param: String,
+        found: Option<&'static str>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.found.is_none() {
+                let on_param = node.receiver().is_some_and(|r| {
+                    r.as_local_variable_read_node()
+                        .is_some_and(|read| constant_id_str(&read.name()) == self.param)
+                });
+                let name = constant_id_str(&node.name());
+                self.found = if on_param {
+                    CONTROLLER_CALLBACK_MACROS.iter().find(|m| **m == name).copied()
+                } else {
+                    callback_macro_name(&node.as_node())
+                };
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+    }
+    let param = included_hook_parameter(def, false)?;
+    let mut finder = Finder { param, found: None };
+    ruby_prism::Visit::visit(&mut finder, &def.body()?);
+    finder.found
+}
+
+/// A callback macro called from anywhere under `stmt`, not counting the
+/// bodies of methods and classes it defines.
+fn nested_callback_macro_name(stmt: &Node<'_>) -> Option<&'static str> {
+    struct Finder(Option<&'static str>);
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.0.is_none() {
+                self.0 = callback_macro_name(&node.as_node());
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+    }
+    let mut finder = Finder(None);
+    ruby_prism::Visit::visit(&mut finder, stmt);
+    finder.0
 }
 
 /// The class methods `AbstractController::Callbacks` and

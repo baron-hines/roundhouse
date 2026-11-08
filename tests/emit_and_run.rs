@@ -21411,6 +21411,9 @@ mod view_unless_no_else;
 #[path = "support/nilable_string_view.rs"]
 #[allow(dead_code)]
 mod nilable_string_view;
+#[path = "support/each_receiver_once.rs"]
+#[allow(dead_code)]
+mod each_receiver_once;
 
 /// `simple_format` with `sanitize: false`: paragraphs, line breaks, html
 /// options and `wrapper_tag:`, as Rails 8.1.4 renders them.
@@ -21905,5 +21908,25 @@ fn nilable_string_view_nil_renders_as_rails_on_spinel() {
 fn nilable_string_view_nil_effect_renders_as_rails_on_spinel() {
     nilable_string_view::nil_effect_app(content_tag_options::app_rendering(nilable_string_view::EFFECT_VIEW, &[]))
         .run_spinel(&helper_escape_at_output::render_script(nilable_string_view::NIL_EFFECT_RENDERS))
+        .assert_passes();
+}
+
+/// #1946: `each` runs a receiver with an effect once, as Rails 8.1.4
+/// does (`each_receiver_once::VIEW`).
+#[test]
+fn each_receiver_once_renders_as_rails() {
+    each_receiver_once::app(content_tag_options::app_rendering(each_receiver_once::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(each_receiver_once::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1946: `each` runs a receiver with an effect once, as Rails 8.1.4
+/// does (`each_receiver_once::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn each_receiver_once_renders_as_rails_on_spinel() {
+    each_receiver_once::app(content_tag_options::app_rendering(each_receiver_once::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(each_receiver_once::RENDERS))
         .assert_passes();
 }

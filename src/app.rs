@@ -624,6 +624,18 @@ pub struct App {
     /// the app walk; empty for apps without concerns.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_filters: HashMap<ClassId, Vec<Filter>>,
+    /// Callback declarations in a concern's `included do` block that ingest
+    /// could not read, keyed by the module, as `(file, message)`. They
+    /// refuse the compile only once a controller registers the concern
+    /// (`ingest::app::refuse_unread_concern_filters`): the block has no
+    /// effect on an app that never includes it in a controller.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_filter_refusals: HashMap<ClassId, Vec<(String, String)>>,
+    /// Modules known not to be Concerns. Ruby does not run the `included`
+    /// hooks of what such a module includes on the module's own includers,
+    /// so filter registration stops there; its methods still arrive.
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub plain_mixins: crate::det::HashSet<ClassId>,
     /// graphql-ruby object types (`ingest::graphql_ruby`), for the
     /// analyzer only; their synthesized methods leave at lowering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1328,6 +1340,8 @@ impl App {
             library_class_files: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::default(),
+            concern_filter_refusals: HashMap::default(),
+            plain_mixins: Default::default(),
             graphql_types: Vec::new(),
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),

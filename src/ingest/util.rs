@@ -471,6 +471,35 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_includes_into_constant(m.body())
         || body_registers_autoloads(m.body())
         || body_extends_module(m.body())
+        || concern_includes_module(m.body())
+}
+
+/// A Concern whose body only includes other modules. It has nothing of
+/// its own to emit, but Rails runs its dependencies' `included` blocks on
+/// whatever includes it, so the `include` edge has to survive.
+fn concern_includes_module(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    let statements = flatten_statements(body);
+    fn call_named<'pr>(stmt: &Node<'pr>, name: &str) -> Option<ruby_prism::CallNode<'pr>> {
+        stmt.as_call_node().filter(|call| {
+            call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
+        })
+    }
+    let extends_concern = statements.iter().any(|stmt| {
+        call_named(stmt, "extend").is_some_and(|call| {
+            call.arguments().is_some_and(|a| {
+                a.arguments().iter().any(|arg| {
+                    constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
+                })
+            })
+        })
+    });
+    extends_concern
+        && statements.iter().any(|stmt| {
+            call_named(stmt, "include").is_some_and(|call| {
+                call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| constant_path_of(&arg).is_some()))
+            })
+        })
 }
 
 // `extend ActiveSupport::Concern` is left out: it is the included-block machinery, not methods the module answers.

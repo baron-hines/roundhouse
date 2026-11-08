@@ -559,7 +559,15 @@ fn untyped_subexpressions_baseline() {
     // reads each error detail and its `attribute`, vars on this RBS-less
     // probe (+2 in active_record/connection.rb); connection.rbs types it
     // for the RBS-paired gate.
-    const CEILING: usize = 1234;
+    // MEASURED 1238 on 2026-11-08 (on 1233, against a ledger of 1234):
+    // partial writes in active_record/connection.rb. `_attributes_snapshot`
+    // reads each attribute's key and value (+3), `_enlist_direct_write` the
+    // transaction depth and enlisted list (+3), `update_column` and
+    // `update_columns` the names they write (+1 each), and
+    // `clear_attribute_change` no longer reads `attributes` directly (-3).
+    // These are vars on this RBS-less probe; connection.rbs types them for
+    // the RBS-paired gate.
+    const CEILING: usize = 1238;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

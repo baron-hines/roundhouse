@@ -1196,7 +1196,14 @@ pub(super) fn emit_send(
                 };
                 let body_s = emit_block_body(&body_ctx, body);
                 // No block parameter binds nothing: Go's bare `for range`.
-                let range_clause = if range_vars.is_empty() { format!("range {recv_s}") } else { format!("{range_vars} := range {recv_s}") };
+                // A receiver that runs something is bound once: the loop and
+                // the returned value are the same evaluation, as in Ruby.
+                let (bind_recv, iterated) = if is_plain_operand(recv_e) {
+                    (String::new(), recv_s.clone())
+                } else {
+                    (format!("\t_rh_recv := {recv_s}\n"), "_rh_recv".to_string())
+                };
+                let range_clause = if range_vars.is_empty() { format!("range {iterated}") } else { format!("{range_vars} := range {iterated}") };
                 // 2-param `each` iterates a Hash. Go map iteration order is
                 // undefined per-run, but several runtime-Ruby surfaces
                 // render observable output from it — notably `render_attrs`,
@@ -1210,8 +1217,7 @@ pub(super) fn emit_send(
                 // attrs in a BTreeMap and is attribute-order-insensitive, so
                 // byte-parity is unaffected. Only string-keyed maps take this
                 // path (the common case); other key types keep the unordered
-                // range. Binding `_m` also avoids the double-eval of a
-                // non-trivial `recv_s` the unordered form has.
+                // range. `_m` binds the receiver once.
                 if params.len() == 2 {
                     let (k_ty, _v_ty) = hash_kv_go_tys(recv_e.ty.as_ref());
                     if k_ty == "string" {
@@ -1235,10 +1241,10 @@ pub(super) fn emit_send(
                 }
                 return format!(
                     "func() interface{{}} {{\n\
-                     \tfor {range_clause} {{\n\
+                     {bind_recv}\tfor {range_clause} {{\n\
                      {body_s}\n\
                      \t}}\n\
-                     \treturn {recv_s}\n\
+                     \treturn {iterated}\n\
                      }}()",
                 );
             }

@@ -235,6 +235,8 @@ fn tiny_blog_round_trips() {
         rake_task_gaps: Vec::new(),
         rails_application: None,
         concern_filters: roundhouse::det::HashMap::default(),
+        concern_filter_refusals: roundhouse::det::HashMap::default(),
+        plain_mixins: Default::default(),
         graphql_types: Vec::new(),
         graphql_signatures: Vec::new(),
         concern_spliced_actions: roundhouse::det::HashMap::default(),

@@ -1398,6 +1398,38 @@ fn configuration_refuses_included_ancestor_framework_shadows() {
     assert!(ingest_app_from_tree(tree).is_ok());
 }
 
+const SCOPED_WINDOW: &str = "module Scoped\n module Window\n  extend ActiveSupport::Concern\n  class_methods do\n   def configure_window(**opts)\n    @window_options = opts\n   end\n   def window_options\n    @window_options || {}\n   end\n  end\n end\n module Wrapped\n  extend ActiveSupport::Concern\n  include Window\n  def marker; :wrapper; end\n end\nend\n";
+
+fn assert_configuration_expanded(app: roundhouse::App) {
+    let controller = &app.controllers[0];
+    assert!(
+        controller.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. })),
+        "the class macro call was not expanded: {:?}",
+        controller.body
+    );
+}
+
+/// `include Window` inside `Scoped::Wrapped` names `Scoped::Window`, and
+/// Rails 8.1.4 stores the value through it.
+#[test]
+fn configuration_reaches_a_carrier_named_relative_to_its_dependent() {
+    let tree = [
+        ("app/controllers/concerns/scoped.rb", SCOPED_WINDOW),
+        ("app/controllers/window_controller.rb", "class WindowController < ActionController::Base\n include Scoped::Wrapped\n configure_window mode: :month\nend\n"),
+    ].into_iter().map(|(path, source)| (path.into(), source.as_bytes().to_vec())).collect();
+    assert_configuration_expanded(ingest_app_from_tree(tree).unwrap());
+}
+
+/// `include Window` in a controller under `Scoped` names `Scoped::Window`.
+#[test]
+fn configuration_reaches_a_carrier_named_relative_to_its_controller() {
+    let tree = [
+        ("app/controllers/concerns/scoped.rb", SCOPED_WINDOW),
+        ("app/controllers/scoped/window_controller.rb", "module Scoped\n class WindowController < ActionController::Base\n  include Window\n  configure_window mode: :month\n end\nend\n"),
+    ].into_iter().map(|(path, source)| (path.into(), source.as_bytes().to_vec())).collect();
+    assert_configuration_expanded(ingest_app_from_tree(tree).unwrap());
+}
+
 #[test]
 fn configuration_requires_concern_identity_through_dependency_wrappers() {
     for (wrapper, supported) in [
