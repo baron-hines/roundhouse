@@ -94,6 +94,151 @@ module SidekiqPush
     nil
   end
 
+  # One native Sidekiq job (a class that includes `Sidekiq::Job` or
+  # `Sidekiq::Worker`), in the envelope Sidekiq 8.1's client writes:
+  #
+  #   {"retry":5,"queue":"pull",<the class's other options>,
+  #    "args":[1,{"a":"b"}],"class":"OkWorker",
+  #    "jid":"<24 hex>","created_at":<ms>,"enqueued_at":<ms>}
+  #
+  # `retry_json` and `extra` are JSON text: the envelope's `retry` and
+  # the class's other `sidekiq_options` as `,"key":value` pairs.
+  # `args_json` is the argument list.
+  #
+  # `at` is what the call named, still to go through Sidekiq's rule: a
+  # value under 1,000,000,000 is an interval from now, anything larger
+  # an epoch, and 0.0 is no delay. A time that isn't in the future is
+  # pushed at once, as Sidekiq does. `class_side` says the call was a
+  # bare class-side `perform_in` / `perform_at`: Sidekiq builds that
+  # item itself, with `class` before `args`, when it schedules it; every
+  # other call goes through its `Setter`, which writes `args` first.
+  def self.enqueue_native(job_class, retry_json, queue, extra, at, class_side, args_json)
+    if bulk_limit[0] > 0
+      bulk.push(HeldNative.new(job_class, retry_json, queue, extra, args_json))
+      flush_bulk if bulk.length >= bulk_limit[0]
+      return nil
+    end
+    now = Time.now.to_f
+    ts = at < 1_000_000_000.0 ? now + at : at
+    scheduled = ts > now
+    body = if class_side && scheduled
+      ",\"class\":" + ActiveJob::Arguments.str(job_class) + ",\"args\":" + args_json
+    else
+      ",\"args\":" + args_json + ",\"class\":" + ActiveJob::Arguments.str(job_class)
+    end
+    head = "{\"retry\":" + retry_json +
+      ",\"queue\":" + ActiveJob::Arguments.str(queue) +
+      extra + body +
+      ",\"jid\":" + ActiveJob::Arguments.str(SecureRandom.hex(12)) +
+      ",\"created_at\":" + now_ms.to_s
+    if scheduled
+      schedule(ts, head + "}")
+    else
+      push(queue, head + ",\"enqueued_at\":" + now_ms.to_s + "}")
+    end
+    nil
+  end
+
+  # One native job of a bulk push, held until its batch is full.
+  class HeldNative
+    def initialize(job_class, retry_json, queue, extra, args_json)
+      @job_class = job_class
+      @retry_json = retry_json
+      @queue = queue
+      @extra = extra
+      @args_json = args_json
+    end
+
+    def job_class
+      @job_class
+    end
+
+    def retry_json
+      @retry_json
+    end
+
+    def queue
+      @queue
+    end
+
+    def extra
+      @extra
+    end
+
+    def args_json
+      @args_json
+    end
+  end
+
+  # A bulk push (`perform_bulk`, the sidekiq-bulk gem's `push_bulk`):
+  # between `bulk_begin(limit)` and `bulk_end` this thread's native jobs
+  # are held and pushed `limit` at a time, as Sidekiq's
+  # `Client#push_bulk` pushes a batch: one `SADD queues` and one `LPUSH`
+  # of every envelope, which share one `created_at` and one
+  # `enqueued_at`, with `class` before `args`.
+  def self.bulk_begin(limit)
+    flush_bulk
+    bulk_limit[0] = limit
+    nil
+  end
+
+  def self.bulk_end
+    bulk_limit[0] = 0
+    flush_bulk
+    nil
+  end
+
+  def self.bulk_limit
+    l = Thread.current[:sidekiq_bulk_limit]
+    if l.nil?
+      l = [0]
+      Thread.current[:sidekiq_bulk_limit] = l
+    end
+    l
+  end
+
+  def self.bulk
+    b = Thread.current[:sidekiq_bulk]
+    if b.nil?
+      b = [HeldNative.new("", "", "", "", "")]
+      b.clear
+      Thread.current[:sidekiq_bulk] = b
+    end
+    b
+  end
+
+  def self.flush_bulk
+    b = bulk
+    if b.length == 0
+      return nil
+    end
+    jobs = b.dup
+    b.clear
+    created = now_ms.to_s
+    enqueued = now_ms.to_s
+    queue = jobs[0].queue + ""
+    envelopes = jobs.map do |j|
+      "{\"retry\":" + j.retry_json +
+        ",\"queue\":" + ActiveJob::Arguments.str(j.queue) +
+        j.extra +
+        ",\"class\":" + ActiveJob::Arguments.str(j.job_class) +
+        ",\"args\":" + j.args_json +
+        ",\"jid\":" + ActiveJob::Arguments.str(SecureRandom.hex(12)) +
+        ",\"created_at\":" + created +
+        ",\"enqueued_at\":" + enqueued + "}"
+    end
+    push_many(queue, envelopes)
+  end
+
+  def self.push_many(queue, jsons)
+    if RECORDING[0]
+      RECORDED.push("sadd queues " + queue)
+      RECORDED.push("lpush queue:" + queue + " " + jsons.join(" "))
+      return nil
+    end
+    SidekiqRedis.push_many(url, queue, jsons)
+  end
+
   # `enqueue`, held while a transaction is open and pushed at its COMMIT
   # (a job that sets `enqueue_after_transaction_commit = true`).
   def self.enqueue_after_commit(job_class, queue, at, aj_json)
