@@ -9,6 +9,8 @@ class Redis
 
   PLAN = []
   LOG = []
+  # The options of the last `Redis.new`.
+  OPTIONS = [{}]
 
   def self.step(what)
     LOG.push(what)
@@ -19,7 +21,8 @@ class Redis
     end
   end
 
-  def initialize(**_options)
+  def initialize(**options)
+    OPTIONS[0] = options
     Redis.step("connect")
     @closed = false
   end
