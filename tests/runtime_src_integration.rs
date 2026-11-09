@@ -1318,7 +1318,10 @@ fn every_runtime_method_body_concretely_typed() {
     // value; `update_columns` names each column it writes). No other
     // runtime file's sites change. Raise to 949, preserving the two-site
     // headroom.
-    const CEILING: usize = 949;
+    // MEASURED 948 on main d534fc3d (947): composite group-count keys
+    // add one gradual site in relation.rb; other files are unchanged.
+    // Raise by one to preserve the existing two-site headroom.
+    const CEILING: usize = 950;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

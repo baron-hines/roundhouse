@@ -751,9 +751,10 @@ const FATES: &[(&str, GemFate)] = &[
     ("acts_as_votable", GemFate::Modeled), // ingest/acts_as_votable: ActsAsVotable::Vote on `votes`; acts_as_votable/acts_as_voter macros -> votes_for/votes + vote_by/liked_by/unvote_by/update_cached_votes (not vote_up_for/get_voted/association extensions)
     // Not Modeled: the catalog types Addressable::URI, but no tree has a body for it, so it runs as the gem itself.
     ("addressable", GemFate::Unknown),
+    // Not Modeled: its routes depend on the modules every model and gem registers, which only its own source draws.
+    ("devise", GemFate::Unknown),
     ("bcrypt", GemFate::Modeled),      // catalog/gems: BCrypt::*; has_secure_password
     ("commonmarker", GemFate::Modeled), // catalog/gems: Commonmarker, Commonmarker::Node
-    ("devise", GemFate::Modeled), // helpers; devise_for = static 4 mappings (not model-module-driven); no Warden route guards
     ("discard", GemFate::Modeled),
     ("elastic-apm", GemFate::Modeled), // catalog/gems: ElasticAPM, SpanHelpers; the real gem on ruby and jruby, lower/ruby_family_gems refuses every other target     // ingest/discard: include Discard::Model -> scopes + predicates + discard/undiscard (not discard_all/undiscard_all); Relation#unscope(where:)
     ("faye-websocket", GemFate::Modeled), // Spinel faye_websocket: text/open/message/close; no protocols/error events
@@ -1298,26 +1299,29 @@ pub fn statically_resolved_external_includes(
     let census = GemCensus::of(lock);
     let mut resolved = std::collections::BTreeMap::new();
     for class in &app.library_classes {
-        let source = source_for_library_class(app, class);
-        let Some(source) = source else { continue };
-        for included in &class.includes {
-            let Some(gem) = gem_owning_constant(&census, included.0.as_str()) else {
-                continue;
-            };
+        // The gem owning each include first: most classes include none,
+        // and finding a class's source can scan every file of the app.
+        let gems: Vec<(&crate::ident::ClassId, &str)> = class
+            .includes
+            .iter()
+            .filter_map(|included| gem_owning_constant(&census, included.0.as_str()).map(|gem| (included, gem)))
             // Fail-closed: Git-sourced gems have no Gemfile pin path that
             // preserves the git remote — keep their includes unresolved.
-            if lock.is_from_git(gem) {
-                continue;
-            }
             // A gem a project extension says reaches Rails is never
             // required natively (`crate::extensions`).
-            if app.extensions.is_rails_dependent(gem) {
-                continue;
-            }
+            .filter(|(_, gem)| !lock.is_from_git(gem) && !app.extensions.is_rails_dependent(gem))
+            .collect();
+        if gems.is_empty() {
+            continue;
+        }
+        let Some(source) = source_for_library_class(app, class) else { continue };
+        let file_requires = literal_file_level_requires(&source.text);
+        for (included, gem) in gems {
             let gem_name = gem.to_ascii_lowercase();
             let namespace = namespace_of(gem).to_ascii_lowercase();
-            let requires: Vec<String> = literal_file_level_requires(&source.text)
-                .into_iter()
+            let requires: Vec<String> = file_requires
+                .iter()
+                .cloned()
                 .filter(|feature| {
                     feature
                         .split('/')

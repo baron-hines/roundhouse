@@ -58,6 +58,10 @@ mod string_truncate_native;
 mod array_excluding;
 #[path = "spinel_toolchain/array_excluding.rs"]
 mod array_excluding_native;
+#[path = "support/haml_class_shortcut_merge.rs"]
+mod haml_class_shortcut_merge;
+#[path = "spinel_toolchain/haml_class_shortcut_merge.rs"]
+mod haml_class_shortcut_merge_native;
 #[path = "spinel_toolchain/lobsters_zero.rs"]
 mod lobsters_zero;
 #[path = "support/addressable_gem.rs"]

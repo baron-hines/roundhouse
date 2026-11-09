@@ -427,6 +427,14 @@ thread_local! {
     static DEFERRAL: std::cell::RefCell<Deferral> = const { std::cell::RefCell::new(Deferral::Off) };
 }
 
+/// Run `f` with no deferral armed, putting back the caller's after: a pass whose app is thrown away defers nothing.
+pub(super) fn not_deferring<T>(f: impl FnOnce() -> T) -> T {
+    let previous = DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), Deferral::Off));
+    let result = f();
+    DEFERRAL.with(|state| *state.borrow_mut() = previous);
+    result
+}
+
 /// Run a survey-mode `ingest` without the surface probe's whole-app clone
 /// and second analysis, for a caller that analyzes the result itself.
 ///

@@ -5503,15 +5503,12 @@ pub fn ingest_concern_filters(source: &[u8], file: &str) -> ConcernFilterScan {
 
         let Some(body) = module.body() else { continue };
         let mut filters = Vec::new();
+        // After every `included do`: Ruby calls the hook once
+        // `append_features`, which runs the block, has returned.
+        let mut hook_filters = Vec::new();
+        let super_is_inert = !singleton_ancestors_beyond_concern(flatten_statements(module.body().unwrap()));
         for stmt in flatten_statements(body) {
-            if let Some(name) = visibility::definition(&stmt).and_then(|def| included_hook_callback_macro(&def)) {
-                out.refusals.push((
-                    id.clone(),
-                    file.to_string(),
-                    format!(
-                        "controller concern `{name}` in a `self.included` hook is not modelled (its effect is dropped from the output)"
-                    ),
-                ));
+            if read_filter_hook(&stmt, &id, file, super_is_inert, &mut hook_filters, &mut out) {
                 continue;
             }
             let Some(call) = stmt.as_call_node() else { continue };
@@ -5524,6 +5521,7 @@ pub fn ingest_concern_filters(source: &[u8], file: &str) -> ConcernFilterScan {
                 ingest_included_filter_statement(&inner, file, &mut filters, &id, &mut out.refusals);
             }
         }
+        filters.extend(hook_filters);
         if !filters.is_empty() {
             out.filters.push((id, filters));
         }
@@ -5537,6 +5535,12 @@ pub struct ConcernFilterScan {
     pub filters: Vec<(ClassId, Vec<crate::dialect::Filter>)>,
     /// `(module, file, message)`, for [`crate::App::concern_filter_refusals`].
     pub refusals: Vec<(ClassId, String, String)>,
+    /// See [`crate::App::concern_hook_modules`].
+    pub hook_modules: Vec<ClassId>,
+    /// See [`crate::App::modelled_included_hooks`].
+    pub modelled_hooks: Vec<Span>,
+    /// See [`crate::App::unguarded_included_hooks`].
+    pub unguarded_hooks: Vec<Span>,
 }
 
 fn ingest_included_filter_statement(
@@ -5592,26 +5596,268 @@ fn ingest_included_filter_statement(
     }
 }
 
-/// A callback macro a `def self.included(base)` hook registers on `base`,
-/// directly or from a `base.class_eval` block.
-fn included_hook_callback_macro(def: &ruby_prism::DefNode<'_>) -> Option<&'static str> {
-    struct Finder {
-        param: String,
+/// `stmt` when it defines an include-time hook that registers filters:
+/// reads it, or refuses it. False for anything else.
+fn read_filter_hook(
+    stmt: &Node<'_>,
+    module: &ClassId,
+    file: &str,
+    super_is_inert: bool,
+    filters: &mut Vec<crate::dialect::Filter>,
+    out: &mut ConcernFilterScan,
+) -> bool {
+    // The hooks `class << self` opens are refused below, not read.
+    if let Some(singleton) = stmt.as_singleton_class_node() {
+        if singleton.expression().as_self_node().is_none() {
+            return false;
+        }
+        let names: Vec<_> = singleton
+            .body()
+            .map(flatten_statements)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(visibility::definition)
+            .filter_map(|def| Some((hook_parameter(&def, true)?, def)))
+            .filter_map(|(param, def)| hook_callback_macro(&def, &param))
+            .collect();
+        for name in &names {
+            refuse_filter_hook(name, module, file, out);
+        }
+        return !names.is_empty();
+    }
+    let Some(def) = visibility::definition(stmt) else { return false };
+    let Some(param) = hook_parameter(&def, false) else { return false };
+    let Some(name) = hook_callback_macro(&def, &param) else { return false };
+    let read = (constant_id_str(&def.name()) == "included").then(|| hook_filters(&def, &param, file, super_is_inert)).flatten();
+    let Some((read, unguarded)) = read else {
+        refuse_filter_hook(name, module, file, out);
+        return true;
+    };
+    filters.extend(read);
+    out.hook_modules.push(module.clone());
+    let span = super::util::def_name_span(&def, file);
+    out.modelled_hooks.push(span);
+    if unguarded {
+        out.unguarded_hooks.push(span);
+    }
+    true
+}
+
+fn refuse_filter_hook(name: &str, module: &ClassId, file: &str, out: &mut ConcernFilterScan) {
+    out.hook_modules.push(module.clone());
+    out.refusals.push((
+        module.clone(),
+        file.to_string(),
+        format!(
+            "controller concern `{name}` in a `self.included` hook is not modelled (its effect is dropped from the output)"
+        ),
+    ));
+}
+
+/// The parameter of `self.included`, `self.append_features` or
+/// `self.prepended`.
+fn hook_parameter(def: &ruby_prism::DefNode<'_>, in_singleton_class: bool) -> Option<String> {
+    if constant_id_str(&def.name()) != "prepended" {
+        return included_hook_parameter(def, in_singleton_class);
+    }
+    if def.receiver().is_some_and(|r| r.as_self_node().is_some()) == in_singleton_class {
+        return None;
+    }
+    let params = def.parameters()?;
+    let [only] = params.requireds().iter().collect::<Vec<_>>().try_into().ok()?;
+    Some(constant_id_str(&only.as_required_parameter_node()?.name()).to_string())
+}
+
+/// Every filter a hook registers, and whether one registers with no
+/// guard, or `None` unless the whole hook is shapes this reads: a hook
+/// kept for its other statements would run the filter's registration
+/// again at load.
+fn hook_filters(
+    def: &ruby_prism::DefNode<'_>,
+    param: &str,
+    file: &str,
+    super_is_inert: bool,
+) -> Option<(Vec<crate::dialect::Filter>, bool)> {
+    let mut read = HookRead { param, file, super_is_inert, filters: Vec::new(), unguarded: false };
+    flatten_statements(def.body()?)
+        .iter()
+        .all(|stmt| read.statement(stmt, false, false))
+        .then_some((read.filters, read.unguarded))
+}
+
+struct HookRead<'a> {
+    param: &'a str,
+    file: &'a str,
+    super_is_inert: bool,
+    filters: Vec<crate::dialect::Filter>,
+    unguarded: bool,
+}
+
+impl HookRead<'_> {
+    /// One hook statement: a `super` that reaches nothing the emitted
+    /// controller would miss, `base.<macro>`, `base.class_eval { ... }`
+    /// or `instance_eval`, each optionally under a guard Rails answers
+    /// true on a controller. Inside the eval block the receiver of a
+    /// macro is implicit, and `self` is `base`.
+    fn statement(&mut self, stmt: &Node<'_>, in_eval: bool, guarded: bool) -> bool {
+        if stmt.as_forwarding_super_node().is_some() || stmt.as_super_node().is_some() {
+            return !in_eval && self.super_is_inert && is_bare_forward(stmt, self.param);
+        }
+        if let Some(body) = decided_hook_guard_body(stmt, self.param, in_eval) {
+            return body.iter().all(|inner| self.statement(inner, in_eval, true));
+        }
+        let Some(call) = stmt.as_call_node() else { return false };
+        if !in_eval && receiver_is_local(call.receiver(), self.param) {
+            if let Some(body) = hook_eval_body(&call) {
+                return body.iter().all(|inner| self.statement(inner, true, guarded));
+            }
+        }
+        // Outside an eval block only `base.<macro>` reaches the includer: a bare
+        // call in the hook runs on the module itself.
+        if !in_eval && !receiver_is_local(call.receiver(), self.param) {
+            return false;
+        }
+        let receiver = (!in_eval).then_some(self.param);
+        let read = match super::controller::parse_filter_call_on(stmt, self.file, receiver) {
+            Ok(Some(read)) => read,
+            Ok(None) if in_eval => match block_form_concern_filter(stmt, self.file) {
+                Some(filter) => vec![filter],
+                None => return false,
+            },
+            _ => return false,
+        };
+        self.filters.extend(read);
+        self.unguarded |= !guarded;
+        true
+    }
+}
+
+/// `super` or `super(base)`, with no block: what `ActiveSupport::Concern#included`
+/// hands on to `Module#included`, which does nothing. `super()` raises
+/// without a Concern, and a block is one the Concern keeps.
+fn is_bare_forward(stmt: &Node<'_>, param: &str) -> bool {
+    if let Some(forward) = stmt.as_forwarding_super_node() {
+        return forward.block().is_none();
+    }
+    let Some(explicit) = stmt.as_super_node() else { return false };
+    if explicit.block().is_some() {
+        return false;
+    }
+    let args: Vec<_> = explicit.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    matches!(args.as_slice(), [only] if only.as_local_variable_read_node().is_some_and(|read| constant_id_str(&read.name()) == param))
+}
+
+/// Whether a module's singleton class gets more than `ActiveSupport::Concern`:
+/// an `extend`, or an `include`/`prepend` in `class << self` or through
+/// `singleton_class`. `super` in its `included` reaches that method, and
+/// a hook dropped from the emitted module cannot run it.
+fn singleton_ancestors_beyond_concern(statements: Vec<Node<'_>>) -> bool {
+    statements.iter().any(|stmt| {
+        if let Some(singleton) = stmt.as_singleton_class_node() {
+            return singleton.expression().as_self_node().is_some()
+                && singleton.body().map(flatten_statements).unwrap_or_default().iter().any(|inner| {
+                    inner.as_call_node().is_some_and(|call| {
+                        call.receiver().is_none()
+                            && matches!(constant_id_str(&call.name()), "include" | "prepend" | "extend")
+                    })
+                });
+        }
+        let Some(call) = stmt.as_call_node() else { return false };
+        let on_singleton_class = call.receiver().and_then(|r| r.as_call_node()).is_some_and(|recv| {
+            constant_id_str(&recv.name()) == "singleton_class" && recv.arguments().is_none()
+        });
+        let on_module = call.receiver().is_none_or(|r| r.as_self_node().is_some());
+        on_singleton_class
+            || (on_module
+                && constant_id_str(&call.name()) == "extend"
+                && !call.arguments().is_some_and(|args| {
+                    let args: Vec<_> = args.arguments().iter().collect();
+                    matches!(args.as_slice(), [only] if constant_path_of(only).is_some_and(|p| p.join("::") == "ActiveSupport::Concern"))
+                }))
+    })
+}
+
+fn receiver_is_local(receiver: Option<Node<'_>>, local: &str) -> bool {
+    receiver.is_some_and(|r| {
+        r.as_local_variable_read_node().is_some_and(|read| constant_id_str(&read.name()) == local)
+    })
+}
+
+/// The statements of `base.class_eval do ... end` or `instance_eval`,
+/// with a literal block that takes no parameters.
+fn hook_eval_body<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Vec<Node<'pr>>> {
+    if !matches!(constant_id_str(&call.name()), "class_eval" | "instance_eval") || call.arguments().is_some() {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    Some(block.body().map(flatten_statements).unwrap_or_default())
+}
+
+/// The statements under a guard every controller answers true:
+/// `respond_to?(:macro)` or `methods.include?(:macro)`, asked of `base`,
+/// or of the implicit receiver inside an eval block. A guard with an
+/// `else` is not one of these.
+fn decided_hook_guard_body<'pr>(stmt: &Node<'pr>, param: &str, in_eval: bool) -> Option<Vec<Node<'pr>>> {
+    let if_node = stmt.as_if_node()?;
+    if if_node.subsequent().is_some() {
+        return None;
+    }
+    let is_base = |receiver: Option<Node<'_>>| match receiver {
+        None => in_eval,
+        Some(node) => (in_eval && node.as_self_node().is_some()) || receiver_is_local(Some(node), param),
+    };
+    let predicate = if_node.predicate().as_call_node()?;
+    let asks_base = match constant_id_str(&predicate.name()) {
+        "respond_to?" => is_base(predicate.receiver()),
+        "include?" => predicate.receiver().and_then(|r| r.as_call_node()).is_some_and(|methods| {
+            constant_id_str(&methods.name()) == "methods"
+                && methods.arguments().is_none()
+                && is_base(methods.receiver())
+        }),
+        _ => false,
+    };
+    if !asks_base {
+        return None;
+    }
+    let args: Vec<_> = predicate.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    if !CONTROLLER_CALLBACK_MACROS.contains(&symbol_value(arg)?.as_str()) {
+        return None;
+    }
+    Some(if_node.statements().map(|s| flatten_statements(s.as_node())).unwrap_or_default())
+}
+
+/// A callback macro a hook registers on `base`, however it is spelled,
+/// including through `send`.
+fn hook_callback_macro(def: &ruby_prism::DefNode<'_>, param: &str) -> Option<&'static str> {
+    struct Finder<'a> {
+        param: &'a str,
         found: Option<&'static str>,
     }
-    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'_> {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if self.found.is_none() {
-                let on_param = node.receiver().is_some_and(|r| {
-                    r.as_local_variable_read_node()
-                        .is_some_and(|read| constant_id_str(&read.name()) == self.param)
-                });
+                let on_param = receiver_is_local(node.receiver(), self.param);
                 let name = constant_id_str(&node.name());
+                let macro_named = |name: &str| CONTROLLER_CALLBACK_MACROS.iter().find(|m| **m == name).copied();
                 self.found = if on_param {
-                    CONTROLLER_CALLBACK_MACROS.iter().find(|m| **m == name).copied()
+                    macro_named(name)
                 } else {
                     callback_macro_name(&node.as_node())
                 };
+                if self.found.is_none()
+                    && (on_param || node.receiver().is_none_or(|r| r.as_self_node().is_some()))
+                    && matches!(name, "send" | "public_send" | "__send__")
+                {
+                    self.found = node
+                        .arguments()
+                        .and_then(|a| a.arguments().iter().next())
+                        .and_then(|first| symbol_value(&first))
+                        .and_then(|sent| macro_named(&sent));
+                }
             }
             ruby_prism::visit_call_node(self, node);
         }
@@ -5619,7 +5865,6 @@ fn included_hook_callback_macro(def: &ruby_prism::DefNode<'_>) -> Option<&'stati
         fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
         fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
     }
-    let param = included_hook_parameter(def, false)?;
     let mut finder = Finder { param, found: None };
     ruby_prism::Visit::visit(&mut finder, &def.body()?);
     finder.found
@@ -5647,6 +5892,10 @@ fn nested_callback_macro_name(stmt: &Node<'_>) -> Option<&'static str> {
 
 /// The class methods `AbstractController::Callbacks` and
 /// `RequestForgeryProtection` give every controller.
+pub(super) fn is_controller_callback_macro(name: &str) -> bool {
+    CONTROLLER_CALLBACK_MACROS.contains(&name)
+}
+
 const CONTROLLER_CALLBACK_MACROS: &[&str] = &[
     "before_action",
     "prepend_before_action",

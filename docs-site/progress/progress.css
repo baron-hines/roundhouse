@@ -54,6 +54,8 @@ svg.fig { display: block; overflow: visible; }
 .f-tick { fill: var(--rh-bg-deep); font: 700 11px var(--sans); }
 .f-open { fill: none; stroke: var(--rh-prism-red); stroke-width: 1; stroke-dasharray: 2 2; }
 .f-cross { fill: var(--rh-prism-red); font: 700 10px var(--sans); }
+.f-unknown { fill: none; stroke: var(--rh-text-dim); stroke-width: 1; stroke-dasharray: 2 2; }
+.f-query { fill: var(--rh-text-muted); font: 700 10px var(--sans); }
 .f-ref { fill: var(--rh-text-faint); }
 .f-label { fill: var(--muted); font: 11px var(--mono); }
 .f-week { fill: var(--rh-prism-cyan); }
@@ -372,8 +374,9 @@ svg.fig { display: block; overflow: visible; }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .group > summary::after, .row > summary::after { transition: none; } }
 @media (forced-colors: active) {
   .f-pass, .f-ok, .f-bad, .f-ref, .f-week, .f-base, .chart .dot { fill: CanvasText; forced-color-adjust: none; }
-  .f-gap, .f-open, .f-week.partial { stroke: CanvasText; forced-color-adjust: none; }
+  .f-gap, .f-open, .f-unknown, .f-week.partial { stroke: CanvasText; forced-color-adjust: none; }
   .f-tick { fill: Canvas; forced-color-adjust: none; }
+  .f-cross, .f-query { fill: CanvasText; forced-color-adjust: none; }
   .bars .wk { background: CanvasText; forced-color-adjust: none; }
   .share { background-image: linear-gradient(CanvasText, CanvasText); forced-color-adjust: none; }
   .chart .line { stroke: CanvasText; }

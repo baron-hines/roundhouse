@@ -754,10 +754,23 @@ pub(super) fn parse_filter_call(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
+    parse_filter_call_on(stmt, file, None)
+}
+
+/// [`parse_filter_call`], also reading a call on the local `receiver`: the
+/// `base` of a `def self.included(base)` hook.
+pub(super) fn parse_filter_call_on(
+    stmt: &Node<'_>,
+    file: &str,
+    receiver: Option<&str>,
+) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
     use crate::dialect::{Filter, FilterKind};
 
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
-    if call.receiver().is_some() {
+    let on_receiver = call.receiver().is_some_and(|r| {
+        r.as_local_variable_read_node().is_some_and(|read| Some(constant_id_str(&read.name())) == receiver)
+    });
+    if call.receiver().is_some() && !on_receiver {
         return Ok(None);
     }
     let macro_name = constant_id_str(&call.name());

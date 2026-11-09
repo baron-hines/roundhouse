@@ -813,6 +813,21 @@ fn scan_lookup_demand(controllers: &[Controller], specs: &mut ParamsSpecs) {
                         blocked.push(class);
                     }
                 }
+                // `<permit-chain>.tap { |p| p.require(:key) }`: the block
+                // parameter is the params object itself.
+                if let ExprNode::Send { recv: Some(recv), method, block: Some(block), .. } = &*expr.node
+                    && method.as_str() == "tap"
+                    && let ExprNode::Lambda { params, body, .. } = &*block.node
+                    && let [param] = params.as_slice()
+                    && block_requires_key(body, param)
+                    && let Some(class) = sources.class(recv, specs).or_else(|| {
+                        match_permit_call_full(recv).and_then(|(resource, fields, _)| {
+                            specs.find(&resource, &fields, &nested_signature(recv)).map(|spec| spec.class_id.clone())
+                        })
+                    })
+                {
+                    calls.push((class, Symbol::from("require")));
+                }
                 let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else {
                     return;
                 };
@@ -870,6 +885,22 @@ fn scan_lookup_demand(controllers: &[Controller], specs: &mut ParamsSpecs) {
             }
         }
     }
+}
+
+/// Whether `body` calls `<param>.require(:key)` with a literal Symbol.
+fn block_requires_key(body: &Expr, param: &Symbol) -> bool {
+    let mut found = false;
+    walk_all(body, &mut |e| {
+        if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node
+            && method.as_str() == "require"
+            && matches!(&*recv.node, ExprNode::Var { name, .. } if name == param)
+            && let [key] = args.as_slice()
+            && sym_of(key).is_some()
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Second phase: which specs a `<Model>.create(<helper>)` call site
@@ -2046,6 +2077,9 @@ fn build_params_class(spec: &ParamsSpec) -> LibraryClass {
             });
         }
         methods.push(synth_to_h(spec));
+        if spec.lookup_methods.contains(&Symbol::from("require")) {
+            methods.push(super::params_values::require_method(spec));
+        }
         if spec.wants_as_json {
             methods.push(synth_as_json(&spec.class_id));
         }

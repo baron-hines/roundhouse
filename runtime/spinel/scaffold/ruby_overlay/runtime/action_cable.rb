@@ -681,9 +681,15 @@ module ActionCable
       # controllers use. Handing it a real signed jar is what makes
       # `connect` the app's code rather than a reimplementation of it.
       attr_reader :cookies
+      attr_writer :request
+
+      def request
+        @request ||= ActionDispatch::Request.for({})
+      end
 
       def initialize(cookies)
         @cookies = cookies
+        @request = nil
       end
 
       # Rails' Base does not define `connect`; a subclass that wants

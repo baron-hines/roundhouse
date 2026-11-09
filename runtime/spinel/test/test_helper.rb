@@ -1578,7 +1578,10 @@ module ActionDispatch
         request_path = request_path.partition("?")[0].partition("#")[0]
         request_path = "/" + request_path unless request_path.start_with?("/")
         table = ([RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table).reject { |route| route.controller == :roundhouse_redirects }
-        matched = ActionDispatch::Router.match(verb, request_path, table)
+        # Rails asks a route's request constraints with a mock request (`Rack::MockRequest.env_for`).
+        asked = ActionDispatch::Request.for({ "HTTP_HOST" => "example.org", "REQUEST_METHOD" => verb, "PATH_INFO" => request_path }, {})
+        asked.format = ActionDispatch::MimeNegotiation.format_name(request_path.split("/").last.to_s.include?(".") ? request_path.split("/").last.to_s.split(".").last.to_s : "", "", "", "")
+        matched = RouteTable.match_asking(verb, request_path, table, asked)
         matched = nil if request_path != "/" && request_path.end_with?("/")
         raise "No route matches #{path.inspect}" if matched.nil?
         controller = RouteTable::CONTROLLER_PATHS[matched.controller] || ActiveStorage::Routes::CONTROLLER_PATHS[matched.controller] || matched.controller.to_s
@@ -2440,8 +2443,20 @@ module RequestDispatch
       override = (params[:_method] || params["_method"]).to_s.upcase
       method = override if override == "PUT" || override == "PATCH" || override == "DELETE"
     end
-    matched = ActionDispatch::Router.match(
-      method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
+    # What a request constraint asks before its route is chosen (`RouteTable.match_asking`).
+    asked_env = { "HTTP_HOST" => host, "REMOTE_ADDR" => "127.0.0.1" }
+    headers.each { |k, v| asked_env[env_key(k.to_s)] = v.to_s }
+    asked_env["HTTPS"] = "on" if https?
+    asked = ActionDispatch::Request.for(asked_env, {})
+    last_segment = match_path.split("/").last.to_s
+    asked.format = ActionDispatch::MimeNegotiation.format_name(
+      last_segment.include?(".") ? last_segment.split(".").last.to_s : "",
+      asked_env.fetch("HTTP_ACCEPT", "").to_s,
+      asked_env.fetch("HTTP_X_REQUESTED_WITH", "").to_s,
+      as == :json ? "application/json" : ""
+    )
+    matched = RouteTable.match_asking(
+      method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table, asked
     )
     raise "No route matches #{method} #{path}" if matched.nil?
     controller = case matched.controller

@@ -175,8 +175,8 @@ pub(super) fn try_binary_operator(
     }
     // `x == "lit"` where x is a nilable column read: Rust can't compare
     // `Option<String>` with `&str`. Ruby's comparison is against the
-    // value, and nil never equals a string literal, so
-    // `unwrap_or_default()` preserves the answer on both sides.
+    // value, and nil never equals a string literal, not even `""`, so
+    // both sides compare as `Option<&str>`.
     if matches!(method, "==" | "!=") {
         let is_str_lit = |e: &Expr| {
             matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Str { .. } })
@@ -192,16 +192,13 @@ pub(super) fn try_binary_operator(
         if is_nilable_str(r) && is_str_lit(&args[0]) {
             let lhs = super::super::wrap_if_needs_parens(r, emit_expr(r));
             return Some(format!(
-                "{lhs}.clone().unwrap_or_default() {method} {}",
+                "{lhs}.as_deref() {method} Some({})",
                 emit_expr(&args[0])
             ));
         }
         if is_str_lit(r) && is_nilable_str(&args[0]) {
-            let lhs = super::super::wrap_if_needs_parens(r, emit_expr(r));
-            return Some(format!(
-                "{lhs} {method} {}.clone().unwrap_or_default()",
-                emit_expr(&args[0])
-            ));
+            let rhs = super::super::wrap_if_needs_parens(&args[0], emit_expr(&args[0]));
+            return Some(format!("Some({}) {method} {rhs}.as_deref()", emit_expr(r)));
         }
     }
     // Int / Int and Int % Int floor in Ruby; Rust's operators truncate.

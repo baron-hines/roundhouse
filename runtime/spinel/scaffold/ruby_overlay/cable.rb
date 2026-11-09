@@ -992,6 +992,9 @@ module Cable
 
     jar = ActionController::CookieJar.new(CgiIo.parse_cookies(env["HTTP_COOKIE"]))
     connection = ActionCable::Connection.build(jar)
+    params = {}
+    CgiIo.parse_form_into(env.fetch("QUERY_STRING", ""), params)
+    connection.request = ActionDispatch::Request.for(env, params)
     connection.connect
     connection
   rescue ActionCable::Connection::Authorization::UnauthorizedError

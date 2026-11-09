@@ -2224,6 +2224,7 @@ mod tests {
             refused: None,
             format_required: false,
             mount_root: false,
+            guards: Vec::new(),
         }
     }
 

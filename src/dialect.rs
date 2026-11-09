@@ -2212,6 +2212,10 @@ pub enum RouteSpec {
         /// still `message`/`messages`; only the class changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         controller: Option<String>,
+        /// `to: "trends#articles"`: the action every route of the resource dispatches to, with
+        /// `controller` taking the part before `#`, as Rails passes `to:` to each route.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<Symbol>,
         /// `resources :tasks, param: :task_id` — the name of the
         /// member segment. Rails binds `/tasks/:task_id` instead of
         /// `/tasks/:id`, and the controller reads `params[:task_id]`;
@@ -2308,6 +2312,9 @@ pub enum RouteSpec {
     /// Routes a gem's routing method draws under a scope it sets for itself (devise's
     /// `with_devise_exclusive_scope`): they take none of the enclosing scopes' path, module or name.
     Exclusive { entries: Vec<RouteSpec> },
+    /// Routes a request constraint guards (`constraints: ->(req) { … }`, `constraints(SomeGuard.new) do … end`):
+    /// a request it refuses goes on to the routes after them, as Rails' router does.
+    Guarded { guard: crate::expr::Expr, entries: Vec<RouteSpec> },
 }
 
 /// One `get "/path", to: "c#a"` entry. Kept as a standalone struct so

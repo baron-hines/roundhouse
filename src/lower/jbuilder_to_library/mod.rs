@@ -1202,6 +1202,125 @@ fn drop_blank_object(mark: Symbol, ctx: &Ctx) -> Expr {
     )
 }
 
+/// The records a pair's value writes as `as_json` does: `Some(None)` for
+/// a reader whose class the row decides and no closed set names.
+fn pair_record(value: &Expr, ctx: &Ctx) -> Option<Option<RecordValue>> {
+    ctx.span_types
+        .get(&value.span)
+        .and_then(|t| ctx.record_shapes.of_ty(t))
+        .map(Some)
+        // An association reader the analyzer left untyped (a polymorphic
+        // one): its records as the reader on the owner's model answers them.
+        .or_else(|| association_read(value, ctx))
+}
+
+/// A pair's value appended to the accumulator.
+fn push_pair_value(value: &Expr, src: &Expr, ctx: &Ctx, out: &mut Vec<Expr>) {
+    if let Some(record) = pair_record(value, ctx) {
+        let value = rewrite_h_escape(&rewrite_route_helpers(value, ctx));
+        out.extend(record_value_or_refusal(value, record.as_ref(), src.span, ctx));
+    } else {
+        let encoded = temporal_column_read(value, ctx)
+            .and_then(|(obj, col)| temporal_column_json(&obj, &col, ctx.arg_columns.get(&col)?))
+            .unwrap_or_else(|| {
+                json_builder_encode(rewrite_h_escape(&rewrite_route_helpers(value, ctx)))
+            });
+        out.push(io_append_call(&ctx.accumulator, encoded));
+    }
+}
+
+/// `json.array!(values)`, one positional and no block: `classify` has no
+/// form for it outside this lowering.
+fn plain_array_value(stmt: &Expr) -> Option<&Expr> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*stmt.node else { return None };
+    if !is_json_receiver(recv) || method.as_str() != "array!" {
+        return None;
+    }
+    let [value] = args.as_slice() else { return None };
+    extract_hash(value).is_none().then_some(value)
+}
+
+/// The statement as an array value, for [`conditional_array`].
+fn is_array_value(stmt: &Expr) -> bool {
+    plain_array_value(stmt).is_some()
+        || matches!(
+            classify(stmt),
+            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } | JbStmt::ArrayExtract { .. }
+        )
+}
+
+/// A key block whose only statement is an `if`/`unless` with one
+/// `json.array!` on either side and nothing else: the array is the key's
+/// value when that side runs, and a side with no array sets nothing.
+/// `None` for any other body, including a side with more statements,
+/// which `emit_object_filled` handles as an object.
+fn conditional_array(body: &Expr) -> Option<(&Expr, Option<&Expr>, Option<&Expr>)> {
+    let stmts = flatten_cache_blocks(stmts_of(body));
+    let [only] = stmts.as_slice() else { return None };
+    let JbStmt::Cond { cond, then_branch, else_branch } = classify(only) else { return None };
+    fn side(branch: &Expr) -> Option<Option<&Expr>> {
+        match branch_stmts(branch).as_slice() {
+            [] => Some(None),
+            [stmt] if is_array_value(stmt) => Some(Some(*stmt)),
+            _ => None,
+        }
+    }
+    let (then_array, else_array) = (side(then_branch)?, side(else_branch)?);
+    (then_array.is_some() || else_array.is_some()).then_some((cond, then_array, else_array))
+}
+
+/// `value`, read once, as an array that `array!` answers `[]` for when it
+/// is nil (Jbuilder's `array!`); `emit` writes the rest. The block and
+/// extract forms bind and guard their collection themselves.
+fn nil_collection_guard(value: &Expr, ctx: &Ctx, emit: impl FnOnce(Expr) -> Vec<Expr>) -> Vec<Expr> {
+    let prepared = rewrite_h_escape(&rewrite_route_helpers(value, ctx));
+    let mut out = Vec::new();
+    let read = match &*prepared.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } => prepared,
+        _ => {
+            let n = ctx.temps.get();
+            ctx.temps.set(n + 1);
+            let name = Symbol::from(format!("__val{n}"));
+            out.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value: prepared },
+            ));
+            let mut read = var_ref(name);
+            read.span = value.span;
+            read.ty = value.ty.clone();
+            read
+        }
+    };
+    out.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send(Some(read.clone()), "nil?", Vec::new(), None, false),
+            then_branch: io_append_lit(&ctx.accumulator, "[]"),
+            else_branch: seq(emit(read)),
+        },
+    ));
+    out
+}
+
+/// What one array statement of a [`conditional_array`] appends.
+fn array_value_appends(stmt: &Expr, ctx: &Ctx) -> Vec<Expr> {
+    if let Some(value) = plain_array_value(stmt) {
+        let record = pair_record(value, ctx);
+        return nil_collection_guard(value, ctx, |read| match record {
+            Some(record) => record_value_or_refusal(read, record.as_ref(), stmt.span, ctx),
+            None => vec![io_append_call(&ctx.accumulator, json_builder_encode(read))],
+        });
+    }
+    match classify(stmt) {
+        JbStmt::ArrayPartial { collection, partial_path, item_var } => {
+            nil_collection_guard(collection, ctx, |read| emit_array_partial(&read, &partial_path, &item_var, ctx))
+        }
+        JbStmt::ArrayBlock { collection, item_var, body } => emit_array_block(collection, &item_var, body, ctx),
+        JbStmt::ArrayExtract { collection, attrs } => emit_array_extract(collection, &attrs, ctx),
+        _ => Vec::new(),
+    }
+}
+
 /// The statements of an `if` branch. A missing `else` (and the empty
 /// side of a modifier) ingests as `nil`, which has no pairs.
 fn branch_stmts(branch: &Expr) -> Vec<&Expr> {
@@ -1303,24 +1422,7 @@ fn emit_pairs(
                 // `encode_value` would otherwise render `Time#to_s`
                 // ("2026-09-12 13:26:25 UTC") where Rails renders
                 // `xmlschema(3)` ("2026-09-12T13:26:25.149Z").
-                // A record, or records: as `as_json` writes them.
-                if let Some(record) = ctx.span_types.get(&value.span).and_then(|t| ctx.record_shapes.of_ty(t)) {
-                    let value = rewrite_h_escape(&rewrite_route_helpers(value, ctx));
-                    out.extend(record_value_or_refusal(value, Some(&record), src.span, ctx));
-                } else if let Some(record) = association_read(value, ctx) {
-                    // An association reader the analyzer left untyped
-                    // (a polymorphic one): its records as the reader
-                    // on the owner's model answers them.
-                    let value = rewrite_h_escape(&rewrite_route_helpers(value, ctx));
-                    out.extend(record_value_or_refusal(value, record.as_ref(), src.span, ctx));
-                } else {
-                    let encoded = temporal_column_read(value, ctx)
-                        .and_then(|(obj, col)| temporal_column_json(&obj, &col, ctx.arg_columns.get(&col)?))
-                        .unwrap_or_else(|| {
-                            json_builder_encode(rewrite_h_escape(&rewrite_route_helpers(value, ctx)))
-                        });
-                    out.push(io_append_call(&ctx.accumulator, encoded));
-                }
+                push_pair_value(value, src, ctx, out);
                 sep = Sep::After;
             }
             JbStmt::PairPartial { key, partial_path, arg, as_name } => {
@@ -1370,6 +1472,40 @@ fn emit_pairs(
                     ));
                 }
                 sep = Sep::After;
+            }
+            JbStmt::Nested { key, body } if conditional_array(body).is_some() => {
+                let (cond, then_array, else_array) = conditional_array(body).expect("guarded above");
+                let n = ctx.key_marks.get();
+                ctx.key_marks.set(n + 1);
+                let mark = Symbol::from(format!("{}_key{n}", ctx.accumulator));
+                out.push(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Assign {
+                        target: LValue::Var { id: VarId(0), name: mark.clone() },
+                        value: io_length(ctx),
+                    },
+                ));
+                push_separator(out, ctx, sep);
+                out.push(io_append_lit(
+                    &ctx.accumulator,
+                    &format!("\"{}\":", key.as_str()),
+                ));
+                // The side with no array sets nothing: an empty object,
+                // which `drop_blank_object` takes back with its key.
+                let side = |array: Option<&Expr>| match array {
+                    Some(stmt) => seq(array_value_appends(stmt, ctx)),
+                    None => io_append_lit(&ctx.accumulator, "{}"),
+                };
+                out.push(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond: cond.clone(),
+                        then_branch: side(then_array),
+                        else_branch: side(else_array),
+                    },
+                ));
+                out.push(drop_blank_object(mark, ctx));
+                sep = if sep == Sep::After { Sep::After } else { Sep::Unknown };
             }
             JbStmt::Nested { key, body } => {
                 let (object, filled) =

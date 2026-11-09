@@ -21,8 +21,9 @@ module ActionDispatch
       def part_count: () -> Integer
       def globbed: () -> bool
       def lead: () -> String
+      def guard: () -> Integer
 
-      def initialize: (String verb, String pattern, Symbol controller, Symbol action, ?Symbol? req_format, ?String int_params, ?String seg_constraints) -> void
+      def initialize: (String verb, String pattern, Symbol controller, Symbol action, ?Symbol? req_format, ?String int_params, ?String seg_constraints, ?Integer guard) -> void
     end
 
     # Successful match result: the resolved controller + action symbols
@@ -32,8 +33,10 @@ module ActionDispatch
       def action: () -> Symbol
       def path_params: () -> Hash[String, String]
       def req_format: () -> Symbol?
+      def index: () -> Integer
+      def guard: () -> Integer
 
-      def initialize: (Symbol controller, Symbol action, Hash[String, String] path_params, ?Symbol? req_format) -> void
+      def initialize: (Symbol controller, Symbol action, Hash[String, String] path_params, ?Symbol? req_format, ?Integer index, ?Integer guard) -> void
     end
 
     # Match a request against the route table. Returns a MatchResult
@@ -50,6 +53,14 @@ module ActionDispatch
       Array[::ActionDispatch::Router::Route] table
     ) -> ::ActionDispatch::Router::MatchResult?
 
+    # `match` over the routes from `start` on.
+    def self.match_from: (
+      String method,
+      String path,
+      Array[::ActionDispatch::Router::Route] table,
+      Integer start
+    ) -> ::ActionDispatch::Router::MatchResult?
+
     # One table scan for a literal path, with the format extension the
     # request carried (`.turbo_stream` stripped off the last segment by
     # `match`) — the empty string when the path carried none. A match
@@ -60,7 +71,8 @@ module ActionDispatch
       String path,
       Array[::ActionDispatch::Router::Route] table,
       String format,
-      bool unpeeled
+      bool unpeeled,
+      Integer start
     ) -> ::ActionDispatch::Router::MatchResult?
 
     # `scan_routes`, retried once with the root read as one empty segment.
@@ -69,7 +81,8 @@ module ActionDispatch
       Array[String] path_parts,
       Array[::ActionDispatch::Router::Route] table,
       String format,
-      bool unpeeled
+      bool unpeeled,
+      Integer start
     ) -> ::ActionDispatch::Router::MatchResult?
 
     # One pass of the table for one (already upcased) verb over the
@@ -79,7 +92,8 @@ module ActionDispatch
       Array[String] path_parts,
       Array[::ActionDispatch::Router::Route] table,
       String format,
-      bool unpeeled
+      bool unpeeled,
+      Integer start
     ) -> ::ActionDispatch::Router::MatchResult?
 
     # Does `route` hold its `(.:format)` to a requirement and end in a

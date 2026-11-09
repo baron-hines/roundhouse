@@ -59,7 +59,11 @@ module ActionDispatch
     def forwarded_authority: () -> String
     def trusted_forwarded_peer?: () -> bool
     def host_authority?: (String value) -> bool
-    def format: () -> String
+    def format: () -> Mime::Type
+    def domain: () -> String?
+    def subdomains: () -> Array[String]
+    def subdomain: () -> String
+    def named_host_parts: () -> Array[String]
     def format=: (untyped value) -> untyped
     def body: () -> RequestBody
     def body=: (String) -> String

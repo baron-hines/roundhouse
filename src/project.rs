@@ -3541,6 +3541,9 @@ fn target_files_inner(
     for d in crate::lower::relation_residue::default_scope_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
+    for d in crate::lower::route_guards::route_guard_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
     for d in crate::lower::model_to_library::select_aliases::select_alias_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
@@ -8314,7 +8317,7 @@ fn apply_controller_dispatch(files: &mut [(String, String)], app: &App, lazy_req
     // of theirs.
     const HARDCODED: &str = "  def self.instantiate_controller(sym)\n    case sym\n    when :articles then ArticlesController.new\n    when :comments then CommentsController.new\n    else ActiveStorage::Routes.instantiate_controller(sym)\n    end\n  end";
 
-    let flat = crate::lower::flatten_routes(app);
+    let flat = crate::lower::routes::flatten_routes_reachable(app);
     let mut seen = crate::det::HashSet::default();
     let current_classes = &app.current_attribute_classes;
     let mut arms = String::new();
@@ -8760,6 +8763,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "OpenSSL::Digest::SHA384" | "OpenSSL::Digest::SHA512" | "OpenSSL" | "OpenSSL::KDF"
         | "OpenSSL::PKey" | "OpenSSL::PKey::PKey" | "OpenSSL::PKey::EC" | "OpenSSL::PKey::EC::Group"
         | "OpenSSL::PKey::PKeyError" | "OpenSSL::PKey::ECError" | "OpenSSL::Digest::DigestError" | "OpenSSL::KDF::KDFError"
+        | "OpenSSL::Cipher" | "OpenSSL::Cipher::CipherError" | "OpenSSL::Cipher::AuthTagError"
         // runtime/spinel/integration_session.rb and the ruby tree's twin.
         | "ActionDispatch::Integration::Session" | "ActionDispatch::TestResponse"
         // runtime/spinel/solid_queue.rb.
@@ -9058,7 +9062,25 @@ fn report_config_for(app: &App, target: BuildTarget) {
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, false, target.as_str()));
 }
 
+/// A generated enum `<column>_before_type_cast` needs the value as
+/// assigned. Roda too: it copies these calls without the ruby emit's reader.
+fn report_enum_before_type_cast(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Futamura) {
+        return;
+    }
+    let reads = if target == BuildTarget::Roda { crate::analyze::roda_generated_reads(app) } else { crate::analyze::generated_reads(app) };
+    for read in reads.into_iter().filter(|read| !read.span.is_synthetic()) {
+        emit::diagnostics::report_unsupported(
+            read.span,
+            target.as_str(),
+            "enum_before_type_cast",
+            format!("#{} needs the value as assigned, which only the ruby family and spinel keep; a stored-value reader is not equivalent", read.method),
+        );
+    }
+}
+
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
+    report_enum_before_type_cast(app, target);
     if puma_boot_hooks(app) && !matches!(target, BuildTarget::Blog | BuildTarget::Futamura | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         let method = app.library_classes.iter().find(|c| c.name.0.as_str() == crate::ingest::puma_boot::CLASS).unwrap().methods.iter()
             .find(|method| method.name.as_str() == crate::ingest::puma_boot::BOOTED).unwrap();
@@ -9172,6 +9194,32 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         }
     }
     fn visit(expr: &crate::expr::Expr, app: &App, target: &str) {
+        if target == "spinel"
+            && let crate::expr::ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node
+            && let Some(args) = (match method.as_str() {
+                "new" => Some(args.as_slice()),
+                "send" | "public_send" | "__send__" if args.first().and_then(|a| match &*a.node {
+                    crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.as_str()),
+                    crate::expr::ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.as_str()),
+                    _ => None,
+                }) == Some("new") => Some(&args[1..]),
+                _ => None,
+            })
+            && recv.decisions & crate::expr::CLASS_OBJECT_VALUE != 0
+            && recv.ty.as_ref().is_some_and(|ty| {
+                let cipher = std::cell::Cell::new(false);
+                ty.map_class_ids(&|id| { cipher.set(cipher.get() || (id.0.as_str() == "OpenSSL::Cipher"
+                    && !["new", method.as_str()].iter().any(|m| crate::analyze::source_class_method(app, id, m))
+                    && !app.library_classes.iter().any(|c| c.name == *id && c.methods.iter().any(|m|
+                        m.name.as_str() == "initialize" && m.receiver == crate::dialect::MethodReceiver::Instance)))); id.clone() });
+                cipher.get()
+            })
+            && !(args.len() == 1 && matches!(&*args[0].node, crate::expr::ExprNode::Lit {
+                value: crate::expr::Literal::Str { value } } if matches!(value.as_str(), "aes-128-gcm" | "aes-256-gcm")))
+        {
+            emit::diagnostics::report_unsupported(expr.span, target, "OpenSSL::Cipher.new",
+                "OpenSSL::Cipher.new requires a literal aes-128-gcm or aes-256-gcm on spinel");
+        }
         if target != "jruby" {
             report_not_nil(expr, app, target);
         }

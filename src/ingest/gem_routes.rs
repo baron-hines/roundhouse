@@ -91,6 +91,24 @@ pub(super) fn expand<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_dirs: &[std::path
     }
 }
 
+fn place_guards(entries: &mut [RouteSpec], span: crate::span::Span) {
+    fn place(e: &mut Expr, span: crate::span::Span) {
+        e.span = span;
+        e.node.for_each_child_mut(&mut |child| place(child, span));
+    }
+    for entry in entries {
+        match entry {
+            RouteSpec::Guarded { guard, entries } => {
+                place(guard, span);
+                place_guards(entries, span);
+            }
+            RouteSpec::Scope { entries, .. } | RouteSpec::Exclusive { entries } => place_guards(entries, span),
+            RouteSpec::Resources { nested, .. } => place_guards(nested, span),
+            _ => {}
+        }
+    }
+}
+
 /// `ActionDispatch::Routing::Mapper.include Helper`: its one effect, the mapper's new methods, is the
 /// routes this pass drew, so the emitted program does not run it (it has no mapper to extend).
 fn consume_installs(app: &mut App) {
@@ -158,7 +176,7 @@ fn rewrite(e: &mut Expr, is_install: &mut dyn FnMut(&Expr) -> bool) {
 fn contains_deferred(entries: &[RouteSpec]) -> bool {
     entries.iter().any(|e| match e {
         RouteSpec::Deferred { .. } => true,
-        RouteSpec::Scope { entries, .. } | RouteSpec::Exclusive { entries } => contains_deferred(entries),
+        RouteSpec::Scope { entries, .. } | RouteSpec::Exclusive { entries } | RouteSpec::Guarded { entries, .. } => contains_deferred(entries),
         RouteSpec::Resources { nested, .. } => contains_deferred(nested),
         _ => false,
     })
@@ -185,6 +203,7 @@ fn replace(entries: &mut Vec<RouteSpec>, app: &App, initializers: &[Expr], enclo
                 failed |= replace(entries, app, initializers, &inner, gaps)
             }
             RouteSpec::Exclusive { entries } => failed |= replace(entries, app, initializers, &Some((None, None, None)), gaps),
+            RouteSpec::Guarded { entries, .. } => failed |= replace(entries, app, initializers, enclosing, gaps),
             RouteSpec::Resources { nested, .. } => failed |= replace(nested, app, initializers, &None, gaps),
             RouteSpec::Deferred { call, span, constraints } => {
                 let drawn = draw(app, call, initializers, enclosing.clone());
@@ -198,6 +217,9 @@ fn replace(entries: &mut Vec<RouteSpec>, app: &App, initializers: &[Expr], enclo
                             gaps.push(crate::diagnostic::Diagnostic::unsupported(*span, None, method.as_str(), why));
                         }
                         super::routes::apply_outer_constraints(&mut inner, constraints);
+                        // Not at `<gem routes>`, which the drawn routes were read back from: a constraint the
+                        // method drew (`authenticate`) is reported where the app calls it.
+                        place_guards(&mut inner, *span);
                         RouteSpec::Scope {
                             path: None,
                             module: None,
@@ -251,16 +273,30 @@ fn draw(app: &App, call: &Expr, initializers: &[Expr], enclosing: Enclosing) -> 
     if lc.name.0.as_str() != "ActionDispatch::Routing::Mapper" {
         roots.push(lc.name.0.as_str().split("::").next().unwrap_or_default().to_string());
     }
-    visit(&def.body, &mut |e| {
-        if let ExprNode::Const { path } = &*e.node
-            && let Some(top) = path.iter().map(|s| s.as_str()).find(|s| !s.is_empty())
-            && app.library_classes.iter().any(|c| c.name.0.as_str() == top)
-            && !roots.iter().any(|r| r == top)
-            && top != "ActionDispatch"
-        {
-            roots.push(top.to_string());
-        }
-    });
+    // Not only its own body: one it calls on the mapper names its constants too (devise_token_auth's `mount_devise_token_auth_for` reaches `Devise` only through `devise_for`).
+    let methods = extensions(app);
+    let mut walked: Vec<&str> = vec![def.name.as_str()];
+    let mut bodies = vec![&def.body];
+    while let Some(body) = bodies.pop() {
+        visit(body, &mut |e| match &*e.node {
+            ExprNode::Const { path } => {
+                if let Some(top) = path.iter().map(|s| s.as_str()).find(|s| !s.is_empty())
+                    && app.library_classes.iter().any(|c| c.name.0.as_str() == top)
+                    && !roots.iter().any(|r| r == top)
+                    && top != "ActionDispatch"
+                {
+                    roots.push(top.to_string());
+                }
+            }
+            ExprNode::Send { recv: None, method, .. } if !walked.contains(&method.as_str()) => {
+                if let Some((_, m)) = methods.iter().find(|(_, m)| m.name == *method) {
+                    walked.push(m.name.as_str());
+                    bodies.push(&m.body);
+                }
+            }
+            _ => {}
+        });
+    }
     let scope = def.enclosing_class.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| lc.name.0.as_str().to_string());
     let mut mixins: Vec<String> = Vec::new();
     for (owner, _) in extensions(app) {

@@ -61,7 +61,7 @@ permalink: /progress/
         {%- if a and a.selected > 0 %}
         <td class="result"><b>{{ a.passed | escape }} / {{ a.selected | escape }}</b> <span>passed</span></td>
         <td class="fig">{{ a.figure }}</td>
-        <td class="scope">Does each published archive start and serve? Selected checks only{% if a.failed_text %}; {{ a.failed_text | escape }}{% endif %}.{% if st.archives.when %} <span class="when">{{ st.archives.when | escape }}</span>{% endif %}</td>
+        <td class="scope">Does each published archive start and serve? Selected checks only{% if a.failed_text %}; {{ a.failed_text | escape }}{% endif %}{% if a.unknown_text %}; {{ a.unknown_text | escape }}{% endif %}.{% if st.archives.when %} <span class="when">{{ st.archives.when | escape }}</span>{% endif %}</td>
         {%- else %}
         <td class="result na"><b>Not available</b></td><td class="fig"></td><td class="scope">{{ st.archives.note | default: "No selected checks in this run." | escape }}</td>
         {%- endif %}
@@ -139,7 +139,7 @@ permalink: /progress/
   {%- elsif g %}
   <p class="notice">Failure groups are withheld because this run couldn’t be verified. <a href="{{ g.report_url | web_url }}">Read the report</a>.</p>
   {%- else %}
-  <p class="notice">{{ st.specs.note | escape }} <a href="https://roundhouse-rb.dev/bench/lobsters-specs/">The report</a> has the latest result.</p>
+  <p class="notice">{{ st.specs.note | escape }} <a href="{{ site.status.lobsters_specs | web_url }}">The report</a> has the latest result.</p>
   {%- endif %}
 </section>
 <aside class="start" id="help" aria-labelledby="start-title">
@@ -220,7 +220,7 @@ permalink: /progress/
     {%- endif %}
     <p class="foot">Ruby {{ g.ruby | escape }} · Lobsters <a href="{{ g.lobsters_url | web_url }}"><code>{{ g.lobsters_sha | escape }}</code></a> · Roundhouse <a href="{{ g.roundhouse_url | web_url }}"><code>{{ g.roundhouse_sha | escape }}</code></a></p>
     {%- else %}
-    <p class="notice">{{ st.specs.note | escape }} The model specs run Lobsters’ own tests against the emitted Ruby; <a href="https://roundhouse-rb.dev/bench/lobsters-specs/">the report</a> has the latest result.</p>
+    <p class="notice">{{ st.specs.note | escape }} The model specs run Lobsters’ own tests against the emitted Ruby; <a href="{{ site.status.lobsters_specs | web_url }}">the report</a> has the latest result.</p>
     {%- endif %}
   </div>
 </section>
@@ -322,7 +322,7 @@ permalink: /progress/
     <dl class="checks">
       {%- for app in a.apps %}
       <dt>{{ app.app | escape }}</dt>
-      <dd><ul>{% for row in app.rows %}<li class="check {{ row.class | escape }}" title="{{ row.result | escape }}{% if row.detail %}. {{ row.detail | escape }}{% endif %}"><span aria-hidden="true">{% case row.class %}{% when "ok" %}✓{% when "fail" %}✕{% else %}–{% endcase %}</span> {{ row.name | escape }}<span class="sr">: {{ row.result | escape }}</span></li>{% endfor %}</ul></dd>
+      <dd><ul>{% for row in app.rows %}<li class="check {{ row.class | escape }}" title="{{ row.result | escape }}{% if row.detail %}. {{ row.detail | escape }}{% endif %}"><span aria-hidden="true">{% case row.class %}{% when "ok" %}✓{% when "fail" %}✕{% when "unknown" %}?{% else %}–{% endcase %}</span> {{ row.name | escape }}<span class="sr">: {{ row.result | escape }}</span></li>{% endfor %}</ul></dd>
       {%- endfor %}
     </dl>
     {%- if a.others.size > 0 %}

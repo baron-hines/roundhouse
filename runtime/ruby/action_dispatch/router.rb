@@ -26,7 +26,7 @@ module ActionDispatch
     # like this one.
     class Route
       attr_reader :verb, :pattern, :controller, :action, :req_format, :int_params,
-                  :pattern_parts, :seg_constraints, :part_count, :globbed, :lead
+                  :pattern_parts, :seg_constraints, :part_count, :globbed, :lead, :guard
 
       # `req_format` — the route-forced response format (Rails'
       # `get "/rss" => "home#index", :format => "rss"`), nil for the
@@ -55,7 +55,14 @@ module ActionDispatch
       # common case. A route whose requirement couldn't be compiled
       # into this subset is never emitted at all (see `lower::routes`),
       # so every `seg_constraints` this class ever sees is enforceable.
-      def initialize(verb, pattern, controller, action, req_format = nil, int_params = +"", seg_constraints = +"")
+      #
+      # `guard` — the index of the route's request constraint among the
+      # app's (`RouteTable.guard`), or -1 for none: Rails asks it with the
+      # request once the path matches, and a request it refuses goes on to
+      # the routes after this one. An Integer rather than a Proc so the
+      # table stays plain data on every target.
+      def initialize(verb, pattern, controller, action, req_format = nil, int_params = +"", seg_constraints = +"", guard = -1)
+        @guard       = guard
         @verb        = verb
         @pattern     = pattern
         @controller  = controller
@@ -98,19 +105,29 @@ module ActionDispatch
     # Replaces the prior `{ controller:, action:, path_params: }` hash
     # return shape. Positional initialize, same rationale as Route.
     class MatchResult
-      attr_reader :controller, :action, :path_params, :req_format
+      attr_reader :controller, :action, :path_params, :req_format, :index, :guard
 
-      def initialize(controller, action, path_params, req_format = nil)
+      # `index` — the matched route's position in the table, where
+      # `Router.match_from` resumes when its `guard` refuses the request.
+      def initialize(controller, action, path_params, req_format = nil, index = 0, guard = -1)
         @controller  = controller
         @action      = action
         @path_params = path_params
         @req_format  = req_format
+        @index       = index
+        @guard       = guard
       end
     end
 
     # Match a request against the route table. Returns a `MatchResult`
     # on success; nil otherwise.
     def self.match(method, path, table)
+      match_from(method, path, table, 0)
+    end
+
+    # `match`, over the routes from `start` on: a dispatcher whose matched
+    # route's guard refused the request asks again from the next one.
+    def self.match_from(method, path, table, start)
       # Rails' `(.:format)`: every route's last segment may carry a
       # `.ext` that names the RESPONSE FORMAT and is not part of the
       # path. `POST /rooms/3/messages.turbo_stream` is the same route as
@@ -157,17 +174,17 @@ module ActionDispatch
           # Trimming from the FULL path (rather than rewriting the
           # segment array and re-joining) avoids an array index
           # ASSIGNMENT, which is another shape not every emitter carries.
-          stripped = match_path(method, path[0, path.length - ext.length - 1].to_s, table, ext, false)
+          stripped = match_path(method, path[0, path.length - ext.length - 1].to_s, table, ext, false, start)
           return stripped unless stripped.nil?
           # The extension was a format no route took. A route holding
           # the format to a requirement (`constraints: { format: :csv }`,
           # `format: false`) must not take it now as part of a param
           # either: Rails' `[^/.?]+` segment never holds the dot, so
           # `/widgets/1.json` is a 404 there, not `id = "1.json"`.
-          return match_path(method, path, table, +"", true)
+          return match_path(method, path, table, +"", true, start)
         end
       end
-      match_path(method, path, table, +"", false)
+      match_path(method, path, table, +"", false, start)
     end
 
     # Is `ext` one of Rails' registered format extensions? The registry
@@ -218,12 +235,12 @@ module ActionDispatch
     # `unpeeled` is the literal-path retry after a registered extension
     # matched nothing stripped: a format-constrained route whose last
     # segment is a param sits it out (`Router.match`).
-    def self.match_path(method, path, table, format, unpeeled)
+    def self.match_path(method, path, table, format, unpeeled, start)
       method_upcase = method.to_s.upcase
       path_parts = path.split("/")
-      hit = scan_root_aware(method_upcase, path_parts, table, format, unpeeled)
+      hit = scan_root_aware(method_upcase, path_parts, table, format, unpeeled, start)
       if hit.nil? && method_upcase == "HEAD"
-        return scan_root_aware("GET", path_parts, table, format, unpeeled)
+        return scan_root_aware("GET", path_parts, table, format, unpeeled, start)
       end
       hit
     end
@@ -236,17 +253,17 @@ module ActionDispatch
     # segment; `match_parts` accepts an empty value only where the
     # route's own constraint admits it, so an unconstrained `/:id` or a
     # `*glob` still refuses the root, as in Rails.
-    def self.scan_root_aware(method_upcase, path_parts, table, format, unpeeled)
-      hit = scan_routes(method_upcase, path_parts, table, format, unpeeled)
+    def self.scan_root_aware(method_upcase, path_parts, table, format, unpeeled, start)
+      hit = scan_routes(method_upcase, path_parts, table, format, unpeeled, start)
       return hit unless hit.nil? && path_parts.empty?
-      scan_routes(method_upcase, ["", ""], table, format, unpeeled)
+      scan_routes(method_upcase, ["", ""], table, format, unpeeled, start)
     end
 
     # One pass of the table for one verb, over the already-split path.
-    def self.scan_routes(method_upcase, path_parts, table, format, unpeeled)
+    def self.scan_routes(method_upcase, path_parts, table, format, unpeeled, start)
       count = path_parts.length
       lead = count > 1 ? path_parts[1].to_s : +""
-      i = 0
+      i = start
       while i < table.length
         route = table[i]
         # "ANY" is `match …, via: :all`: Rails routes it for every verb.
@@ -267,7 +284,7 @@ module ActionDispatch
              !(unpeeled && format_held_param_tail(route))
             params = match_parts(route.pattern_parts, path_parts, route.int_params + "", format, route.seg_constraints + "")
             unless params.nil?
-              return ActionDispatch::Router::MatchResult.new(route.controller, route.action, params, route.req_format)
+              return ActionDispatch::Router::MatchResult.new(route.controller, route.action, params, route.req_format, i, route.guard)
             end
           end
         end

@@ -6,6 +6,9 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
+#[path = "support/small_rails_gaps_app.rs"]
+mod small_rails_gaps_app;
+
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write(

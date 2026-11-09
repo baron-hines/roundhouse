@@ -8,7 +8,7 @@
 
 use ruby_prism::Node;
 
-use super::super::super::util::{constant_id_str, flatten_statements};
+use super::super::super::util::{constant_id_str, flatten_statements, string_value, symbol_value};
 use super::EnumConstants;
 use crate::expr::Literal;
 
@@ -57,6 +57,39 @@ pub(super) enum Recipe {
     EnumOf { path: String, owners: Vec<String>, method: String },
     Keys(Box<Recipe>),
     Merge(Box<Recipe>, Box<Recipe>),
+    /// One literal label: the argument of `<<`.
+    Label(String),
+    /// `a + b` over label lists.
+    Concat(Box<Recipe>, Box<Recipe>),
+    /// `a << b`, with `a` a list this expression built.
+    Push(Box<Recipe>, Box<Recipe>),
+    /// `a.flatten`.
+    Flatten(Box<Recipe>),
+}
+
+/// An element of a label list being folded: `<<` with an Array nests it,
+/// and only `flatten` takes it back out.
+#[derive(Clone)]
+enum ListItem {
+    Label(String),
+    Nested(Vec<String>),
+}
+
+/// Whether `node` is an Array the expression itself built, which `<<` can
+/// append to. `BASE << :x` writes to the constant, and a frozen one
+/// raises: neither folds.
+fn fresh_list(node: &Node<'_>) -> bool {
+    if let Some(parentheses) = node.as_parentheses_node() {
+        let Some(body) = parentheses.body() else { return false };
+        let statements = flatten_statements(body);
+        return matches!(statements.as_slice(), [only] if fresh_list(only));
+    }
+    if node.as_array_node().is_some() {
+        return true;
+    }
+    node.as_call_node().is_some_and(|call| {
+        call.block().is_none() && matches!(constant_id_str(&call.name()).as_ref(), "dup" | "+" | "<<" | "flatten")
+    })
 }
 
 /// One `enum` declaration an owner's body makes, by column.
@@ -142,6 +175,18 @@ impl Recipe {
                 Box::new(Recipe::of(&receiver, owners, table, file)?),
                 Box::new(Recipe::of(other, owners, table, file)?),
             )),
+            ("flatten", []) => Some(Recipe::Flatten(Box::new(Recipe::of(&receiver, owners, table, file)?))),
+            ("+", [other]) => Some(Recipe::Concat(
+                Box::new(Recipe::of(&receiver, owners, table, file)?),
+                Box::new(Recipe::of(other, owners, table, file)?),
+            )),
+            ("<<", [other]) if fresh_list(&receiver) => {
+                let item = match symbol_value(other).or_else(|| string_value(other)) {
+                    Some(label) => Recipe::Label(label),
+                    None => Recipe::of(other, owners, table, file)?,
+                };
+                Some(Recipe::Push(Box::new(Recipe::of(&receiver, owners, table, file)?), Box::new(item)))
+            }
             (_, []) => {
                 let path = EnumConstants::path(&receiver)?;
                 let lowercase = method.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_');
@@ -204,7 +249,12 @@ impl Recipe {
             Recipe::EnumOf { .. } => true,
             Recipe::Keys(inner) => inner.reads_enum_method(),
             Recipe::Merge(left, right) => left.reads_enum_method() || right.reads_enum_method(),
-            Recipe::Fixed(_) | Recipe::Const { .. } => false,
+            Recipe::Fixed(_)
+            | Recipe::Const { .. }
+            | Recipe::Label(_)
+            | Recipe::Concat(..)
+            | Recipe::Push(..)
+            | Recipe::Flatten(_) => false,
         }
     }
 }
@@ -262,6 +312,14 @@ impl EnumConstants {
     /// order: refused.
     fn evaluate(&self, recipe: &Recipe, loading: &mut Vec<String>) -> Option<Value> {
         match recipe {
+            Recipe::Label(_) => None,
+            Recipe::Concat(..) | Recipe::Push(..) | Recipe::Flatten(_) => {
+                let labels = self.list_items(recipe)?.into_iter().map(|item| match item {
+                    ListItem::Label(label) => Some(label),
+                    ListItem::Nested(_) => None,
+                });
+                Some(Value::List(labels.collect::<Option<Vec<_>>>()?))
+            }
             Recipe::Fixed(value) => Some(value.clone()),
             Recipe::Const { path, owners } => {
                 let name = self.resolve_name(path, owners)?;
@@ -323,6 +381,54 @@ impl EnumConstants {
                 }
                 Some(Value::Map { pairs: out, indifferent: true })
             }
+        }
+    }
+
+    /// The elements of a label list built by `+`, `<<` and `flatten` from
+    /// literal lists and constants holding one. Nothing else folds, so a
+    /// Hash constant or another owner's enum refuses the whole expression.
+    fn list_items(&self, recipe: &Recipe) -> Option<Vec<ListItem>> {
+        match recipe {
+            Recipe::Fixed(Value::List(labels)) => Some(labels.iter().cloned().map(ListItem::Label).collect()),
+            Recipe::Const { path, owners } => {
+                if !self.snapshot_constant_is_stable(path, owners) {
+                    return None;
+                }
+                let (_, member, table) = self.owner_constant(path, owners)?;
+                Some(table.labels.get(&member)?.iter().cloned().map(ListItem::Label).collect())
+            }
+            Recipe::Concat(left, right) => {
+                let mut items = self.list_items(left)?;
+                items.extend(self.list_items(right)?);
+                Some(items)
+            }
+            Recipe::Push(list, item) => {
+                let mut items = self.list_items(list)?;
+                items.push(match item.as_ref() {
+                    Recipe::Label(label) => ListItem::Label(label.clone()),
+                    other => ListItem::Nested(
+                        self.list_items(other)?
+                            .into_iter()
+                            .map(|element| match element {
+                                ListItem::Label(label) => Some(label),
+                                ListItem::Nested(_) => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                    ),
+                });
+                Some(items)
+            }
+            Recipe::Flatten(list) => Some(
+                self.list_items(list)?
+                    .into_iter()
+                    .flat_map(|item| match item {
+                        ListItem::Label(label) => vec![label],
+                        ListItem::Nested(labels) => labels,
+                    })
+                    .map(ListItem::Label)
+                    .collect(),
+            ),
+            _ => None,
         }
     }
 

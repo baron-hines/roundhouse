@@ -1017,6 +1017,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("OpenSSL::PKey::ECError", "OpenSSL::PKey::PKeyError"),
         ("OpenSSL::Digest::DigestError", "OpenSSL::OpenSSLError"),
         ("OpenSSL::KDF::KDFError", "OpenSSL::OpenSSLError"),
+        ("OpenSSL::Cipher::CipherError", "OpenSSL::OpenSSLError"),
+        ("OpenSSL::Cipher::AuthTagError", "OpenSSL::Cipher::CipherError"),
     ] {
         let surface = if matches!(exc, "OpenSSL::PKey::PKeyError" | "OpenSSL::PKey::ECError") { gradual_errors.as_slice() } else { &[] };
         register_stdlib_class(classes, exc, &[], surface);
@@ -1244,8 +1246,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("symbol", Ty::Union { variants: vec![Ty::Sym, Ty::Nil].into() }),
         ("to_sym", Ty::Union { variants: vec![Ty::Sym, Ty::Nil].into() }),
         ("to_s", Ty::Str), ("to_str", Ty::Str), ("inspect", Ty::Str),
+        ("ref", Ty::Union { variants: vec![Ty::Sym, Ty::Str].into() }),
         ("hash", Ty::Int), ("==", Ty::Bool), ("eql?", Ty::Bool),
     ]);
+    // `html?`, `json?`, …: one predicate per registered symbol, as `runtime/ruby/mime.rb` spells them out.
+    for format in MIME_PREDICATES {
+        classes.entry(ClassId(Symbol::from("Mime::Type"))).or_default().instance_methods.insert(Symbol::from(format!("{format}?")), Ty::Bool);
+    }
     // `URI.parse` can return scheme-specific classes beyond HTTP/HTTPS;
     // keep it gradual while class guards recover the readers below.
     register_stdlib_class(classes, "URI", &[
@@ -1416,6 +1423,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "OpenSSL::HMAC", &[("digest", Ty::Str), ("hexdigest", Ty::Str)], &[]);
     register_stdlib_class(classes, "OpenSSL", &[("fixed_length_secure_compare", Ty::Bool), ("secure_compare", Ty::Bool)], &[]);
     register_stdlib_class(classes, "OpenSSL::KDF", &[("hkdf", Ty::Str)], &[]);
+    // Spinel's GCM surface; constructors and mode switches preserve the receiving subclass.
+    register_stdlib_class(classes, "OpenSSL::Cipher", &[("new", Ty::SelfInstance)], &[
+        ("encrypt", Ty::SelfInstance), ("decrypt", Ty::SelfInstance),
+        ("update", Ty::Str), ("final", Ty::Str), ("auth_tag", Ty::Str),
+        ("random_key", Ty::Str), ("random_iv", Ty::Str),
+        ("key=", Ty::Str), ("iv=", Ty::Str), ("auth_tag=", Ty::Str), ("auth_data=", Ty::Str),
+    ]);
     register_stdlib_class(classes, "OpenSSL::PKey", &[("read", Ty::Untyped), ("new_raw_private_key", class("OpenSSL::PKey::PKey"))], &[]);
     register_stdlib_class(classes, "OpenSSL::PKey::PKey", &[], &[("sign", Ty::Str)]);
     register_stdlib_class(classes, "OpenSSL::PKey::EC", &[("generate", Ty::Untyped)], &[
@@ -1713,3 +1727,6 @@ const ERRNO_CLASSES: &[&str] = &[
     "ENOBUFS", "EISCONN", "ENOTCONN", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH",
     "EALREADY", "EINPROGRESS", "ESTALE", "EDQUOT", "ECANCELED", "EOVERFLOW", "EILSEQ",
 ];
+
+/// The formats `Mime::Type` answers a predicate for (`runtime/ruby/mime.rb` SYMBOLS).
+const MIME_PREDICATES: &[&str] = &["atom", "bmp", "css", "csv", "gif", "gzip", "html", "ics", "jpeg", "js", "json", "m4a", "md", "mp3", "mp4", "mpeg", "multipart_form", "ogg", "otf", "pdf", "png", "rss", "svg", "text", "tiff", "ttf", "turbo_stream", "url_encoded_form", "vcf", "vtt", "webm", "webp", "woff", "woff2", "xml", "yaml", "zip"];

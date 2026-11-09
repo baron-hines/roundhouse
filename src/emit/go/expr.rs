@@ -1540,6 +1540,19 @@ pub(super) fn emit_send(
                 let lhs_v = if int_lhs && float_rhs { format!("float64({lhs_v})") } else { lhs_v };
                 return format!("{lhs_v} {op} {}", args_s[0]);
             }
+            // Two nullable string columns compare by content, and nil equals
+            // only nil. Read from the columns, not the analyzer's types: a nil
+            // check narrows a local's reader to String, and its Go field stays
+            // a pointer.
+            if matches!(op, "==" | "!=")
+                && nullable_read_go_ty(r).as_deref() == Some("*string")
+                && nullable_read_go_ty(&args[0]).as_deref() == Some("*string")
+            {
+                let rhs = &args_s[0];
+                let equal = "(_rh_lhs == nil && _rh_rhs == nil) || (_rh_lhs != nil && _rh_rhs != nil && *_rh_lhs == *_rh_rhs)";
+                let compare = if op == "==" { equal.to_string() } else { format!("!({equal})") };
+                return format!("func() bool {{ _rh_lhs := {lhs}; _rh_rhs := {rhs}; return {compare} }}()");
+            }
             // A nullable string column against a String: nil equals no
             // String, as in Ruby, and a present value compares by content.
             if matches!(op, "==" | "!=")
@@ -1560,6 +1573,23 @@ pub(super) fn emit_send(
                     format!("({lhs} != nil && *{lhs} == {rhs})")
                 } else {
                     format!("({lhs} == nil || *{lhs} != {rhs})")
+                };
+            }
+            // The same comparison with the column on the right. The left
+            // side still runs first.
+            if matches!(op, "==" | "!=")
+                && nullable_read_go_ty(&args[0]).as_deref() == Some("*string")
+                && matches!(r.ty.as_ref(), Some(Ty::Str))
+            {
+                let rhs = &args_s[0];
+                if !(is_plain_operand(r) && is_plain_column_read(&args[0])) {
+                    let compare = if op == "==" { "_rh_rhs != nil && _rh_lhs == *_rh_rhs" } else { "_rh_rhs == nil || _rh_lhs != *_rh_rhs" };
+                    return format!("func() bool {{ _rh_lhs := {lhs}; _rh_rhs := {rhs}; return {compare} }}()");
+                }
+                return if op == "==" {
+                    format!("({rhs} != nil && {lhs} == *{rhs})")
+                } else {
+                    format!("({rhs} == nil || {lhs} != *{rhs})")
                 };
             }
             return format!("{lhs} {} {}", op, args_s[0]);
@@ -1946,6 +1976,13 @@ pub(super) fn emit_send(
         if let Some(r) = recv {
             let recv_s = emit_expr(ctx, r);
             let recv_go_ty = super::ty::go_ty_stub(r.ty.as_ref());
+            // The loop below reads the receiver twice, and a receiver that
+            // runs something runs once.
+            let (bind_recv, joined) = if is_plain_operand(r) {
+                (String::new(), recv_s.clone())
+            } else {
+                (format!("\t_rh_recv := {recv_s}\n"), "_rh_recv".to_string())
+            };
             let sep = if args.is_empty() {
                 "\"\"".to_string()
             } else {
@@ -1954,12 +1991,25 @@ pub(super) fn emit_send(
             if recv_go_ty == "[]string" {
                 return format!("strings.Join({recv_s}, {sep})");
             }
+            // Ruby's `join` reads a nil element as "", and `%v` prints
+            // `<nil>`. Only an interface element can be nil here. It can
+            // also hold a nullable column's pointer, nil or not, which
+            // `%v` would print as an address: read those first.
+            let stringify = if matches!(recv_go_ty.as_str(), "[]interface{}" | "[]any") {
+                let read_pointer = ["*string", "*int64", "*float64", "*bool"]
+                    .map(|ty| format!("case {ty}: if _e == nil {{ _v = nil }} else {{ _v = *_e }}"))
+                    .join("; ");
+                format!("switch _e := _v.(type) {{ {read_pointer} }}; if _v == nil {{ _out = append(_out, \"\") }} else {{ _out = append(_out, fmt.Sprintf(\"%v\", _v)) }}")
+            } else {
+                "_out = append(_out, fmt.Sprintf(\"%v\", _v))".to_string()
+            };
             return format!(
-                "strings.Join(func() []string {{\n\
+                "strings.Join(func() []string {{\n{bind_recv}\
                  \t_out := make([]string, 0, len({recv_s}))\n\
-                 \tfor _, _v := range {recv_s} {{ _out = append(_out, fmt.Sprintf(\"%v\", _v)) }}\n\
+                 \tfor _, _v := range {recv_s} {{ {stringify} }}\n\
                  \treturn _out\n\
                  }}(), {sep})",
+                recv_s = joined,
             );
         }
     }

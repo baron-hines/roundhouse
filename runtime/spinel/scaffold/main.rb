@@ -441,7 +441,40 @@ module Main
       end
     end
 
-    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
+    # A request constraint reads the request before its route is chosen
+    # (`RouteTable.match_asking`), so what it can ask is filled in first.
+    request_obj.request_method = verb
+    request_obj.path = request_path
+    request_obj.remote_ip = req.remote_host
+    request_obj.host = req.req_headers.fetch("host", "localhost")
+    # `request.headers` follows Rails' HTTP-to-CGI env mapping. Copy all
+    # parsed headers, not just those the dispatcher itself reads: cache
+    # validators, `Accept-Encoding`, and `Turbo-Frame` are consumed by
+    # application code after dispatch. Write directly into the RBS-pinned
+    # env field so each value keeps its poly-hash representation. This
+    # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
+    # content type; keeping one mapping avoids a drifting header allowlist.
+    req.req_headers.each do |name, value|
+      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    request_obj.env["roundhouse.listener"] = req.listener_transport
+    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
+    # Rails' AssumeSSL marks the request https before the action, so
+    # secure cookies and absolute redirects use https.
+    if AppEnvironment.serving_assume_ssl?
+      request_obj.env["HTTPS"] = "on"
+      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
+      request_obj.env["rack.url_scheme"] = "https"
+    end
+    last_segment = request_path.split("/").last.to_s
+    extension = last_segment.include?(".") ? last_segment.split(".").last.to_s : ""
+    request_obj.format = ActionDispatch::MimeNegotiation.format_name(
+      extension,
+      req.req_headers.fetch("accept", ""),
+      req.req_headers.fetch("x-requested-with", ""),
+      req.req_headers.fetch("content-type", "")
+    )
+    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)
     if matched.nil?
       # No route: the format is the `?format=` param, a trusted Accept,
       # or the path's extension (Main.render_not_found).
@@ -540,25 +573,6 @@ module Main
     # is a valid poly-member write and never constructs the competing hash.
     request_obj.env["REQUEST_METHOD"] = verb
     user_agent = req.req_headers.fetch("user-agent", "")
-    # `request.headers` follows Rails' HTTP-to-CGI env mapping. Copy all
-    # parsed headers, not just those the dispatcher itself reads: cache
-    # validators, `Accept-Encoding`, and `Turbo-Frame` are consumed by
-    # application code after dispatch. Write directly into the RBS-pinned
-    # env field so each value keeps its poly-hash representation. This
-    # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
-    # content type; keeping one mapping avoids a drifting header allowlist.
-    req.req_headers.each do |name, value|
-      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
-    end
-    request_obj.env["roundhouse.listener"] = req.listener_transport
-    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
-    # Rails' AssumeSSL marks the request https before the action, so
-    # secure cookies and absolute redirects use https.
-    if AppEnvironment.serving_assume_ssl?
-      request_obj.env["HTTPS"] = "on"
-      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
-      request_obj.env["rack.url_scheme"] = "https"
-    end
     # `user_agent` is ALSO a separate reader slot. The overlay twin's
     # `user_agent` reads `@env["HTTP_USER_AGENT"]`; the shared runtime's
     # (`runtime/ruby/action_dispatch/request.rb`) returns `@user_agent`,

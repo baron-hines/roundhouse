@@ -5085,13 +5085,7 @@ pub(crate) fn union_of(a: Ty, b: Ty) -> Ty {
     let mut acc = UnionAcc::default();
     push_union_variants(a, &mut acc);
     push_union_variants(b, &mut acc);
-    let mut variants = acc.out;
-    Ty::canonicalize_variants(&mut variants);
-    match variants.len() {
-        0 => Ty::Bottom,
-        1 => variants.into_iter().next().unwrap(),
-        _ => Ty::Union { variants: variants.into() },
-    }
+    acc.finish()
 }
 
 /// Unions at or above this many variants find an equal variant through a
@@ -5123,9 +5117,23 @@ struct UnionAcc {
     /// Fingerprint → positions in `out`, covering `out[..indexed]`.
     index: HashMap<u64, Vec<usize>>,
     indexed: usize,
+    /// Where `out` holds its one `Hash` and its one `Array` spine.
+    hash_at: Option<usize>,
+    array_at: Option<usize>,
 }
 
 impl UnionAcc {
+    /// The canonical type of the variants pushed.
+    fn finish(self) -> Ty {
+        let mut variants = self.out;
+        Ty::canonicalize_variants(&mut variants);
+        match variants.len() {
+            0 => Ty::Bottom,
+            1 => variants.into_iter().next().unwrap(),
+            _ => Ty::Union { variants: variants.into() },
+        }
+    }
+
     /// The first position holding a variant `==` to `other`. `other` is
     /// neither `Hash` nor `Array`, so those entries (mutated in place by
     /// the merge arms) never match and are left out of the index.
@@ -5157,25 +5165,27 @@ fn push_union_variants(t: Ty, acc: &mut UnionAcc) {
                 push_union_variants(v, acc);
             }
         }
-        Ty::Hash { key, value } => {
-            for existing in acc.out.iter_mut() {
-                if let Ty::Hash { key: k0, value: v0 } = existing {
-                    *k0 = std::sync::Arc::new(union_of((**k0).clone(), std::sync::Arc::unwrap_or_clone(key)));
-                    *v0 = std::sync::Arc::new(union_of((**v0).clone(), std::sync::Arc::unwrap_or_clone(value)));
-                    return;
-                }
+        Ty::Hash { key, value } => match acc.hash_at {
+            Some(i) => {
+                let Ty::Hash { key: k0, value: v0 } = &mut acc.out[i] else { unreachable!("hash_at holds the Hash") };
+                *k0 = std::sync::Arc::new(union_of((**k0).clone(), std::sync::Arc::unwrap_or_clone(key)));
+                *v0 = std::sync::Arc::new(union_of((**v0).clone(), std::sync::Arc::unwrap_or_clone(value)));
             }
-            acc.out.push(Ty::Hash { key, value });
-        }
-        Ty::Array { elem } => {
-            for existing in acc.out.iter_mut() {
-                if let Ty::Array { elem: e0 } = existing {
-                    *e0 = std::sync::Arc::new(union_of((**e0).clone(), std::sync::Arc::unwrap_or_clone(elem)));
-                    return;
-                }
+            None => {
+                acc.hash_at = Some(acc.out.len());
+                acc.out.push(Ty::Hash { key, value });
             }
-            acc.out.push(Ty::Array { elem });
-        }
+        },
+        Ty::Array { elem } => match acc.array_at {
+            Some(i) => {
+                let Ty::Array { elem: e0 } = &mut acc.out[i] else { unreachable!("array_at holds the Array") };
+                *e0 = std::sync::Arc::new(union_of((**e0).clone(), std::sync::Arc::unwrap_or_clone(elem)));
+            }
+            None => {
+                acc.array_at = Some(acc.out.len());
+                acc.out.push(Ty::Array { elem });
+            }
+        },
         other => match acc.position_of(&other) {
             // An equal variant can differ in record field order; keep
             // the canonical one so the result doesn't depend on which
@@ -5243,14 +5253,27 @@ fn is_settled_arm_list(variants: &[Ty]) -> bool {
         && variants.windows(2).all(|w| Ty::cmp_nil_last(&w[0], &w[1]) != std::cmp::Ordering::Greater)
 }
 
+/// The join of `tys`, as folding them through [`union_of`] gives.
+///
+/// Three or more arms, none of them a union (a union's arms, as
+/// `fixpoint_bound::cut` re-joins them), go into one accumulator
+/// instead: a fold built a fresh one per step and indexed the whole
+/// result so far each time, which made a wide union (a parameter met by
+/// a call per class of an app with thousands) quadratic in its arms.
+/// Each step of the fold flattens, dedups and merges spines into a
+/// sorted list as `push_union_variants` does, so the result is the
+/// same. A union among the inputs keeps the fold: `union_of` returns an
+/// input equal to the other as it stands, nested arms included.
 pub(super) fn union_many(tys: Vec<Ty>) -> Ty {
-    // Fold through `union_of` so the same Bottom-filtering, structural
-    // container join, and flatten/dedup normalization applies.
-    let mut iter = tys.into_iter().filter(|t| !matches!(t, Ty::Bottom));
-    match iter.next() {
-        None => Ty::Bottom,
-        Some(first) => iter.fold(first, union_of),
+    let tys: Vec<Ty> = tys.into_iter().filter(|t| !matches!(t, Ty::Bottom)).collect();
+    if tys.len() < 3 || tys.iter().any(|t| matches!(t, Ty::Union { .. })) {
+        return tys.into_iter().reduce(union_of).unwrap_or(Ty::Bottom);
     }
+    let mut acc = UnionAcc::default();
+    for t in tys {
+        push_union_variants(t, &mut acc);
+    }
+    acc.finish()
 }
 
 
@@ -6546,6 +6569,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn union_many_is_the_fold_of_union_of() {
+        let universe = law_universe();
+        let wide: Vec<Ty> = (0..60).map(|i| Ty::Class { id: ClassId(Symbol::from(format!("C{i}").as_str())), args: vec![].into() }).collect();
+        let fold = |tys: &[Ty]| tys.iter().cloned().filter(|t| !matches!(t, Ty::Bottom)).reduce(union_of).unwrap_or(Ty::Bottom);
+        for a in &universe {
+            for b in &universe {
+                for c in &universe {
+                    let tys = [a.clone(), b.clone(), c.clone(), a.clone()];
+                    assert_eq!(union_many(tys.to_vec()), fold(&tys), "{tys:?}");
+                }
+            }
+            let tys: Vec<Ty> = wide.iter().cloned().chain([a.clone()]).chain(wide.iter().rev().cloned()).chain(universe.iter().cloned()).collect();
+            assert_eq!(union_many(tys.clone()), fold(&tys), "{a:?} among a wide union");
+        }
+        let nested = Ty::Union { variants: vec![Ty::Union { variants: vec![Ty::Untyped, Ty::Nil].into() }, Ty::Nil].into() };
+        let tys = vec![nested.clone(), nested.clone(), nested];
+        assert_eq!(union_many(tys.clone()), fold(&tys), "a union equal to the other arms is kept as it stands");
     }
 
     #[test]

@@ -49,9 +49,13 @@ output, so a skip printed with `eprintln!` never reaches a CI log. A test
 whose prerequisite (a gem for a native Rails control, Ruby on `PATH`, a
 native compiler) is missing calls `prerequisite::missing(what)` from
 [`tests/support/prerequisite.rs`](../../tests/support/prerequisite.rs) and
-returns. `ROUNDHOUSE_SKIP_LOG=<file>` appends each skip to that file; the
-CI unit job lists them in its summary. `ROUNDHOUSE_REQUIRE_PREREQUISITES=1`
-fails such a test instead, for a run that provides everything. PostgreSQL
+returns. `ROUNDHOUSE_SKIP_LOG=<file>` appends each skip to that file.
+`ROUNDHOUSE_REQUIRE_PREREQUISITES=1` fails such a test as well, for a run
+that provides everything. The CI unit job sets both: it installs every gem
+its tests probe for, so a skip there fails the job and its summary names
+the test and what was missing. A test that needs Spinel belongs in
+`tests/spinel_toolchain/`, `#[ignore]`d, where the Spinel lane runs it;
+the unit job has no Spinel. PostgreSQL
 keeps its own pair, `ROUNDHOUSE_PG_TEST_URL` and `ROUNDHOUSE_PG_TEST_REQUIRED`.
 
 A `run_ruby` or `run_spinel*` script reports a failed check by raising, so

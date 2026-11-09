@@ -561,7 +561,6 @@ fn openssl_digest_subclasses_execute_in_native_spinel() {
 fn buffered_stdlib_calls_refuse_unqualified_intermediate_results() {
     let mut admitted = Vec::new();
     for expression in [
-        "OpenSSL::Cipher.new(\"aes-256-gcm\").update(\"sample\")",
         "Zlib::Deflate.new.deflate(\"sample\")",
         "Zlib::Deflate.new.deflate(\"sample\", 0)",
         "Zlib::Deflate.new.deflate(\"sample\", 2 + 2)",
@@ -573,8 +572,7 @@ fn buffered_stdlib_calls_refuse_unqualified_intermediate_results() {
         let source = format!("class BufferProbe\n  def self.value\n    {expression}\n  end\nend\n");
         for target in [roundhouse::project::BuildTarget::Ruby, roundhouse::project::BuildTarget::Spinel] {
             let (_, errors) = stdlib_app().write("app/models/buffer_probe.rb", &source).emit(target);
-            let refused = if expression.starts_with("OpenSSL") { !errors.is_empty() }
-                else { errors.iter().any(|e| e.contains("buffered zlib result")) };
+            let refused = errors.iter().any(|e| e.contains("buffered zlib result"));
             if !refused { admitted.push(format!("{expression}, {target:?}: {errors:?}")); }
         }
     }

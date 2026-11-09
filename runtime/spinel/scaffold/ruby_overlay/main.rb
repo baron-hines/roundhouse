@@ -147,8 +147,14 @@ module Main
     # to TABLE. ROOT is kept as a separate constant in routes.rb for
     # legibility (it's the only literal-pattern entry); the dispatch
     # composes them here so Router.match stays a flat-table walk.
-    matched = ActionDispatch::Router.match(request[:method], request_path,
-                           route_table)
+    # What a request constraint asks before its route is chosen (`RouteTable.match_asking`).
+    asked = ActionDispatch::Request.new(env.to_h, request[:params])
+    last_segment = request_path.split("/").last.to_s
+    asked.format = ActionDispatch::MimeNegotiation.format_name(
+      last_segment.include?(".") ? last_segment.split(".").last.to_s : "",
+      env["HTTP_ACCEPT"].to_s, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s
+    )
+    matched = RouteTable.match_asking(request[:method], request_path, route_table, asked)
     if matched.nil?
       # No route: the format is the `?format=` param, a trusted Accept,
       # or the path's extension (Main.not_found_response).

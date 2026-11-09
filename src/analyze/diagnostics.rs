@@ -827,10 +827,10 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
     out.extend(super::graphql::diagnose(app, diagnose_expr));
-    out.extend(super::enum_raw_input::diagnose(app));
     out.extend(super::data::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
     out.extend(crate::lower::model_to_library::encrypts_diagnostics(app));
+    out.extend(route_guard_untyped_sends(app));
     // A support file the class ingest left out, at what failed it.
     out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));
     out.extend(conditional_declarations_reopened(app));
@@ -1143,6 +1143,41 @@ pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
 /// analyzer set for positions it couldn't resolve). `Ty::Untyped` —
 /// the gradual escape — counts as *known*: the author signed that
 /// position out of checking.
+/// A request constraint the Ruby-family router asks (`lower::route_guards`) runs every request its
+/// path matches, so a call in it on a value the analyzer cannot type (`request.env["warden"].send(…)`)
+/// is an error there, not an unchecked send: answered at runtime, it would raise instead of refusing.
+fn route_guard_untyped_sends(app: &App) -> Vec<Diagnostic> {
+    // `placed`: the nearest enclosing span the source has; a desugared send (`h[k] += 1`) has none of its own.
+    fn visit(expr: &Expr, placed: crate::span::Span, out: &mut Vec<Diagnostic>) {
+        let placed = if expr.span.is_synthetic() { placed } else { expr.span };
+        // The call's own type unknown too: a method the receiver's class does not answer (`format.json?`).
+        // Not one every object answers (`params["id"].nil?`): that cannot raise, whatever the value is.
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
+            && !matches!(method.as_str(), "nil?" | "==" | "!=" | "!" | "equal?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "to_s" | "inspect" | "frozen?" | "hash" | "class")
+            && (matches!(r.ty, Some(Ty::Untyped)) || is_unknown_ty(r.ty.as_ref()) || is_unknown_ty(expr.ty.as_ref()))
+            && expr.diagnostic().is_none()
+        {
+            out.push(Diagnostic::unsupported(
+                placed,
+                None,
+                "request constraint",
+                format!("`{method}` is called on a value the request constraint cannot type, so the router could not ask it"),
+            ));
+        }
+        expr.node.for_each_child(&mut |child| visit(child, placed, out));
+    }
+    let mut out = Vec::new();
+    for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == crate::lower::route_guards::GUARD_CLASS) {
+        for method in &class.methods {
+            // One per constraint, its first such call: the rest follow from the same value.
+            let mut found = Vec::new();
+            visit(&method.body, method.body.span, &mut found);
+            out.extend(found.into_iter().next());
+        }
+    }
+    out
+}
+
 fn is_unknown_ty(ty: Option<&Ty>) -> bool {
     match ty {
         None => true,

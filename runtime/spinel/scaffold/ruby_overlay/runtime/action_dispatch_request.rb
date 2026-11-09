@@ -160,6 +160,35 @@ module ActionDispatch
       raw_host_with_port
     end
 
+    # The twins of runtime/ruby/action_dispatch/request.rb's: Rails'
+    # `domain`/`subdomains` at `tld_length` 1, and the negotiated format.
+    def domain
+      parts = named_host_parts
+      parts.empty? ? nil : parts.last(2).join(".")
+    end
+
+    def subdomains
+      parts = named_host_parts
+      parts.length < 3 ? [] : parts[0, parts.length - 2]
+    end
+
+    def subdomain
+      subdomains.join(".")
+    end
+
+    def named_host_parts
+      name = host.sub(/:[0-9]+\z/, "")
+      name.match?(/\A[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\z/) ? [] : name.split(".")
+    end
+
+    def format=(value)
+      @format = value.to_s
+    end
+
+    def format
+      Mime::Type.lookup_by_extension(@format.to_s) || Mime::Type.new("text/html", :html)
+    end
+
     def raw_host_with_port
       forwarded = forwarded_authority
       return forwarded unless forwarded.empty?

@@ -616,7 +616,7 @@ end
             ("Rails.application.config.middleware.use", "rails"),
             ("Rails.application.config.assets.paths.<<", "rails-boot-only"),
             ("Rails.autoloaders.main.ignore", "rails-boot-only"),
-            ("config.password_length =", "gem:devise:modeled"),
+            ("config.password_length =", "gem:devise:unknown"),
             ("orm :active_record", "gem:doorkeeper:unknown"),
             ("Rack::Attack.throttle", "gem:rack-attack:unknown"),
             ("OmniAuth.config.logger =", "gem:omniauth:unknown"),
@@ -642,7 +642,7 @@ fn a_rooted_configure_block_and_an_in_repo_gem_keep_their_gems() {
         ),
     ]);
     let got: Vec<(&str, &str)> = ledger.iter().map(|d| (statement(d), holder(d))).collect();
-    assert_eq!(got, [("config.password_length =", "gem:devise:modeled"), ("c.size =", "gem:catalog:in-repo")]);
+    assert_eq!(got, [("config.password_length =", "gem:devise:unknown"), ("c.size =", "gem:catalog:in-repo")]);
 }
 
 #[test]

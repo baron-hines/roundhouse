@@ -241,18 +241,22 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             }
             files
         })
-        .fold(Vec::<EmittedFile>::new(), |mut out, file| {
+        .fold((Vec::<EmittedFile>::new(), HashMap::<PathBuf, usize>::default()), |(mut out, mut at), file| {
             // Not left to the tree's last-wins dedupe: a module opened in two files (rolify's `Rolify`) would lose one opening's methods.
-            match out.iter_mut().find(|f| f.path == file.path) {
-                Some(existing) if existing.content == file.content => {}
-                Some(existing) => {
-                    existing.content.push('\n');
-                    existing.content.push_str(&file.content);
+            match at.get(&file.path) {
+                Some(&i) if out[i].content == file.content => {}
+                Some(&i) => {
+                    out[i].content.push('\n');
+                    out[i].content.push_str(&file.content);
                 }
-                None => out.push(file),
+                None => {
+                    at.insert(file.path.clone(), out.len());
+                    out.push(file);
+                }
             }
-            out
+            (out, at)
         })
+        .0
 }
 
 /// A class opened in several gem files (graphql-client's `Client`, in
@@ -9956,6 +9960,7 @@ struct NameIndex {
     library_classes: HashMap<String, Vec<usize>>,
     first_modules_bare: std::cell::OnceCell<HashMap<String, usize>>,
     constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
+    file_constant_owners: std::cell::OnceCell<HashMap<String, String>>,
     source_ptr: usize,
     source_len: usize,
 }
@@ -9998,6 +10003,7 @@ impl NameIndex {
             library_classes,
             first_modules_bare: std::cell::OnceCell::new(),
             constant_paths: std::cell::OnceCell::new(),
+            file_constant_owners: std::cell::OnceCell::new(),
             source_ptr: classes.as_ptr() as usize,
             source_len: classes.len(),
         };
@@ -10558,6 +10564,30 @@ fn owns_a_file(name: &str, app: &App, classes: &[LibraryClass]) -> bool {
     library_classes_named(name, app, classes).iter().any(|c| !c.is_module)
 }
 
+/// The first file of constants alone, among `classes` and then the app's
+/// library classes, that defines the constant `name`.
+fn file_constant_owner(name: &str, app: &App, classes: &[LibraryClass]) -> Option<String> {
+    let files = || classes.iter().chain(&app.library_classes).filter(|class| class.is_file_constants());
+    match NameIndex::current(app).filter(|index| index.covers(classes)) {
+        Some(index) => index
+            .file_constant_owners
+            .get_or_init(|| {
+                let mut owners: HashMap<String, String> = HashMap::default();
+                for class in files() {
+                    for (constant, _) in &class.constants {
+                        owners.entry(constant.as_str().to_string()).or_insert_with(|| class.name.0.as_str().to_string());
+                    }
+                }
+                owners
+            })
+            .get(name)
+            .cloned(),
+        None => files()
+            .find(|class| class.constants.iter().any(|(constant, _)| constant.as_str() == name))
+            .map(|class| class.name.0.as_str().to_string()),
+    }
+}
+
 /// Every constant path the app declares (models, controllers, library
 /// classes and modules, test modules) and each namespace enclosing one.
 fn app_constant_paths(app: &App, classes: &[LibraryClass]) -> std::rc::Rc<crate::det::HashSet<String>> {
@@ -10860,11 +10890,8 @@ fn require_path_for_body_const(
     }
     // Any constant of a file of constants alone is that file's, not only
     // the one it is named for: `Labels = DEFAULT` beside `DEFAULT = […]`.
-    if let Some(file) = classes.iter().chain(&app.library_classes).find(|class| {
-        class.is_file_constants() && class.constants.iter().any(|(name, _)| name.as_str() == first)
-    }) {
-        let owner = file.name.0.as_str();
-        return (owner != self_name).then(|| format!("app/models/{}", crate::naming::underscore(owner)));
+    if let Some(owner) = file_constant_owner(first, app, classes) {
+        return (owner != self_name).then(|| format!("app/models/{}", crate::naming::underscore(&owner)));
     }
     if first == self_name {
         return None;
@@ -11300,6 +11327,7 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
 /// `super` casts too. An enum column's writer maps labels and is left
 /// alone, as is the primary key's.
 pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &App) {
+    apply_enum_raw_input_lowering(lcs, app);
     for model in &app.models {
         let table = app.schema.tables.get(&model.table.0);
         let mut casts: HashMap<Symbol, &'static str> = table
@@ -11413,6 +11441,178 @@ pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &A
             }
         }
     }
+}
+
+/// `<enum>_before_type_cast` answers what was assigned until the record
+/// saves or loads, and the stored value after (activerecord 8.1.4). Only
+/// for the enum columns the app reads it on.
+fn apply_enum_raw_input_lowering(lcs: &mut [LibraryClass], app: &App) {
+    let demanded = crate::analyze::raw_input_columns(app);
+    if demanded.is_empty() {
+        return;
+    }
+    for model in &app.models {
+        // By model: another model's generated reader doesn't replace this one's own.
+        let columns: Vec<Symbol> = model
+            .enums
+            .keys()
+            .filter(|c| demanded.contains(*c))
+            .filter(|c| !crate::analyze::source_instance_method(app, &model.name, &format!("{c}_before_type_cast")))
+            .cloned()
+            .collect();
+        if columns.is_empty() {
+            continue;
+        }
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else {
+            continue;
+        };
+        for m in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
+            let defaults = (m.name.as_str() == "initialize").then_some(model);
+            remember_enum_input(&mut m.body, &columns, defaults);
+            // A loaded record's load writer, as well as saving and reloading.
+            let loaded = columns.iter().find(|c| m.name.as_str() == format!("_write_{}_raw", c.as_str()));
+            if let Some(column) = loaded {
+                let write = std::mem::replace(&mut m.body, sp_expr(ExprNode::Lit { value: Literal::Nil }));
+                m.body = sp_expr(ExprNode::Seq { exprs: vec![forget_enum_input(column), write] });
+            }
+            if matches!(m.name.as_str(), "_adapter_insert" | "_adapter_update" | "_adapter_reload") {
+                let mut exprs: Vec<Expr> = columns.iter().map(forget_enum_input).collect();
+                exprs.push(std::mem::replace(&mut m.body, sp_expr(ExprNode::Lit { value: Literal::Nil })));
+                m.body = sp_expr(ExprNode::Seq { exprs });
+            }
+        }
+        for column in &columns {
+            let Some(reader) = lc.methods.iter().find(|m| m.receiver == MethodReceiver::Instance && m.name == *column) else {
+                continue;
+            };
+            let mut raw_reader = reader.clone();
+            raw_reader.name = raw_ivar(column);
+            raw_reader.kind = crate::dialect::AccessorKind::Method;
+            raw_reader.signature = None;
+            let ivar = |name: Symbol| sp_expr(ExprNode::Ivar { name });
+            raw_reader.body = sp_expr(ExprNode::If {
+                cond: sp_expr(ExprNode::Send {
+                    recv: Some(ivar(raw_ivar(column))),
+                    method: Symbol::from("nil?"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                }),
+                then_branch: ivar(column.clone()),
+                else_branch: ivar(raw_ivar(column)),
+            });
+            lc.methods.push(raw_reader);
+        }
+    }
+}
+
+fn forget_enum_input(column: &Symbol) -> Expr {
+    sp_expr(ExprNode::Assign {
+        target: crate::expr::LValue::Ivar { name: raw_ivar(column) },
+        value: sp_expr(ExprNode::Lit { value: Literal::Nil }),
+    })
+}
+
+/// After each write that casts an input through the enum's mapping, keep
+/// that input. A call of the writer already holding a cast value is
+/// followed by the original, which replaces what the writer kept.
+fn remember_enum_input(e: &mut Expr, columns: &[Symbol], defaults: Option<&crate::dialect::Model>) {
+    e.node.for_each_child_mut(&mut |c| remember_enum_input(c, columns, defaults));
+    let (column, value) = match &*e.node {
+        ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value } if columns.contains(name) => (name.clone(), value),
+        ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, value }
+            if matches!(&*recv.node, ExprNode::SelfRef) && columns.contains(&writer_column(name)) =>
+        {
+            (writer_column(name), value)
+        }
+        ExprNode::Send { recv, method, args, .. }
+            if args.len() == 1
+                && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && method.as_str().ends_with('=')
+                && columns.contains(&writer_column(method)) =>
+        {
+            (writer_column(method), &args[0])
+        }
+        _ => return,
+    };
+    let input = match defaults.and_then(|model| enum_default_input(model, &column, value)) {
+        Some(default) => sp_expr(ExprNode::Lit { value: default }),
+        None => {
+            let Some(input) = enum_cast_input(value) else {
+                return;
+            };
+            before_normalizer(input, &column)
+        }
+    };
+    let remember = sp_expr(ExprNode::Assign {
+        target: crate::expr::LValue::Ivar { name: raw_ivar(&column) },
+        value: input,
+    });
+    let write = std::mem::replace(e, sp_expr(ExprNode::Lit { value: Literal::Nil }));
+    *e = sp_expr(ExprNode::Seq { exprs: vec![write, remember] });
+}
+
+/// What the reader answers for the literal `initialize` seeds a column
+/// with: an enum's `default:` as its label, a schema default as its text
+/// (activerecord 8.1.4).
+fn enum_default_input(model: &crate::dialect::Model, column: &Symbol, seed: &Expr) -> Option<Literal> {
+    let ExprNode::Lit { value: seeded } = &*seed.node else {
+        return None;
+    };
+    let text = match seeded {
+        Literal::Int { value } => value.to_string(),
+        Literal::Str { value } => value.clone(),
+        _ => return None,
+    };
+    if model.enum_defaults.contains_key(column) {
+        let (label, _) = model.enums.get(column)?.iter().find(|(_, stored)| stored == seeded)?;
+        return Some(Literal::Sym { value: Symbol::from(label.as_str()) });
+    }
+    Some(Literal::Str { value: text })
+}
+
+/// The value handed to `Model._normalize_<col>(x)`. The reader answers
+/// what was assigned, not what `normalizes` made of it (activerecord
+/// 8.1.4), and the remembered input mustn't call the normalizer again.
+fn before_normalizer(input: Expr, column: &Symbol) -> Expr {
+    if matches!(&*input.node, ExprNode::Var { name, .. } if name.as_str() == crate::lower::normalizes::NORMALIZED_LOCAL) {
+        return sp_expr(ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("value") });
+    }
+    if let ExprNode::Send { method, args, .. } = &*input.node
+        && method.as_str() == format!("_normalize_{}", column.as_str())
+        && let [assigned] = args.as_slice()
+    {
+        return assigned.clone();
+    }
+    input
+}
+
+fn writer_column(name: &Symbol) -> Symbol {
+    Symbol::from(name.as_str().trim_end_matches('='))
+}
+
+/// `x` in the `ActiveRecord.enum_*(x.to_s, ...)` a write casts through.
+fn enum_cast_input(e: &Expr) -> Option<Expr> {
+    if let ExprNode::Send { method, args, .. } = &*e.node
+        && matches!(method.as_str(), "enum_int" | "enum_int_or_nil" | "enum_str" | "enum_str_or_nil")
+        && let Some(first) = args.first()
+    {
+        // The text is `x.to_s`, or a String cast of `x`.
+        match &*first.node {
+            ExprNode::Send { recv: Some(input), method: to_s, args: no_args, .. } if to_s.as_str() == "to_s" && no_args.is_empty() => {
+                return Some(input.clone());
+            }
+            ExprNode::Cast { value, .. } => return Some(value.clone()),
+            _ => {}
+        }
+    }
+    let mut found = None;
+    e.node.for_each_child(&mut |c| {
+        if found.is_none() {
+            found = enum_cast_input(c);
+        }
+    });
+    found
 }
 
 /// `@<col>_before_type_cast`: what the user assigned to `col`, nil when

@@ -39,18 +39,20 @@ pub(super) struct Facts {
 
 impl Facts {
     pub(super) fn of(app: &App) -> Self {
-        let mut devise_configured = HashSet::default();
-        for model in &app.models {
-            let configured = model.body.iter().any(|item| match item {
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => matches!(&*expr.node, ExprNode::Send { recv: None, method, args, .. }
-                    if method.as_str() == "devise" && args.iter().any(|a| !matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { .. } }))),
-                _ => false,
-            });
-            if configured {
-                devise_configured.insert(model.name.0.as_str().to_string());
+        let parents = parents(app);
+        let calls = devise_calls(app);
+        let mut devise_configured: HashSet<String> = calls
+            .iter()
+            .filter(|(_, args)| args.iter().any(|a| !matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { .. } })))
+            .map(|(class, _)| class.to_string())
+            .collect();
+        // A subclass's are its parent's too (`class_attribute`): chatwoot's `SuperAdmin < User` declares none of its own.
+        for name in parents.keys() {
+            if ancestors(&parents, name).any(|a| devise_configured.contains(a)) {
+                devise_configured.insert(name.to_string());
             }
         }
-        Facts { devise_models: devise_modules(app), devise_configured }
+        Facts { devise_models: devise_modules(&parents, &calls), devise_configured }
     }
 
     /// Whether `class_answer` may answer for `class`.
@@ -59,22 +61,81 @@ impl Facts {
     }
 }
 
-/// Each model's `devise :a, :b` declaration, by class name, as `Devise::Models#devise` reads it.
-pub(super) fn devise_modules(app: &App) -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::default();
+/// Each of the app's classes and its superclass: a subclass of a model with no table of its own is a library class (chatwoot's `SuperAdmin < User`).
+fn parents(app: &App) -> HashMap<&str, Option<&str>> {
+    fn parent(p: &Option<crate::ident::ClassId>) -> Option<&str> {
+        p.as_ref().map(|p| p.0.as_str().trim_start_matches("::"))
+    }
+    app.models
+        .iter()
+        .map(|m| (m.name.0.as_str(), parent(&m.parent)))
+        .chain(app.library_classes.iter().map(|c| (c.name.0.as_str(), parent(&c.parent))))
+        .collect()
+}
+
+/// A class's superclasses among the app's, nearest first.
+fn ancestors<'a>(parents: &'a HashMap<&'a str, Option<&'a str>>, class: &str) -> impl Iterator<Item = &'a str> {
+    let mut seen: HashSet<&str> = HashSet::default();
+    let mut current = parents.get(class).copied().flatten();
+    std::iter::from_fn(move || {
+        let name = current.filter(|name| seen.insert(name))?;
+        current = parents.get(name).copied().flatten();
+        Some(name)
+    })
+}
+
+/// Each class's `devise :a, :b` call, a model's or a library class's (a subclass with no table of its own), with its arguments.
+fn devise_calls(app: &App) -> Vec<(&str, &[Expr])> {
+    fn is_devise(e: &Expr) -> Option<&[Expr]> {
+        match &*e.node {
+            ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "devise" => Some(args.as_slice()),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
     for model in &app.models {
         for item in &model.body {
-            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-            if method.as_str() != "devise" {
-                continue;
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
+                && let Some(args) = is_devise(expr)
+            {
+                out.push((model.name.0.as_str(), args));
             }
-            let modules = out.entry(model.name.0.as_str().to_string()).or_default();
-            for arg in args {
-                if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
-                    modules.push(value.as_str().to_string());
-                }
+        }
+    }
+    for class in &app.library_classes {
+        for call in &class.unknown_calls {
+            if let Some(args) = is_devise(call) {
+                out.push((class.name.0.as_str(), args));
             }
+        }
+    }
+    out
+}
+
+/// Each class's modules as `Devise::Models#devise` reads them: its superclasses' first, as `devise_modules |=` keeps them.
+fn devise_modules(parents: &HashMap<&str, Option<&str>>, calls: &[(&str, &[Expr])]) -> HashMap<String, Vec<String>> {
+    let mut own: HashMap<&str, Vec<String>> = HashMap::default();
+    for (class, args) in calls {
+        let modules = own.entry(class).or_default();
+        for arg in args.iter() {
+            if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
+                modules.push(value.as_str().to_string());
+            }
+        }
+    }
+    let mut out: HashMap<String, Vec<String>> = HashMap::default();
+    for name in parents.keys() {
+        let mut chain: Vec<&str> = ancestors(parents, name).collect();
+        chain.reverse();
+        chain.push(name);
+        let mut modules: Option<Vec<String>> = None;
+        for class in chain {
+            if let Some(declared) = own.get(class) {
+                modules.get_or_insert_with(Vec::new).extend(declared.iter().cloned());
+            }
+        }
+        if let Some(modules) = modules {
+            out.insert(name.to_string(), modules);
         }
     }
     out
@@ -85,6 +146,17 @@ pub(super) fn omits_on_failure(known: &HashSet<String>, owner: &str, name: &str)
     // devise's OmniAuth callbacks: one route per provider `Devise.omniauth_configs` holds, which an app often sets from ENV at boot (mastodon's CAS, SAML and OIDC).
     (known.contains("Devise") && owner == "ActionDispatch::Routing::Mapper" && name == "devise_omniauth_callback")
         .then_some("devise_for: the OmniAuth callback routes are not drawn: they are one per provider the app configures, which is not known here")
+}
+
+/// A statement of a gem's routing method whose routes, when it cannot run, are left out and reported, the rest of the call's still drawn.
+pub(super) fn omits_statement_on_failure(known: &HashSet<String>, statement: &Expr) -> Option<&'static str> {
+    // devise_token_auth's OmniAuth routes: one of them redirects through a block that builds its URL per request, which no route table holds.
+    let ExprNode::If { cond, .. } = &*statement.node else { return None };
+    if !known.contains("DeviseTokenAuth") {
+        return None;
+    }
+    (crate::emit::ruby::emit_expr(cond).starts_with("defined?(::OmniAuth)") && crate::emit::ruby::emit_expr(statement).contains("DeviseTokenAuth.omniauth_prefix"))
+        .then_some("mount_devise_token_auth_for: the OmniAuth routes are not drawn: one redirects through a block that builds its URL per request")
 }
 
 /// What a class outside the library classes (a model) answers that a gem's macro gave it.

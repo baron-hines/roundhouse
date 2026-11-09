@@ -42,7 +42,167 @@ use crate::ty::Ty;
 /// consumers: helpers are called from view + controller bodies,
 /// dispatch is read at startup by the HTTP router.
 pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
-    let flat = flatten_routes(app);
+    dispatch_functions(app, flatten_routes(app).into_iter().map(|r| (r, None)).collect(), false)
+}
+
+/// `lower_routes_to_dispatch_functions` for the Ruby-family router, which asks a guarded route's
+/// request constraints once its path matches: each route carries the index of its constraints in
+/// `RouteTable.guard_allows`, which the dispatcher calls before taking it.
+pub fn lower_routes_to_guarded_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    let routes = crate::lower::routes::flatten_routes_asking_guards(app)
+        .into_iter()
+        .map(|(route, guards)| {
+            if guards.is_empty() {
+                return (route, None);
+            }
+            let at = chains.iter().position(|c| *c == guards).unwrap_or_else(|| {
+                chains.push(guards);
+                chains.len() - 1
+            });
+            (route, Some(at))
+        })
+        .collect();
+    let mut out = dispatch_functions(app, routes, true);
+    out.push(guard_allows_function(&chains));
+    out.push(match_asking_function());
+    out
+}
+
+/// `RouteTable.match_asking(verb, path, table, request)`: `Router.match`, past every route whose
+/// constraints refuse the request, as Rails' router goes on to the next route.
+///
+/// ```ruby
+/// matched = ActionDispatch::Router.match_from(verb, path, table, 0)
+/// while !matched.nil? && matched.guard >= 0 && !RouteTable.guard_allows(matched.guard, request)
+///   matched = ActionDispatch::Router.match_from(verb, path, table, matched.index + 1)
+/// end
+/// matched
+/// ```
+fn match_asking_function() -> LibraryFunction {
+    let syn = |node: ExprNode, ty: Ty| with_ty(Expr::new(Span::synthetic(), node), ty);
+    let string = Ty::Str;
+    let route_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Router::Route")), args: vec![].into() };
+    let table_ty = Ty::Array { elem: std::sync::Arc::new(route_ty) };
+    let request_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Request")), args: vec![].into() };
+    let result_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Router::MatchResult")), args: vec![].into() };
+    let maybe_result = Ty::Union { variants: vec![result_ty, Ty::Nil].into() };
+    let var = |name: &str, ty: &Ty| syn(ExprNode::Var { id: VarId(0), name: Symbol::from(name) }, ty.clone());
+    let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>, ty: Ty| {
+        syn(ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true }, ty)
+    };
+    let int = |value: i64| syn(ExprNode::Lit { value: Literal::Int { value } }, Ty::Int);
+    let matched = || var("matched", &maybe_result);
+    let match_from = |start: Expr| {
+        send(
+            Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionDispatch"), Symbol::from("Router")] })),
+            "match_from",
+            vec![var("verb", &string), var("path", &string), var("table", &table_ty), start],
+            maybe_result.clone(),
+        )
+    };
+    let assign = |value: Expr| syn(ExprNode::Assign { target: crate::expr::LValue::Var { id: VarId(0), name: Symbol::from("matched") }, value }, maybe_result.clone());
+    let and = |left: Expr, right: Expr| syn(ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, surface: crate::expr::BoolOpSurface::Symbol, left, right }, Ty::Bool);
+    let not = |e: Expr| send(Some(e), "!", vec![], Ty::Bool);
+    let guard = || send(Some(matched()), "guard", vec![], Ty::Int);
+    let cond = and(
+        and(not(send(Some(matched()), "nil?", vec![], Ty::Bool)), send(Some(guard()), ">=", vec![int(0)], Ty::Bool)),
+        not(send(
+            Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("RouteTable")] })),
+            "guard_allows",
+            vec![guard(), var("request", &request_ty)],
+            Ty::Bool,
+        )),
+    );
+    let next = assign(match_from(send(Some(send(Some(matched()), "index", vec![], Ty::Int)), "+", vec![int(1)], Ty::Int)));
+    let body = syn(
+        ExprNode::Seq {
+            exprs: vec![
+                assign(match_from(int(0))),
+                syn(ExprNode::While { cond, body: next, until_form: false }, Ty::Nil),
+                matched(),
+            ],
+        },
+        maybe_result.clone(),
+    );
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")],
+        name: Symbol::from("match_asking"),
+        params: ["verb", "path", "table", "request"].into_iter().map(|n| Param::positional(Symbol::from(n))).collect(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: Some(fn_sig(
+            vec![
+                (Symbol::from("verb"), string.clone()),
+                (Symbol::from("path"), string),
+                (Symbol::from("table"), table_ty),
+                (Symbol::from("request"), request_ty),
+            ],
+            maybe_result,
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+/// `RouteTable.guard_allows(chain, request)`: whether every constraint of a route's chain admits the request.
+fn guard_allows_function(chains: &[Vec<usize>]) -> LibraryFunction {
+    let request_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Request")), args: vec![].into() };
+    let var = |name: &str, ty: Ty| with_ty(Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) }), ty);
+    let lit_bool = |value: bool| with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value } }), Ty::Bool);
+    let ask = |index: usize| {
+        with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from(crate::lower::route_guards::GUARD_CLASS)] })),
+                    method: Symbol::from(format!("guard_{index}")),
+                    args: vec![var("request", request_ty.clone())],
+                    block: None,
+                    parenthesized: true,
+                },
+            ),
+            Ty::Bool,
+        )
+    };
+    // Each chain's test in turn, `true` past the last: a route with no chain never asks.
+    let body = chains.iter().enumerate().rev().fold(lit_bool(true), |rest, (at, chain)| {
+        let all = chain.iter().map(|&i| ask(i)).reduce(|left, right| {
+            with_ty(
+                Expr::new(Span::synthetic(), ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, surface: crate::expr::BoolOpSurface::Symbol, left, right }),
+                Ty::Bool,
+            )
+        }).expect("a chain names one constraint at least");
+        let cond = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(var("chain", Ty::Int)),
+                    method: Symbol::from("=="),
+                    args: vec![with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: at as i64 } }), Ty::Int)],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Bool,
+        );
+        with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: all, else_branch: rest }), Ty::Bool)
+    });
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")],
+        name: Symbol::from("guard_allows"),
+        params: vec![Param::positional(Symbol::from("chain")), Param::positional(Symbol::from("request"))],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: Some(fn_sig(vec![(Symbol::from("chain"), Ty::Int), (Symbol::from("request"), request_ty)], Ty::Bool)),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+fn dispatch_functions(app: &App, flat: Vec<(FlatRoute, Option<usize>)>, asks_guards: bool) -> Vec<LibraryFunction> {
     let mounts = super::rack_mounts::mounts(app);
     if flat.is_empty() && mounts.is_empty() {
         return Vec::new();
@@ -55,9 +215,9 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
     // path, so a `match "/", via: %i[post delete]` beside a `root` (or
     // the second verb of that `match`) is a route of its own, and it
     // stays in the table in declaration order.
-    let root_index = flat.iter().position(|r| r.path == "/");
-    let root_routes: Vec<&FlatRoute> = root_index.map(|i| &flat[i]).into_iter().collect();
-    let table_routes: Vec<&FlatRoute> =
+    let root_index = flat.iter().position(|(r, _)| r.path == "/");
+    let root_routes: Vec<&(FlatRoute, Option<usize>)> = root_index.map(|i| &flat[i]).into_iter().collect();
+    let table_routes: Vec<&(FlatRoute, Option<usize>)> =
         flat.iter().enumerate().filter(|(i, _)| Some(*i) != root_index).map(|(_, r)| r).collect();
 
     let route_class_id = ClassId(Symbol::from("ActionDispatch::Router::Route"));
@@ -74,7 +234,7 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
             ExprNode::Array {
                 elements: table_routes
                     .iter()
-                    .map(|r| build_route_new(r, &route_class_id, &route_ty))
+                    .map(|(r, chain)| build_route_new(r, *chain, asks_guards, &route_class_id, &route_ty))
                     .collect(),
                 style: ArrayStyle::Brackets,
             },
@@ -96,8 +256,8 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
         is_async: false,
     });
 
-    if let Some(r) = root_routes.first() {
-        let root_body = build_route_new(r, &route_class_id, &route_ty);
+    if let Some((r, chain)) = root_routes.first() {
+        let root_body = build_route_new(r, *chain, asks_guards, &route_class_id, &route_ty);
         // Where the root was declared among the table's routes: route
         // generation (the test helper's `assert_generates`) breaks a
         // tie by declaration order, so `root "articles#index"` declared
@@ -135,7 +295,7 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
             ));
         }
         out.push(rack_route_array(
-            "rack_head_routes", flat.iter().filter(|route| route.method == HttpMethod::Head),
+            "rack_head_routes", flat.iter().map(|(route, _)| route).filter(|route| route.method == HttpMethod::Head),
             &route_class_id, &route_ty,
         ));
     }
@@ -152,7 +312,7 @@ fn rack_route_array<'a>(
         module_path: vec![Symbol::from("RouteTable")], name: Symbol::from(name),
         params: Vec::new(), unsupported_formals: None, has_anonymous_block: false,
         body: with_ty(Expr::new(Span::synthetic(), ExprNode::Array {
-            elements: routes.map(|route| build_route_new(route, class, route_ty)).collect(),
+            elements: routes.map(|route| build_route_new(route, None, false, class, route_ty)).collect(),
             style: ArrayStyle::Brackets,
         }), ty.clone()),
         signature: Some(fn_sig(vec![], ty)), effects: EffectSet::default(), is_async: false,
@@ -167,7 +327,7 @@ fn rack_route_array<'a>(
 /// args — per-target emitters convert kwarg-style def to positional
 /// pub fn but don't unpack kwarg-style call sites; matches the
 /// positional `initialize` signature.
-fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
+fn build_route_new(r: &FlatRoute, chain: Option<usize>, asks_guards: bool, class_id: &ClassId, route_ty: &Ty) -> Expr {
     let verb_str = match r.method {
         HttpMethod::Get => "GET",
         HttpMethod::Post => "POST",
@@ -220,6 +380,21 @@ fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
     // 4-/5-/6-arg shape, so unconstrained apps emit byte-identical.
     if !seg_constraints.is_empty() {
         args.push(lit_str(seg_constraints));
+    }
+    // A guarded route's chain rides the optional 8th positional (`RouteTable.guard_allows`).
+    if let Some(chain) = chain.filter(|_| asks_guards) {
+        let nil = || {
+            let mut nil = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil });
+            nil.ty = Some(Ty::Nil);
+            nil
+        };
+        match args.len() {
+            4 => args.extend([nil(), lit_str(String::new()), lit_str(String::new())]),
+            5 => args.extend([lit_str(String::new()), lit_str(String::new())]),
+            6 => args.push(lit_str(String::new())),
+            _ => {}
+        }
+        args.push(with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: chain as i64 } }), Ty::Int));
     }
     let class_path: Vec<Symbol> = class_id
         .0

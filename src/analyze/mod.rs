@@ -26,6 +26,7 @@
 mod alba;
 pub(crate) mod assoc_pluck;
 mod enum_raw_input;
+pub(crate) use enum_raw_input::{generated_reads, raw_input_columns, roda_generated_reads};
 mod body;
 pub(crate) use body::some_operands_take_it;
 mod class_configuration;
@@ -540,7 +541,9 @@ impl Analyzer {
                 };
                 cls.instance_methods.insert(name.clone(), reader_ty);
                 if model.enums.contains_key(name) {
-                    cls.instance_methods.entry(Symbol::from(format!("{n}_before_type_cast"))).or_insert(ty.clone());
+                    // What was assigned, in any form the writer takes, or the stored value.
+                    let raw_ty = Ty::Union { variants: vec![ty.clone(), Ty::Str, Ty::Sym, Ty::Nil].into() };
+                    cls.instance_methods.entry(Symbol::from(format!("{n}_before_type_cast"))).or_insert(raw_ty);
                 }
                 let predicate = Symbol::from(format!("{n}?"));
                 cls.instance_methods.entry(predicate).or_insert(Ty::Bool);
@@ -8546,14 +8549,19 @@ fn unknown_receiver() -> ClassId {
     ClassId(Symbol::from("?"))
 }
 
-/// The sites apart from the untyped-receiver ones, and those, under
-/// `App::pins_unresolved_params`, as calls of every library class that
-/// defines the instance method (raabro's `Tree#subgather`, which fugit
-/// calls with a Symbol on a tree the analysis does not type); otherwise
-/// dropped, as such a site always was.
 /// A call on a receiver of unknown type, as a call of each app class
 /// that defines an instance method of that name, when the app pins its
-/// unresolved parameters.
+/// unresolved parameters (raabro's `Tree#subgather`, which fugit calls
+/// with a Symbol on a tree the analysis does not type).
+///
+/// Each distinct call is expanded once. Untyped receivers are mostly
+/// the same few calls (`x[k]`, `x.to_h`, a protobuf accessor) made
+/// thousands of times, and a method named like that is defined by
+/// thousands of classes, so expanding every site made a hundred
+/// million sites a round on a large app. The observations they make
+/// are joined, and a join is idempotent, so a repeat adds nothing; the
+/// first of each is kept, in site order, so the rows come out in the
+/// same order too.
 fn guessed_receiver_sites(unknown: &[&SendSite], app: &App) -> Vec<SendSite> {
     if unknown.is_empty() || !app.pins_unresolved_params {
         return Vec::new();
@@ -8564,13 +8572,38 @@ fn guessed_receiver_sites(unknown: &[&SendSite], app: &App) -> Vec<SendSite> {
             defining.entry(&m.name).or_default().push(&lc.name);
         }
     }
+    let mut seen: HashMap<(&Symbol, SiteRecv, u64), Vec<&SendSite>> = HashMap::default();
     let mut guessed = Vec::new();
     for site in unknown {
-        for class in defining.get(&site.1).into_iter().flatten() {
+        let Some(classes) = defining.get(&site.1) else { continue };
+        let bucket = seen.entry((&site.1, site.4, site_shape_hash(site))).or_default();
+        if bucket.iter().any(|kept| kept.2 == site.2 && kept.3 == site.3) {
+            continue;
+        }
+        bucket.push(site);
+        for class in classes {
             guessed.push(((*class).clone(), site.1.clone(), site.2.clone(), site.3.clone(), site.4));
         }
     }
     guessed
+}
+
+/// A hash of a site's argument and keyword types for bucketing repeats;
+/// equal sites hash equal, and a bucket is still compared exactly.
+fn site_shape_hash(site: &SendSite) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    for t in &site.2 {
+        fixpoint_check::type_hash(t).hash(&mut h);
+    }
+    let kw = &site.3;
+    (kw.group, kw.anonymous_forward).hash(&mut h);
+    for (k, t) in &kw.keys {
+        k.as_str().hash(&mut h);
+        fixpoint_check::type_hash(t).hash(&mut h);
+    }
+    kw.splat.as_ref().map(fixpoint_check::type_hash).hash(&mut h);
+    h.finish()
 }
 
 fn leaves_unknown(t: &Ty) -> bool {
@@ -11616,7 +11649,7 @@ mod concern_method_snapshot_tests {
         Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
     }
 
-    fn method(name: &str) -> MethodDef {
+    pub(super) fn method(name: &str) -> MethodDef {
         MethodDef {
             visibility: MethodVisibility::Public,
             unsupported_formals: None,
@@ -11636,7 +11669,7 @@ mod concern_method_snapshot_tests {
         }
     }
 
-    fn module(name: &str, includes: &[&str], methods: Vec<MethodDef>) -> LibraryClass {
+    pub(super) fn module(name: &str, includes: &[&str], methods: Vec<MethodDef>) -> LibraryClass {
         LibraryClass {
             name: ClassId(Symbol::from(name)),
             is_module: true,
@@ -11745,6 +11778,46 @@ mod concern_method_snapshot_tests {
 
 #[cfg(test)]
 mod ordered_worker_tests;
+
+#[cfg(test)]
+mod guessed_receiver_site_tests {
+    use super::concern_method_snapshot_tests::{method, module};
+    use super::*;
+
+    fn unknown_site(name: &str, args: Vec<Ty>, recv: SiteRecv) -> SendSite {
+        (unknown_receiver(), Symbol::from(name), args, SiteKeywords { group: false, keys: Vec::new(), splat: None, anonymous_forward: false }, recv)
+    }
+
+    #[test]
+    fn a_repeated_untyped_call_is_expanded_once_per_defining_class() {
+        let mut app = App::default();
+        app.pins_unresolved_params = true;
+        app.library_classes = vec![module("A", &[], vec![method("go")]), module("B", &[], vec![method("go")])];
+        let sites = [
+            unknown_site("go", vec![Ty::Int], SiteRecv::Instance),
+            unknown_site("go", vec![Ty::Int], SiteRecv::Instance),
+            unknown_site("go", vec![Ty::Str], SiteRecv::Instance),
+            unknown_site("nobody", vec![Ty::Int], SiteRecv::Instance),
+            unknown_site("go", vec![Ty::Int], SiteRecv::Class),
+            unknown_site("go", vec![Ty::Str], SiteRecv::Instance),
+        ];
+        let refs: Vec<&SendSite> = sites.iter().collect();
+        let got: Vec<(String, Vec<Ty>, SiteRecv)> =
+            guessed_receiver_sites(&refs, &app).into_iter().map(|(class, _, args, _, recv)| (class.0.as_str().to_string(), args, recv)).collect();
+        let row = |class: &str, ty: Ty, recv: SiteRecv| (class.to_string(), vec![ty], recv);
+        assert_eq!(
+            got,
+            [
+                row("A", Ty::Int, SiteRecv::Instance),
+                row("B", Ty::Int, SiteRecv::Instance),
+                row("A", Ty::Str, SiteRecv::Instance),
+                row("B", Ty::Str, SiteRecv::Instance),
+                row("A", Ty::Int, SiteRecv::Class),
+                row("B", Ty::Int, SiteRecv::Class),
+            ]
+        );
+    }
+}
 
 #[cfg(test)]
 mod finder_reopening_tests {

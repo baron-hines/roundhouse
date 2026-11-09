@@ -20,7 +20,93 @@ fn is_request_params(e: &Expr) -> bool {
     }
 }
 
+/// Array methods whose block's first parameter is one element.
+const ELEMENT_BLOCK_METHODS: &[&str] =
+    &["map", "collect", "each", "flat_map", "filter_map", "select", "filter", "reject", "each_with_index"];
+
+/// `params.require(:list)`, before or after it lowers to `Params.require_key`.
+fn is_required_list(e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "require" => is_request_params(r) && args.len() == 1,
+        "require_key" => {
+            matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Params")
+                && args.first().is_some_and(is_request_params)
+        }
+        _ => false,
+    }
+}
+
+/// `params.require(:list).map { |item| ... }`: Rails makes each element an
+/// `ActionController::Parameters` (actionpack 8.1.4), and the runtime's
+/// are String-keyed Hashes, so the element's own calls lower here.
+fn rewrite_element_block(expr: &mut Expr) {
+    let ExprNode::Send { recv: Some(r), method, block: Some(block), .. } = &mut *expr.node else { return };
+    if !ELEMENT_BLOCK_METHODS.contains(&method.as_str()) || !is_required_list(r) {
+        return;
+    }
+    let ExprNode::Lambda { params, body, .. } = &mut *block.node else { return };
+    let Some(item) = params.first().cloned() else { return };
+    rewrite_element_calls(body, &item);
+}
+
+fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
+    if matches!(&*expr.node, ExprNode::Lambda { params, .. } if params.contains(item)) {
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item));
+    let ExprNode::Send { recv: Some(r), method, args, block, .. } = &mut *expr.node else { return };
+    if !matches!(&*r.node, ExprNode::Var { name, .. } if name == item) {
+        return;
+    }
+    match method.as_str() {
+        "permit" | "expect" if block.is_none() => {
+            if let Some(mut new) = element_filter(expr) {
+                new.ty = expr.ty.clone();
+                *expr = new;
+            }
+        }
+        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" => {
+            let keys = if method.as_str() == "dig" { args.len() } else { args.len().min(1) };
+            for key in args.iter_mut().take(keys) {
+                if let Some(name) = sym_name(key) {
+                    *key = str_lit(key.span, name);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An element's `permit(:a, b: [...])`, and `expect(:a)`, which is Rails'
+/// permit then require: a nested or blank value raises `ParameterMissing`.
+fn element_filter(e: &Expr) -> Option<Expr> {
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return None };
+    let params_const = || Expr::new(e.span, ExprNode::Const { path: vec![Symbol::from("Params")] });
+    let allowed = |names: Vec<String>| {
+        let mut list = Expr::new(e.span, ExprNode::Array {
+            elements: names.into_iter().map(|n| str_lit(e.span, n)).collect(),
+            style: Default::default(),
+        });
+        list.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+        send(e.span, Some(params_const()), "allowed_scalars", vec![r.clone(), list])
+    };
+    if method.as_str() == "expect" {
+        let [key] = args.as_slice() else { return None };
+        let name = sym_name(key)?;
+        return Some(send(e.span, Some(params_const()), "require_key", vec![allowed(vec![name.clone()]), str_lit(e.span, name)]));
+    }
+    if matches!(args.last().map(|a| &*a.node), Some(ExprNode::Hash { .. })) {
+        return filtered_call(e);
+    }
+    if args.is_empty() {
+        return None;
+    }
+    Some(allowed(args.iter().map(sym_name).collect::<Option<Vec<_>>>()?))
+}
+
 fn rewrite(expr: &mut Expr) {
+    rewrite_element_block(expr);
     expr.node.for_each_child_mut(&mut rewrite);
     // A top-level `params.permit(:a, :b)` CONSUMED IN PLACE, as a call's
     // argument — the Rails 8 authentication generator's
@@ -121,11 +207,18 @@ pub(crate) fn stringify_filtered_helper_reads(expr: &mut Expr, helpers: &crate::
 /// hash or list, which a `Hash[Symbol, String]` cannot hold, so this keeps
 /// Rails' own String-keyed storage and the emit's indifferent key reads.
 fn filtered_chain(e: &Expr) -> Option<Expr> {
-    use crate::lower::controller_to_library::params::{nested_candidates, params_hash_ty};
-    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return None };
+    let ExprNode::Send { recv: Some(r), method, block: None, .. } = &*e.node else { return None };
     if method.as_str() != "permit" || !is_request_params(r) || is_param_value(r.ty.as_ref()) {
         return None;
     }
+    filtered_call(e)
+}
+
+/// `Params.filtered_values` for a `permit` call whose last argument is a
+/// Hash of nested filters.
+fn filtered_call(e: &Expr) -> Option<Expr> {
+    use crate::lower::controller_to_library::params::{nested_candidates, params_hash_ty};
+    let ExprNode::Send { recv: Some(r), args, .. } = &*e.node else { return None };
     let (last, scalars) = args.split_last()?;
     let ExprNode::Hash { entries, .. } = &*last.node else { return None };
     let names = scalars.iter().map(sym_name).collect::<Option<Vec<_>>>()?;
