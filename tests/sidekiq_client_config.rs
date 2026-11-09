@@ -135,6 +135,10 @@ fn connection_settings_in_each_form() {
     // `network_timeout:` replaces `timeout:` wherever it is written.
     assert_eq!((config.effective_connect_timeout(), config.effective_read_timeout()), (4.0, 2.0));
     assert_eq!(config.effective_reconnect_delays(), vec![0.1, 0.5]);
+    // A String literal naming a database reads as that Integer.
+    let (config, warnings) = ingest(&redis("db: \"7\""));
+    assert!(warnings.is_empty(), "{warnings:#?}");
+    assert_eq!(config.db, Some(RedisSetting::Literal("7".into())));
 
     // Sidekiq's defaults: 3-second timeouts and one retry, which
     // `reconnect_attempts: false` (or nil) keeps, as Sidekiq's `||= 1`
@@ -172,6 +176,8 @@ fn settings_that_cant_be_honored_are_errors_on_sidekiq() {
         ("username: Rails.application.credentials.redis_user", "username", "String literal"),
         ("db: -1", "db", "negative"),
         ("db: \"two\"", "db", "Integer"),
+        ("db: \"08\"", "db", "without leading zeros"),
+        ("db: \"010\"", "db", "without leading zeros"),
         ("db: Rails.env.test? ? 1 : 0", "db", "Integer literal"),
         ("timeout: ENV.fetch(\"REDIS_TIMEOUT\", 1).to_f", "timeout", "positive"),
         ("read_timeout: 0", "read_timeout", "positive"),

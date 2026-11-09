@@ -13359,9 +13359,15 @@ fn sidekiq_redis_key(key: &str, value: &Node<'_>, src: &str) -> RedisKey {
             Some(n) if n >= 0 => RedisKey::Db(crate::app::RedisSetting::Literal(n.to_string())),
             Some(_) => RedisKey::Refused("`db:` must not be negative".to_string()),
             None => match redis_setting(value, src) {
-                Some(crate::app::RedisSetting::Literal(text)) if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) => {
-                    RedisKey::Refused("`db:` must be an Integer".to_string())
-                }
+                // A String literal is emitted as an Integer literal, so it
+                // must read as one in plain decimal: `"08"` would emit `08`,
+                // which Ruby refuses, and `"010"` would be octal.
+                Some(crate::app::RedisSetting::Literal(text)) => match decimal_db(&text) {
+                    Some(n) => RedisKey::Db(crate::app::RedisSetting::Literal(n.to_string())),
+                    None => RedisKey::Refused(
+                        "`db:` must be an Integer, written in decimal without leading zeros".to_string(),
+                    ),
+                },
                 Some(setting) => RedisKey::Db(setting),
                 None => RedisKey::Refused(
                     "`db:` is read only as an Integer literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])".to_string(),
@@ -13433,6 +13439,15 @@ fn number_value(node: &Node<'_>) -> Option<f64> {
 }
 
 /// A Redis setting's value as `RedisSetting` reads it.
+/// A `db:` given as a String literal, read as the Integer it names: plain
+/// decimal digits, `"0"` or no leading zero, and small enough for an i64.
+fn decimal_db(text: &str) -> Option<i64> {
+    let decimal = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if decimal { text.parse().ok() } else { None }
+}
+
 fn redis_setting(node: &Node<'_>, src: &str) -> Option<crate::app::RedisSetting> {
     use crate::app::RedisSetting;
     if let Some(literal) = string_literal_value(node) {
