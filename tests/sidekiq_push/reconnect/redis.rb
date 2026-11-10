@@ -11,6 +11,8 @@ class Redis
   LOG = []
   # The options of the last `Redis.new`.
   OPTIONS = [{}]
+  # Each database SELECTed.
+  SELECTED = []
 
   def self.step(what)
     LOG.push(what)
@@ -30,6 +32,12 @@ class Redis
   def ping
     Redis.step("ping")
     "PONG"
+  end
+
+  def select(db)
+    Redis.step("select")
+    SELECTED.push(db)
+    "OK"
   end
 
   def pipelined

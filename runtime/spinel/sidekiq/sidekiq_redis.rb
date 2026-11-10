@@ -35,7 +35,8 @@
 # `BaseConnectionError`s, so a timed-out read takes the reconnects above.
 #
 # `username:` and `db:` go to `Redis.new` beside `password:`, and each
-# overrides the URL's, as on redis-client. One left out leaves the URL's.
+# overrides the URL's, as on redis-client. One the app leaves out isn't
+# passed at all, so the URL's stands.
 require "redis"
 
 module SidekiqRedis
@@ -112,7 +113,7 @@ module SidekiqRedis
   # A new connection to the app's `configure_client` Redis. Its
   # `password:`, `username:` or `db:` overrides the URL's, as the
   # explicit option does on both clients; one the app doesn't give is
-  # passed as nil (and `db:` not at all), so the URL's stands.
+  # left out, so the URL's stands.
   def self.open(url, password)
     connect(url, given(SidekiqPush.username), given(password), SidekiqPush.db, SidekiqPush.connect_timeout, SidekiqPush.read_timeout)
   end
@@ -127,16 +128,40 @@ module SidekiqRedis
   # Connected and authenticated here, outside LOCK: redis-rb connects at
   # its first command, so the PING makes that happen now rather than
   # inside LOCK at the first push (spinel-redis connects in its
-  # constructor already). `db` is -1 for none.
+  # constructor already). `db` is -1 for none. A `db:` the app gives is
+  # SELECTed in place of the PING: spinel-redis reads `db: 0` as none
+  # and keeps the URL's database, where redis-client selects 0. On
+  # redis-client the SELECT repeats its own, and `db:` still goes to
+  # `Redis.new` so a reconnect inside redis-rb selects it again.
   def self.connect(url, user, pass, db, connect_timeout, read_timeout)
-    conn = db < 0 ? Redis.new(url: url, username: user, password: pass, connect_timeout: connect_timeout, read_timeout: read_timeout) : Redis.new(url: url, username: user, password: pass, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout)
+    conn = client(url, user, pass, db, connect_timeout, read_timeout)
     begin
-      conn.ping
+      if db < 0
+        conn.ping
+      else
+        conn.select(db)
+      end
     rescue StandardError => e
       close_quietly(conn)
       raise e
     end
     conn
+  end
+
+  # `Redis.new` with only the settings given: a nil `username:` or
+  # `password:` would not leave the URL's, because redis-client before
+  # 0.17 replaces the URL's with it.
+  def self.client(url, user, pass, db, connect_timeout, read_timeout)
+    if db < 0
+      if user.nil?
+        return pass.nil? ? Redis.new(url: url, connect_timeout: connect_timeout, read_timeout: read_timeout) : Redis.new(url: url, password: pass, connect_timeout: connect_timeout, read_timeout: read_timeout)
+      end
+      return pass.nil? ? Redis.new(url: url, username: user, connect_timeout: connect_timeout, read_timeout: read_timeout) : Redis.new(url: url, username: user, password: pass, connect_timeout: connect_timeout, read_timeout: read_timeout)
+    end
+    if user.nil?
+      return pass.nil? ? Redis.new(url: url, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout) : Redis.new(url: url, password: pass, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout)
+    end
+    pass.nil? ? Redis.new(url: url, username: user, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout) : Redis.new(url: url, username: user, password: pass, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout)
   end
 
   # A setting the app gave, or nil for `""` (one it didn't).

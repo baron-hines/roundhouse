@@ -50,6 +50,7 @@ def attempt(plan)
   SidekiqRedis::CONN.clear
   Redis::PLAN.replace(plan)
   Redis::LOG.clear
+  Redis::SELECTED.clear
   begin
     yield
     "pushed"
@@ -85,24 +86,36 @@ got = attempt([:refuse, :refuse], &schedule)
 check("schedule: connect refused twice raises", got == "Redis::CannotConnectError", got)
 
 # Sidekiq's defaults reach Redis.new: no user, password or db of its
-# own (the URL's stand), and 3-second timeouts.
+# own, not even as nil (redis-client before 0.17 lets a nil replace the
+# URL's), and 3-second timeouts.
 attempt([], &push)
-want = { url: URL, username: nil, password: nil, connect_timeout: 3.0, read_timeout: 3.0 }
+want = { url: URL, connect_timeout: 3.0, read_timeout: 3.0 }
 check("defaults: Redis.new options", Redis::OPTIONS[0] == want, Redis::OPTIONS[0].inspect)
+check("defaults: PING, no SELECT", Redis::LOG == %w[connect ping pipeline] && Redis::SELECTED.empty?, Redis::LOG.join(","))
 
 # The app's username:, password:, db: and timeouts reach Redis.new.
 SETTINGS.merge!(username: "jobs", password: "s3cret", db: 2, connect_timeout: 0.5, read_timeout: 2.0)
 attempt([], &push)
 want = { url: URL, username: "jobs", password: "s3cret", db: 2, connect_timeout: 0.5, read_timeout: 2.0 }
 check("configured: Redis.new options", Redis::OPTIONS[0] == want, Redis::OPTIONS[0].inspect)
+check("configured: db: SELECTed", Redis::LOG == %w[connect select pipeline] && Redis::SELECTED == [2], Redis::LOG.join(",") + " " + Redis::SELECTED.inspect)
+# db: 0 is SELECTed too: spinel-redis would keep a URL's nonzero
+# database for `db: 0` alone.
 SETTINGS[:db] = 0
 attempt([], &push)
-check("db: 0 is passed, not left to the URL", Redis::OPTIONS[0][:db] == 0, Redis::OPTIONS[0].inspect)
+check("db: 0 is passed and SELECTed", Redis::OPTIONS[0][:db] == 0 && Redis::SELECTED == [0], Redis::OPTIONS[0].inspect + " " + Redis::SELECTED.inspect)
+# Each credential the app gives goes alone; the one it doesn't stays out.
+SETTINGS.merge!(username: "", password: "s3cret", db: -1)
+attempt([], &push)
+check("password: alone", Redis::OPTIONS[0].keys.sort == %i[connect_timeout password read_timeout url], Redis::OPTIONS[0].inspect)
+SETTINGS.merge!(username: "jobs", password: "")
+attempt([], &push)
+check("username: alone", Redis::OPTIONS[0].keys.sort == %i[connect_timeout read_timeout url username], Redis::OPTIONS[0].inspect)
 
 # Action Cable's connection to cable.yml's Redis takes none of them.
 Redis::PLAN.clear
 SidekiqRedis.open_cable(URL)
-want = { url: URL, username: nil, password: nil, connect_timeout: 1.0, read_timeout: 1.0 }
+want = { url: URL, connect_timeout: 1.0, read_timeout: 1.0 }
 check("the cable connection: no Sidekiq settings", Redis::OPTIONS[0] == want, Redis::OPTIONS[0].inspect)
 defaults
 
