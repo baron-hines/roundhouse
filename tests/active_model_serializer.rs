@@ -318,33 +318,6 @@ fn a_scope_render_passes_the_controllers_scope() {
     assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).as_json_str"), "{controller}");
 }
 
-/// Devise defines a `current_<mapping>` helper per model it maps: a
-/// `devise` model `Admin` gives `current_admin`, and only `User` gives
-/// the `current_user` the default `serialization_scope` reads. With
-/// `Admin` alone the controller has no `current_user`, and the scope is
-/// nil.
-#[test]
-fn only_a_devise_user_model_gives_the_controller_current_user() {
-    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
-    let controller = "class ArticlesController < ApplicationController\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\nend\n";
-    let schema = |table: &str| {
-        format!("ActiveRecord::Schema.define(version: 1) do\n  create_table :articles do |t|\n    t.string :title\n    t.datetime :published_at\n  end\n  create_table :{table} do |t|\n    t.string :email\n    t.string :encrypted_password\n  end\nend\n")
-    };
-    let admin_schema = schema("admins");
-    let (_, rendered, _) = emitted_with(scoped, controller, &[
-        ("db/schema.rb", &admin_schema),
-        ("app/models/admin.rb", "class Admin < ApplicationRecord\n  devise :database_authenticatable\nend\n"),
-    ]);
-    assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{rendered}");
-    let user_schema = schema("users");
-    let (_, rendered, _) = emitted_with(scoped, controller, &[
-        ("db/schema.rb", &user_schema),
-        ("app/models/user.rb", "class User < ApplicationRecord\n  devise :database_authenticatable\nend\n"),
-    ]);
-    // Devise's helper is the runtime's, called without `self.`.
-    assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).serializable_hash"), "{rendered}");
-}
-
 /// A controller that includes a module the app doesn't define (a gem's)
 /// may have a `current_user` from it: the scope is unknown, so the
 /// render is left as written, and reported.
@@ -368,4 +341,37 @@ fn a_scope_render_under_an_unresolved_include_with_its_own_current_user_stays_re
     let (_, rendered, messages) = emitted_with(scoped, controller, &[]);
     assert!(!rendered.contains("serializable_hash"), "{rendered}");
     assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
+}
+
+/// A concern's `included do` that includes a module the app doesn't
+/// define gives the controller that module too, which may define
+/// `serialization_scope` or `current_user`: the scope is unknown even
+/// when the controller defines `current_user`, so the render is left as
+/// written, and reported.
+#[test]
+fn a_scope_render_under_a_concerns_unresolved_include_stays_reported() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let concern = "module Scoping\n  extend ActiveSupport::Concern\n\n  included do\n    include Authentication::Helpers\n  end\nend\n";
+    let controller = "class ArticlesController < ApplicationController\n  include Scoping\n\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n";
+    let (_, rendered, messages) = emitted_with(scoped, controller, &[("app/controllers/concerns/scoping.rb", concern)]);
+    assert!(!rendered.contains("serializable_hash"), "{rendered}");
+    assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
+}
+
+/// A concern's `included do` can declare the controller's
+/// `serialization_scope`: under `serialization_scope nil` the serializer
+/// has no `current_user`, whether the controller's scope is its
+/// `current_user` or its own `serialization_scope` method. The name the
+/// rewrite would assume is then not known, so the render is left as
+/// written, and reported.
+#[test]
+fn a_scope_name_a_concern_declares_stays_reported() {
+    let viewer = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:viewer) { current_user }\nend\n";
+    let concern = "module Scoping\n  extend ActiveSupport::Concern\n\n  included do\n    serialization_scope nil\n  end\nend\n";
+    for helper in ["current_user", "serialization_scope"] {
+        let controller = format!("class ArticlesController < ApplicationController\n  include Scoping\n\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n\n  private\n\n  def {helper}\n    \"ann\"\n  end\nend\n");
+        let (_, rendered, messages) = emitted_with(viewer, &controller, &[("app/controllers/concerns/scoping.rb", concern)]);
+        assert!(!rendered.contains("as_json_str") && !rendered.contains("serializable_hash"), "{helper}: {rendered}");
+        assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{helper}: {messages:#?}");
+    }
 }

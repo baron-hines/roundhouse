@@ -553,3 +553,29 @@ fn a_devise_user_signs_in_over_http_natively() {
     let (again, _) = server.request_with_set_cookies("GET", "/users/sign_in", &[("Cookie", cookie.as_str())], "");
     assert_eq!(again.status, 302, "{}", server.log());
 }
+
+/// Devise names its helpers from the route mapping: `devise_for :users`
+/// gives `current_user`, the scope active_model_serializers' default
+/// `serialization_scope` reads. `class_name:`, `as:` or `singular:`
+/// changes what the mapping is called or which model it answers, and a
+/// `devise` model with no mapping drawn gives no helper: under any of
+/// those the scope is left unknown, and the render as written, reported.
+#[test]
+fn a_serializer_scope_is_devises_current_user_only_under_devise_for_users() {
+    let serializer = "class CardSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class CardsController < ApplicationController\n  def show\n    render json: Article.find(params[:id]), serializer: CardSerializer\n  end\nend\n";
+    let rendered = |routes: &str| {
+        let (tree, errors) = app(":database_authenticatable", &format!("{routes}  get \"/cards/:id\", to: \"cards#show\"\n"))
+            .write("app/serializers/card_serializer.rb", serializer)
+            .write("app/controllers/cards_controller.rb", controller)
+            .emit(BuildTarget::Ruby);
+        (std::fs::read_to_string(tree.join("app/controllers/cards_controller.rb")).expect("cards_controller.rb"), errors)
+    };
+    let (cards, errors) = rendered("  devise_for :users\n");
+    assert!(cards.contains("CardSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).serializable_hash"), "{cards}\n{errors:#?}");
+    for routes in ["  devise_for :users, class_name: \"User\"\n", "  devise_for :users, as: :member\n", "  devise_for :users, singular: :member\n", ""] {
+        let (cards, errors) = rendered(routes);
+        assert!(!cards.contains("serializable_hash"), "{routes:?}: {cards}");
+        assert!(errors.iter().any(|e| e.contains("rendering through an active_model_serializers")), "{routes:?}: {errors:#?}");
+    }
+}
