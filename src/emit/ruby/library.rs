@@ -18,6 +18,7 @@ use crate::dialect::{AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, 
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
+use crate::lower::view_to_library::hoist_constants::{hoist_pure_helper_constants, is_view_helpers_const};
 use crate::ty::Ty;
 
 /// Base's shared methods return Base in the runtime sidecar. A concrete
@@ -220,43 +221,49 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         }
     }
 
-    lcs.iter()
+    // Each file is rendered on its own: the passes above did the
+    // lowering, and what a render reads is the same for every class.
+    let roots: Vec<&LibraryClass> = lcs
+        .iter()
         .filter(|lc| !is_spliced_factory(lc))
         .filter(|lc| !matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })))
         .filter(|lc| owner_in_this_tree(lc).is_none())
-        .flat_map(|lc| {
-            // `underscore`, not `snake_case`: a namespaced reopen
-            // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
-            // `ShortId::CandidateId`) nests as `active_record/base.rb` —
-            // a literal `::` in the filename breaks the emitted
-            // Makefile's dependency list.
-            let file_stem = crate::naming::underscore(lc.name.0.as_str());
-            let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
-            let mut files = match children.get(lc.name.0.as_str()) {
-                Some(kids) => emit_library_class_with_nested(lc, kids, app, classes, &factories, out_path),
-                None => emit_library_class_pair_in(lc, app, classes, &factories, out_path),
-            };
-            for block in &data_blocks {
-                splice_data_block(&mut files, block, app, classes, &factories);
+        .collect();
+    super::par_render::map(app, classes, &roots, |&lc| {
+        // `underscore`, not `snake_case`: a namespaced reopen
+        // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
+        // `ShortId::CandidateId`) nests as `active_record/base.rb` —
+        // a literal `::` in the filename breaks the emitted
+        // Makefile's dependency list.
+        let file_stem = crate::naming::underscore(lc.name.0.as_str());
+        let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+        let mut files = match children.get(lc.name.0.as_str()) {
+            Some(kids) => emit_library_class_with_nested(lc, kids, app, classes, &factories, out_path),
+            None => emit_library_class_pair_in(lc, app, classes, &factories, out_path),
+        };
+        for block in &data_blocks {
+            splice_data_block(&mut files, block, app, classes, &factories);
+        }
+        files
+    })
+    .into_iter()
+    .flatten()
+    .fold((Vec::<EmittedFile>::new(), HashMap::<PathBuf, usize>::default()), |(mut out, mut at), file| {
+        // Not left to the tree's last-wins dedupe: a module opened in two files (rolify's `Rolify`) would lose one opening's methods.
+        match at.get(&file.path) {
+            Some(&i) if out[i].content == file.content => {}
+            Some(&i) => {
+                out[i].content.push('\n');
+                out[i].content.push_str(&file.content);
             }
-            files
-        })
-        .fold((Vec::<EmittedFile>::new(), HashMap::<PathBuf, usize>::default()), |(mut out, mut at), file| {
-            // Not left to the tree's last-wins dedupe: a module opened in two files (rolify's `Rolify`) would lose one opening's methods.
-            match at.get(&file.path) {
-                Some(&i) if out[i].content == file.content => {}
-                Some(&i) => {
-                    out[i].content.push('\n');
-                    out[i].content.push_str(&file.content);
-                }
-                None => {
-                    at.insert(file.path.clone(), out.len());
-                    out.push(file);
-                }
+            None => {
+                at.insert(file.path.clone(), out.len());
+                out.push(file);
             }
-            (out, at)
-        })
-        .0
+        }
+        (out, at)
+    })
+    .0
 }
 
 /// A class opened in several gem files (graphql-client's `Client`, in
@@ -3603,6 +3610,17 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     let view_ivars = view_assigned_ivars(app);
     // Instance-method names the app defines anywhere that collide with a
     // framework view helper; only these need the ancestry lookup above.
+    // Read from the whole app, not this run's slice: a controller's untyped
+    // receiver can be a model or a library class. A helper's `pluralize` is
+    // called bare, so a receiver never reaches one. The index names one
+    // module per method, so a second helper defining it is only in
+    // `app.helper_modules`.
+    let app_defines_pluralize = app.models.iter().any(|m| m.methods().any(|d| d.name.as_str() == "pluralize"))
+        || lcs
+            .iter()
+            .chain(app.library_classes.iter())
+            .filter(|lc| !helper_modules.contains(&lc.name) && !app.helper_modules.contains(&lc.name))
+            .any(|lc| lc.methods.iter().any(|m| m.name.as_str() == "pluralize"));
     let app_framework_helper_names: BTreeSet<String> = app
         .models
         .iter()
@@ -3744,6 +3762,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                     &own_params,
                     &app.view_visible_controller_methods,
                 );
+                ground_string_pluralize(default, app_defines_pluralize);
                 if is_helper_module {
                     rewrite_helper_ivars(default, &helper_ivars);
                 }
@@ -3758,6 +3777,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 &own_params,
                 &app.view_visible_controller_methods,
             );
+            ground_string_pluralize(&mut m.body, app_defines_pluralize);
             // A CONTROLLER IVAR read in a helper body. Rails mixes
             // helpers into the view instance, which carries the
             // controller's assigns, so `@room` there IS the
@@ -4229,300 +4249,6 @@ fn is_framework_view_helper(name: &str) -> bool {
     )
 }
 
-/// Is this a call on `ActionView::ViewHelpers` (or a bare `ViewHelpers`
-/// const)? Shared by the post-rewrite transforms below.
-fn is_view_helpers_const(e: &Expr) -> bool {
-    matches!(&*e.node, ExprNode::Const { path }
-        if path.last().map(|s| s.as_str() == "ViewHelpers").unwrap_or(false))
-}
-
-/// View helpers a call site can be hoisted OUT of, when every argument is
-/// a literal: each is a pure function of its arguments and always returns
-/// a freshly built String.
-///
-/// PURITY IS DECLARED HERE, NOT INFERRED, and the list is grown by
-/// measurement rather than by reasoning about what looks pure. Two traps
-/// make inference the wrong tool:
-///
-///   - `csrf_token_hidden_input` takes NO arguments, so "every argument is
-///     a literal" is vacuously true of it. Hoisting it would compute one
-///     session's token at load and serve it to every reader afterwards.
-///     Arity is not evidence of purity.
-///   - An empty `EffectSet` on the call is not evidence either: it means
-///     the analyzer did not model the callee, not that the callee is pure.
-///
-/// The "freshly built String" half matters as much as the purity half.
-/// `image_path("/already/absolute")` RETURNS ITS ARGUMENT, so hoisting it
-/// would put a literal's own String object in a constant where a caller
-/// could mutate it; the three below all interpolate into a new String.
-///
-/// `stylesheet_link_tag` / `javascript_include_tag` map a literal name to
-/// a path through the immutable emitted asset table, so they are pure
-/// over their literals the way `image_tag`
-/// is; `javascript_importmap_tags` is pure over the importmap table,
-/// which is the one non-literal argument this list admits (see
-/// `HOISTABLE_CONST_READERS`). campfire's layout pays all three on every
-/// page — 27 stylesheet links, and the importmap's 92 pins rebuilt as
-/// Hashes and rendered to JSON — for a header that never changes
-/// between one boot and the next: about 360 allocations per request
-/// that the room page's profile put beside the message loop's.
-const HOISTABLE_TAG_HELPERS: &[&str] = &[
-    "image_tag",
-    "content_tag",
-    "hidden_field_tag",
-    "stylesheet_link_tag",
-    "javascript_include_tag",
-    "javascript_importmap_tags",
-];
-
-/// Argument-less reads of emitted TABLES that a hoistable call may take
-/// as an argument and still be a per-process constant: `Importmap.pins`
-/// and `Importmap.entry` are `config/importmap.rb` rendered as methods
-/// answering literals (see `emit_importmap`), so a call over them is as
-/// constant as a call over the literals themselves. Declared, like the
-/// helpers: a reader is on this list because its body was read, not
-/// because it takes no arguments.
-const HOISTABLE_CONST_READERS: &[(&str, &str)] = &[("Importmap", "pins"), ("Importmap", "entry")];
-
-/// A canonical spelling of an all-literal expression — `None` the moment
-/// any part of it is not a literal. Doubles as the dedupe key, so two call
-/// sites spelled the same way share one constant, and as the guard that
-/// decides whether a call is hoistable at all.
-fn literal_key(e: &Expr) -> Option<String> {
-    match &*e.node {
-        ExprNode::Lit { value } => Some(match value {
-            Literal::Nil => "nil".to_string(),
-            Literal::Bool { value } => format!("b:{value}"),
-            Literal::Int { value } => format!("i:{value}"),
-            Literal::Float { value } => format!("f:{value}"),
-            Literal::Str { value } => format!("s:{value:?}"),
-            Literal::Sym { value } => format!("y:{}", value.as_str()),
-            Literal::Regex { pattern, flags } => format!("r:{pattern:?}/{flags}"),
-        }),
-        ExprNode::Hash { entries, kwargs } => {
-            let mut out = String::from(if *kwargs { "kw{" } else { "h{" });
-            for (k, v) in entries {
-                out.push_str(&literal_key(k)?);
-                out.push_str("=>");
-                out.push_str(&literal_key(v)?);
-                out.push(',');
-            }
-            out.push('}');
-            Some(out)
-        }
-        ExprNode::Array { elements, .. } => {
-            let mut out = String::from("[");
-            for el in elements {
-                out.push_str(&literal_key(el)?);
-                out.push(',');
-            }
-            out.push(']');
-            Some(out)
-        }
-        // An already-hoisted constant is a literal for the purposes of
-        // the call that takes it (a `+` chain over hoisted tags, below).
-        ExprNode::Const { path } if path.len() == 1 && path[0].as_str().starts_with("HOISTED_") => {
-            Some(format!("c:{}", path[0].as_str()))
-        }
-        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if args.is_empty() => {
-            let ExprNode::Const { path } = &*r.node else { return None };
-            let [konst] = path.as_slice() else { return None };
-            HOISTABLE_CONST_READERS
-                .iter()
-                .any(|(k, m)| *k == konst.as_str() && *m == method.as_str())
-                .then(|| format!("{}.{}", konst.as_str(), method.as_str()))
-        }
-        _ => None,
-    }
-}
-
-/// A `+` chain whose every leaf is a hoisted constant or a String
-/// literal — the layout's `stylesheet_link_tag(…) + "\n" +
-/// stylesheet_link_tag(…) + …` once each call is a constant. String `+`
-/// is pure and answers a fresh String, so the WHOLE chain is one more
-/// constant (its key is the chain's spelling); without this the tags
-/// would be hoisted and the 27 concatenations still run per request.
-/// Answers the key for a chain, `None` for anything else — including a
-/// bare leaf, which is not a chain.
-fn hoistable_concat_key(e: &Expr) -> Option<String> {
-    fn leaf_or_chain(x: &Expr) -> Option<String> {
-        match &*x.node {
-            ExprNode::Lit { value: Literal::Str { .. } } => literal_key(x),
-            ExprNode::Const { path } if path.len() == 1 && path[0].as_str().starts_with("HOISTED_") => {
-                literal_key(x)
-            }
-            _ => hoistable_concat_key(x),
-        }
-    }
-    let ExprNode::Send { recv: Some(l), method, args, block: None, .. } = &*e.node else {
-        return None;
-    };
-    if method.as_str() != "+" || args.len() != 1 {
-        return None;
-    }
-    Some(format!("plus({},{})", leaf_or_chain(l)?, leaf_or_chain(&args[0])?))
-}
-
-/// The dedupe key for a hoistable call, or `None` if this expression is
-/// not one: `ActionView::ViewHelpers.<helper>(<literals>)`, no block.
-fn hoistable_call_key(e: &Expr) -> Option<String> {
-    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else {
-        return None;
-    };
-    if !is_view_helpers_const(r) || !HOISTABLE_TAG_HELPERS.contains(&method.as_str()) {
-        return None;
-    }
-    let mut key = format!("{}(", method.as_str());
-    for a in args {
-        key.push_str(&literal_key(a)?);
-        key.push(',');
-    }
-    key.push(')');
-    Some(key)
-}
-
-/// `image_tag("boost.svg", …)` -> `HOISTED_IMAGE_TAG_BOOST_SVG`. The first
-/// String argument names it, because that is what a reader of the emitted
-/// view is looking for; a suffix disambiguates two calls that differ only
-/// in their options.
-fn hoisted_const_name(
-    method: &str,
-    args: &[Expr],
-    used: &mut crate::det::HashSet<String>,
-) -> Symbol {
-    let mut base = format!("HOISTED_{}", method.to_uppercase());
-    if let Some(first) = args.iter().find_map(|a| match &*a.node {
-        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-        _ => None,
-    }) {
-        let slug: String = first
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
-            .collect();
-        let slug = slug.trim_matches('_').to_string();
-        if !slug.is_empty() {
-            base = format!("{base}_{slug}");
-        }
-    }
-    let mut name = base.clone();
-    let mut n = 2;
-    while !used.insert(name.clone()) {
-        name = format!("{base}_{n}");
-        n += 1;
-    }
-    Symbol::from(name.as_str())
-}
-
-/// Replace hoistable calls in one expression tree with references to
-/// class constants, minting a constant the first time each distinct call
-/// is seen. Children first, so a nested call is hoisted before its parent
-/// is examined (a parent that contains one is not itself all-literal, so
-/// the two can never both fire on the same node).
-fn hoist_in_expr(
-    e: &mut Expr,
-    minted: &mut crate::det::HashMap<String, Symbol>,
-    order: &mut Vec<(Symbol, Expr)>,
-    used: &mut crate::det::HashSet<String>,
-) {
-    hoist_in_expr_at(e, false, minted, order, used)
-}
-
-/// `in_concat`: this node is an operand of a `+` the parent will fold
-/// if the whole chain qualifies — so a qualifying `+` here is left for
-/// the parent, and only the outermost `+` of a chain mints a constant.
-fn hoist_in_expr_at(
-    e: &mut Expr,
-    in_concat: bool,
-    minted: &mut crate::det::HashMap<String, Symbol>,
-    order: &mut Vec<(Symbol, Expr)>,
-    used: &mut crate::det::HashSet<String>,
-) {
-    let child_in_concat = matches!(&*e.node, ExprNode::Send { method, args, block: None, .. }
-        if method.as_str() == "+" && args.len() == 1);
-    e.node.for_each_child_mut(&mut |c| hoist_in_expr_at(c, child_in_concat, minted, order, used));
-    let (key, label) = match hoistable_call_key(e) {
-        Some(key) => (key, None),
-        None => match hoistable_concat_key(e) {
-            Some(key) => (key, Some("concat")),
-            None => return,
-        },
-    };
-    // A chain is hoisted at its TOP: a `+` whose parent is also a `+`
-    // over the same kind of leaves is folded by the parent, so the
-    // whole chain becomes one constant rather than one per operator.
-    if label.is_some() && in_concat {
-        return;
-    }
-    let name = match minted.get(&key) {
-        Some(name) => name.clone(),
-        None => {
-            let ExprNode::Send { method, args, .. } = &*e.node else { unreachable!() };
-            let name = match label {
-                Some(label) => hoisted_const_name(label, &[], used),
-                None => hoisted_const_name(method.as_str(), args, used),
-            };
-            minted.insert(key, name.clone());
-            order.push((name.clone(), e.clone()));
-            name
-        }
-    };
-    let span = e.span;
-    let ty = e.ty.clone();
-    *e = Expr::new(span, ExprNode::Const { path: vec![name] });
-    e.ty = ty;
-}
-
-/// Hoist a pure view-helper call whose arguments are all literals to a
-/// class constant, so the string it always produces is built once at load
-/// rather than on every call.
-///
-/// WHY THIS IS WORTH A PASS. campfire's `_actions.rb` calls `image_tag`
-/// seven times per MESSAGE — about 200 times on a 40-message room page —
-/// and each call allocates the options hash, the nested `aria:` hash,
-/// another hash from `opts.to_h`, the materialised key/value pairs, then
-/// an array and a string per attribute in `render_attrs`, to produce a
-/// byte-identical `<img>` tag every time. Profiled on the spinel binary,
-/// `image_tag` was 13.9% of the whole server's CPU on `/rooms/1`, and
-/// `sp_PolyArray_new` was the single hottest leaf underneath it. Hoisting
-/// those seven took the page from 206 to 224-238 req/s, byte-identical.
-///
-/// Hoisting rather than constant-FOLDING is deliberate: computing the
-/// string in Rust here would make a second implementation of `image_tag`
-/// that can drift from the runtime's, and the emitted constant keeps the
-/// one implementation while paying it once per process.
-///
-/// NAMES ARE UNIQUE ACROSS THE WHOLE SLICE, not per class, and that is not
-/// tidiness. campfire's `_actions.rb` and `_template.rb` are two
-/// LibraryClasses that both reopen `Views::Messages`, and both ask for the
-/// same icon — one with `size: 20` and one without. Named per class they
-/// both minted `HOISTED_IMAGE_TAG_MENU_DOTS_HORIZONTAL_SVG`, whichever
-/// file loaded second silently won, and every message rendered its
-/// options menu with an `<img>` that had lost its `width` and `height`.
-/// `scripts/campfire-compare` caught it against Rails; nothing else would
-/// have. Dedupe stays PER CLASS (a class must define what it references,
-/// since sibling files of one namespace have no load-order contract), so
-/// two files hoisting the identical call get two constants with equal
-/// values — redundant, and the only alternative that is safe.
-fn hoist_pure_helper_constants(lcs: &mut [LibraryClass]) {
-    // Seeded from every class, so a hoisted name can never collide with an
-    // app constant defined in a sibling file of the same namespace either.
-    let mut used: crate::det::HashSet<String> = lcs
-        .iter()
-        .flat_map(|lc| lc.constants.iter().map(|(n, _)| n.as_str().to_string()))
-        .collect();
-    for lc in lcs.iter_mut() {
-        let mut minted: crate::det::HashMap<String, Symbol> =
-            crate::det::HashMap::default();
-        // Source order of first use, so the emitted constants read down the
-        // file in the order the template reaches them.
-        let mut order: Vec<(Symbol, Expr)> = Vec::new();
-        for m in &mut lc.methods {
-            hoist_in_expr(&mut m.body, &mut minted, &mut order, &mut used);
-        }
-        lc.constants.extend(order);
-    }
-}
-
 /// Strip one trailing `.to_s` (the view walker's `coerce_to_s` wrap) so
 /// the safe-call check sees the helper call itself.
 fn strip_to_s(e: &Expr) -> &Expr {
@@ -4835,6 +4561,56 @@ fn bang_to_reassign(expr: &mut Expr) {
     }
 }
 
+/// ActiveSupport `String#pluralize` / `String#pluralize(count)`, inflection
+/// of the string ITSELF (singular when count == 1, else the plural),
+/// distinct from the count-labeling `Inflector.pluralize(count, word)`.
+/// Spinel can't reopen the built-in String, so the call lands on the
+/// ruby-family `Inflector.pluralize_word` module function. A value read
+/// out of `params` or an untyped Hash reaches here as untyped or nilable,
+/// so those receivers count too, unless the app defines a `pluralize` of
+/// its own that such a receiver could be dispatching to.
+fn ground_string_pluralize(expr: &mut Expr, app_defines_pluralize: bool) {
+    expr.node.for_each_child_mut(&mut |c| ground_string_pluralize(c, app_defines_pluralize));
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return };
+    if method.as_str() != "pluralize" || args.len() > 1 {
+        return;
+    }
+    let Some(ty) = r.ty.as_ref() else { return };
+    let string_receiver = matches!(ty, crate::ty::Ty::Str)
+        || (!app_defines_pluralize && pluralize_receiver_may_be_string(ty));
+    if !string_receiver {
+        return;
+    }
+    let span = expr.span;
+    let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+    let ExprNode::Send { recv, args, .. } = node else { unreachable!() };
+    let count = args.into_iter().next().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+    *expr.node = ExprNode::Send {
+        recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Inflector")] })),
+        method: Symbol::from("pluralize_word"),
+        args: vec![recv.unwrap(), count],
+        block: None,
+        parenthesized: true,
+    };
+}
+
+/// A String or a value of no settled type, possibly nilable (a Hash read
+/// nests the nil). An element of a `params` list reads as a `ParamValue`,
+/// and a block over a list built from `permit(...).to_h` leaves its element
+/// an unresolved variable.
+fn pluralize_receiver_may_be_string(ty: &crate::ty::Ty) -> bool {
+    use crate::ty::Ty;
+    match ty {
+        Ty::Str | Ty::Untyped | Ty::Var { .. } => true,
+        Ty::Class { id, .. } => id.0.as_str() == "Roundhouse::ParamValue",
+        Ty::Union { variants } => {
+            variants.iter().any(|v| !matches!(v, Ty::Nil))
+                && variants.iter().all(|v| matches!(v, Ty::Nil) || pluralize_receiver_may_be_string(v))
+        }
+        _ => false,
+    }
+}
+
 fn rewrite_helper_calls(
     expr: &mut Expr,
     index: &HashMap<Symbol, ClassId>,
@@ -4877,36 +4653,6 @@ fn rewrite_helper_calls(
     {
         for statement in statements {
             bang_to_reassign(statement);
-        }
-    }
-
-    // ActiveSupport `String#pluralize(count)` — count-aware inflection of
-    // the string ITSELF (singular when count == 1, else the inflected
-    // plural), distinct from the count-labeling `Inflector.pluralize(count,
-    // word)` grounded below. Spinel can't reopen the built-in String, so
-    // lower the String-receiver form to the ruby-family `Inflector.
-    // pluralize_word` module function. String-typed receiver only, so a
-    // model's own one-arg `pluralize` (should one exist) is left alone.
-    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node {
-        if method.as_str() == "pluralize"
-            && args.len() == 1
-            && matches!(r.ty, Some(crate::ty::Ty::Str))
-        {
-            let span = expr.span;
-            let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
-            let ExprNode::Send { recv, args, .. } = node else { unreachable!() };
-            let count = args.into_iter().next().unwrap();
-            *expr.node = ExprNode::Send {
-                recv: Some(Expr::new(
-                    span,
-                    ExprNode::Const { path: vec![Symbol::from("Inflector")] },
-                )),
-                method: Symbol::from("pluralize_word"),
-                args: vec![recv.unwrap(), count],
-                block: None,
-                parenthesized: true,
-            };
-            return;
         }
     }
 
@@ -6116,6 +5862,7 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
         .direct_helpers
         .iter()
         .map(|h| format!("{}_path", h.name.as_str()))
+        .chain(app.generated_route_helpers.iter().map(|m| m.name.as_str().to_string()))
         .collect();
     let class_method_targets = record_answering_class_methods(app);
     // The route helpers' OWN lowered signatures — read off the slice we
@@ -6798,14 +6545,7 @@ fn to_s_keeping_nil(value: Expr, sig: &RecordSignals<'_>) -> Expr {
     let span = value.span;
     // A name the method doesn't already bind: the `Let` assigns in
     // the method's own scope.
-    let name = loop {
-        let n = sig.next_local.get();
-        sig.next_local.set(n + 1);
-        let candidate = Symbol::from(format!("route_segment_{n}"));
-        if sig.taken_locals.borrow_mut().insert(candidate.clone()) {
-            break candidate;
-        }
-    };
+    let name = fresh_route_segment_local(sig);
     let value_ty = value.ty.clone().unwrap_or(crate::ty::Ty::Untyped);
     let typed = |node: ExprNode, ty: crate::ty::Ty| Expr { ty: Some(ty), ..Expr::new(span, node) };
     let read = || typed(ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() }, value_ty.clone());
@@ -6825,6 +6565,17 @@ fn to_s_keeping_nil(value: Expr, sig: &RecordSignals<'_>) -> Expr {
         opt_str.clone(),
     );
     typed(ExprNode::Let { id: crate::ident::VarId(0), name, value, body: check }, opt_str)
+}
+
+fn fresh_route_segment_local(sig: &RecordSignals<'_>) -> Symbol {
+    loop {
+        let n = sig.next_local.get();
+        sig.next_local.set(n + 1);
+        let candidate = Symbol::from(format!("route_segment_{n}"));
+        if sig.taken_locals.borrow_mut().insert(candidate.clone()) {
+            return candidate;
+        }
+    }
 }
 
 /// The instance method names `lc` and its ancestors (parents and
@@ -6864,6 +6615,33 @@ fn ancestry_methods(
 /// model's own `to_param` (a slug model), else its id — as text when
 /// the slot is declared `String`.
 fn project_record_arg(arg: &mut Expr, model: &str, sig: &RecordSignals<'_>, wants_str: bool) {
+    if let Some(Ty::Union { variants }) = &arg.ty {
+        if variants.contains(&Ty::Nil) {
+            let span = arg.span;
+            let value = std::mem::replace(arg, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+            let value_ty = value.ty.clone().unwrap();
+            let name = fresh_route_segment_local(sig);
+            let typed = |node, ty| Expr { ty: Some(ty), ..Expr::new(span, node) };
+            let read = |ty| typed(ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() }, ty);
+            let mut projected = read(value_ty.clone().strip_nil());
+            project_record_arg(&mut projected, model, sig, wants_str);
+            let result_ty = crate::analyze::union_of(projected.ty.clone().unwrap(), Ty::Nil);
+            let cond = typed(
+                ExprNode::Send { recv: Some(read(value_ty)), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false },
+                Ty::Bool,
+            );
+            let check = typed(
+                ExprNode::If {
+                    cond,
+                    then_branch: typed(ExprNode::Lit { value: crate::expr::Literal::Nil }, Ty::Nil),
+                    else_branch: projected,
+                },
+                result_ty.clone(),
+            );
+            *arg = typed(ExprNode::Let { id: crate::ident::VarId(0), name, value, body: check }, result_ty);
+            return;
+        }
+    }
     {
         let slug = sig.slug_models.contains(model);
         let span = arg.span;
@@ -8526,6 +8304,24 @@ fn module_adapter_preserves_parameter_declaration_facts() {
 
 thread_local! {
     static RENDERED: std::cell::RefCell<Option<Vec<LibraryClass>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Both per-reference indexes over `classes`, for a render on a worker
+/// thread (`par_render`), which starts with none installed.
+pub(super) fn install_worker_lookup_indexes<'a>(app: &'a App, classes: &'a [LibraryClass]) -> LookupIndexes<'a> {
+    install_lookup_indexes_for(app, classes)
+}
+
+/// Whether a lookup test has turned the indexes off on this thread.
+#[cfg(test)]
+pub(super) fn lookups_uncached() -> bool {
+    lookup_tests::UNCACHED.get()
+}
+
+/// Whether a [`record_rendered`] is collecting the classes rendered on
+/// this thread, which it lists in render order.
+pub(super) fn recording_rendered() -> bool {
+    RENDERED.with(|r| r.borrow().is_some())
 }
 
 pub fn record_rendered<T>(f: impl FnOnce() -> T) -> (T, Vec<LibraryClass>) {

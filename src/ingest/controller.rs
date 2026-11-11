@@ -153,6 +153,20 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
             // `controller_layout` resolves each action's layout from. A
             // non-literal `only:`/`except:` is a located gap (survey) or a
             // strict error, as a filter's is, and leaves `layout` as it was.
+            // `alias :new :old` is the keyword spelling of `alias_method :new, :old`, which the lowering copies the method for.
+            if let Some(alias) = stmt.as_alias_method_node()
+                && let (Some(to), Some(from)) = (alias.new_name().as_symbol_node(), alias.old_name().as_symbol_node())
+            {
+                let span = crate::span::Span { file: super::sources::file_id(file), start: stmt_start as u32, end: stmt.location().end_offset() as u32 };
+                let sym = |s: &ruby_prism::SymbolNode<'_>| crate::expr::Expr::new(span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(String::from_utf8_lossy(s.unescaped()).as_ref()) } });
+                body_items.push(ControllerBodyItem::Unknown {
+                    expr: crate::expr::Expr::new(span, crate::expr::ExprNode::Send { recv: None, method: Symbol::from("alias_method"), args: vec![sym(&to), sym(&from)], block: None, parenthesized: false }),
+                    leading_comments: std::mem::take(&mut leading),
+                    leading_blank_line: leading_blank,
+                });
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             match parse_layout_call(&stmt, file) {
                 Ok(Some(decl)) => layout = decl,
                 Ok(None) => {}
@@ -778,9 +792,10 @@ pub(super) fn parse_filter_call_on(
         return parse_forgery_macro(&call, macro_name == "protect_from_forgery", file);
     }
     let kind = match macro_name {
-        "before_action" | "prepend_before_action" => FilterKind::Before,
-        "around_action" => FilterKind::Around,
-        "after_action" => FilterKind::After,
+        // `append_*` is Rails' alias of the plain macro (AbstractController::Callbacks).
+        "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
+        "around_action" | "append_around_action" => FilterKind::Around,
+        "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,

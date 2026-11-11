@@ -53,6 +53,17 @@ fn rb_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::pa
     }
 }
 
+fn all_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            all_files(root, &path, out);
+        } else {
+            out.push(path.strip_prefix(root).unwrap().to_path_buf());
+        }
+    }
+}
+
 fn app(modules: &str, routes: &str) -> emit_and_run::Overlay {
     let fixture = roundhouse::fixtures::real_blog();
     let lock = std::fs::read_to_string(fixture.join("Gemfile.lock")).unwrap();
@@ -72,12 +83,19 @@ fn app(modules: &str, routes: &str) -> emit_and_run::Overlay {
         let gem = installed(name, version);
         let mut files = Vec::new();
         rb_files(&gem, &gem.join("lib"), &mut files);
+        // Not lib/ alone: an installed engine has its app/ too, devise's controllers and views.
+        all_files(&gem, &gem.join("app"), &mut files);
         for file in files {
             let text = std::fs::read_to_string(gem.join(&file)).unwrap();
             overlay = overlay.write(&format!("vendor/bundle/ruby/3.4.0/gems/{name}-{version}/{}", file.display()), &text);
         }
     }
     overlay
+}
+
+/// A route by its verb, path, controller and action, which a guard's arguments may follow: not a longer action's name.
+fn has_route(routes: &str, route: &str) -> bool {
+    routes.contains(&format!("{route})")) || routes.contains(&format!("{route},"))
 }
 
 fn drawn(overlay: emit_and_run::Overlay) -> (String, String) {
@@ -92,12 +110,12 @@ fn drawn(overlay: emit_and_run::Overlay) -> (String, String) {
 fn devise_for_draws_the_routes_of_the_models_modules() {
     let (routes, helpers) = drawn(app(":database_authenticatable, :registerable, :recoverable", "  devise_for :users\n"));
     for route in [
-        r#"Route.new("GET", "/users/sign_in", :devise__sessions, :new)"#,
-        r#"Route.new("DELETE", "/users/sign_out", :devise__sessions, :destroy)"#,
-        r#"Route.new("GET", "/users/cancel", :devise__registrations, :cancel)"#,
-        r#"Route.new("PUT", "/users/password", :devise__passwords, :update)"#,
+        r#"Route.new("GET", "/users/sign_in", :devise__sessions, :new"#,
+        r#"Route.new("DELETE", "/users/sign_out", :devise__sessions, :destroy"#,
+        r#"Route.new("GET", "/users/cancel", :devise__registrations, :cancel"#,
+        r#"Route.new("PUT", "/users/password", :devise__passwords, :update"#,
     ] {
-        assert!(routes.contains(route), "{route}\n{routes}");
+        assert!(has_route(&routes, route), "{route}\n{routes}");
     }
     assert!(!routes.contains("confirmation"), "{routes}");
     for helper in ["new_user_session_path", "destroy_user_session_path", "cancel_user_registration_path", "edit_user_password_path"] {
@@ -105,11 +123,11 @@ fn devise_for_draws_the_routes_of_the_models_modules() {
     }
 
     let (routes, _) = drawn(app(":database_authenticatable", "  devise_for :users\n"));
-    assert!(routes.contains(r#"Route.new("GET", "/users/sign_in", :devise__sessions, :new)"#), "{routes}");
+    assert!(has_route(&routes, r#"Route.new("GET", "/users/sign_in", :devise__sessions, :new"#), "{routes}");
     assert!(!routes.contains("registrations") && !routes.contains("passwords"), "{routes}");
 
     let (routes, _) = drawn(app(":database_authenticatable, :registerable, :recoverable", "  devise_for :users, skip: [:registrations]\n"));
-    assert!(routes.contains(r#"Route.new("GET", "/users/password/new", :devise__passwords, :new)"#), "{routes}");
+    assert!(has_route(&routes, r#"Route.new("GET", "/users/password/new", :devise__passwords, :new"#), "{routes}");
     assert!(!routes.contains("registrations"), "{routes}");
 }
 
@@ -122,11 +140,11 @@ fn devise_for_options_and_an_enclosing_module_are_devises() {
         "  scope module: :auth do\n    devise_for :users, path: \"account\", path_names: { sign_in: \"login\" }, controllers: { registrations: \"users/registrations\" }\n  end\n",
     ));
     for route in [
-        r#"Route.new("GET", "/account/login", :auth__sessions, :new)"#,
-        r#"Route.new("DELETE", "/account/sign_out", :auth__sessions, :destroy)"#,
-        r#"Route.new("GET", "/account/sign_up", :users__registrations, :new)"#,
+        r#"Route.new("GET", "/account/login", :auth__sessions, :new"#,
+        r#"Route.new("DELETE", "/account/sign_out", :auth__sessions, :destroy"#,
+        r#"Route.new("GET", "/account/sign_up", :users__registrations, :new"#,
     ] {
-        assert!(routes.contains(route), "{route}\n{routes}");
+        assert!(has_route(&routes, route), "{route}\n{routes}");
     }
     assert!(!routes.contains("auth/devise/") && !routes.contains("auth__users__"), "{routes}");
 }
@@ -137,7 +155,252 @@ fn devise_for_a_subclass_draws_its_superclasss_modules() {
     let (routes, helpers) = drawn(
         app(":database_authenticatable, :recoverable", "  devise_for :admins, path: \"admin\"\n").write("app/models/admin.rb", "class Admin < User\nend\n"),
     );
-    assert!(routes.contains(r#"Route.new("GET", "/admin/sign_in", :devise__sessions, :new)"#), "{routes}");
-    assert!(routes.contains(r#"Route.new("GET", "/admin/password/new", :devise__passwords, :new)"#), "{routes}");
+    assert!(has_route(&routes, r#"Route.new("GET", "/admin/sign_in", :devise__sessions, :new"#), "{routes}");
+    assert!(has_route(&routes, r#"Route.new("GET", "/admin/password/new", :devise__passwords, :new"#), "{routes}");
     assert!(helpers.contains("def self.new_admin_session_path"), "{helpers}");
+}
+
+/// Devise's engine stacks Warden's `Warden::Manager` (`config.app_middleware.use Warden::Manager do
+/// |config| … end`), so a request carries `env["warden"]` as in Rails; the block configures it.
+#[test]
+fn devise_puts_warden_on_the_middleware_stack_with_its_configuring_block() {
+    let (tree, errors) = app(":database_authenticatable", "  devise_for :users\n").emit(BuildTarget::Ruby);
+    let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
+    assert!(stack.contains("Warden::Manager.new(app) { |config|\nDevise.warden_config = config\n}"), "{stack}\n{errors:#?}");
+    // Not refused: with no `config.omniauth`, the engine's loop over `Devise.omniauth_configs` inserts nothing.
+    assert!(!errors.iter().any(|e| e.contains("railtie middleware")), "{errors:#?}");
+}
+
+/// Devise's `require 'responders'` compiles the responders gem too, though its `ActionController::Responder`
+/// names no namespace of its own: Devise's Responder then settles `respond_to?(:error_status=)` on it.
+#[test]
+fn devise_compiles_the_responders_it_requires() {
+    let (tree, errors) = app(":database_authenticatable", "  devise_for :users\n").emit(BuildTarget::Spinel);
+    let responder = std::fs::read_to_string(tree.join("app/models/action_controller/responder.rb")).expect("responder.rb");
+    assert!(responder.contains("class Responder"), "{responder}");
+    assert!(!errors.iter().any(|e| e.contains("devise/controllers/responder.rb")), "{errors:#?}");
+}
+
+/// A provider the app configures is a middleware the engine's loop inserts, which the stack does not hold.
+#[test]
+fn an_omniauth_provider_keeps_the_engines_middleware_loop_refused() {
+    let (_, errors) = app(":database_authenticatable", "  devise_for :users\n")
+        .write(
+            "config/initializers/devise.rb",
+            "Devise.setup do |config|\n  config.mailer_sender = \"please-change-me@example.com\"\n  require \"devise/orm/active_record\"\n  config.omniauth :github, \"id\", \"secret\"\nend\n",
+        )
+        .emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("railtie middleware") && e.contains("inserted under a condition")), "{errors:#?}");
+}
+
+/// `authenticated :user` with no block: Devise's `block.nil? || block.call(…)` is `true` once the
+/// block is written in, so the constraint asks only the Warden proxy Devise's engine stacks.
+#[test]
+fn devise_authenticated_asks_the_warden_proxy_its_engine_stacks() {
+    let (tree, errors) = app(":database_authenticatable", "  devise_for :users\n  authenticated :user do\n    get \"/dash\", to: \"articles#index\"\n  end\n")
+        .emit(BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("request constraint")), "{errors:#?}");
+    let guards = std::fs::read_to_string(tree.join("app/models/roundhouse_route_guards.rb")).expect("guards");
+    assert!(guards.contains("request.env[\"warden\"].send(:authenticate?, scope: :user) && true"), "{guards}");
+}
+
+/// A gem's `Devise.token` (devise-jwt's `Devise.jwt` is written this way) yields a settings object of the gem's own, not `Devise`:
+/// that `Devise.setup` cannot run it leaves none of Devise's settings unsure, and the routes that read them are still drawn.
+#[test]
+fn devise_for_is_drawn_past_a_setup_block_configuring_another_object() {
+    let gem = "module Devise\n  def self.token\n    yield(Devise::Token.config)\n  end\n\n  module Token\n  end\nend\n";
+    let setup = "Devise.setup do |config|\n  config.mailer_sender = \"please-change-me@example.com\"\n  require \"devise/orm/active_record\"\n  config.token do |token|\n    token.secret = \"x\"\n  end\nend\n";
+    let (routes, helpers) = drawn(
+        app(":database_authenticatable", "  devise_for :users\n")
+            .write("lib/devise_token.rb", gem)
+            .write("config/initializers/devise.rb", setup),
+    );
+    assert!(has_route(&routes, r#"Route.new("GET", "/users/sign_in", :devise__sessions, :new"#), "{routes}");
+    assert!(helpers.contains("def self.new_user_session_path"), "{helpers}");
+}
+
+/// A gem can register its module with a bare `add_module` inside `module Devise` (devise-jwt does): the module is one Devise knows, as `Devise.add_module` makes it.
+#[test]
+fn devise_for_knows_a_module_registered_inside_module_devise() {
+    let (routes, _) = drawn(
+        app(":database_authenticatable, :token_authenticatable", "  devise_for :users\n")
+            .edit("Gemfile.lock", "    devise (4.9.4)\n", "    devise-token (0.1.0)\n      devise (~> 4.0)\n    devise (4.9.4)\n")
+            .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  devise-token\n")
+            .edit("Gemfile", "gem \"devise\"\n", "gem \"devise\"\ngem \"devise-token\"\n")
+            .write("vendor/bundle/ruby/3.4.0/gems/devise-token-0.1.0/lib/devise-token.rb", "module Devise\n  add_module(:token_authenticatable, strategy: :token)\nend\n"),
+    );
+    assert!(has_route(&routes, r#"Route.new("GET", "/users/sign_in", :devise__sessions, :new"#), "{routes}");
+}
+
+/// A `devise` option sets that option on the model and no other: `stretches:` leaves the unlock strategy Devise's, so its unlock routes are drawn.
+/// The option it does read, set on the model, is the model's own: no route is guessed from Devise's default.
+#[test]
+fn devise_for_reads_past_a_model_option_it_does_not_ask_about() {
+    let (routes, _) = drawn(app(":database_authenticatable, :lockable, stretches: 1", "  devise_for :users\n"));
+    assert!(has_route(&routes, r#"Route.new("GET", "/users/unlock/new", :devise__unlocks, :new"#), "{routes}");
+
+    let (routes, _) = drawn(app(":database_authenticatable, :lockable, unlock_strategy: :time", "  devise_for :users\n"));
+    assert!(!routes.contains("/users/unlock"), "{routes}");
+}
+
+/// `new_session_path(resource_or_scope, *args)`, which Devise's `generate_helpers!` defines by a computed name, calls the scope's own helper.
+/// The expected answers are Rails' (Devise 4.9.4 on Rails 8.1), with `:admin` a mapping that uses no password routes and has its session routes skipped.
+#[test]
+fn devise_generated_url_helpers_answer_for_a_scope_and_a_resource_as_in_rails() {
+    let admins = "  create_table \"admins\", force: :cascade do |t|\n    t.string \"email\", default: \"\", null: false\n    t.string \"encrypted_password\", default: \"\", null: false\n  end\n\n";
+    let (tree, _) = app(":database_authenticatable, :recoverable", "  devise_for :users\n  devise_for :admins, skip: [:sessions]\n")
+        .edit("db/schema.rb", "  create_table \"articles\"", &format!("{admins}  create_table \"articles\""))
+        .write("app/models/admin.rb", "class Admin < ApplicationRecord\n  devise :database_authenticatable\nend\n")
+        // A query passed to the scope's own helper gives it a keyword parameter, which is no path segment.
+        .write("app/controllers/gadgets_controller.rb", "class GadgetsController < ApplicationController\n  def show\n    redirect_to new_user_session_path(foo: 1)\n  end\nend\n")
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"gadget\", to: \"gadgets#show\"\n")
+        .emit(BuildTarget::Spinel);
+    // The Spinel tree is the one holding the gem compiled from source; `RouteHelpers` and its query rendering load on their own.
+    let script = r##"
+module ActiveSupport; end
+class User; end
+class Manager < User; end
+class Admin; end
+require "./runtime/action_view/view_helpers"
+require "./runtime/hash_to_query"
+require "./app/route_helpers"
+def expect(label, want)
+  got = begin
+    yield
+  rescue Exception => e
+    e.class
+  end
+  raise "#{label}: #{got.inspect}, want #{want.inspect}" unless got == want
+end
+R = RouteHelpers
+expect("symbol", "/users/sign_in") { R.new_session_path(:user) }
+expect("string", "/users/sign_in") { R.new_session_path("user") }
+expect("instance", "/users/sign_in") { R.new_session_path(User.new) }
+expect("class", "/users/sign_in") { R.new_session_path(User) }
+expect("subclass instance", "/users/sign_in") { R.new_session_path(Manager.new) }
+expect("destroy", "/users/sign_out") { R.destroy_session_path(:user) }
+expect("no action", "/users/sign_in") { R.session_path(:user) }
+expect("query", "/users/password/edit?reset_password_token=x+y") { R.edit_password_path(:user, reset_password_token: "x y") }
+expect("instance and query", "/users/password/edit?extra%5B%5D=1&extra%5B%5D=2&reset_password_token=x") { R.edit_password_path(User.new, reset_password_token: "x", extra: [1, 2]) }
+# Rails answers these two, which the helper does not write: refused rather than left out of the URL.
+expect("format", ArgumentError) { R.new_session_path(:user, format: :json) }
+expect("positional format", ArgumentError) { R.new_session_path(:user, "json") }
+# A helper this mapping does not use, one whose routes are skipped, one no mapping uses, an unknown scope and an object that maps to none: Rails' errors.
+expect("helper the mapping does not use", NoMethodError) { R.new_password_path(:admin) }
+expect("routes skipped", NoMethodError) { R.new_session_path(:admin) }
+expect("no mapping uses it", NoMethodError) { R.new_confirmation_path(:user) }
+expect("unknown scope", NoMethodError) { R.new_session_path(:ghost) }
+expect("no mapping for the object", RuntimeError) { R.new_session_path(Object.new) }
+expect("nil", RuntimeError) { R.new_session_path(nil) }
+puts "devise url helpers passed"
+"##;
+    let out = std::process::Command::new("ruby").args(["-e", script]).current_dir(&tree).output().expect("spawn ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("devise url helpers passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `Devise.mappings` is a Hash, so a scope drawn again keeps its first place, and `find_scope!` walks it in that order.
+#[test]
+fn devise_url_helpers_keep_a_redrawn_scopes_first_place() {
+    let admins = "  create_table \"admins\", force: :cascade do |t|\n    t.string \"email\", default: \"\", null: false\n    t.string \"encrypted_password\", default: \"\", null: false\n  end\n\n";
+    let (tree, _) = app(":database_authenticatable", "  devise_for :users, skip: :all\n  devise_for :admins\n  devise_for :users\n")
+        .edit("db/schema.rb", "  create_table \"articles\"", &format!("{admins}  create_table \"articles\""))
+        .write("app/models/admin.rb", "class Admin < ApplicationRecord\n  devise :database_authenticatable\nend\n")
+        .emit(BuildTarget::Spinel);
+    let script = r##"
+module ActiveSupport; end
+class User; end
+class Admin < User; end
+require "./runtime/action_view/view_helpers"
+require "./runtime/hash_to_query"
+require "./app/route_helpers"
+got = RouteHelpers.new_session_path(Admin.new)
+raise "got #{got}" unless got == "/users/sign_in"
+puts "first place kept"
+"##;
+    let out = std::process::Command::new("ruby").args(["-e", script]).current_dir(&tree).output().expect("spawn ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("first place kept"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// The helper asks the record itself for its scope, so a caller's record reaches it whole: `@user.id` would map to no scope.
+#[test]
+fn devise_generated_url_helpers_take_a_record_as_written() {
+    let (tree, _) = app(":database_authenticatable", "  devise_for :users\n")
+        .write("app/controllers/gadgets_controller.rb", "class GadgetsController < ApplicationController\n  def show\n    @user = User.new\n    @path = new_session_path(@user)\n    @url = new_session_url(@user)\n  end\nend\n")
+        .write("app/views/gadgets/show.html.erb", "<%= new_session_path(@user) %>\n<%= render \"row\", user: @user %>\n")
+        .write("app/views/gadgets/_row.html.erb", "<%= link_to \"in\", new_session_path(user) %>\n")
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"gadget\", to: \"gadgets#show\"\n")
+        .emit(BuildTarget::Spinel);
+    let controller = std::fs::read_to_string(tree.join("app/controllers/gadgets_controller.rb")).expect("controller");
+    assert!(controller.contains("RouteHelpers.new_session_path(@user)"), "{controller}");
+    assert!(!controller.contains("@user.id"), "{controller}");
+    let view = std::fs::read_to_string(tree.join("app/views/gadgets/show.rb")).expect("view");
+    assert!(!view.contains(".id"), "{view}");
+    let partial = std::fs::read_to_string(tree.join("app/views/gadgets/_row.rb")).expect("partial");
+    assert!(partial.contains("RouteHelpers.new_session_path(user)"), "{partial}");
+}
+
+/// Without a `define_method` by a computed name left for Spinel to refuse: the generator's bodies are written out.
+#[test]
+fn devise_generate_helpers_is_emptied_once_its_helpers_are_written() {
+    let (tree, errors) = app(":database_authenticatable", "  devise_for :users\n")
+        .write("app/models/widget_links.rb", "class WidgetLinks\n  include Devise::Controllers::UrlHelpers\nend\n")
+        .emit(BuildTarget::Spinel);
+    let module = std::fs::read_to_string(tree.join("app/models/devise/controllers/url_helpers.rb")).expect("url_helpers.rb");
+    assert!(!module.contains("define_method"), "{module}");
+    assert!(!errors.iter().any(|e| e.contains("url helpers")), "{errors:#?}");
+}
+
+/// `devise_for … router_name:`: the helper sends to another router, which `RouteHelpers` does not hold. Refused, its generator left standing.
+#[test]
+fn devise_url_helpers_of_a_named_router_are_refused() {
+    let (tree, errors) = app(":database_authenticatable", "  devise_for :users, router_name: :other\n")
+        .write("app/models/widget_links.rb", "class WidgetLinks\n  include Devise::Controllers::UrlHelpers\nend\n")
+        .emit(BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("url helpers") && e.contains("router_name")), "{errors:#?}");
+    let module = std::fs::read_to_string(tree.join("app/models/devise/controllers/url_helpers.rb")).expect("url_helpers.rb");
+    assert!(module.contains("define_method"), "{module}");
+    let helpers = std::fs::read_to_string(tree.join("app/route_helpers.rb")).expect("route_helpers.rb");
+    assert!(!helpers.contains("def self.new_session_path"), "{helpers}");
+}
+
+/// `devise_for` runs `Devise.add_mapping` at boot, as Rails draws the routes then, and `devise_scope`'s
+/// constraint writes the mapping into the env each routed request carries, where Devise's controllers read it.
+#[test]
+fn devise_for_maps_at_boot_and_its_scope_writes_the_mapping_a_request_carries() {
+    let (tree, _) = app(":database_authenticatable", "  devise_for :users\n").emit(BuildTarget::Spinel);
+    let boot = std::fs::read_to_string(tree.join("config/initializers.rb")).expect("initializers.rb");
+    assert!(boot.contains("Devise.add_mapping(:users, "), "{boot}");
+    let guards = std::fs::read_to_string(tree.join("app/models/roundhouse_route_guards.rb")).expect("guards");
+    assert!(guards.contains("request.env[\"devise.mapping\"] = Devise.mappings[:user]"), "{guards}");
+}
+
+/// A Devise controller no route dispatches to (no model is `:recoverable`, so no password routes) runs no
+/// action: it is left out of the Spinel tree, and is there once a model's modules route to it.
+#[test]
+fn a_devise_controller_no_route_reaches_is_left_out() {
+    let (tree, _) = app(":database_authenticatable", "  devise_for :users\n").emit(BuildTarget::Spinel);
+    assert!(tree.join("app/controllers/devise/sessions_controller.rb").exists());
+    assert!(!tree.join("app/controllers/devise/passwords_controller.rb").exists());
+    let (tree, _) = app(":database_authenticatable, :recoverable", "  devise_for :users\n").emit(BuildTarget::Spinel);
+    assert!(tree.join("app/controllers/devise/passwords_controller.rb").exists());
+}
+
+/// What the app's mappings answer alike is a constant: no model here is `:validatable` or `:omniauthable`, so
+/// `if devise_mapping.validatable?` and the shared links' `if devise_mapping.omniauthable?` take their `else`, and
+/// what only those branches call (`resource_class.password_length`, `OmniAuth::Utils`) is not reported. The mailer
+/// the gem's `app/` declares inside `if defined?(ActionMailer)` is in the tree (`Devise.mailer` names it by a string),
+/// with the action `after_update :send_email_changed_notification` sends.
+#[test]
+fn devise_answers_its_mappings_modules_and_leaves_out_what_no_model_uses() {
+    let (tree, errors) = app(":database_authenticatable", "  devise_for :users\n").emit(BuildTarget::Spinel);
+    for absent in ["password_length", "OmniAuth::Utils", "confirmation_instructions", "unlock_instructions"] {
+        assert!(!errors.iter().any(|e| e.contains(absent)), "{absent}: {errors:#?}");
+    }
+    let mut files = Vec::new();
+    all_files(&tree, &tree, &mut files);
+    let has = |needle: &str| files.iter().any(|f| f.to_string_lossy().contains(needle));
+    assert!(has("devise/mailer"), "the gem's mailer: {files:#?}");
+    assert!(has("email_changed"), "an action DatabaseAuthenticatable's callback sends: {files:#?}");
 }

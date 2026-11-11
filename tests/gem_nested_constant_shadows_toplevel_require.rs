@@ -52,12 +52,6 @@ fn a_gem_nested_format_does_not_resolve_to_the_apps_toplevel_format() {
         .write("vendor/gems/kitgem-1.0.0/lib/kitgem.rb", KITGEM)
         .write("vendor/gems/kitgem-1.0.0/lib/kitgem/format.rb", KITGEM_FORMAT)
         .run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), expected, "emitted boot diverges from CRuby");
 }

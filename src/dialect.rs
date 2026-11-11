@@ -2681,6 +2681,11 @@ pub struct ConditionalArm {
     /// exists only when Ruby runs the branch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarations: Vec<ConditionalDeclaration>,
+    /// The writes through the class's own writers this branch makes as it runs
+    /// (`self.error_status = :ok`), in source order. Kept only once the branch
+    /// Ruby takes is settled, when they join the class body's statements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<Expr>,
 }
 
 /// A `class` / `module` statement in a [`ConditionalArm`]: the name it

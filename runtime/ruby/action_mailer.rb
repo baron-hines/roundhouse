@@ -263,7 +263,15 @@ module ActionMailer
     # The action this mailer runs, which the generated callback chain sets
     # (`ingest::mailer_callbacks`).
     def action_name
-      @_action_name.to_s
+      (@_action_name || @_called_action).to_s
+    end
+
+    # The action a mailer whose `mail` looks its template up runs, the
+    # outermost: what `action_name` answers without a callback chain
+    # (`lower::mailer_templates`).
+    def __called(name)
+      @_called_action = name if @_called_action.nil?
+      nil
     end
 
     # Starts the action's chain, or answers false while another action

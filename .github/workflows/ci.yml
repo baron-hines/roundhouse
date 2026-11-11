@@ -1876,6 +1876,13 @@ jobs:
         run: |
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
+      # Not -O2, as in spinel-framework: these tests judge behavior. `spin build` finds the spinel beside it and keeps -O2.
+      - name: Compile with spinel at -O0
+        run: |
+          mkdir -p "$RUNNER_TEMP/spinel-shim"
+          printf '#!/bin/sh\nexec "%s" -O0 "$@"\n' "$PWD/spinel-dist/spinel" > "$RUNNER_TEMP/spinel-shim/spinel"
+          chmod +x "$RUNNER_TEMP/spinel-shim/spinel"
+          echo "$RUNNER_TEMP/spinel-shim" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ needs.spinel-toolchain-plan.outputs.artifact-id }}
@@ -2227,6 +2234,9 @@ jobs:
       # Not separate jobs: each target's framework-tests and toolchain suites ride the compare job that already installs its toolchain (#273).
       - name: cargo test --test rust_toolchain controller identity values
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2235,6 +2245,9 @@ jobs:
             --select rust_toolchain::real_blog_controller_identity_values_match_rails
       - name: cargo test --test rust_toolchain real_blog_i18n_locales_run
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2243,6 +2256,9 @@ jobs:
             --select rust_toolchain::real_blog_i18n_locales_run
       - name: cargo test --test rust_toolchain real_blog_begin_rescue_runs
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2251,6 +2267,9 @@ jobs:
             --select rust_toolchain::real_blog_begin_rescue_runs
       - name: cargo test --test rust_toolchain real_blog_rescue_from_runs
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2259,6 +2278,9 @@ jobs:
             --select rust_toolchain::real_blog_rescue_from_runs
       - name: cargo test --test emit_and_run render json writer on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2287,6 +2309,9 @@ jobs:
           retention-days: 7
       - name: cargo test --test json_builder_nested_values on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2311,6 +2336,9 @@ jobs:
             --select json_builder_nested_values::nested_values_encode_on_csharp
       - name: cargo test --test truncate_separator on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2495,6 +2523,9 @@ jobs:
             --select emit_and_run::render_json_record_writer_runs_on_elixir
       - name: cargo test --test emit_and_run implicit self on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2503,6 +2534,9 @@ jobs:
             --select emit_and_run::model_methods_read_the_record_on_implicit_self_on_rust
       - name: cargo test --test emit_and_run controller params on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2511,6 +2545,9 @@ jobs:
             --select emit_and_run::a_controller_reads_params_into_a_local_on_rust
       - name: cargo test --test emit_and_run setup fixture on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
         run: |
           python3 scripts/ci-unit-tests.py select \
             --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
@@ -2766,20 +2803,38 @@ jobs:
   # assets aren't built (the DOM diff compares asset tags, not files —
   # see scripts/compare's jruby branch).
   compare-jruby:
-    needs: [generate-fixture, plan]
+    # Waits for builds, as compare-ruby does: compiling Roundhouse here took two builds (the test profile
+    # for the bind suites, release for `bin/rh transpile jruby`), about 11 of this job's 14 minutes.
+    needs: [generate-fixture, plan, unit-build, build-roundhouse]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'compare-jruby') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # The archive embeds the producer's checkout and target paths.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - uses: actions/checkout@v7
+      # tools/compare (scripts/compare's HTTP differ) is still built here.
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-nextest
       - uses: actions/download-artifact@v8
         with:
           name: real-blog-fixture
       - name: Extract fixture
         run: tar -xzf real-blog.tar.gz
+      - uses: actions/download-artifact@v8
+        with:
+          name: roundhouse-debug-bin
+          path: roundhouse-debug-bin
+      - *stage-roundhouse-debug-bin
+      - name: Download current-run test bundle
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.unit-build.outputs.unit-test-artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/unit-tests
       # JRuby 10 requires Java 21+ (it refuses to boot on older JDKs).
       # setup-ruby provisions JRuby but not the JDK, so pin Java first.
       - uses: actions/setup-java@v6
@@ -2815,7 +2870,11 @@ jobs:
           jruby -S gem install jdbc-sqlite3 --no-document
           jruby tests/param_binds_jruby.rb
           jruby tests/support/jdbc_value_semantics.rb
-          cargo test --locked --test param_binds_values --test param_binds_cleanup jruby -- --ignored --nocapture
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-jruby/selection.json" \
+            --select param_binds_values:jruby --select param_binds_cleanup:jruby
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.MRI_RUBY }}
@@ -2836,8 +2895,9 @@ jobs:
   spinel-compare:
     name: spinel-compare (blog)
     # Advisory unless ci:spinel focus hardens CORE (spinel-advisory=false).
-    needs: [generate-fixture, spinel-build, plan]
-    if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-compare') && needs.generate-fixture.result == 'success' && needs.spinel-build.outputs.artifact-id != '' }}
+    # build-roundhouse's binary emits: `bin/rh transpile spinel` otherwise compiled a release Roundhouse, about 4 minutes.
+    needs: [generate-fixture, spinel-build, build-roundhouse, plan]
+    if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-compare') && needs.generate-fixture.result == 'success' && needs.spinel-build.outputs.artifact-id != '' && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     outputs: *advisory-outputs
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -2860,6 +2920,11 @@ jobs:
         run: |
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
+      - uses: actions/download-artifact@v8
+        with:
+          name: roundhouse-debug-bin
+          path: roundhouse-debug-bin
+      - *stage-roundhouse-debug-bin
       - name: Install libsqlite3-dev + libjemalloc-dev
         timeout-minutes: 8
         run: |

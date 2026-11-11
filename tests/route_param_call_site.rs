@@ -65,8 +65,16 @@ fn emit(extra_model_body: &str) -> String {
 #[test]
 fn singular_association_read_gets_to_param() {
     let out = emit("  def author_link\n    RouteHelpers.user_path(self.user)\n  end\n");
-    assert!(
-        out.contains("RouteHelpers.user_path(self.user.to_param)"),
+    let projection = concat!(
+        "RouteHelpers.user_path((route_segment_0 = self.user\n",
+        "    if route_segment_0.nil?\n",
+        "      nil\n",
+        "    else\n",
+        "      route_segment_0.to_param\n",
+        "    end))",
+    );
+    assert_eq!(
+        out.matches(projection).count(), 1,
         "a belongs_to read whose target overrides to_param is a record:\n{out}",
     );
 }

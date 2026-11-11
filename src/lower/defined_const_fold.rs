@@ -521,12 +521,32 @@ fn fold_class_statement(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts) {
 }
 
 fn contains_defined(e: &Expr) -> bool {
-    if matches!(&*e.node, ExprNode::Defined { .. }) {
+    if matches!(&*e.node, ExprNode::Defined { .. }) || framework_answer(e).is_some() {
         return true;
     }
     let mut found = false;
     e.node.for_each_child(&mut |c| found |= contains_defined(c));
     found
+}
+
+/// What a Rails framework module the emitted program models answers to `respond_to?` for a method
+/// a gem probes for to tell Rails versions apart.
+const FRAMEWORK_ANSWERS: &[(&str, &str, bool)] = &[
+    // Rails 7.0 removed the classic autoloader's `constantize` and `reference` with it.
+    ("ActiveSupport::Dependencies", "constantize", false),
+    ("ActiveSupport::Dependencies", "reference", false),
+];
+
+fn framework_answer(e: &Expr) -> Option<bool> {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return None };
+    if method.as_str() != "respond_to?" {
+        return None;
+    }
+    let [arg] = args.as_slice() else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node else { return None };
+    let ExprNode::Const { path } = &*r.node else { return None };
+    let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+    FRAMEWORK_ANSWERS.iter().find(|(c, m, _)| *c == name && *m == value.as_str()).map(|(_, _, has)| *has)
 }
 
 /// Literal truthiness, for the value shapes this pass produces.
@@ -563,6 +583,10 @@ fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool, cond: bo
     });
     let any = changed.iter().any(|c| *c);
 
+    if let Some(has) = framework_answer(e) {
+        *e = lit(e, Literal::Bool { value: has }, Ty::Bool);
+        return true;
+    }
     if let ExprNode::Defined { operand } = &*e.node {
         if let ExprNode::Const { path } = &*operand.node {
             let path: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();

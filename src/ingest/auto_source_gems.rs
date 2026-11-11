@@ -38,11 +38,11 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
     let carried = crate::gems::native_extension_gem_namespaces(app);
     let ownership = crate::gems::LockGemIndex::new(lock);
     let mut out: BTreeSet<String> = BTreeSet::new();
-    let mut consider = |path: &str, from_gem: bool| {
-        if own.contains(path) || ported.contains(path) {
+    let mut consider = |path: &str, from_gem: bool, required: bool| {
+        if !required && (own.contains(path) || ported.contains(path)) {
             return;
         }
-        let owners = ownership.owners(path);
+        let owners = if required { vec![path] } else { ownership.owners(path) };
         let [gem] = owners.as_slice() else { return };
         if lock.is_in_repo(gem)
             || lock.is_from_git(gem)
@@ -95,14 +95,14 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
     {
         if let Some(parent) = parent {
             let from_gem = in_source_file(span.file);
-            consider(parent.0.as_str(), from_gem);
+            consider(parent.0.as_str(), from_gem, false);
         }
     }
     // Not only bodies and superclasses: a module the class mixes in names its gem too (fugit's `include Raabro`).
     for lc in &app.library_classes {
         for (i, module) in lc.includes.iter().enumerate() {
             let from_gem = lc.include_spans.get(i).is_some_and(|span| in_source_file(span.file));
-            consider(module.0.as_str(), from_gem);
+            consider(module.0.as_str(), from_gem, false);
         }
     }
     fn visit(e: &Expr, f: &mut dyn FnMut(&Expr, &str)) {
@@ -124,8 +124,40 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
     for path in &app.boot_gem_constants {
         named.insert((path.clone(), false));
     }
+    // The app's own `config.middleware.use Warden::Manager`: the gem's class runs on the emitted stack.
+    for path in super::railtie_middleware::application_use_paths(vfs, dir) {
+        named.insert((path, false));
+    }
     for (path, from_gem) in &named {
-        consider(path, *from_gem);
+        consider(path, *from_gem, false);
+    }
+    // Not only by namespace: a gem can define constants of another's (responders' `ActionController::Responder`), and a sourced gem's `require` of a dependency's feature loads it as Ruby does.
+    let mut libs: std::collections::BTreeMap<&str, Option<std::path::PathBuf>> = std::collections::BTreeMap::new();
+    let mut required: BTreeSet<&str> = BTreeSet::new();
+    for program in &app.file_programs {
+        let Some(owner) = lock.source.iter().find(|g| lock.version_of(g).is_some_and(|v| super::source_gems::file_of(&program.source, g, v))) else {
+            continue;
+        };
+        let Some(deps) = lock.spec_deps.get(owner.as_str()) else { continue };
+        let mut features = Vec::new();
+        required_features(&program.items, &mut features);
+        if features.is_empty() {
+            continue;
+        }
+        for dep in deps {
+            if required.contains(dep.as_str()) {
+                continue;
+            }
+            let lib = libs
+                .entry(dep.as_str())
+                .or_insert_with(|| lock.version_of(dep).and_then(|v| crate::i18n::gems::installed_gem(vfs, &roots, dep, v)).map(|dir| dir.join("lib")));
+            if lib.as_ref().is_some_and(|lib| features.iter().any(|f| vfs.exists(&lib.join(format!("{f}.rb"))))) {
+                required.insert(dep.as_str());
+            }
+        }
+    }
+    for dep in required {
+        consider(dep, true, true);
     }
     // Not only gems the app names: Bundler requires every direct dependency, and one that depends on a gem compiled from source can extend it as it loads (devise_invitable's `Devise.add_module :invitable`).
     let mut extenders: Vec<String> = Vec::new();
@@ -155,4 +187,17 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
     }
     out.extend(extenders);
     out.into_iter().collect()
+}
+
+fn required_features(items: &[crate::app::ProgramItem], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            crate::app::ProgramItem::Require { feature, relative: false, .. } => out.push(feature.trim_end_matches(".rb").to_string()),
+            crate::app::ProgramItem::Branch { then_items, else_items, .. } => {
+                required_features(then_items, out);
+                required_features(else_items, out);
+            }
+            _ => {}
+        }
+    }
 }

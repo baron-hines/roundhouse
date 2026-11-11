@@ -47,6 +47,15 @@ pub fn analyze_and_lower(app: &mut App) -> Vec<Diagnostic> {
 fn analyze_and_lower_with_target(app: &mut App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
     let mut analyzer = crate::analyze::Analyzer::new(app);
     analyzer.analyze(app);
+    // Typed again without the gem code the program does not reach: its calls are no evidence for what the reached code is
+    // passed, as Warden's `update(label, &block)`, which nothing calls, would type `add`'s strategy `untyped`.
+    if target == crate::build_target::BuildTarget::Spinel
+        && let Some(trimmed) = crate::source_gem_shake::shake(app)
+    {
+        *app = trimmed;
+        analyzer = crate::analyze::Analyzer::new(app);
+        analyzer.analyze(app);
+    }
     #[cfg(feature = "memory-census")]
     crate::memory_census::census("after analyze", app);
     app.helper_diagnostics = Some(crate::analyze::diagnose_helper_modules(app));

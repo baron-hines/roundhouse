@@ -1338,6 +1338,17 @@ fn ingest_route_stmts<'pr>(
             }
         }
 
+        // discourse's `get(**{ "#{root_path}/account-created/" => "users#account_created" }.merge(index == 1 ? { as: :x } : {}))`.
+        if let Some(source) = splat_merged_call(&call) {
+            let result = super::prism::parse(source.as_bytes(), file);
+            let root = result.node();
+            let Some(merged) = root.as_program_node().and_then(|p| p.statements().body().iter().next()) else {
+                return Err(receiver_block_route_stmt(&call, file));
+            };
+            entries.extend(ingest_route_stmts(std::iter::once(merged), file, parent, cx)?);
+            continue;
+        }
+
         // `%w[alpha beta].each { |page| get page, to: "pages##{page}" }`
         // — Rails evaluates `routes.rb` as Ruby, so a loop draws one
         // route per element. A literal Array of Strings or Symbols is
@@ -2069,17 +2080,70 @@ fn receiver_block_route_stmt(call: &ruby_prism::CallNode<'_>, file: &str) -> Ing
     }
 }
 
+/// `verb(**{ A }.merge(cond ? { B } : { C }))`, as the source of `verb(A, B)` (or `verb(A, C)`): the
+/// merged pairs' own source, a later key replacing an earlier one, padded to the call's offset so
+/// what it reports still points into the route file. `None` for any other shape, or a condition
+/// the evaluator does not settle.
+fn splat_merged_call(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    if call.receiver().is_some() || call.block().is_some() {
+        return None;
+    }
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    let [only] = args.as_slice() else { return None };
+    let elements: Vec<Node<'_>> = only.as_keyword_hash_node()?.elements().iter().collect();
+    let [splat] = elements.as_slice() else { return None };
+    let merge = splat.as_assoc_splat_node()?.value()?.as_call_node()?;
+    if constant_id_str(&merge.name()) != "merge" || merge.block().is_some() {
+        return None;
+    }
+    let base = merge.receiver()?;
+    let base = base.as_hash_node()?;
+    let merged: Vec<Node<'_>> = merge.arguments()?.arguments().iter().collect();
+    let [other] = merged.as_slice() else { return None };
+    let chosen = match other.as_if_node() {
+        Some(ternary) => {
+            let arm = if eval::truth(&ternary.predicate())? {
+                ternary.statements().map(|s| s.as_node())
+            } else {
+                ternary.subsequent().and_then(|e| e.as_else_node()).and_then(|e| e.statements()).map(|s| s.as_node())
+            };
+            let stmts = flatten_statements(arm?);
+            let [hash] = stmts.as_slice() else { return None };
+            hash.as_hash_node()?.elements().iter().collect::<Vec<_>>()
+        }
+        None => other.as_hash_node()?.elements().iter().collect(),
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for pair in base.elements().iter().chain(chosen) {
+        let assoc = pair.as_assoc_node()?;
+        let key = String::from_utf8_lossy(assoc.key().location().as_slice()).into_owned();
+        let text = String::from_utf8_lossy(pair.location().as_slice()).into_owned();
+        pairs.retain(|(k, _)| *k != key);
+        pairs.push((key, text));
+    }
+    let name = String::from_utf8_lossy(call.message_loc()?.as_slice()).into_owned();
+    let start = call.location().start_offset();
+    let mut source = " ".repeat(start);
+    source.push_str(&format!("{name}({})", pairs.into_iter().map(|(_, t)| t).collect::<Vec<_>>().join(", ")));
+    Some(source)
+}
+
 /// The elements of `[…].each { |x| … }` when the receiver is an Array
 /// literal (`%w[…]`, `%i[…]`, `[:a, "b"]`) of String or Symbol literals,
 /// the call takes no arguments and its block exactly one required
 /// parameter. `None` for any other shape.
 fn literal_each_elements(call: &ruby_prism::CallNode<'_>) -> Option<Vec<eval::RVal>> {
-    if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
+    let indexed = match constant_id_str(&call.name()) {
+        "each" => false,
+        "each_with_index" => true,
+        _ => return None,
+    };
+    if call.arguments().is_some() {
         return None;
     }
     let block = call.block()?.as_block_node()?;
     let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
-    if params.requireds().iter().count() != 1
+    if params.requireds().iter().count() != 1 + usize::from(indexed)
         || params.optionals().iter().count() != 0
         || params.rest().is_some()
         || params.posts().iter().count() != 0
@@ -2089,7 +2153,9 @@ fn literal_each_elements(call: &ruby_prism::CallNode<'_>) -> Option<Vec<eval::RV
     {
         return None;
     }
-    params.requireds().iter().next()?.as_required_parameter_node()?;
+    if !params.requireds().iter().all(|p| p.as_required_parameter_node().is_some()) {
+        return None;
+    }
     // A literal, a `.freeze` of one, or a local holding either (forem's `pages_actions = %w[…].freeze`).
     match eval::value(&call.receiver()?)? {
         eval::RVal::List(elements) => Some(elements),
@@ -2111,16 +2177,17 @@ fn ingest_literal_each(
     let Some(block) = call.block().and_then(|b| b.as_block_node()) else {
         return Ok(Vec::new());
     };
-    let param = block
+    let names: Vec<String> = block
         .parameters()
         .and_then(|p| p.as_block_parameters_node())
         .and_then(|p| p.parameters())
-        .and_then(|p| p.requireds().iter().next())
-        .and_then(|r| r.as_required_parameter_node())
-        .map(|r| constant_id_str(&r.name()).to_string());
-    let Some(param) = param else {
+        .map(|p| p.requireds().iter().filter_map(|r| r.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string())).collect())
+        .unwrap_or_default();
+    let Some(param) = names.first().cloned() else {
         return Ok(Vec::new());
     };
+    // `each_with_index`'s second parameter.
+    let index = names.get(1).cloned();
     // A loop body is a block, like `if`/`unless` arms, `constraints`/
     // `member`/`collection`/`devise_scope` and the generic
     // `block_entries` for `namespace`/`scope`/concern blocks — every
@@ -2135,16 +2202,23 @@ fn ingest_literal_each(
     let mut entries = Vec::new();
     // The block parameter shadows a local of the same name; popping the body's frame must not write it back.
     let shadowed = eval::get(&param);
-    for element in elements {
+    let shadowed_index = index.as_ref().and_then(|name| eval::get(name));
+    for (at, element) in elements.into_iter().enumerate() {
         let Some(body) = block.body() else { break };
         eval::push_inherited_frame();
         eval::bind(&param, element);
+        if let Some(name) = &index {
+            eval::bind(name, eval::RVal::Int(at as i64));
+        }
         let walked = cx.with_mount_scope(cx.mount_scope_depth.get() + 1, || {
             ingest_route_body(body, file, parent, cx)
         });
         eval::pop_frame();
         if let Some(outer) = &shadowed {
             eval::bind(&param, outer.clone());
+        }
+        if let (Some(name), Some(outer)) = (&index, &shadowed_index) {
+            eval::bind(name, outer.clone());
         }
         entries.extend(walked?);
     }
@@ -3264,6 +3338,9 @@ mod eval {
         Hash(Vec<(String, RVal)>),
         /// `%w[welcome editor_guide]`, and a local or `.freeze` of one: what a route loop walks.
         List(Vec<RVal>),
+        /// `each_with_index`'s index.
+        Int(i64),
+        Bool(bool),
         Unknown,
     }
 
@@ -3346,6 +3423,7 @@ mod eval {
         match v {
             RVal::Str(s) | RVal::Sym(s) => Some(s.clone()),
             RVal::Nil => Some(String::new()),
+            RVal::Int(i) => Some(i.to_string()),
             _ => None,
         }
     }
@@ -3361,6 +3439,30 @@ mod eval {
         }
         if node.as_nil_node().is_some() {
             return Some(RVal::Nil);
+        }
+        if let Some(int) = node.as_integer_node() {
+            return String::from_utf8_lossy(int.location().as_slice()).replace('_', "").parse().ok().map(RVal::Int);
+        }
+        if node.as_true_node().is_some() {
+            return Some(RVal::Bool(true));
+        }
+        if node.as_false_node().is_some() {
+            return Some(RVal::Bool(false));
+        }
+        if let Some(call) = node.as_call_node()
+            && matches!(constant_id_str(&call.name()), "==" | "!=")
+            && call.block().is_none()
+            && let (Some(recv), Some(args)) = (call.receiver(), call.arguments())
+            && let [other] = args.arguments().iter().collect::<Vec<_>>().as_slice()
+        {
+            let same = match (value(&recv)?, value(other)?) {
+                (RVal::Int(a), RVal::Int(b)) => a == b,
+                (RVal::Str(a), RVal::Str(b)) | (RVal::Sym(a), RVal::Sym(b)) => a == b,
+                (RVal::Nil, RVal::Nil) => true,
+                (RVal::Bool(a), RVal::Bool(b)) => a == b,
+                _ => return None,
+            };
+            return Some(RVal::Bool(same == (constant_id_str(&call.name()) == "==")));
         }
         if let Some(array) = node.as_array_node() {
             return array
@@ -3464,6 +3566,15 @@ mod eval {
             }
         }
         Some(out)
+    }
+
+    /// Whether `node` is true or false where it is evaluated; `None` when not known here.
+    pub(super) fn truth(node: &Node<'_>) -> Option<bool> {
+        match value(node)? {
+            RVal::Nil | RVal::Bool(false) => Some(false),
+            RVal::Unknown => None,
+            _ => Some(true),
+        }
     }
 
     /// A string: a literal, or an expression that evaluates to one.

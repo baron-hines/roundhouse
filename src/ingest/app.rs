@@ -698,7 +698,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     }
     // One walk of an unchanging tree: remember what each path answered.
     let cached_vfs = crate::vfs::CachedVfs::new(vfs);
-    let mount_vfs = super::source_gems::MountVfs { inner: &cached_vfs, gems: &source_gems };
+    let framework_libs = super::source_gems::framework_libs(vfs, dir, lock.as_ref());
+    let mount_vfs = super::source_gems::MountVfs { inner: &cached_vfs, gems: &source_gems, framework_libs: &framework_libs };
     let mut path_gems = path_gem_dirs(&mount_vfs, dir);
     path_gems.extend(source_gems.iter().map(|gem| gem.mount.clone()));
     let source_vfs = PathGemVfs::new(&mount_vfs, dir, &path_gems);
@@ -742,7 +743,11 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     app.spinel_int_overflow = spinel_int_overflow;
     // Not a framework gem's models (solid_queue's): only a gem compiled for the app runs its Railtie here.
     let gem_libs: Vec<PathBuf> = source_gems.iter().map(|gem| gem.mount.join("lib")).collect();
-    (app.gem_middlewares, app.gem_middleware_refusals) = super::railtie_middleware::read(vfs, &gem_libs);
+    let stack = super::railtie_middleware::read(vfs, dir, &gem_libs);
+    let stacked_application_uses = stack.application_taken;
+    let middleware_loops = stack.loops;
+    (app.gem_middlewares, app.gem_middleware_blocks, app.rack_env_writes, app.gem_middleware_refusals) =
+        (stack.classes, stack.blocks, stack.env_writes, stack.diags);
     // `enum` columns declared inside a concern's `included do`, keyed by
     // the module. Local rather than a field on `App`: they exist only
     // until the splice folds them into each including model's own
@@ -1298,6 +1303,23 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                                     app.boot_gem_entries.push(found);
                                 }
                             }
+                        }
+                    }
+                    // Not a gem's `lib/` alone: its `app/` holds them too (devise's `if defined?(ActionMailer)
+                    // class Devise::Mailer …`), which no program loads but Rails' autoload.
+                    let in_gem_app = path_gems.iter().any(|gem| entry.starts_with(gem.join("app")));
+                    if in_gem_app && !gem_libs.iter().any(|lib| entry.starts_with(lib)) {
+                        let (branched, branch_aliases) = super::inherited_alias::capturing(|| {
+                            super::library_class::ingest_file_branch_classes(&source, &path_str)
+                        });
+                        for span in branch_aliases {
+                            if !aliases.contains(&span) {
+                                aliases.push(span);
+                            }
+                        }
+                        if let Ok(branched) = branched {
+                            let branched: Vec<_> = branched.into_iter().filter(|m| !classes.iter().any(|c| c.name == m.name)).collect();
+                            classes.extend(branched);
                         }
                     }
                     if gem_libs.iter().any(|lib| entry.starts_with(lib)) {
@@ -2963,6 +2985,7 @@ end
     let gem_lock = app.gem_lock.clone();
     let mut boot_taken = super::boot_program::build(vfs, dir, &path_gems, &mut app, gem_lock.as_ref(), &app_namespaces, &rate_limit_store_values)?;
     boot_taken.extend(super::engine_config::carry(&mut app, dir));
+    boot_taken.extend(stacked_application_uses.iter().map(|start| ("config/application.rb".to_string(), *start)));
     super::boot_program::apply_call_sites(&mut app);
     super::initializer_ledger::record(
         vfs,
@@ -3047,6 +3070,14 @@ end
     // `Ns::BaseController`; `include Avatar` inside `class User` names
     // `User::Avatar`. The passes above leave both as written.
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
+    // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
+    super::configured_superclass::expand_model_mixin_macros(vfs, dir, &path_gems, &mut app);
+    for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {
+        if let Some(carrier) = concern_class_method_spans.iter_mut().find(|c| c.owner == owner) {
+            carrier.methods.push(span);
+        }
+        app.concern_class_side_spans.insert(span);
+    }
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
@@ -3178,6 +3209,7 @@ end
     // After the macros: a configured object's readers and its builder's writers are methods by now.
     super::configured_superclass::fold(vfs, dir, &mut app);
     super::configured_superclass::fold_class_names(vfs, dir, &mut app);
+    super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops);
     super::gem_routes::expand(vfs, dir, &path_gems, &mut app);
     super::class_macros::drop_expanded_hook_macros(&mut app, &hook_macros_called, &mentions);
     super::model_callbacks::expand_model_callbacks(&mut app);
@@ -3230,6 +3262,7 @@ end
     // class-side methods, and its expansion joins the same filter chain.
     super::class_configuration::expand(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
     super::class_attribute::expand(&mut app, &concern_class_method_spans, &framework_shadow_scopes);
+    super::controller_class_methods::splice(&mut app, &concern_class_method_spans);
     expand_class_body_macros(&mut app)?;
     // After the splice: a guard constant may live on an ancestor or arrive with a concern.
     super::caches_page::expand(&mut app);
@@ -3338,20 +3371,25 @@ end
     // Before the body statements, which ask whether a class-side writer
     // the class body writes through is defined.
     super::hook_class_attribute::expand(&mut app);
+    super::aliased_includes::resolve(&mut app);
+    // Between the two: a class body's `respond_to?(:status=)` asks for the writers just made, and the settled branch's writes join the body statements.
+    super::settled_conditionals::settle(&mut app);
     super::app_extension_calls::mark(&mut app);
     super::body_statements::mark(&mut app);
     report_unmodelled_records(&app);
     super::unreached_gem_modules::drop(&mut app, dir);
+    super::gem_load_program::carry(&mut app);
     super::interpolated_renders::expand(&mut app);
     super::controller_delegates::expand(&mut app);
     super::active_model_super::rewrite(&mut app);
     super::queue_adapter_reader::synthesize(&mut app);
     super::container_specialize::specialize(&mut app);
     super::unreachable_views::mark(&mut app);
+    mime_extension_lookups(&mut app);
+    super::option_merger::expand(&mut app);
     for d in crate::controller_layout::diagnostics(&app.controllers, &app.views) {
         super::prism::push(d);
     }
-    super::settled_conditionals::settle(&mut app);
     // Not beside the hoists: later passes give an included module methods and ancestors (forwardable, carried includes, props bases, the queue adapter reader) or take an inactive branch's away.
     app.included_hoist_conflicts = super::library_class::included_hoist_conflicts(&app.library_classes);
     // Here, once later passes stop giving modules methods: a concern's `to_param` before analysis types it on the model.
@@ -4290,6 +4328,25 @@ pub(super) fn concern_class_method_catalog(
     class_side
 }
 
+/// A concern's class method as its includer's: the concern's bare
+/// constants are spelled so they still name its own.
+pub(super) fn concern_class_method_copy(
+    method: &crate::dialect::MethodDef,
+    concern: &crate::ident::ClassId,
+    consts: &crate::det::HashSet<Symbol>,
+) -> crate::dialect::MethodDef {
+    let mut copy = method.clone();
+    if !consts.is_empty() {
+        qualify_lexical_consts(&mut copy.body, concern, consts);
+        for param in &mut copy.params {
+            if let Some(default) = &mut param.default {
+                qualify_lexical_consts(default, concern, consts);
+            }
+        }
+    }
+    copy
+}
+
 /// Copy a concern's CLASS-side methods onto every model or library class
 /// that includes it, before analysis so receiver-relative bodies are
 /// typed against each concrete includer.
@@ -4382,16 +4439,7 @@ fn splice_concern_class_methods_into_includers(
                     continue;
                 }
                 provenance.insert(m.name.clone(), concern.clone());
-                let mut m = m.clone();
-                if !consts.is_empty() {
-                    qualify_lexical_consts(&mut m.body, concern, consts);
-                    for param in &mut m.params {
-                        if let Some(default) = &mut param.default {
-                            qualify_lexical_consts(default, concern, consts);
-                        }
-                    }
-                }
-                added.push(m);
+                added.push(concern_class_method_copy(m, concern, consts));
             }
         }
         (added, provenance)
@@ -5897,13 +5945,19 @@ fn is_serialization_scope_nil(method: &str, args: &[crate::expr::Expr]) -> bool 
         && matches!(args, [a] if matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil }))
 }
 
+/// `respond_to :html`: what `respond_with` lowers for (`lower::controller_to_library::respond_with`).
+fn respond_to_macro_is_html_only(args: &[crate::expr::Expr]) -> bool {
+    use crate::expr::{ExprNode, Literal};
+    !args.is_empty() && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "html"))
+}
+
 /// Class-level `respond_to :json` is consumed as a no-op when nothing
 /// in this controller's ANCESTOR CHAIN (self included) calls
 /// `respond_with` — the only thing the responders gem's `respond_to`
-/// declaration ever feeds. `respond_with` isn't modeled, so a
-/// controller that actually calls it is left to fail there (an
-/// ordinary unresolved-method error at analyze time), not silenced by
-/// this check.
+/// declaration ever feeds. `respond_with` is modeled for html-only
+/// declarations; a controller that calls it with another format is
+/// left to fail there (an ordinary unresolved-method error at analyze
+/// time), not silenced by this check.
 fn respond_to_macro_is_consumed(
     controller: &crate::dialect::Controller,
     all: &[crate::dialect::Controller],
@@ -6148,17 +6202,18 @@ fn report_unrecognized_controller_macros(app: &App) {
             }
             // Class-level `respond_to :json` (the responders gem) — a
             // pure config declaration: it names the mimes `respond_with`
-            // answers, and has no effect of its own. `respond_with`
-            // itself isn't modeled, so a controller that actually
-            // depends on it keeps failing loudly there (an ordinary
-            // unresolved-method error); this macro just configures a
-            // call nothing in the chain makes, so it's consumed as a
-            // no-op rather than flagged as an unrecognized gap. Distinct
+            // answers, and has no effect of its own. `respond_with` is
+            // modeled for html-only declarations
+            // (`lower::controller_to_library::respond_with`); for others
+            // a controller that depends on it keeps failing loudly there
+            // (an ordinary unresolved-method error). Otherwise this macro
+            // configures a call nothing in the chain makes, so it's
+            // consumed as a no-op rather than flagged as a gap. Distinct
             // from the ACTION-body `respond_to do |format| … end`
             // block, which carries a block and never reaches this
             // (blockless) branch at all.
             if method.as_str() == "respond_to"
-                && respond_to_macro_is_consumed(controller, &app.controllers)
+                && (respond_to_macro_is_html_only(args) || respond_to_macro_is_consumed(controller, &app.controllers))
             {
                 continue;
             }
@@ -7156,9 +7211,9 @@ fn filter_from_send(
         return None;
     };
     let kind = match method.as_str() {
-        "before_action" | "prepend_before_action" => FilterKind::Before,
-        "around_action" => FilterKind::Around,
-        "after_action" => FilterKind::After,
+        "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
+        "around_action" | "append_around_action" => FilterKind::Around,
+        "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,
@@ -14590,3 +14645,28 @@ mod path_gem_vfs_tests {
 }
 
 
+
+/// Rails' `Mime::EXTENSION_LOOKUP[ext]` (devise's `navigational_formats`), the registered type for an extension
+/// or nil: what `Mime::Type.lookup_by_extension(ext)` answers in the runtime, which has no such table, in every body
+/// the tree emits (a `direct` route helper's too). Only that read: any other use of the table stays the unknown
+/// constant it is.
+fn mime_extension_lookups(app: &mut App) {
+    use crate::expr::{Expr, ExprNode};
+    use crate::ident::Symbol;
+    fn rewrite(e: &mut Expr) {
+        if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *e.node
+            && method.as_str() == "[]"
+            && args.len() == 1
+            && matches!(&*recv.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).eq(["Mime", "EXTENSION_LOOKUP"]))
+        {
+            let span = recv.span;
+            let mut constant = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Mime"), Symbol::from("Type")] });
+            // Not resolved where it stands: the source names `Mime::EXTENSION_LOOKUP` there, not this.
+            constant.decisions |= crate::expr::GENERATED_CONST_REF;
+            *recv = constant;
+            *method = Symbol::from("lookup_by_extension");
+        }
+        e.node.for_each_child_mut(&mut rewrite);
+    }
+    crate::lower::for_each_emit_body(app, &mut rewrite);
+}

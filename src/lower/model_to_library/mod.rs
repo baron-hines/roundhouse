@@ -260,16 +260,93 @@ pub fn lower_models_to_library_classes_unfolding(
     lower_models_inner(models, schema, extra_class_infos, params_specs, unfolded, Materialization::Emit, FinderInputs::Request).0
 }
 
-/// Register raw-input finders only for Ruby-family controller/test consumers.
-pub(crate) fn lower_models_with_request_finders(
+/// What one model lowering with raw-input finders leaves behind besides
+/// its classes: the registry, the diagnostics it reported, and how many
+/// read ids it took.
+struct RequestFinderRegistry {
+    registry: std::rc::Rc<HashMap<ClassId, crate::analyze::ClassInfo>>,
+    diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    read_ids: usize,
+}
+
+type SharedRegistry = (usize, usize, usize, std::rc::Rc<std::cell::OnceCell<std::rc::Rc<RequestFinderRegistry>>>);
+
+thread_local! {
+    static REQUEST_FINDER_REGISTRY: std::cell::RefCell<Option<SharedRegistry>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previously shared registry when dropped. It borrows the
+/// models and the schema, so neither can change while it is shared.
+pub(crate) struct RequestFinderRegistryGuard<'a>(Option<SharedRegistry>, std::marker::PhantomData<(&'a [Model], &'a Schema)>);
+
+impl Drop for RequestFinderRegistryGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        REQUEST_FINDER_REGISTRY.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Share [`request_finder_registry`] of `models` and `schema` among its
+/// callers for the guard's life. The Spinel and Ruby-family assembly asks
+/// for it once per controller lowering and once for the tests, each of
+/// which lowered every model again to throw the classes away. A guard
+/// inside another for the same models and schema shares the outer one's.
+pub(crate) fn share_request_finder_registry<'a>(models: &'a [Model], schema: &'a Schema) -> RequestFinderRegistryGuard<'a> {
+    let key = (models.as_ptr() as usize, models.len(), schema as *const Schema as usize);
+    let previous = REQUEST_FINDER_REGISTRY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let cell = slot.as_ref().filter(|(m, n, s, _)| (*m, *n, *s) == key).map(|(_, _, _, cell)| cell.clone()).unwrap_or_default();
+        slot.replace((key.0, key.1, key.2, cell))
+    });
+    RequestFinderRegistryGuard(previous, std::marker::PhantomData)
+}
+
+/// The class registry of the models lowered with raw-input finders, for
+/// the Ruby-family controller/test consumers that type against it, with
+/// the diagnostics that lowering reports pushed to the active emit sink
+/// when `report` (a caller that only wants the registry drops them).
+///
+/// Computed once per [`share_request_finder_registry`] guard. A cached
+/// call stands in for a run exactly: it pushes the same diagnostics and
+/// takes the same read ids (`lower::arel::visitor::skip_read_ids`).
+pub(crate) fn request_finder_registry(
     models: &[Model],
     schema: &Schema,
-    extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
-) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
-    lower_models_inner(
-        models, schema, extra_class_infos, &Default::default(), &Default::default(),
-        Materialization::Emit, FinderInputs::Request,
-    )
+    report: bool,
+) -> std::rc::Rc<HashMap<ClassId, crate::analyze::ClassInfo>> {
+    let compute = || {
+        let before = crate::lower::arel::visitor::read_ids_taken();
+        let ((_, registry), diagnostics) = crate::emit::diagnostics::scope(|| {
+            lower_models_inner(
+                models, schema, Vec::new(), &Default::default(), &Default::default(),
+                Materialization::Emit, FinderInputs::Request,
+            )
+        });
+        let read_ids = crate::lower::arel::visitor::read_ids_taken() - before;
+        std::rc::Rc::new(RequestFinderRegistry { registry: std::rc::Rc::new(registry), diagnostics, read_ids })
+    };
+    let shared = REQUEST_FINDER_REGISTRY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(m, n, s, _)| (*m, *n, *s) == (models.as_ptr() as usize, models.len(), schema as *const Schema as usize))
+            .map(|(_, _, _, cell)| cell.clone())
+    });
+    let (entry, cached) = match shared {
+        Some(cell) => {
+            let hit = cell.get().cloned();
+            (hit.clone().unwrap_or_else(|| cell.get_or_init(compute).clone()), hit.is_some())
+        }
+        None => (compute(), false),
+    };
+    if cached {
+        crate::lower::arel::visitor::skip_read_ids(entry.read_ids);
+    }
+    if report {
+        for d in &entry.diagnostics {
+            crate::emit::diagnostics::push(d.clone());
+        }
+    }
+    entry.registry.clone()
 }
 
 /// Build one registry for the complete model graph, then type the selected

@@ -26,7 +26,14 @@ rails = read(ARGV.fetch(0)).reject { |r| %w[INTERNAL ENGINE RACK].include?(r.end
 # Rails' own engines' routes (`/rails/active_storage`, `/rails/action_mailbox`, `/rails/conductor`):
 # roundhouse serves Active Storage from its runtime table, not the app's, so these are counted apart.
 framework, rails = rails.partition { |r| r.path.start_with?("/rails/") }
-ours = read(ARGV.fetch(1))
+ours = read(ARGV.fetch(1)).reject { |r| r.path.start_with?("/rails/") }
+# Routes of a gem not yet read from source (`ORACLE_OUT_OF_SCOPE`, a regexp over "PATH ENDPOINT"), counted apart.
+out_of_scope = []
+if (scope = ENV["ORACLE_OUT_OF_SCOPE"]) && !scope.empty?
+  pattern = Regexp.new(scope)
+  out_of_scope, rails = rails.partition { |r| pattern.match?("#{r.path} #{r.endpoint}") }
+  ours = ours.reject { |r| pattern.match?("#{r.path} #{r.endpoint}") }
+end
 # A route roundhouse knows it cannot run (`RoundhouseUnmodeledEndpoint`) is reported, not served.
 unmodeled, ours = ours.partition { |r| r.endpoint.start_with?("RoundhouseUnmodeledEndpoint") }
 served = ours.reject { |r| r.state.start_with?("refused") }
@@ -70,7 +77,7 @@ names_moved = rails_names.select do |n, shape|
 end.keys
 
 puts "rails #{rails_first.size} routes, roundhouse #{ours_first.size} served (#{refused.values.sum} refused: #{refused.map { |k, v| "#{k.sub("refused:", "")} #{v}" }.join(", ")})"
-puts "framework routes (/rails/*) #{framework.size}, known unmodeled endpoints #{unmodeled.size}, guarded #{served.count { |r| r.state == "guarded" }}"
+puts "framework routes (/rails/*) #{framework.size}, out of scope #{out_of_scope.size}, known unmodeled endpoints #{unmodeled.size}, guarded #{served.count { |r| r.state == "guarded" }}"
 puts "missing #{missing.size}, extra #{extra.size}, different endpoint #{wrong.size}, helpers missing #{names_missing.size}, helpers at another path #{names_moved.size}"
 puts "\n## missing (Rails serves, roundhouse does not)"; missing.each { |r| puts "  #{r.verb} #{r.path} #{r.endpoint}#{ours.any? { |o| o.key == r.key } ? "  [refused here]" : ""}" }
 puts "\n## extra (roundhouse serves, Rails does not)"; extra.each { |r| puts "  #{r.verb} #{r.path} #{r.endpoint}" }

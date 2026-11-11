@@ -596,8 +596,21 @@ fn lower_route_helpers(app: &App, hash_query: bool) -> Vec<LibraryFunction> {
     // parameter is a `Hash[Symbol, untyped]` — the one shape
     // `feedback_types_are_performance` says to keep out of a tree that
     // does not need it.
-    if app_splats_into_a_route_helper(app) || app_merges_into_url_options(app) {
+    if app_splats_into_a_route_helper(app) || app_merges_into_url_options(app) || (hash_query && !app.generated_route_helpers.is_empty()) {
         funcs.push(build_query_suffix_helper(&module_path));
+    }
+    for m in app.generated_route_helpers.iter().filter(|_| hash_query) {
+        funcs.push(LibraryFunction {
+            module_path: module_path.clone(),
+            name: m.name.clone(),
+            params: m.params.to_vec(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body: m.body.clone(),
+            signature: None,
+            effects: EffectSet::default(),
+            is_async: false,
+        });
     }
     // These bodies carry APP source (a `direct` block's expressions —
     // campfire's `v: Current.account&.updated_at&.to_fs(:number)`), but

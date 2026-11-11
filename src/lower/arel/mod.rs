@@ -880,6 +880,12 @@ thread_local! {
     static HOIST_TEMPORARIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Temporaries this thread has hoisted. Work handed to a worker thread
+/// must hoist none: the names follow the order bodies are lowered in.
+pub(crate) fn hoisted_temporaries() -> usize {
+    HOIST_TEMPORARIES.with(std::cell::Cell::get)
+}
+
 /// `__hoisted_N = <slot>`, leaving a read of `__hoisted_N` in its place.
 fn bind_to_temporary(slot: &mut Expr) -> Expr {
     let n = HOIST_TEMPORARIES.with(|c| {

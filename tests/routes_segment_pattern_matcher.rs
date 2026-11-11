@@ -179,7 +179,7 @@ raise "refused route must not be served: #{got}" unless got.start_with?("404")
         "{:?}",
         run.errors
     );
-    assert!(run.success, "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
 }
 
 /// lobsters' ORIGINS_IDENTIFIER: the greedy `.+` crosses `/`, so the

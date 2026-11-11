@@ -65,8 +65,9 @@ fn an_undecided_guard_around_a_filter_refuses_the_compile() {
 
 #[test]
 fn an_unmodelled_callback_macro_refuses_the_compile() {
-    let error = strict_refusal("    append_before_action :check");
-    assert!(error.contains("macro not recognized: `append_before_action`"), "{error}");
+    // Not `append_before_action`, which is `before_action` under Rails' alias: `prepend_after_action` is not modelled.
+    let error = strict_refusal("    prepend_after_action :check");
+    assert!(error.contains("macro not recognized: `prepend_after_action`"), "{error}");
 }
 
 #[test]
@@ -129,7 +130,7 @@ fn hook_shapes_the_compiler_cannot_read_refuse_the_compile() {
         "base.before_action { head :unauthorized }",
         "base.before_action :check, only: ACTIONS",
         "%i[check].each { |name| base.before_action name }",
-        "base.append_before_action :check",
+        "base.prepend_after_action :check",
         // Half a hook cannot be dropped, and the other half re-runs the filter.
         "base.before_action :check\n    base.extend(Enumerable)",
     ] {

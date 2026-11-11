@@ -812,18 +812,11 @@ module ActionController
 
     # Discard the current session (Rails' logout idiom). The dispatch
     # layer persists whatever the session holds after the action; an
-    # empty replacement means the outbound session cookie is cleared
-    # (or, when a CSRF token is lazily re-added during render, that
-    # the next session starts fresh — matching Rails' new-session-id
-    # semantics closely enough for cookie-carried state).
-    #
-    # The trailing `@session` read is load-bearing: assignment is not
-    # a value expression on the strict targets (kotlin/swift/C#/rust
-    # all reject a `-> Session` body ending in an assignment), so the
-    # return must be an explicit read. Same rule as the CookieJar
-    # cascade — mutation methods with non-void returns.
+    # emptied session means the outbound session cookie is cleared.
+    # Not a fresh Session: Rails' `session.destroy` empties the request's own, which Warden's proxy holds too.
+    # Not a bare `@session.clear`: Rust borrows `self` mutably only where a field is assigned, and Go and Python read a bare name as a field.
     def reset_session
-      @session = ActionDispatch::Session.new
+      @session = @session.clear()
       @session
     end
 

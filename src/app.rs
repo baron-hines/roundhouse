@@ -131,6 +131,11 @@ pub struct App {
     /// (`ingest::boot_program`): run at boot on the ruby family and spinel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boot_program: Vec<Expr>,
+    /// The statements of [`App::boot_program`] that a gem file runs as it
+    /// loads (`ingest::gem_load_program`): the ruby family leaves them to
+    /// the file's program, which runs them where the file is required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gem_load_statements: Vec<crate::span::Span>,
     /// The constants an initializer statement held by a gem not compiled
     /// from source calls (`Rack::Attack` of `Rack::Attack.throttle`):
     /// `ingest::auto_source_gems` brings that gem in, and the statement
@@ -142,6 +147,13 @@ pub struct App {
     /// them in front of the routes, where Rails puts them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_middlewares: Vec<String>,
+    /// The block a `use` passes its middleware (`use Warden::Manager do |config| … end`), by class,
+    /// as brace-block Ruby the stack hands the constructor.
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub gem_middleware_blocks: crate::det::HashMap<String, String>,
+    /// The Rack env keys a stacked middleware writes, and the class there (`"warden"` → `Warden::Proxy`).
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub rack_env_writes: crate::det::HashMap<String, String>,
     /// The insertions it could not read, reported by analyze.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_middleware_refusals: Vec<crate::diagnostic::Diagnostic>,
@@ -154,6 +166,9 @@ pub struct App {
     /// Routes a gem's routing method draws that are left out (`ingest::gem_hooks::omits_on_failure`), at the call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_route_gaps: Vec<crate::diagnostic::Diagnostic>,
+    /// `RouteHelpers` methods a gem's load generates from its route tables (Devise's `new_session_path(resource_or_scope)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_route_helpers: Vec<crate::dialect::MethodDef>,
     /// Pins from `config/importmap.rb`, expanded (each
     /// `pin_all_from` has been resolved into explicit per-file
     /// pins via `app/javascript/**` walking). Consumed by the
@@ -407,6 +422,14 @@ pub struct App {
     /// (not a seeded `include` set on every model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_class_macros: Vec<ClassId>,
+    /// The modules a model macro's body includes into the model (devise's
+    /// `devise :database_authenticatable`), written in the call's place
+    /// (`configured_superclass::expand_model_mixin_macros`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_includes: Vec<(ClassId, ClassId)>,
+    /// The model macro calls those includes took the place of, as written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_macro_calls: Vec<(ClassId, crate::expr::Expr)>,
     /// Modules `extend`ed inside `ActiveSupport.on_load(:active_record)`:
     /// their instance methods are class-method macros on every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1289,12 +1312,16 @@ impl App {
             fixtures: Vec::new(),
             seeds: None,
             boot_program: Vec::new(),
+            gem_load_statements: Vec::new(),
             boot_gem_constants: Vec::new(),
             gem_middlewares: Vec::new(),
+            gem_middleware_blocks: Default::default(),
+            rack_env_writes: Default::default(),
             gem_middleware_refusals: Vec::new(),
             included_hoist_conflicts: Vec::new(),
             superclass_refusals: Vec::new(),
             gem_route_gaps: Vec::new(),
+            generated_route_helpers: Vec::new(),
             importmap: None,
             engine_importmaps: Vec::new(),
             inertia: None,
@@ -1326,6 +1353,8 @@ impl App {
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             load_hook_extended_macros: Vec::new(),
+            macro_includes: Vec::new(),
+            expanded_macro_calls: Vec::new(),
             spliced_class_methods: Default::default(),
             time_tag_calls: Vec::new(),
             partial_local_types: HashMap::default(),

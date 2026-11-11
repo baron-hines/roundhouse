@@ -747,3 +747,26 @@ fn a_hook_in_a_case_branch_stays_on_the_ledger() {
     assert!(!ledger.is_empty(), "the hook is reported");
     assert!(app.boot_program.is_empty(), "{:?}", app.boot_program);
 }
+
+/// The app's own `config.middleware.use` of a gem compiled from source is stacked, so it is no
+/// dropped statement; one of a class no source gem defines still is.
+#[test]
+fn a_stacked_application_middleware_use_is_not_dropped() {
+    let (app, ledger) = ingest(&[
+        ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    warden (1.2.9)\n\nDEPENDENCIES\n  warden\n"),
+        (".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n"),
+        (
+            "vendor/bundle/ruby/3.4.0/gems/warden-1.2.9/lib/warden.rb",
+            "module Warden\n  class Proxy\n    def initialize(env)\n      @env = env\n    end\n  end\n  class Manager\n    def initialize(app)\n      @app = app\n    end\n\n    def call(env)\n      env[\"warden\"] = Proxy.new(env)\n      @app.call(env)\n    end\n  end\nend\n",
+        ),
+        (
+            "config/application.rb",
+            "module Blog\n  class Application < Rails::Application\n    config.middleware.use Rack::Deflater\n    config.middleware.use Warden::Manager\n  end\nend\n",
+        ),
+    ]);
+    assert_eq!(app.gem_middlewares, ["Warden::Manager"]);
+    assert_eq!(app.rack_env_writes.get("warden").map(String::as_str), Some("Warden::Proxy"));
+    let got: Vec<&str> = ledger.iter().map(|d| statement(d)).collect();
+    assert_eq!(got, ["config.middleware.use"], "{ledger:#?}");
+    assert!(ledger[0].message.contains("config/application.rb:3"), "{}", ledger[0].message);
+}

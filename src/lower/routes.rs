@@ -320,6 +320,10 @@ pub fn helper_id_segments(app: &App) -> crate::det::HashMap<String, Vec<bool>> {
             .collect();
         out.entry(format!("{}_path", r.as_name)).or_insert(shape);
     }
+    // A generated helper's arguments are the record or scope it resolves and its query: neither is an id segment.
+    for m in &app.generated_route_helpers {
+        out.entry(m.name.as_str().to_string()).or_insert_with(|| vec![false, false]);
+    }
     out
 }
 

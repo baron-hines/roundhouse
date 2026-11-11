@@ -506,6 +506,41 @@ module ActiveSupport
   # `rescue_from(ActiveSupport::MessageVerifier::InvalidSignature) {
   # head :not_found }` over an avatar URL that carries a signed id.
   #
+  # Not `Rails.log_line`, which a host logger may filter, nor `$stderr`
+  # or `STDERR` puts, which the runtime's typing cannot type: Kernel#warn,
+  # which `-W0` silences where Rails' :stderr behavior would still write.
+  def self.deprecation_line(line)
+    warn(line)
+  end
+
+  # Rails' deprecator a gem keeps for itself (`Devise.deprecator`): `warn`
+  # writes Rails' line to stderr, the default behavior of a deprecator
+  # the app's `config.active_support.deprecation` has not configured.
+  class Deprecation
+    attr_reader :deprecation_horizon, :gem_name
+    attr_accessor :silenced
+
+    def initialize(deprecation_horizon = "next release", gem_name = "Rails")
+      @deprecation_horizon = deprecation_horizon
+      @gem_name = gem_name
+      @silenced = false
+    end
+
+    # Not Rails' "(called from …)" suffix: no target keeps the caller's location.
+    def warn(message = nil, callstack = nil)
+      return nil if @silenced
+      ActiveSupport.deprecation_line("DEPRECATION WARNING: #{message}")
+      nil
+    end
+
+    # Rails installs a `const_missing` hook that warns and answers the
+    # replacement. Not ported: a hook no target has, and a program that
+    # reads no deprecated name never calls it (`deprecate_constant` is
+    # refused where one is read).
+    module DeprecatedConstantAccessor
+    end
+  end
+
   # A namespace with no verifier in it, because ours is
   # `ActionController::MessageVerifier` (it serves the cookie jar first).
   # The error keeps Rails' path so app code that names it resolves.
@@ -543,6 +578,16 @@ module ActiveSupport
   # subtracting them.
   def self.excluding(list, *elements)
     list - elements.flatten(1)
+  end
+
+  # AS `Array#extract_options!` (`lower::enumerable_ext`): the trailing
+  # Hash, removed from the Array it was called on, or a new empty one.
+  # Only a plain Hash, as Rails' `Hash#extractable_options?` answers
+  # (`instance_of?(Hash)`): a subclass stays in the Array.
+  def self.extract_options!(list)
+    last = list.last
+    return list.pop if last.instance_of?(Hash)
+    {}
   end
 
   # AS `Enumerable#pluck` on a receiver the analyzer could not type

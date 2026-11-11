@@ -951,8 +951,10 @@ fn synth_adapter_reload(model: &Model, table: &Table, param: bool) -> MethodDef 
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
 
     // Rails' `reload` clears the association cache — owned by
-    // associations (same kinds as `assoc_cache_ivar_bindings`).
-    let clear_assoc = super::associations::clear_loaded_flag_assigns(model);
+    // associations (same kinds as `assoc_cache_ivar_bindings`) — and
+    // the attachment proxies and unsaved attachment assignments.
+    let mut clear_assoc = super::associations::clear_loaded_flag_assigns(model);
+    clear_assoc.extend(crate::lower::attached::reload_resets(model));
 
     // SQL: "SELECT <cols> FROM <table> WHERE id = " + Db.escape_int(@id) + " LIMIT 1"
     let cols_csv: String = table

@@ -65,6 +65,14 @@ completion line after the script and counts the run a success only if that
 line was printed. Do not end a passing script with `exit`; let it reach
 its last line.
 
+A run that ran clean has still not passed if analysis or emit reported an
+error (Invariant 6). `run.assert_passes()` checks both halves and says
+which one failed; `run.passed()` is the same check as a value, for an
+assertion with its own message. `run.program_succeeded()` reads only the
+program's half: use it only next to an assertion on `run.errors`, for
+example in a test that expects a refusal, or a control whose wrong
+expectation must fail.
+
 ## Native probes
 
 A Spinel test that checks one construct rather than the app can compile the

@@ -17,7 +17,7 @@ fn a_class_body_reads_a_data_file_under_rails_root() {
             "require \"yaml\"\nrequire \"json\"\nrequire \"erb\"\n\nclass RegionDefaults\n  OVERRIDES = YAML.safe_load_file(File.join(Rails.root, \"components\", \"regions\", \"config\", \"overrides.yml\")).freeze\n  FONTS = JSON.parse(File.read(File.join(Rails.root, \"db\", \"data\", \"fonts.json\"))).freeze\n  PAGE = YAML.safe_load(ERB.new(File.read(File.join(Rails.root, \"lib\", \"templates\", \"page.yml.erb\"))).result).freeze\nend\n",
         )
         .run_ruby("p RegionDefaults::OVERRIDES\np RegionDefaults::FONTS\np RegionDefaults::PAGE\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "{\"EUR\" => [\"FR\", \"DE\"]}\n{\"serif\" => [\"Georgia\"]}\n{\"title\" => 2}\n");
 }
 

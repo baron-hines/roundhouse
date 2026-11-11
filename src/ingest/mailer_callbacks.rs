@@ -163,9 +163,9 @@ fn is_rescue(call: &Expr) -> bool {
 /// The callback's kind, and whether it is a delivery callback.
 fn kind_of(method: &str) -> Option<(Kind, bool)> {
     match method {
-        "before_action" => Some((Kind::Before, false)),
-        "after_action" => Some((Kind::After, false)),
-        "around_action" => Some((Kind::Around, false)),
+        "before_action" | "append_before_action" => Some((Kind::Before, false)),
+        "after_action" | "append_after_action" => Some((Kind::After, false)),
+        "around_action" | "append_around_action" => Some((Kind::Around, false)),
         "before_deliver" => Some((Kind::Before, true)),
         "after_deliver" => Some((Kind::After, true)),
         "around_deliver" => Some((Kind::Around, true)),

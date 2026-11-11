@@ -81,13 +81,7 @@ fn run(eager: bool) {
         overlay = overlay.write(&format!("vendor/gems/ak-1.0.0/lib/{path}"), text);
     }
     let run = overlay.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }

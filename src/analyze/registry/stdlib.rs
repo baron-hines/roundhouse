@@ -57,6 +57,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Rails::BacktraceCleaner", &[("new", cleaner)], &[
         ("clean", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
     ]);
+    // runtime/ruby/active_support_reporters.rb's ParameterFilter. `filter`
+    // answers a Hash of what it was given, whose values are untyped.
+    let parameter_filter = class("ActiveSupport::ParameterFilter");
+    register_stdlib_class(classes, "ActiveSupport::ParameterFilter", &[("new", parameter_filter)], &[
+        ("filter", Ty::Untyped),
+        ("filter_param", Ty::Untyped),
+    ]);
     register_stdlib_class(classes, "ActiveSupport", &[
         ("event_reporter", event_reporter.clone()), ("error_reporter", error_reporter.clone()),
         ("event_reporter=", event_reporter.clone()), ("error_reporter=", error_reporter.clone()),
@@ -783,9 +790,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("time_fragment", Ty::Str),
         ("written", Ty::Str),
     ], &[]);
-    // `Rack::Utils` — the two encoding-negotiation functions, ported
-    // into `runtime/ruby/rack_utils.rb` (the rack gem's own on the ruby
-    // family). ONLY that surface, the IPAddr rule. A pair is
+    // `Rack::Utils` — the two encoding-negotiation functions and
+    // `unescape_path`, ported into `runtime/ruby/rack_utils.rb` (the rack
+    // gem's own on the ruby family). ONLY that surface, the IPAddr rule. A pair is
     // `[name, quality]`; the name is nil for an empty header part.
     let q_pair = Ty::Tuple {
         elems: vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }, Ty::Float].into(),
@@ -793,6 +800,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Rack::Utils", &[
         ("q_values", Ty::Array { elem: std::sync::Arc::new(q_pair) }),
         ("select_best_encoding", Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
+        ("unescape_path", Ty::Str),
     ], &[]);
     // `Rack::Utils::HTTP_STATUS_CODES` — the status-code-to-reason-phrase
     // table every app can reach for (`Rack::Utils::HTTP_STATUS_CODES
@@ -1142,6 +1150,16 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         register_stdlib_class(classes, "ActiveSupport::TimeZoneInfo", &[], &[
             ("name", Ty::Str), ("identifier", Ty::Str),
         ]);
+    }
+    // A gem's own deprecator, `runtime/ruby/active_support_ext.rb`'s port: only what that class defines.
+    register_stdlib_class(classes, "ActiveSupport::Deprecation", &[], &[
+        ("warn", Ty::Nil), ("deprecation_horizon", Ty::Str), ("gem_name", Ty::Str),
+        ("silenced", Ty::Bool), ("silenced=", Ty::Bool),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::Deprecation::DeprecatedConstantAccessor", &[], &[]);
+    // `runtime/ruby/action_controller/metal.rb`: the modules a Metal subclass includes back, which Base already holds.
+    for module in ["ActionController::UrlFor", "ActionController::Redirecting", "AbstractController::Callbacks", "ActionView::Rendering"] {
+        register_stdlib_class(classes, module, &[], &[]);
     }
     register_stdlib_class(classes, crate::analyze::indifferent::CLASS, &[], &[]);
     // Not answered here beyond `new`: the dispatch arm for `ActiveSupport::StringInquirer` types its predicates and String surface.

@@ -1321,7 +1321,11 @@ fn every_runtime_method_body_concretely_typed() {
     // MEASURED 948 on main d534fc3d (947): composite group-count keys
     // add one gradual site in relation.rb; other files are unchanged.
     // Raise by one to preserve the existing two-site headroom.
-    const CEILING: usize = 950;
+    // MEASURED 956 on devise-helpers (main f189962ad: 948):
+    // ActiveSupport.extract_options! takes any Array, so its untyped list
+    // argument adds 8 sites in active_support_ext.rb; other files are
+    // unchanged. Raise to 958, preserving the two-site headroom.
+    const CEILING: usize = 958;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

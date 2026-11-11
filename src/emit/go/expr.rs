@@ -2590,6 +2590,12 @@ pub(super) fn emit_send(
                 if is_known_class_method(method) {
                     return format!("{recv_s}.{go_m}()");
                 }
+                // Not every `clear`: a reader of that name is a field; the transpiled Session's (`reset_session`) is a method.
+                if method == "clear"
+                    && matches!(r.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionDispatch::Session")
+                {
+                    return format!("{recv_s}.{go_m}()");
+                }
                 // Not a field: the written-down `render json:` encoder is a method on every model it serializes.
                 if method == crate::lower::JSON_WRITER_METHOD
                     || method.starts_with(&format!("{}__", crate::lower::JSON_WRITER_METHOD))

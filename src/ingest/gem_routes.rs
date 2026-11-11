@@ -79,21 +79,177 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 pub(super) fn expand<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_dirs: &[std::path::PathBuf], app: &mut App) {
     let mut entries = std::mem::take(&mut app.routes.entries);
     let mut failed = false;
+    let mut devise = Vec::new();
     if contains_deferred(&entries) {
         let initializers = super::configured_superclass::initializers_of(vfs, dir, gem_dirs);
         let mut gaps = Vec::new();
-        failed = replace(&mut entries, app, &initializers, &Some((None, None, None)), &mut gaps);
+        failed = replace(&mut entries, app, &initializers, &Some((None, None, None)), &mut gaps, &mut devise);
         app.gem_route_gaps.extend(gaps);
     }
     app.routes.entries = entries;
+    // After the initializers, as Rails loads the routes after them.
+    for boot in super::configured_superclass::take_boot_calls() {
+        match boot {
+            Ok(expr) => app.boot_program.push(expr),
+            Err(why) => {
+                let mut gap = crate::diagnostic::Diagnostic::unsupported(crate::span::Span::synthetic(), None, "routing method boot state", why);
+                gap.severity = crate::diagnostic::Severity::Warning;
+                app.gem_route_gaps.push(gap);
+            }
+        }
+    }
+    write_devise_url_helpers(app, devise);
+    write_load_time_evals(app);
+    write_mapping_helpers(app);
+    super::configured_superclass::expand_boot_base_mixins(app);
+    super::gem_hooks::devise_mapping_types(app);
     if !failed {
         consume_installs(app);
+    }
+}
+
+/// What the gems' files defined by a `class_eval` string as they loaded (devise's `Mapping.add_module` gives `Devise::Mapping`
+/// its `validatable?`), as each class's own methods. A definer whose body is nothing but such strings is emptied: it still
+/// runs at boot, where a compiled tree cannot run the string, and what it would define is defined.
+fn write_load_time_evals(app: &mut App) {
+    let mut defs: std::collections::BTreeMap<String, Vec<MethodDef>> = std::collections::BTreeMap::new();
+    let mut definers: HashSet<(String, String, bool)> = HashSet::default();
+    for (by_class, by) in super::configured_superclass::take_evaled_defs() {
+        for (class, methods) in by_class {
+            let into = defs.entry(class).or_default();
+            for m in methods {
+                if !into.iter().any(|d| d.name == m.name && d.receiver == m.receiver) {
+                    into.push(m);
+                }
+            }
+        }
+        definers.extend(by);
+    }
+    for (class, methods) in defs {
+        let Some(lc) = app.library_classes.iter_mut().find(|lc| lc.name.0.as_str() == class) else { continue };
+        for m in methods {
+            if !lc.methods.iter().any(|d| d.name == m.name && d.receiver == m.receiver) {
+                lc.methods.push(m);
+            }
+        }
+    }
+    let only_string_evals = |body: &Expr| {
+        let statements: Vec<&Expr> = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.iter().collect(),
+            _ => vec![body],
+        };
+        !statements.is_empty()
+            && statements.iter().all(|e| matches!(&*e.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                if matches!(method.as_str(), "class_eval" | "module_eval") && args.first().is_some_and(|a| !matches!(&*a.node, ExprNode::Lit { .. }))
+                    || matches!(method.as_str(), "class_eval" | "module_eval") && args.first().is_some_and(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Str { .. } }))))
+    };
+    for (owner, name, class_side) in definers {
+        let receiver = if class_side { MethodReceiver::Class } else { MethodReceiver::Instance };
+        for lc in app.library_classes.iter_mut().filter(|lc| lc.name.0.as_str() == owner) {
+            for m in lc.methods.iter_mut().filter(|m| m.name.as_str() == name && m.receiver == receiver && only_string_evals(&m.body)) {
+                m.body = Expr::new(m.body.span, ExprNode::Lit { value: Literal::Nil });
+            }
+        }
+    }
+}
+
+/// Each drawn mapping's controller helpers as its module's own methods, and the definer they came from emptied: Rails ran it at
+/// boot and `Devise.add_mapping` still calls it there, but what it would define is defined. The names it made view helpers are the views'.
+fn write_mapping_helpers(app: &mut App) {
+    let written = super::configured_superclass::take_mapping_helpers();
+    if written.is_empty() {
+        return;
+    }
+    // Not the definer emptied for a module one of whose mappings did not run: Rails runs it at boot for each, so it stays.
+    let mut failed: Vec<String> = Vec::new();
+    for (module, result) in &written {
+        if let Err(why) = result {
+            let mut gap = crate::diagnostic::Diagnostic::unsupported(crate::span::Span::synthetic(), None, "mapping helpers", why.clone());
+            gap.severity = crate::diagnostic::Severity::Warning;
+            app.gem_route_gaps.push(gap);
+            failed.push(module.clone());
+        }
+    }
+    for (module, result) in written {
+        let Ok((defs, names)) = result else { continue };
+        if failed.contains(&module) {
+            continue;
+        }
+        let Some(lc) = app.library_classes.iter_mut().find(|lc| lc.name.0.as_str() == module) else { continue };
+        for def in defs {
+            if !lc.methods.iter().any(|m| m.name == def.name && m.receiver == def.receiver) {
+                lc.methods.push(def);
+            }
+        }
+        for m in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "define_helpers") {
+            m.body = Expr::new(m.body.span, ExprNode::Lit { value: Literal::Nil });
+        }
+        app.view_visible_controller_methods.extend(names.into_iter().map(|n| crate::ident::Symbol::from(n.as_str())));
+    }
+}
+
+type DeviseDraws = Vec<(crate::span::Span, Result<super::gem_hooks::DeviseUrlFacts, String>)>;
+
+/// `Devise::Controllers::UrlHelpers.generate_helpers!` runs at load and defines, by a computed name, a proxy from each helper the mappings use
+/// to the scope's own route helper. Its bodies send to a routes proxy the runtime does not have; written out once the routes are, on `RouteHelpers`,
+/// and the generator with its `define_method` emptied. Anything unread leaves the generator standing, so Spinel refuses it there and the helpers stay undefined.
+fn write_devise_url_helpers(app: &mut App, draws: DeviseDraws) {
+    let Some(span) = draws.first().map(|(span, _)| *span) else { return };
+    let mut merged: Option<super::gem_hooks::DeviseUrlFacts> = None;
+    for (at, facts) in draws {
+        match facts {
+            Ok(facts) => match &mut merged {
+                Some(m) => m.mappings.extend(facts.mappings),
+                None => merged = Some(facts),
+            },
+            Err(why) => {
+                app.gem_route_gaps.push(crate::diagnostic::Diagnostic::unsupported(at, None, "devise_for", format!("Devise's url helpers are not written: {why}")));
+                return;
+            }
+        }
+    }
+    let Some(mut facts) = merged else { return };
+    // `Devise.mappings` is a Hash: a later mapping of a scope replaces the earlier in its place, and `find_scope!` walks them in that order.
+    let mut mappings: Vec<super::gem_hooks::DeviseMapping> = Vec::new();
+    for mapping in std::mem::take(&mut facts.mappings) {
+        match mappings.iter_mut().find(|m| m.name == mapping.name) {
+            Some(existing) => *existing = mapping,
+            None => mappings.push(mapping),
+        }
+    }
+    facts.mappings = mappings;
+    let scope_defined_by_program = app.library_classes.iter().filter(|c| c.name.0.as_str() != "ActionDispatch::Routing::Mapper").any(|c| c.methods.iter().any(|m| m.name.as_str() == "devise_scope"))
+        || app.models.iter().any(|m| m.methods().any(|d| d.name.as_str() == "devise_scope"));
+    if scope_defined_by_program {
+        app.gem_route_gaps.push(crate::diagnostic::Diagnostic::unsupported(span, None, "devise_for", "Devise's url helpers are not written: a class defines `devise_scope`, which `Devise::Mapping.find_scope!` asks first".to_string()));
+        return;
+    }
+    let routes: crate::det::HashMap<String, usize> = crate::lower::lower_routes_to_library_functions(app)
+        .into_iter()
+        .map(|f| (f.name.as_str().to_string(), f.params.iter().filter(|p| p.default.is_none() && !p.keyword && !p.rest && !p.forwarding).count()))
+        .collect();
+    let source = format!("module RouteHelpersDeviseUrl\n{}end\n", super::gem_hooks::devise_url_helpers_source(&facts, &routes));
+    let parsed = super::prism::scope(|| super::ingest_library_classes(source.as_bytes(), "<devise url helpers>")).0;
+    let Ok(mut classes) = parsed else {
+        app.gem_route_gaps.push(crate::diagnostic::Diagnostic::unsupported(span, None, "devise_for", "Devise's url helpers did not parse".to_string()));
+        return;
+    };
+    let Some(class) = classes.pop() else { return };
+    app.generated_route_helpers = class.methods;
+    for lc in app.library_classes.iter_mut().filter(|lc| lc.name.0.as_str() == "Devise::Controllers::UrlHelpers") {
+        for m in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Class && matches!(m.name.as_str(), "generate_helpers!" | "remove_helpers!")) {
+            m.body = Expr::new(m.body.span, ExprNode::Lit { value: Literal::Nil });
+        }
     }
 }
 
 fn place_guards(entries: &mut [RouteSpec], span: crate::span::Span) {
     fn place(e: &mut Expr, span: crate::span::Span) {
         e.span = span;
+        // Not resolved where the call stands: no `Devise` is written there, and the constant is the gem method's own.
+        if matches!(&*e.node, ExprNode::Const { .. }) {
+            e.decisions |= crate::expr::GENERATED_CONST_REF;
+        }
         e.node.for_each_child_mut(&mut |child| place(child, span));
     }
     for entry in entries {
@@ -185,7 +341,7 @@ fn contains_deferred(entries: &[RouteSpec]) -> bool {
 /// Where a call stands, as Rails' `@scope` accumulates it: path, module and name; `None` inside a resource.
 type Enclosing = Option<(Option<String>, Option<String>, Option<String>)>;
 
-fn replace(entries: &mut Vec<RouteSpec>, app: &App, initializers: &[Expr], enclosing: &Enclosing, gaps: &mut Vec<crate::diagnostic::Diagnostic>) -> bool {
+fn replace(entries: &mut Vec<RouteSpec>, app: &App, initializers: &[Expr], enclosing: &Enclosing, gaps: &mut Vec<crate::diagnostic::Diagnostic>, devise: &mut DeviseDraws) -> bool {
     let mut failed = false;
     for entry in entries.iter_mut() {
         match entry {
@@ -200,15 +356,16 @@ fn replace(entries: &mut Vec<RouteSpec>, app: &App, initializers: &[Expr], enclo
                     };
                     (join(p, path, "/", true), join(m, module, "/", false), join(a, &as_prefix.as_ref().map(|s| s.as_str().to_string()), "_", false))
                 });
-                failed |= replace(entries, app, initializers, &inner, gaps)
+                failed |= replace(entries, app, initializers, &inner, gaps, devise)
             }
-            RouteSpec::Exclusive { entries } => failed |= replace(entries, app, initializers, &Some((None, None, None)), gaps),
-            RouteSpec::Guarded { entries, .. } => failed |= replace(entries, app, initializers, enclosing, gaps),
-            RouteSpec::Resources { nested, .. } => failed |= replace(nested, app, initializers, &None, gaps),
+            RouteSpec::Exclusive { entries } => failed |= replace(entries, app, initializers, &Some((None, None, None)), gaps, devise),
+            RouteSpec::Guarded { entries, .. } => failed |= replace(entries, app, initializers, enclosing, gaps, devise),
+            RouteSpec::Resources { nested, .. } => failed |= replace(nested, app, initializers, &None, gaps, devise),
             RouteSpec::Deferred { call, span, constraints } => {
                 let drawn = draw(app, call, initializers, enclosing.clone());
                 *entry = match drawn {
-                    Ok((mut inner, omitted)) => {
+                    Ok((mut inner, omitted, facts)) => {
+                        devise.extend(facts.map(|f| (*span, f)));
                         let method = match &*call.node {
                             ExprNode::Send { method, .. } => method.as_str().to_string(),
                             _ => "call".into(),
@@ -264,7 +421,8 @@ fn replace(entries: &mut Vec<RouteSpec>, app: &App, initializers: &[Expr], enclo
     failed
 }
 
-fn draw(app: &App, call: &Expr, initializers: &[Expr], enclosing: Enclosing) -> Result<(Vec<RouteSpec>, Vec<String>), String> {
+#[allow(clippy::type_complexity)]
+fn draw(app: &App, call: &Expr, initializers: &[Expr], enclosing: Enclosing) -> Result<(Vec<RouteSpec>, Vec<String>, Option<Result<super::gem_hooks::DeviseUrlFacts, String>>), String> {
     let ExprNode::Send { method, .. } = &*call.node else { return Err("not a call".into()) };
     let (lc, def) = extensions(app).into_iter().find(|(_, m)| &m.name == method).ok_or("no method of a mapper extension")?;
     // The gems the method reaches: its module's, and each top-level constant the program defines that its body names (`Devise` from the reopened mapper).
@@ -304,9 +462,9 @@ fn draw(app: &App, call: &Expr, initializers: &[Expr], enclosing: Enclosing) -> 
             mixins.push(owner.name.0.as_str().to_string());
         }
     }
-    let (drawn, omitted) = super::configured_superclass::draw_routes(app, def, scope, call, initializers, &roots, mixins, enclosing)?;
+    let (drawn, omitted, devise) = super::configured_superclass::draw_routes(app, def, scope, call, initializers, &roots, mixins, enclosing)?;
     let body: String = drawn.iter().map(|e| crate::emit::ruby::emit_expr(e) + "\n").collect();
     let source = format!("Rails.application.routes.draw do\n{body}end\n");
     let table = super::routes::ingest_routes(source.as_bytes(), "<gem routes>").map_err(|e| format!("the drawn routes do not read: {e:?}"))?;
-    Ok((table.entries, omitted))
+    Ok((table.entries, omitted, devise))
 }

@@ -98,7 +98,7 @@ raise "expected a span: #{out.inspect}" unless out == "<span>hi</span>"
 puts "model tag builder ok"
 "#);
     assert!(
-        !run.errors.is_empty() || run.success,
+        !run.errors.is_empty() || run.program_succeeded(),
         "silently broken: no error from check, and the emitted program failed\n\
          === stdout ===\n{}\n=== stderr ===\n{}",
         run.stdout,

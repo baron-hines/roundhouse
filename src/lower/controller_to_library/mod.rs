@@ -32,6 +32,7 @@ mod params_values;
 mod params_sources;
 mod permit_splat;
 mod typed_update;
+mod respond_with;
 pub mod params_wrapper;
 pub mod rewrites;
 pub mod util;
@@ -294,6 +295,10 @@ pub struct LowerControllerOptions<'a> {
     /// for every controller. Read only when the tree
     /// `FormatBreadth::wraps_json_params`.
     pub wrap_parameters_by_default: bool,
+    /// The app bundles jbuilder (its `Gemfile.lock`, and not `require: false` in its Gemfile), so
+    /// `ActionController::API` renders views: jbuilder's railtie includes `ActionView::Rendering` there.
+    /// `None` without a lockfile: any `.jbuilder` view answers.
+    pub jbuilder_loaded: Option<bool>,
     /// `App::concern_spliced_actions`: per controller, the methods the
     /// ingest copied in from included modules. They count as defined
     /// for the missing-action check (`missing_action_check`). `None`
@@ -331,6 +336,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
         models,
         wrap_parameters_by_default,
         concern_spliced_actions,
+        jbuilder_loaded,
     } = opts;
     // `None` (every wrapper's default) means the projection stays
     // purely shape-directed — what it was before this table existed.
@@ -339,6 +345,10 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     // `permit(*helper)` with a helper answering a literal Symbol list is
     // the same permit written inline; inline it before anything reads
     // the permit lists (`permit_splat`).
+    let responders_with_behavior = respond_with::Responders {
+        with_behavior: respond_with::responders_with_behavior(library_classes),
+        jbuilder_loaded: jbuilder_loaded.unwrap_or_else(|| views.iter().any(|v| v.jbuilder)),
+    };
     let inlined = self::permit_splat::inline_permit_splats(controllers);
     let controllers: &[Controller] = inlined.as_deref().unwrap_or(controllers);
     // Scan source-shape action bodies for `permit(...)` declarations.
@@ -394,7 +404,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
                 library_classes,
                 concern_spliced_actions,
             );
-            let methods = build_methods(controller, controllers, &params_specs, &assoc_registry, &json_actions, &text_format_actions, routed.as_ref(), &view_ivars, &partials, format_breadth, route_id_segments, inferred_params, wrapper.as_ref(), action_check.as_ref());
+            let methods = build_methods(controller, controllers, &params_specs, &assoc_registry, &json_actions, &text_format_actions, routed.as_ref(), &view_ivars, &partials, format_breadth, route_id_segments, inferred_params, wrapper.as_ref(), action_check.as_ref(), &responders_with_behavior);
             all_methods.push((methods, controller));
         }
         subclass_template_hooks(&mut all_methods, controllers, &view_ivars, &partials);
@@ -707,6 +717,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
         None,
         None,
         None,
+        &respond_with::Responders { with_behavior: crate::det::HashSet::default(), jbuilder_loaded: false },
     );
     methods.extend(collect_attr_accessor_methods(controller));
     apply_alias_methods(controller, &mut methods);
@@ -1159,6 +1170,7 @@ fn build_methods(
     // Rails' ParamsWrapper for this controller, when its requests get one.
     wrapper: Option<&self::params_wrapper::WrapperSpec>,
     action_check: Option<&crate::det::HashSet<Symbol>>,
+    responders_with_behavior: &respond_with::Responders,
 ) -> Vec<MethodDef> {
     let mut methods: Vec<MethodDef> = controller.class_methods().cloned().collect();
 
@@ -1438,7 +1450,7 @@ fn build_methods(
             params_specs, assocs, json_actions,
             text_format_actions, view_ivars,
             partials, format_breadth, &shadows, route_id_segments, inferred_params,
-            &deferred_renders, &mut deferred_tails,
+            &deferred_renders, &mut deferred_tails, responders_with_behavior,
         ));
     }
     if let Some((mut preamble, mut wraps)) = pending_dispatcher {
@@ -1487,7 +1499,7 @@ fn build_methods(
             params_specs, assocs, json_actions,
             text_format_actions, view_ivars,
             partials, format_breadth, &shadows, route_id_segments, inferred_params,
-            &no_deferred, &mut crate::det::HashMap::default(),
+            &no_deferred, &mut crate::det::HashMap::default(), responders_with_behavior,
         ));
     }
     // Public methods no route reaches are helpers/filters, not actions:
@@ -1500,7 +1512,7 @@ fn build_methods(
             params_specs, assocs, json_actions,
             text_format_actions, view_ivars,
             partials, format_breadth, &shadows, route_id_segments, inferred_params,
-            &no_deferred, &mut crate::det::HashMap::default(),
+            &no_deferred, &mut crate::det::HashMap::default(), responders_with_behavior,
         ));
     }
 
@@ -3202,6 +3214,7 @@ fn action_to_method(
     inferred_params: Option<&crate::det::HashMap<(ClassId, Symbol), Vec<Ty>>>,
     deferred_renders: &crate::det::HashSet<Symbol>,
     deferred_out: &mut crate::det::HashMap<Symbol, Expr>,
+    responders_with_behavior: &respond_with::Responders,
 ) -> MethodDef {
     let method_name = method_name_for_action(a.name.as_str());
     // Required positionals, optionals (so `def get_from_cache(opts = {})`
@@ -3261,8 +3274,44 @@ fn action_to_method(
         can_respond_within(&a.body, &resolve, &mut std::collections::BTreeSet::new())
     };
     let inheritor_modules = inheritor_view_modules(controller, all_controllers_for_params);
+    let chain: Vec<&Controller> = std::iter::once(controller).chain(ancestor_chain(controller, all_controllers_for_params).into_iter().rev()).collect();
+    let responder_expr = chain.iter().find_map(|c| {
+        c.body.iter().find_map(|item| {
+            let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item else { return None };
+            match &*expr.node {
+                ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, value } if matches!(&*recv.node, ExprNode::SelfRef) && name.as_str() == "responder" => Some(value),
+                // The setter call a class body writes as `self.responder = v`.
+                ExprNode::Send { recv: Some(recv), method, args, .. } if method.as_str() == "responder=" && matches!(&*recv.node, ExprNode::SelfRef) && args.len() == 1 => args.first(),
+                _ => None,
+            }
+        })
+    });
+    // Past `ancestor_chain`'s depth a further ancestor may declare other formats.
+    let chain_complete = !chain.last().and_then(|c| c.parent.as_ref()).is_some_and(|p| all_controllers_for_params.iter().any(|c| &c.name == p));
+    let responder_keeps_defaults = !responder_expr.is_some_and(|r| respond_with::names_responder_with_behavior(r, &responders_with_behavior.with_behavior));
+    let html_only = respond_with::html_only_declared(&chain) == Some(true);
+    let json_only = respond_with::json_only_declared(&chain) == Some(true);
+    // Native renders an action's template from the controller's own view directory. A json-only action whose
+    // template could come from an ancestor's directory instead keeps its call: Rails would render that template.
+    let json_template_inherited = json_only
+        && !json_actions.contains(&a.name)
+        && chain.iter().skip(1).any(|c| views_module_name(c).is_some_and(|m| view_ivars.contains_key(&(m, format!("{}_json", a.name.as_str())))));
+    let respond_with_body = (chain_complete && responder_keeps_defaults && (html_only || json_only) && !json_template_inherited).then(|| {
+        let has_template = if json_only {
+            json_actions.contains(&a.name)
+        } else {
+            chain.iter().any(|c| views_module_name(c).is_some_and(|m| view_ivars.contains_key(&(m, a.name.as_str().to_string()))))
+        };
+        // The chain's root: an app controller's parent the app does not define.
+        let on_api = chain.last().and_then(|c| c.parent.as_ref()).is_some_and(|p| p.0.as_str().trim_start_matches("::") == "ActionController::API");
+        let view_rendering = !on_api || responders_with_behavior.jbuilder_loaded;
+        respond_with::lower(
+            &a.body,
+            &respond_with::Facts { action: is_public.then_some(a.name.as_str()), has_template, responder: responder_expr, json: json_only, view_rendering },
+        )
+    });
     let (body, deferred_tail) = lower_action_body(
-        &a.body,
+        respond_with_body.as_ref().unwrap_or(&a.body),
         controller,
         a.name.as_str(),
         privs,

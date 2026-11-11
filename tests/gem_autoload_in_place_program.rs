@@ -100,13 +100,7 @@ fn a_literal_gem_autoload_of_a_file_with_requires_loads_its_program() {
         app = app.write(&format!("vendor/gems/kafka-kit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), EXPECTED, "emitted boot diverges from CRuby\n{}", run.stderr);
     // Each constant's autoload is the gem's own, registered by the program
     // of the file that writes it, and loads the target file's program

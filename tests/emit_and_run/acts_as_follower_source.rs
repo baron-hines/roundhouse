@@ -90,12 +90,13 @@ check("stop_following", [c.following?(b), Follow.count], [false, 0])
 puts "ok"
 "##,
     );
+    // Not the gem's `ActiveSupport::Deprecation.warn(…)`: Rails 7.2 removed the class-side `warn`, so Rails raises NoMethodError there as the emitted tree does, on a path no request takes.
     let mut reported: Vec<&str> = run
         .errors
         .iter()
-        .map(|e| if e.contains("ActiveSupport::Deprecation") { "deprecation" } else if e.contains("association join") { "join" } else { e.as_str() })
+        .map(|e| if e.contains("association join") { "join" } else { e.as_str() })
         .collect();
     reported.sort();
-    assert_eq!(reported, ["deprecation", "deprecation", "join", "join"], "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(reported, ["join", "join"], "{:#?}", run.errors);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
 }

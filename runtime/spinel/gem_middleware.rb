@@ -8,4 +8,10 @@ module GemMiddleware
     Main.dispatch_request(req, res, request_obj)
     nil
   end
+
+  # The test harness's request through the stack (Rails' integration tests run it): with no gem
+  # middleware, the block is the whole stack.
+  def self.around(env)
+    yield(env)
+  end
 end

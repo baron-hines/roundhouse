@@ -121,9 +121,26 @@ object Server {
             return
         }
 
-        // Rails' `_method` override (button_to delete/patch forms POST).
-        var method = ctx.method().name
-        if (method == "POST") {
+        // Read a form body only when the request carries one — Rack's
+        // `form_data?`: a form media type (Javalin's predicates match it
+        // case-insensitively, as RFC 9110 requires), or a POST with no
+        // Content-Type at all. Otherwise `formParamMap` reads the (empty)
+        // body of every GET through Jetty's request-content lock (+2-4%
+        // GET throughput on the real-blog bench routes without it).
+        // Both tests read the ORIGINAL method, as Rack's do: Javalin's
+        // `ctx.method()` already applies an `X-HTTP-Method-Override`
+        // header, on any method.
+        val originalMethod = ctx.req().method
+        val formBody = ctx.isFormUrlencoded() || ctx.isMultipartFormData() ||
+            (originalMethod == "POST" && ctx.header("Content-Type") == null)
+
+        // Rails' method override (button_to delete/patch forms POST), as
+        // `Rack::MethodOverride` decides it: only a POST is overridden, the
+        // `_method` param wins over the header, and the param is read under
+        // the same gate as the params, so a text/plain POST neither
+        // re-routes nor carries fields. A GET with the header stays a GET.
+        var method = if (originalMethod == "POST") ctx.method().name else originalMethod
+        if (originalMethod == "POST" && formBody) {
             ctx.formParam("_method")?.let { method = it.uppercase() }
         }
 
@@ -149,8 +166,10 @@ object Server {
         for ((k, vals) in ctx.queryParamMap()) {
             vals.firstOrNull()?.let { setParam(params, k, it) }
         }
-        for ((k, vals) in ctx.formParamMap()) {
-            vals.firstOrNull()?.let { setParam(params, k, it) }
+        if (formBody) {
+            for ((k, vals) in ctx.formParamMap()) {
+                vals.firstOrNull()?.let { setParam(params, k, it) }
+            }
         }
 
         val controller = factory()

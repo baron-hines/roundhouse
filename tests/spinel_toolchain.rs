@@ -66,6 +66,10 @@ mod haml_class_shortcut_merge_native;
 mod lobsters_zero;
 #[path = "support/addressable_gem.rs"]
 mod addressable_gem;
+#[path = "support/class_param_or_assign.rs"]
+mod class_param_or_assign_app;
+#[path = "spinel_toolchain/class_param_or_assign.rs"]
+mod class_param_or_assign;
 #[path = "spinel_toolchain/addressable.rs"]
 mod addressable;
 #[path = "support/class_attribute.rs"]

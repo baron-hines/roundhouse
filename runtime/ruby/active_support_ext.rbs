@@ -44,6 +44,25 @@ module ActiveSupport
   def self.interpolate: (String template, Hash[String, String] values) -> String
   def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
 
+  def self.deprecation_line: (String line) -> nil
+
+  class Deprecation
+    @deprecation_horizon: String
+    @gem_name: String
+    @silenced: bool
+
+    def deprecation_horizon: () -> String
+    def gem_name: () -> String
+    def silenced: () -> bool
+    def silenced=: (bool value) -> bool
+
+    def initialize: (?String deprecation_horizon, ?String gem_name) -> void
+    def warn: (?String? message, ?untyped callstack) -> nil
+
+    module DeprecatedConstantAccessor
+    end
+  end
+
   # Rails' name for "this signed value does not verify" — see the .rb.
   class MessageVerifier
     class InvalidSignature < StandardError
@@ -52,6 +71,8 @@ module ActiveSupport
   end
   def self.index_by: (untyped list) { (untyped) -> untyped } -> Hash[untyped, untyped]
   def self.excluding: [A] (Array[A] list, *A elements) -> Array[A]
+  # `untyped list`, as `sole`'s: an `Array[String]` argument does not link against `Array[untyped]` on Spinel.
+  def self.extract_options!: (untyped list) -> Hash[untyped, untyped]
   def self.pluck: (untyped list, *(Symbol | String | Integer) keys) -> Array[untyped]
   # The lowerer routes Array receivers here, Relation receivers to
   # `size > 1` (campfire `@room.users.many?`), and Array/Relation unions

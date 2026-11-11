@@ -29,16 +29,17 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     ] {
         assert_eq!(jobs[name]["needs"].as_str(), Some("plan"), "{name}");
     }
-    for name in ["store-check", "browser-smoke-typescript", "compare-jruby"] {
+    for name in ["store-check", "browser-smoke-typescript"] {
         assert_eq!(
             jobs[name]["needs"],
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[generate-fixture, plan]").unwrap(),
             "{name} must not wait for tests, or lose its fixture/selection"
         );
     }
-    // The CRuby compare jobs wait for the builds they reuse, never for tests.
+    // The CRuby and JRuby compare jobs wait for the builds they reuse, never for tests.
     for (name, needs) in [
         ("compare-ruby", "[generate-fixture, plan, unit-build, build-roundhouse]"),
+        ("compare-jruby", "[generate-fixture, plan, unit-build, build-roundhouse]"),
         ("compare-ruby-next", "[generate-fixture, plan, unit-build]"),
         ("compare", "[generate-fixture, plan, unit-build]"),
         ("compare-extra", "[generate-fixture, plan, unit-build]"),

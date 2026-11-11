@@ -23,6 +23,7 @@ const SPINEL_TEST_HELPER: &str =
 
 pub(crate) mod expr;
 mod library;
+mod par_render;
 pub(crate) use library::install_lookup_indexes;
 pub(crate) use library::app_presents_time_zoned;
 mod rbs;
@@ -655,13 +656,11 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth, param_
     // + class_info_from_library_class) because the former returns
     // ClassInfo with `table` set — the Arel pass needs `info.table`
     // to map a Const recv to a TableRef when recognizing chains.
-    let (_, model_registry) = crate::lower::model_to_library::lower_models_with_request_finders(
-        &app.models,
-        &app.schema,
-        Vec::new(),
-    );
     let model_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> =
-        model_registry.into_iter().collect();
+        crate::lower::model_to_library::request_finder_registry(&app.models, &app.schema, true)
+            .iter()
+            .map(|(id, info)| (id.clone(), info.clone()))
+            .collect();
     // Association graph drives `includes(:assoc)` eager-load lowering
     // (issue #27) — without it the Arel pass drops includes and the
     // reader N+1s.
@@ -697,6 +696,10 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth, param_
             models: &app.models,
             wrap_parameters_by_default: app.wrap_parameters_by_default,
             concern_spliced_actions: Some(&app.concern_spliced_actions),
+            // `require: false` (an empty require list) keeps Bundler from loading it, and its railtie with it.
+            jbuilder_loaded: app.gem_lock.as_ref().map(|lock| {
+                lock.has("jbuilder") && !lock.gemfile_requires.get("jbuilder").is_some_and(|features| features.is_empty())
+            }),
         },
     )
 }
@@ -1237,15 +1240,11 @@ pub(crate) fn emit_spinel_with_param_binds(app: &App, param_binds: bool) -> Vec<
         // its registry, and letting it report again duplicated 58
         // `unsupported` entries into campfire's ledger — the same gaps,
         // counted twice, which is worse than not knowing.
-        let (model_registry, _dup_diags) = crate::emit::diagnostics::scope(|| {
-            let (_, reg) =
-                crate::lower::model_to_library::lower_models_with_request_finders(&app.models, &app.schema, Vec::new());
-            reg
-        });
+        let model_registry = crate::lower::model_to_library::request_finder_registry(&app.models, &app.schema, false);
         let fixture_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> = fixture_lcs
             .iter()
             .map(|lc| (lc.name.clone(), crate::lower::class_info_from_library_class(lc)))
-            .chain(model_registry)
+            .chain(model_registry.iter().map(|(id, info)| (id.clone(), info.clone())))
             .collect();
         // A test body's `_url` answers absolute, on the session's host,
         // as the Ruby family's jbuilder `_url` does (see the pass).
