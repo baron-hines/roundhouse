@@ -140,7 +140,7 @@ pub(super) fn push_validate_method(
                     // Not the `@attr` slot a column has: a typed_store attribute lives in its store column, behind the reader Rails validates through.
                     // A defaulted `attribute` holds nil in `@attr` until its reader applies the default.
                     // Nor for an attribute no column holds (Devise's `password`): Rails validates what its reader answers.
-                    let virtual_attr = attr_ty.is_none() && !is_assoc && attachment.is_none() && !is_collection;
+                    let virtual_attr = attr_ty.is_none() && !is_assoc && attachment.is_none() && !is_collection && !own_ivar_accessor(model, &v.attribute);
                     if store_attrs.contains(&v.attribute) || defaulted_attrs.contains(&v.attribute) || virtual_attr {
                         for check in &mut produced {
                             read_through_reader(check, &v.attribute);
@@ -1019,6 +1019,15 @@ fn with_condition_guard(body: Expr, if_cond: &Option<Expr>, unless_cond: &Option
 
 /// `@<attr>` — direct ivar read passed as the `value` positional arg
 /// to every validates_* helper.
+/// The model's own file declares `attr` by `attr_accessor` / `attr_reader`, whose reader is the ivar itself.
+fn own_ivar_accessor(model: &Model, attr: &Symbol) -> bool {
+    model.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
+        if expr.span.file == model.span.file
+            && matches!(&*expr.node, ExprNode::Send { recv: None, method, args, .. }
+                if matches!(method.as_str(), "attr_accessor" | "attr_reader")
+                    && args.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)))))
+}
+
 fn read_through_reader(expr: &mut Expr, attr: &Symbol) {
     expr.node.for_each_child_mut(&mut |c| read_through_reader(c, attr));
     if matches!(&*expr.node, ExprNode::Ivar { name } if name == attr) {
