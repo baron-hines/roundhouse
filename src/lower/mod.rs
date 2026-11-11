@@ -127,6 +127,7 @@ pub mod records_to_relation_arg;
 pub mod save_without_validation;
 pub mod defined_ivar_read;
 pub mod method_missing_calls;
+pub mod dynamic_try;
 mod core_instance_methods;
 pub mod route_param_recall;
 pub mod expect_string_key;
@@ -954,6 +955,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     record_snapshot::apply_record_snapshot_lowering(app);
     ran!("record_snapshot");
     method_missing_calls::apply_method_missing_calls(app, registry, target);
+    dynamic_try::apply_dynamic_try(app, target);
     diags.extend(where_range_split::apply_where_range_split(app, target));
     ran!("where_range_split");
     for_each_hook_body(app, &mut |body| {

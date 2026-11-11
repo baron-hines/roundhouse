@@ -219,6 +219,9 @@ pub struct Ctx {
 pub struct ClassInfo {
     /// `request.env[KEY]` a middleware on the stack writes (`ActionDispatch::Request` only).
     pub env_keys: HashMap<String, Ty>,
+    /// The values a call no method answers reads through `method_missing`, by name, where a gem documents them
+    /// (`ingest::gem_hooks::method_missing_readers`: OmniAuth's AuthHash `info`).
+    pub missing_readers: HashMap<Symbol, Ty>,
     pub upload_array_fields: std::collections::BTreeMap<(Symbol, Vec<Symbol>, Vec<String>), std::collections::BTreeSet<Symbol>>,
     /// Kind of the indexed source declaration; never inferred from its name.
     pub is_module: bool,

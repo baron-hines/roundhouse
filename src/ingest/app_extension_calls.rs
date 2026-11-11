@@ -133,7 +133,10 @@ pub(super) fn mark(app: &mut App) {
                 _ => None,
             });
             let replays = own_call || through_own_reader || on_app_class.is_some();
-            if replays && !hook && block.is_none() && !expr.span.is_synthetic() {
+            // A block only to the class's own class method (OmniAuth's `uid do … end`, spliced from the Strategy's
+            // ClassMethods), which takes it as Ruby hands it over.
+            let block_ok = block.is_none() || (own_call && direct.contains(method.as_str()));
+            if replays && !hook && block_ok && !expr.span.is_synthetic() {
                 let local_new = own_call && !direct.contains(method.as_str());
                 if local_new && (mixed_body || args.iter().any(|a| !literal_argument(a))
                     || redefined.contains(&owner) || parents.get(&owner).and_then(|p| dispatching.get(p)).is_some_and(|m| m.contains(method.as_str()))

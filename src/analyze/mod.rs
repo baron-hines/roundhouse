@@ -1148,8 +1148,7 @@ impl Analyzer {
         // `registry::controllers`. Runs after view::register because the
         // Devise fold also augments ActionView::Base.
         registry::controllers::register(&mut classes, app, &route_helper_names);
-
-        // User-authored RBS sidecars. Signatures discovered under
+     // User-authored RBS sidecars. Signatures discovered under
         // `sig/**/*.rbs` at ingest time apply on top of the hardcoded
         // catalog — later entries win, so RBS overrides conventions
         // when both declare the same method. All RBS methods land in
@@ -1171,7 +1170,18 @@ impl Analyzer {
         // ActionMailer classes, ActiveJob classes, and Sidekiq workers —
         // see `registry::library`.
         registry::library::register(&mut classes, app, &route_helper_names);
+        for (class, readers) in crate::ingest::method_missing_readers() {
+            let Some(cls) = classes.get_mut(&ClassId(Symbol::from(*class))) else { continue };
+            for (name, held) in readers.iter() {
+                let (base, nilable) = held.strip_suffix('?').map_or((*held, false), |b| (b, true));
+                let ty = if base == "String" { Ty::Str } else { Ty::Class { id: ClassId(Symbol::from(base)), args: vec![].into() } };
+                let ty = if nilable { Ty::Union { variants: vec![ty, Ty::Nil].into() } } else { ty };
+                cls.missing_readers.insert(Symbol::from(format!("{name}?")), Ty::Bool);
+                cls.missing_readers.insert(Symbol::from(*name), ty);
+            }
+        }
 
+   
         // A helper object built from a YAML table
         // (`WebUrlHelpers = Factory.create(YAML.load_file(…)["paths"])`):
         // one path/URL String per generated name. See

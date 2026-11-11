@@ -2518,6 +2518,19 @@ impl<'a> BodyTyper<'a> {
                 // likely inherited from that gem, so treat it as a gradual
                 // escape rather than an "unknown method" error. Reached only
                 // after the precise builtins above have had their say.
+                // A key the gem documents for its `method_missing` class answers what it holds (OmniAuth's `auth.info`),
+                // ahead of the gradual answers below.
+                if instance_receiver && method_missing_ty.is_some() {
+                    let mut walk = Some(id.clone());
+                    for _ in 0..32 {
+                        let Some(c) = walk.take() else { break };
+                        let Some(info) = self.classes().get(&c) else { break };
+                        if let Some(ty) = info.missing_readers.get(method) {
+                            return ty.clone();
+                        }
+                        walk = info.parent.clone();
+                    }
+                }
                 if unknown_named_ancestor {
                     return Ty::Untyped;
                 }

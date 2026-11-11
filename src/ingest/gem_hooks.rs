@@ -1250,3 +1250,23 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     e.node.for_each_child(&mut |c| visit(c, f));
 }
+
+/// The keys a gem's `method_missing` class documents, read as attributes (`auth.info.email`), and what each holds:
+/// OmniAuth's Auth Hash Schema (`OmniAuth::AuthHash`, whose `regular_writer` makes `info` an InfoHash, and hashie's
+/// `convert_value` makes a nested Hash the class itself). `Some` for a value that may be nil; the `?` and `=` forms follow.
+// Not inferred from the writes: `auth.info = info` stores a Hash that the writer converts, which the analysis does not follow.
+pub(crate) fn method_missing_readers() -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
+    &[
+        (
+            "OmniAuth::AuthHash",
+            &[("provider", "String"), ("uid", "String"), ("info", "OmniAuth::AuthHash::InfoHash"), ("credentials", "OmniAuth::AuthHash?"), ("extra", "OmniAuth::AuthHash?")],
+        ),
+        (
+            "OmniAuth::AuthHash::InfoHash",
+            &[
+                ("email", "String?"), ("nickname", "String?"), ("first_name", "String?"), ("last_name", "String?"),
+                ("location", "String?"), ("description", "String?"), ("image", "String?"), ("phone", "String?"),
+            ],
+        ),
+    ]
+}
