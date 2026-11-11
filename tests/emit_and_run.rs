@@ -138,6 +138,30 @@ mod gem_class_macros;
 mod source_gem_autoload;
 #[path = "emit_and_run/source_gem_load_order.rs"]
 mod source_gem_load_order;
+#[path = "emit_and_run/gem_file_statements.rs"]
+mod gem_file_statements;
+#[path = "emit_and_run/uncalled_config_writers.rs"]
+mod uncalled_config_writers;
+#[path = "emit_and_run/gem_mailer_reach.rs"]
+mod gem_mailer_reach;
+#[path = "emit_and_run/helper_method_splat.rs"]
+mod helper_method_splat;
+#[path = "emit_and_run/constant_branches.rs"]
+mod constant_branches;
+#[path = "emit_and_run/defined_method_query.rs"]
+mod defined_method_query;
+#[path = "emit_and_run/metal_subclass.rs"]
+mod metal_subclass;
+#[path = "emit_and_run/boot_with_options.rs"]
+mod boot_with_options;
+#[path = "support/class_param_or_assign.rs"]
+mod class_param_or_assign_app;
+#[path = "emit_and_run/class_param_or_assign.rs"]
+mod class_param_or_assign;
+#[path = "emit_and_run/forwarded_block_reach.rs"]
+mod forwarded_block_reach;
+#[path = "emit_and_run/superclass_respond_to.rs"]
+mod superclass_respond_to;
 #[path = "emit_and_run/unresolved_param_rbs.rs"]
 mod unresolved_param_rbs;
 #[path = "emit_and_run/declared_sig_rbs.rs"]
@@ -186,6 +210,8 @@ mod file_mtime_time;
 mod class_attribute;
 #[path = "emit_and_run/gem_routes.rs"]
 mod gem_routes;
+#[path = "emit_and_run/route_request_guards.rs"]
+mod route_request_guards;
 #[path = "support/option_dsl.rs"]
 mod option_dsl;
 #[path = "emit_and_run/option_dsl.rs"]
@@ -7943,7 +7969,7 @@ fn a_fixture_naming_a_missing_parent_fails_setup() {
             "require \"test_helper\"\n\nclass FkCheckTest < ActiveSupport::TestCase\n  test \"loads\" do\n    assert Article.count > 0\n  end\nend\n",
         )
         .run_test("test/models/fk_check_test.rb");
-    assert!(!run.success, "{}", run.stdout);
+    assert!(!run.program_succeeded(), "{}", run.stdout);
     assert!(run.stdout.contains("Foreign key violations found: comments") || run.stderr.contains("Foreign key violations found: comments"), "{}\n{}", run.stdout, run.stderr);
 }
 
@@ -11058,6 +11084,134 @@ puts "ok"
         .assert_passes();
 }
 
+/// `row.pluralize` on a receiver of no settled type, in a controller. An
+/// app class outside the controllers that defines `pluralize` owns the
+/// call (Rails 8.1.4 dispatches to it).
+fn an_untyped_pluralize_receiver_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write(
+        "app/controllers/probes_controller.rb",
+        r#"class ProbesController < ApplicationController
+  def tag_of(row)
+    row.pluralize
+  end
+end
+"#,
+    )
+}
+
+#[test]
+fn a_library_class_pluralize_owns_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .write("app/models/label.rb", "class Label\n  def pluralize\n    \"custom\"\n  end\nend\n")
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+raise "library class override lost" unless ProbesController.allocate.tag_of(Label.new) == "custom"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
+fn a_model_pluralize_owns_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/models/comment.rb",
+            r#"class Comment < ApplicationRecord
+  belongs_to :article
+  validates :body, presence: true
+
+  def pluralize
+    "custom"
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+raise "model override lost" unless ProbesController.allocate.tag_of(Comment.new) == "custom"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Only a String has `pluralize` (Rails 8.1.4 raises NoMethodError on a number).
+#[test]
+fn a_number_raises_in_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+begin
+  out = ProbesController.allocate.tag_of(5)
+  raise "answered: #{out}"
+rescue NoMethodError => e
+  raise e.message unless e.message == "undefined method 'pluralize' for an instance of Integer"
+end
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Two helpers define it, and each name indexes only one of them.
+#[test]
+fn two_helpers_pluralize_leave_an_untyped_controller_call_lowered() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\nend\n",
+        )
+        .write(
+            "app/helpers/other_helper.rb",
+            "module OtherHelper\n  def pluralize(count, word)\n    \"other\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+out = ProbesController.allocate.tag_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// The same inside the helper module that defines it (Rails 8.1.4 answers
+/// `statuses` from `word.pluralize` there).
+#[test]
+fn a_helper_pluralize_leaves_its_own_untyped_call_lowered() {
+    emit_and_run::real_blog()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\n\n  def plural_of(word)\n    word.pluralize\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"out = ApplicationHelper.plural_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// A helper's `pluralize(count, word)` is not what `row.pluralize` reaches.
+#[test]
+fn a_helper_pluralize_leaves_an_untyped_controller_call_lowered() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+out = ProbesController.allocate.tag_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
 #[test]
 fn an_app_tag_helper_override_owns_helper_and_view_calls() {
     emit_and_run::real_blog()
@@ -13228,10 +13382,8 @@ puts "string inflections passed"
     assert!(run.stdout.contains("string inflections passed"), "{}", run.stdout);
 }
 
-/// #293: `tableize` needs Rails' plural rules, which the runtime does not
-/// carry (its `pluralize_word` keeps a word that ends in "s", where Rails
-/// answers "statuses"). It is refused at check time, not emitted onto a
-/// String no runtime reopens.
+/// #293: `tableize` has no runtime body. It is refused at check time, not
+/// emitted onto a String no runtime reopens.
 #[test]
 fn string_extensions_without_a_runtime_body_are_refused() {
     for (call, method) in [(r#""Status".tableize"#, "tableize")] {
@@ -16039,6 +16191,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/attached_record.rs"]
+mod attached_record;
 #[path = "emit_and_run/many_attached.rs"]
 mod many_attached;
 
@@ -18847,7 +19001,7 @@ fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
     for (name, hits, members) in cases {
         let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
         assert!(run.errors.is_empty(), "{name}: {:?}", run.errors);
-        assert!(!run.success, "{name}: the failing assertion passed\n{}", run.stdout);
+        assert!(!run.program_succeeded(), "{name}: the failing assertion passed\n{}", run.stdout);
         assert!(run.stdout.contains(&format!("CASE {name} HITS={hits}\n")), "{name}: {}", run.stdout);
     }
 }
@@ -20943,6 +21097,8 @@ mod file_level_struct;
 mod concern_class_side_contract;
 #[path = "emit_and_run/concern_class_side.rs"]
 mod concern_class_side;
+#[path = "emit_and_run/controller_concern_class_methods.rs"]
+mod controller_concern_class_methods;
 #[path = "support/concern_define_loop.rs"]
 mod concern_define_loop_contract;
 #[path = "emit_and_run/concern_define_loop.rs"]
@@ -20953,10 +21109,22 @@ mod mutated_loop_constant;
 mod solid_queue_worker_contract;
 #[path = "emit_and_run/solid_queue_surface.rs"]
 mod solid_queue_surface;
+#[path = "emit_and_run/included_block_attribute_writes.rs"]
+mod included_block_attribute_writes;
 #[path = "emit_and_run/controller_surface.rs"]
 mod controller_surface;
 #[path = "emit_and_run/rack_attack.rs"]
 mod rack_attack;
+#[path = "emit_and_run/devise.rs"]
+mod devise;
+#[path = "emit_and_run/warden.rs"]
+mod warden;
+#[path = "emit_and_run/class_eval_string_macro.rs"]
+mod class_eval_string_macro;
+#[path = "emit_and_run/send_built_name.rs"]
+mod send_built_name;
+#[path = "emit_and_run/app_middleware.rs"]
+mod app_middleware;
 #[path = "support/addressable_gem.rs"]
 mod addressable_gem;
 #[path = "emit_and_run/addressable.rs"]
@@ -21412,6 +21580,9 @@ mod nilable_string_view;
 #[path = "support/each_receiver_once.rs"]
 #[allow(dead_code)]
 mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
 
 /// `simple_format` with `sanitize: false`: paragraphs, line breaks, html
 /// options and `wrapper_tag:`, as Rails 8.1.4 renders them.
@@ -21928,3 +22099,43 @@ fn each_receiver_once_renders_as_rails_on_spinel() {
         .run_spinel(&helper_escape_at_output::render_script(each_receiver_once::RENDERS))
         .assert_passes();
 }
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::VIEW`).
+#[test]
+fn join_nil_renders_as_rails() {
+    join_nil::app(content_tag_options::app_rendering(join_nil::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(join_nil::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+#[path = "emit_and_run/cable_connection_request.rs"]
+mod cable_connection_request;
+#[path = "emit_and_run/respond_with.rs"]
+mod respond_with;
+#[path = "emit_and_run/respond_with_json.rs"]
+mod respond_with_json;
+#[path = "emit_and_run/respond_with_resource_location.rs"]
+mod respond_with_resource_location;
+#[path = "emit_and_run/route_loop_index.rs"]
+mod route_loop_index;
+#[path = "emit_and_run/deprecation.rs"]
+mod deprecation;
+#[path = "emit_and_run/loaded_begin.rs"]
+mod loaded_begin;
+#[path = "emit_and_run/class_eval_definer_call.rs"]
+mod class_eval_definer_call;
+#[path = "emit_and_run/model_mixin_macro.rs"]
+mod model_mixin_macro;
+#[path = "emit_and_run/controller_append_callbacks.rs"]
+mod controller_append_callbacks;
+#[path = "emit_and_run/routing_method_boot_state.rs"]
+mod routing_method_boot_state;
+#[path = "emit_and_run/boot_base_mixins.rs"]
+mod boot_base_mixins;
+#[path = "emit_and_run/array_grep_extract_options.rs"]
+mod array_grep_extract_options;
+#[path = "emit_and_run/load_time_string_definer.rs"]
+mod load_time_string_definer;
+#[path = "emit_and_run/mime_extension_lookup.rs"]
+mod mime_extension_lookup;

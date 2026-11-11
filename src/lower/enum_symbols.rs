@@ -47,6 +47,11 @@ const ATTR_METHODS: &[&str] = &[
     "merge",
 ];
 
+/// The calls among those that assign through the model's writer, which
+/// casts a label itself. A column whose `_before_type_cast` is read keeps
+/// the label as written here, since that reader answers it.
+pub(crate) const WRITER_METHODS: &[&str] = &["new", "create", "create!", "build", "update", "update!", "assign_attributes"];
+
 type Mapping = crate::det::HashMap<String, Literal>;
 
 /// model → column → (label → stored value), the model-agnostic column
@@ -65,6 +70,8 @@ pub(crate) struct EnumMap {
     /// body: its Symbols, keyed by `NAME` and by `Owner::NAME`. A bare
     /// name two classes bind to different lists is left out.
     symbol_lists: crate::det::HashMap<String, Vec<crate::ident::Symbol>>,
+    /// Columns whose assigned value `_before_type_cast` reads back.
+    raw_input_columns: std::collections::BTreeSet<crate::ident::Symbol>,
 }
 
 impl EnumMap {
@@ -117,7 +124,8 @@ pub(crate) fn enum_columns(app: &App) -> EnumMap {
     let models = app.models.iter().map(|m| m.name.clone()).collect();
     let columns = enum_column_mappings(app);
     let symbol_lists = if by_model.is_empty() { Default::default() } else { symbol_list_constants(app) };
-    EnumMap { by_model, models, columns, symbol_lists }
+    let raw_input_columns = crate::analyze::raw_input_columns(app);
+    EnumMap { by_model, models, columns, symbol_lists, raw_input_columns }
 }
 
 fn enum_column_mappings(
@@ -260,6 +268,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr, map: &EnumMap, owner: Option<&crate:
                 None => map.columns.get(col.as_str()),
             };
             let Some(mapping) = mapping else { continue };
+            if WRITER_METHODS.contains(&method.as_str()) && map.raw_input_columns.contains(col) {
+                continue;
+            }
             expand_symbol_list_constant(value, mapping, &map.symbol_lists);
             rewrite_value(value, mapping);
         }

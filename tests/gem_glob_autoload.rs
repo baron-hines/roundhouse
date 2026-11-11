@@ -77,7 +77,7 @@ fn overlay() -> emit_and_run::Overlay {
 fn a_gem_glob_autoload_loop_registers_each_constant_as_native() {
     assert_eq!(native(), EXPECTED, "native control");
     let run = overlay().run_ruby(SCRIPT);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
     assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
 }
@@ -178,7 +178,7 @@ fn a_gem_glob_autoload_loop_naming_symbols_registers_each_constant_as_native() {
         overlay = overlay.write(&format!("vendor/gems/payoff-1.0.0/{path}"), text);
     }
     let run = overlay.run_ruby(SYM_SCRIPT);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, SYM_EXPECTED, "{}", run.stderr);
     assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
 }

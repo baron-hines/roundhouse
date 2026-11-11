@@ -1527,6 +1527,15 @@ impl<'a> BodyTyper<'a> {
         // `m` on the receiver's class (walking its parents and mixins);
         // otherwise the gradual answer stands — silence about a method
         // is not a claim that the class lacks it.
+        // Kernel#instance_variable_set answers the value it sets (Devise's `@resource = instance_variable_set("@#{name}", record)`).
+        if method.as_str() == "instance_variable_set"
+            && let [_, value] = args
+            && let Some(ty) = value.ty.clone().filter(|t| !t.is_open())
+            // Not a receiver whose chain defines its own.
+            && !matches!(recv_ty, Some(Ty::Class { id, .. }) if self.chain_defines(id, method))
+        {
+            return ty;
+        }
         if matches!(method.as_str(), "try" | "try!") {
             // A nullable receiver (`@user.try(:username)` with `@user:
             // User?`) answers the same: `nil.try` is nil, already in the
@@ -3605,6 +3614,10 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         // and renders every element as a Story; left at the union, each
         // read off it (`ms.comments.build`) was gradual.
         "flatten" => Ty::Array { elem: std::sync::Arc::new(flatten_elem(elem)) },
+        // Ruby's `grep`/`grep_v`: the matching elements, or what the block answers for each.
+        "grep" | "grep_v" => Ty::Array { elem: std::sync::Arc::new(block_ret.cloned().unwrap_or_else(|| elem.clone())) },
+        // ActiveSupport's `extract_options!` (`lower::enumerable_ext`): the trailing Hash it removes, or a new one.
+        "extract_options!" => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
         "each" | "reverse_each" | "select" | "filter" | "reject"
         | "sort" | "sort_by" | "reverse" | "compact" | "uniq"
         // `drop`/`take` (and their block forms) return a same-element

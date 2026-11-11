@@ -92,9 +92,8 @@ module MessageDigest
   # object: `OpenSSL::Cipher` is the package's spelling of CRuby's. The
   # encrypt side answers ciphertext followed by the 16-byte tag; the
   # decrypt side answers the plaintext, or "" when the tag does not
-  # authenticate (the package raises `OpenSSL::CipherError`, its name
-  # for CRuby's `OpenSSL::Cipher::CipherError`). The callers never
-  # encrypt an empty message, so "" is never a real plaintext here.
+  # authenticate (both runtimes raise `OpenSSL::Cipher::CipherError`).
+  # The callers never encrypt an empty message, so "" is never a real plaintext here.
   def self.aes_256_gcm_encrypt(key, iv, plain)
     c = OpenSSL::Cipher.new("aes-256-gcm")
     c.encrypt
@@ -116,7 +115,7 @@ module MessageDigest
     c.auth_data = ""
     begin
       c.update(ct) + c.final
-    rescue OpenSSL::CipherError
+    rescue OpenSSL::Cipher::CipherError
       ""
     end
   end

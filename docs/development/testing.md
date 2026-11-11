@@ -49,9 +49,13 @@ output, so a skip printed with `eprintln!` never reaches a CI log. A test
 whose prerequisite (a gem for a native Rails control, Ruby on `PATH`, a
 native compiler) is missing calls `prerequisite::missing(what)` from
 [`tests/support/prerequisite.rs`](../../tests/support/prerequisite.rs) and
-returns. `ROUNDHOUSE_SKIP_LOG=<file>` appends each skip to that file; the
-CI unit job lists them in its summary. `ROUNDHOUSE_REQUIRE_PREREQUISITES=1`
-fails such a test instead, for a run that provides everything. PostgreSQL
+returns. `ROUNDHOUSE_SKIP_LOG=<file>` appends each skip to that file.
+`ROUNDHOUSE_REQUIRE_PREREQUISITES=1` fails such a test as well, for a run
+that provides everything. The CI unit job sets both: it installs every gem
+its tests probe for, so a skip there fails the job and its summary names
+the test and what was missing. A test that needs Spinel belongs in
+`tests/spinel_toolchain/`, `#[ignore]`d, where the Spinel lane runs it;
+the unit job has no Spinel. PostgreSQL
 keeps its own pair, `ROUNDHOUSE_PG_TEST_URL` and `ROUNDHOUSE_PG_TEST_REQUIRED`.
 
 A `run_ruby` or `run_spinel*` script reports a failed check by raising, so
@@ -60,6 +64,14 @@ The [emit-and-run harness](../../tests/support/emit_and_run.rs) adds a
 completion line after the script and counts the run a success only if that
 line was printed. Do not end a passing script with `exit`; let it reach
 its last line.
+
+A run that ran clean has still not passed if analysis or emit reported an
+error (Invariant 6). `run.assert_passes()` checks both halves and says
+which one failed; `run.passed()` is the same check as a value, for an
+assertion with its own message. `run.program_succeeded()` reads only the
+program's half: use it only next to an assertion on `run.errors`, for
+example in a test that expects a refusal, or a control whose wrong
+expectation must fail.
 
 ## Native probes
 

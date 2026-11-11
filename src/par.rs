@@ -87,6 +87,15 @@ pub fn map_init<T: Sync, R: Send, S>(
     items.iter().map(|item| f(&mut state, item)).collect()
 }
 
+/// [`map`] over `items` a chunk at a time, for work where each item is
+/// small (comparing or copying one class's method table), so that handing
+/// them out one by one would cost more than doing them.
+pub fn map_chunked<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    const CHUNK: usize = 128;
+    let chunks: Vec<&[T]> = items.chunks(CHUNK).collect();
+    map(&chunks, |chunk| chunk.iter().map(&f).collect::<Vec<R>>()).into_iter().flatten().collect()
+}
+
 /// `a` and `b`, concurrently where there are threads; both results, as
 /// if run one after the other.
 pub fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {

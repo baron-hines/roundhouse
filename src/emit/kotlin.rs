@@ -126,7 +126,12 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     );
     let mut all_view_lcs = view_lcs.clone();
     all_view_lcs.extend(jbuilder_lcs);
-    for lc in merge_by_module(all_view_lcs) {
+    // Pure helper calls over literals (the layout's stylesheet links and
+    // importmap tags) become per-process constants instead of being rebuilt
+    // on every request: +8-11% on the real-blog HTML routes.
+    let mut merged_view_lcs = merge_by_module(all_view_lcs);
+    crate::lower::view_to_library::hoist_constants::hoist_pure_helper_constants(&mut merged_view_lcs);
+    for lc in merged_view_lcs {
         let last = lc.name.0.as_str().rsplit("::").next().unwrap_or(lc.name.0.as_str());
         files.push(EmittedFile {
             path: std::path::PathBuf::from(format!("src/main/kotlin/app/views/{last}.kt")),

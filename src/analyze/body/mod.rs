@@ -138,6 +138,10 @@ pub struct Ctx {
     pub class_objects: crate::det::HashSet<Symbol>,
     /// Locals an `is_a?(Class)` / `is_a?(Module)` guard proved class objects of unknown identity: Module queries only (`answers_module_queries`).
     pub query_class_objects: crate::det::HashSet<Symbol>,
+    /// The method's parameters no write in its body rebinds but `||=`: their type is what the call
+    /// sites pass, so a `p ||= v` over one typed never nil nor false never assigns (`expr::DEAD_OR_ASSIGN`).
+    /// Not any local's: a destructured `before, after = row` types an element it may not hold.
+    pub call_site_params: crate::det::HashSet<Symbol>,
     /// Module/class-level typed constants such as
     /// `STATUS_CODES = { ok: 200, ... }.freeze`. Rubydex IDs resolve
     /// source-backed reads; this scope types generated expressions.
@@ -204,6 +208,8 @@ pub struct Ctx {
 /// Rails schema + conventions; the body-typer reads it.
 #[derive(Default, Clone)]
 pub struct ClassInfo {
+    /// `request.env[KEY]` a middleware on the stack writes (`ActionDispatch::Request` only).
+    pub env_keys: HashMap<String, Ty>,
     pub upload_array_fields: std::collections::BTreeMap<(Symbol, Vec<Symbol>, Vec<String>), std::collections::BTreeSet<Symbol>>,
     /// Kind of the indexed source declaration; never inferred from its name.
     pub is_module: bool,
@@ -540,6 +546,8 @@ pub struct BodyTyper<'a> {
     typed_constants: Option<&'a IdentityHashMap<DeclarationId, Ty>>,
     data_factories: Option<&'a HashMap<crate::span::Span, Ty>>,
     class_factories: Option<&'a HashMap<crate::span::Span, Ty>>,
+    /// Instance methods whose body is a literal `true` or `false` and whose name nothing else defines.
+    constant_predicates: Option<&'a HashMap<(ClassId, Symbol), bool>>,
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
@@ -691,6 +699,7 @@ impl<'a> BodyTyper<'a> {
             typed_constants: None,
             data_factories: None,
             class_factories: None,
+            constant_predicates: None,
             inquirers: None,
             i18n: None,
             helper_modules: None,
@@ -867,6 +876,11 @@ impl<'a> BodyTyper<'a> {
         self
     }
 
+    pub(super) fn with_constant_predicates(mut self, predicates: &'a HashMap<(ClassId, Symbol), bool>) -> Self {
+        self.constant_predicates = Some(predicates);
+        self
+    }
+
     /// Name the app's inquirer-returning methods, so their predicates
     /// type as Bool instead of failing dispatch on `Str`.
     pub fn with_inquirers(
@@ -897,6 +911,19 @@ impl<'a> BodyTyper<'a> {
         let root = self.inquirers.is_some() && self.scope_bindings.borrow().is_none();
         if root {
             *self.scope_bindings.borrow_mut() = Some(active_storage::ScopeBindings::of(expr));
+        }
+        if let ExprNode::If { cond, else_branch, .. } = &*expr.node
+            && self.superclass_never_responds(cond, ctx)
+        {
+            *expr = else_branch.clone();
+        }
+        // `if devise_mapping.validatable?` over a predicate that answers one constant: Ruby takes one branch, and the
+        // other, typed, would report what never runs.
+        if let ExprNode::If { cond, .. } = &mut *expr.node
+            && let Some(answer) = self.constant_predicate(cond, ctx)
+            && let ExprNode::If { then_branch, else_branch, .. } = &*expr.node
+        {
+            *expr = if answer { then_branch.clone() } else { else_branch.clone() };
         }
         // A direct self receiver keeps main's lookup type and identity evidence.
         let ty = if receiver && matches!(&*expr.node, ExprNode::SelfRef) {
@@ -1216,6 +1243,140 @@ impl<'a> BodyTyper<'a> {
             ExprNode::Send { recv: Some(r), method, .. } => self.class_factory_receiver(r, method, ctx),
             _ => false,
         }
+    }
+
+    fn constant_predicate(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
+        // `devise_mapping.lockable? && resource_class.unlock_strategy_enabled?(:email)`: Ruby never evaluates the right.
+        if let ExprNode::BoolOp { left, op, right, .. } = &mut *cond.node {
+            let short = matches!(op, crate::expr::BoolOpKind::Or);
+            return match self.constant_predicate(left, ctx)? {
+                answer if answer == short => Some(short),
+                _ => self.constant_predicate(right, ctx),
+            };
+        }
+        let predicates = self.constant_predicates?;
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *cond.node else { return None };
+        // `x.try(:m)` on a class nothing in whose chain answers `m` is nil (Devise's mailer views'
+        // `@resource.try(:unconfirmed_email?)` on a model that is not `:confirmable`).
+        if method.as_str() == "try"
+            && let [name] = args.as_slice()
+            && let ExprNode::Lit { value: Literal::Sym { value: asked } } = &*name.node
+        {
+            let asked = asked.clone();
+            self.analyze_expr(r, ctx);
+            return match r.ty.as_ref().map(Ty::peel_nilable) {
+                // Not a class with a `try` of the program's in its chain: Object's is the one that answers nil.
+                Some(t @ Ty::Class { id, .. }) if self.never_responds(t, &asked) && !self.chain_defines(id, &Symbol::from("try")) => Some(false),
+                _ => None,
+            };
+        }
+        if !args.is_empty() {
+            return None;
+        }
+        // Not a name every object answers (ActiveSupport's `blank?` / `present?`): another definition can answer it.
+        if ["Object", "NilClass", "BasicObject", "Kernel"].iter().any(|c| {
+            self.classes().get(&ClassId(Symbol::from(*c))).is_some_and(|info| info.instance_methods.contains_key(method))
+        }) {
+            return None;
+        }
+        self.analyze_expr(r, ctx);
+        // Not peeled of nil: a nil receiver answers NilClass's.
+        let (definer, answer) = match r.ty.as_ref() {
+            Some(Ty::Class { id, .. }) => (id.clone(), *predicates.get(&(id.clone(), method.clone()))?),
+            // A receiver of no known type (a view's `devise_mapping`, a stateful `helper_method`): the one definition of
+            // the name is the only one that can answer it, as any other receiver raises NoMethodError.
+            None | Some(Ty::Var { .. } | Ty::Untyped) => predicates.iter().find(|((_, m), _)| m == method).map(|((c, _), v)| (c.clone(), *v))?,
+            _ => return None,
+        };
+        // Nor a name another class of the registry answers (a column's `admin?`, a framework method).
+        self.only_answered_by(&definer, method).then_some(answer)
+    }
+
+    /// Whether a source definition of `method` is in `class`'s chain: itself, its parents, the modules they include.
+    fn chain_defines(&self, class: &ClassId, method: &Symbol) -> bool {
+        let classes = self.classes();
+        let mut seen: Vec<ClassId> = Vec::new();
+        let mut pending = vec![class.clone()];
+        while let Some(c) = pending.pop() {
+            if seen.contains(&c) || seen.len() > 64 {
+                continue;
+            }
+            seen.push(c.clone());
+            if let Some(info) = classes.get(&c) {
+                if info.source_instance_methods.contains(method) {
+                    return true;
+                }
+                pending.extend(info.parent.iter().cloned());
+                pending.extend(info.includes.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Whether every class that answers `method` is `definer` or takes it from `definer` (a subclass, an includer).
+    fn only_answered_by(&self, definer: &ClassId, method: &Symbol) -> bool {
+        let classes = self.classes();
+        let reaches = |start: &ClassId| {
+            let mut seen: Vec<ClassId> = Vec::new();
+            let mut pending = vec![start.clone()];
+            while let Some(c) = pending.pop() {
+                if &c == definer {
+                    return true;
+                }
+                if seen.contains(&c) || seen.len() > 64 {
+                    continue;
+                }
+                seen.push(c.clone());
+                if let Some(info) = classes.get(&c) {
+                    pending.extend(info.parent.iter().cloned());
+                    pending.extend(info.includes.iter().cloned());
+                }
+            }
+            false
+        };
+        classes.iter().all(|(id, info)| !info.instance_methods.contains_key(method) || reaches(id))
+    }
+
+    /// `superclass.respond_to?(:m)` on the class side of a class nothing
+    /// subclasses, whose parent's class side answers no `m`: Devise's
+    /// `Models.config` readers ask it of each model before falling back
+    /// to `Devise.m`. Only so, as the receiver is then that one parent.
+    fn superclass_never_responds(&self, cond: &Expr, ctx: &Ctx) -> bool {
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*cond.node else { return false };
+        let [asked] = args.as_slice() else { return false };
+        let ExprNode::Lit { value: Literal::Sym { value: asked } } = &*asked.node else { return false };
+        let ExprNode::Send { recv: inner, method: sup, args: sup_args, block: None, .. } = &*r.node else { return false };
+        if method.as_str() != "respond_to?" || sup.as_str() != "superclass" || !sup_args.is_empty()
+            || !inner.as_ref().is_none_or(|i| matches!(&*i.node, ExprNode::SelfRef)) || !ctx.class_side
+        {
+            return false;
+        }
+        let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return false };
+        let classes = self.classes();
+        let Some(parent) = classes.get(id).and_then(|c| c.parent.clone()) else { return false };
+        if classes.values().any(|c| c.parent.as_ref() == Some(id)) {
+            return false;
+        }
+        self.class_side_lacks(&parent, asked)
+    }
+
+    /// Whether `of`'s class side, its parents' and what they extend define no `method` nor a fallback for it.
+    fn class_side_lacks(&self, of: &ClassId, method: &Symbol) -> bool {
+        let fallbacks = [method.clone(), Symbol::from("method_missing"), Symbol::from("respond_to_missing?")];
+        let mut current = Some(of.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { return !crate::emit::audit::OBJECT_METHODS.contains(&method.as_str()) };
+            let Some(cls) = self.classes().get(&id) else { return false };
+            if fallbacks.iter().any(|m| cls.class_methods.contains_key(m) || cls.source_class_methods.contains(m))
+                || cls.unknown_class_side_hook
+                || cls.class_side_hook_methods.contains(method)
+                || cls.class_method_extensions.iter().any(|m| self.classes().get(m).is_none() || self.lookup_in_module(m, method).is_some())
+            {
+                return false;
+            }
+            current = cls.parent.clone();
+        }
+        false
     }
 
     fn each_branch_is_class_object(&self, expr: &Expr, ctx: &Ctx) -> bool {
@@ -2716,6 +2877,18 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Untyped;
                 }
+                // Not the env's untyped value: a middleware on the stack writes this key on every request (`env["warden"] = Proxy.new`).
+                if method.as_str() == "[]"
+                    && let (Some(receiver), [key]) = (recv.as_ref(), args.as_slice())
+                    && let ExprNode::Lit { value: crate::expr::Literal::Str { value: key } } = &*key.node
+                    && let ExprNode::Send { recv: Some(request), method: env, args: env_args, .. } = &*receiver.node
+                    && env.as_str() == "env"
+                    && env_args.is_empty()
+                    && let Some(Ty::Class { id, .. }) = request.ty.as_ref()
+                    && let Some(ty) = self.classes().get(id).and_then(|c| c.env_keys.get(key.as_str()))
+                {
+                    return ty.clone();
+                }
                 let receiver_is_instance = recv.as_ref().map_or(ctx.instance_body, |r| self.is_instance(r, ctx));
                 let instance_receiver = receiver_is_instance
                     && recv_ty.as_ref().is_some_and(instance_shaped);
@@ -3398,7 +3571,16 @@ impl<'a> BodyTyper<'a> {
                         if !matches!(&*e.node, ExprNode::Assign { target: LValue::Var { .. }, .. }) {
                             forget_class_object_writes(e, &mut local_ctx);
                         }
+                        let dead_or_assign = matches!(&*e.node, ExprNode::OpAssign { target: LValue::Var { name, .. }, op: crate::expr::OpAssignOp::OrOr, .. }
+                            if local_ctx.call_site_params.contains(name) && local_ctx.local_bindings.get(name).is_some_and(never_falsy));
+                        if dead_or_assign { e.decisions |= crate::expr::DEAD_OR_ASSIGN } else { e.decisions &= !crate::expr::DEAD_OR_ASSIGN }
                         last = self.analyze_expr(e, &local_ctx);
+                        if let (true, ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }) = (dead_or_assign, &*e.node)
+                            && let Some(kept) = local_ctx.local_bindings.get(name)
+                        {
+                            e.ty = Some(kept.clone());
+                            last = kept.clone();
+                        }
                         // A self binding gives `self` its declared type from
                         // the next statement to the end of this body, blocks
                         // inside included. It changes only how `self` types:
@@ -3431,6 +3613,15 @@ impl<'a> BodyTyper<'a> {
                             // Before the binding insert below: the lambda body
                             // was typed in this `local_ctx`, without its own name.
                             lambda_local::remember(&mut lambda_locals, i, e, &local_ctx);
+                        }
+                        // Warden's `strategy ||= Class.new(Base)` over a `strategy = nil` parameter: a class either way, of no one identity.
+                        if let ExprNode::OpAssign { target: LValue::Var { name, .. }, op: crate::expr::OpAssignOp::OrOr, value } = &*e.node
+                            && !local_ctx.class_objects.contains(name)
+                            && !local_ctx.query_class_objects.contains(name)
+                            && matches!(local_ctx.local_bindings.get(name).map(Ty::peel_nilable), Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "Class" | "Module"))
+                            && self.each_branch_is_class_object(value, &local_ctx)
+                        {
+                            local_ctx.query_class_objects.insert(name.clone());
                         }
                     }
                     // Before the binding insert and the seed/narrowing
@@ -3576,7 +3767,9 @@ impl<'a> BodyTyper<'a> {
                     {
                         local_ctx.ivar_bindings.insert(name, ty);
                     }
-                    if let ExprNode::OpAssign { target, .. } = &*e.node {
+                    if let ExprNode::OpAssign { target, .. } = &*e.node
+                        && e.decisions & crate::expr::DEAD_OR_ASSIGN == 0
+                    {
                         if let Some(ty) = e.ty.clone() {
                             if !matches!(ty, Ty::Var { .. }) {
                                 match target {
@@ -5085,13 +5278,7 @@ pub(crate) fn union_of(a: Ty, b: Ty) -> Ty {
     let mut acc = UnionAcc::default();
     push_union_variants(a, &mut acc);
     push_union_variants(b, &mut acc);
-    let mut variants = acc.out;
-    Ty::canonicalize_variants(&mut variants);
-    match variants.len() {
-        0 => Ty::Bottom,
-        1 => variants.into_iter().next().unwrap(),
-        _ => Ty::Union { variants: variants.into() },
-    }
+    acc.finish()
 }
 
 /// Unions at or above this many variants find an equal variant through a
@@ -5123,9 +5310,23 @@ struct UnionAcc {
     /// Fingerprint → positions in `out`, covering `out[..indexed]`.
     index: HashMap<u64, Vec<usize>>,
     indexed: usize,
+    /// Where `out` holds its one `Hash` and its one `Array` spine.
+    hash_at: Option<usize>,
+    array_at: Option<usize>,
 }
 
 impl UnionAcc {
+    /// The canonical type of the variants pushed.
+    fn finish(self) -> Ty {
+        let mut variants = self.out;
+        Ty::canonicalize_variants(&mut variants);
+        match variants.len() {
+            0 => Ty::Bottom,
+            1 => variants.into_iter().next().unwrap(),
+            _ => Ty::Union { variants: variants.into() },
+        }
+    }
+
     /// The first position holding a variant `==` to `other`. `other` is
     /// neither `Hash` nor `Array`, so those entries (mutated in place by
     /// the merge arms) never match and are left out of the index.
@@ -5157,25 +5358,27 @@ fn push_union_variants(t: Ty, acc: &mut UnionAcc) {
                 push_union_variants(v, acc);
             }
         }
-        Ty::Hash { key, value } => {
-            for existing in acc.out.iter_mut() {
-                if let Ty::Hash { key: k0, value: v0 } = existing {
-                    *k0 = std::sync::Arc::new(union_of((**k0).clone(), std::sync::Arc::unwrap_or_clone(key)));
-                    *v0 = std::sync::Arc::new(union_of((**v0).clone(), std::sync::Arc::unwrap_or_clone(value)));
-                    return;
-                }
+        Ty::Hash { key, value } => match acc.hash_at {
+            Some(i) => {
+                let Ty::Hash { key: k0, value: v0 } = &mut acc.out[i] else { unreachable!("hash_at holds the Hash") };
+                *k0 = std::sync::Arc::new(union_of((**k0).clone(), std::sync::Arc::unwrap_or_clone(key)));
+                *v0 = std::sync::Arc::new(union_of((**v0).clone(), std::sync::Arc::unwrap_or_clone(value)));
             }
-            acc.out.push(Ty::Hash { key, value });
-        }
-        Ty::Array { elem } => {
-            for existing in acc.out.iter_mut() {
-                if let Ty::Array { elem: e0 } = existing {
-                    *e0 = std::sync::Arc::new(union_of((**e0).clone(), std::sync::Arc::unwrap_or_clone(elem)));
-                    return;
-                }
+            None => {
+                acc.hash_at = Some(acc.out.len());
+                acc.out.push(Ty::Hash { key, value });
             }
-            acc.out.push(Ty::Array { elem });
-        }
+        },
+        Ty::Array { elem } => match acc.array_at {
+            Some(i) => {
+                let Ty::Array { elem: e0 } = &mut acc.out[i] else { unreachable!("array_at holds the Array") };
+                *e0 = std::sync::Arc::new(union_of((**e0).clone(), std::sync::Arc::unwrap_or_clone(elem)));
+            }
+            None => {
+                acc.array_at = Some(acc.out.len());
+                acc.out.push(Ty::Array { elem });
+            }
+        },
         other => match acc.position_of(&other) {
             // An equal variant can differ in record field order; keep
             // the canonical one so the result doesn't depend on which
@@ -5243,14 +5446,27 @@ fn is_settled_arm_list(variants: &[Ty]) -> bool {
         && variants.windows(2).all(|w| Ty::cmp_nil_last(&w[0], &w[1]) != std::cmp::Ordering::Greater)
 }
 
+/// The join of `tys`, as folding them through [`union_of`] gives.
+///
+/// Three or more arms, none of them a union (a union's arms, as
+/// `fixpoint_bound::cut` re-joins them), go into one accumulator
+/// instead: a fold built a fresh one per step and indexed the whole
+/// result so far each time, which made a wide union (a parameter met by
+/// a call per class of an app with thousands) quadratic in its arms.
+/// Each step of the fold flattens, dedups and merges spines into a
+/// sorted list as `push_union_variants` does, so the result is the
+/// same. A union among the inputs keeps the fold: `union_of` returns an
+/// input equal to the other as it stands, nested arms included.
 pub(super) fn union_many(tys: Vec<Ty>) -> Ty {
-    // Fold through `union_of` so the same Bottom-filtering, structural
-    // container join, and flatten/dedup normalization applies.
-    let mut iter = tys.into_iter().filter(|t| !matches!(t, Ty::Bottom));
-    match iter.next() {
-        None => Ty::Bottom,
-        Some(first) => iter.fold(first, union_of),
+    let tys: Vec<Ty> = tys.into_iter().filter(|t| !matches!(t, Ty::Bottom)).collect();
+    if tys.len() < 3 || tys.iter().any(|t| matches!(t, Ty::Union { .. })) {
+        return tys.into_iter().reduce(union_of).unwrap_or(Ty::Bottom);
     }
+    let mut acc = UnionAcc::default();
+    for t in tys {
+        push_union_variants(t, &mut acc);
+    }
+    acc.finish()
 }
 
 
@@ -6549,6 +6765,26 @@ mod tests {
     }
 
     #[test]
+    fn union_many_is_the_fold_of_union_of() {
+        let universe = law_universe();
+        let wide: Vec<Ty> = (0..60).map(|i| Ty::Class { id: ClassId(Symbol::from(format!("C{i}").as_str())), args: vec![].into() }).collect();
+        let fold = |tys: &[Ty]| tys.iter().cloned().filter(|t| !matches!(t, Ty::Bottom)).reduce(union_of).unwrap_or(Ty::Bottom);
+        for a in &universe {
+            for b in &universe {
+                for c in &universe {
+                    let tys = [a.clone(), b.clone(), c.clone(), a.clone()];
+                    assert_eq!(union_many(tys.to_vec()), fold(&tys), "{tys:?}");
+                }
+            }
+            let tys: Vec<Ty> = wide.iter().cloned().chain([a.clone()]).chain(wide.iter().rev().cloned()).chain(universe.iter().cloned()).collect();
+            assert_eq!(union_many(tys.clone()), fold(&tys), "{a:?} among a wide union");
+        }
+        let nested = Ty::Union { variants: vec![Ty::Union { variants: vec![Ty::Untyped, Ty::Nil].into() }, Ty::Nil].into() };
+        let tys = vec![nested.clone(), nested.clone(), nested];
+        assert_eq!(union_many(tys.clone()), fold(&tys), "a union equal to the other arms is kept as it stands");
+    }
+
+    #[test]
     fn union_of_bool_int_nil_is_structural_not_debug_order() {
         // Debug-string sort put Bool before Int; `ty_tag` puts Int first.
         let got = union_of(union_of(Ty::Bool, Ty::Int), Ty::Nil);
@@ -7399,6 +7635,36 @@ fn falsy_part(ty: &Ty) -> Option<Ty> {
         t if never_falsy(t) => None,
         t => Some(t.clone()),
     }
+}
+
+/// The locals `body` binds other than by `x ||= v`: an assignment, a destructuring, another compound assignment, a block parameter.
+pub(crate) fn rebound_locals(body: &Expr) -> crate::det::HashSet<Symbol> {
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        match &*e.node {
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+                out.insert(name.clone());
+            }
+            ExprNode::OpAssign { target: LValue::Var { name, .. }, op, .. } if !matches!(op, crate::expr::OpAssignOp::OrOr) => {
+                out.insert(name.clone());
+            }
+            ExprNode::MultiAssign { targets, .. } => {
+                for t in targets {
+                    if let LValue::Var { name, .. } = t {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+                out.extend(params.iter().chain(rest_param.iter()).chain(block_param.iter()).cloned());
+                out.extend(extra_params.iter().map(|p| p.name.clone()));
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = crate::det::HashSet::default();
+    walk(body, &mut out);
+    out
 }
 
 /// Can this type NEVER be Ruby-falsy?

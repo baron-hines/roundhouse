@@ -368,7 +368,10 @@ module Main
     started = ActionDispatch::Runtime.clock_time
     request_obj = ActionDispatch::Request.new
     request_obj.request_id = ActionDispatch::RequestId.make(req.req_headers.fetch("x-request-id", ""))
+    # Not for an asset: Rails' Static answers it above the session middleware, with no cookie verified.
+    Main.restore_session(req, request_obj) unless Main.static_asset?(req.path)
     GemMiddleware.dispatch(req, res, request_obj)
+    Main.persist_session(res, request_obj)
     return nil if res.file_path.length > 0 || res.upgrading_ws
     res.headers[ActionDispatch::RequestId::HEADER] =
       request_obj.request_id.to_s
@@ -376,6 +379,38 @@ module Main
     unless res.headers.keys.any? { |k| k.downcase == "x-runtime" }
       res.headers[ActionDispatch::Runtime::HEADER] = ActionDispatch::Runtime.header_value(started)
     end
+    nil
+  end
+
+  # Cookie-carried session: restore the whole session from the session
+  # cookie (url-encoded k=v pairs; empty when absent or garbled).
+  # Persisted after the action only when the encoding changed — an
+  # action that leaves the session untouched emits no Set-Cookie.
+  #
+  # The NAME comes from `Rails.application.session_cookie_key`, not a
+  # literal: apps declare it via `config.session_store :cookie_store,
+  # key: "..."`, which ingest lifts onto the Rails::Application reopen
+  # (framework default "_session" when they don't). App code reads the
+  # same accessor, and the two must agree — lobsters'
+  # `remove_unknown_cookies` deletes every cookie whose key isn't the
+  # configured one, so a literal here would clear the session on every
+  # request.
+  #
+  # SIGNED (runtime/signed_cookies.rb): a value that does not verify
+  # restores as an empty session. `roundhouse.session.in` is the
+  # restored session's PLAIN encoding — what the persist step compares
+  # against, so an untouched session writes no Set-Cookie and a
+  # rejected one is not rewritten until the action changes it.
+  #
+  # Not in `dispatch_request` beside the controller: Rails' session
+  # middleware sits above Warden's and the routes, which read it first.
+  def self.restore_session(req, request_obj)
+    session_cookie = Rails.application.session_cookie_key
+    restored = ActionDispatch::Session.from_signed_cookie(
+      req.cookies.fetch(session_cookie, ""), session_cookie)
+    request_obj.session = restored
+    request_obj.env["rack.session"] = restored
+    request_obj.env["roundhouse.session.in"] = restored.to_cookie
     nil
   end
 
@@ -441,7 +476,40 @@ module Main
       end
     end
 
-    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
+    # A request constraint reads the request before its route is chosen
+    # (`RouteTable.match_asking`), so what it can ask is filled in first.
+    request_obj.request_method = verb
+    request_obj.path = request_path
+    request_obj.remote_ip = req.remote_host
+    request_obj.host = req.req_headers.fetch("host", "localhost")
+    # `request.headers` follows Rails' HTTP-to-CGI env mapping. Copy all
+    # parsed headers, not just those the dispatcher itself reads: cache
+    # validators, `Accept-Encoding`, and `Turbo-Frame` are consumed by
+    # application code after dispatch. Write directly into the RBS-pinned
+    # env field so each value keeps its poly-hash representation. This
+    # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
+    # content type; keeping one mapping avoids a drifting header allowlist.
+    req.req_headers.each do |name, value|
+      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    request_obj.env["roundhouse.listener"] = req.listener_transport
+    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
+    # Rails' AssumeSSL marks the request https before the action, so
+    # secure cookies and absolute redirects use https.
+    if AppEnvironment.serving_assume_ssl?
+      request_obj.env["HTTPS"] = "on"
+      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
+      request_obj.env["rack.url_scheme"] = "https"
+    end
+    last_segment = request_path.split("/").last.to_s
+    extension = last_segment.include?(".") ? last_segment.split(".").last.to_s : ""
+    request_obj.format = ActionDispatch::MimeNegotiation.format_name(
+      extension,
+      req.req_headers.fetch("accept", ""),
+      req.req_headers.fetch("x-requested-with", ""),
+      req.req_headers.fetch("content-type", "")
+    )
+    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)
     if matched.nil?
       # No route: the format is the `?format=` param, a trusted Accept,
       # or the path's extension (Main.render_not_found).
@@ -540,25 +608,6 @@ module Main
     # is a valid poly-member write and never constructs the competing hash.
     request_obj.env["REQUEST_METHOD"] = verb
     user_agent = req.req_headers.fetch("user-agent", "")
-    # `request.headers` follows Rails' HTTP-to-CGI env mapping. Copy all
-    # parsed headers, not just those the dispatcher itself reads: cache
-    # validators, `Accept-Encoding`, and `Turbo-Frame` are consumed by
-    # application code after dispatch. Write directly into the RBS-pinned
-    # env field so each value keeps its poly-hash representation. This
-    # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
-    # content type; keeping one mapping avoids a drifting header allowlist.
-    req.req_headers.each do |name, value|
-      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
-    end
-    request_obj.env["roundhouse.listener"] = req.listener_transport
-    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
-    # Rails' AssumeSSL marks the request https before the action, so
-    # secure cookies and absolute redirects use https.
-    if AppEnvironment.serving_assume_ssl?
-      request_obj.env["HTTPS"] = "on"
-      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
-      request_obj.env["rack.url_scheme"] = "https"
-    end
     # `user_agent` is ALSO a separate reader slot. The overlay twin's
     # `user_agent` reads `@env["HTTP_USER_AGENT"]`; the shared runtime's
     # (`runtime/ruby/action_dispatch/request.rb`) returns `@user_agent`,
@@ -583,29 +632,7 @@ module Main
     controller.query_string = request_obj.query_string
     ActionController::Current.request = request_obj
     ActionController::Current.controller = controller
-    # Cookie-carried session: restore the whole session from the session
-    # cookie (url-encoded k=v pairs; empty when absent or garbled).
-    # Persisted below only when the encoding changed — an action that
-    # leaves the session untouched emits no Set-Cookie.
-    #
-    # The NAME comes from `Rails.application.session_cookie_key`, not a
-    # literal: apps declare it via `config.session_store :cookie_store,
-    # key: "..."`, which ingest lifts onto the Rails::Application reopen
-    # (framework default "_session" when they don't). App code reads the
-    # same accessor, and the two must agree — lobsters'
-    # `remove_unknown_cookies` deletes every cookie whose key isn't the
-    # configured one, so a literal here would clear the session on every
-    # request.
-    session_cookie = Rails.application.session_cookie_key
-    # SIGNED (runtime/signed_cookies.rb): a value that does not
-    # verify restores as an empty session. `session_in` is the restored
-    # session's PLAIN encoding — what the persist step below compares
-    # against, so an untouched session writes no Set-Cookie and a
-    # rejected one is not rewritten until the action changes it.
-    restored = ActionDispatch::Session.from_signed_cookie(
-      req.cookies.fetch(session_cookie, ""), session_cookie)
-    session_in = restored.to_cookie
-    controller.assign_http_session(restored)
+    controller.assign_http_session(request_obj.session)
     # Controller-level cookie access (`cookies[:k]` reads, `cookies[:k] = v`
     # records writes surfaced as Set-Cookie below). The inbound jar is the
     # request's parsed cookies (String-keyed Tep.str_hash); the CookieJar
@@ -668,6 +695,11 @@ module Main
       # Not a 500: Rails' rescue_responses answer these with 422.
       res.status = 422
       res.body = "<h1>422 Unprocessable Content</h1>"
+      return
+    rescue ActionController::UnknownFormat
+      # Rails' rescue_responses answer it with 406; the default app ships no public/406.html, so the body is empty.
+      res.status = 406
+      res.body = ""
       return
     end
 
@@ -773,17 +805,21 @@ module Main
       res.set_cookie(cname, out_cookies[cname], copts)
       ci += 1
     end
+  end
 
-    # Session persistence: re-encode whatever the action (or a lazy
-    # CSRF token generated during the layout render above) left in the
-    # session; Set-Cookie only on change. An emptied session
-    # (reset_session) clears the cookie. Runs after the render so
-    # lazily-created tokens are captured, and on redirects too (login
-    # sets `session[:u]` then 302s).
-    # `request.session_options[:skip] = true` (lobsters'
-    # `clear_session_cookie`) leaves the cookie alone, as Rails'
-    # session middleware skips its commit.
-    session_out = controller.session.to_cookie
+  # Session persistence: re-encode whatever the action (or a lazy
+  # CSRF token generated during the layout render) left in the
+  # session; Set-Cookie only on change. An emptied session
+  # (reset_session) clears the cookie. Runs on redirects too (login
+  # sets `session[:u]` then 302s).
+  # `request.session_options[:skip] = true` (lobsters'
+  # `clear_session_cookie`) leaves the cookie alone, as Rails'
+  # session middleware skips its commit.
+  # Not at the end of `dispatch_request`: Rails commits above the gems' middleware, so what one writes or answers itself counts.
+  def self.persist_session(res, request_obj)
+    session_cookie = Rails.application.session_cookie_key
+    session_in = request_obj.env.fetch("roundhouse.session.in", "").to_s
+    session_out = request_obj.session.to_cookie
     if session_out != session_in && !request_obj.session_skip?
       if session_out == ""
         Main.clear_flash_cookie(res, session_cookie)
@@ -792,6 +828,7 @@ module Main
           ActionDispatch::Session.signed_cookie(session_out, session_cookie), request_obj.ssl?)
       end
     end
+    nil
   end
 
   # Flash cookies are HttpOnly + Path=/; the read side is server-only

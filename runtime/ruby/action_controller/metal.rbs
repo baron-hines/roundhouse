@@ -1,0 +1,35 @@
+module AbstractController
+  module Callbacks
+  end
+end
+
+module ActionView
+  module Rendering
+  end
+end
+
+module ActionController
+  module UrlFor
+  end
+
+  module Redirecting
+  end
+
+  class Base
+    include AbstractController::Callbacks
+    include UrlFor
+    include Redirecting
+    include ActionView::Rendering
+  end
+
+  class API < Base
+    def self.include?: (Module mod) -> bool
+  end
+
+  class Metal < Base
+    def self.include?: (Module mod) -> bool
+    def self.around_action: (*untyped names) ?{ (untyped, untyped) -> untyped } -> nil
+    def self.before_action: (*untyped names) ?{ (untyped) -> untyped } -> nil
+    def self.after_action: (*untyped names) ?{ (untyped) -> untyped } -> nil
+  end
+end

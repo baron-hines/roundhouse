@@ -811,10 +811,9 @@ fn diagnose_controller_output_collisions(app: &App, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// [`diagnose`] plus the missing-preload coverage triple, for report
-/// skins that state the denominator (#64: "0 findings" must be
-/// distinguishable from "couldn't check").
-pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
+/// What [`diagnose_with_coverage`] collects before the forwarding, private-call,
+/// filter-target and preload passes: the diagnostics in the order they are reported.
+fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     let mut out = app.routes.diagnostics.clone();
     diagnose_controller_output_collisions(app, &mut out);
     // A `default_url_options` whose path segments the route helpers do not take.
@@ -827,13 +826,14 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
     out.extend(super::graphql::diagnose(app, diagnose_expr));
-    out.extend(super::enum_raw_input::diagnose(app));
     out.extend(super::data::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
     out.extend(crate::lower::model_to_library::encrypts_diagnostics(app));
+    out.extend(route_guard_untyped_sends(app));
     // A support file the class ingest left out, at what failed it.
     out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));
     out.extend(conditional_declarations_reopened(app));
+    out.extend(unsettled_conditional_writes(app));
     // Constructor refusals must also reach executable class constants and
     // parameter defaults, which the ordinary method diagnostic policy omits.
     fn collect_storage_constructors(expr: &Expr, out: &mut Vec<Diagnostic>) {
@@ -993,14 +993,36 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     for stmt in &app.boot_program {
         diagnose_expr(stmt, &mut out);
     }
-    out.extend(super::forwarding::diagnose(app));
-    out.extend(super::private_calls::diagnose(app));
-    out.extend(super::filter_targets::diagnose(app));
+    out
+}
 
-    // Static N+1 pass (#64): missing-preload warnings over the typed
-    // query chains, same-procedure and through the controller→view
-    // ivar channel.
-    let (preload_diags, coverage) = preload::missing_preload_report(app);
+/// [`diagnose`] plus the missing-preload coverage triple, for report
+/// skins that state the denominator (#64: "0 findings" must be
+/// distinguishable from "couldn't check").
+pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
+    // The passes after the head read the app alone, as the head does, so they run beside it
+    // and their findings follow the head's, in this order.
+    let (mut out, (forwarding, (private_calls, filter_targets), (preload_diags, coverage))) = super::parallel::join(
+        || diagnose_head(app),
+        || {
+            let (forwarding, (private_calls_and_filters, preload)) = super::parallel::join(
+                || super::forwarding::diagnose(app),
+                || {
+                    super::parallel::join(
+                        || (super::private_calls::diagnose(app), super::filter_targets::diagnose(app)),
+                        // Static N+1 pass (#64): missing-preload warnings over the typed
+                        // query chains, same-procedure and through the controller→view
+                        // ivar channel.
+                        || preload::missing_preload_report(app),
+                    )
+                },
+            );
+            (forwarding, private_calls_and_filters, preload)
+        },
+    );
+    out.extend(forwarding);
+    out.extend(private_calls);
+    out.extend(filter_targets);
     out.extend(preload_diags);
     unshipped_gem_helpers(app, &mut out);
     let refused_gem_sites: crate::det::HashSet<_> = out.iter().filter_map(|diagnostic| {
@@ -1143,6 +1165,50 @@ pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
 /// analyzer set for positions it couldn't resolve). `Ty::Untyped` —
 /// the gradual escape — counts as *known*: the author signed that
 /// position out of checking.
+/// A request constraint the Ruby-family router asks (`lower::route_guards`) runs every request its
+/// path matches, so a call in it on a value the analyzer cannot type (`request.env["warden"].send(…)`)
+/// is an error there, not an unchecked send: answered at runtime, it would raise instead of refusing.
+fn route_guard_untyped_sends(app: &App) -> Vec<Diagnostic> {
+    // `placed`: the nearest enclosing span the source has; a desugared send (`h[k] += 1`) has none of its own.
+    fn visit(expr: &Expr, placed: crate::span::Span, out: &mut Vec<Diagnostic>) {
+        let placed = if expr.span.is_synthetic() { placed } else { expr.span };
+        // The call's own type unknown too: a method the receiver's class does not answer (`format.json?`).
+        // Not one every object answers (`params["id"].nil?`): that cannot raise, whatever the value is.
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
+            && !matches!(method.as_str(), "nil?" | "==" | "!=" | "!" | "equal?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "to_s" | "inspect" | "frozen?" | "hash" | "class")
+            && (gradual(r.ty.as_ref()) || is_unknown_ty(r.ty.as_ref()) || is_unknown_ty(expr.ty.as_ref()))
+            && expr.diagnostic().is_none()
+        {
+            out.push(Diagnostic::unsupported(
+                placed,
+                None,
+                "request constraint",
+                format!("`{method}` is called on a value the request constraint cannot type, so the router could not ask it"),
+            ));
+        }
+        expr.node.for_each_child(&mut |child| visit(child, placed, out));
+    }
+    let mut out = Vec::new();
+    for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == crate::lower::route_guards::GUARD_CLASS) {
+        for method in &class.methods {
+            // One per constraint, its first such call: the rest follow from the same value.
+            let mut found = Vec::new();
+            visit(&method.body, method.body.span, &mut found);
+            out.extend(found.into_iter().next());
+        }
+    }
+    out
+}
+
+/// Not `Untyped` alone: a Hash read of an untyped value is `untyped | nil`, still nothing the router can check.
+fn gradual(ty: Option<&Ty>) -> bool {
+    match ty {
+        Some(Ty::Untyped) => true,
+        Some(Ty::Union { variants }) => variants.iter().any(|v| gradual(Some(v))),
+        _ => false,
+    }
+}
+
 fn is_unknown_ty(ty: Option<&Ty>) -> bool {
     match ty {
         None => true,
@@ -1707,6 +1773,36 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
+}
+
+/// A write through the class's own writer in a load-time conditional whose
+/// branch is not settled at compile time: the emitted conditional selects
+/// methods only, so the write would run in no branch.
+fn unsettled_conditional_writes(app: &App) -> Vec<Diagnostic> {
+    fn writes<'a>(conditional: &'a crate::dialect::ConditionalDefinitions, out: &mut Vec<&'a Expr>) {
+        for arm in &conditional.arms {
+            out.extend(arm.statements.iter());
+            for nested in &arm.nested {
+                writes(nested, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for lc in &app.library_classes {
+        for conditional in &lc.conditional_definitions {
+            let mut found = Vec::new();
+            writes(conditional, &mut found);
+            for write in found {
+                out.push(Diagnostic::unsupported(
+                    write.span,
+                    None,
+                    "load-time conditional",
+                    "a class setting written in a load-time conditional whose branch is not known when compiling is not modeled".to_string(),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// A class or module declared in a load-time conditional that another

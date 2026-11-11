@@ -137,7 +137,7 @@ fn a_self_received_concern_filter_behind_an_undecided_guard_is_a_survey_gap() {
 #[test]
 fn an_unmodelled_callback_under_a_decided_guard_is_a_survey_gap() {
     let gaps = survey_gaps(
-        "    append_before_action :require_login! if respond_to?(:append_before_action)",
+        "    prepend_after_action :require_login! if respond_to?(:prepend_after_action)",
     );
-    assert!(has_gap(&gaps, "macro not recognized: `append_before_action`"), "{gaps:?}");
+    assert!(has_gap(&gaps, "macro not recognized: `prepend_after_action`"), "{gaps:?}");
 }

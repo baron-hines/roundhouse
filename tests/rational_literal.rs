@@ -67,7 +67,7 @@ fn rational_literals_keep_their_exact_value_like_native() {
         .write("config/environments/development.rb", CONFIG)
         .write("lib/ratlab/limits.rb", RAT)
         .run_ruby(REPORT);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     let source = std::fs::read_to_string(run.emitted.join("app/models/ratlab/limits.rb"))
         .expect("emitted limits");
     for lowered in [

@@ -111,7 +111,7 @@ fn a_singleton_include_and_its_macro_run_on_the_singleton_class_as_in_cruby() {
     assert_eq!(String::from_utf8_lossy(&native.stdout), EXPECTED, "native control");
 
     let run = app().write("roundhouse.yml", "").run_ruby(SCRIPT);
-    assert!(run.success, "{}\n{}\n{}\n{:?}", run.emitted.display(), run.stdout, run.stderr, run.errors);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
 }
 

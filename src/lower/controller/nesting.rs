@@ -64,7 +64,7 @@ fn find_nested_parent_in(
         // Namespace/scope wrappers are transparent to resource
         // nesting — the parent relation lives between the Resources
         // entries themselves.
-        if let RouteSpec::Scope { entries, .. } | RouteSpec::Exclusive { entries } = entry {
+        if let RouteSpec::Scope { entries, .. } | RouteSpec::Exclusive { entries } | RouteSpec::Guarded { entries, .. } = entry {
             if let Some(p) = find_nested_parent_in(entries, child_plural) {
                 return Some(p);
             }

@@ -20,9 +20,20 @@ pub const RENDERS: &[&str] = &["L0:y|", "L1:n|", "L2:1|", "L3:y|"];
 pub const NIL_VIEW: &str = concat!(
     "L0:<% if @article.title == \"t\" %>y<% end %>|\n",
     "L1:<% if @article.title != \"u\" %>y<% end %>|\n",
+    "L2:<% if @article.title == \"\" %>y<% else %>n<% end %>|\n",
+    "L3:<% if @article.title != \"\" %>y<% else %>n<% end %>|\n",
 );
 
-pub const NIL_RENDERS: &[&str] = &["L0:|", "L1:y|"];
+pub const NIL_RENDERS: &[&str] = &["L0:|", "L1:y|", "L2:n|", "L3:y|"];
+
+/// The String literal on the left. Rails 8.1.4 renders `NIL_LEFT_RENDERS`
+/// with the title nil.
+pub const NIL_LEFT_VIEW: &str = concat!(
+    "L0:<% if \"\" == @article.title %>y<% else %>n<% end %>|\n",
+    "L1:<% if \"\" != @article.title %>y<% else %>n<% end %>|\n",
+);
+
+pub const NIL_LEFT_RENDERS: &[&str] = &["L0:n|", "L1:y|"];
 
 /// `base` (a probe app over `fixtures/real-blog`) with an article whose
 /// title is "t".
@@ -47,10 +58,14 @@ pub fn strict_nil_app() -> Overlay {
     nil_app(super::content_tag_options::app_rendering(NIL_VIEW, NIL_RENDERS))
 }
 
+pub fn strict_nil_left_app() -> Overlay {
+    nil_app(super::content_tag_options::app_rendering(NIL_LEFT_VIEW, NIL_LEFT_RENDERS))
+}
+
 /// Operands with an effect. `mark_a` appends "a" to the body and returns
 /// the record; `mark_b` appends "b" and returns "t". Each runs once, left
 /// then right, whether or not the title is nil, so the body shows how
-/// many times each ran and in what order (`oracle-effect.rb`, Rails 8.1.4).
+/// many times each ran and in what order (Rails 8.1.4).
 pub const EFFECT_VIEW: &str = concat!(
     "L0:<% if @article.mark_a.title == @article.mark_b %>y<% end %>|<%= @article.body %>|\n",
     "L1:<% if @article.mark_a.title != @article.mark_b %>y<% end %>|<%= @article.body %>|\n",

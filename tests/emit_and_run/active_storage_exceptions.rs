@@ -369,7 +369,7 @@ fn active_storage_exception_owner_constructor_refusals_survive_emission() {
         let run = app(&format!("  def self.value\n    {owner}.new({{ resize_to_limit: [10, 10] }})\n  end"))
             .run_ruby("StorageErrors.value");
         assert!(run.errors.iter().any(|e| e.contains(".new lacks a shared runtime constructor implementation")));
-        assert!(!run.success && run.stderr.contains("ActiveStorage constructor not supported"), "{}", run.stderr);
+        assert!(!run.program_succeeded() && run.stderr.contains("ActiveStorage constructor not supported"), "{}", run.stderr);
     }
 }
 

@@ -35,8 +35,19 @@ class Square
   end
 end
 
+module Metric
+  def metric?
+    true
+  end
+end
+
 class Celsius
   UNIT = "C"
+  include Metric
+
+  def freezing
+    0
+  end
 end
 
 class Fahrenheit
@@ -48,6 +59,11 @@ class Thermometer
     scale = metric ? Celsius : Fahrenheit
     [scale::UNIT, scale.const_defined?(:UNIT)]
   end
+
+  def traits_for(metric)
+    scale = metric ? Celsius : Fahrenheit
+    [scale.method_defined?(:freezing), scale.include?(Metric)]
+  end
 end
 "#;
 
@@ -55,6 +71,8 @@ const ASSERTIONS: &str = r#"raise unless Circle.new.describe == [0, "circle"]
 raise unless Square.new.describe == [4, "square"]
 raise unless Thermometer.new.unit_for(true) == ["C", true]
 raise unless Thermometer.new.unit_for(false) == ["F", true]
+raise unless Thermometer.new.traits_for(true) == [true, true]
+raise unless Thermometer.new.traits_for(false) == [false, false]
 puts "class unions passed"
 "#;
 
@@ -80,8 +98,9 @@ fn native_class_unions_agree() {
 fn strict_targets_keep_their_refusal() {
     let (_, errors) = app().emit(BuildTarget::Typescript);
     assert!(errors.iter().any(|e| e.contains("Module protocol") && e.contains("typescript")), "{errors:#?}");
-    // Spinel compiles `shape::SIDES` and `scale::UNIT`; it refuses the
-    // explicit queries on one of several classes, which it does not answer.
+    // Spinel compiles `shape::SIDES` and `scale::UNIT`, and answers
+    // `method_defined?` and `include?` on one of several classes; it refuses
+    // the constant queries there, which it does not answer.
     let (_, errors) = app().emit(BuildTarget::Spinel);
     let refused: Vec<_> = errors.iter().filter(|e| e.contains("on one of several classes")).collect();
     assert_eq!(refused.len(), 2, "{errors:#?}");

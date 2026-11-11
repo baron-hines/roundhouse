@@ -2241,14 +2241,28 @@ module ActiveRecord
     # `group(:col).count` — Rails hands back a Hash of group-key =>
     # COUNT. The group_count lowering renames the grouped chain's
     # terminal to this method, so the scalar `count` keeps its
-    # Integer return (no polymorphic count). Single group expression
-    # (the corpus shape); Rails' multi-group array keys would need a
-    # composite key here first. HAVING and DISTINCT ride the same SQL
+    # Integer return (no polymorphic count). Multiple group expressions
+    # use Array keys; a single expression keeps scalar keys.
+    # HAVING and DISTINCT ride the same SQL
     # as `to_sql` so the Hash only contains surviving groups, and a
     # distinct projection counts distinct values per group (#343).
     def group_count
       return {} if @null
       key = @groups.join(", ")
+      names = []
+      selects = []
+      survivors_selects = []
+      survivor_names = []
+      @groups.each_with_index do |group, index|
+        name = "__rh_group_#{index}"
+        survivor_name = "__rh_survivor_#{index}"
+        names << name
+        selects << "#{group} AS #{name}"
+        survivor_names << survivor_name
+        survivors_selects << "#{group} AS #{survivor_name}"
+      end
+      projection = selects.join(", ")
+      group_names = names.join(", ")
       # DISTINCT uses a subquery so a multi-column / aliased `select`
       # never lands inside SQLite's one-expression COUNT(DISTINCT …).
       # HAVING filters groups on the original grouped relation first
@@ -2257,25 +2271,26 @@ module ActiveRecord
       # can name selected aliases, matching `count_sql`.
       sql = if @distinct
         inner = append_join_where(
-          "#{cte_prefix}SELECT DISTINCT #{distinct_count_columns}, #{key} AS k FROM #{from_source}"
+          "#{cte_prefix}SELECT DISTINCT #{distinct_count_columns}, #{projection} FROM #{from_source}"
         )
         if @havings.length > 0
           survivors = append_group_having(
-            append_join_where("#{cte_prefix}SELECT #{key} AS __rh_k FROM #{from_source}")
+            append_join_where("#{cte_prefix}SELECT #{survivors_selects.join(", ")} FROM #{from_source}")
           )
-          clause = "#{key} IN (SELECT __rh_k FROM (#{survivors}) AS __rh_surv)"
+          key_tuple = names.length == 1 ? key : "(#{key})"
+          clause = "#{key_tuple} IN (SELECT #{survivor_names.join(", ")} FROM (#{survivors}) AS __rh_surv)"
           inner = if @wheres.length > 0
             "#{inner} AND #{clause}"
           else
             "#{inner} WHERE #{clause}"
           end
         end
-        "SELECT k, COUNT(*) AS n FROM (#{inner}) AS __rh_gc GROUP BY k"
+        "SELECT #{group_names}, COUNT(*) AS n FROM (#{inner}) AS __rh_gc GROUP BY #{group_names}"
       else
         proj = if @select_sql.nil?
-          "#{key} AS k, COUNT(*) AS n"
+          "#{projection}, COUNT(*) AS n"
         else
-          "#{@select_sql}, #{key} AS k, COUNT(*) AS n"
+          "#{@select_sql}, #{projection}, COUNT(*) AS n"
         end
         append_group_having(
           append_join_where("#{cte_prefix}SELECT #{proj} FROM #{from_source}")
@@ -2283,7 +2298,16 @@ module ActiveRecord
       end
       h = {}
       rows = ActiveRecord.adapter.select_rows(sql)
-      rows.each { |row| h[row["k"]] = row["n"].to_i }
+      rows.each do |row|
+        key_values = []
+        names.each_with_index do |name, index|
+          value = row[name]
+          group_column = schema_group_column(@groups[index])
+          key_values << (group_column.nil? ? value : cast_schema_value(value, group_column))
+        end
+        group_key = names.length == 1 ? key_values[0] : key_values
+        h[group_key] = row["n"].to_i
+      end
       h
     end
 
@@ -2544,29 +2568,18 @@ module ActiveRecord
     # `Rooms::Direct.find_or_create_for` does exactly that: `find_for`
     # plucks the user ids, then hands the SAME relation to `grant_to`,
     # which built memberships for user 0.
+    #
+    # An `Arel.sql` fragment is the caller's own projection, past the
+    # column check as in `order`, and a single one can name several
+    # columns, so that form takes its row width from the result as Rails
+    # does: one column plucks scalars, more pluck rows.
     def pluck(*cols)
       return [] if @null
+      return pluck_sql(cols) if cols.any? { |col| col.is_a?(Arel::Nodes::SqlLiteral) }
       columns = cols.length == 0 ? @model.schema_columns : cols
       projections = []
       columns.each_with_index do |col, index|
-        name = sql_ident(col)
-        # Same rule as `schema::pluck_argument`. A real `id` column is
-        # what `pluck(:id)` selects. `:id` aliases the primary key only
-        # when that column is absent, which is also why a bare `pluck`
-        # must not rename `id` and project the key twice.
-        if name == "id" && !@model.schema_columns.include?(:id)
-          name = @model.primary_key.to_s
-        end
-        # `sql_ident` accepts a reserved word. Quote after substitution,
-        # each part of a qualified name on its own. `@table` is already
-        # `_table_sql`.
-        if name.include?(".")
-          table, column = name.split(".", 2)
-          name = "#{ActiveRecord.adapter.quote_column_name(table)}.#{ActiveRecord.adapter.quote_column_name(column)}"
-        else
-          name = "#{@table}.#{ActiveRecord.adapter.quote_column_name(name)}"
-        end
-        projections << "#{name} AS v#{index}"
+        projections << "#{pluck_column_sql(col)} AS v#{index}"
       end
       prior = @select_sql
       begin
@@ -2581,6 +2594,123 @@ module ActiveRecord
         columns.each_with_index { |col, index| values << @model.decode_plucked(col, row["v#{index}"]) }
         values
       end
+    end
+
+    # One `pluck` column as SQL.
+    def pluck_column_sql(col)
+      name = sql_ident(col)
+      # Same rule as `schema::pluck_argument`. A real `id` column is
+      # what `pluck(:id)` selects. `:id` aliases the primary key only
+      # when that column is absent, which is also why a bare `pluck`
+      # must not rename `id` and project the key twice.
+      if name == "id" && !@model.schema_columns.include?(:id)
+        name = @model.primary_key.to_s
+      end
+      # `sql_ident` accepts a reserved word. Quote after substitution,
+      # each part of a qualified name on its own. `@table` is already
+      # `_table_sql`.
+      if name.include?(".")
+        table, column = name.split(".", 2)
+        "#{ActiveRecord.adapter.quote_column_name(table)}.#{ActiveRecord.adapter.quote_column_name(column)}"
+      else
+        "#{@table}.#{ActiveRecord.adapter.quote_column_name(name)}"
+      end
+    end
+
+    # `pluck` with an `Arel.sql` fragment among its columns. Rows are Hashes
+    # keyed by column name, so result columns sharing a name arrive as one
+    # value: Rails answers both (`a.id, b.id`), and this raises rather than
+    # return a row with a column missing.
+    #
+    # Each value decodes as `pluck` decodes it, in result order: a plain
+    # column through the alias it was given, anything else by its result
+    # column name, as Rails casts a fragment's columns.
+    def pluck_sql(cols)
+      projections = []
+      plain = {}
+      expected = 0
+      cols.each_with_index do |col, index|
+        if col.is_a?(Arel::Nodes::SqlLiteral)
+          sql = col.to_s
+          projections << sql
+          expected += sql_projection_width(sql)
+        else
+          projections << "#{pluck_column_sql(col)} AS v#{index}"
+          plain["v#{index}"] = col.to_s
+          expected += 1
+        end
+      end
+      prior = @select_sql
+      begin
+        @select_sql = projections.join(", ")
+        rows = ActiveRecord.adapter.select_rows(bound_sql)
+      ensure
+        @select_sql = prior
+      end
+      rows.map do |row|
+        values = []
+        row.each do |name, value|
+          column = plain.key?(name) ? plain[name] : name
+          values << @model.decode_plucked(column, value)
+        end
+        if values.length < expected
+          raise ArgumentError, "pluck expected #{expected} columns but the row has #{values.length}: result columns share a name, give them distinct names with AS"
+        end
+        values.length == 1 ? values[0] : values
+      end
+    end
+
+    # How many result columns a projection list names, one top-level item
+    # at a time. A comma inside parentheses, brackets or a quoted string
+    # separates nothing here.
+    def sql_projection_width(sql)
+      width = 0
+      depth = 0
+      quote = ""
+      start = 0
+      i = 0
+      while i < sql.length
+        ch = sql[i]
+        if quote != ""
+          quote = "" if ch == quote
+        elsif ch == "'" || ch == "\"" || ch == "`"
+          quote = ch
+        elsif ch == "(" || ch == "["
+          depth += 1
+        elsif ch == ")" || ch == "]"
+          depth -= 1
+        elsif ch == "," && depth == 0
+          width += sql_item_width(sql[start, i - start].to_s.strip)
+          start = i + 1
+        end
+        i += 1
+      end
+      width + sql_item_width(sql[start, sql.length - start].to_s.strip)
+    end
+
+    # One projection item's columns. A `*` is this model's columns only
+    # when this table is all it can expand: over a join, or for another
+    # table, its width is not known here, so a collapsed duplicate behind
+    # it could not be seen and the projection is refused.
+    def sql_item_width(item)
+      return 1 unless item == "*" || item.end_with?(".*")
+      if item == "*"
+        if @joins.length > 0
+          raise ArgumentError, "pluck cannot count the columns of * over a join, so a column sharing a name could not be seen; list the columns"
+        end
+        return @model.schema_columns.length
+      end
+      table = sql_unquoted(item[0, item.length - 2].to_s)
+      return @model.schema_columns.length if table == sql_unquoted(@table)
+      raise ArgumentError, "pluck cannot count the columns of #{item}, so a column sharing a name could not be seen; list the columns"
+    end
+
+    # An identifier without its surrounding `"` or backtick quotes.
+    def sql_unquoted(name)
+      return name if name.length < 2
+      first = name[0]
+      return name unless first == "\"" || first == "`"
+      name[1, name.length - 2].to_s
     end
 
     # `pick(*cols)` — Rails' `limit(1).pluck(*cols).first`: a value or

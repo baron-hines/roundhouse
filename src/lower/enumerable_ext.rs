@@ -150,6 +150,18 @@ pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
         *parenthesized = true;
         return true;
     }
+    // ActiveSupport's `Array#extract_options!`: the receiver loses its trailing Hash in place, which the helper does to the same Array.
+    if method.as_str() == "extract_options!" && args.is_empty() && block.is_none() {
+        let Some(receiver) = recv.as_ref() else { return false };
+        if !matches!(receiver.ty.as_ref(), Some(Ty::Array { .. })) {
+            return false;
+        }
+        let receiver = recv.take().expect("checked above");
+        *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+        args.insert(0, receiver);
+        *parenthesized = true;
+        return true;
+    }
     if method.as_str() == "pluck" && block.is_none() {
         if ground_indexed_pluck(expr) {
             return true;

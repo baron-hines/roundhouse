@@ -1142,7 +1142,11 @@ fn rewrite_extension_body(e: &mut Expr, assoc: &Symbol, siblings: &[Symbol]) {
     }
     // Bare relation surface -> `self.<assoc>.<method>(…)`, which the
     // scope-chain lowering then seeds from the foreign key.
-    if extension_relation_method(method.as_str()) {
+    // `select(:a)` and `find(id)` are the relation's. Their block forms
+    // enumerate the records, which neither `Relation#select` nor
+    // `Relation#find` does, so those stay out of the relation vocabulary.
+    let relation_call = matches!(method.as_str(), "select" | "find") && !args.is_empty() && block.is_none();
+    if extension_relation_method(method.as_str()) || relation_call {
         let assoc_read = Expr::new(
             e.span,
             ExprNode::Send {
@@ -1175,6 +1179,9 @@ fn extension_relation_method(name: &str) -> bool {
     matches!(
         name,
         "where"
+            | "unscope"
+            | "unscope_where"
+            | "unscope_parts"
             | "order"
             | "limit"
             | "count"

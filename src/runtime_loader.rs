@@ -847,6 +847,17 @@ thread_local! {
     static APP_LOCALES: std::cell::RefCell<Option<(String, Vec<String>)>> = const { std::cell::RefCell::new(None) };
 }
 
+/// The app locales this thread holds, for a worker on another thread.
+pub(crate) fn app_locales_snapshot() -> Option<(String, Vec<String>)> {
+    APP_LOCALES.with(|l| l.borrow().clone())
+}
+
+/// Hold `locales` on this thread, for good: for a worker thread that ends
+/// with its work.
+pub(crate) fn install_app_locales(locales: Option<(String, Vec<String>)>) {
+    APP_LOCALES.with(|l| *l.borrow_mut() = locales);
+}
+
 pub fn with_app_locales<R>(app: &crate::App, f: impl FnOnce() -> R) -> R {
     let catalog = app.i18n.or_rails_default();
     let prev = APP_LOCALES.with(|l| l.replace(Some((catalog.locale.clone(), catalog.locales()))));

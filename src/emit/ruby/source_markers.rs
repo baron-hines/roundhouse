@@ -28,7 +28,8 @@ use crate::span::Span;
 
 pub(crate) const MARKER_PREFIX: &str = "#<SPINEL_SOURCE>";
 
-struct Sources {
+#[derive(Clone)]
+pub(super) struct Sources {
     /// `FileId(n)` → entry `n - 1`: the app-relative path and the byte
     /// offset each line starts at.
     files: Vec<(String, Vec<u32>)>,
@@ -36,6 +37,17 @@ struct Sources {
 
 thread_local! {
     static SOURCES: RefCell<Option<Sources>> = const { RefCell::new(None) };
+}
+
+/// The sources markers resolve against on this thread, if markers are on.
+pub(super) fn snapshot() -> Option<Sources> {
+    SOURCES.with(|c| c.borrow().clone())
+}
+
+/// Resolve markers against `sources` on this thread, for good: for a
+/// worker thread that ends with its work.
+pub(super) fn install(sources: Option<Sources>) {
+    SOURCES.with(|c| *c.borrow_mut() = sources);
 }
 
 /// Run `f` with marker emission on, resolving spans against `app`'s

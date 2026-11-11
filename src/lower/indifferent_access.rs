@@ -6,6 +6,8 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 pub fn apply_indifferent_access_lowering(app: &mut App) {
+    let app_defines = app_defines_conversion(app);
+    let mut lower = |body: &mut Expr| lower(body, app_defines);
     super::for_each_hook_body(app, &mut lower);
     for view in &mut app.views {
         lower(&mut view.body);
@@ -13,15 +15,34 @@ pub fn apply_indifferent_access_lowering(app: &mut App) {
     super::for_each_test_body(app, &mut lower);
 }
 
-fn lower(body: &mut Expr) {
-    rewrite(body);
+fn app_defines_conversion(app: &App) -> bool {
+    let conversion = |name: &str| name == "with_indifferent_access";
+    app.models.iter().any(|m| m.methods().any(|d| conversion(d.name.as_str())))
+        || app.library_classes.iter().any(|c| c.methods.iter().any(|d| conversion(d.name.as_str())))
+}
+
+fn lower(body: &mut Expr, app_defines: bool) {
+    rewrite(body, app_defines);
     // Not retyped during the rewrite: a parent call finds its indifferent receiver by the type its child still carries.
     retype(body);
 }
 
-fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
+fn rewrite(expr: &mut Expr, app_defines: bool) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, app_defines));
     if !expr.ty.as_ref().is_some_and(|t| !matches!(t, Ty::Var { .. })) {
+        // A receiver analysis could not type: a jbuilder partial's local
+        // is one, as no `render` call binds it. Only a Hash's conversion
+        // can be meant unless the app defines the name itself.
+        if !app_defines
+            && let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node
+            && method.as_str() == "with_indifferent_access"
+            && args.is_empty()
+            && recv.ty.as_ref().is_none_or(|t| matches!(t, Ty::Var { .. }))
+        {
+            let mut call = support_call(expr.span, "indifferent", vec![recv.clone()]);
+            call.ty = indifferent::from_gradual(&Ty::Untyped);
+            *expr = call;
+        }
         return;
     }
     // An untyped receiver (a json column's reader, `extras || {}`) is the

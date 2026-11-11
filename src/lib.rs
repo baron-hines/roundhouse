@@ -88,7 +88,7 @@ pub mod runtime_src;
 pub mod session;
 pub mod timings;
 pub mod treeshake;
-pub(crate) mod source_gem_shake;
+pub mod source_gem_shake;
 pub mod version;
 pub mod schema;
 pub mod span;

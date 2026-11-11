@@ -48,12 +48,6 @@ fn a_gem_module_body_require_runs_before_the_call_that_needs_it() {
         app = app.write(&format!("vendor/gems/act-kit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby("puts ActKit.formats.inspect\n");
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(run.stdout.lines().last(), Some("[:json, :avro]"), "{}", run.stderr);
 }

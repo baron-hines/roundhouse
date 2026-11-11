@@ -23,6 +23,7 @@ const SPINEL_TEST_HELPER: &str =
 
 pub(crate) mod expr;
 mod library;
+mod par_render;
 pub(crate) use library::install_lookup_indexes;
 pub(crate) use library::app_presents_time_zoned;
 mod rbs;
@@ -494,7 +495,7 @@ pub fn emit_lowered_schema_pair(app: &App) -> Vec<EmittedFile> {
 /// `main.rb`. The body itself (the data) flows through the
 /// universal walker.
 pub fn emit_lowered_routes(app: &App) -> EmittedFile {
-    let funcs = crate::lower::lower_routes_to_dispatch_functions(app);
+    let funcs = crate::lower::routes_to_library::lower_routes_to_guarded_dispatch_functions(app);
     let mut emitted = library::emit_module_file(
         &funcs,
         app,
@@ -504,7 +505,7 @@ pub fn emit_lowered_routes(app: &App) -> EmittedFile {
     // Prepend require_relative headers for application_controller and
     // each unique controller used by the route table — Spinel runtime
     // loads controllers via require chain rooted at config/routes.rb.
-    let flat = crate::lower::routes::flatten_routes(app);
+    let flat = crate::lower::routes::flatten_routes_reachable(app);
     let mut header = String::new();
     use std::fmt::Write;
     let mut seen: Vec<String> = vec!["application_controller".to_string()];
@@ -655,13 +656,11 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth, param_
     // + class_info_from_library_class) because the former returns
     // ClassInfo with `table` set — the Arel pass needs `info.table`
     // to map a Const recv to a TableRef when recognizing chains.
-    let (_, model_registry) = crate::lower::model_to_library::lower_models_with_request_finders(
-        &app.models,
-        &app.schema,
-        Vec::new(),
-    );
     let model_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> =
-        model_registry.into_iter().collect();
+        crate::lower::model_to_library::request_finder_registry(&app.models, &app.schema, true)
+            .iter()
+            .map(|(id, info)| (id.clone(), info.clone()))
+            .collect();
     // Association graph drives `includes(:assoc)` eager-load lowering
     // (issue #27) — without it the Arel pass drops includes and the
     // reader N+1s.
@@ -674,7 +673,7 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth, param_
         crate::ident::ClassId,
         crate::det::HashSet<crate::ident::Symbol>,
     > = crate::det::HashMap::default();
-    for r in crate::lower::flatten_routes(app) {
+    for r in crate::lower::routes::flatten_routes_reachable(app) {
         routed.entry(r.controller).or_default().insert(r.action);
     }
     let route_ids = crate::lower::routes::helper_id_segments(app);
@@ -697,6 +696,10 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth, param_
             models: &app.models,
             wrap_parameters_by_default: app.wrap_parameters_by_default,
             concern_spliced_actions: Some(&app.concern_spliced_actions),
+            // `require: false` (an empty require list) keeps Bundler from loading it, and its railtie with it.
+            jbuilder_loaded: app.gem_lock.as_ref().map(|lock| {
+                lock.has("jbuilder") && !lock.gemfile_requires.get("jbuilder").is_some_and(|features| features.is_empty())
+            }),
         },
     )
 }
@@ -1032,7 +1035,7 @@ pub(crate) fn emit_spinel_with_param_binds(app: &App, param_binds: bool) -> Vec<
     // routes.rb gets a require-relative header prepended (see
     // emit_lowered_routes); emit the .rb via that path, then derive
     // the .rbs sidecar from the same funcs without the header.
-    let route_funcs = crate::lower::lower_routes_to_dispatch_functions(app);
+    let route_funcs = crate::lower::routes_to_library::lower_routes_to_guarded_dispatch_functions(app);
     files.push(emit_lowered_routes(app));
     files.extend(rbs_only_from_funcs(
         &route_funcs,
@@ -1237,15 +1240,11 @@ pub(crate) fn emit_spinel_with_param_binds(app: &App, param_binds: bool) -> Vec<
         // its registry, and letting it report again duplicated 58
         // `unsupported` entries into campfire's ledger — the same gaps,
         // counted twice, which is worse than not knowing.
-        let (model_registry, _dup_diags) = crate::emit::diagnostics::scope(|| {
-            let (_, reg) =
-                crate::lower::model_to_library::lower_models_with_request_finders(&app.models, &app.schema, Vec::new());
-            reg
-        });
+        let model_registry = crate::lower::model_to_library::request_finder_registry(&app.models, &app.schema, false);
         let fixture_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> = fixture_lcs
             .iter()
             .map(|lc| (lc.name.clone(), crate::lower::class_info_from_library_class(lc)))
-            .chain(model_registry)
+            .chain(model_registry.iter().map(|(id, info)| (id.clone(), info.clone())))
             .collect();
         // A test body's `_url` answers absolute, on the session's host,
         // as the Ruby family's jbuilder `_url` does (see the pass).

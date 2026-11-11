@@ -173,7 +173,22 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         // `INSTANCE_PROPS` so body references read as properties.
         let ivars = emit_object_body_ivars(&lc.methods, &accessor_props);
         out.push_str(&ivars);
-        if !accessor_props.is_empty() || !ivars.is_empty() {
+        // A view module's hoisted helper calls (`hoist_pure_helper_constants`:
+        // the layout's stylesheet links and importmap tags) are built on
+        // first read and shared by every request after, like the Ruby
+        // emit's class constants. `lazy` (synchronized) rather than an
+        // eager `val`, so no object's initializer depends on the order in
+        // which the JVM happens to load ViewHelpers and Importmap. Views
+        // only (`Views::<Dir>`, and the bare `Views` a top-level template
+        // lowers to): a runtime module's constants are already emitted at
+        // file scope by the runtime-unit path.
+        let view_name = lc.name.0.as_str();
+        let view_constants: &[(crate::ident::Symbol, Expr)] =
+            if view_name == "Views" || view_name.starts_with("Views::") { &lc.constants } else { &[] };
+        for (name, value) in view_constants {
+            out.push_str(&format!("    val {} by lazy {{ {} }}\n", name.as_str(), emit_expr(value)));
+        }
+        if !accessor_props.is_empty() || !ivars.is_empty() || !view_constants.is_empty() {
             out.push('\n');
         }
         for m in &lc.methods {

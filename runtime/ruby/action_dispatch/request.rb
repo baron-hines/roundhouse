@@ -130,7 +130,6 @@ module ActionDispatch
     attr_accessor :referer
     # `host` is a method: it answers `raw_host_with_port`, while `@host`
     # stays the Host header the dispatcher stored.
-    attr_reader :format
     attr_accessor :env
     # Rails' `request_parameters`: the BODY's params alone, without the
     # query string or the path captures. ParamsWrapper copies from these
@@ -176,6 +175,8 @@ module ActionDispatch
       # defect `@params` had, one read away from surfacing.
       @user_agent = +""
       @session_options = {}
+      # Not a Session yet: a request no dispatcher restored one for (a cable handshake's) builds it on first read, as Rails' does.
+      @session = nil
       # Memo for `content_security_policy`. False until the first read
       # copies the app default; a later read returns that same object so
       # a before_action and the header writer share the narrowed policy.
@@ -214,6 +215,16 @@ module ActionDispatch
       @session_options
     end
 
+    # Not read from `@env["rack.session"]` as Rails does: that value is untyped, and the slot keeps it a Session.
+    def session
+      @session = ActionDispatch::Session.new if @session.nil?
+      @session
+    end
+
+    def session=(value)
+      @session = value
+    end
+
     # Whether the dispatcher should leave the session cookie alone this
     # response (Rails: the session middleware skips its commit).
     def session_skip?
@@ -224,6 +235,14 @@ module ActionDispatch
     # canonical string.
     def format=(value)
       @format = value.to_s
+    end
+
+    # Rails' `request.format`: the negotiated Mime::Type, which answers
+    # `== :json` as well as `== "application/json"`.
+    def format
+      type = Mime::Type.lookup_by_extension(@format)
+      return type unless type.nil?
+      Mime::Type.new("text/html", :html)
     end
 
     # The body the transport (or the test harness) hands over is a
@@ -270,6 +289,10 @@ module ActionDispatch
 
     def put?
       @request_method == "PUT"
+    end
+
+    def patch?
+      @request_method == "PATCH"
     end
 
     # `head?` sits beside `get?` because Rails' "is this a safe
@@ -352,6 +375,30 @@ module ActionDispatch
 
     def host=(value)
       @host = value.to_s
+    end
+
+    # Rails' `domain` and `subdomains` at the default `tld_length` of 1,
+    # over the host without its port; an IPv4 host has neither.
+    def domain
+      parts = named_host_parts
+      return nil if parts.empty?
+      parts.last(2).join(".")
+    end
+
+    def subdomains
+      parts = named_host_parts
+      return [] if parts.length < 3
+      parts[0, parts.length - 2].to_a
+    end
+
+    def subdomain
+      subdomains.join(".")
+    end
+
+    def named_host_parts
+      name = host.sub(/:[0-9]+\z/, "")
+      return [] if name.match?(/\A[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\z/)
+      name.split(".")
     end
 
     def forwarded_authority

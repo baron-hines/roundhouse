@@ -42,7 +42,7 @@ fn same_as_native(files: &[(&str, &str)], entry: &str, script: &str, runs: &[(&[
             overlay = overlay.write(&format!("vendor/gems/gqlc-1.0.0/lib/{path}"), text);
         }
         let run = overlay.run_ruby_env(script, env);
-        assert!(run.success, "emitted tree failed under {env:?} in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+        assert!(run.passed(), "under {env:?} in {}: errors {:#?}\n{}\n{}", run.emitted.display(), run.errors, run.stdout, run.stderr);
         assert!(!run.stderr.contains("not_carried"), "{}", run.stderr);
         assert_eq!(run.stdout, *expected, "under {env:?}: {}", run.stderr);
     }

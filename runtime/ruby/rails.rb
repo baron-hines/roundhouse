@@ -812,6 +812,12 @@ module Rails
     def assets
       @assets
     end
+
+    # `Rails.application.config.filter_parameters` read at run time. The
+    # list is the one ingest lifts from the app's `config.filter_parameters`.
+    def filter_parameters
+      Rails.application.config_filter_parameters
+    end
   end
 
   class ImportmapMap

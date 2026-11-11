@@ -22,10 +22,9 @@ const UNSCOPE_PARTS: &[&str] = &["where", "order", "limit", "offset"];
 /// Other literal parts, alone or with `:where`, are `Relation#unscope_parts`
 /// of their list.
 pub fn rewrite_unscope_where(app: &mut App) {
-    fn rewrite(e: &mut Expr) {
-        e.node.for_each_child_mut(&mut rewrite);
+    fn rewrite_send(e: &mut Expr) {
         let span = e.span;
-        if let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &mut *e.node
+        if let ExprNode::Send { method, args, block: None, .. } = &mut *e.node
             && method.as_str() == "unscope"
             && let Some(parts) = literal_parts(args)
         {
@@ -36,6 +35,30 @@ pub fn rewrite_unscope_where(app: &mut App) {
                 *method = Symbol::from("unscope_parts");
                 let elements = std::mem::take(args);
                 *args = vec![Expr::new(span, ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets })];
+            }
+        }
+    }
+    fn rewrite(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut rewrite);
+        if matches!(&*e.node, ExprNode::Send { recv: Some(_), .. }) {
+            rewrite_send(e);
+        }
+    }
+    // An association extension's bare `unscope(:where)` is the relation's
+    // (the flattening re-roots it onto the association). Elsewhere a
+    // bare `unscope` is the model's class method.
+    fn rewrite_bare(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut rewrite_bare);
+        if matches!(&*e.node, ExprNode::Send { recv: None, .. }) {
+            rewrite_send(e);
+        }
+    }
+    for model in &mut app.models {
+        for item in &mut model.body {
+            if let crate::dialect::ModelBodyItem::Association { assoc: crate::dialect::Association::HasMany { extension, .. }, .. } = item {
+                for method in extension {
+                    rewrite_bare(&mut method.body);
+                }
             }
         }
     }

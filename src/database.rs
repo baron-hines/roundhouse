@@ -56,6 +56,10 @@ impl DatabaseAdapter {
     /// The adapter a `url:` names by its scheme, as Rails'
     /// `ConnectionUrlResolver` maps it (`postgres` is `postgresql`).
     pub fn from_url(url: &str) -> Option<Self> {
+        let query_adapter = Self::query_pairs(url).filter(|(key, _)| *key == "adapter").last();
+        if let Some((_, adapter)) = query_adapter {
+            return Some(Self::parse(adapter));
+        }
         let (scheme, _) = url.split_once(':')?;
         if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) {
             return None;
@@ -64,6 +68,13 @@ impl DatabaseAdapter {
             "postgres" => Self::Postgresql,
             scheme => Self::parse(&scheme.replace('-', "_")),
         })
+    }
+
+    /// The `key=value` pairs of a hierarchical URL's query, where Rails' `ConnectionUrlResolver`
+    /// lets them win over the URL's own parts. An opaque URL (`sqlite3:db/x`) keeps its scheme.
+    pub fn query_pairs(url: &str) -> impl Iterator<Item = (&str, &str)> {
+        let query = url.split_once(':').map(|(_, rest)| rest).filter(|rest| rest.starts_with('/')).and_then(|rest| rest.split('#').next()).and_then(|rest| rest.split_once('?')).map(|(_, query)| query);
+        query.into_iter().flat_map(|query| query.split('&')).map(|pair| pair.split_once('=').unwrap_or((pair, "")))
     }
 
     pub fn name(&self) -> &str {

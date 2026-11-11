@@ -484,6 +484,21 @@ fn inflect(word: &str, rules: &[(&str, &str)], from_singular: bool) -> String {
     word.to_string()
 }
 
+/// `String#pluralize`: the rules match case-insensitively, and the word keeps its own case where the plural keeps its letters ("Person" → "People", "API" → "APIs").
+pub fn pluralize(word: &str) -> String {
+    // Not by byte position past ASCII: lowercasing can change a character's width.
+    if !word.is_ascii() {
+        return inflect(word, PLURAL_RULES, true);
+    }
+    let lower = word.to_lowercase();
+    let plural = inflect(&lower, PLURAL_RULES, true);
+    if lower == word {
+        return plural;
+    }
+    let kept = lower.char_indices().zip(plural.chars()).take_while(|((_, a), b)| a == b).last().map_or(0, |((i, c), _)| i + c.len_utf8());
+    format!("{}{}", &word[..kept], &plural[kept..])
+}
+
 pub fn pluralize_snake(class_name: &str) -> String {
     inflect(&snake_case(class_name), PLURAL_RULES, true)
 }
@@ -576,6 +591,13 @@ pub(crate) fn is_sqlite_keyword(name: &str) -> bool {
 
 #[cfg(test)]
 mod string_query_parity {
+    #[test]
+    fn pluralize_matches_any_case_and_keeps_the_words_own() {
+        for (word, plural) in [("User", "Users"), ("Status", "Statuses"), ("Person", "People"), ("Mouse", "Mice"), ("API", "APIs"), ("admin_user", "admin_users")] {
+            assert_eq!(super::pluralize(word), plural, "{word}");
+        }
+    }
+
     use super::{is_reserved_local, RESERVED_LOCALS};
     use ruby_prism::StringQuery;
 

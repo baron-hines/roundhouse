@@ -3,6 +3,32 @@ use crate::ident::Symbol;
 
 use super::params::ParamsSpec;
 
+/// `ActionController::Parameters#require`: the value of `key`, or
+/// `ParameterMissing` when it is absent or blank. `false` is a value.
+const REQUIRE_METHOD: &str = r#"
+  def require(key)
+    value = self[key]
+    if value != false && ActiveSupport.blank?(value)
+      raise ActionController::ParameterMissing.new(key.to_s)
+    end
+    value
+  end
+"#;
+
+/// [`REQUIRE_METHOD`] for the record form of the params class, whose
+/// `[]` reads the fields.
+pub(super) fn require_method(spec: &ParamsSpec) -> MethodDef {
+    let owner = spec.class_id.0.as_str();
+    let source = format!("class {owner}{REQUIRE_METHOD}end\n");
+    let signatures = format!("class {owner}\n  def require: (Symbol) -> untyped\nend\n");
+    let mut method = crate::runtime_src::parse_library_with_rbs(source.as_bytes(), &signatures, "<params_require>")
+        .expect("params require template")
+        .into_iter().flat_map(|class| class.methods)
+        .next().expect("params require method");
+    method.enclosing_class = Some(spec.class_id.0.clone());
+    method
+}
+
 pub(super) fn methods(spec: &ParamsSpec) -> Vec<MethodDef> {
     let owner = spec.class_id.0.as_str();
     let mut source = format!(r#"class {owner}
@@ -74,6 +100,10 @@ pub(super) fn methods(spec: &ParamsSpec) -> Vec<MethodDef> {
   end
 "#));
         signatures.push_str(&format!("  def except: (*(String | Symbol)) -> {owner}\n"));
+    }
+    if spec.lookup_methods.contains(&Symbol::from("require")) {
+        source.push_str(REQUIRE_METHOD);
+        signatures.push_str("  def require: (Symbol) -> Roundhouse::ParamValue\n");
     }
     if spec.lookup_methods.contains(&Symbol::from("compact")) {
         source.push_str(&format!(r#"

@@ -1661,10 +1661,15 @@ fn map_builtin_method(recv: &str, method: &str, ty: Option<&Ty>, args_s: &[Strin
         "join" if is_array => {
             let str_elems =
                 matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Str));
+            // Ruby's `join` reads a nil element as "", and `str(None)` is
+            // "None". Elements of these types are never nil.
+            let never_nil = matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Int | Ty::Float | Ty::Sym));
             let items = if str_elems {
                 recv.to_string()
-            } else {
+            } else if never_nil {
                 format!("map(str, {recv})")
+            } else {
+                format!("\"\" if _x is None else str(_x) for _x in {recv}")
             };
             match args_s.first() {
                 Some(sep) => format!("{sep}.join({items})"),

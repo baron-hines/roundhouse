@@ -154,6 +154,6 @@ fn the_sig_reads_the_constant_it_names_and_the_require_stays() {
 #[ignore = "fork spec: postgresql"]
 fn the_emitted_boot_configures_from_the_sig_and_resolves_the_required_class() {
     let run = app().run_ruby(SCRIPT);
-    assert!(run.success, "{}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
 }

@@ -124,6 +124,15 @@ fn the_spinel_tree_stacks_the_railtie_middleware() {
     assert!(attack.contains("module StoreProxy\n    class RedisProxy < Rack::Attack::BaseProxy"), "{attack}");
 }
 
+#[test]
+fn the_app_middleware_sits_outside_the_railtie_middleware() {
+    let overlay = super::app_middleware::with_application_lines(app(), "    config.middleware.use ProbeUse\n");
+    let (tree, errors) = overlay.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
+    assert!(stack.contains("@stack ||= ProbeUse.new(Rack::Attack.new(App.new))"), "{stack}");
+}
+
 // Not through an emitted app: the ruby family loads rack's own Rack::Request, so only Spinel runs the port.
 #[test]
 fn the_spinel_rack_request_port_finds_the_client_rack_finds() {
@@ -167,9 +176,13 @@ fn the_spinel_adapter_sends_the_response_the_middleware_returns() {
 module Tep
   def self.str_hash = {{}}
 end
+module ActionDispatch
+  class Session
+  end
+end
 Res = Struct.new(:status, :headers, :body, :file_path, :streaming, :set_cookies, :header_fields)
-Req = Struct.new(:verb, :path, :raw_query, :remote_host, :http_version, :req_headers, :raw_body)
-ReqObj = Struct.new(:request_id)
+Req = Struct.new(:verb, :path, :raw_query, :remote_host, :http_version, :req_headers, :raw_body, :listener_transport)
+ReqObj = Struct.new(:request_id, :env, :session)
 module Main
   def self.dispatch_request(req, res, _obj)
     res.status = 200
@@ -196,13 +209,14 @@ class Probe
     case env["PATH_INFO"]
     when "/file", "/stream" then [429, {{ "x-own" => "1" }}, ["replaced"]]
     when "/element" then (body[0] = "element"; response)
+    when "/listener" then [200, {{ "x-listener" => env["roundhouse.listener"] }}, ["listener"]]
     else [status, headers, body]
     end
   end
 end
-def run(path)
+def run(path, listener = "tcp")
   res = Res.new(0, {{}}, +"", +"", false, [], [])
-  GemMiddleware.dispatch(Req.new("GET", path, "", "127.0.0.1", "HTTP/1.1", {{}}, ""), res, ReqObj.new("id"))
+  GemMiddleware.dispatch(Req.new("GET", path, "", "127.0.0.1", "HTTP/1.1", {{}}, "", listener), res, ReqObj.new("id", {{}}, {{}}))
   res
 end
 # Two first requests at once still build one stack.
@@ -215,6 +229,11 @@ res = run("/element")
 raise "element: #{{res.to_h}}" unless res.body == "element" && res.headers["x-routes"] == "/element"
 res = run("/old/page")
 raise "path: #{{res.to_h}}" unless res.body == "routes body" && res.headers["x-routes"] == "/new/page"
+# The env names the listener that accepted the connection, as request.env does.
+%w[unix tcp].each do |listener|
+  res = run("/listener", listener)
+  raise "listener #{{listener}}: #{{res.to_h}}" unless res.headers == {{ "x-listener" => listener }}
+end
 # Built once, as Rails builds its stack, not per request.
 raise "built #{{Probe.built}} times" unless Probe.built == 1
 puts "adapter passed"
