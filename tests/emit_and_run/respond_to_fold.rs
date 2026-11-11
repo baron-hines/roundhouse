@@ -3,7 +3,7 @@ use super::emit_and_run;
 /// `x.respond_to?(:m)` on a class nothing in whose chain answers `m` is false, so Ruby never runs what it guards:
 /// the right of `&&`, the branch of an `if`, and the branch of an `if` over a predicate of the class's own whose body
 /// is that condition (Devise's `unlockable?(resource)`). Those calls are not typed, and the action answers as CRuby.
-const PROBES: &str = r#"class ProbesController < ApplicationController
+const PROBES: &str = r##"class ProbesController < ApplicationController
   def show
     article = Article.new(title: "t")
     first = answers?(article) ? article.nonexistent_method : "missing"
@@ -17,7 +17,7 @@ const PROBES: &str = r#"class ProbesController < ApplicationController
     record.respond_to?(:nonexistent_method) && record.nonexistent_method
   end
 end
-"#;
+"##;
 
 fn app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
@@ -28,10 +28,10 @@ fn app() -> emit_and_run::Overlay {
 #[test]
 fn a_guard_no_class_answers_folds_and_runs_as_ruby_does() {
     let run = app().run_ruby(
-        r#"status, _headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/probe", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+        r##"status, _headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/probe", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
 raise "probe #{status} #{body.join}" unless status == 200 && body.join == "missing skipped false"
 puts "respond_to fold passed"
-"#,
+"##,
     );
     run.assert_passes();
     assert!(run.stdout.contains("respond_to fold passed"), "{}", run.stdout);
