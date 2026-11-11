@@ -108,13 +108,15 @@ module SidekiqPush
   # `at` is what the call named, still to go through Sidekiq's rule: a
   # value under 1,000,000,000 is an interval from now, anything larger
   # an epoch, and 0.0 is no delay. A time that isn't in the future is
-  # pushed at once, as Sidekiq does. `class_side` says the call was a
-  # bare class-side `perform_in` / `perform_at`: Sidekiq builds that
-  # item itself, with `class` before `args`, whether or not it ends up
-  # scheduled; every other call goes through its `Setter`, which writes
-  # `args` first.
-  def self.enqueue_native(job_class, retry_json, queue, extra, at, class_side, args_json)
-    if bulk_limit[0] > 0
+  # pushed at once, as Sidekiq does. `shape` is how Sidekiq builds the
+  # item: 0 through its `Setter`, which writes `args` first; 1 for a bare
+  # class-side `perform_in` / `perform_at`, which it builds itself with
+  # `class` before `args`, whether or not it ends up scheduled; 2 for one
+  # job of a bulk push, held for its batch while one is open. Only a bulk
+  # job is held: another push the bulk block makes goes out as it would
+  # anywhere else.
+  def self.enqueue_native(job_class, retry_json, queue, extra, at, shape, args_json)
+    if shape == 2 && bulk_limit[0] > 0
       bulk.push(HeldNative.new(job_class, retry_json, queue, extra, args_json))
       flush_bulk if bulk.length >= bulk_limit[0]
       return nil
@@ -122,7 +124,7 @@ module SidekiqPush
     now = Time.now.to_f
     ts = at < 1_000_000_000.0 ? now + at : at
     scheduled = ts > now
-    body = if class_side
+    body = if shape != 0
       ",\"class\":" + ActiveJob::Arguments.str(job_class) + ",\"args\":" + args_json
     else
       ",\"args\":" + args_json + ",\"class\":" + ActiveJob::Arguments.str(job_class)
@@ -192,7 +194,7 @@ module SidekiqPush
   end
 
   # A bulk push (`perform_bulk`, the sidekiq-bulk gem's `push_bulk`):
-  # between `bulk_begin(limit)` and `bulk_end` this thread's native jobs
+  # between `bulk_begin(limit)` and `bulk_end` this thread's bulk jobs
   # are held and pushed `limit` at a time, as Sidekiq's
   # `Client#push_bulk` pushes a batch: one `SADD queues` and one `LPUSH`
   # of every envelope, which share one `created_at` and one
@@ -206,6 +208,15 @@ module SidekiqPush
   def self.bulk_end
     bulk_limit[0] = 0
     flush_bulk
+    nil
+  end
+
+  # After a bulk push however it ends: the batch is closed, and the jobs
+  # of a slice the block raised in are dropped, as sidekiq-bulk pushes a
+  # slice only once its block has built every job in it.
+  def self.bulk_abort
+    bulk_limit[0] = 0
+    bulk.clear
     nil
   end
 

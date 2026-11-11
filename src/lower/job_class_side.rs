@@ -671,7 +671,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 wrappers.push(perform_later_with(later));
             }
         }
-        // `perform_async_with(at, queue, retry, class_side, argc, args)`,
+        // `perform_async_with(at, queue, retry, shape, argc, args)`,
         // for a worker an enqueue was folded into under `:sidekiq`.
         if is_worker && sidekiq {
             if let Some(async_) = wrappers.iter().find(|w| w.name.as_str() == "perform_async") {

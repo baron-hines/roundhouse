@@ -6,15 +6,17 @@
 //! Four halves, run where `job_payload`'s are:
 //!
 //! - [`fold_sites`] rewrites each enqueue of a worker into one call,
-//!   `W.perform_async_with(at, queue, retry, class_side, argc, args…)`:
+//!   `W.perform_async_with(at, queue, retry, shape, argc, args…)`:
 //!   `perform_async`, `perform_in` / `perform_at`, and any chain of
 //!   literal `set(queue:, wait:, wait_until:, retry:)` before one of
 //!   them. `at` is the interval or epoch the call names (0.0 for none),
 //!   still to go through Sidekiq's rule for which it is; `queue` and
-//!   `retry` are a `set` override or "" for the class's own; `class_side`
-//!   says the call was a bare class-side `perform_in` / `perform_at`,
-//!   whose envelope Sidekiq writes with `class` before `args`; `argc` is
-//!   how many arguments the call passed, since Sidekiq writes only those.
+//!   `retry` are a `set` override or "" for the class's own; `shape` is
+//!   how Sidekiq builds the envelope: 0 through its `Setter` (`args`
+//!   before `class`), 1 for a bare class-side `perform_in` /
+//!   `perform_at` (`class` before `args`), 2 for one job of a bulk push,
+//!   held for its batch; `argc` is how many arguments the call passed,
+//!   since Sidekiq writes only those.
 //!   Run from `job_class_side`, on every target.
 //! - [`plan_workers`] works out a [`NativePlan`] per worker from those
 //!   call sites: the JSON codec for each of `perform`'s parameters, and
@@ -237,6 +239,14 @@ fn error(span: Span, key: &str, reason: &str, message: String) -> Diagnostic {
 /// job's own.
 pub const LEAD: usize = 5;
 
+/// `perform_async_with`'s `shape`: through Sidekiq's `Setter` (`args`
+/// before `class`).
+const SHAPE_SETTER: i64 = 0;
+/// A bare class-side `perform_in` / `perform_at` (`class` before `args`).
+const SHAPE_CLASS_SIDE: i64 = 1;
+/// One job of a bulk push: held for its batch, and only such a job is.
+const SHAPE_BULK_ITEM: i64 = 2;
+
 /// What [`fold_sites`] did: the workers it folded a call for, and each
 /// `set(...)` it couldn't honor.
 #[derive(Default)]
@@ -261,10 +271,6 @@ fn float_lit(span: Span, v: f64) -> Expr {
 
 fn str_lit(span: Span, v: &str) -> Expr {
     typed(span, ExprNode::Lit { value: Literal::Str { value: v.to_string() } }, Ty::Str)
-}
-
-fn bool_lit(span: Span, v: bool) -> Expr {
-    typed(span, ExprNode::Lit { value: Literal::Bool { value: v } }, Ty::Bool)
 }
 
 fn int_lit(span: Span, v: i64) -> Expr {
@@ -472,9 +478,9 @@ fn fold_in(
                     let at = at.unwrap_or_else(|| float_lit(span, 0.0));
                     let queue = opts.queue.unwrap_or_else(|| str_lit(span, ""));
                     let retry = str_lit(span, opts.retry.as_deref().unwrap_or(""));
-                    let class_side = bool_lit(span, delayed && sets.is_empty());
+                    let shape = int_lit(span, if delayed && sets.is_empty() { SHAPE_CLASS_SIDE } else { SHAPE_SETTER });
                     let argc = int_lit(span, own.len() as i64);
-                    let mut all = vec![at, queue, retry, class_side, argc];
+                    let mut all = vec![at, queue, retry, shape, argc];
                     all.extend(own);
                     let mut call = Expr::new(
                         span,
@@ -507,10 +513,10 @@ fn fold_in(
     }
 }
 
-/// `perform_async_with(0.0, <queue>, <retry>, false, argc, row…)` on
+/// `perform_async_with(0.0, <queue>, <retry>, 2, argc, row…)` on
 /// `worker`: one job of a bulk push.
 fn async_with_call(span: Span, worker: &Expr, queue: Expr, retry: &str, row: Vec<Expr>) -> Expr {
-    let mut all = vec![float_lit(span, 0.0), queue, str_lit(span, retry), bool_lit(span, false), int_lit(span, row.len() as i64)];
+    let mut all = vec![float_lit(span, 0.0), queue, str_lit(span, retry), int_lit(span, SHAPE_BULK_ITEM), int_lit(span, row.len() as i64)];
     all.extend(row);
     typed(
         span,
@@ -544,8 +550,9 @@ fn bulk_limit(args: &mut Vec<Expr>, name: &str) -> Result<Option<i64>, ()> {
     Ok(Some(n))
 }
 
-/// A bulk push, folded to one `perform_async_with` per job between the
-/// worker's `push_bulk_begin(limit)` and `push_bulk_end`, which batch
+/// A bulk push, folded to one `perform_async_with` per job (shape
+/// `SHAPE_BULK_ITEM`) between the worker's `push_bulk_begin(limit)` and
+/// `push_bulk_end`, with `push_bulk_abort` on every exit, which batch
 /// them as Sidekiq's `Client#push_bulk` does (`SidekiqPush.bulk_begin`):
 ///
 /// - `W.push_bulk(items, limit: N) { |x| …; [a, b] }` (the sidekiq-bulk
@@ -714,9 +721,24 @@ fn fold_bulk(
         ExprNode::Send { recv: Some(base.clone()), method: Symbol::from("push_bulk_end"), args: vec![], block: None, parenthesized: false },
         Ty::Nil,
     );
+    let abort = typed(
+        span,
+        ExprNode::Send { recv: Some(base.clone()), method: Symbol::from("push_bulk_abort"), args: vec![], block: None, parenthesized: false },
+        Ty::Nil,
+    );
+    // The last batch is pushed only when every item was built, as
+    // sidekiq-bulk maps a whole slice before pushing it; whatever ends the
+    // block, the batch is then closed, and a slice the block raised in is
+    // dropped.
     let guarded = typed(
         span,
-        ExprNode::BeginRescue { body, rescues: Vec::new(), else_branch: None, ensure: Some(end), implicit: false },
+        ExprNode::BeginRescue {
+            body: typed(span, ExprNode::Seq { exprs: vec![body, end] }, Ty::Nil),
+            rescues: Vec::new(),
+            else_branch: None,
+            ensure: Some(abort),
+            implicit: false,
+        },
         Ty::Nil,
     );
     folds.workers.insert(name.clone());
@@ -759,9 +781,10 @@ fn retype_item(e: &mut Expr, name: &Symbol, model: &str, models: &NativeModels) 
     e.node.for_each_child_mut(&mut |c| retype_item(c, name, model, models));
 }
 
-/// `push_bulk_begin(limit)` and `push_bulk_end`: nothing on a target
-/// without the push, where the jobs between them run inline; on the Ruby
-/// family [`apply_ruby`] makes them `SidekiqPush.bulk_begin` / `bulk_end`.
+/// `push_bulk_begin(limit)`, `push_bulk_end` and `push_bulk_abort`:
+/// nothing on a target without the push, where the jobs between them run
+/// inline; on the Ruby family [`apply_ruby`] makes them
+/// `SidekiqPush.bulk_begin` / `bulk_end` / `bulk_abort`.
 pub fn bulk_wrappers(async_: &MethodDef) -> Vec<MethodDef> {
     let span = async_.body.span;
     let nil = typed(span, ExprNode::Lit { value: Literal::Nil }, Ty::Nil);
@@ -776,17 +799,20 @@ pub fn bulk_wrappers(async_: &MethodDef) -> Vec<MethodDef> {
         ret: std::sync::Arc::new(Ty::Nil),
         effects: crate::effect::EffectSet::pure(),
     });
-    let mut end = async_.clone();
-    end.name = Symbol::from("push_bulk_end");
-    end.params = Vec::new();
-    end.body = nil;
-    end.signature = Some(Ty::Fn {
-        params: Vec::new().into(),
-        block: None,
-        ret: std::sync::Arc::new(Ty::Nil),
-        effects: crate::effect::EffectSet::pure(),
-    });
-    vec![begin, end]
+    let no_args = |name: &str| {
+        let mut m = async_.clone();
+        m.name = Symbol::from(name);
+        m.params = Vec::new();
+        m.body = nil.clone();
+        m.signature = Some(Ty::Fn {
+            params: Vec::new().into(),
+            block: None,
+            ret: std::sync::Arc::new(Ty::Nil),
+            effects: crate::effect::EffectSet::pure(),
+        });
+        m
+    };
+    vec![begin, no_args("push_bulk_end"), no_args("push_bulk_abort")]
 }
 
 /// The folds' errors: a `set(...)` before a worker's enqueue that isn't
@@ -823,7 +849,7 @@ pub fn rejected_diagnostics(folds: &NativeFolds) -> Vec<Diagnostic> {
     out
 }
 
-/// `perform_async_with(at, queue, retry_json, class_side, argc, *params)`:
+/// `perform_async_with(at, queue, retry_json, shape, argc, *params)`:
 /// `async_`'s body with its parameters moved `LEAD` places along. The
 /// lead names are made fresh past the job's own.
 pub fn perform_async_with(async_: &MethodDef) -> MethodDef {
@@ -837,7 +863,7 @@ pub fn perform_async_with(async_: &MethodDef) -> MethodDef {
     w.name = Symbol::from("perform_async_with");
     shift(&mut w.body);
     let names = lead_names(&async_.params);
-    let tys = [Ty::Float, Ty::Str, Ty::Str, Ty::Bool, Ty::Int];
+    let tys = [Ty::Float, Ty::Str, Ty::Str, Ty::Int, Ty::Int];
     let mut params: Vec<crate::dialect::Param> =
         names.iter().map(|n| crate::dialect::Param::positional(Symbol::from(n.as_str()))).collect();
     params.extend(async_.params.iter().cloned());
@@ -858,11 +884,11 @@ pub fn perform_async_with(async_: &MethodDef) -> MethodDef {
     w
 }
 
-/// `at`, `queue`, `retry_json`, `class_side`, `argc`, each made fresh
+/// `at`, `queue`, `retry_json`, `shape`, `argc`, each made fresh
 /// past the job's own parameter names.
 fn lead_names(own: &[crate::dialect::Param]) -> Vec<String> {
     let own: Vec<&str> = own.iter().map(|p| p.name.as_str()).collect();
-    ["at", "queue", "retry_json", "class_side", "argc"]
+    ["at", "queue", "retry_json", "shape", "argc"]
         .iter()
         .map(|b| super::job_payload::fresh_name(b, &own))
         .collect()
@@ -1184,7 +1210,7 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
         for m in lc.methods.iter_mut() {
             if m.receiver == MethodReceiver::Class
                 && plan.is_payload()
-                && matches!(m.name.as_str(), "push_bulk_begin" | "push_bulk_end")
+                && matches!(m.name.as_str(), "push_bulk_begin" | "push_bulk_end" | "push_bulk_abort")
             {
                 let span = m.body.span;
                 let args = if m.name.as_str() == "push_bulk_begin" {
@@ -1194,7 +1220,11 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                 } else {
                     Vec::new()
                 };
-                let method = if m.name.as_str() == "push_bulk_begin" { "bulk_begin" } else { "bulk_end" };
+                let method = match m.name.as_str() {
+                    "push_bulk_begin" => "bulk_begin",
+                    "push_bulk_end" => "bulk_end",
+                    _ => "bulk_abort",
+                };
                 m.body = typed(
                     span,
                     ExprNode::Send {
@@ -1242,7 +1272,7 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                     v
                 })
                 .collect();
-            // `push_native_<w>(queue, at, retry_json, class_side, argc, args…)`.
+            // `push_native_<w>(queue, at, retry_json, shape, argc, args…)`.
             let args: Vec<Expr> = if m.name.as_str() == "perform_async_with" {
                 let mut all: Vec<Expr> = vars[..LEAD].to_vec();
                 all.swap(0, 1);
@@ -1253,7 +1283,7 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                     str_lit(span, ""),
                     float_lit(span, 0.0),
                     str_lit(span, ""),
-                    bool_lit(span, false),
+                    int_lit(span, SHAPE_SETTER),
                     int_lit(span, vars.len() as i64),
                 ];
                 all.extend(vars);
@@ -1314,9 +1344,9 @@ fn is_active_job_call(e: &Expr, name: &str) -> bool {
 /// Each pushable worker's `push_native_<worker>`:
 ///
 /// ```ruby
-/// def self.push_native_ok_worker(queue, at, retry_json, class_side, argc, id, opts)
+/// def self.push_native_ok_worker(queue, at, retry_json, shape, argc, id, opts)
 ///   SidekiqPush.enqueue_native("OkWorker", retry_json == "" ? "5" : retry_json,
-///     queue == "" ? "pull" : queue, "", at, class_side,
+///     queue == "" ? "pull" : queue, "", at, shape,
 ///     ActiveJob::Arguments.list([ActiveJob::Arguments.int(id), …].first(argc)))
 /// end
 /// ```
@@ -1324,11 +1354,11 @@ pub fn registry_source(plans: &[NativePlan]) -> String {
     let mut s = String::new();
     for plan in plans.iter().filter(|p| p.is_payload()) {
         let own: Vec<&str> = plan.params.iter().map(|p| p.name.as_str()).collect();
-        let lead: Vec<String> = ["queue", "at", "retry_json", "class_side", "argc"]
+        let lead: Vec<String> = ["queue", "at", "retry_json", "shape", "argc"]
             .iter()
             .map(|b| super::job_payload::fresh_name(b, &own))
             .collect();
-        let (queue, at, retry, class_side, argc) = (&lead[0], &lead[1], &lead[2], &lead[3], &lead[4]);
+        let (queue, at, retry, shape, argc) = (&lead[0], &lead[1], &lead[2], &lead[3], &lead[4]);
         let mut params = lead.clone();
         params.extend(own.iter().map(|n| n.to_string()));
         let list = if plan.params.is_empty() {
@@ -1339,7 +1369,7 @@ pub fn registry_source(plans: &[NativePlan]) -> String {
         };
         s.push_str(&format!("  def self.push_native_{}({})\n", plan.suffix(), params.join(", ")));
         s.push_str(&format!(
-            "    SidekiqPush.enqueue_native({}, {retry} == \"\" ? {} : {retry}, {queue} == \"\" ? {} : {queue}, {}, {at}, {class_side},\n      {list})\n",
+            "    SidekiqPush.enqueue_native({}, {retry} == \"\" ? {} : {retry}, {queue} == \"\" ? {} : {queue}, {}, {at}, {shape},\n      {list})\n",
             ruby_str(&plan.worker),
             ruby_str(&plan.retry),
             ruby_str(&plan.queue),

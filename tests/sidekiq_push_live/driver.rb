@@ -81,11 +81,11 @@ ActiveJob.transaction_rolled_back
 # Native Sidekiq jobs: one pushed at once, one scheduled (a class-side
 # perform_in), and a bulk push of three in batches of two through
 # SidekiqRedis.push_many.
-SidekiqPush.enqueue_native("NativeWorker", "5", "native", ",\"dead\":false", 0.0, false, "[1,{\"a\":\"b\"}]")
-SidekiqPush.enqueue_native("NativeWorker", "5", "native", "", 300.0, true, "[2]")
+SidekiqPush.enqueue_native("NativeWorker", "5", "native", ",\"dead\":false", 0.0, 0, "[1,{\"a\":\"b\"}]")
+SidekiqPush.enqueue_native("NativeWorker", "5", "native", "", 300.0, 1, "[2]")
 SidekiqPush.bulk_begin(2)
 [3, 4, 5].each do |i|
-  SidekiqPush.enqueue_native("NativeWorker", "true", "native", "", 0.0, false, "[" + i.to_s + "]")
+  SidekiqPush.enqueue_native("NativeWorker", "true", "native", "", 0.0, 2, "[" + i.to_s + "]")
 end
 SidekiqPush.bulk_end
 

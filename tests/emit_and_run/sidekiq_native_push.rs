@@ -328,13 +328,13 @@ fn native_pushes_match_sidekiq() {
 
     let registry = std::fs::read_to_string(run.emitted.join("runtime/job_registry.rb")).unwrap();
     assert!(
-        registry.contains("def self.push_native_ok_worker(queue, at, retry_json, class_side, argc, id, opts)"),
+        registry.contains("def self.push_native_ok_worker(queue, at, retry_json, shape, argc, id, opts)"),
         "{registry}"
     );
     let worker = std::fs::read_to_string(run.emitted.join("app/workers/ok_worker.rb"))
         .or_else(|_| std::fs::read_to_string(run.emitted.join("app/models/ok_worker.rb")))
         .unwrap();
-    assert!(worker.contains("def self.perform_async_with(at, queue, retry_json, class_side, argc, id, opts = {})"), "{worker}");
+    assert!(worker.contains("def self.perform_async_with(at, queue, retry_json, shape, argc, id, opts = {})"), "{worker}");
     assert!(!worker.contains("Sidekiq::Job") && !worker.contains("sidekiq_options"), "{worker}");
 }
 
@@ -348,6 +348,53 @@ fn bulk_pushes_match_sidekiq() {
     run.assert_passes();
     assert!(run.stdout.contains("native pushes recorded"), "{}", run.stdout);
     check_against_oracle(&run, BULK_SCENARIOS);
+}
+
+/// A `push_bulk` block's other pushes go out as they would anywhere (a
+/// `perform_in` is scheduled, another worker's push isn't batched), and
+/// a block that raises pushes the slices it finished and drops the one
+/// it raised in, as sidekiq-bulk does.
+#[test]
+fn a_bulk_block_holds_only_its_own_jobs() {
+    let run = on_sidekiq(&[
+        (
+            "bulk_with_others",
+            "OkWorker.push_bulk([1, 2, 3], limit: 2) do |i|\n      PlainWorker.perform_in(60, i)\n      NoRetryWorker.perform_async(i)\n      [i, \"n\"]\n    end",
+        ),
+        (
+            "bulk_raises",
+            "OkWorker.push_bulk([1, 2, 3], limit: 2) do |i|\n      raise ArgumentError, \"bad item\" if i == 3\n      [i, \"n\"]\n    end",
+        ),
+    ])
+    .write("app/workers/ok_worker.rb", BULK_OK_WORKER)
+    .run_ruby(
+        r##"ActiveJob.register_drain
+SidekiqPush.start_recording
+Article.native_bulk_with_others
+lines = SidekiqPush.recorded
+scheduled = lines.select { |l| l.start_with?("zadd schedule ") }
+raise "perform_in in the block: #{lines.inspect}" unless scheduled.length == 3 && scheduled.all? { |l| l.include?(""class":"PlainWorker"") }
+others = lines.select { |l| l.start_with?("lpush queue:default ") }
+raise "another worker's push: #{lines.inspect}" unless others.length == 3 && others.all? { |l| l.split(""jid":").length == 2 }
+bulk = lines.select { |l| l.start_with?("lpush queue:pull ") }
+raise "the bulk's batches: #{lines.inspect}" unless bulk.map { |l| l.split(""jid":").length - 1 } == [2, 1]
+SidekiqPush.start_recording
+raised = false
+begin
+  Article.native_bulk_raises
+rescue ArgumentError
+  raised = true
+end
+lines = SidekiqPush.recorded
+raise "the block's error: #{lines.inspect}" unless raised
+raise "a raised slice was pushed: #{lines.inspect}" unless lines.length == 2 && lines[1].split(""jid":").length == 3 && !lines[1].include?(""args":[3,")
+raise "the batch stayed open" unless SidekiqPush.bulk_limit[0] == 0 && SidekiqPush.bulk.length == 0
+SidekiqPush.stop_recording
+puts "bulk block passed"
+"##,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("bulk block passed"), "{}", run.stdout);
 }
 
 /// A bulk push over a relation's records types each item as the model,
