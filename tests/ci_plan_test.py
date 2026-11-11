@@ -851,6 +851,7 @@ class Routing(unittest.TestCase):
     def test_file_level_data_records_select_the_native_toolchain_lane(self):
         for path in [
             "src/analyze/data.rs",
+            "src/analyze/mod.rs",
             "src/ingest/library_class.rs",
             "src/ingest/app.rs",
             "src/ingest/file_program.rs",

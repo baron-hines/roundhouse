@@ -3557,8 +3557,8 @@ pub(crate) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "strscan", "tempfile", "time", "timeout", "tmpdir", "uri", "weakref", "yaml", "zlib",
 ];
 
-/// [`App::app_requires`]: every literal top-level `require "lib"` of a
-/// standard library in the ingested Ruby sources under the app and
+/// [`App::app_requires`]: every literal `require "lib"` at file level or
+/// in a class or module body for a standard library under the app and
 /// support roots, including files loaded by the boot chain. A terminal
 /// channel that requires `pty` and `io/console` needs the second for `IO#winsize=`,
 /// which io/console adds and no constant names, so the bundled requires
@@ -3572,12 +3572,8 @@ fn collect_app_requires(sources: &[crate::span::SourceFile], roots: &[PathBuf]) 
         {
             continue;
         }
-        let parsed = super::prism::parse(source.text.as_bytes(), &source.path);
-        if let Some(program) = parsed.node().as_program_node() {
-            out.extend(program.statements().body().iter().filter_map(|stmt| {
-                stmt.as_call_node().and_then(|call| super::file_program::literal_require(&call))
-            }).filter_map(|(lib, relative)| (!relative && APP_REQUIRABLE_STDLIB.contains(&lib.as_str())).then_some(lib)));
-        }
+        out.extend(super::file_program::literal_requires(source.text.as_bytes(), &source.path)
+            .into_iter().filter(|lib| APP_REQUIRABLE_STDLIB.contains(&lib.as_str())));
     }
     out.into_iter().collect()
 }

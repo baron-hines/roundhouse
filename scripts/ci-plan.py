@@ -856,6 +856,7 @@ def select(
 
         if path in {
             "src/analyze/data.rs",
+            "src/analyze/mod.rs",
             "src/ingest/library_class.rs",
             "src/ingest/app.rs",
             "src/ingest/file_program.rs",

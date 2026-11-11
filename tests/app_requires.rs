@@ -32,6 +32,26 @@ fn an_ingested_library_file_contributes_its_require() {
 }
 
 #[test]
+fn a_data_records_sibling_declaration_contributes_its_require() {
+    for kind in ["class", "module"] {
+        for indent in ["", "  "] {
+            // The unindented form was also collected by the old line scanner.
+            let source = format!(
+                "Artifact = Data.define(:value)\n{kind} TerminalProbe\n{indent}require \"io/console\"\n  def self.rows = 1\nend\n"
+            );
+            for path in ["lib/terminal_probe.rb", "app/models/terminal_probe.rb"] {
+                let app = app(&[(path, &source)]);
+                for name in ["Artifact", "TerminalProbe"] {
+                    assert!(app.library_classes.iter().any(|class| class.name.0.as_str() == name),
+                        "{path}: {source}: {name} was dropped");
+                }
+                assert_eq!(app.app_requires, ["io/console"], "{path}: {source}");
+            }
+        }
+    }
+}
+
+#[test]
 fn an_ignored_library_file_contributes_no_requires() {
     let app = app(&[
         (
