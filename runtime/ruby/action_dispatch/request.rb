@@ -293,7 +293,10 @@ module ActionDispatch
     def self.for_env(env)
       found = env["roundhouse.request"]
       return found if found.is_a?(ActionDispatch::Request)
-      ActionDispatch::Request.new
+      # Not a request of its own env: what it is asked for and writes (its cookie jar) is the env's, as Rails' is.
+      request = ActionDispatch::Request.new
+      request.env = env
+      request
     end
 
     # Rails' HTTP_METHOD_LOOKUP: the verb as a Symbol, `M-SEARCH` as `:m_search`.

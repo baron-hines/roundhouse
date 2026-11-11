@@ -1166,3 +1166,58 @@ fn a_devise_account_locks_and_unlocks_over_http_natively() {
     let signed = sign_in("secret123");
     assert_eq!(signed.status, 302, "{}\n{}", signed.body, server.log());
 }
+
+/// `:rememberable`, as Rails 8.1.4 with Devise 4.9.4 answers it: a sign-in with "remember me" sets the signed
+/// `remember_user_token` (its value `[[id], salt, at]` read back as JSON, an Expires `remember_for` out), the cookie
+/// alone signs the user back in through a route's `authenticate` (a Warden strategy before any controller, reading
+/// `request.cookie_jar`), and signing out forgets it.
+const RACK_REMEMBER: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  $set = Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }
+  $set.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+token_of = ->(page) { URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1]) }
+
+req("GET", "/account/new")
+_, _, page = req("GET", "/users/sign_in")
+status, = req("POST", "/users/sign_in", "authenticity_token=#{token_of.(page)}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=secret123&user%5Bremember_me%5D=1")
+remember = $set.find { |line| line.start_with?("remember_user_token=") }
+raise "sign in #{status} #{$set.inspect}" unless status == 302 && remember && remember =~ /expires=/i && remember =~ /httponly/i
+raise "remember_created_at" if User.find_by(email: "a@example.com").remember_created_at.nil?
+$jar.delete("_real_blog_session")
+status, = req("GET", "/secret")
+raise "remembered #{status}" unless status == 200
+_, _, home = req("GET", "/")
+token = URI.encode_www_form_component(home[/name="csrf-token" content="([^"]*)"/, 1].to_s)
+status, = req("POST", "/users/sign_out", "_method=delete&authenticity_token=#{token}")
+raise "sign out #{status} #{$set.inspect}" unless status == 302 && $set.any? { |line| line.start_with?("remember_user_token=;") && line.include?("Max-Age=0") }
+raise "forgotten" unless User.find_by(email: "a@example.com").remember_created_at.nil?
+$jar.delete("_real_blog_session")
+status, = req("GET", "/secret")
+raise "signed out #{status}" unless status == 302
+puts "devise remember-me over rack passed"
+"##;
+
+#[test]
+fn a_devise_user_is_remembered_by_cookie_over_rack_on_the_ruby_family() {
+    let run = app(":database_authenticatable, :rememberable", "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n")
+        .edit("db/schema.rb", "    t.datetime \"reset_password_sent_at\"\n", "    t.datetime \"reset_password_sent_at\"\n    t.datetime \"remember_created_at\"\n")
+        .write("app/controllers/accounts_controller.rb", ACCOUNTS)
+        .run_ruby(RACK_REMEMBER);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise remember-me over rack passed"), "{}", run.stdout);
+}
