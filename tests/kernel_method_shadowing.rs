@@ -146,6 +146,78 @@ end
     }
 }
 
+const EXTENDED: &str = r#"module Inner
+  def format(value) = 17
+end
+module Outer
+  include Inner
+  def format(value) = "outer"
+end
+class Extended
+  extend Outer
+  def self.reference = format(nil)
+end
+"#;
+
+#[test]
+fn an_extended_module_precedes_its_included_methods() {
+    let signatures = rbs(EXTENDED, "extended");
+    assert!(signatures.contains("def self.reference: () -> String"), "{signatures}");
+    let run = app(EXTENDED).run_ruby("p Extended.reference\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "\"outer\"\n");
+}
+
+#[test]
+fn stored_class_and_instance_method_references_keep_their_dispatch_side() {
+    for method in ["load", "parse"] {
+        for storage in ["@loader", "@@loader"] {
+            for (value, expected, output) in [
+                ("Loader", "Integer", "[17]\n"),
+                ("Loader.new", "String", "[\"instance\"]\n"),
+            ] {
+                let initializer = if storage == "@@loader" {
+                    format!("  {storage} = {value}\n")
+                } else {
+                    format!("  def initialize\n    {storage} = {value}\n  end\n")
+                };
+                let source = format!(r#"class Loader
+  def self.{method}(value) = 17
+  def {method}(value) = "instance"
+end
+class Stored
+{initializer}
+  def reference = [nil].map(&{storage}.method(:{method}))
+end
+"#);
+                let signatures = rbs(&source, "stored");
+                assert!(signatures.contains(&format!("def reference: () -> Array[{expected}]")),
+                    "{storage} = {value}, {method}:\n{signatures}");
+                let run = app(&source).run_ruby("p Stored.new.reference\n");
+                run.assert_passes();
+                assert_eq!(run.stdout, output);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nested_extensions_compile_with_unmodified_signatures() {
+    let (tree, errors) = app(EXTENDED).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(tree.join("contract.rb"),
+        "require_relative \"app/models/inner\"\nrequire_relative \"app/models/outer\"\nrequire_relative \"app/models/extended\"\np Extended.reference\n").unwrap();
+    let built = std::process::Command::new(std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into()))
+        .args(["--strict-require", "--rbs", "app/models", "contract.rb", "-o", "contract"])
+        .current_dir(&tree).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let run = std::process::Command::new(tree.join("contract"))
+        .current_dir(&tree).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "\"outer\"\n");
+}
+
 #[test]
 fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls
