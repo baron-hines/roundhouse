@@ -36,6 +36,8 @@ raise "required helper" unless DefaultsApplication.routes.url_helpers.number_pat
 raise "optional helper" unless DefaultsApplication.routes.url_helpers.optional_path == "/optional"
 links = Rack::MockRequest.new(DefaultsApplication).get("/links")
 raise "default helpers: #{links.body}" unless links.body == "/optional|/optional|/optional/2|/optional/2|/optional|/literal|/entry/9|/entry/9/page/2|/catalog|/fr/catalog"
+formatted = Rack::MockRequest.new(DefaultsApplication).get("/format_links")
+raise "formatted helpers: #{formatted.body}" unless formatted.body == "/optional/1.json|/optional/1.json|/entry/9/page/1.json|/archive/2024.json"
 raise "unescaped recognition" unless DefaultsApplication.routes.recognize_path("/escaped")[:text] == "a b+%20"
 raise "byte recognition" unless DefaultsApplication.routes.recognize_path("/byte")[:text].bytes == [255]
 escaped = Rack::MockRequest.new(DefaultsApplication).get("/escaped")
@@ -69,6 +71,15 @@ class DefaultsControllerTest < ActionController::TestCase
 end
 class DefaultsRoutingTest < ActionDispatch::IntegrationTest
   setup { @routes = DefaultsApplication.routes }
+  test "optional defaults are omitted only when nothing follows" do
+    assert_routing "/archive", { controller: "defaults", action: "archive", year: 2024 }
+    assert_generates "/archive", { controller: "defaults", action: "archive", year: 2024 }
+    assert_generates "/archive", { controller: "defaults", action: "archive", year: "2024" }
+    assert_generates "/archive/2025", { controller: "defaults", action: "archive", year: 2025 }
+    assert_generates "/archive/2024.json", { controller: "defaults", action: "archive", year: 2024, format: "json" }
+    assert_generates "/required/1", { controller: "defaults", action: "required", number: 1 }
+    assert_generates "/json_archive", { controller: "defaults", action: "json_archive", year: 2024, format: "json" }
+  end
   test "routing recognizes and generates defaults" do
     assert_routing "/routing", { controller: "defaults", action: "routing", text: "fixed", symbol: :staff, number: 1, yes: true, no: false, absent: nil }
     assert_generates "/routing", { controller: "defaults", action: "routing", text: "other" }

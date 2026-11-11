@@ -1538,14 +1538,16 @@ fn build_helper_function(
     } else {
         build_path_expr(path, &seg_params, &slug_params)
     };
-    // A single optional segment is omitted when its supplied value equals its default.
-    if let Some(p) = seg_params.get(required).filter(|_| seg_params.len() == required + 1) {
-        if let Some((_, value, _)) = route.request_defaults.iter().find(|(name, _, _)| name == p) {
-            let default = Expr::new(Span::synthetic(), ExprNode::Lit { value: value.clone() });
-            let cond = with_ty(send_method(send_method(var_ref(p), "to_s", vec![]), "==", vec![send_method(default, "to_s", vec![])]), Ty::Bool);
-            let omitted = build_path_expr(route.required_path.as_deref().unwrap_or("/"), &seg_params[..required], &slug_params);
-            body = with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: omitted, else_branch: body }), Ty::Str);
-        }
+    // A single optional default is omitted only when no format follows it.
+    if let Some(p) = seg_params.get(required).filter(|_| seg_params.len() == required + 1 && ext.is_none_or(|ext| route.format.as_ref().is_some_and(|default| default.as_str() == ext)))
+        && let Some((_, value, _)) = route.request_defaults.iter().find(|(name, _, _)| name == p) {
+        let default = Expr::new(Span::synthetic(), ExprNode::Lit { value: value.clone() });
+        let cond = with_ty(send_method(send_method(var_ref(p), "to_s", vec![]), "==", vec![send_method(default, "to_s", vec![])]), Ty::Bool);
+        let omitted = build_path_expr(route.required_path.as_deref().unwrap_or("/"), &seg_params[..required], &slug_params);
+        let omitted = if has_format {
+            with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond: with_ty(send_method(send_method(var_ref("format"), "to_s", vec![]), "==", vec![lit_str(String::new())]), Ty::Bool), then_branch: omitted, else_branch: body.clone() }), Ty::Str)
+        } else { omitted };
+        body = with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: omitted, else_branch: body }), Ty::Str);
     }
     // Rails' `(.:format)`: a route path spelled the `rails routes` way
     // ends in `(.:format)`, which gives the helper a trailing optional

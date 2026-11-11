@@ -102,6 +102,31 @@ raise "default helpers" unless answer("GET", "/links", "", "", {{}})[1] == "/opt
 "#)).assert_passes();
 }
 #[test]
+fn routing_assertions_omit_only_trailing_optional_defaults() {
+    app().write("test/controllers/defaults_controller_test.rb", r#"require "test_helper"
+class DefaultsControllerTest < ActionDispatch::IntegrationTest
+  test "routing omits an optional value equal to its default" do
+    assert_routing "/archive", { controller: "defaults", action: "archive", year: 2024 }
+  end
+  test "generation omits an optional value equal to its default" do
+    assert_generates "/archive", { controller: "defaults", action: "archive", year: 2024 }
+    assert_generates "/archive", { controller: "defaults", action: "archive", year: "2024" }
+    assert_generates "/archive/2025", { controller: "defaults", action: "archive", year: 2025 }
+    assert_generates "/archive/2024.json", { controller: "defaults", action: "archive", year: 2024, format: "json" }
+    assert_generates "/required/1", { controller: "defaults", action: "required", number: 1 }
+    assert_generates "/json_archive", { controller: "defaults", action: "json_archive", year: 2024, format: "json" }
+  end
+end
+"#).run_test("test/controllers/defaults_controller_test.rb").assert_passes();
+}
+
+#[test]
+fn helpers_keep_optional_defaults_before_a_format() {
+    app().run_ruby(&format!(r#"{CHECKS}
+raise "formatted helpers" unless answer("GET", "/format_links", "", "", {{}})[1] == "/optional/1.json|/optional/1.json|/entry/9/page/1.json|/archive/2024.json"
+"#)).assert_passes();
+}
+#[test]
 #[ignore = "requires the Spinel toolchain"]
 fn typed_defaults_reach_native_params() {
     let script = r#"require_relative "test/test_helper"
@@ -117,6 +142,9 @@ raise "types: " + controller.response.body.inspect unless controller.response.bo
 probe = ActionDispatch::IntegrationTest.new
 probe.assert_recognizes({ controller: "defaults", action: "show", text: "a b+%20" }, "/escaped")
 probe.assert_routing("/routing", { controller: "defaults", action: "routing", text: "fixed", symbol: :staff, number: 1, yes: true, no: false, absent: nil })
+probe.assert_routing("/archive", { controller: "defaults", action: "archive", year: 2024 })
+probe.assert_generates("/archive", { controller: "defaults", action: "archive", year: 2024 })
+probe.assert_generates("/archive/2024.json", { controller: "defaults", action: "archive", year: 2024, format: "json" })
 puts "kind=fixed"
 "#;
     app().run_spinel_with_rbs(script).assert_passes();
@@ -136,6 +164,9 @@ fn route_defaults_win_over_native_multipart_uploads() {
     let links = server.get("/links");
     assert_eq!(links.status, 200, "{}", server.log());
     assert_eq!(links.body, "/optional|/optional|/optional/2|/optional/2|/optional|/literal|/entry/9|/entry/9/page/2|/catalog|/fr/catalog", "{}", server.log());
+    let formatted = server.get("/format_links");
+    assert_eq!(formatted.status, 200, "{}", server.log());
+    assert_eq!(formatted.body, "/optional/1.json|/optional/1.json|/entry/9/page/1.json|/archive/2024.json", "{}", server.log());
 }
 
 #[test]

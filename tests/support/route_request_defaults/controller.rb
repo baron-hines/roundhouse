@@ -8,4 +8,16 @@ class DefaultsController < ApplicationController
   def routing
     show
   end
+  def archive
+    show
+  end
+  def required
+    show
+  end
+  def json_archive
+    show
+  end
+  def format_links
+    render plain: [optional_path(1, format: :json), optional_path(number: 1, format: "json"), entry_path(9, 1, format: :json), archive_path(2024, format: :json)].join("|")
+  end
 end

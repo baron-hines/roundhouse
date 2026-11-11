@@ -10,3 +10,7 @@
   get "/byte", to: "defaults#show", defaults: { text: "%FF" }
   get "/entry/:id(/page/:number)", as: :entry, to: "defaults#show", defaults: { number: 1 }
   get "(/:locale)/catalog", as: :catalog, to: "defaults#show", defaults: { locale: "en" }
+  get "/archive(/:year)", as: :archive, to: "defaults#archive", defaults: { year: 2024 }
+  get "/format_links", to: "defaults#format_links"
+  get "/required/:number", to: "defaults#required", defaults: { number: 1 }
+  get "/json_archive(/:year)", to: "defaults#json_archive", defaults: { year: 2024, format: "json" }

@@ -1677,6 +1677,12 @@ module ActionDispatch
           end
           names = generation_segment_names(route.pattern)
           next unless names.all? { |name| given.key?(name) }
+          defaults = {}
+          RouteTable.route_defaults(route.defaults, defaults, {})
+          trailing = names.last.to_s
+          if (!route.req_format.nil? || !given.key?("format")) && defaults.key?(trailing) && defaults[trailing].to_s == given[trailing]
+            next if routes.any? { |short| short.defaults == route.defaults && short.controller == route.controller && short.action == route.action && route.pattern.start_with?(short.pattern + "/") && generation_segment_names(short.pattern) == names[0, names.length - 1] }
+          end
           path = generated_route_path(route, given)
           bare = route.req_format.nil? && given.key?("format") ? path.delete_suffix("." + given["format"].to_s) : path
           next if ActionDispatch::Router.match_pattern(route.pattern, bare, route.int_params + "", route.seg_constraints + "").nil?
