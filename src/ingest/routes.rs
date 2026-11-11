@@ -1491,7 +1491,7 @@ fn ingest_route_stmts<'pr>(
         }
 
         if !route_options_kept(&call, &method) {
-            route_refusal(&call.as_node(), file, cx, "route defaults", "only literal `format` and segment defaults reach the table");
+            route_refusal(&call.as_node(), file, cx, "route defaults", "this route option or defaults form is not modeled");
         }
         // Per-entry recovery: one `mount`/`use_doorkeeper` must not
         // zero the whole table. Survey mode records the gap and keeps
@@ -1539,6 +1539,7 @@ fn route_default_literal(node: &Node<'_>) -> Option<crate::expr::Literal> {
 /// Literal `defaults:` the table keeps (scope ones are checked per route), and no option the ingesters skip.
 fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
     let default_kept = |default: Node<'_>| empty_route_splat(&default) || default.as_assoc_node().is_some_and(|pair| symbol_value(&pair.key()).is_some_and(|key|
+        if http_method_from(method).is_some() && matches!(key.as_str(), "controller" | "action") { false } else
         if method == "scope" || key == "format" { symbol_or_string_value(&pair.value()).is_some() && (method == "scope" || http_method_from(method).is_some()) }
         else { http_method_from(method).is_some() && route_default_literal(&pair.value()).is_some() }));
     let literal_format = |value: Node<'_>| symbol_or_string_value(&value).is_some() || bool_value(&value).is_some()

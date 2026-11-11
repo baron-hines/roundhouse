@@ -135,6 +135,18 @@ pub struct Analyzer {
     /// they pass, not its default too: Warden's `add(label, strategy =
     /// nil)` is never called without the class. Grows only.
     defaulted_param_slots: std::sync::Mutex<BTreeSet<(ParamKey, usize)>>,
+    /// Set for the typing pass before the first unification only: no
+    /// method has a parameter row yet, so a parameter no default types is
+    /// one its call sites have not been read for, not one nobody passes
+    /// (`Ctx::unseen_params`).
+    seeding_unseen_params: bool,
+    /// Set for the production rounds' typing passes: a `p ||= v` over a
+    /// parameter whose row slot is still pending is left untyped too. The
+    /// passes after that loop retype every production body without it.
+    deferring_pending_slots: bool,
+    /// The classes that pass left a `p ||= v` untyped in: the first
+    /// fixpoint round retypes them whatever else moved.
+    unseen_or_assign_classes: std::sync::Mutex<crate::det::HashSet<ClassId>>,
     /// The classes compiled from a gem's source. Only their slots drop a default no caller leaves:
     /// an app method's callers include its tests and the console, which no site here records.
     source_gem_classes: crate::det::HashSet<ClassId>,
@@ -1388,6 +1400,9 @@ impl Analyzer {
             open_param_slots: BTreeSet::new(),
             pinned_param_slots: BTreeSet::new(),
             defaulted_param_slots: Default::default(),
+            seeding_unseen_params: false,
+            deferring_pending_slots: false,
+            unseen_or_assign_classes: Default::default(),
             source_gem_classes: source_gem_classes(app),
             declared_signatures: app
                 .rbs_signatures
@@ -1614,6 +1629,11 @@ impl Analyzer {
             .map(|c| (c.name.clone(), c.parent.clone()))
             .collect();
 
+        // No parameter row exists yet: a `p ||= v` over a parameter the
+        // call sites will type is left untyped rather than bound to `v`
+        // (`Ctx::unseen_params`).
+        self.seeding_unseen_params = true;
+        self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         crate::timings::phase("typing passes (initial)", || {
             self.run_typing_passes(
                 app,
@@ -1625,6 +1645,11 @@ impl Analyzer {
                 TypingMode::Production { dirty: None },
             )
         });
+        self.seeding_unseen_params = false;
+        self.deferring_pending_slots = true;
+        // Those bodies were typed against no rows, so the first round
+        // retypes them even where no row or return moved.
+        let mut unseen = std::mem::take(&mut *self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()));
 
         let mut rounds = FixpointRounds {
             production: LoopEnd::RanToCap,
@@ -1657,7 +1682,8 @@ impl Analyzer {
             // verdicts (`DirtyHints`); both must be quiet before the
             // loop stops, or a newly block-valued method leaves its
             // callers on the registered return instead of the block.
-            if self.inference_matches(&prev_hints.sig)
+            if unseen.is_empty()
+                && self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
                 rounds.production = LoopEnd::Settled(round);
@@ -1673,7 +1699,11 @@ impl Analyzer {
             // so the later rounds retype the whole app for a handful of
             // returns. `dirty_classes_for_retype` is that handful plus
             // everything that reads it.
-            let dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            let mut dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            if let Some(dirty) = dirty.as_mut() {
+                dirty.extend(unseen.drain());
+            }
+            unseen.clear();
             crate::timings::note(match &dirty {
                 Some(dirty) => format!("round {round}: retype frontier {} classes", dirty.len()),
                 None => format!("round {round}: retype frontier everything"),
@@ -1691,6 +1721,7 @@ impl Analyzer {
                 )
             });
         }
+        self.deferring_pending_slots = false;
         let round_inputs = fixpoint_check::RoundInputs {
             dynamic_render_ivars: &dynamic_render_ivars,
             existing_view_names: &existing_view_names,
@@ -2156,6 +2187,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
                 in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -2521,6 +2553,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: shared.clone(),
                     annotate_self_dispatch: false,
                     in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -2818,6 +2851,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -2837,6 +2871,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: class_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -2859,7 +2894,7 @@ impl Analyzer {
                     }
                 }
                 let mctx = self.seed_method_params(&class_ctx, &model_name, method, true);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
+                self.body_typer().analyze_method_body(&mut method.body, &mctx);
             }
 
             // Pass B: gather every ivar assignment across the model's
@@ -2908,6 +2943,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: class_constants.clone(),
                     annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                 };
@@ -2935,7 +2971,7 @@ impl Analyzer {
                 for method in model.methods_mut() {
                     let side = if method.receiver == MethodReceiver::Class { &class_side_ctx } else { &reseeded_ctx };
                     let mctx = self.seed_method_params(side, &model_name, method, true);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
             self.harvest_one_model(model);
@@ -2978,6 +3014,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -3001,6 +3038,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: class_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -3066,7 +3104,7 @@ impl Analyzer {
                         }
                     }
                     let mctx = self.seed_method_params(&ctx, &ctrl_id, method, false);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
 
@@ -3607,6 +3645,7 @@ impl Analyzer {
                             class_objects: Default::default(),
                             query_class_objects: Default::default(),
                             call_site_params: Default::default(),
+                            unseen_params: Default::default(),
                             constants: meta.class_constants.clone(),
                             annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                         };
@@ -4093,6 +4132,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         call_site_params: Default::default(),
+                        unseen_params: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
                         in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -4166,6 +4206,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         call_site_params: Default::default(),
+                        unseen_params: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
                         in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -4402,6 +4443,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: self.helper_modules.contains(&lc.name),
             };
 
@@ -4430,7 +4472,7 @@ impl Analyzer {
                             self.body_typer().analyze_expr(default, &mctx);
                         }
                     }
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
 
@@ -4580,11 +4622,12 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: class_ctx.helper_body,
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
             views
@@ -5259,6 +5302,25 @@ impl Analyzer {
             .filter(|p| !p.rest && !rebound.contains(&p.name) && observed.is_some())
             .map(|p| p.name.clone())
             .collect();
+        // Before the first unification no row exists; in the production
+        // rounds after it, a row whose slot is still pending (`Var`) names
+        // callers whose argument is not typed yet. A method no call site
+        // reaches has no row then, and keeps its default from round one.
+        let unseen_slot = |i: usize| match observed {
+            None => self.seeding_unseen_params,
+            Some(row) => self.deferring_pending_slots && row.get(i).is_none_or(|t| matches!(t, Ty::Var { .. })),
+        };
+        if self.seeding_unseen_params || (self.deferring_pending_slots && observed.is_some()) {
+            let or_assigned = body::or_assigned_locals(&method.body);
+            ctx.unseen_params = method.params.iter().enumerate()
+                .filter(|(i, p)| !p.rest && !rebound.contains(&p.name) && or_assigned.contains(&p.name) && unseen_slot(*i))
+                .filter(|(_, p)| !ctx.local_bindings.contains_key(&p.name))
+                .map(|(_, p)| p.name.clone())
+                .collect();
+            if self.seeding_unseen_params && !ctx.unseen_params.is_empty() {
+                self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).insert(class_id.clone());
+            }
+        }
         ctx
     }
 
@@ -12323,7 +12385,7 @@ impl Analyzer {
     /// is measured on a copy. Destructured without `..`, so a new field has
     /// to be listed here; `Copy` fields own no heap.
     pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
-        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, source_gem_classes, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
+        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, source_gem_classes, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("module_self_types", crate::memory_census::freed_by(|| drop(module_self_types))),
@@ -12333,6 +12395,7 @@ impl Analyzer {
             ("open_param_slots", crate::memory_census::freed_by(|| drop(open_param_slots))),
             ("pinned_param_slots", crate::memory_census::freed_by(|| drop(pinned_param_slots))),
             ("defaulted_param_slots", crate::memory_census::freed_by(|| drop(defaulted_param_slots))),
+            ("unseen_or_assign_classes", crate::memory_census::freed_by(|| drop(unseen_or_assign_classes))),
             ("source_gem_classes", crate::memory_census::freed_by(|| drop(source_gem_classes))),
             ("declared_signatures", crate::memory_census::freed_by(|| drop(declared_signatures))),
             ("adapter", crate::memory_census::freed_by(|| drop(adapter))),

@@ -69,6 +69,8 @@ fn the_reported_routes_stop_only_at_the_draw_time_guard() {
 #[test]
 fn defaults_the_table_has_no_slot_for_are_refused() {
     for (body, line) in [
+        ("get '/catalog', to: 'catalog#show', defaults: { controller: :other }", 2),
+        ("get '/catalog', to: 'catalog#show', defaults: { action: :other }", 2),
         ("get '/catalog', to: 'catalog#show', defaults: { format: nil }", 2),
         ("get '/catalog', to: 'catalog#show', defaults: { format: 1 }", 2),
         ("get '/catalog', to: 'catalog#show', defaults: { 'format' => 'json' }", 2),
@@ -510,6 +512,8 @@ check("route default", reported.recognize_path("/items")[:kind], "fixed")
 check("false guard", reported.routes.map {{ |r| r.path.spec.to_s }}.grep(%r{{guarded}}), [])
 check("scope default", draw(%q{{scope defaults: {{ kind: "fixed" }} do get "/catalog", to: "catalog#show" end}}).recognize_path("/catalog")[:kind], "fixed")
 check("root format", draw(%q{{scope defaults: {{ format: :json }} do root to: "catalog#show" end}}).recognize_path("/")[:format], :json)
+check("reserved controller", draw(%q{{get '/catalog', to: 'catalog#show', defaults: {{ controller: :other }}}}).recognize_path('/catalog')[:controller], 'catalog')
+check("reserved action", draw(%q{{get '/catalog', to: 'catalog#show', defaults: {{ action: :other }}}}).recognize_path('/catalog')[:action], 'show')
 check("symbol format", draw(%q{{get "/catalog", to: "catalog#show", defaults: {{ format: :json }}}}).recognize_path("/catalog")[:format], :json)
 check("regex scope", draw(%q{{scope ':shop', shop: /\\d+/ do get '/catalog', to: 'catalog#show' end}}).recognize_path('/7/catalog')[:shop], '7')
 check("literal guard", draw(%q{{get "/a", to: "catalog#show" if false
