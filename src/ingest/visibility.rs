@@ -455,6 +455,15 @@ impl Visibility {
         self.conditionals
     }
 
+    /// A Data factory has these class-side constructors before its block runs.
+    pub(super) fn resolve_data(body: Option<&Node<'_>>, file: &str, owner: &ClassId) -> IngestResult<Self> {
+        let out = Self::resolve_carrying_inherited_with(body, file, None, Some(owner), true)?;
+        if let Some((_, name, _)) = out.inherited.iter().find(|(class_side, name, _)| {
+            !*class_side || !matches!(name.as_str(), "new" | "[]" | "allocate")
+        }) { return Err(Self::undefined(file, name)); }
+        Ok(out)
+    }
+
     pub(super) fn resolve_owned(
         body: Option<&Node<'_>>,
         file: &str,

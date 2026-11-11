@@ -49,3 +49,50 @@ pub fn override_overlay(path: &str) -> emit_and_run::Overlay {
         "def formatted_digest = digest\n  def digest = \"override\"",
     ))
 }
+
+pub const REQUIRE_SOURCE: &str = "require \"stringio\"\nArtifact = Data.define(:digest)\n";
+pub const REOPEN_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  def initialize(digest:)
+    super(digest: digest + "!")
+  end
+  def label = digest
+end
+class Artifact
+  def extra = "reopened:" + label
+end
+"#;
+pub const PRIVATE_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  def self.build(digest) = new(digest:)
+  private_class_method :new, :[], :allocate
+end
+"#;
+pub const REDEFINED_SOURCE: &str = "Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; def label = 'first'; end\nclass Artifact; def label = digest; end\n";
+pub const MEMBER_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").digest\n";
+pub const REOPEN_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").extra\n";
+pub const PRIVATE_ASSERTIONS: &str = r#"puts Artifact.members == [:digest]
+puts Artifact.build("abc").digest
+begin
+  Artifact.new(digest: "direct")
+  raise "new is public"
+rescue NoMethodError
+  puts "new refused"
+end
+begin
+  Artifact["direct"]
+  raise "[] is public"
+rescue NoMethodError
+  puts "[] refused"
+end
+begin
+  Artifact.allocate
+  raise "allocate is public"
+rescue NoMethodError
+  puts "allocate refused"
+end
+"#;
+pub const COMPOSITION_CASES: &[(&str, &str, &str)] = &[
+    (REQUIRE_SOURCE, MEMBER_ASSERTIONS, "true\nabc\n"),
+    (REOPEN_SOURCE, REOPEN_ASSERTIONS, "true\nreopened:abc!\n"),
+    (PRIVATE_SOURCE, PRIVATE_ASSERTIONS, "true\nabc\nnew refused\n[] refused\nallocate refused\n"),
+    (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\n", "abc\n"),
+];

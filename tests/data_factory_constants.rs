@@ -16,6 +16,57 @@ fn review_record(source: &str, path: &str, reopen: Option<(&str, &str)>) -> roun
 }
 
 #[test]
+fn file_data_composition_strictly_emits() {
+    for source in [
+        "require \"stringio\"\nArtifact = Data.define(:digest)\n",
+        "require('set')\nrequire 'digest/sha2'\nArtifact = Data.define(:digest)\n",
+        "Artifact = Data.define(:digest)\nclass Artifact; def label = digest; end\n",
+        "Artifact = Data.define(:digest) do\n def self.build(digest) = new(digest:)\n private_class_method :new, :[], :allocate\nend\n",
+    ] {
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            let mut app = review_record(source, path, None);
+            let diagnostics = errors(&mut app);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            let files = roundhouse::emit::ruby::emit_library(&app);
+            let ruby = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rb")).unwrap().content;
+            assert_eq!(ruby.matches("Data.define").count(), 1, "{ruby}");
+            if source.contains("private_class_method") {
+                let rbs = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rbs")).unwrap().content;
+                assert!(rbs.contains("private def self.new:"), "{rbs}");
+            }
+        }
+    }
+}
+
+#[test]
+fn private_data_constructors_do_not_allow_unproven_inherited_methods() {
+    for marker in ["private_class_method :missing", "private :new", "private_class_method ENV.fetch('NAME')",
+        "class << self; private :new; end"] {
+        let source = format!("Artifact = Data.define(:digest) do\n {marker}\nend");
+        let mut app = review_record(&source, "lib/artifact.rb", None);
+        assert!(!errors(&mut app).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn file_data_admission_does_not_accept_arbitrary_calls_or_replace_an_earlier_class() {
+    for source in [
+        "require ENV.fetch('FEATURE')\nArtifact = Data.define(:digest)",
+        "require 'not_a_standard_library'\nArtifact = Data.define(:digest)",
+        "Kernel.require 'stringio'\nArtifact = Data.define(:digest)",
+        "puts 'side effect'\nArtifact = Data.define(:digest)",
+        "class Artifact; def label = 'old'; end\nArtifact = Data.define(:digest)",
+        "Artifact = Data.define(:digest)\nArtifact = Data.define(:other)",
+        "Artifact = Data.define(:digest)\nclass Artifact; VALUE = 'inside'; end",
+        "Artifact = Data.define(:digest) do; def label = 'before'; end\nmodule Observer; VALUE = Artifact.new('x').label; end\nclass Artifact; def label = 'after'; end",
+    ] {
+        let mut app = review_record(source, "lib/artifact.rb", None);
+        let diagnostics = errors(&mut app);
+        assert!(diagnostics.iter().any(|d| !d.span.is_synthetic()), "{source}: {diagnostics:?}");
+    }
+}
+
+#[test]
 fn review_data_nested_bodyless_factory_keeps_emitting() {
     let source = "Artifact = Data.define(:digest) do\n  Inner = Data.define(:value)\n  def label = digest\nend\nmodule Builder; def self.make = Artifact.new(\"abc\"); end\n";
     for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
@@ -1024,10 +1075,9 @@ fn unsupported_file_level_data_blocks_keep_source_located_refusals() {
 }
 
 #[test]
-fn file_level_data_redefinitions_are_refused_in_either_order() {
+fn file_level_data_replacements_are_refused() {
     let record = "Artifact = Data.define(:digest) do; def label = digest; end";
     for source in [
-        format!("{record}\nclass Artifact; def extra = 1; end"),
         format!("class Artifact; def extra = 1; end\n{record}"),
         format!("{record}\nArtifact = Data.define(:size)"),
     ] {

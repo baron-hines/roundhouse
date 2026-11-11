@@ -3519,7 +3519,7 @@ fn report_unmodelled_records(app: &App) {
     }
 }
 
-const APP_REQUIRABLE_STDLIB: &[&str] = &[
+pub(super) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "base64", "benchmark", "bigdecimal", "cgi", "csv", "date", "delegate", "digest",
     "digest/md5", "digest/sha1", "digest/sha2", "English", "erb", "etc", "fileutils", "find",
     "forwardable", "io/console", "io/nonblock", "io/wait", "ipaddr", "json", "logger",
@@ -3543,20 +3543,11 @@ fn collect_app_requires(sources: &[crate::span::SourceFile], roots: &[PathBuf]) 
         {
             continue;
         }
-        for line in source.text.lines() {
-            let Some(rest) = line.strip_prefix("require ") else { continue };
-            // `require "io/console" # why`: the literal, then nothing but
-            // a comment
-            let rest = rest.trim_start();
-            let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
-            let Some(end) = rest[1..].find(q) else { continue };
-            let after = rest[end + 2..].trim_start();
-            let quoted = (after.is_empty() || after.starts_with('#')).then(|| &rest[1..end + 1]);
-            if let Some(lib) = quoted {
-                if APP_REQUIRABLE_STDLIB.contains(&lib) {
-                    out.insert(lib.to_string());
-                }
-            }
+        let parsed = super::prism::parse(source.text.as_bytes(), &source.path);
+        if let Some(program) = parsed.node().as_program_node() {
+            out.extend(program.statements().body().iter().filter_map(|stmt| {
+                stmt.as_call_node().and_then(|call| super::file_program::literal_require(&call))
+            }).filter_map(|(lib, relative)| (!relative && APP_REQUIRABLE_STDLIB.contains(&lib.as_str())).then_some(lib)));
         }
     }
     out.into_iter().collect()

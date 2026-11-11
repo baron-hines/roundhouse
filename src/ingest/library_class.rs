@@ -384,15 +384,38 @@ fn ingest_library_classes_impl(
     };
     if file_level && let Some(program) = root.as_program_node() {
         for statement in program.statements().body().iter() {
-            if let Some(class) = file_data_class(&statement, file)
+            if let Some(mut class) = file_data_class(&statement, file)
                 .map_err(|err| super::error_site::at(err, &statement))?
             {
-                if out.iter().chain(made.iter().map(|(_, class)| class)).any(|other| other.name == class.name) {
+                let reopenings = find_all_classes_with_scope(&root).into_iter().filter(|(scope, node)| {
+                    class_name_path(node).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == class.name.0.as_str())
+                }).collect::<Vec<_>>();
+                let invalid_reopen = reopenings.iter().any(|(_, node)| {
+                    node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
+                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| {
+                            visibility::definition(stmt).is_none() && !struct_block_marker(stmt)
+                        }))
+                });
+                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset()).max().unwrap_or(0);
+                let separated = program.statements().body().iter().any(|stmt| {
+                    let at = stmt.location().start_offset();
+                    at >= statement.location().end_offset() && at < last_reopen
+                        && !reopenings.iter().any(|(_, node)| node.location().start_offset() == at)
+                });
+                if invalid_reopen || separated || out.iter().any(|other| other.name == class.name && other.is_module)
+                    || made.iter().any(|(_, other)| other.name == class.name) {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
                         message: "Data.define beside another declaration of the same class".into(),
                     }, &statement));
                 }
+                // Only later, method-only reopenings can join the factory without moving load-time work.
+                let mut index = 0;
+                while index < out.len() {
+                    if out[index].name == class.name { class.methods.extend(out.remove(index).methods); }
+                    else { index += 1; }
+                }
+                class.methods.sort_by_key(|method| method.name_span.start);
                 made.push((class.name.0.clone(), class));
             }
         }
@@ -401,8 +424,10 @@ fn ingest_library_classes_impl(
                 let qualified_factory = statement.as_constant_path_write_node()
                     .and_then(|write| static_constant_path(&write.target().as_node()))
                     .is_some_and(|path| made.iter().any(|(_, class)| class.name.0.as_str() == path.join("::")));
+                let stdlib_require = statement.as_call_node().and_then(|call| super::file_program::literal_require(&call))
+                    .is_some_and(|(feature, relative)| !relative && super::app::APP_REQUIRABLE_STDLIB.contains(&feature.as_str()));
                 if statement.as_constant_write_node().is_none() && statement.as_class_node().is_none()
-                    && statement.as_module_node().is_none() && !qualified_factory
+                    && statement.as_module_node().is_none() && !qualified_factory && !stdlib_require
                 {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
@@ -571,8 +596,19 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
             });
         }
     }
+    let visibility = Visibility::resolve_data(body().as_ref(), file, &owner)?;
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
-        walk_decl_body(body(), &owner, file, DeclBodyMode::Instance)?;
+        walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
+    let mut carried = HashSet::default();
+    for statement in body().map(flatten_statements).unwrap_or_default() {
+        if visibility.names_inherited(&statement) {
+            carried.insert(statement.location().start_offset());
+            let mut expr = ingest_expr(&statement, file)?;
+            expr.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+            unknown_calls.push(expr);
+        }
+    }
+    visibility.uncarried_inherited(&carried, file)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok(Some(LibraryClass {
         name: owner,

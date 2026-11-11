@@ -145,7 +145,16 @@ fn render_class(
 
     if let Some((members, _)) = lc.data_define() {
         if !lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "new") {
-            writeln!(s, "{body_pad}def self.new: (*untyped, **untyped) -> instance").unwrap();
+            let visibility = lc.unknown_calls.iter().rev().find_map(|expr| {
+                let ExprNode::Send { method, args, .. } = &*expr.node else { return None };
+                let names_new = args.iter().any(|arg| match &*arg.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => value.as_str() == "new",
+                    ExprNode::Lit { value: Literal::Str { value } } => value == "new", _ => false,
+                });
+                (names_new && matches!(method.as_str(), "private_class_method" | "public_class_method"))
+                    .then_some(if method.as_str() == "private_class_method" { "private " } else { "" })
+            }).unwrap_or("");
+            writeln!(s, "{body_pad}{visibility}def self.new: (*untyped, **untyped) -> instance").unwrap();
         }
         // A `def` in the `Data.define` block replaces the reader, and RBS
         // rejects a second declaration of one method.
@@ -169,7 +178,8 @@ fn render_class(
         render_data_factory(&mut s, lc, name.as_str(), value, &body_pad, factory);
     }
 
-    for m in &lc.methods {
+    for (index, m) in lc.methods.iter().enumerate() {
+        if lc.data_define().is_some() && lc.methods[index + 1..].iter().any(|later| later.name == m.name && later.receiver == m.receiver) { continue; }
         let line = render_method(m, &segments);
         let visibility = if lc.data_define().is_some() && m.visibility != MethodVisibility::Public { "private " } else { "" };
         writeln!(s, "{body_pad}{visibility}{line}").unwrap();

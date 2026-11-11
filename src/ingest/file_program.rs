@@ -690,7 +690,7 @@ fn derived_autoload(stmt: &ruby_prism::Node<'_>) -> Option<String> {
 
 /// `require "x"` / `require_relative "x"` of a string literal, as
 /// `(feature, relative)`.
-fn literal_require(call: &ruby_prism::CallNode<'_>) -> Option<(String, bool)> {
+pub(super) fn literal_require(call: &ruby_prism::CallNode<'_>) -> Option<(String, bool)> {
     let name = constant_id_str(&call.name());
     if call.receiver().is_some() || call.block().is_some() || !matches!(name, "require" | "require_relative") {
         return None;
