@@ -474,3 +474,41 @@ fn a_serializable_resource_the_rewrite_leaves_is_refused() {
     let class = app.library_classes.iter().find(|c| c.name.0.as_str() == "Api::ArticleSerializer").expect("class");
     assert!(class.methods.iter().all(|m| m.name.as_str() != "as_json_str"), "lowered");
 }
+
+const RESOURCE_CARD: &str = "class ArticleCard\n  def initialize(article)\n    @article = article\n  end\n\n  def as_json\n    ActiveModelSerializers::SerializableResource.new(@article, serializer: ArticleSerializer).as_json\n  end\nend\n";
+
+/// `SerializableResource.new(x, serializer: S).as_json` passes S no scope
+/// unless it's given `scope:` (active_model_serializers 0.10.16): a
+/// serializer that reads only `scope` reads nil there, as
+/// `S.new(x).serializable_hash` does, so the call is rewritten to that.
+#[test]
+fn a_serializable_resource_gives_a_scope_reader_no_scope() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope.nil? ? \"none\" : scope }\nend\n";
+    let mut files = tree(scoped, CONTROLLER);
+    files.insert(PathBuf::from("app/models/article_card.rb"), RESOURCE_CARD.as_bytes().to_vec());
+    let mut app = ingest_app_from_tree(files).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let files = roundhouse::project::target_files(&app, std::path::Path::new("fixtures/tiny-blog"), roundhouse::project::BuildTarget::Ruby)
+        .expect("emit");
+    let emitted = files.iter().find(|(p, _)| p.ends_with("article_card.rb")).map(|(_, c)| c.clone()).expect("card");
+    assert!(emitted.contains("ArticleSerializer.new(@article).serializable_hash"), "{emitted}");
+}
+
+/// A resource defines no scope name, so a serializer that reads
+/// `current_user` raises NameError there (active_model_serializers
+/// 0.10.16): that use stays the gem's, refused at the serializer.
+#[test]
+fn a_serializable_resource_of_a_current_user_reader_is_refused() {
+    let viewer = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:viewer) { current_user }\nend\n";
+    let mut files = tree(viewer, CONTROLLER);
+    files.insert(PathBuf::from("app/models/article_card.rb"), RESOURCE_CARD.as_bytes().to_vec());
+    survey::activate();
+    let result = ingest_app_from_tree(files);
+    let gaps = survey::drain();
+    result.expect("survey ingest recovers");
+    assert!(
+        gaps.iter().any(|g| matches!(g, IngestError::Unsupported { message, .. }
+            if message.contains("used at app/models/article_card.rb:7 other than through `render json:`"))),
+        "{gaps:?}"
+    );
+}
