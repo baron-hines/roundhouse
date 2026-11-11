@@ -869,7 +869,7 @@ fn refuse(source: &SourceFile, offset: usize, reason: &str) -> IngestError {
 /// What a controller's `serialization_scope` names, its own or its
 /// nearest ancestor's (a class attribute, the last declaration winning):
 /// `:current_user` when none is declared.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ControllerScope {
     CurrentUser,
     Nil,
@@ -954,8 +954,39 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
             Some((controller_scope(&chain), has_current_user, facts.serialization_scope))
         })
         .collect();
-    for (controller, plan) in app.controllers.iter_mut().zip(plans) {
+    // An action a descendant inherits renders through the same body: its
+    // plan holds only when every descendant that doesn't override the
+    // action (the first in its chain to define it is this controller)
+    // has the same one.
+    let key = |id: &ClassId| id.0.as_str().trim_start_matches("::").to_string();
+    let chains: Vec<Vec<String>> =
+        app.controllers.iter().map(|c| controller_chain(app, &c.name).iter().map(|d| key(&d.name)).collect()).collect();
+    let defines: HashMap<String, HashSet<String>> =
+        app.controllers.iter().map(|c| (key(&c.name), c.actions().map(|a| a.name.as_str().to_string()).collect())).collect();
+    let action_plans: Vec<HashMap<String, Option<(ControllerScope, Option<bool>, bool)>>> = app
+        .controllers
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let me = key(&c.name);
+            c.actions()
+                .map(|a| {
+                    let action = a.name.as_str();
+                    let agrees = chains.iter().enumerate().all(|(j, chain)| {
+                        let at = chain.iter().position(|d| *d == me);
+                        let inherits = j != i
+                            && at.is_some()
+                            && chain.iter().position(|d| defines.get(d).is_some_and(|names| names.contains(action))) == at;
+                        !inherits || plans[j] == plans[i]
+                    });
+                    (action.to_string(), if agrees { plans[i] } else { None })
+                })
+                .collect()
+        })
+        .collect();
+    for (controller, action_plans) in app.controllers.iter_mut().zip(action_plans) {
         for action in controller.actions_mut() {
+            let plan = action_plans.get(action.name.as_str()).copied().flatten();
             let span = action.body.span;
             let call = move |name: &str| {
                 Expr::new(
@@ -1018,7 +1049,22 @@ fn chain_facts(app: &crate::App, chain: &[&crate::dialect::Controller]) -> Optio
         let mut found = false;
         for lc in app.library_classes.iter().filter(|lc| lc.name.0.as_str().trim_start_matches("::") == name) {
             found = true;
-            lc.methods.iter().for_each(|m| note(m.name.as_str()));
+            for m in &lc.methods {
+                // A module's `def self.x` is its own, not a helper the
+                // including controller answers; `module_function` keeps an
+                // instance copy, and `extend self` (ingested as the class
+                // side alone) is read back from the module's source.
+                let instance = match m.receiver {
+                    crate::dialect::MethodReceiver::Instance => true,
+                    crate::dialect::MethodReceiver::Class if matches!(m.name.as_str(), "current_user" | "serialization_scope") => {
+                        extend_self_defines(&name, m)?
+                    }
+                    crate::dialect::MethodReceiver::Class => false,
+                };
+                if instance {
+                    note(m.name.as_str());
+                }
+            }
             pending.extend(lc.includes.iter().cloned());
             let items = app.concern_model_items.iter().filter(|(id, _)| id.0.as_str().trim_start_matches("::") == name);
             for item in items.flat_map(|(_, items)| items) {
@@ -1043,60 +1089,131 @@ fn chain_facts(app: &crate::App, chain: &[&crate::dialect::Controller]) -> Optio
     Some(facts)
 }
 
+/// Whether `module`'s `def method` (no receiver) comes after a direct
+/// `extend self` in the module's body, which makes it an instance method
+/// of an includer too. `None` when the source can't be read back.
+fn extend_self_defines(module: &str, method: &crate::dialect::MethodDef) -> Option<bool> {
+    let path = super::sources::path_of(method.body.span.file)?;
+    let text = super::sources::text_of(&path)?;
+    struct Find<'a> {
+        module: &'a str,
+        method: &'a str,
+        nesting: Vec<String>,
+        found: Option<bool>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Find<'_> {
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let written = String::from_utf8_lossy(node.constant_path().location().as_slice()).trim_start_matches("::").to_string();
+            self.nesting.push(written);
+            if self.nesting.join("::") == self.module {
+                let mut extended = false;
+                let statements: Vec<ruby_prism::Node<'pr>> =
+                    node.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+                for stmt in statements {
+                    if let Some(call) = stmt.as_call_node() {
+                        let to_self = call.arguments().is_some_and(|a| {
+                            let args: Vec<_> = a.arguments().iter().collect();
+                            args.len() == 1 && args[0].as_self_node().is_some()
+                        });
+                        extended |= call.receiver().is_none() && constant_id_str(&call.name()) == "extend" && to_self;
+                    } else if let Some(def) = stmt.as_def_node()
+                        && def.receiver().is_none()
+                        && constant_id_str(&def.name()) == self.method
+                    {
+                        self.found = Some(extended);
+                    }
+                }
+            }
+            ruby_prism::visit_module_node(self, node);
+            self.nesting.pop();
+        }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let written = String::from_utf8_lossy(node.constant_path().location().as_slice()).trim_start_matches("::").to_string();
+            self.nesting.push(written);
+            ruby_prism::visit_class_node(self, node);
+            self.nesting.pop();
+        }
+    }
+    let parsed = super::prism::parse_silent(text.as_bytes());
+    let mut find = Find { module, method: method.name.as_str(), nesting: Vec::new(), found: None };
+    ruby_prism::Visit::visit(&mut find, &parsed.node());
+    Some(find.found.unwrap_or(false))
+}
+
 /// What Devise gives a controller's `current_user`. It defines
 /// `current_<mapping>` for each `devise_for` the routes draw, the
-/// mapping named from the route's resource unless `class_name:`, `as:` or
-/// `singular:` changes it.
+/// mapping named from the route's resource and the scopes around it,
+/// unless `class_name:`, `as:` or `singular:` changes it.
 #[derive(Clone, Copy)]
 enum DeviseUser {
     /// The app doesn't use Devise: no model calls `devise` and no route
     /// draws `devise_for`.
     Absent,
-    /// A plain `devise_for :users`, and no mapping renamed.
+    /// A single `devise_for :users` drawn unconditionally, directly in
+    /// `config/routes.rb`'s `draw` block, and no mapping renamed or drawn
+    /// anywhere else.
     CurrentUser,
-    /// Devise is used, but no route file read here draws a plain
-    /// `devise_for :users`, or one renames a mapping.
+    /// Devise is used, and its mappings aren't that one.
     Unknown,
 }
 
 fn devise_user(app: &crate::App, sources: &[SourceFile]) -> DeviseUser {
-    struct DeviseFor {
-        users: bool,
-        renamed: bool,
-        any: bool,
-    }
-    impl<'pr> ruby_prism::Visit<'pr> for DeviseFor {
+    struct Count(usize);
+    impl<'pr> ruby_prism::Visit<'pr> for Count {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if node.receiver().is_none() && constant_id_str(&node.name()) == "devise_for" {
-                self.any = true;
-                let mut users = false;
-                for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
-                    if let Some(sym) = arg.as_symbol_node() {
-                        users |= sym.unescaped() == b"users";
-                    } else if let Some(hash) = arg.as_keyword_hash_node() {
-                        for element in hash.elements().iter() {
-                            let key = element.as_assoc_node().and_then(|a| a.key().as_symbol_node().map(|k| k.unescaped().to_vec()));
-                            match key.as_deref() {
-                                Some(b"class_name" | b"as" | b"singular") | None => self.renamed = true,
-                                Some(_) => {}
-                            }
-                        }
-                    } else {
-                        self.renamed = true;
-                    }
-                }
-                self.users |= users;
+                self.0 += 1;
             }
             ruby_prism::visit_call_node(self, node);
         }
     }
-    let mut found = DeviseFor { users: false, renamed: false, any: false };
+    // Each `devise_for` a route file holds, and the ones that are direct
+    // statements of a top-level `draw` block in `config/routes.rb`.
+    let mut all = 0;
+    let mut direct: Vec<(bool, bool)> = Vec::new();
     for source in sources.iter().filter(|s| s.path.contains("config/routes") && s.path.ends_with(".rb")) {
         if !source.text.contains("devise_for") {
             continue;
         }
         let parsed = super::prism::parse_silent(source.text.as_bytes());
-        ruby_prism::Visit::visit(&mut found, &parsed.node());
+        let mut count = Count(0);
+        ruby_prism::Visit::visit(&mut count, &parsed.node());
+        all += count.0;
+        if !source.path.ends_with("config/routes.rb") {
+            continue;
+        }
+        let top: Vec<ruby_prism::Node<'_>> =
+            parsed.node().as_program_node().map(|p| p.statements().body().iter().collect()).unwrap_or_default();
+        for stmt in top {
+            let Some(draw) = stmt.as_call_node() else { continue };
+            if constant_id_str(&draw.name()) != "draw" {
+                continue;
+            }
+            let Some(block) = draw.block().and_then(|b| b.as_block_node()) else { continue };
+            let body: Vec<ruby_prism::Node<'_>> =
+                block.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+            for call in body.iter().filter_map(|n| n.as_call_node()) {
+                if call.receiver().is_some() || constant_id_str(&call.name()) != "devise_for" || call.block().is_some() {
+                    continue;
+                }
+                let (mut users, mut renamed) = (false, false);
+                for arg in call.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                    if let Some(sym) = arg.as_symbol_node() {
+                        users |= sym.unescaped() == b"users";
+                    } else if let Some(hash) = arg.as_keyword_hash_node() {
+                        for element in hash.elements().iter() {
+                            let key = element.as_assoc_node().and_then(|a| a.key().as_symbol_node().map(|k| k.unescaped().to_vec()));
+                            if matches!(key.as_deref(), Some(b"class_name" | b"as" | b"singular") | None) {
+                                renamed = true;
+                            }
+                        }
+                    } else {
+                        renamed = true;
+                    }
+                }
+                direct.push((users, renamed));
+            }
+        }
     }
     // A model's `devise` call, as written or as the gem's macro expanded
     // it, or the gem's own module, says the app uses Devise.
@@ -1105,9 +1222,10 @@ fn devise_user(app: &crate::App, sources: &[SourceFile]) -> DeviseUser {
         m.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if is_devise(expr)))
     }) || app.expanded_macro_calls.iter().any(|(_, expr)| is_devise(expr))
         || app.library_classes.iter().any(|c| c.name.0.as_str().trim_start_matches("::") == "Devise");
-    if !found.any && !devise_model {
+    let users = direct.iter().filter(|(users, _)| *users).count();
+    if all == 0 && !devise_model {
         DeviseUser::Absent
-    } else if found.users && !found.renamed {
+    } else if all == direct.len() && users == 1 && !direct.iter().any(|(_, renamed)| *renamed) {
         DeviseUser::CurrentUser
     } else {
         DeviseUser::Unknown
