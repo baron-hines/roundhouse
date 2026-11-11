@@ -40,8 +40,10 @@ fn inherited_data_constructor_visibility_is_refused_at_the_call() {
         ":new, :[], :allocate", ":new, :allocate, :[]", ":[], :new, :allocate",
         ":[], :allocate, :new", ":allocate, :new, :[]", ":allocate, :[], :new"] {
         let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
-        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
-            Some(source.find("private_class_method").unwrap()));
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "requires an already defined local method",
+                Some(source.find("private_class_method").unwrap()));
+        }
     }
 }
 
@@ -91,16 +93,27 @@ fn assert_review_refusal(source: &str, path: &str, shape: &str, marker: Option<u
             assert!(diagnostics.iter().any(|d| !d.span.is_synthetic() && d.message.contains(shape)
                 && marker.is_none_or(|at| d.span.start as usize == at)), "{source}: {diagnostics:?}");
         }
-        Err(roundhouse::ingest::IngestError::Unsupported { file, message }) => {
+        Err(err) => {
+            let roundhouse::ingest::IngestError::Unsupported { file, message } = &err else {
+                panic!("{source}: expected an unsupported construct, got {err:?}");
+            };
             assert_eq!(file, path);
             assert!(message.contains(shape), "{source}: {message}");
             if let Some(at) = marker {
                 let line = source[..at].bytes().filter(|&c| c == b'\n').count() + 1;
-                assert!(message.contains(&format!("{path}:{line}")), "{message}");
+                let rendered = roundhouse::ingest::render_error(&err);
+                assert!(rendered.contains(&format!("{path}:{line}:")), "{rendered}");
             }
         }
-        other => panic!("{source}: expected a source-located refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn an_unlocated_ingest_error_keeps_its_existing_rendering() {
+    let err = roundhouse::ingest::IngestError::Unsupported {
+        file: "unregistered.rb".into(), message: "no recorded site".into(),
+    };
+    assert_eq!(roundhouse::ingest::render_error(&err), err.to_string());
 }
 
 #[test]
