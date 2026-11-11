@@ -71,10 +71,10 @@ module ActiveRecord
 
   module Reflection
     class AssociationReflection
-      @macro: Symbol?
+      @kind: Symbol?
       @foreign_key: String
       @polymorphic: bool
-      def initialize: (Symbol name, untyped counter_cache_column, Symbol? macro, String foreign_key, bool polymorphic) -> void
+      def initialize: (Symbol name, untyped counter_cache_column, Symbol? kind, String foreign_key, bool polymorphic) -> void
       def name: () -> Symbol
       def counter_cache_column: () -> untyped
       def klass: () -> untyped

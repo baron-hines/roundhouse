@@ -3277,6 +3277,7 @@ end
     carry_included_block_includes_into_controllers(&mut app);
     refuse_unread_concern_filters(&app)?;
     drop_modelled_included_hooks(&mut app);
+    crate::lower::for_each_hook_body(&mut app, &mut read_primary_key_sends);
     splice_concerns_into_controllers(&mut app);
     // After the splice: an action a concern provides is not implicit.
     synthesize_template_only_actions(&mut app);
@@ -5460,6 +5461,20 @@ fn answers_callback_macro(app: &App, name: &crate::ident::ClassId) -> bool {
         cur = parts.iter().find_map(|lc| lc.parent.clone()).or_else(|| model.and_then(|m| m.parent.clone()));
     }
     false
+}
+
+/// `record.send(record.class.primary_key)` (orm_adapter's `conditions_to_fields`): the record's key attribute, its
+/// `[]` of that name, as the key is a column the record reads.
+fn read_primary_key_sends(body: &mut crate::expr::Expr) {
+    use crate::expr::ExprNode;
+    body.node.for_each_child_mut(&mut read_primary_key_sends);
+    if let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &mut *body.node
+        && matches!(method.as_str(), "send" | "public_send" | "__send__")
+        && let [name] = args.as_slice()
+        && matches!(&*name.node, ExprNode::Send { method, args, block: None, .. } if method.as_str() == "primary_key" && args.is_empty())
+    {
+        *method = crate::ident::Symbol::from("[]");
+    }
 }
 
 /// A modelled hook has nothing left to do at load, and the emitted

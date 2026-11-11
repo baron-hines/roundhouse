@@ -6098,20 +6098,8 @@ fn all_program_items(items: &[crate::app::ProgramItem]) -> Vec<&crate::app::Prog
 
 /// A path with `.` and `..` segments folded, as a require resolves it.
 
-/// A feature of the Rails frameworks (`active_support/core_ext/…`,
-/// `rails`): the runtime ports are the framework in an emitted tree, and
-/// no such file is on its load path.
-pub(crate) fn is_framework_feature(feature: &str) -> bool {
-    let root = feature.split('/').next().unwrap_or(feature);
-    matches!(
-        root,
-        "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
-            | "active_model" | "activemodel" | "active_job" | "activejob" | "action_pack" | "actionpack"
-            | "action_controller" | "action_dispatch" | "abstract_controller" | "action_view" | "actionview"
-            | "action_mailer" | "actionmailer" | "action_cable" | "actioncable" | "action_text" | "actiontext"
-            | "active_storage" | "activestorage" | "action_mailbox" | "actionmailbox"
-    )
-}
+pub(crate) use crate::source_gem_shake::is_framework_feature;
+
 
 /// An error diagnostic for a program item the tree does not carry.
 fn report_program_error(span: crate::span::Span, construct: &str, message: &str) {

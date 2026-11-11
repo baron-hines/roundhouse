@@ -188,7 +188,9 @@ fn hook_constants(e: &mut Expr, constants: &[(Symbol, Vec<Symbol>)]) {
         && let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node
         && let Some((_, path)) = constants.iter().find(|(n, _)| n == value)
     {
-        let mut c = Expr::new(e.span, ExprNode::Const { path: path.clone() });
+        // Rooted: read from the module the hook extends, a bare path resolves under it first.
+        let rooted = std::iter::once(Symbol::from("")).chain(path.iter().filter(|p| !p.as_str().is_empty()).cloned()).collect();
+        let mut c = Expr::new(e.span, ExprNode::Const { path: rooted });
         c.decisions |= crate::expr::GENERATED_CONST_REF;
         *e = c;
         return;
