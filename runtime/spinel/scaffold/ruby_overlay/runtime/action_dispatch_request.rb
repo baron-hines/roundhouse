@@ -43,16 +43,27 @@ module ActionDispatch
       @params = params
       @request_parameters = {}
       @path_parameters = RequestPathParameters.new({})
-      @session_options = {}
     end
 
     # Rack's per-request session options — see the twin in
     # runtime/ruby/action_dispatch/request.rb. `:skip` is the one key
     # read: the dispatcher writes no session cookie when it is set.
-    attr_reader :session_options
+    # Not an ivar: the session commit above the gems' middleware reads Rails' `rack.session.options` from the env.
+    def session_options
+      @env["rack.session.options"] ||= {}
+    end
 
     def session_skip?
-      @session_options[:skip] == true
+      session_options[:skip] == true
+    end
+
+    # Not a slot as in the twin: Rails reads the Rack env's, the one Warden's proxy holds too.
+    def session
+      @env["rack.session"] ||= ActionDispatch::Session.new
+    end
+
+    def session=(value)
+      @env["rack.session"] = value
     end
 
     # `request.headers["Accept-Encoding"]` — the shared
@@ -108,6 +119,7 @@ module ActionDispatch
     # `"put"` must stay false). Shared `runtime/ruby` `put?` is likewise
     # case-sensitive on `@request_method` (no upcase on assign).
     def put? = @env["REQUEST_METHOD"] == "PUT"
+    def patch? = @env["REQUEST_METHOD"] == "PATCH"
     # Rails' "is this a safe request" idiom is `request.get? ||
     # request.head?`, and campfire writes exactly that in
     # `BlockBannedRequests#safe_request?`. This overlay is the Request
@@ -158,6 +170,35 @@ module ActionDispatch
     # host authority. `config.hosts` is not applied yet.
     def host
       raw_host_with_port
+    end
+
+    # The twins of runtime/ruby/action_dispatch/request.rb's: Rails'
+    # `domain`/`subdomains` at `tld_length` 1, and the negotiated format.
+    def domain
+      parts = named_host_parts
+      parts.empty? ? nil : parts.last(2).join(".")
+    end
+
+    def subdomains
+      parts = named_host_parts
+      parts.length < 3 ? [] : parts[0, parts.length - 2]
+    end
+
+    def subdomain
+      subdomains.join(".")
+    end
+
+    def named_host_parts
+      name = host.sub(/:[0-9]+\z/, "")
+      name.match?(/\A[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\z/) ? [] : name.split(".")
+    end
+
+    def format=(value)
+      @format = value.to_s
+    end
+
+    def format
+      Mime::Type.lookup_by_extension(@format.to_s) || Mime::Type.new("text/html", :html)
     end
 
     def raw_host_with_port
@@ -365,8 +406,8 @@ module ActionController
       attr_accessor :request
       # The dispatching controller, parked so module-function helpers
       # can reach per-request session state. Held as the controller
-      # (not the session object) because `reset_session` swaps the
-      # controller's @session for a fresh instance mid-action — a
+      # (not the session object) because the controller's @session can be
+      # swapped for another instance (a test's `session=`) — a
       # parked session reference would go stale, and a CSRF token
       # generated during the post-logout render would land in the
       # discarded session instead of the one the dispatch persists.

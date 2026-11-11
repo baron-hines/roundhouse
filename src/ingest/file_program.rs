@@ -844,3 +844,36 @@ mod tests {
         assert_eq!(read, vec![true, true, true, true, false, false, true]);
     }
 }
+
+/// A gem file's path with `.` and `..` segments folded, as programs and sources are keyed.
+pub(crate) fn normalize_source(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." => {}
+            ".." if out.last().is_some_and(|s| !s.is_empty() && *s != "..") => {
+                out.pop();
+            }
+            _ => out.push(segment),
+        }
+    }
+    out.join("/")
+}
+
+/// The carried file a gem file's `require` (or `require_relative`) of `feature` loads, among `known`.
+pub(crate) fn resolve_gem_require(known: &crate::det::HashSet<String>, from: &str, feature: &str, relative: bool) -> Option<String> {
+    let file = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+    if relative {
+        let dir = std::path::Path::new(from).parent()?;
+        return Some(normalize_source(&dir.join(&file).display().to_string()));
+    }
+    let lib_of = |path: &str| path.rfind("/lib/").map(|at| path[..at + 5].to_string());
+    let own = lib_of(from).map(|lib| normalize_source(&format!("{lib}{file}")));
+    if let Some(own) = own.filter(|p| known.contains(p)) {
+        return Some(own);
+    }
+    let suffix = format!("/lib/{file}");
+    let mut found: Vec<&String> = known.iter().filter(|p| p.ends_with(&suffix)).collect();
+    found.sort();
+    found.first().map(|p| p.to_string())
+}

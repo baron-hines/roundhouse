@@ -537,7 +537,7 @@ puts "super packet reaches the synthesized positional contract"
             "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
         )
         .run_ruby("puts 'super packet into a replaced model ancestor is diagnosed'");
-    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(
         run.stdout,
         "super packet into a replaced model ancestor is diagnosed\n"
@@ -638,7 +638,7 @@ puts "base and sibling keyword calls still dispatch"
             "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
         )
         .run_ruby("puts 'unsafe inherited keyword destinations are diagnosed'");
-    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(run.stdout, "unsafe inherited keyword destinations are diagnosed\n");
     assert_eq!(run.errors.len(), 4, "errors={:?}", run.errors);
     assert!(
@@ -697,7 +697,7 @@ puts "model-owned source method is replaced"
             "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
         )
         .run_ruby("puts 'model-owned replacement is diagnosed'");
-    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(run.stdout, "model-owned replacement is diagnosed\n");
     assert_eq!(run.errors.len(), 1, "errors={:?}", run.errors);
     assert!(

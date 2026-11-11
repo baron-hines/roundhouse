@@ -3123,6 +3123,34 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // own expressions, so a constant or call in the block is not lost.
         n if n.as_singleton_class_node().is_some() => {
             let sc = n.as_singleton_class_node().unwrap();
+            // Not another object's as `self`'s: its body defines on that object. Attribute macros alone are that object's singleton class's (`class << mod; attr_accessor :x; end`), a public call since Ruby 2.5.
+            if sc.expression().as_self_node().is_none() {
+                let stmts: Vec<_> = sc.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+                let attrs = !stmts.is_empty()
+                    && stmts.iter().all(|stmt| {
+                        stmt.as_call_node().is_some_and(|c| {
+                            c.receiver().is_none()
+                                && c.block().is_none()
+                                && matches!(constant_id_str(&c.name()).as_ref(), "attr_accessor" | "attr_reader" | "attr_writer")
+                                && c.arguments().is_some_and(|a| a.arguments().iter().all(|x| x.as_symbol_node().is_some()))
+                        })
+                    });
+                if attrs {
+                    let owner = ingest_expr(&sc.expression(), file)?;
+                    let singleton = Expr::new(span, ExprNode::Send { recv: Some(owner), method: Symbol::from("singleton_class"), args: Vec::new(), block: None, parenthesized: false });
+                    let mut calls = Vec::new();
+                    for stmt in &stmts {
+                        let call = stmt.as_call_node().expect("checked above");
+                        let args = call.arguments().map(|a| a.arguments().iter().map(|x| ingest_expr(&x, file)).collect::<IngestResult<Vec<_>>>()).transpose()?.unwrap_or_default();
+                        calls.push(Expr::new(span, ExprNode::Send { recv: Some(singleton.clone()), method: Symbol::from(constant_id_str(&call.name()).as_ref()), args, block: None, parenthesized: true }));
+                    }
+                    return Ok(if calls.len() == 1 { calls.pop().expect("one") } else { Expr::new(span, ExprNode::Seq { exprs: calls }) });
+                }
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "`class << obj` on an object other than self inside a method or block (its body defines on that object)".into(),
+                });
+            }
             match sc.body() {
                 Some(body) => return ingest_expr(&body, file),
                 None => ExprNode::Lit { value: Literal::Nil },

@@ -136,8 +136,20 @@ fn example() -> emit_and_run::Overlay {
 fn a_record_read_after_a_builder_head_projects_to_its_id() {
     let (emitted, _) = example().emit(BuildTarget::Ruby);
     let controller = std::fs::read_to_string(emitted.join("app/controllers/widgets_controller.rb")).expect("read the emitted controller");
-    assert!(controller.contains("redirect_to(RouteHelpers.edit_gadget_path(@part.id))"), "{controller}");
-    assert_eq!(controller.matches("redirect_to(RouteHelpers.edit_gadget_path(@thing.id))").count(), 4, "{controller}");
+    for (index, record) in ["@part", "@thing", "@thing", "@thing", "@thing"].iter().enumerate() {
+        let projection = format!(
+            concat!(
+                "redirect_to(RouteHelpers.edit_gadget_path((route_segment_{0} = {1}\n",
+                "    if route_segment_{0}.nil?\n",
+                "      nil\n",
+                "    else\n",
+                "      route_segment_{0}.id\n",
+                "    end)))",
+            ),
+            index, record,
+        );
+        assert_eq!(controller.matches(&projection).count(), 1, "{controller}");
+    }
 }
 
 #[test]

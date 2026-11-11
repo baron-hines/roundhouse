@@ -81,8 +81,9 @@ fn respond_to_json_with_no_respond_with_records_no_gap_and_actions_still_work() 
 }
 
 /// `respond_to :json` alongside a `respond_with` call anywhere in the
-/// controller's ancestor chain: `respond_with` is not modeled, so the
-/// macro keeps its gap rather than being silently consumed.
+/// controller's ancestor chain: `respond_with` for a non-html format
+/// is not modeled, so the macro keeps its gap rather than being
+/// silently consumed.
 #[test]
 fn respond_to_json_with_a_respond_with_call_still_gets_the_gap() {
     let files: &[(&str, &str)] = &[
@@ -98,4 +99,20 @@ fn respond_to_json_with_a_respond_with_call_still_gets_the_gap() {
         messages.iter().any(|m| m.contains("respond_to")),
         "a `respond_with` call in the chain must keep the `respond_to` gap, got: {messages:?}"
     );
+}
+
+/// `respond_to :html` with a `respond_with` call: the navigational response is modeled
+/// (`lower::controller_to_library::respond_with`), so neither is a gap.
+#[test]
+fn respond_to_html_with_a_respond_with_call_records_no_gap() {
+    let files: &[(&str, &str)] = &[
+        ("db/schema.rb", SCHEMA),
+        ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),
+        (
+            "app/controllers/gadget_tags_controller.rb",
+            "class GadgetTagsController < ApplicationController\n  respond_to :html\n\n  def create\n    @tag = :made_up\n    respond_with(@tag)\n  end\nend\n",
+        ),
+    ];
+    let (_app, messages) = respond_to_gaps(files);
+    assert!(!messages.iter().any(|m| m.contains("respond_to")), "got: {messages:?}");
 }

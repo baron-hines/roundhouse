@@ -577,6 +577,8 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
         // %>` lowers to — renders nothing and does nothing: nothing is
         // dropped, so no residue line.
         ExprNode::Lit { .. } => vec![noop_io_append()],
+        // The branch an `if` whose condition the analysis settled leaves in its place (`<% if @resource.try(:x?) %>`).
+        ExprNode::Seq { .. } => walk_body(stmt, ctx),
         _ => vec![todo_io_append("unknown stmt", stmt.span)],
     }
 }

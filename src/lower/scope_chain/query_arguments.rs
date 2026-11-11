@@ -55,70 +55,70 @@ impl<'a> QueryArguments<'a> {
                 result.insert(&controller.name, method);
             }
         }
-        loop {
-            let mut updates = Vec::new();
-            for (key, method) in &result.methods {
-                let mut blocked = HashSet::default();
-                walk(method.body, &mut |expr| match &*expr.node {
-                    ExprNode::Assign {
-                        target: LValue::Var { name, .. },
-                        ..
-                    } => {
-                        blocked.insert(name.clone());
-                    }
-                    ExprNode::Lambda {
-                        params,
-                        rest_param,
-                        extra_params,
-                        ..
-                    } => {
-                        blocked.extend(params.iter().cloned());
-                        blocked.extend(rest_param.iter().cloned());
-                        blocked.extend(extra_params.iter().map(|p| p.name.clone()));
-                    }
-                    _ => {}
-                });
-                walk(method.body, &mut |expr| {
-                    let ExprNode::Send {
-                        recv,
-                        method: name,
-                        args,
-                        block,
-                        ..
-                    } = &*expr.node
-                    else {
-                        return;
-                    };
-                    let mut read = |value: &Expr| {
-                        if let ExprNode::Var { name, .. } = &*value.node
-                            && !blocked.contains(name)
-                            && let Some(index) = method.params.iter().position(|p| p == name)
-                            && !result.queries.get(key).is_some_and(|q| q.contains(&index))
-                        {
-                            updates.push((key.clone(), index));
-                        }
-                    };
-                    if query_operation(name, block.as_ref())
-                        && let Some(receiver) = recv
-                    {
-                        read(receiver);
-                    }
-                    if let Some(callee) = method_key(recv.as_ref(), name, &key.0, key.1)
-                        && let Some(indices) = result.queries.get(&callee)
-                    {
-                        for index in indices {
-                            if let Some(arg) = args.get(*index) {
-                                read(arg);
-                            }
+        // A parameter is a query argument when the method runs a query
+        // on it, or passes it where a method it calls takes one. Each
+        // body is walked once: what it queries directly, and which of its
+        // parameters it passes in each callee position. The rest follows
+        // those edges from what is already known, so a body is not
+        // re-walked for every parameter a later round finds.
+        let mut found: Vec<(MethodKey, usize)> = Vec::new();
+        let mut passes: HashMap<(MethodKey, usize), Vec<(MethodKey, usize)>> = HashMap::default();
+        for (key, method) in &result.methods {
+            let mut blocked = HashSet::default();
+            walk(method.body, &mut |expr| match &*expr.node {
+                ExprNode::Assign {
+                    target: LValue::Var { name, .. },
+                    ..
+                } => {
+                    blocked.insert(name.clone());
+                }
+                ExprNode::Lambda {
+                    params,
+                    rest_param,
+                    extra_params,
+                    ..
+                } => {
+                    blocked.extend(params.iter().cloned());
+                    blocked.extend(rest_param.iter().cloned());
+                    blocked.extend(extra_params.iter().map(|p| p.name.clone()));
+                }
+                _ => {}
+            });
+            let param_of = |value: &Expr| match &*value.node {
+                ExprNode::Var { name, .. } if !blocked.contains(name) => method.params.iter().position(|p| p == name),
+                _ => None,
+            };
+            walk(method.body, &mut |expr| {
+                let ExprNode::Send {
+                    recv,
+                    method: name,
+                    args,
+                    block,
+                    ..
+                } = &*expr.node
+                else {
+                    return;
+                };
+                if query_operation(name, block.as_ref())
+                    && let Some(index) = recv.as_ref().and_then(|receiver| param_of(receiver))
+                {
+                    found.push((key.clone(), index));
+                }
+                if let Some(callee) = method_key(recv.as_ref(), name, &key.0, key.1) {
+                    for (at, arg) in args.iter().enumerate() {
+                        if let Some(index) = param_of(arg) {
+                            passes.entry((callee.clone(), at)).or_default().push((key.clone(), index));
                         }
                     }
-                });
+                }
+            });
+        }
+        while let Some((key, index)) = found.pop() {
+            if !result.queries.entry(key.clone()).or_default().insert(index) {
+                continue;
             }
-            if updates.is_empty() {
-                break;
-            }
-            for (key, index) in updates {
-                result.queries.entry(key).or_default().insert(index);
+            if let Some(callers) = passes.get(&(key, index)) {
+                found.extend(callers.iter().cloned());
             }
         }
         result
@@ -311,4 +311,40 @@ fn seed_argument(value: &Expr, ctx: &Ctx) -> Option<Expr> {
 fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     expr.node.for_each_child(&mut |child| walk(child, visit));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(report: &str) -> crate::App {
+        let tree = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :members do |t|\n    t.integer :parent_id\n  end\nend\n"),
+            ("app/models/member.rb", "class Member < ActiveRecord::Base\nend\n"),
+            ("app/models/report.rb", report),
+        ]
+        .into_iter()
+        .map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec()))
+        .collect();
+        crate::ingest::ingest_app_from_tree(tree).expect("ingest")
+    }
+
+    fn queried(arguments: &QueryArguments<'_>, method: &str) -> Vec<usize> {
+        let key = (ClassId(Symbol::from("Report")), MethodReceiver::Instance, Symbol::from(method));
+        let mut indices: Vec<usize> = arguments.queries.get(&key).into_iter().flatten().copied().collect();
+        indices.sort();
+        indices
+    }
+
+    #[test]
+    fn a_parameter_passed_on_to_a_query_through_several_calls_is_a_query_argument() {
+        let app = app(
+            "class Report\n  def top(a, b)\n    middle(b, a)\n  end\n\n  def middle(x, y)\n    bottom(1, x)\n  end\n\n  def bottom(n, rows)\n    rows.order(:id)\n  end\n\n  def shadowed(rows)\n    rows = []\n    bottom(1, rows)\n  end\nend\n",
+        );
+        let arguments = QueryArguments::build(&app);
+        assert_eq!(queried(&arguments, "bottom"), [1]);
+        assert_eq!(queried(&arguments, "middle"), [0]);
+        assert_eq!(queried(&arguments, "top"), [1]);
+        assert!(queried(&arguments, "shadowed").is_empty());
+    }
 }

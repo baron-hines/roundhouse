@@ -1317,10 +1317,26 @@ module ActiveStorage
       @row_loaded = false
       @attachment_id = 0
       @blob = nil
+      @staged = nil
     end
 
     def variations
       @variations
+    end
+
+    # The id of the record this proxy reads for. The model's reader
+    # compares it with the record's id before it reuses the proxy.
+    def record_id
+      @record_id
+    end
+
+    # The blob that `attach` keeps for a record that is not saved yet
+    # (record id 0), as Rails keeps it in `attachment_changes`. The
+    # model's after-save takes it and writes it under the new id.
+    def take_staged
+      staged = @staged
+      @staged = nil
+      staged
     end
 
     # The attachment row and its blob, in one join. `attachment_id` 0
@@ -1354,6 +1370,7 @@ module ActiveStorage
     end
 
     def attached?
+      return true unless @staged.nil?
       load_row
       @attachment_id != 0
     end
@@ -1361,6 +1378,8 @@ module ActiveStorage
     # The blob, or nil when nothing is attached — Rails' `Attached::One`
     # delegates to its attachment with `allow_nil: true`.
     def blob
+      staged = @staged
+      return staged unless staged.nil?
       load_row
       @blob
     end
@@ -1514,8 +1533,13 @@ module ActiveStorage
     # there is no job here and an orphaned blob row would make
     # `attached?` answer for a file no longer attached, so the row and
     # its bytes go with it — except when `blob` is ALREADY attached:
-    # re-attaching the same Blob must not purge its bytes.
+    # re-attaching the same Blob must not purge its bytes. For a record
+    # that is not saved yet, the blob is staged (see `take_staged`).
     def attach_blob(blob)
+      if @record_id == 0
+        @staged = blob
+        return nil
+      end
       load_row
       current = @blob
       if !(current.nil?) && current.id == blob.id
@@ -1633,6 +1657,11 @@ module ActiveStorage
       @rows_loaded = false
     end
 
+    # The id of the record this proxy reads for — see `Attached#record_id`.
+    def record_id
+      @record_id
+    end
+
     def attached?
       attachments.length > 0
     end
@@ -1740,6 +1769,10 @@ module ActiveStorage
     # APPEND — prior attachments under `@name` stay. One's `attach_blob`
     # purges first; Many must not.
     def attach_blob(blob)
+      # Rails keeps the attachment of a record that is not saved yet
+      # until `save`. This proxy keeps no such changes, and a row for
+      # record 0 would belong to no record.
+      raise "has_many_attached: attach to a record that is not saved yet is not supported (#{@record_type}##{@name})" if @record_id == 0
       @rows_loaded = false
       ActiveRecord.adapter.insert("active_storage_attachments", {
         "name" => @name,

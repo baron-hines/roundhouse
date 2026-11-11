@@ -75,6 +75,16 @@ fn json_response_defaults_run_on_spinel() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain"]
+fn installed_rails_defaults_run_on_spinel() {
+    for defaults in [r##""#{Rails::VERSION::MAJOR}.#{Rails::VERSION::MINOR}""##, "Rails::VERSION::STRING.to_f"] {
+        json_response_escaping::app(defaults)
+            .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    railties (8.1.4)\n\nPLATFORMS\n  ruby\n")
+            .run_spinel(&json_response_escaping::program("8.1")).assert_passes();
+    }
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
 fn dispatcher_rescue_uses_its_application_defaults_on_spinel() {
     use std::{fs, path::Path};
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/dispatcher_cases/render-classes");

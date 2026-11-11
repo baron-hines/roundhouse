@@ -53,6 +53,14 @@ pub(super) fn without_recording<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Run `f` as survey mode would, then put back the caller's mode and what it had recorded.
+pub(super) fn surveying<T>(f: impl FnOnce() -> T) -> T {
+    let saved = SURVEY_STATE.with(|s| s.borrow_mut().replace(Vec::new()));
+    let result = f();
+    SURVEY_STATE.with(|s| *s.borrow_mut() = saved);
+    result
+}
+
 /// How many errors are recorded so far, for `rewind`.
 pub(super) fn mark() -> Option<usize> {
     SURVEY_STATE.with(|s| s.borrow().as_ref().map(Vec::len))

@@ -112,8 +112,16 @@ fn reproducible(expr: &Expr) -> Option<(Vec<Symbol>, Symbol, Expr, bool)> {
 /// a String or Integer column's value is first cast by its type
 /// (`ActiveRecord::Type::String#cast`), as Rails casts before it
 /// normalizes: assignment, a finder keyword and `normalize_value_for`
-/// all reach it through here.
-pub(crate) fn push_normalize_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &HashMap<Symbol, Ty>, cast: bool) {
+/// all reach it through here. An enum column's value is cast by the enum
+/// instead (`enum_input`): the lambda gets the label, whether the write
+/// named the label or its stored value.
+pub(crate) fn push_normalize_methods(
+    methods: &mut Vec<MethodDef>,
+    model: &Model,
+    columns: &HashMap<Symbol, Ty>,
+    cast: bool,
+    enum_input: &dyn Fn(&Symbol, Expr, &Symbol) -> Option<(Expr, Expr)>,
+) {
     let type_class = |ty: &Ty| match ty {
         Ty::Str => Some("String"),
         Ty::Int => Some("Integer"),
@@ -158,7 +166,16 @@ pub(crate) fn push_normalize_methods(methods: &mut Vec<MethodDef>, model: &Model
         //   `ActiveRecord::Type::Integer.new.cast(value)` (blank is nil).
         let cast_value = Symbol::from("cast_value");
         let read_cast = || synthetic(ExprNode::Var { id: VarId(0), name: cast_value.clone() });
+        let stored_value = Symbol::from("stored_value");
+        let enum_cast = if cast { enum_input(&attr, read_value(), &stored_value) } else { None };
+        let is_enum = enum_cast.is_some();
         let body = match if cast { type_class(col_ty) } else { None } {
+            _ if is_enum => {
+                let (stored, label) = enum_cast.expect("is_enum");
+                let normalized = lambda_with(read_cast());
+                let guarded = if apply_to_nil { normalized } else { if_nil(read_cast(), nil_lit(), normalized) };
+                synthetic(ExprNode::Seq { exprs: vec![assign(&stored_value, stored), assign(&cast_value, label), guarded] })
+            }
             Some("String") => {
                 let as_string = synthetic(ExprNode::If {
                     cond: send(read_value(), "==", vec![synthetic(ExprNode::Lit { value: Literal::Bool { value: true } })]),
@@ -203,7 +220,12 @@ pub(crate) fn push_normalize_methods(methods: &mut Vec<MethodDef>, model: &Model
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(value.clone())],
             body,
-            signature: Some(super::model_to_library::fn_sig(vec![(value, col_ty.clone())], col_ty.clone())),
+            // An enum's takes a label, a Symbol or a stored value, and answers whatever the lambda does.
+            signature: Some(if is_enum {
+                super::model_to_library::fn_sig(vec![(value, Ty::Untyped)], Ty::Untyped)
+            } else {
+                super::model_to_library::fn_sig(vec![(value, col_ty.clone())], col_ty.clone())
+            }),
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
             kind: AccessorKind::Method,
@@ -214,6 +236,17 @@ pub(crate) fn push_normalize_methods(methods: &mut Vec<MethodDef>, model: &Model
     }
 }
 
+/// A finder condition's normalizing class method on an enum column:
+/// the stored value, since the condition is compared with the column.
+/// `Model._normalize_<attr>` answers what the lambda did, a label.
+pub(crate) fn condition_name(attr: &Symbol) -> Symbol {
+    Symbol::from(format!("_normalize_{}_condition", attr.as_str()))
+}
+
+/// The local an enum writer holds its normalized value in, so the nil
+/// check and the cast read one call's answer.
+pub(crate) const NORMALIZED_LOCAL: &str = "normalized";
+
 /// The column writer's right-hand side for a normalized attribute:
 /// `Model._normalize_<attr>(value)`.
 pub(crate) fn normalized_write(model: &Model, attr: &Symbol, value: Expr) -> Option<Expr> {
@@ -223,7 +256,11 @@ pub(crate) fn normalized_write(model: &Model, attr: &Symbol, value: Expr) -> Opt
     Some(call_normalizer(&model.name, attr, value))
 }
 
-fn call_normalizer(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
+pub(crate) fn call_normalizer(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
+    call_named(model, normalizer_name(attr), value)
+}
+
+fn call_named(model: &ClassId, method: Symbol, value: Expr) -> Expr {
     // The model's constant, a synthesized class reference: no source span
     // (the value's would make the resolver look for a constant there).
     let mut model_ref = Expr::new(
@@ -235,7 +272,7 @@ fn call_normalizer(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
         value.span,
         ExprNode::Send {
             recv: Some(model_ref),
-            method: normalizer_name(attr),
+            method,
             args: vec![value.clone()],
             block: None,
             parenthesized: true,
@@ -250,7 +287,7 @@ fn call_normalizer(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
 /// the class or a relation over it) normalize `v` the way assignment
 /// would. Runs after every pass that synthesizes a `find_by`
 /// (`authenticate_by` expands into one).
-pub fn apply_normalizes_finder_lowering(app: &mut App) {
+pub fn apply_normalizes_finder_lowering(app: &mut App, target: crate::build_target::BuildTarget) {
     // Only the attributes `push_normalize_methods` writes a normalizer
     // for: the model's columns. Another one (an `attr_accessor`) has no
     // `_normalize_<attr>` to call.
@@ -270,14 +307,25 @@ pub fn apply_normalizes_finder_lowering(app: &mut App) {
     if normalized.is_empty() {
         return;
     }
-    super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, &normalized, owner));
+    // Only the targets whose normalizer answers a label (`push_normalize_methods`' `cast`).
+    let enums: HashMap<ClassId, Vec<Symbol>> = if target.has_runtime_relation() {
+        app.models.iter().map(|m| (m.name.clone(), m.enums.keys().cloned().collect())).collect()
+    } else {
+        HashMap::default()
+    };
+    super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, &normalized, &enums, owner));
 }
 
 const FINDERS: &[&str] =
     &["find_by", "find_by!", "where", "exists?", "find_or_create_by", "find_or_initialize_by", "create_or_find_by", "create_or_find_by!"];
 
-fn rewrite(e: &mut Expr, normalized: &HashMap<ClassId, Vec<Symbol>>, owner: Option<&ClassId>) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, normalized, owner));
+fn rewrite(
+    e: &mut Expr,
+    normalized: &HashMap<ClassId, Vec<Symbol>>,
+    enums: &HashMap<ClassId, Vec<Symbol>>,
+    owner: Option<&ClassId>,
+) {
+    e.node.for_each_child_mut(&mut |c| rewrite(c, normalized, enums, owner));
     if let Some(call) = normalize_value_for(e, normalized, owner) {
         *e = call;
         return;
@@ -304,7 +352,8 @@ fn rewrite(e: &mut Expr, normalized: &HashMap<ClassId, Vec<Symbol>>, owner: Opti
             if !attrs.contains(key) || is_normalizer_call(v) {
                 continue;
             }
-            *v = normalize_condition(&class, key, v.clone());
+            let method = if enums.get(&class).is_some_and(|e| e.contains(key)) { condition_name(key) } else { normalizer_name(key) };
+            *v = normalize_condition(&class, &method, v.clone());
         }
     }
 }
@@ -348,7 +397,7 @@ fn normalize_value_for(e: &Expr, normalized: &HashMap<ClassId, Vec<Symbol>>, own
 /// under `apply_to_nil: true` (`where(note: [nil])` is `"note" IS
 /// NULL`). Before, the whole Array went to the normalizer, which
 /// normalized its `to_s`.
-fn normalize_condition(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
+fn normalize_condition(model: &ClassId, method: &Symbol, value: Expr) -> Expr {
     if let ExprNode::Array { elements, style } = &*value.node
         && !elements.iter().any(|e| matches!(&*e.node, ExprNode::Splat { .. }))
     {
@@ -358,7 +407,7 @@ fn normalize_condition(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
                 if matches!(&*e.node, ExprNode::Lit { value: Literal::Nil }) || is_normalizer_call(e) {
                     e.clone()
                 } else {
-                    call_normalizer(model, attr, e.clone())
+                    call_named(model, method.clone(), e.clone())
                 }
             })
             .collect();
@@ -367,7 +416,7 @@ fn normalize_condition(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
         return array;
     }
     let Some(Ty::Array { elem }) = value.ty.clone() else {
-        return call_normalizer(model, attr, value);
+        return call_named(model, method.clone(), value);
     };
     // `titles.map { |element| Model._normalize_title(element) }`, with
     // a nil guard when an element can be nil.
@@ -375,7 +424,7 @@ fn normalize_condition(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
     let name = Symbol::from("element");
     let mut read = Expr::new(span, ExprNode::Var { id: VarId(0), name: name.clone() });
     read.ty = Some(elem.as_ref().clone());
-    let normalized = call_normalizer(model, attr, read.clone());
+    let normalized = call_named(model, method.clone(), read.clone());
     let can_be_nil = match elem.as_ref() {
         Ty::Nil | Ty::Untyped => true,
         Ty::Union { variants } => variants.contains(&Ty::Nil),

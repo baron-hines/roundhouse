@@ -535,6 +535,10 @@ fn transpile(
             roundhouse::diagnostic::DiagnosticKind::Unsupported {
                 construct, detail, ..
             } if construct.as_str() == "constant" => !external_roots.names_any(detail),
+            // Not this tree's: it runs the gem file's statements in the file's program (`ingest::gem_load_program`).
+            roundhouse::diagnostic::DiagnosticKind::Unsupported {
+                target: Some(only), construct, ..
+            } if only.as_str() == "spinel" && construct.as_str() == "gem file statement" => false,
             _ => true,
         });
     }
@@ -628,6 +632,9 @@ fn transpile(
     // materialized `files` are deferred to after the gate (below) so a
     // gate failure reports every diagnostic before the run aborts.
     diags.splice(0..0, parse_diags);
+    // A gem's code the app does not reach is no error of the emitted program (`source_gem_shake`).
+    roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut diags);
+    roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut analyze_diags);
 
     // Policy: errors (unsupported constructs and type errors alike) fail
     // the transpile cleanly by default. With --allow-unsupported they

@@ -135,13 +135,7 @@ fn program_only_autoload(eager: bool) {
         app = app.write(&format!("vendor/gems/trackkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), EXPECTED, "emitted boot diverges from CRuby\n{}", run.stderr);
     // Track's autoload, as the gem's own, loads the program of the file
     // that only requires its children; the program drops that autoload

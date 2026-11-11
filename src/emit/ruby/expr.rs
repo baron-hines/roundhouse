@@ -58,6 +58,43 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// The emit settings above as this thread holds them, for a worker that
+/// renders on another thread (`par_render`).
+#[derive(Clone)]
+pub(super) struct Settings {
+    core_class_reopen: bool,
+    futamura_box: bool,
+    body_statements: bool,
+    external_gem_namespaces: std::collections::BTreeSet<String>,
+    external_includes: std::collections::BTreeMap<String, Vec<String>>,
+    emitted_file: Option<std::path::PathBuf>,
+}
+
+impl Settings {
+    pub(super) fn capture() -> Self {
+        Settings {
+            core_class_reopen: IN_CORE_CLASS_REOPEN.with(Cell::get),
+            futamura_box: FUTAMURA_BOX.with(Cell::get),
+            body_statements: BODY_STATEMENTS.with(Cell::get),
+            external_gem_namespaces: EXTERNAL_GEM_NAMESPACES.with(|c| c.borrow().clone()),
+            external_includes: EXTERNAL_INCLUDES.with(|c| c.borrow().clone()),
+            emitted_file: EMITTED_FILE.with(|c| c.borrow().clone()),
+        }
+    }
+
+    /// Hold these settings on this thread, for good: a worker thread ends
+    /// with its work.
+    pub(super) fn install(&self) {
+        IN_CORE_CLASS_REOPEN.with(|c| c.set(self.core_class_reopen));
+        FUTAMURA_BOX.with(|c| c.set(self.futamura_box));
+        BODY_STATEMENTS.with(|c| c.set(self.body_statements));
+        EXTERNAL_GEM_NAMESPACES.with(|c| *c.borrow_mut() = self.external_gem_namespaces.clone());
+        EXTERNAL_ROOT_INDEX.with(|c| *c.borrow_mut() = crate::gems::ExternalRootIndex::new(&self.external_gem_namespaces));
+        EXTERNAL_INCLUDES.with(|c| *c.borrow_mut() = self.external_includes.clone());
+        EMITTED_FILE.with(|c| *c.borrow_mut() = self.emitted_file.clone());
+    }
+}
+
 /// Run `f` while emitting the file that lands at `out_path` (relative
 /// to the output root), restoring the previous setting after.
 pub(super) fn with_emitted_file<R>(out_path: &std::path::Path, f: impl FnOnce() -> R) -> R {

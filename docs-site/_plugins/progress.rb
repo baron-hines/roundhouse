@@ -112,8 +112,9 @@ module RoundhouseProgress
   end
 
   # One square per item: green with a tick when it passed, red with a cross when
-  # it failed, a dashed outline with a cross when it didn't finish. A wider space
-  # separates groups.
+  # it failed, a dashed outline with a question mark when this attempt didn't
+  # establish it, a dashed outline with a cross when it didn't finish. A wider
+  # space separates groups.
   def unit_marks(items, label)
     x = 0
     body = items.each_with_index.map do |item, i|
@@ -122,6 +123,8 @@ module RoundhouseProgress
         %(<rect class="f-ok" x="#{x}" y="4" width="16" height="16" rx="3"/><text class="f-tick" x="#{x + 8}" y="15.5" text-anchor="middle">✓</text>)
       elsif item["failed"]
         %(<rect class="f-bad" x="#{x}" y="4" width="16" height="16" rx="3"/><text class="f-tick" x="#{x + 8}" y="15.5" text-anchor="middle">✕</text>)
+      elsif item["unknown"]
+        %(<rect class="f-unknown" x="#{x + 0.5}" y="4.5" width="15" height="15" rx="3"/><text class="f-query" x="#{x + 8}" y="15.5" text-anchor="middle">?</text>)
       else
         %(<rect class="f-open" x="#{x + 0.5}" y="4.5" width="15" height="15" rx="3"/><text class="f-cross" x="#{x + 8}" y="15.5" text-anchor="middle">✕</text>)
       end
@@ -162,7 +165,8 @@ module RoundhouseProgress
 
   # --- Modules ----------------------------------------------------------------
 
-  def gap(feed, repo)
+  # A saved result's local report isn't in the new publication, so it links upstream.
+  def gap(feed, repo, upstream)
     d = feed["data"]
     failing = d.dig("examples", "failed").to_i
     taken = Hash.new(0)
@@ -188,7 +192,7 @@ module RoundhouseProgress
       "pass_pct" => ex["total"].to_i.positive? ? (ex["passed"] * 100.0 / ex["total"]).round(1) : 0,
       "ruby" => d["ruby_pinned"], "lobsters_sha" => short(d["lobsters_sha"]), "lobsters_url" => commit_url("https://github.com/lobsters/lobsters", d["lobsters_sha"]),
       "roundhouse_sha" => short(d["roundhouse_sha"]), "roundhouse_url" => commit_url("https://github.com/#{repo}", d["roundhouse_sha"]),
-      "report_url" => feed["sources"].last, "groups" => active.map(&group), "group_count" => active.count { |c| c["slug"] != "unclassified" },
+      "report_url" => feed["cached"] ? upstream : feed["sources"].last, "groups" => active.map(&group), "group_count" => active.count { |c| c["slug"] != "unclassified" },
       "smaller_count" => [active.size - 3, 0].max, "smaller_examples" => plural(active.drop(3).sum { |c| c["failures"] }, "example"),
       # Two parts only: with pending examples, passed + failed isn't the whole run.
       "figure" => d["canary_ok"] && d["consistent"] && ex["pending"].to_i.zero? ? gap_meter(ex["passed"].to_i, ex["total"].to_i) : nil,
@@ -606,13 +610,15 @@ module RoundhouseProgress
     not_selected = checked.count { |r| r["result"] == "Not selected" }
     apps = checked.group_by { |r| r["app"] }.map { |app, rs| { "app" => app, "rows" => rs.sort_by { |r| r["name"].downcase }.reject { |r| r["result"] == "Not selected" } } }.reject { |x| x["rows"].empty? }
     failed = checked.select { |r| r["class"] == "fail" }.map { |r| "#{r["app"]} on #{r["name"]}" }
-    marks = apps.flat_map { |x| x["rows"].map { |r| { "ok" => r["class"] == "ok", "failed" => r["class"] == "fail", "title" => "#{r["app"]} · #{r["name"]}: #{r["result"].downcase}", "group" => x["app"] } } }
+    unknown = checked.count { |r| r["class"] == "unknown" }
+    marks = apps.flat_map { |x| x["rows"].map { |r| { "ok" => r["class"] == "ok", "failed" => r["class"] == "fail", "unknown" => r["class"] == "unknown", "title" => "#{r["app"]} · #{r["name"]}: #{r["result"].downcase}", "group" => x["app"] } } }
     {
       "headline" => "#{passed} of #{selected} selected checks passed", "passed" => passed, "selected" => selected, "not_selected" => not_selected,
+      "unknown_text" => unknown.positive? ? "#{unknown} not established in this attempt" : nil,
       "failed" => checked.select { |r| r["class"] == "fail" }.map { |r| "#{r["app"]}: #{r["name"]}" },
       "apps" => apps, "apps_label" => apps.map { |x| x["app"] }.join(" + "),
       "failed_text" => failed.empty? ? nil : "#{failed.size > 1 ? "#{failed[0..-2].join(", ")} and #{failed[-1]}" : failed[0]} failed",
-      "figure" => marks.empty? ? nil : unit_marks(marks, "#{passed} of #{selected} selected checks passed#{"; #{failed.join(", ")} failed" unless failed.empty?}"),
+      "figure" => marks.empty? ? nil : unit_marks(marks, "#{passed} of #{selected} selected checks passed#{"; #{failed.join(", ")} failed" unless failed.empty?}#{"; #{unknown} not established in this attempt" if unknown.positive?}"),
       "others" => checked.select { |r| r["result"] == "Not selected" }.sort_by { |r| [r["app"], r["name"].downcase] },
       "others_text" => plural(not_selected, "more check") + (not_selected == 1 ? " wasn’t" : " weren’t") + " selected for this run",
       "unchecked" => rows.reject { |r| r["check"] }.map { |r| "#{r["app"]}: #{r["name"]}" },
@@ -680,7 +686,7 @@ module RoundhouseProgress
     repo = site.config.dig("status", "repo")
     states = SOURCE_NAMES.keys.to_h { |k| [k, guarded({}, k) { state(k, status[k], now) } || UNREADABLE.dup] }
     view = { "built" => datetime(status["generated_at"]), "site_sha" => short(status["site_sha"]), "states" => states, "repo" => repo }
-    view["gap"] = guarded(states, "specs") { gap(status["specs"], repo) } if states.dig("specs", "available")
+    view["gap"] = guarded(states, "specs") { gap(status["specs"], repo, site.config.dig("status", "lobsters_specs")) } if states.dig("specs", "available")
     view["over_time"] = guarded(states, "history") { over_time(site.data["status_history"]) } || { "count" => 0 }
     view["replay"] = guarded(states, "replay", "routes") { replay(status["replay"], status["routes"]) }
     view["targets"] = guarded(states, "archives") { targets(status["archives"]) } if states.dig("archives", "available")

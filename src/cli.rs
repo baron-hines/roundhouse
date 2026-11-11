@@ -189,7 +189,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // Ingest inside a parse-diagnostic scope so Prism syntax errors —
     // which the error-recovering parser otherwise drops — are collected
     // and reported alongside the analyze diagnostics.
-    let (ingest_result, parse_diags) =
+    let (ingest_result, mut parse_diags) =
         crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
 
     let mut survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
@@ -224,7 +224,11 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     };
     let mut analyzer = Analyzer::for_source(&app);
     crate::timings::phase("analyze", || analyzer.analyze(&mut app));
+    // Not left to lowering: a branch the fold removes holds no code of the emitted program, which is what emit diagnoses.
+    crate::lower::defined_const_fold::apply_defined_const_fold(&mut app);
     let mut diags = crate::timings::phase("diagnose", || diagnose(&app));
+    crate::source_gem_shake::demote_unreached_gem_errors(&app, &mut diags);
+    crate::source_gem_shake::demote_unreached_gem_errors(&app, &mut parse_diags);
     // Survey mode: diagnostics that trace back to a recorded ingest gap
     // are the tool's coverage problem, not the app's — downgrade them to
     // notes with the root cause attached so the error count below means

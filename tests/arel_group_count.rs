@@ -201,10 +201,9 @@ fn a_where_survives_into_the_grouped_select() {
 
 #[test]
 fn a_multi_column_group_stays_on_the_relation_path() {
-    // Rails answers Array keys for a multi-column group, and the
-    // runtime's own `group_count` joins its groups into one key
-    // expression and hydrates a flat Hash. Neither side can carry the
-    // composite today, so decline rather than guess.
+    // Rails answers Array keys for a multi-column group. Arel's
+    // GroupCount projection handles one key expression, so composite
+    // keys stay on the Relation runtime path.
     let body = method_body(&comment_model(), "two_groups");
     assert!(
         body.contains("group_count"),
@@ -212,7 +211,7 @@ fn a_multi_column_group_stays_on_the_relation_path() {
     );
     assert!(
         !body.contains("GROUP BY"),
-        "no SQL is composed for a group shape we cannot render:\n{body}"
+        "the single-key Arel fold does not compose composite-key SQL:\n{body}"
     );
 }
 

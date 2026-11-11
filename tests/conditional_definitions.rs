@@ -78,7 +78,7 @@ end
 "#,
         )
         .run_ruby("p Sampling.diagnostic_sampling\np CacheStore.new.report\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "\"other\"\n[\"development\", \"lenient\", \"other\", true, true, true]\n");
 }
 
@@ -123,7 +123,7 @@ end
 "#,
         )
         .run_ruby("p Connection.new.report\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "[:TLS1_2, nil, false, false, false, \"s\"]\n");
 }
 
@@ -251,7 +251,7 @@ end
              p [Shop.sharded_table?, Shop.sharded_hook, Shop.tracked_hook]\n\
              p Sharded::ClassMethods.singleton_methods\n",
         );
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(
         run.stdout,
         "[true, \"extended Widget\", \"tracked Widget\"]\n[true, \"extended Shop\", \"tracked Shop\"]\n[:extended]\n"
@@ -340,6 +340,6 @@ end
         .write("vendor/gems/vc-1.0.0/lib/vc.rb", GEM)
         .write("lib/widget.rb", WIDGET)
         .run_ruby(SCRIPT);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
 }

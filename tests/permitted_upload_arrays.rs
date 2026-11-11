@@ -167,7 +167,7 @@ fn every_permit_filter_keeps_uploads_of_a_field_read_as_uploads() {
             .write("config/routes.rb", "Rails.application.routes.draw do\n  resources :prompts, only: :create\n  post \"prompts/preview\", to: \"prompts#preview\"\nend\n")
             .write("app/controllers/prompts_controller.rb", &prompts_controller(&actions, &helpers))
             .run_ruby(BOTH_MODES);
-        assert!(run.errors.is_empty() && run.success, "{case}: {:?}\n{}\n{}", run.errors, run.stdout, run.stderr);
+        assert!(run.passed(), "{case}: {:?}\n{}\n{}", run.errors, run.stdout, run.stderr);
     }
 }
 

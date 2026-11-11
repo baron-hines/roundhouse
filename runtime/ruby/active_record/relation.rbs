@@ -345,7 +345,12 @@ module ActiveRecord
     # lowerer monomorphizing per call site from the schema.
     # `ids` is Array[Integer] for integer-key apps; string/uuid apps
     # widen it via `project::widen_key_contract` (#310).
-    def pluck: (*(String | Symbol) cols) -> Array[untyped]
+    def pluck: (*(String | Symbol | Arel::Nodes::SqlLiteral) cols) -> Array[untyped]
+    def pluck_column_sql: (String | Symbol col) -> String
+    def pluck_sql: (Array[String | Symbol | Arel::Nodes::SqlLiteral] cols) -> Array[untyped]
+    def sql_projection_width: (String sql) -> Integer
+    def sql_item_width: (String item) -> Integer
+    def sql_unquoted: (String name) -> String
     def pick: (*(String | Symbol) cols) -> untyped
     def ids: () -> Array[Integer]
     def find: (Integer | Float | String | Array[Integer | Float | String] | nil id) -> untyped

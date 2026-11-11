@@ -72,6 +72,6 @@ fn another_session_cookie_key_fails_the_test() {
         .write("test/controllers/session_key_controller_test.rb", &TEST.replace("_real_blog_session", "_other_session"))
         .run_test("test/controllers/session_key_controller_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "a wrong key passed:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "a wrong key passed:\n{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("FAIL SessionKeyControllerTest"), "the test did not run:\n{}\n{}", run.stdout, run.stderr);
 }

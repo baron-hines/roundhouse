@@ -7,4 +7,9 @@ module GemMiddleware
   def self.wrap(app)
     app
   end
+
+  # The test harness's request through the stack (Rails' integration tests run it), the block at its bottom.
+  def self.around(env, &inner)
+    wrap(inner).call(env)
+  end
 end

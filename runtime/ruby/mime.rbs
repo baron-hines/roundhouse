@@ -15,7 +15,45 @@ module Mime
     def to_s: () -> String
     def to_str: () -> String
     def to_sym: () -> Symbol?
+    def ref: () -> (Symbol | String)
     def ==: (untyped other) -> bool
+    def atom?: () -> bool
+    def bmp?: () -> bool
+    def css?: () -> bool
+    def csv?: () -> bool
+    def gif?: () -> bool
+    def gzip?: () -> bool
+    def html?: () -> bool
+    def ics?: () -> bool
+    def jpeg?: () -> bool
+    def js?: () -> bool
+    def json?: () -> bool
+    def m4a?: () -> bool
+    def md?: () -> bool
+    def mp3?: () -> bool
+    def mp4?: () -> bool
+    def mpeg?: () -> bool
+    def multipart_form?: () -> bool
+    def ogg?: () -> bool
+    def otf?: () -> bool
+    def pdf?: () -> bool
+    def png?: () -> bool
+    def rss?: () -> bool
+    def svg?: () -> bool
+    def text?: () -> bool
+    def tiff?: () -> bool
+    def ttf?: () -> bool
+    def turbo_stream?: () -> bool
+    def url_encoded_form?: () -> bool
+    def vcf?: () -> bool
+    def vtt?: () -> bool
+    def webm?: () -> bool
+    def webp?: () -> bool
+    def woff?: () -> bool
+    def woff2?: () -> bool
+    def xml?: () -> bool
+    def yaml?: () -> bool
+    def zip?: () -> bool
     def eql?: (untyped other) -> bool
     def hash: () -> Integer
     def inspect: () -> String
@@ -24,6 +62,7 @@ module Mime
     # well-formed string and raises for the rest. See the note in mime.rb.
     def self.lookup: (String string) -> Mime::Type
     def self.lookup_by_extension: ((String | Symbol) extension) -> Mime::Type?
+    def self.symbol_for: (String media_type) -> Symbol?
     def self.valid?: (String? string) -> bool
   end
 

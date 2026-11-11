@@ -124,6 +124,7 @@ module Rails
     @assets: AssetConfig
     def initialize: () -> void
     def assets: () -> AssetConfig
+    def filter_parameters: () -> Array[String | Regexp]
   end
 
   class ImportmapMap

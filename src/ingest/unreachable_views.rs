@@ -21,10 +21,43 @@ use crate::app::App;
 use crate::dialect::{Controller, ControllerBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 
+/// The controllers a source gem's files declare that no route dispatches to, neither them nor a
+/// controller that inherits from them (devise's `PasswordsController` where no model is `:recoverable`):
+/// Rails loads them, and never runs an action of theirs.
+pub(crate) fn unrouted_gem_controllers(app: &App) -> HashSet<String> {
+    let routed: HashSet<String> = crate::lower::routes::flatten_routes_for_helpers(app)
+        .into_iter()
+        .map(|r| r.controller.0.as_str().to_string())
+        .collect();
+    let by_name: HashMap<&str, &Controller> = app.controllers.iter().map(|c| (c.name.0.as_str(), c)).collect();
+    let gem_source = |c: &Controller| {
+        app.source_path(c.parent_span.file)
+            .is_some_and(|p| p.contains("/.roundhouse/source_gems/") || p.starts_with(".roundhouse/source_gems/"))
+    };
+    let descends = |child: &Controller, ancestor: &str| {
+        let mut current = child;
+        for _ in 0..32 {
+            if current.name.0.as_str() == ancestor {
+                return true;
+            }
+            let Some(next) = current.parent.as_ref().and_then(|p| by_name.get(p.0.as_str().trim_start_matches("::"))) else { return false };
+            current = next;
+        }
+        false
+    };
+    app.controllers
+        .iter()
+        .filter(|c| gem_source(c))
+        .filter(|c| !app.controllers.iter().any(|d| routed.contains(d.name.0.as_str()) && descends(d, c.name.0.as_str())))
+        .map(|c| c.name.0.as_str().to_string())
+        .collect()
+}
+
 pub(super) fn mark(app: &mut App) {
     if app.controllers.is_empty() || app.views.is_empty() {
         return;
     }
+    let unrouted = unrouted_gem_controllers(app);
     let by_name: HashMap<&str, &Controller> = app.controllers.iter().map(|c| (c.name.0.as_str(), c)).collect();
     let modules: HashMap<&str, HashSet<&str>> = app
         .library_classes
@@ -49,11 +82,15 @@ pub(super) fn mark(app: &mut App) {
             continue;
         }
         let family = family(controller, &by_name);
-        let reachable = family.iter().any(|c| {
-            defines(c, base, &modules)
+        // Not by an ancestor's render either, for a gem controller no route dispatches to: Rails looks a template up
+        // under the running controller's own prefixes, and no running controller has this directory among them.
+        let unrouted_dir = unrouted.contains(controller.name.0.as_str());
+        let reachable = (!unrouted_dir && family.iter().any(|c| {
+            // Not an action of a gem's controller no route dispatches to: Rails never runs it.
+            (defines(c, base, &modules) && !unrouted.contains(c.name.0.as_str()))
                 || routes.contains(&(c.name.0.as_str().to_string(), base.to_string()))
-                || renders(c, base, view.name.as_str())
-        }) || named_anywhere.iter().any(|lit| names_template(lit, view.name.as_str()));
+                || (renders(c, base, view.name.as_str()) && !unrouted.contains(c.name.0.as_str()))
+        })) || named_anywhere.iter().any(|lit| names_template(lit, view.name.as_str()));
         if !reachable {
             unreachable.push(i);
         }

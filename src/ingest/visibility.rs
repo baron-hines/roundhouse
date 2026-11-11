@@ -110,6 +110,7 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
         stmts.iter().all(|stmt| {
             definition(stmt).is_some()
                 || conditional_accessor(stmt).is_some()
+                || self_write(stmt).is_some()
                 || conditional_definition(stmt).is_some()
                 || stmt.as_class_node().is_some()
                 || stmt.as_module_node().is_some()
@@ -158,6 +159,7 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
     let admitted = |stmt: &Node<'_>| {
         definition(stmt).is_some()
             || conditional_accessor(stmt).is_some()
+            || self_write(stmt).is_some()
             || conditional_definition(stmt).is_some()
             || stmt.as_class_node().is_some()
             || stmt.as_module_node().is_some()
@@ -182,6 +184,18 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
         "a load-time conditional definition whose branch holds a statement other than a `def` is not modeled"
     };
     Some((stmt, why))
+}
+
+/// `self.error_status = :ok`: a write through the class's own writer, as a branch runs it.
+pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    let name = constant_id_str(&call.name());
+    (call.receiver().is_some_and(|r| r.as_self_node().is_some())
+        && call.block().is_none()
+        && name.ends_with('=')
+        && !matches!(name, "==" | "!=" | "<=" | ">=" | "===")
+        && call.arguments().is_some_and(|a| a.arguments().iter().count() == 1))
+    .then_some(call)
 }
 
 /// A bare `attr_reader` / `attr_writer` / `attr_accessor` of literal

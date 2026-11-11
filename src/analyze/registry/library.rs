@@ -56,7 +56,7 @@ pub(in crate::analyze) fn register(
         let cls = classes.entry(lc.name.clone()).or_default();
         // Newly modeled OpenSSL returns must not pin an app override to the native result.
         if matches!(lc.name.0.as_str(), "OpenSSL" | "OpenSSL::KDF" | "OpenSSL::PKey" | "OpenSSL::PKey::PKey"
-            | "OpenSSL::PKey::EC" | "OpenSSL::PKey::EC::Group" | "OpenSSL::Digest::SHA384" | "OpenSSL::Digest::SHA512")
+            | "OpenSSL::PKey::EC" | "OpenSSL::PKey::EC::Group" | "OpenSSL::Digest::SHA384" | "OpenSSL::Digest::SHA512" | "OpenSSL::Cipher")
         {
             for method in lc.methods.iter().filter(|m| m.signature.is_none()
                 && !app.rbs_signatures.get(&lc.name).is_some_and(|s| s.contains_key(&m.name)))

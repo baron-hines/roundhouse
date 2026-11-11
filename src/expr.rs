@@ -205,6 +205,8 @@ pub const GUARDED_NAME_ERROR: u64 = 1 << 55;
 pub const UNCALLED_DEFINER: u64 = 1 << 56;
 /// An integer literal wider than 64 bits, built from 32-bit limbs: the ruby family's Integer holds it, a fixed-width one does not.
 pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
+/// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
+pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 
 /// On a route-helper call `lower::route_format_suffix` renamed for its
 /// literal `format:` (`widget_url(w, format: :json)` to

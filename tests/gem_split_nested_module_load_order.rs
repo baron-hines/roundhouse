@@ -53,13 +53,7 @@ fn a_nested_module_loads_before_a_sibling_class_includes_its_owner() {
     let run = app.run_ruby(
         "begin\n  Idents::Skeleton.in_effect?\nrescue StandardError => e\n  puts e.class.name\nend\nputs Idents::Skeleton.singleton_class.include?(Idents::Interface::ClassMethods)\n",
     );
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     let lines: Vec<&str> = run.stdout.lines().rev().take(2).collect();
     assert_eq!(lines, ["true", "Idents::Interface::NotImplemented"], "{}", run.stderr);
 }

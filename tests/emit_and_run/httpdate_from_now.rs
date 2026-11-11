@@ -37,7 +37,7 @@ fn an_http_date_an_hour_ahead_is_sent() {
 fn the_expires_test_fails_without_the_header() {
     let run = emit_and_run::real_blog().write("test/controllers/expires_controller_test.rb", TEST).run_test("test/controllers/expires_controller_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "no Expires header passed:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "no Expires header passed:\n{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("FAIL ExpiresControllerTest"), "the test did not run:\n{}\n{}", run.stdout, run.stderr);
 }
 

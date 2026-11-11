@@ -11,8 +11,8 @@
 # Module-ivar statics rather than `class << self` (the overlay's
 # shape): explicit `def self.` accessors are the statically-resolvable
 # form every ingest/AOT path handles. The controller is parked (not
-# its session) because `reset_session` swaps the controller's @session
-# mid-action — a parked session reference would go stale.
+# its session) because the controller's @session can be swapped
+# (a test's `session=`) — a parked session reference would go stale.
 module ActionController
   class Base
     attr_accessor :request

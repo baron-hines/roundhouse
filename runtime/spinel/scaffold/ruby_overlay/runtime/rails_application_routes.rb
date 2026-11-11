@@ -85,7 +85,10 @@ module Rails
           accepted = "#{HTTP_METHODS[0...-1].join(", ")}, and #{HTTP_METHODS.last}"
           raise ActionController::UnknownHttpMethod, "#{verb}, accepted HTTP methods are #{accepted}"
         end
-        matched = ActionDispatch::Router.match(verb, request_path, table)
+        # Rails asks a route's request constraints with a mock request (`Rack::MockRequest.env_for`).
+        asked = ActionDispatch::Request.for({ "HTTP_HOST" => "example.org", "REQUEST_METHOD" => verb, "PATH_INFO" => request_path }, {})
+        asked.format = ActionDispatch::MimeNegotiation.format_name(request_path.split("/").last.to_s.include?(".") ? request_path.split("/").last.to_s.split(".").last.to_s : "", "", "", "")
+        matched = defined?(::RouteTable) ? ::RouteTable.match_asking(verb, request_path, table, asked) : ActionDispatch::Router.match(verb, request_path, table)
         # The router ignores a trailing slash. Rails does not normalize
         # the path of a full URL, so there a trailing slash matches no
         # route without a glob. On a glob route, Rails keeps the slash in

@@ -369,7 +369,8 @@ pub(in crate::analyze) fn register(
         // Rack env accessors and the parameter/header views Rails exposes on every
         // request. `POST`/`GET` are the raw form/query hashes; the header
         // readers are Rack env lookups.
-        for m in ["POST", "GET", "session_options"] {
+        // The Rack env: a Hash with String keys (`@env` in runtime/ruby/action_dispatch/request.rbs).
+        for m in ["POST", "GET", "session_options", "env"] {
             request.instance_methods.insert(
                 Symbol::from(m),
                 Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Untyped) },
@@ -382,8 +383,18 @@ pub(in crate::analyze) fn register(
         request.instance_methods.insert(Symbol::from("request_method_symbol"), Ty::Sym);
         request.instance_methods.insert(Symbol::from("route_uri_pattern"), str_or_nil());
         request.instance_methods.insert(Symbol::from("content_length"), Ty::Int);
-        for m in ["headers", "env", "cookie_jar", "session", "params",
-                  "path_parameters", "format", "body", "variant",
+        // Rails' `request.format` is the negotiated `Mime::Type` (`== :json` holds), as the runtime answers.
+        request.instance_methods.insert(Symbol::from("format"), Ty::Class { id: ClassId(Symbol::from("Mime::Type")), args: vec![].into() });
+        for (key, class) in &app.rack_env_writes {
+            request.env_keys.insert(key.clone(), Ty::Class { id: ClassId(Symbol::from(class.as_str())), args: vec![].into() });
+        }
+        // The runtime's `Request#params` (runtime/ruby/action_dispatch/request.rbs).
+        request.instance_methods.insert(
+            Symbol::from("params"),
+            Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Untyped) },
+        );
+        for m in ["headers", "cookie_jar", "session",
+                  "path_parameters", "body", "variant",
                   "flash", "subdomains", "accepts", "mime_type", "authorization",
                   // The app's key generator, and the controller CLASS the
                   // request routed to (`Request#controller_class`).

@@ -34,6 +34,7 @@ pub(crate) mod form_builder;
 pub(crate) mod turbo_drive;
 pub(crate) mod turbo_frames;
 pub(crate) mod attr_parts;
+pub(crate) mod hoist_constants;
 
 /// Largest `cached: true` collection that skips the store (`length > N`
 /// takes the concat-cache path). Named for the exclusive bound: length
@@ -365,7 +366,12 @@ impl<'a> ViewLowerCtx<'a> {
             app_helper_names: std::rc::Rc::new(
                 app.helper_method_index.keys().map(|n| n.as_str().to_string()).collect(),
             ),
-            direct_route_helpers: std::rc::Rc::new(crate::lower::routes::direct_helper_names(app)),
+            direct_route_helpers: std::rc::Rc::new(
+                crate::lower::routes::direct_helper_names(app)
+                    .into_iter()
+                    .chain(app.generated_route_helpers.iter().flat_map(|m| [m.name.as_str().to_string(), m.name.as_str().replace("_path", "_url")]))
+                    .collect(),
+            ),
             route_helper_arity: std::rc::Rc::new(route_helpers.into_iter().collect()),
             strict_locals: std::rc::Rc::new(strict_locals_by_key(&app.views)),
             yielding_partials: std::rc::Rc::new(yielding),

@@ -493,7 +493,7 @@ impl Ty {
     /// variant by lookup instead of a scan of `==`.
     pub(crate) fn eq_fingerprint(&self) -> u64 {
         use std::hash::Hasher;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = rustc_hash::FxHasher::default();
         self.hash_eq(&mut h);
         h.finish()
     }

@@ -2914,7 +2914,7 @@ fn enum_label_values(
     consts: &ClassConsts,
     resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<Vec<(String, EnumStored)>>> {
-    if node.as_constant_path_node().is_some() {
+    if node.as_constant_path_node().is_some() || node.as_parentheses_node().is_some() {
         return Ok(resolve_constant(node).map(|pairs| pairs.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect()));
     }
 

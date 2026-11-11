@@ -78,6 +78,7 @@ module ActionMailer
     def __null_mail: () -> Message
     def __deliver: (Message mail) -> Message?
     def action_name: () -> String
+    def __called: (String name) -> nil
     def __start_action: (String name) -> bool
     def __end_action: () -> nil
     def __processing: () -> self

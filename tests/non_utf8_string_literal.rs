@@ -72,6 +72,6 @@ fn a_string_literal_that_is_not_utf8_keeps_its_bytes_as_in_ruby() {
         .write("app/models/legacy.rb", LEGACY)
         .run_ruby(SCRIPT);
     assert!(run.errors.is_empty(), "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, native_out, "emitted\n{}", run.stderr);
 }

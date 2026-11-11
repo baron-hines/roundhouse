@@ -231,7 +231,14 @@ pub(super) fn push_schema_methods(
         model,
         &table.columns.iter().map(|c| (c.name.clone(), super::ty_of_column_slot(c))).collect(),
         runtime_relation == super::RuntimeRelation::Present,
+        &|attr, value, stored| {
+            let col = table.columns.iter().find(|c| &c.name == attr)?;
+            enum_normalizer_input(model, col, value, stored)
+        },
     );
+    if runtime_relation == super::RuntimeRelation::Present {
+        push_enum_condition_methods(methods, model, table);
+    }
     let mut demanded: Option<std::rc::Rc<crate::det::HashSet<Symbol>>> = None;
     for col in &table.columns {
         let slot = ColumnSlot::classify(col, model);
@@ -1531,18 +1538,27 @@ fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model, raw_inputs: b
         col_ty.clone()
     };
     let value = with_ty(var_ref(value_param.clone()), value_ty.clone());
+    let mut normalized_bind = None;
     let rhs = if let Some(assigned) = json_assignment {
         crate::lower::normalizes::normalized_write(model, &col.name, assigned.clone())
             .unwrap_or(assigned)
     } else if let Some(dumped) = slot.json_dump(value.clone()) {
         dumped
     } else {
-        let value = crate::lower::normalizes::normalized_write(model, &col.name, value.clone())
-            .unwrap_or(value);
-        enum_setter_value(model, col, value.clone()).unwrap_or(value)
+        let normalized = crate::lower::normalizes::normalized_write(model, &col.name, value.clone());
+        match normalized.as_ref().filter(|_| raw_inputs).and_then(|call| normalized_enum_store(model, col, call.clone())) {
+            Some((bind, stored)) => {
+                normalized_bind = Some(bind);
+                stored
+            }
+            None => {
+                let value = normalized.unwrap_or(value);
+                enum_setter_value(model, col, value.clone()).unwrap_or(value)
+            }
+        }
     };
     // Assign expression evaluates to the RHS in Ruby; same in TS.
-    let body = with_ty(
+    let write = with_ty(
         Expr::new(
             Span::synthetic(),
             ExprNode::Assign {
@@ -1552,6 +1568,10 @@ fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model, raw_inputs: b
         ),
         col_ty.clone(),
     );
+    let body = match normalized_bind {
+        Some(bind) => with_ty(Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![bind, write] }), col_ty.clone()),
+        None => write,
+    };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -3829,6 +3849,123 @@ fn enum_setter_value(model: &Model, col: &Column, value: Expr) -> Option<Expr> {
     Some(nil_guarded(col, value, call))
 }
 
+/// The stored value of a normalized enum write, and the local binding it
+/// reads. The write reads its input more than once (the nil check, the
+/// cast, a `nil` label), and that input must be one call's answer.
+fn normalized_enum_store(model: &Model, col: &Column, normalizer_call: Expr) -> Option<(Expr, Expr)> {
+    let local = Symbol::from(crate::lower::normalizes::NORMALIZED_LOCAL);
+    let read = with_ty(Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: local.clone() }), Ty::Untyped);
+    let stored = enum_setter_value(model, col, read)?;
+    let bind = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign { target: LValue::Var { id: VarId(0), name: local }, value: normalizer_call },
+    );
+    Some((bind, stored))
+}
+
+/// `Model._normalize_<enum>_condition(value)`, the method a finder keyword
+/// on a normalized enum calls: what the condition compares with the
+/// column, the stored value of what the lambda answers. A nil condition
+/// stays nil on a NOT NULL column too.
+fn push_enum_condition_methods(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
+    let attrs = crate::lower::normalizes::normalizations(model);
+    for col in &table.columns {
+        if !model.enums.contains_key(&col.name) || !attrs.contains_key(&col.name) {
+            continue;
+        }
+        let value = Symbol::from("value");
+        let call = crate::lower::normalizes::call_normalizer(&model.name, &col.name, with_ty(var_ref(value.clone()), Ty::Untyped));
+        let Some((bind, stored)) = normalized_enum_store(model, col, call) else { continue };
+        let guarded = if matches!(super::ty_of_column_slot(col), Ty::Union { .. }) {
+            stored
+        } else {
+            let read = with_ty(
+                Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(crate::lower::normalizes::NORMALIZED_LOCAL) }),
+                Ty::Untyped,
+            );
+            let is_nil = with_ty(
+                Expr::new(Span::synthetic(), ExprNode::Send { recv: Some(read), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false }),
+                Ty::Bool,
+            );
+            let nil = with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }), Ty::Nil);
+            Expr::new(Span::synthetic(), ExprNode::If { cond: is_nil, then_branch: nil, else_branch: stored })
+        };
+        let body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![bind, guarded] });
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: crate::lower::normalizes::condition_name(&col.name),
+            receiver: MethodReceiver::Class,
+            params: vec![Param::positional(value.clone())],
+            body,
+            signature: Some(fn_sig(vec![(value, Ty::Untyped)], Ty::Untyped)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+}
+
+/// What `normalizes` on an enum hands its lambda: the label, as Rails'
+/// enum type casts before the normalizer runs (activerecord 8.1.4). A
+/// blank or nil is nil, and a value no mapping names raises, before the
+/// lambda sees it. The stored value the write names, bound to `stored`,
+/// and the label read back from it, through the runtime's enum helpers.
+fn enum_normalizer_input(model: &Model, col: &Column, value: Expr, stored: &Symbol) -> Option<(Expr, Expr)> {
+    let (_, _, value_ty) = enum_arrays(model, col)?;
+    let (labels, values, _) = enum_array_refs(model, col, &value_ty);
+    let text = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(value), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false },
+        ),
+        Ty::Str,
+    );
+    // The `_or_nil` cast on a NOT NULL column too: a blank is nil here, not the zero `enum_int` answers.
+    let cast = enum_int_call_as(model, col, text.clone(), true)?;
+    let read_stored = || with_ty(Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: stored.clone() }), value_ty.clone());
+    let is_nil = with_ty(
+        Expr::new(Span::synthetic(), ExprNode::Send { recv: Some(read_stored()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false }),
+        Ty::Bool,
+    );
+    let label_ty = Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    let read_label = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActiveRecord")] })),
+                method: Symbol::from(if value_ty == Ty::Int { "enum_label" } else { "enum_label_str" }),
+                args: vec![read_stored(), labels, values],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        label_ty.clone(),
+    );
+    let nil = with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }), Ty::Nil);
+    let label = with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond: is_nil, then_branch: nil, else_branch: read_label }), label_ty.clone());
+    // The mapping's `nil` label is a label too: the cast answers nil for it, and the arrays leave it out.
+    let Some(nil_label) = enum_nil_label(model, col) else {
+        return Some((cast, label));
+    };
+    let is_label = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(text), method: Symbol::from("=="), args: vec![with_ty(lit_str(nil_label.clone()), Ty::Str)], block: None, parenthesized: false },
+        ),
+        Ty::Bool,
+    );
+    Some((
+        cast,
+        with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond: is_label, then_branch: with_ty(lit_str(nil_label), Ty::Str), else_branch: label }), label_ty),
+    ))
+}
+
 // Not a helper answering nil itself: a nullable column's nil has to stay nil, and `enum_int` answers an Integer.
 fn nil_guarded(col: &Column, raw: Expr, call: Expr) -> Expr {
     let nil = with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }), Ty::Nil);
@@ -4013,9 +4150,13 @@ pub(super) fn enum_constants(model: &Model, table: &Table) -> Vec<(Symbol, Expr)
 }
 
 fn enum_int_call(model: &Model, col: &Column, text: Expr) -> Option<Expr> {
+    enum_int_call_as(model, col, text, matches!(super::ty_of_column_slot(col), Ty::Union { .. }))
+}
+
+/// The enum cast of `text`; `nullable` picks the form that answers nil for a blank.
+fn enum_int_call_as(model: &Model, col: &Column, text: Expr, nullable: bool) -> Option<Expr> {
     let (_, values, value_ty) = enum_arrays(model, col)?;
     let text_for_nil = text.clone();
-    let nullable = matches!(super::ty_of_column_slot(col), Ty::Union { .. });
     let method = match (&value_ty, nullable) {
         (Ty::Int, false) => "enum_int",
         (Ty::Int, true) => "enum_int_or_nil",

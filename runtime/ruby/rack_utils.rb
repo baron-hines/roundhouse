@@ -1,6 +1,6 @@
 # frozen_string_literal: true
-# `Rack::Utils.q_values`, `Rack::Utils.select_best_encoding`, and
-# `Rack::Utils::HTTP_STATUS_CODES`, ported from rack 3.2
+# `Rack::Utils.q_values`, `Rack::Utils.select_best_encoding`,
+# `Rack::Utils.unescape_path` and `Rack::Utils::HTTP_STATUS_CODES`, ported from rack 3.2
 # (lib/rack/utils.rb) for the trees that have no rack gem to load. The
 # ruby family swaps this file for `require "rack/utils"` (see
 # `project::ruby_runtime_files`), so the gem's own code runs there —
@@ -146,6 +146,37 @@ module Rack
         candidates.delete(entry[0]) if entry[1] == 0.0
       end
       (candidates & available_encodings)[0]
+    end
+
+    # rack's `unescape_path` is `URI::RFC2396_PARSER.unescape`: each `%`
+    # followed by two hex digits becomes that byte, and anything else, `+`
+    # included, stays as written. The bytes are read as UTF-8, as URI reads
+    # a UTF-8 path, so `%ff` answers a String that is not valid UTF-8.
+    def self.unescape_path(s)
+      out = +""
+      i = 0
+      n = s.bytesize
+      while i < n
+        b = s.getbyte(i)
+        hi = i + 2 < n ? path_hex_value(s.getbyte(i + 1)) : -1
+        lo = i + 2 < n ? path_hex_value(s.getbyte(i + 2)) : -1
+        if b == 37 && hi >= 0 && lo >= 0
+          out << (hi * 16 + lo).chr
+          i += 3
+        else
+          out << b.chr
+          i += 1
+        end
+      end
+      out.force_encoding("UTF-8")
+    end
+
+    # The value of one hex digit's byte, or -1 for any other byte.
+    def self.path_hex_value(b)
+      return b - 48 if b >= 48 && b <= 57
+      return b - 55 if b >= 65 && b <= 70
+      return b - 87 if b >= 97 && b <= 102
+      -1
     end
   end
 end

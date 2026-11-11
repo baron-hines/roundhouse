@@ -196,6 +196,14 @@ class Routing(unittest.TestCase):
                 self.assertIn("spinel-framework", plan["jobs"])
                 self.assertIn("module_self_argument_rbs", plan["spinel_tests"])
 
+    def test_json_defaults_readers_run_the_native_response_contract(self):
+        for path in ("src/ingest/public_file_server_config.rs", "src/ingest/json_response_config.rs"):
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-build", plan["jobs"])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("render_json_encoder_spinel", plan["spinel_tests"])
+
     def test_shared_controller_base_runs_every_extra_language(self):
         for suffix in ("rb", "rbs"):
             with self.subTest(suffix=suffix):
@@ -418,6 +426,7 @@ class Routing(unittest.TestCase):
         for path in [
             "src/analyze/registry/stdlib.rs", "src/analyze/registry/library.rs", "src/project.rs",
             "tests/openssl_registrations.rs", "tests/support/openssl_registrations.rb",
+            "tests/support/cipher_registrations.rb", "runtime/spinel/message_digest.rb",
         ]:
             with self.subTest(path=path):
                 self.assertIn("openssl_registrations", ci.select([path])["spinel_tests"])

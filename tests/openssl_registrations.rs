@@ -230,3 +230,241 @@ fn openssl_error_alias_override_runs_natively_with_sidecars() {
         raise \"alias override\" unless AliasConsumer.value == 42\n\
         puts \"OpenSSL alias override OK\"\n", "OpenSSL alias override OK");
 }
+
+const CIPHER: &str = include_str!("support/cipher_registrations.rb");
+
+fn cipher_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app().write("app/models/cipher_boundary.rb", CIPHER.split_once("\nct, tag =").unwrap().0)
+}
+
+fn cipher_assertions() -> &'static str {
+    &CIPHER[CIPHER.find("\nct, tag =").unwrap()..]
+}
+
+#[test]
+fn cipher_constants_pass_strict_emission() {
+    let (_, errors) = cipher_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn cipher_emitted_ruby_matches_nist_vectors_and_error_parents() {
+    cipher_overlay().run_ruby(cipher_assertions()).assert_passes();
+}
+
+#[test]
+fn cipher_ruby_keeps_bundled_non_gcm_and_computed_names() {
+    let source = r#"require "openssl"
+class BundledCipher
+  def self.value(name)
+    c = OpenSSL::Cipher.new(name)
+    c.encrypt
+    c.key = "k" * 32
+    c.iv = "i" * 16
+    (c.update("hello cipher") + c.final).unpack1("H*")
+  end
+end
+"#;
+    emit_and_run::empty_app().write("app/models/bundled_cipher.rb", source).run_ruby(
+        "raise \"bundled CBC\" unless BundledCipher.value(\"aes-256-cbc\") == \"a89ad56b39c88372415c2772b6cb63ec\"").assert_passes();
+    let (_, errors) = emit_and_run::empty_app().write("app/models/bundled_cipher.rb", source).emit(BuildTarget::Jruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn cipher_names_require_gcm_literals_on_spinel() {
+    for call in [
+        "OpenSSL::Cipher.new(\"aes-256-cbc\")",
+        "::OpenSSL::Cipher.new(\"AES-128-GCM\")",
+        "OpenSSL::Cipher.new(name)",
+        "OpenSSL::Cipher.public_send(:new, name)",
+        "OpenSSL::Cipher.send(\"new\", name)",
+        "OpenSSL::Cipher.__send__(:new, name)",
+        "factory = OpenSSL::Cipher; factory.new(name)",
+        "copy = \"aes-128-gcm\"; OpenSSL::Cipher.new(copy)",
+        "OpenSSL::Cipher.new(name ? \"aes-128-gcm\" : \"aes-256-gcm\")",
+        "OpenSSL::Cipher.new",
+        "OpenSSL::Cipher.new(\"aes-128-gcm\", name)",
+    ] {
+        let source = format!("require \"openssl\"\nclass CipherName\n  def self.value(name)\n    {call}\n  end\nend\n");
+        let (_, errors) = emit_and_run::empty_app().write("app/models/cipher_name.rb", &source).emit(BuildTarget::Spinel);
+        assert!(errors.iter().any(|e| e.contains("requires a literal aes-128-gcm or aes-256-gcm")), "{call}: {errors:#?}");
+        let (_, errors) = emit_and_run::empty_app().write("app/models/cipher_name.rb", &source).emit(BuildTarget::Ruby);
+        assert!(errors.is_empty(), "Ruby {call}: {errors:#?}");
+    }
+}
+
+#[test]
+fn cipher_constants_keep_other_target_availability() {
+    let (_, errors) = cipher_overlay().emit(BuildTarget::Crystal);
+    for name in ["OpenSSL::Cipher", "OpenSSL::Cipher::CipherError", "OpenSSL::Cipher::AuthTagError"] {
+        assert!(errors.iter().any(|e| e.contains(&format!("{name} is not available as a class/module value on crystal"))), "{name}: {errors:#?}");
+    }
+}
+
+const CIPHER_OVERRIDE: &str = r#"require "openssl"
+class OpenSSL::Cipher
+  def self.new(name)
+    17
+  end
+  def update(value)
+    19
+  end
+end
+class CipherOverride
+  def self.value
+    OpenSSL::Cipher.new("custom")
+  end
+end
+"#;
+
+#[test]
+fn cipher_source_overrides_do_not_inherit_native_returns_or_name_limits() {
+    let (tree, errors) = emit_and_run::empty_app().write("app/models/cipher_override.rb", CIPHER_OVERRIDE).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let sidecar = std::fs::read_to_string(tree.join("app/models/open_ssl/cipher.rbs")).unwrap();
+    assert!(!sidecar.contains("-> String") && !sidecar.contains("-> OpenSSL::Cipher"), "{sidecar}");
+    emit_and_run::empty_app().write("app/models/cipher_override.rb", CIPHER_OVERRIDE)
+        .run_ruby("raise \"source override\" unless CipherOverride.value == 17").assert_passes();
+}
+
+#[test]
+fn cipher_unregistered_methods_stay_gradual() {
+    let (tree, errors) = emit_and_run::empty_app().write("app/models/cipher_unknown.rb", r#"require "openssl"
+class CipherUnknown
+  def self.value
+    OpenSSL::Cipher.new("aes-128-gcm").unprovided_cipher_api
+  end
+end
+"#).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let sidecar = std::fs::read_to_string(tree.join("app/models/cipher_unknown.rbs")).unwrap();
+    assert!(sidecar.contains("-> untyped"), "{sidecar}");
+}
+
+#[test]
+fn cipher_union_receivers_refuse_the_native_constructor_in_either_arm() {
+    for receiver in ["flag ? OpenSSL::Cipher : OtherCipher", "flag ? OtherCipher : OpenSSL::Cipher"] {
+        let source = format!(r#"require "openssl"
+class OtherCipher
+  def self.new(name)
+    17
+  end
+end
+class CipherUnion
+  def self.value(flag, name)
+    factory = {receiver}
+    factory.new(name)
+  end
+end
+"#);
+        let (_, errors) = emit_and_run::empty_app().write("app/models/cipher_union.rb", &source).emit(BuildTarget::Spinel);
+        assert!(errors.iter().any(|e| e.contains("requires a literal aes-128-gcm or aes-256-gcm")), "{receiver}: {errors:#?}");
+    }
+}
+
+const CIPHER_SUBCLASS: &str = r#"require "openssl"
+class CustomCipher < OpenSSL::Cipher
+  def update(value)
+    19
+  end
+end
+class CipherSubclass
+  def self.value
+    CustomCipher.new("aes-128-gcm").encrypt.update("payload")
+  end
+end
+"#;
+
+#[test]
+fn cipher_subclass_mode_switches_preserve_source_overrides() {
+    let source = emit_and_run::empty_app().write("app/models/cipher_subclass.rb", CIPHER_SUBCLASS);
+    source.run_ruby("raise \"subclass override\" unless CipherSubclass.value == 19").assert_passes();
+    let (tree, errors) = emit_and_run::empty_app().write("app/models/cipher_subclass.rb", CIPHER_SUBCLASS).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let sidecar = std::fs::read_to_string(tree.join("app/models/cipher_subclass.rbs")).unwrap();
+    assert!(!sidecar.contains("-> String"), "subclass override erased: {sidecar}");
+}
+
+#[test]
+fn cipher_reopen_order_and_initialize_concerns_keep_source_behavior() {
+    let constructor = r#"require "openssl"
+module CipherConstructor
+  def initialize(name)
+    @local_name = name
+  end
+end
+class OpenSSL::Cipher
+  include CipherConstructor
+end
+"#;
+    let method = r#"require "openssl"
+class OpenSSL::Cipher
+  def update(value)
+    19
+  end
+end
+class CipherConcern
+  def self.value
+    OpenSSL::Cipher.new("custom").update("payload")
+  end
+end
+"#;
+    for own in [false, true] {
+        let constructor = if own { constructor.replace("  include CipherConstructor",
+            "  include CipherConstructor\n  def initialize(name)\n    @local_name = name\n  end") } else { constructor.to_string() };
+        for reverse in [false, true] {
+            let (first, second) = if reverse { (method, constructor.as_str()) } else { (constructor.as_str(), method) };
+            let overlay = || emit_and_run::empty_app().write("app/models/a_cipher.rb", first).write("app/models/z_cipher.rb", second);
+            let (_, errors) = overlay().emit(BuildTarget::Spinel);
+            if own {
+                assert!(errors.is_empty(), "reverse={reverse}: {errors:#?}");
+                overlay().run_ruby("raise \"own constructor\" unless CipherConcern.value == 19").assert_passes();
+            } else {
+                // A class's native initialize wins over an included module's initialize on CRuby.
+                assert!(errors.iter().any(|e| e.contains("requires a literal aes-128-gcm or aes-256-gcm")), "{errors:#?}");
+                overlay().run_ruby("begin; CipherConcern.value; raise \"lost native initializer\"; rescue OpenSSL::Cipher::CipherError; end").assert_passes();
+            }
+        }
+    }
+}
+
+const CIPHER_RUNTIME_ASSERTIONS: &str = r#"
+raise "valid runtime tag" unless MessageDigest.aes_256_gcm_decrypt("k" * 32, "i" * 12,
+  ["b2e194185dd8c26d8b3c840a"].pack("H*"), ["03c4ad5dffea8e00a2e79b9676b4077e"].pack("H*")) == "hello cipher"
+raise "invalid runtime tag" unless MessageDigest.aes_256_gcm_decrypt("k" * 32, "i" * 12, "abcdef", "x" * 16) == ""
+raise "short runtime tag" unless MessageDigest.aes_256_gcm_decrypt("k" * 32, "i" * 12, "abcdef", "x") == ""
+puts "Cipher runtime rescue OK"
+"#;
+
+#[test]
+fn cipher_runtime_rescue_matches_cruby() {
+    // CRuby does not implement Spinel's FFI declaration. Only the AES methods run.
+    let script = format!("module SpCrypto; def self.ffi_func(*); end; end\nrequire {:?}\n{}",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/spinel/message_digest.rb"), CIPHER_RUNTIME_ASSERTIONS);
+    let run = Command::new("ruby").args(["-e", &script]).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "Cipher runtime rescue OK");
+}
+
+#[test]
+#[ignore = "requires Spinel with OpenSSL GCM support"]
+fn cipher_native_vectors_and_runtime_rescue_with_sidecars() {
+    let (tree, errors) = cipher_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    compile_and_run(&tree, "app/models", &format!("require_relative \"app/models/cipher_boundary\"\n{}", cipher_assertions()),
+        "Cipher registrations OK");
+    std::fs::write(tree.join("cipher_runtime.rb"), include_str!("../runtime/spinel/message_digest.rb")).unwrap();
+    compile_and_run(&tree, "app/models", &format!("require \"base64\"\nrequire_relative \"cipher_runtime\"\n{CIPHER_RUNTIME_ASSERTIONS}"),
+        "Cipher runtime rescue OK");
+    let (tree, errors) = emit_and_run::empty_app().write("app/models/cipher_subclass.rb", CIPHER_SUBCLASS).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    compile_and_run(&tree, "app/models", "require \"openssl\"\nrequire_relative \"app/models/custom_cipher\"\n\
+        require_relative \"app/models/cipher_subclass\"\nraise \"subclass override\" unless CipherSubclass.value == 19\n\
+        puts \"Cipher subclass OK\"\n", "Cipher subclass OK");
+    let (tree, errors) = emit_and_run::empty_app().write("app/models/cipher_override.rb", CIPHER_OVERRIDE).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    compile_and_run(&tree, "app/models", "require \"openssl\"\nrequire_relative \"app/models/open_ssl/cipher\"\n\
+        require_relative \"app/models/cipher_override\"\nraise \"source factory\" unless CipherOverride.value == 17\n\
+        puts \"Cipher factory OK\"\n", "Cipher factory OK");
+}

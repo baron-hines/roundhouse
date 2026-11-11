@@ -305,3 +305,81 @@ fn a_devise_setup_statement_passed_over_leaves_only_its_settings_unsure() {
         assert!(errors.iter().any(|e| e.contains("ring_routes_for")), "{initializer}\n{errors:#?}");
     }
 }
+
+const TOKEN_SHAPED: &str = r##"module Bells
+  mattr_accessor :prefix
+  @@prefix = "bells"
+  LIST = []
+
+  def self.setup
+    yield self
+  end
+end
+
+if defined?(Bells::LIST)
+  Bells::LIST << :tokens
+end
+
+module DeviseTokenAuth
+  mattr_accessor :omniauth_prefix
+  self.omniauth_prefix = "/omniauth"
+end
+
+module ActionDispatch::Routing
+  class Mapper
+    def bells_for(name)
+      get "#{Bells.prefix}/#{name}", to: "articles#index", as: "bells_#{name}"
+    end
+
+    def mount_bells_for(resource, opts)
+      route = opts[:as] || resource.pluralize.underscore.gsub("/", "_")
+      bells_for(route)
+      get "#{DeviseTokenAuth.omniauth_prefix}/#{route}", to: "articles#index", as: "token_#{route}"
+      if defined?(::OmniAuth)
+        get "#{DeviseTokenAuth.omniauth_prefix}/:provider", to: redirect { |params, request| "/#{params[:provider]}" }
+      end
+    end
+  end
+end
+"##;
+
+/// devise_token_auth's shape: a routing method reaches the settings of a gem it names only through
+/// another routing method, its own defaults are set through `mattr_accessor` writers, a gem's file
+/// guards a write with `defined?`, and its OmniAuth routes redirect through a per-request block.
+/// The rest is drawn, and those OmniAuth routes are left out and reported.
+#[test]
+fn a_routing_method_reaching_a_gem_through_another_draws_with_its_settings() {
+    let (tree, errors) = emit_and_run::real_blog()
+        .edit("Gemfile.lock", "GEM\n", "PATH\n  remote: vendor/gems/token_shaped\n  specs:\n    token_shaped (1.0.0)\n\nGEM\n")
+        .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  token_shaped!\n")
+        .write("vendor/gems/token_shaped/lib/token_shaped.rb", TOKEN_SHAPED)
+        .write("config/initializers/bells.rb", "Bells.setup do |config|\n  config.prefix = \"chimes\"\nend\n")
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  mount_bells_for \"Admin::User\", at: \"auth\"\n")
+        .emit(roundhouse::build_target::BuildTarget::Ruby);
+    let routes = std::fs::read_to_string(tree.join("config/routes.rb")).expect("routes.rb");
+    assert!(routes.contains("\"/chimes/admin_users\""), "{routes}");
+    assert!(routes.contains("\"/omniauth/admin_users\""), "{routes}");
+    assert!(!routes.contains(":provider"), "{routes}");
+    assert!(errors.iter().any(|e| e.contains("the OmniAuth routes are not drawn")), "{errors:#?}");
+}
+
+/// A routing method's block constraint is written with the locals it closes over as their values,
+/// unless the block could read one other than that value: then the routes are refused, with why.
+#[test]
+fn a_block_constraint_that_could_read_a_captured_local_otherwise_is_refused() {
+    for (body, why) in [
+        ("allowed, unused = false, 0\n          allowed", "rebinds `allowed`"),
+        ("case req.path\n          when allowed then true\n          end", "reads `allowed`"),
+        ("allowed = false\n          allowed", "rebinds `allowed`"),
+    ] {
+        let gate = format!(
+            "module Gates\n  module Helper\n    def gated\n      allowed = true\n      constraints(lambda do |req|\n          {body}\n        end) do\n        get \"/gated\", to: \"articles#index\"\n      end\n    end\n  end\n\n  def self.install!\n    ActionDispatch::Routing::Mapper.include Gates::Helper\n  end\nend\n"
+        );
+        let (_, errors) = emit_and_run::real_blog()
+            .write("lib/gates.rb", &gate)
+            .write("config/initializers/gates.rb", "Gates.install!\n")
+            .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  gated\n")
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(errors.iter().any(|e| e.contains("not drawn") && e.contains(why)), "{why}: {errors:#?}");
+    }
+}

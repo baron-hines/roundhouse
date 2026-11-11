@@ -66,4 +66,5 @@ status:
   site: https://roundhouse-rb.dev
   repo: roundhouse-rb/roundhouse
   lobsters_bench: https://roundbench.showcase.party/lobsters
+  lobsters_specs: https://roundbench.showcase.party/lobsters-specs/
   weeks: 12
