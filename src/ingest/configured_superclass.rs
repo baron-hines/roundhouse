@@ -570,6 +570,12 @@ impl<'a> Eval<'a> {
                 let Some(writes) = confined.or_else(|| self.may_write_with(e, &owner, side, &mut HashSet::default(), &frame.locals)) else {
                     return Err(format!("{why}, in a statement whose writes are not known"));
                 };
+                if let Some((class, method)) = super::gem_hooks::route_side_effect(&self.known, self.calls.last().map(|c| (c.0.as_str(), c.1.as_str())), e)
+                    && let ExprNode::Send { args, .. } = &*e.node
+                    && let Ok(given) = args.iter().map(|a| self.value(a, frame)).collect::<Res<Vec<_>>>()
+                {
+                    self.side_calls.push((class.to_string(), method.to_string(), given));
+                }
                 self.passed_over = true;
                 for tag in &writes {
                     self.make_unsure(tag);

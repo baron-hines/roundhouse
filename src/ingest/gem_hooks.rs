@@ -604,6 +604,16 @@ pub(super) fn fold_devise_module_probes(app: &mut App) {
     }
 }
 
+/// A statement a routing method runs that the evaluation passes over, whose write the boot has to make as Rails' route
+/// load did: Devise's `set_omniauth_path_prefix!(path_prefix)` sets `OmniAuth.config.path_prefix`, where each provider's
+/// strategy answers its request and callback paths. The receiver's text and the method; the arguments are the call's.
+pub(super) fn route_side_effect(known: &HashSet<String>, caller: Option<(&str, &str)>, statement: &Expr) -> Option<(&'static str, &'static str)> {
+    (known.contains("Devise")
+        && caller == Some(("ActionDispatch::Routing::Mapper", "devise_omniauth_callback"))
+        && matches!(&*statement.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "set_omniauth_path_prefix!" && args.len() == 1))
+        .then_some(("OmniAuth.config", "path_prefix="))
+}
+
 /// `Devise::TimeInflector.time_ago_in_words(t)` (`:confirmable`'s expiry message): the class only hands the call to an
 /// instance that includes `ActionView::Helpers::DateHelper`, whose method the runtime carries as the view helper's.
 // Not through the class: its `delegate` sits in `class << self` and forwards arguments, which the delegate expansion's
@@ -1187,6 +1197,34 @@ pub(super) fn devise_url_helpers_source(facts: &DeviseUrlFacts, routes: &HashMap
                 "def self.{name}(resource_or_scope, params = nil)\n  scope = RouteHelpers.devise_scope_of(resource_or_scope)\n{arms}  raise NoMethodError, \"undefined method '{prefix}#{{scope}}_{module}_path'\"\nend\n\n"
             ));
         }
+    }
+    // `Devise::OmniAuth::UrlHelpers`, which Devise's engine includes once a provider is configured: the mapping's
+    // `"#{scope}_#{provider}_omniauth_authorize_path"` (and `_callback_`), one arm per provider route drawn.
+    for kind in ["authorize", "callback"] {
+        let mut arms = String::new();
+        for m in &facts.mappings {
+            let prefix = format!("{}_", m.name);
+            let suffix = format!("_omniauth_{kind}_path");
+            let mut providers: Vec<&str> = routes
+                .iter()
+                .filter(|(name, segments)| **segments == 0 && name.starts_with(&prefix) && name.ends_with(&suffix))
+                .map(|(name, _)| &name[prefix.len()..name.len() - suffix.len()])
+                .filter(|p| !p.is_empty())
+                .collect();
+            providers.sort_unstable();
+            for provider in providers {
+                arms.push_str(&format!(
+                    "  return RouteHelpers.devise_path_with(RouteHelpers.{}{provider}{suffix}, params) if scope == :{} && provider.to_s == \"{provider}\"\n",
+                    prefix, m.name
+                ));
+            }
+        }
+        if arms.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "def self.omniauth_{kind}_path(resource_or_scope, provider, params = nil)\n  scope = RouteHelpers.devise_scope_of(resource_or_scope)\n{arms}  raise NoMethodError, \"undefined method '#{{scope}}_#{{provider}}_omniauth_{kind}_path'\"\nend\n\n"
+        ));
     }
     out
 }

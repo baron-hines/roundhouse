@@ -645,6 +645,28 @@ impl<'a> Gems<'a> {
                 s.body(e, &[]);
             }
         });
+        // What a gem's file runs as it loads (`app.file_programs`, the boot's): Devise's `OmniAuth.config.on_failure =
+        // proc { … Devise::Mapping.find_by_path!(…) … }` calls into the gem when a provider fails.
+        fn program_bodies<'e>(items: &'e [crate::app::ProgramItem], out: &mut Vec<&'e crate::expr::Expr>) {
+            for item in items {
+                match item {
+                    crate::app::ProgramItem::Statement(e) => out.push(e),
+                    crate::app::ProgramItem::Branch { condition, then_items, else_items, .. } => {
+                        out.push(condition);
+                        program_bodies(then_items, out);
+                        program_bodies(else_items, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut loaded = Vec::new();
+        for program in &app.file_programs {
+            program_bodies(&program.items, &mut loaded);
+        }
+        for e in loaded {
+            s.body(e, &[]);
+        }
         let (mut calls, mut consts) = (s.calls, s.consts);
         let mut live = Vec::new();
         for c in app.library_classes.iter().filter(|c| !self.is_gem(c)) {

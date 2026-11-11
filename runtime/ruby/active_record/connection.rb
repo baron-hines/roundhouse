@@ -1535,16 +1535,16 @@ module ActiveRecord
     # lowered call sites (`lower::first_or_create`) inline the statement
     # forms; these answer the rest (a receiverless call inside a class
     # method, an `||` operand).
-    def self.find_or_initialize_by(conditions)
-      ActiveRecord::Relation.new(self).find_or_initialize_by(conditions.to_h)
+    def self.find_or_initialize_by(conditions, &block)
+      ActiveRecord::Relation.new(self).find_or_initialize_by(conditions.to_h, &block)
     end
 
-    def self.find_or_create_by(conditions)
-      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h)
+    def self.find_or_create_by(conditions, &block)
+      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h, &block)
     end
 
-    def self.find_or_create_by!(conditions)
-      ActiveRecord::Relation.new(self).find_or_create_by!(conditions.to_h)
+    def self.find_or_create_by!(conditions, &block)
+      ActiveRecord::Relation.new(self).find_or_create_by!(conditions.to_h, &block)
     end
 
     def self.create_or_find_by(conditions)
