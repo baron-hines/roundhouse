@@ -142,10 +142,30 @@ fn an_unlocated_ingest_error_keeps_its_existing_rendering() {
 }
 
 #[test]
-fn data_reopenings_keep_pure_constants_and_deferred_method_calls() {
-    let source = "Artifact = Data.define(:digest) do\n  FIRST = 'constant'\n  def label = digest.to_s\nend\nclass Artifact\n  def label = digest\nend\n";
-    let mut app = review_record(source, "lib/artifact.rb", None);
-    assert!(errors(&mut app).is_empty());
+fn data_reopenings_refuse_non_method_block_statements_at_the_statement() {
+    for work in [
+        "VALUE = 1 if true", "VALUE = 1", "value = 1", "@value = 1",
+        "if true; VALUE = 1; end", "unless false; VALUE = 1; end",
+        "if true; def hidden = digest; end", "puts 'loaded'", "private private(:label)",
+        "def Artifact.extra = 1", "private_class_method def Artifact.extra = 1",
+    ] {
+        let source = format!("Artifact = Data.define(:digest) do\n  def label = digest.to_s\n  {work}\nend\nclass Artifact\n  def value = VALUE\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "Data.define reopening with load-time",
+                Some(source.find(work).unwrap()));
+        }
+    }
+}
+
+#[test]
+fn a_data_block_without_a_reopening_keeps_its_existing_constants() {
+    let source = "Artifact = Data.define(:digest) do\n  VALUE = 1\n  def label = digest.to_s\nend\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        assert!(errors(&mut app).is_empty());
+        let record = app.library_classes.iter().find(|c| c.name.0.as_str() == "Artifact").unwrap();
+        assert!(record.constants.iter().any(|(name, _)| name.as_str() == "VALUE"));
+    }
 }
 
 #[test]

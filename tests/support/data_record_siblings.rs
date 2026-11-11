@@ -69,9 +69,23 @@ end
 "#;
 pub const MEMBER_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").digest\n";
 pub const REOPEN_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").extra\n";
+pub const PRIVATE_REOPEN_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  private
+  def hidden = digest.to_s
+  public
+  def label = hidden
+  def self.build(value) = new(value)
+  private_class_method :build
+  def self.make(value) = build(value)
+end
+class Artifact
+  def extra = label
+end
+"#;
 pub const COMPOSITION_CASES: &[(&str, &str, &str)] = &[
     (REQUIRE_SOURCE, MEMBER_ASSERTIONS, "true\nabc\n"),
     (REOPEN_SOURCE, REOPEN_ASSERTIONS, "true\nreopened:abc!\n"),
+    (PRIVATE_REOPEN_SOURCE, "puts Artifact.make('abc').extra\n", "abc\n"),
     (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\nputs Artifact.new(digest: 7).label\n", "abc\n7\n"),
     (PUBLIC_CHILD_SOURCE, "record = Child.make('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
     ("Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; private; def hidden = digest; public; def label = hidden; end\n", "puts Artifact.new('abc').label\n", "abc\n"),

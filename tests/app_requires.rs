@@ -21,6 +21,23 @@ fn app(files: &[(&str, &str)]) -> roundhouse::App {
 const PROBE: &str = "require \"io/console\"\nclass TerminalProbe\n  def self.rows = 1\nend\n";
 
 #[test]
+fn require_collection_does_not_repeat_syntax_diagnostics_in_survey_mode() {
+    let source = "require \"stringio\"\nclass TerminalProbe\n  def self.rows = 1\nend\n)\n";
+    // The declaration and on-load ingesters already report syntax errors;
+    // collecting requires must not introduce a third reporting pass.
+    let expected = 2 * ruby_prism::parse(source.as_bytes()).errors().count();
+    assert!(expected > 0, "the source must have a syntax error");
+    roundhouse::ingest::survey::activate();
+    let (app, diagnostics) = roundhouse::ingest::prism::scope(|| {
+        app(&[("lib/terminal_probe.rb", source)])
+    });
+    roundhouse::ingest::survey::drain();
+    assert_eq!(app.app_requires, ["stringio"]);
+    let parse: Vec<_> = diagnostics.iter().filter(|d| d.code() == "parse").collect();
+    assert_eq!(parse.len(), expected, "a read-only require scan repeated diagnostics: {parse:?}");
+}
+
+#[test]
 fn an_ingested_library_file_contributes_its_require() {
     let app = app(&[("lib/terminal_probe.rb", PROBE)]);
     assert!(

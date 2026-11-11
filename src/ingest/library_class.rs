@@ -392,17 +392,14 @@ fn ingest_library_classes_impl(
                 }).collect::<Vec<_>>();
                 if !reopenings.is_empty() && let Some((_, call)) = file_data_declaration(&statement)
                     && let Some(body) = call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body()) {
-                    let mut calls = LoadTimeCalls(false);
-                    ruby_prism::Visit::visit(&mut calls, &body);
-                    if calls.0 { return Err(super::error_site::at(IngestError::Unsupported {
-                        file: file.into(), message: "Data.define reopening with load-time method calls in its block is not modeled".into(),
-                    }, &statement)); }
+                    if let Some(work) = flatten_statements(body).iter().find(|stmt| !data_method_statement(stmt)) {
+                        return Err(super::error_site::at(IngestError::Unsupported {
+                            file: file.into(), message: "Data.define reopening with load-time statements in its block is not modeled".into(),
+                        }, work)); }
                 }
                 let invalid_reopen = reopenings.iter().any(|(_, node)| {
                     node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
-                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| {
-                            visibility::definition(stmt).is_none() && !struct_block_marker(stmt)
-                        }))
+                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt)))
                 });
                 let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset()).max().unwrap_or(0);
                 let separated = program.statements().body().iter().any(|stmt| {
@@ -575,10 +572,12 @@ fn data_block_classes(
     Ok(out)
 }
 
-struct LoadTimeCalls(bool);
-impl<'pr> ruby_prism::Visit<'pr> for LoadTimeCalls {
-    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) { self.0 |= visibility::definition(&node.as_node()).is_none(); }
-    fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+fn data_method_statement(stmt: &Node<'_>) -> bool {
+    if let Some(def) = visibility::definition(stmt) {
+        return def.receiver().is_none_or(|receiver| receiver.as_self_node().is_some());
+    }
+    stmt.as_call_node().filter(|call| call.receiver().is_none() && call.block().is_none() && visibility::marker(call))
+        .is_some_and(|call| call.arguments().is_none_or(|args| args.arguments().iter().all(|arg| super::util::symbol_or_string_value(&arg).is_some())))
 }
 
 /// The class a file-level statement `X = Data.define(:a, :b)` creates.
