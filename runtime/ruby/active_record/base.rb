@@ -143,12 +143,43 @@ module ActiveRecord
 
   # Thin reflection surface for `Model.reflect_on_association(:name)`.
   # Campfire asks `counter_cache_column` (nil when the belongs_to did not
-  # declare `counter_cache:`). Deeper Rails reflection stays unmodeled.
+  # declare `counter_cache:`); orm_adapter asks `belongs_to?`,
+  # `foreign_key` and `options[:polymorphic]`. Deeper Rails reflection
+  # stays unmodeled.
   module Reflection
     class AssociationReflection
-      def initialize(name, counter_cache_column)
+      def initialize(name, counter_cache_column, macro, foreign_key, polymorphic)
         @name = name
         @counter_cache_column = counter_cache_column
+        @macro = macro
+        @foreign_key = foreign_key
+        @polymorphic = polymorphic
+      end
+
+      def macro
+        @macro
+      end
+
+      def belongs_to?
+        @macro == :belongs_to
+      end
+
+      def foreign_key
+        @foreign_key
+      end
+
+      def polymorphic?
+        @polymorphic
+      end
+
+      # Not every option the association was declared with: only `polymorphic:` is kept, as Rails holds it (present only when given).
+      def options
+        @polymorphic ? { polymorphic: true } : {}
+      end
+
+      # Rails' `"#{name}_type"`, of a polymorphic belongs_to only.
+      def foreign_type
+        @polymorphic ? "#{@name}_type" : nil
       end
 
       def name
@@ -159,16 +190,12 @@ module ActiveRecord
         @counter_cache_column
       end
 
-      # Catalog also types `.klass` / `.macro`; presence-only callers get
-      # nil rather than a NameError until those halves are synthesized.
+      # Catalog also types `.klass`; presence-only callers get nil rather
+      # than a NameError until that half is synthesized.
       # Bare `nil` (return-tail untyped) — not `result = nil; result`,
       # which rust emits as `Option`/`None` against a Value return
       # (issue #832). Same shape as `request_for_csrf`.
       def klass
-        nil
-      end
-
-      def macro
         nil
       end
     end
@@ -485,6 +512,19 @@ module ActiveRecord
       []
     end
 
+    # Each association's macro, foreign key and `polymorphic:`, in `_association_names`' order (the lowerer's too).
+    def self._association_macros
+      []
+    end
+
+    def self._association_foreign_keys
+      []
+    end
+
+    def self._association_polymorphic
+      []
+    end
+
     # Rails' `Model.reflect_on_association(:name)`. Looks the name up in
     # `_association_names`; `counter_cache:` is unmodeled so every hit
     # answers `counter_cache_column == nil` (honest for campfire's
@@ -503,7 +543,9 @@ module ActiveRecord
       end
       assoc = names[i]
       if assoc.to_s == needle
-        return ActiveRecord::Reflection::AssociationReflection.new(assoc, nil)
+        return ActiveRecord::Reflection::AssociationReflection.new(
+          assoc, nil, _association_macros[i], _association_foreign_keys[i].to_s, _association_polymorphic[i] == true
+        )
       end
       reflect_on_association_at(needle, i + 1)
     end

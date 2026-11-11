@@ -155,6 +155,10 @@ mod constant_branches;
 mod defined_method_query;
 #[path = "emit_and_run/metal_subclass.rs"]
 mod metal_subclass;
+#[path = "emit_and_run/association_reflection.rs"]
+mod association_reflection;
+#[path = "emit_and_run/human_attribute_name_dynamic.rs"]
+mod human_attribute_name_dynamic;
 #[path = "emit_and_run/boot_with_options.rs"]
 mod boot_with_options;
 #[path = "support/class_param_or_assign.rs"]
