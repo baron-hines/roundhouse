@@ -607,6 +607,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         let mut app = match ingest_rails_app(vfs, dir, &auto) {
             Ok(app) => app,
             Err(err) => {
+                let site = super::error_site::of(&err);
+                let source = match &err {
+                    IngestError::Unsupported { file, .. } => super::sources::text_of(file), _ => None,
+                };
                 let strict = super::prism::mark();
                 // Not the strict pass's first refusal as the answer: it can be a gem's DSL (`devise_for`) that only the gem's source, which this pass has not read yet, defines.
                 let more: Vec<String> = super::concern_accessors::not_deferring(|| super::survey::surveying(|| {
@@ -617,6 +621,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 .collect();
                 if more.is_empty() || auto.len() >= 32 {
                     super::prism::rewind(strict);
+                    if let (Some(source), IngestError::Unsupported { file, .. }) = (source, &err) {
+                        super::sources::register(file, &source);
+                    }
+                    if let Some((start, end)) = site { super::error_site::note(&err, start, end); }
                     return Err(err);
                 }
                 super::prism::rewind(marks.1);
