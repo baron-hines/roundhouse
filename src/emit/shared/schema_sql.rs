@@ -63,12 +63,16 @@ impl Dialect {
     /// environment with a primary). PostgreSQL when that is postgresql,
     /// SQLite otherwise, as before the file was read.
     pub fn for_app(app: &crate::App) -> Dialect {
-        let primary = app.databases.iter().filter(|d| d.primary);
-        let chosen = primary.clone().find(|d| d.env == "test").or_else(|| primary.clone().next());
-        match chosen.map(|d| &d.adapter) {
+        match Self::database(&app.databases).map(|d| &d.adapter) {
             Some(crate::database::DatabaseAdapter::Postgresql) => Dialect::Postgres,
             _ => Dialect::Sqlite,
         }
+    }
+
+    /// The configuration [`Dialect::for_app`] reads the adapter of.
+    pub(crate) fn database(databases: &[crate::database::Database]) -> Option<&crate::database::Database> {
+        let primary = databases.iter().filter(|d| d.primary);
+        primary.clone().find(|d| d.env == "test").or_else(|| primary.clone().next())
     }
 
     /// A literal boolean: SQLite stores 1/0; PostgreSQL's boolean takes
@@ -382,8 +386,19 @@ pub fn validate_schema_for_dialect(schema: &Schema, dialect: Dialect) -> Result<
             return Err(format!("unsupported primary-key default on {}.{}", table.name, column.name));
         }
         {
-            for expression in table.check_constraints.iter().map(|c| c.expression.as_str())
-                .chain(table.indexes.iter().filter_map(|i| i.expression.as_deref()))
+            for expression in table.check_constraints.iter().map(|c| c.expression.as_str()) {
+                // SQLite's own text reaches SQLite alone; PostgreSQL takes the shared grammar.
+                let own = sqlite_check_expression(expression, table, schema.expression_dialect);
+                let supported = match dialect {
+                    Dialect::Sqlite => own || sqlite_expression(expression, Some(table)),
+                    Dialect::Postgres => schema_expression_supported(expression, Some(table), expression_dialect)
+                        && (!own || sqlite_expression(expression, Some(table))),
+                };
+                if !supported {
+                    return Err(format!("unsupported schema expression on {}: {expression}", table.name));
+                }
+            }
+            for expression in table.indexes.iter().filter_map(|i| i.expression.as_deref())
                 .chain(table.indexes.iter().filter(|_| dialect == Dialect::Postgres).filter_map(|i| i.predicate.as_deref()))
             {
                 if !schema_expression_supported(expression, Some(table), expression_dialect) {
@@ -471,7 +486,7 @@ pub(crate) fn sqlite_reads_alike(predicate: &str, table: &Table) -> bool {
 
 /// Defaults cannot reference columns; randomblob is allowed only there.
 pub(crate) fn schema_expression_supported(sql: &str, table: Option<&Table>, dialect: crate::schema::generated::GeneratedExpressionDialect) -> bool {
-    if dialect == crate::schema::generated::GeneratedExpressionDialect::Portable {
+    if dialect != crate::schema::generated::GeneratedExpressionDialect::Postgres {
         return sqlite_expression(sql, table);
     }
     // Skip quoted data and comments; recognize quoted function names too.
@@ -577,6 +592,72 @@ fn sqlite_expression(predicate: &str, table: Option<&Table>) -> bool {
     table.is_some() || has_function || ["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"].iter().any(|clock| predicate.eq_ignore_ascii_case(clock))
 }
 
+/// Whether `sql` is a CHECK in SQLite's own grammar, from a schema whose
+/// application database is SQLite (`source`; false for any other). Such
+/// text reaches SQLite DDL as written, so SQLite reads there what it read
+/// in the application. Beyond [`sqlite_expression`] this admits `GLOB`,
+/// `CASE`, `json_type` and `char`, and `LIKE` once `config/database.yml`
+/// names sqlite3: PostgreSQL rejects the first four or reads them alike,
+/// and it reads `LIKE` with case.
+///
+/// A word is an operator or a name by where it stands, as in SQLite's
+/// parser: after an operand it is an operator (`code LIKE 'a%'`), and
+/// anywhere else a column or a call (`like IS NULL`). A column of the
+/// same name never stands in for the operator. Comments, `ESCAPE`,
+/// `REGEXP`, casts and every unlisted call stay refused.
+pub(crate) fn sqlite_check_expression(sql: &str, table: &Table, source: crate::schema::generated::GeneratedExpressionDialect) -> bool {
+    use crate::schema::generated::GeneratedExpressionDialect::{Portable, Postgres, Sqlite, Unconfigured};
+    const FUNCTIONS: &[&str] = &["LOWER", "UPPER", "LENGTH", "COALESCE", "NULLIF", "ABS", "PRINTF", "HEX", "JSON_VALID", "JSON_TYPE", "CHAR", "SUBSTR"];
+    let like = match source {
+        Sqlite => true,
+        Unconfigured => false,
+        Portable | Postgres => return false,
+    };
+    let tokens = regex::Regex::new(r#"\A(?:'(?:''|[^'])*'|[0-9]+(?:\.[0-9]+)?|"((?:""|[^"])*)"|([a-zA-Z_][a-zA-Z0-9_]*)|<>|!=|<=|>=|==|\|\||[-+=<>*/%(),])"#).unwrap();
+    let column = |name: &str, quoted: bool| table.columns.iter().any(|c| if quoted { c.name.as_str() == name } else { c.name.as_str().eq_ignore_ascii_case(name) });
+    // SQLite's whitespace; any other character outside a literal is refused.
+    let space = |c: char| matches!(c, ' ' | '\t'..='\r');
+    // `operand`: the last token ended an operand, so an operator comes next.
+    let (mut rest, mut operand, mut after_case) = (sql.trim_start_matches(space), false, false);
+    while !rest.is_empty() {
+        if rest.starts_with("--") || rest.starts_with("/*") {
+            return false;
+        }
+        let Some(token) = tokens.captures(rest) else { return false };
+        let text = token.get(0).unwrap().as_str();
+        rest = rest[text.len()..].trim_start_matches(space);
+        let was_case = std::mem::take(&mut after_case);
+        operand = if let Some(word) = token.get(2) {
+            match (word.as_str().to_ascii_uppercase().as_str(), operand) {
+                ("NOT", _) => operand,
+                ("AND" | "OR" | "IS" | "IN" | "BETWEEN" | "GLOB" | "WHEN" | "THEN" | "ELSE", true) => false,
+                ("LIKE", true) if like => false,
+                ("END", true) => true,
+                (_, true) => return false,
+                ("CASE", false) => {
+                    after_case = true;
+                    false
+                }
+                ("WHEN", false) if was_case => false,
+                ("NULL" | "TRUE" | "FALSE", false) => true,
+                (name, false) if rest.starts_with('(') && FUNCTIONS.contains(&name) => false,
+                (name, false) if !rest.starts_with('(') && column(name, false) => true,
+                _ => return false,
+            }
+        } else if matches!(text, ")" | "," | "+" | "-") {
+            text == ")"
+        } else {
+            // A literal, a quoted column or `(` begins an operand; any other operator joins two.
+            let begins = text == "(" || text.starts_with(|c: char| c == '\'' || c == '"' || c.is_ascii_digit());
+            if begins == operand || token.get(1).is_some_and(|name| !column(&name.as_str().replace("\"\"", "\""), true)) {
+                return false;
+            }
+            begins && text != "("
+        };
+    }
+    operand
+}
+
 fn is_integer(ct: &ColumnType) -> bool {
     matches!(ct, ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. })
 }
@@ -670,7 +751,7 @@ mod tests {
     }
 
     fn schema_of(tables: Vec<Table>) -> Schema {
-        Schema { tables: tables.into_iter().map(|t| (t.name.clone(), t)).collect() }
+        Schema { tables: tables.into_iter().map(|t| (t.name.clone(), t)).collect(), ..Default::default() }
     }
 
     const ARTICLES: &str = r#"ActiveRecord::Schema[8.1].define(version: 1) do
@@ -864,6 +945,27 @@ end
                  WHERE ((kind)::text = 'initial'::text)",
             ]
         );
+    }
+
+    /// The SQLite CHECK reader answers for a SQLite source alone: any
+    /// other source gets `false` whatever the text, so another database's
+    /// SQL only ever meets the gates it met before. `LIKE` after an
+    /// operand is the operator, whatever the columns are called, and
+    /// needs the application to name sqlite3.
+    #[test]
+    fn sqlite_check_expression_reads_only_a_sqlite_source() {
+        use crate::schema::generated::GeneratedExpressionDialect::{Portable, Postgres, Sqlite, Unconfigured};
+        let items = table("items", vec![column("code", ColumnType::Text, true, false), column("like", ColumnType::Text, true, false)], vec![]);
+        for sql in ["code = 'a'", "code GLOB 'a*'", "CASE WHEN code = 'a' THEN true END", "like IS NULL", "char(65) = code", "json_type(\"like\") = 'array'"] {
+            assert!(sqlite_check_expression(sql, &items, Sqlite) && sqlite_check_expression(sql, &items, Unconfigured), "{sql}");
+            assert!(!sqlite_check_expression(sql, &items, Portable) && !sqlite_check_expression(sql, &items, Postgres), "{sql}");
+        }
+        for sql in ["code LIKE 'a%'", "like LIKE like", "code NOT LIKE like || '%'", "CASE WHEN code LIKE 'a%' THEN true ELSE false END"] {
+            assert!(sqlite_check_expression(sql, &items, Sqlite), "{sql}");
+            for source in [Unconfigured, Portable, Postgres] {
+                assert!(!sqlite_check_expression(sql, &items, source), "{sql} under {source:?}");
+            }
+        }
     }
 
     /// What SQLite is trusted to run as written: Mastodon's predicates,

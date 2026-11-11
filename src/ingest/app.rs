@@ -33,7 +33,10 @@ use super::library_class::{
 };
 use super::model::ingest_model_with_enum_constants;
 use super::routes::{EngineRouteSource, RouteHelperSource, ingest_route_file, merge_route_files};
-use super::schema::{ingest_migration, ingest_schema};
+use super::schema::{
+    ingest_migration_with_generated_expression_dialect, ingest_schema,
+    ingest_schema_with_generated_expression_dialect,
+};
 use super::structure_sql::ingest_structure_sql;
 use super::test::{ingest_test_bases, ingest_test_files};
 use super::view::{ViewEngine, ingest_template};
@@ -791,10 +794,11 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
 
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
+    let expression_dialect = schema_expression_dialect(vfs, dir);
     if vfs.exists(&schema_path) {
         if let Some(source) = read_or_ledger(vfs, &schema_path)? {
             if let Some(schema) =
-                unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
+                unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &schema_path.display().to_string(), expression_dialect))?
             {
                 app.schema = schema;
             }
@@ -852,15 +856,17 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             let mut schema = crate::schema::Schema::default();
             for entry in files {
                 let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
-                unwrap_or_record(ingest_migration(
+                unwrap_or_record(ingest_migration_with_generated_expression_dialect(
                     &source,
                     &entry.display().to_string(),
                     &mut schema,
+                    expression_dialect,
                 ))?;
             }
             app.schema = schema;
         }
     }
+    app.schema.expression_dialect = expression_dialect;
     // Not its own database: the runtime opens only the primary, so solid_queue's tables join it.
     if solid_queue_root.is_some() && vfs.exists(&dir.join("db/queue_schema.rb")) {
         let queue_schema = dir.join("db/queue_schema.rb");
@@ -13298,6 +13304,21 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
     let literal = !name.is_empty()
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     Some(literal.then(|| name.to_string()))
+}
+
+/// The grammar the app's CHECKs are read under. SQLite's own needs the
+/// app's database to be SQLite: `config/database.yml` names sqlite3 for
+/// the configuration `Dialect::for_app` reads. Without the file nothing
+/// names another database; a file naming one, or not resolved at build
+/// time, keeps the portable grammar.
+fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
+    use crate::schema::generated::GeneratedExpressionDialect::{Portable, Sqlite, Unconfigured};
+    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Unconfigured };
+    let databases = super::database_yml::database_configurations(&text, crate::span::FileId(0)).databases;
+    match crate::emit::shared::schema_sql::Dialect::database(&databases).map(|d| &d.adapter) {
+        Some(crate::database::DatabaseAdapter::Sqlite3) => Sqlite,
+        _ => Portable,
+    }
 }
 
 /// Use the ordinary schema readers for selection too. The normal primary schema
