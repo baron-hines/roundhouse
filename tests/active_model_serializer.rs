@@ -49,6 +49,25 @@ fn emitted(serializer: &str, controller: &str) -> (String, String, Vec<String>) 
     (find("article_serializer.rb"), find("articles_controller.rb"), messages)
 }
 
+/// [`emitted`] with more files in the app, or files replaced.
+fn emitted_with(serializer: &str, controller: &str, extra: &[(&str, &str)]) -> (String, String, Vec<String>) {
+    let mut tree = tree(serializer, controller);
+    for (path, source) in extra {
+        tree.insert(PathBuf::from(path), source.as_bytes().to_vec());
+    }
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    let (files, emit_diags) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, std::path::Path::new("fixtures/tiny-blog"), roundhouse::project::BuildTarget::Ruby)
+    });
+    let files = files.expect("emit");
+    let find = |needle: &str| {
+        files.iter().filter(|(p, _)| p.ends_with(needle)).map(|(_, c)| c.clone()).collect::<Vec<_>>().join("\n")
+    };
+    let messages = diags.into_iter().chain(emit_diags).map(|d| d.message).collect();
+    (find("article_serializer.rb"), find("articles_controller.rb"), messages)
+}
+
 /// The serializer loses its gem parent and gains its readers and writer;
 /// the render calls the writer, and a temporal column is written as Rails
 /// writes it.
@@ -297,4 +316,43 @@ fn a_scope_render_passes_the_controllers_scope() {
     assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{controller}");
     let (_, controller, _) = emitted(SERIALIZER, &format!("class ArticlesController < ApplicationController\n{show}{helper}"));
     assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).as_json_str"), "{controller}");
+}
+
+/// Devise defines a `current_<mapping>` helper per model it maps: a
+/// `devise` model `Admin` gives `current_admin`, and only `User` gives
+/// the `current_user` the default `serialization_scope` reads. With
+/// `Admin` alone the controller has no `current_user`, and the scope is
+/// nil.
+#[test]
+fn only_a_devise_user_model_gives_the_controller_current_user() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class ArticlesController < ApplicationController\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\nend\n";
+    let schema = |table: &str| {
+        format!("ActiveRecord::Schema.define(version: 1) do\n  create_table :articles do |t|\n    t.string :title\n    t.datetime :published_at\n  end\n  create_table :{table} do |t|\n    t.string :email\n    t.string :encrypted_password\n  end\nend\n")
+    };
+    let admin_schema = schema("admins");
+    let (_, rendered, _) = emitted_with(scoped, controller, &[
+        ("db/schema.rb", &admin_schema),
+        ("app/models/admin.rb", "class Admin < ApplicationRecord\n  devise :database_authenticatable\nend\n"),
+    ]);
+    assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{rendered}");
+    let user_schema = schema("users");
+    let (_, rendered, _) = emitted_with(scoped, controller, &[
+        ("db/schema.rb", &user_schema),
+        ("app/models/user.rb", "class User < ApplicationRecord\n  devise :database_authenticatable\nend\n"),
+    ]);
+    // Devise's helper is the runtime's, called without `self.`.
+    assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).serializable_hash"), "{rendered}");
+}
+
+/// A controller that includes a module the app doesn't define (a gem's)
+/// may have a `current_user` from it: the scope is unknown, so the
+/// render is left as written, and reported.
+#[test]
+fn a_scope_render_under_an_unresolved_include_stays_reported() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class ArticlesController < ApplicationController\n  include Authentication::Helpers\n\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\nend\n";
+    let (_, rendered, messages) = emitted_with(scoped, controller, &[]);
+    assert!(!rendered.contains("serializable_hash"), "{rendered}");
+    assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
 }

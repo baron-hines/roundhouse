@@ -127,3 +127,121 @@ fn a_serializer_reading_its_scope_emits_for_spinel() {
     let (_emitted, errors) = app().emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
 }
+
+/// How active_model_serializers 0.10.16 reads the scope (Rails 8.1.4):
+/// once per render, after the rendered value, also for an
+/// `each_serializer` collection; from the controller's own
+/// `serialization_scope` when it defines one; and from a `current_user`
+/// an included concern defines.
+fn read_app() -> emit_and_run::Overlay {
+    app()
+        .write(
+            "app/controllers/counting_json_controller.rb",
+            r#"class CountingJsonController < ApplicationController
+  def index
+    render json: items, each_serializer: ScopeOnlySerializer
+  end
+
+  def show
+    render json: item, serializer: ScopeOnlySerializer
+  end
+
+  private
+
+  def items
+    (@reads ||= []) << "items"
+    Article.order(:id)
+  end
+
+  def item
+    (@reads ||= []) << "item"
+    Article.order(:id).first
+  end
+
+  def current_user
+    (@reads ||= []) << "current_user"
+    "ann"
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/override_json_controller.rb",
+            r#"class OverrideJsonController < ApplicationController
+  def show
+    render json: Article.find(params[:id]), serializer: ScopeOnlySerializer
+  end
+
+  def viewer
+    render json: Article.find(params[:id]), serializer: ViewerSerializer
+  end
+
+  private
+
+  def serialization_scope
+    "override"
+  end
+
+  def current_user
+    "ignored"
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/concerns/current_user_concern.rb",
+            "module CurrentUserConcern\n  extend ActiveSupport::Concern\n\n  private\n\n  def current_user\n    \"concern\"\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/concern_json_controller.rb",
+            r#"class ConcernJsonController < ApplicationController
+  include CurrentUserConcern
+
+  def show
+    render json: Article.find(params[:id]), serializer: ScopeOnlySerializer
+  end
+
+  def viewer
+    render json: Article.find(params[:id]), serializer: ViewerSerializer
+  end
+end
+"#,
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"counting\" => \"counting_json#index\"\n  get \"counting/one\" => \"counting_json#show\"\n  get \"override/:id/viewer\" => \"override_json#viewer\"\n  get \"override/:id\" => \"override_json#show\"\n  get \"concern/:id/viewer\" => \"concern_json#viewer\"\n  get \"concern/:id\" => \"concern_json#show\"\n  resources :articles do",
+        )
+}
+
+/// The bodies and reads are active_model_serializers 0.10.16's.
+const READ_SCRIPT: &str = r##"
+%w[counting_json override_json concern_json].each { |c| require_relative "app/controllers/#{c}_controller" }
+a = Article.create!(title: "Hello", body: "A long body")
+b = Article.create!(title: "World", body: "Another body")
+run = ->(controller, action, params) { c = controller.new; c.params = params; c.process_action(action); c }
+failures = []
+check = ->(label, got, want) { failures << "#{label}: #{got.inspect}, want #{want.inspect}" unless got == want }
+ida, idb = a.id.to_s, b.id.to_s
+c = run.(CountingJsonController, :index, {})
+check.("each_serializer body", c.body, '[{"id":' + ida + ',"scoped":"ann"},{"id":' + idb + ',"scoped":"ann"}]')
+check.("each_serializer reads", c.instance_variable_get(:@reads), ["items", "current_user"])
+c = run.(CountingJsonController, :show, {})
+check.("serializer body", c.body, '{"id":' + ida + ',"scoped":"ann"}')
+check.("serializer reads", c.instance_variable_get(:@reads), ["item", "current_user"])
+check.("override, scope only", run.(OverrideJsonController, :show, { "id" => ida }).body, '{"id":' + ida + ',"scoped":"override"}')
+check.("override, viewer", run.(OverrideJsonController, :viewer, { "id" => ida }).body,
+  '{"id":' + ida + ',"title":"Hello","viewer":"OVERRIDE","scoped":"override"}')
+check.("concern, scope only", run.(ConcernJsonController, :show, { "id" => ida }).body, '{"id":' + ida + ',"scoped":"concern"}')
+check.("concern, viewer", run.(ConcernJsonController, :viewer, { "id" => ida }).body,
+  '{"id":' + ida + ',"title":"Hello","viewer":"CONCERN","scoped":"concern"}')
+raise failures.join("\n") unless failures.empty?
+puts "scope reads OK"
+"##;
+
+#[test]
+fn a_render_reads_the_scope_as_the_gem_does() {
+    let run = read_app().run_ruby(READ_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("scope reads OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+}
