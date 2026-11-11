@@ -72,7 +72,7 @@ pub const REOPEN_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Ar
 pub const COMPOSITION_CASES: &[(&str, &str, &str)] = &[
     (REQUIRE_SOURCE, MEMBER_ASSERTIONS, "true\nabc\n"),
     (REOPEN_SOURCE, REOPEN_ASSERTIONS, "true\nreopened:abc!\n"),
-    (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\n", "abc\n"),
+    (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\nputs Artifact.new(digest: 7).label\n", "abc\n7\n"),
     (PUBLIC_CHILD_SOURCE, "record = Child.make('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
     ("Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; private; def hidden = digest; public; def label = hidden; end\n", "puts Artifact.new('abc').label\n", "abc\n"),
 ];

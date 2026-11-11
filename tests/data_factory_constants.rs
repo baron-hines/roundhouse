@@ -48,6 +48,31 @@ fn inherited_data_constructor_visibility_is_refused_at_the_call() {
 }
 
 #[test]
+fn data_constructor_visibility_before_a_definition_is_refused_at_the_marker() {
+    for (marker, later) in [
+        ("private_class_method :new", "def self.new(digest:) = digest"),
+        ("private_class_method :new", "def new = digest"),
+    ] {
+        let source = format!("Artifact = Data.define(:digest) do\n  {marker}\n  {later}\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            let at = source.find(marker).unwrap();
+            assert_review_refusal(&source, path, "requires an already defined local method", Some(at));
+        }
+    }
+}
+
+#[test]
+fn data_constructor_visibility_in_a_singleton_block_is_refused_at_the_marker() {
+    for later in ["", "def self.new(digest:) = digest"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  class << self; private :new; end\n  {later}\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "requires an already defined local method",
+                Some(source.find("private :new").unwrap()));
+        }
+    }
+}
+
+#[test]
 fn private_data_constructors_refuse_subclasses_toggles_and_reopenings_at_the_call() {
     let parent = "Artifact = Data.define(:digest) do\n  def self.build(digest) = new(digest:)\n  private_class_method :new, :[], :allocate\nend\n";
     for suffix in [
@@ -200,6 +225,40 @@ fn review_record_signature(source: &str, path: &str) -> String {
     roundhouse::emit::ruby::emit_library(&app).into_iter()
         .find(|file| file.path.to_string_lossy().ends_with("artifact.rbs"))
         .expect("Artifact signature").content
+}
+
+#[test]
+fn data_reopening_return_uses_the_last_definition_on_each_receiver() {
+    for (first, last, expected) in [("'old'", "digest", "untyped"), ("digest", "'last'", "String")] {
+        for receiver in ["", "self."] {
+            let member = if receiver.is_empty() { "digest" } else { "new(digest: 1).digest" };
+            let first = if first == "digest" { member } else { first };
+            let last = if last == "digest" { member } else { last };
+            let source = format!("Artifact = Data.define(:digest) do\n  def {receiver}label = {first}\nend\nclass Artifact\n  def {receiver}label = {last}\nend\n");
+            for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+                let rbs = review_record_signature(&source, path);
+                assert!(rbs.contains(&format!("def {receiver}label: () -> {expected}")), "{rbs}");
+                assert_eq!(rbs.matches(&format!("def {receiver}label:")).count(), 1, "{rbs}");
+            }
+        }
+    }
+    let source = "Artifact = Data.define(:digest) do\n  def label = digest\nend\nclass Artifact\n  def self.label = 'class'\nend\n";
+    let rbs = review_record_signature(source, "lib/artifact.rb");
+    assert!(rbs.contains("def label: () -> untyped") && rbs.contains("def self.label: () -> String"), "{rbs}");
+}
+
+#[test]
+fn data_reopening_keeps_a_declared_return_signature() {
+    let source = "Artifact = Data.define(:digest) do\n  def label = 'old'\nend\nclass Artifact\n  def label = digest\nend\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        app.rbs_signatures = roundhouse::rbs::parse_app_signatures(
+            "class Artifact\n  def label: () -> Integer\nend\n").unwrap();
+        assert!(errors(&mut app).is_empty());
+        let rbs = roundhouse::emit::ruby::emit_library(&app).into_iter()
+            .find(|file| file.path.to_string_lossy().ends_with("artifact.rbs")).unwrap().content;
+        assert!(rbs.contains("def label: () -> Integer"), "{rbs}");
+    }
 }
 
 #[test]
