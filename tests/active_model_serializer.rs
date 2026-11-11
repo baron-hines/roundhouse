@@ -120,17 +120,17 @@ fn a_serializer_base_stays_as_it_was() {
     assert!(base.methods.iter().all(|m| m.name.as_str() != "as_json_str"), "the base was lowered");
 }
 
-/// A serializer method calling what the gem supplies (`scope`) has nothing
+/// A serializer method calling what the gem supplies (`serialization_context`) has nothing
 /// to answer it once the class loses the gem's parent: refused.
 #[test]
-fn a_call_to_the_gems_scope_is_refused() {
-    let serializer = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id, :mine\n\n  def mine\n    object.id == scope.id\n  end\nend\n";
+fn a_call_to_the_gems_serialization_context_is_refused() {
+    let serializer = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id, :mine\n\n  def mine\n    serialization_context.request_url\n  end\nend\n";
     survey::activate();
     let result = ingest_app_from_tree(tree(serializer, CONTROLLER));
     let gaps = survey::drain();
     let app = result.expect("survey ingest recovers");
     assert!(
-        gaps.iter().any(|g| matches!(g, IngestError::Unsupported { message, .. } if message.contains("`scope` is the gem's"))),
+        gaps.iter().any(|g| matches!(g, IngestError::Unsupported { message, .. } if message.contains("`serialization_context` is the gem's"))),
         "{gaps:?}"
     );
     let class = app.library_classes.iter().find(|c| c.name.0.as_str() == "ArticleSerializer").expect("class");
@@ -262,4 +262,39 @@ fn a_rooted_serializer_name_resolves_at_the_top_level() {
         let class = app.library_classes.iter().find(|c| c.name.0.as_str() == name).expect(name);
         assert!(class.methods.iter().any(|m| m.name.as_str() == "as_json_str"), "{name} isn't lowered: {gaps:?}");
     }
+}
+
+/// Where active_model_serializers 0.10.16 gives the serializer no
+/// `current_user` (`serialization_scope nil`, or a scope under another
+/// name, where calling it raises NameError), or passes a named scope, the
+/// render through a serializer that reads it is left as it was: the
+/// reported residue, not a lowered render that answers nil.
+#[test]
+fn a_scope_render_the_rewrite_cannot_answer_stays_reported() {
+    let viewer = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:viewer) { current_user }\nend\n";
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let render = "  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n\n  private\n\n  def current_user\n    \"ann\"\n  end\n\n  def reader\n    \"other\"\n  end\nend\n";
+    for (serializer, declaration) in [(viewer, "serialization_scope nil"), (viewer, "serialization_scope :reader"), (scoped, "serialization_scope :reader")] {
+        let controller = format!("class ArticlesController < ApplicationController\n  {declaration}\n\n{render}");
+        let (_, controller, messages) = emitted(serializer, &controller);
+        assert!(!controller.contains("as_json_str"), "{declaration}: {controller}");
+        assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{declaration}: {messages:#?}");
+    }
+}
+
+/// The scope a render passes: the controller's `current_user` under the
+/// default `serialization_scope`, none under `serialization_scope nil`
+/// for a serializer that reads only `scope`. A serializer that reads
+/// neither renders as before, with no scope, through its writer.
+#[test]
+fn a_scope_render_passes_the_controllers_scope() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let helper = "\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n";
+    let show = "  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n";
+    let (_, controller, _) = emitted(scoped, &format!("class ArticlesController < ApplicationController\n{show}{helper}"));
+    assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"]), { scope: self.current_user }).serializable_hash"), "{controller}");
+    let (_, controller, _) = emitted(scoped, &format!("class ArticlesController < ApplicationController\n  serialization_scope nil\n\n{show}{helper}"));
+    assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{controller}");
+    let (_, controller, _) = emitted(SERIALIZER, &format!("class ArticlesController < ApplicationController\n{show}{helper}"));
+    assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).as_json_str"), "{controller}");
 }

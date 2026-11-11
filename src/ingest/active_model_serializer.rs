@@ -71,6 +71,22 @@ struct Field {
 struct Decl {
     fields: Vec<Field>,
     span: Span,
+    reads: ScopeReads,
+}
+
+/// Which of the gem's scope readers a serializer calls: `scope`, and
+/// `current_user`, the name the default `serialization_scope
+/// :current_user` defines on it. The lowering writes each one it calls.
+#[derive(Clone, Copy, Default)]
+struct ScopeReads {
+    scope: bool,
+    current_user: bool,
+}
+
+impl ScopeReads {
+    fn any(self) -> bool {
+        self.scope || self.current_user
+    }
 }
 
 pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[SourceFile]) -> IngestResult<()> {
@@ -144,10 +160,10 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
                 continue;
             }
             match collect_fields(&class, source) {
-                Ok(fields) => {
+                Ok((fields, reads)) => {
                     let span =
                         Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
-                    decls.insert(id, Decl { fields, span });
+                    decls.insert(id, Decl { fields, span, reads });
                 }
                 Err(e) => {
                     refused.insert(id, e);
@@ -200,7 +216,14 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
         }
     }
     decls.retain(|id, _| lowered_ok.contains(id));
-    let lowered: HashSet<String> = decls.keys().map(|id| id.0.as_str().to_string()).collect();
+    // A serializer that reads its scope renders with the one its
+    // controller passes, which `rewrite_scoped_renders` settles per
+    // controller; every other rewrite leaves it as it was.
+    let scoped: HashMap<String, ScopeReads> =
+        decls.iter().filter(|(_, d)| d.reads.any()).map(|(id, d)| (id.0.as_str().to_string(), d.reads)).collect();
+    rewrite_scoped_renders(app, &scoped);
+    let lowered: HashSet<String> =
+        decls.iter().filter(|(_, d)| !d.reads.any()).map(|(id, _)| id.0.as_str().to_string()).collect();
     for controller in &mut app.controllers {
         for action in controller.actions_mut() {
             rewrite_renders(&mut action.body, &lowered);
@@ -244,9 +267,9 @@ fn collect_classes<'pr>(
     }
 }
 
-fn collect_fields(class: &ruby_prism::ClassNode<'_>, source: &SourceFile) -> IngestResult<Vec<Field>> {
+fn collect_fields(class: &ruby_prism::ClassNode<'_>, source: &SourceFile) -> IngestResult<(Vec<Field>, ScopeReads)> {
     let mut fields: Vec<Field> = Vec::new();
-    let Some(body) = class.body() else { return Ok(fields) };
+    let Some(body) = class.body() else { return Ok((fields, ScopeReads::default())) };
     let stmts = flatten_statements(body);
     // The serializer's own instance methods: an attribute of that name
     // reads the method, as `read_attribute_for_serialization` does.
@@ -275,7 +298,7 @@ fn collect_fields(class: &ruby_prism::ClassNode<'_>, source: &SourceFile) -> Ing
     // nothing to answer it once the class loses the gem's parent.
     // Read in the method bodies and the `attribute` blocks, not the
     // class-body DSL (`attributes :id` is the declaration).
-    let mut gem_calls = GemCalls { own: &methods, found: None, super_at: None };
+    let mut gem_calls = GemCalls { own: &methods, found: None, super_at: None, reads: ScopeReads::default() };
     for stmt in &stmts {
         if let Some(def) = stmt.as_def_node() {
             if let Some(body) = def.body() {
@@ -379,7 +402,7 @@ fn collect_fields(class: &ruby_prism::ClassNode<'_>, source: &SourceFile) -> Ing
             return Err(refuse(source, class.location().start_offset(), &format!("the key `{}` is declared twice", f.key)));
         }
     }
-    Ok(fields)
+    Ok((fields, gem_calls.reads))
 }
 
 fn synthesize(class: &mut LibraryClass, decl: &Decl) -> IngestResult<()> {
@@ -387,6 +410,14 @@ fn synthesize(class: &mut LibraryClass, decl: &Decl) -> IngestResult<()> {
     src.push_str(&format!("class {}\n", class.name.0));
     src.push_str("  def initialize(object, options = {})\n    @object = object\n    @instance_options = options\n  end\n\n");
     src.push_str("  def object\n    @object\n  end\n\n  def instance_options\n    @instance_options\n  end\n");
+    // The gem's `scope` is the `scope:` option; `current_user` is the
+    // reader the default `serialization_scope :current_user` defines for it.
+    if decl.reads.any() {
+        src.push_str("\n  def scope\n    @instance_options[:scope]\n  end\n");
+    }
+    if decl.reads.current_user {
+        src.push_str("\n  def current_user\n    scope\n  end\n");
+    }
     for f in &decl.fields {
         src.push_str(&format!("\n  def ams_{}\n    {}\n  end\n", f.name, f.value));
     }
@@ -450,7 +481,14 @@ fn synthesize(class: &mut LibraryClass, decl: &Decl) -> IngestResult<()> {
 /// `each_serializer:` → `x.map { |item| S.new(item).serializable_hash }`.
 /// A render with another serializer option is left as it is.
 fn rewrite_renders(expr: &mut Expr, lowered: &HashSet<String>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_renders(c, lowered));
+    rewrite_renders_with(expr, &|class| lowered.contains(class).then_some(None));
+}
+
+/// The render rewrite, `scope_of` answering for each serializer whether
+/// the render is taken (`None`: left as it was) and the `scope:` it passes
+/// (`Some(None)`: none, so the serializer's scope is nil).
+fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<Expr>>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_renders_with(c, scope_of));
     let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { return };
     if method.as_str() != "render" || args.len() != 1 {
         return;
@@ -474,9 +512,7 @@ fn rewrite_renders(expr: &mut Expr, lowered: &HashSet<String>) {
         (None, Some(s)) => (s, true),
         _ => return,
     };
-    if !lowered.contains(&class) {
-        return;
-    }
+    let Some(scope) = scope_of(&class) else { return };
     let Some(json) = entries.iter().position(|(k, _)| name(k).as_deref() == Some("json")) else { return };
     let span = entries[json].1.span;
     let send = |recv: Option<Expr>, m: &str, args: Vec<Expr>, block: Option<Expr>| {
@@ -487,7 +523,14 @@ fn rewrite_renders(expr: &mut Expr, lowered: &HashSet<String>) {
     let class_expr = || {
         Expr::new(Span::synthetic(), ExprNode::Const { path: class.split("::").map(Symbol::from).collect() })
     };
-    let hashed = |value: Expr| send(Some(send(Some(class_expr()), "new", vec![value], None)), "serializable_hash", vec![], None);
+    let hashed = |value: Expr| {
+        let mut args = vec![value];
+        if let Some(scope) = &scope {
+            let key = Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("scope") } });
+            args.push(Expr::new(span, ExprNode::Hash { entries: vec![(key, scope.clone())], kwargs: false }));
+        }
+        send(Some(send(Some(class_expr()), "new", args, None)), "serializable_hash", vec![], None)
+    };
     let value = entries[json].1.clone();
     let rendered = if collection {
         let item = Symbol::from("__ams_item");
@@ -541,12 +584,21 @@ struct GemCalls<'a> {
     found: Option<(String, usize)>,
     /// The first `super`: the parent it reaches is the gem's.
     super_at: Option<usize>,
+    /// The scope readers called, which the lowering writes.
+    reads: ScopeReads,
 }
 
 impl<'pr> ruby_prism::Visit<'pr> for GemCalls<'_> {
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         let name = constant_id_str(&node.name());
-        if self.found.is_none()
+        let plain = node.receiver().is_none() && node.arguments().is_none() && node.block().is_none();
+        if plain && !self.own.contains(name) && matches!(name, "scope" | "current_user") {
+            if name == "scope" {
+                self.reads.scope = true;
+            } else {
+                self.reads.current_user = true;
+            }
+        } else if self.found.is_none()
             && node.receiver().is_none()
             && GEM_INSTANCE_METHODS.contains(&name)
             && !self.own.contains(name)
@@ -732,5 +784,100 @@ fn refuse(source: &SourceFile, offset: usize, reason: &str) -> IngestError {
     IngestError::Unsupported {
         file: source.path.clone(),
         message: format!("{line}:{column}: ActiveModel::Serializer subset: {reason}"),
+    }
+}
+
+/// What a controller's `serialization_scope` names, its own or its
+/// nearest ancestor's (a class attribute, the last declaration winning):
+/// `:current_user` when none is declared.
+#[derive(Clone, Copy)]
+enum ControllerScope {
+    CurrentUser,
+    Nil,
+    /// A named scope other than `:current_user`, or a computed one.
+    Other,
+}
+
+/// The app controllers from `name` up its `parent` chain.
+fn controller_chain<'a>(app: &'a crate::App, name: &ClassId) -> Vec<&'a crate::dialect::Controller> {
+    let mut chain: Vec<&crate::dialect::Controller> = Vec::new();
+    let mut at = Some(name.0.as_str().trim_start_matches("::").to_string());
+    while let Some(id) = at {
+        let Some(controller) = app.controllers.iter().find(|c| c.name.0.as_str().trim_start_matches("::") == id) else { break };
+        if chain.iter().any(|c| std::ptr::eq(*c, controller)) {
+            break;
+        }
+        chain.push(controller);
+        at = controller.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::").to_string());
+    }
+    chain
+}
+
+fn controller_scope(chain: &[&crate::dialect::Controller]) -> ControllerScope {
+    for controller in chain {
+        for item in controller.body.iter().rev() {
+            let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if method.as_str() != "serialization_scope" {
+                continue;
+            }
+            return match args.as_slice() {
+                [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Nil }) => ControllerScope::Nil,
+                [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "current_user") => {
+                    ControllerScope::CurrentUser
+                }
+                _ => ControllerScope::Other,
+            };
+        }
+    }
+    ControllerScope::CurrentUser
+}
+
+/// `render json: x, serializer: S` for a serializer that reads its scope,
+/// as active_model_serializers renders it: the controller's
+/// `serialization_scope` is the `scope:`, and under the default
+/// `:current_user` the serializer's `current_user` reads it. The scope is
+/// the controller's `current_user` when it has one (its own or an
+/// ancestor's method, or Devise's from a model's `devise`), nil without
+/// one. Under `serialization_scope nil` the scope is nil and the
+/// serializer has no `current_user`, so a serializer that calls it is left
+/// as it was, as is any render under another named scope.
+fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeReads>) {
+    if scoped.is_empty() {
+        return;
+    }
+    let devise = app.models.iter().any(|m| {
+        m.body.iter().any(|item| {
+            matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "devise"))
+        })
+    });
+    let plans: Vec<(ControllerScope, bool)> = app
+        .controllers
+        .iter()
+        .map(|c| {
+            let chain = controller_chain(app, &c.name);
+            let own = chain.iter().any(|c| c.actions().any(|a| a.name.as_str() == "current_user"));
+            (controller_scope(&chain), devise || own)
+        })
+        .collect();
+    for (controller, (scope, has_current_user)) in app.controllers.iter_mut().zip(plans) {
+        for action in controller.actions_mut() {
+            let span = action.body.span;
+            let current_user = move || {
+                Expr::new(
+                    span,
+                    ExprNode::Send { recv: None, method: Symbol::from("current_user"), args: vec![], block: None, parenthesized: false },
+                )
+            };
+            rewrite_renders_with(&mut action.body, &|class| {
+                let reads = scoped.get(class)?;
+                match scope {
+                    ControllerScope::CurrentUser => Some(has_current_user.then(current_user)),
+                    ControllerScope::Nil if !reads.current_user => Some(None),
+                    _ => None,
+                }
+            });
+        }
     }
 }
