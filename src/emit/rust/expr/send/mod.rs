@@ -77,7 +77,7 @@ pub(super) fn emit_send(
             if let ExprNode::Const { path } = &*r.node {
                 if path.last().map(|s| s.as_str()) == Some("ActiveSupport") {
                     let arg = match &*args[0].node {
-                        ExprNode::Ivar { name } => format!("&self.{}", name.as_str()),
+                        ExprNode::Ivar { name } => format!("&self.{}", crate::emit::rust::expr::util::escape_rust_keyword(name.as_str())),
                         _ => format!("&({})", emit_expr(&args[0])),
                     };
                     return format!("crate::rh_datetime::parse_db_time({arg})");
