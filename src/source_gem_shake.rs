@@ -676,7 +676,8 @@ impl<'a> Gems<'a> {
             }
         }
         let mut loaded = Vec::new();
-        for program in &app.file_programs {
+        // Not every program: a file nothing loads (Devise's `strategies/rememberable`, which only the model module requires) runs none of it.
+        for program in app.file_programs.iter().filter(|p| app.gem_loaded_files.contains(&crate::ingest::normalize_source(&p.source))) {
             program_bodies(&program.items, &mut loaded);
         }
         for e in loaded {

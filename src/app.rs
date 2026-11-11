@@ -140,6 +140,9 @@ pub struct App {
     /// the file's program, which runs them where the file is required.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_load_statements: Vec<crate::span::Span>,
+    /// The gem files the boot loads, as `ingest::gem_load_program` walks them (normalized source paths).
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub gem_loaded_files: crate::det::HashSet<String>,
     /// The constants an initializer statement held by a gem not compiled
     /// from source calls (`Rack::Attack` of `Rack::Attack.throttle`):
     /// `ingest::auto_source_gems` brings that gem in, and the statement
@@ -1325,6 +1328,7 @@ impl App {
             seeds: None,
             boot_program: Vec::new(),
             gem_load_statements: Vec::new(),
+            gem_loaded_files: Default::default(),
             boot_gem_constants: Vec::new(),
             gem_middlewares: Vec::new(),
             gem_middleware_blocks: Default::default(),
