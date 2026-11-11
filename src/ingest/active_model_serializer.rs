@@ -867,7 +867,8 @@ fn controller_scope(chain: &[&crate::dialect::Controller]) -> ControllerScope {
 /// nil` the scope is nil and the serializer has no `current_user`, so a
 /// serializer that calls it is left as it was, as is any render under
 /// another named scope, and any whose controller includes a module the
-/// app doesn't define (a gem's), which may answer `current_user`.
+/// app doesn't define (a gem's), which may define `serialization_scope`
+/// or `current_user`.
 fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeReads>) {
     if scoped.is_empty() {
         return;
@@ -881,15 +882,15 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
                     if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "devise"))
             })
     });
-    let plans: Vec<(ControllerScope, Option<bool>, bool)> = app
+    let plans: Vec<(ControllerScope, Option<bool>, Option<bool>)> = app
         .controllers
         .iter()
         .map(|c| {
             let chain = controller_chain(app, &c.name);
             let has_current_user = if devise { Some(true) } else { chain_defines(app, &chain, "current_user") };
-            // A gem's module is taken not to override the gem's own
-            // `serialization_scope`.
-            let own_scope = chain_defines(app, &chain, "serialization_scope") == Some(true);
+            // `None` when an included module the app doesn't define may
+            // override `serialization_scope`: the scope is then unknown.
+            let own_scope = chain_defines(app, &chain, "serialization_scope");
             (controller_scope(&chain), has_current_user, own_scope)
         })
         .collect();
@@ -904,7 +905,9 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
             };
             rewrite_renders_with(&mut action.body, &|class| {
                 let reads = scoped.get(class)?;
-                if own_scope {
+                // An unknown `serialization_scope` leaves the render as
+                // written, as an unknown `current_user` does.
+                if own_scope? {
                     // The serializer's `current_user` is the scope only
                     // under the default scope name.
                     return (matches!(scope, ControllerScope::CurrentUser) || !reads.current_user)
