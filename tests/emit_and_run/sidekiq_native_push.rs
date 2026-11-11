@@ -446,8 +446,9 @@ puts "mixed passed"
 
 /// Under `:sidekiq` a worker whose queue or retry can't be read, its own
 /// or inherited, is an error: the push would write the default in its
-/// place. So is enqueueing a worker that defines its own `perform_async`,
-/// which isn't lowered to a push.
+/// place. So is enqueueing a worker that has its own `perform_async`,
+/// defined on it or from a module it extends, which isn't lowered to a
+/// push.
 #[test]
 fn unreadable_options_and_an_own_perform_async_are_errors_under_sidekiq() {
     let errors_for = |files: &[(&str, &str)], call: &str| {
@@ -473,6 +474,8 @@ fn unreadable_options_and_an_own_perform_async_are_errors_under_sidekiq() {
     let hash_worker = format!("class HashWorker\n  include Sidekiq::Job\n  sidekiq_options(Hash.new)\n{perform}");
     let custom_worker =
         format!("class CustomWorker\n  include Sidekiq::Job\n\n  def self.perform_async(n)\n    new.perform(n)\n  end\n{perform}");
+    let fast_enqueue = "module FastEnqueue\n  def perform_async(n)\n    nil\n  end\nend\n";
+    let extended_worker = format!("class ExtendedWorker\n  include Sidekiq::Job\n  extend FastEnqueue\n{perform}");
     let cases: Vec<(Vec<(&str, &str)>, &str, &str)> = vec![
         (vec![("app/workers/queue_worker.rb", queue_worker.as_str())], "QueueWorker.perform_async(1)", "sidekiq_options `queue:` is not a literal"),
         (
@@ -483,6 +486,11 @@ fn unreadable_options_and_an_own_perform_async_are_errors_under_sidekiq() {
         (vec![("app/workers/hash_worker.rb", hash_worker.as_str())], "HashWorker.perform_async(1)", "is not one literal Hash"),
         (vec![("app/workers/custom_worker.rb", custom_worker.as_str())], "CustomWorker.perform_in(60, 1)", "`CustomWorker` defines its own `perform_async`"),
         (vec![("app/workers/custom_worker.rb", custom_worker.as_str())], "CustomWorker.perform_async(1)", "`CustomWorker` defines its own `perform_async`"),
+        (
+            vec![("app/workers/fast_enqueue.rb", fast_enqueue), ("app/workers/extended_worker.rb", extended_worker.as_str())],
+            "ExtendedWorker.perform_async(1)",
+            "`ExtendedWorker` gets its own `perform_async` from `FastEnqueue`",
+        ),
     ];
     for (files, call, want) in cases {
         let errors = errors_for(&files, call);

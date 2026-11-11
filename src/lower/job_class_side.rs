@@ -135,8 +135,8 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     });
     diags.extend(super::sidekiq_native::rejected_diagnostics(&native));
     for worker in &refused_folds.workers {
-        if let Some(span) = own_async.get(worker) {
-            diags.push(super::sidekiq_native::own_perform_async_error(worker, *span));
+        if let Some(own) = own_async.get(worker) {
+            diags.push(super::sidekiq_native::own_perform_async_error(worker, own));
         }
     }
     for span in scheduled.waits.iter().filter(|_| !sidekiq) {

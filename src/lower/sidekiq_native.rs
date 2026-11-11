@@ -247,34 +247,72 @@ fn ancestry<'a>(app: &'a App, lc: &'a LibraryClass) -> Vec<&'a LibraryClass> {
     out
 }
 
-/// The workers in `workers` that define a class-side `perform_async` of
-/// their own or inherit one, each with where it is defined. Their calls
-/// aren't folded, so they keep dispatching to it; enqueueing one under
-/// `:sidekiq` is an error ([`own_perform_async_error`]).
-pub fn own_perform_async(app: &App, workers: &BTreeSet<String>) -> std::collections::BTreeMap<String, Span> {
+/// Where a worker's own `perform_async` comes from: the method, and the
+/// module it extends that provides it, if it isn't defined on the class
+/// or an ancestor.
+pub struct OwnAsync {
+    pub span: Span,
+    pub module: Option<String>,
+}
+
+/// The workers in `workers` that have a class-side `perform_async` of
+/// their own: defined on the class or an ancestor, or an instance method
+/// of an app module one of them `extend`s. Their calls aren't folded, so
+/// they keep dispatching to it; enqueueing one under `:sidekiq` is an
+/// error ([`own_perform_async_error`]). A module the app doesn't define
+/// (a gem's) isn't looked into.
+pub fn own_perform_async(app: &App, workers: &BTreeSet<String>) -> std::collections::BTreeMap<String, OwnAsync> {
+    let defined = |c: &LibraryClass, receiver: MethodReceiver| {
+        c.methods.iter().find(|m| m.receiver == receiver && m.name.as_str() == "perform_async").map(|m| m.name_span)
+    };
+    let module_named = |owner: &str, path: &[Symbol]| -> Option<&LibraryClass> {
+        let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+        let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+        let nested = (!rooted).then(|| format!("{owner}::{written}"));
+        nested
+            .iter()
+            .chain(std::iter::once(&written))
+            .find_map(|name| app.library_classes.iter().find(|c| c.is_module && c.name.0.as_str() == name.as_str()))
+    };
     app.library_classes
         .iter()
         .filter(|lc| workers.contains(lc.name.0.as_str()))
         .filter_map(|lc| {
-            ancestry(app, lc).into_iter().find_map(|c| {
-                c.methods
-                    .iter()
-                    .find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "perform_async")
-                    .map(|m| (lc.name.0.as_str().to_string(), m.name_span))
-            })
+            let found = ancestry(app, lc).into_iter().find_map(|c| {
+                if let Some(span) = defined(c, MethodReceiver::Class) {
+                    return Some(OwnAsync { span, module: None });
+                }
+                c.unknown_calls.iter().rev().find_map(|call| {
+                    let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return None };
+                    if method.as_str() != "extend" {
+                        return None;
+                    }
+                    args.iter().rev().find_map(|a| {
+                        let ExprNode::Const { path } = &*a.node else { return None };
+                        let module = module_named(c.name.0.as_str(), path)?;
+                        let span = defined(module, MethodReceiver::Instance)?;
+                        Some(OwnAsync { span, module: Some(module.name.0.as_str().to_string()) })
+                    })
+                })
+            })?;
+            Some((lc.name.0.as_str().to_string(), found))
         })
         .collect()
 }
 
 /// A worker with its own `perform_async`, enqueued under `:sidekiq`: its
 /// jobs would run where that method sends them, not in Redis.
-pub fn own_perform_async_error(worker: &str, span: Span) -> Diagnostic {
+pub fn own_perform_async_error(worker: &str, own: &OwnAsync) -> Diagnostic {
+    let has = match &own.module {
+        None => "defines its own `perform_async`".to_string(),
+        Some(module) => format!("gets its own `perform_async` from `{module}`"),
+    };
     error(
-        span,
+        own.span,
         "job-own-perform-async",
         "own perform_async not lowered",
         format!(
-            "sidekiq_native: `{worker}` defines its own `perform_async`, which isn't lowered to a push; under queue_adapter :sidekiq its jobs must be pushed to Redis in Sidekiq's envelope"
+            "sidekiq_native: `{worker}` {has}, which isn't lowered to a push; under queue_adapter :sidekiq its jobs must be pushed to Redis in Sidekiq's envelope"
         ),
     )
 }
