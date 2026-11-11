@@ -39,27 +39,40 @@ end
 }
 #[test]
 fn integration_requests_and_assert_recognizes_keep_default_types() {
-    app().write("test/controllers/defaults_test.rb", r#"require "test_helper"
-class DefaultsTest < ActionDispatch::IntegrationTest
+    app().write("test/controllers/defaults_controller_test.rb", r#"require "test_helper"
+class DefaultsControllerTest < ActionDispatch::IntegrationTest
   test "typed defaults" do
     get "/literal?text=query&number=9"
     assert_equal '"fixed"|:staff|1|true|false|nil', response.body
     assert_recognizes({ controller: "defaults", action: "show", text: "fixed", symbol: :staff, number: 1, yes: true, no: false, absent: nil }, "/literal")
   end
 end
-"#).run_test("test/controllers/defaults_test.rb").assert_passes();
+"#).run_test("test/controllers/defaults_controller_test.rb").assert_passes();
+}
+
+#[test]
+fn controller_requests_keep_typed_defaults() {
+    app().write("test/controllers/defaults_controller_test.rb", r#"require "test_helper"
+class DefaultsControllerTest < ActionController::TestCase
+  test "controller requests keep typed defaults" do
+    get :show, params: { text: "query" }
+    assert_equal '"fixed"|:staff|1|true|false|nil', response.body
+  end
+end
+"#).run_test("test/controllers/defaults_controller_test.rb").assert_passes();
 }
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn typed_defaults_reach_native_params() {
     let script = r#"matched = ActionDispatch::Router.match("GET", "/literal", [RouteTable.root] + RouteTable.table)
 raise "match" if matched.nil?
-params = { "text" => "query", "number" => "9" }
+params = ParamBuilder.from_query_string("text=query&number=9")
+raise "query" if params.nil?
 RouteTable.route_defaults(matched.defaults, params, matched.path_params)
 controller = DefaultsController.new
 controller.params = params
 controller.show
-raise "types" unless controller.response.body == '"fixed"|:staff|1|true|false|nil'
+raise "types: " + controller.response.body.inspect unless controller.response.body == '"fixed"|:staff|1|true|false|nil'
 puts "kind=fixed"
 "#;
     app().run_spinel_with_rbs(script).assert_passes();

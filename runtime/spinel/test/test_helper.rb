@@ -2173,7 +2173,7 @@ module ActionController
         headers["HTTP_X_REQUESTED_WITH"] = "XMLHttpRequest"
         headers["HTTP_ACCEPT"] = "text/javascript, text/html, application/xml, text/xml, */*"
       end
-      run_controller(@controller, route.action, path_params, nil, method, method, path, "", rest, headers, as)
+      run_controller(@controller, route.action, path_params, nil, method, method, path, "", rest, headers, as, route.defaults)
     end
 
     # A param value as a request carries it: what Rails' TestRequest
@@ -2482,7 +2482,7 @@ module RequestDispatch
                    when :comments then CommentsController.new
                    else ActiveStorage::Routes.instantiate_controller(matched.controller)
                    end
-      run_controller(controller, matched.action, matched.path_params, matched.req_format, method, wire_method, path, query, params, headers, as)
+      run_controller(controller, matched.action, matched.path_params, matched.req_format, method, wire_method, path, query, params, headers, as, matched.defaults)
       [@__response.status, @__response.headers, [@__response.body.to_s]]
     end
     return @__response if @__routed
@@ -2508,7 +2508,7 @@ module RequestDispatch
   # the action run inside a connection lease, and the response kept.
   # `dispatch_request` comes here after the router matched the path;
   # ActionController::TestCase#process with the controller it holds.
-  def run_controller(controller, action, path_params, req_format, method, wire_method, path, query, params, headers, as)
+  def run_controller(controller, action, path_params, req_format, method, wire_method, path, query, params, headers, as, defaults = -1)
     # Test fixtures pass Symbol-keyed nested hashes (`{article: {title:
     # ...}}`); the wire-level request body is String-keyed at runtime.
     # Stringify recursively so the harness shape matches what the
@@ -2559,7 +2559,7 @@ module RequestDispatch
     end
     # Rails' `params.merge!(path_parameters)`: the route's own segments win over both.
     path_params.each { |k, v| merged[k.to_s] = v }
-    RouteTable.route_defaults(matched.defaults, merged, matched.path_params)
+    RouteTable.route_defaults(defaults, merged, path_params)
     controller.params  = merged
     controller.path_parameters = path_params
     controller.session = @__session ||= ActionDispatch::Session.new
