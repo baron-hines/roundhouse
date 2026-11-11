@@ -1212,7 +1212,7 @@ impl<'a> BodyTyper<'a> {
 
     /// Does `of` or an ancestor define `method` class-side (a scope, a
     /// `def self.…`, a runtime-declared class method)?
-    fn class_side_defines(&self, of: &ClassId, method: &Symbol) -> bool {
+    pub(super) fn class_side_defines(&self, of: &ClassId, method: &Symbol) -> bool {
         let mut current = Some(of.clone());
         for _ in 0..32 {
             let Some(id) = current else { return false };

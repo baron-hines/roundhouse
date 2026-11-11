@@ -7024,9 +7024,9 @@ fn requires_files(stmt: &ruby_prism::Node<'_>) -> bool {
 // Not a later version: whether the block runs is the running Ruby's, which the body cannot tell.
 fn inline_version_gates<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
     const FLOOR: [u32; 3] = [3, 2, 0];
-    let gate = |s: &ruby_prism::Node<'pr>| -> Option<Vec<ruby_prism::Node<'pr>>> {
-        let call = s.as_call_node()?;
-        if call.receiver().is_some() || constant_id_str(&call.name()) != "with_minimum_ruby" {
+    // The version a `with_minimum_ruby('v')` / `with_minimum_ruby?('v')` call names, when every Ruby the app runs on meets it.
+    let met = |call: &ruby_prism::CallNode<'pr>, name: &str| -> Option<()> {
+        if call.receiver().is_some() || constant_id_str(&call.name()) != name {
             return None;
         }
         let args: Vec<_> = call.arguments()?.arguments().iter().collect();
@@ -7034,9 +7034,17 @@ fn inline_version_gates<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> Vec<ruby
         let text = String::from_utf8_lossy(version.as_string_node()?.unescaped()).into_owned();
         let parts: Vec<u32> = text.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
         let padded: Vec<u32> = (0..3).map(|i| parts.get(i).copied().unwrap_or(0)).collect();
-        if padded.as_slice() > FLOOR.as_slice() {
-            return None;
+        (padded.as_slice() <= FLOOR.as_slice()).then_some(())
+    };
+    let gate = |s: &ruby_prism::Node<'pr>| -> Option<Vec<ruby_prism::Node<'pr>>> {
+        // `if with_minimum_ruby?('2.6.0') … else … end`: the branch that runs.
+        if let Some(branch) = s.as_if_node() {
+            met(&branch.predicate().as_call_node()?, "with_minimum_ruby?")?;
+            let inner = flatten_statements(branch.statements()?.as_node());
+            return inner.iter().all(|n| n.as_def_node().is_some()).then_some(inner);
         }
+        let call = s.as_call_node()?;
+        met(&call, "with_minimum_ruby")?;
         let body = call.block()?.as_block_node()?.body()?;
         let inner = flatten_statements(body);
         inner.iter().all(|n| n.as_def_node().is_some()).then_some(inner)

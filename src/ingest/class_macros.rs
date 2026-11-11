@@ -455,11 +455,19 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
     // instance method's own receiverless `precedence`. What is left is a call by name the expansion did
     // not consume — `Base.precedence(…)`, a class method's `precedence(…)`, or `:precedence` handed to `send`.
     // A receiver counts when it is a class that has the macro (it or an ancestor defines it), not `Rails.root`.
+    // Not a class whose class method of the name defines nothing: another method that shares it (OmniAuth's
+    // `Strategy::ClassMethods#default_options`, a reader, beside rack-protection's `Base.default_options` macro).
+    fn defines(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Send { method, .. }
+            if matches!(method.as_str(), "define_method" | "class_eval" | "module_eval" | "attr_accessor" | "attr_reader" | "attr_writer" | "alias_method"));
+        e.node.for_each_child(&mut |c| found = found || defines(c));
+        found
+    }
     let owners = |name: &Symbol| -> HashSet<String> {
         let defining: Vec<&ClassId> = app
             .library_classes
             .iter()
-            .filter(|lc| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && &m.name == name))
+            .filter(|lc| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && &m.name == name && defines(&m.body)))
             .map(|lc| &lc.name)
             .collect();
         app.library_classes
@@ -522,9 +530,12 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
                     class_side_mentions(&m.body, &HashMap::from_iter([(name, only.clone())]), false, &mut counted);
                     *own.entry(name.clone()).or_default() += counted.get(name).copied().unwrap_or(0);
                 }
+                // Not a bare call in another class's class method: there `self` is that class, which owns no such macro.
+                let here: HashMap<&Symbol, HashSet<String>> =
+                    names.iter().filter(|(_, owners)| owners.contains(lc.name.0.as_str())).map(|(n, o)| (*n, o.clone())).collect();
                 let (mut inside, mut outside) = (HashMap::default(), HashMap::default());
-                class_side_mentions(&m.body, &names, true, &mut inside);
-                class_side_mentions(&m.body, &names, false, &mut outside);
+                class_side_mentions(&m.body, &here, true, &mut inside);
+                class_side_mentions(&m.body, &here, false, &mut outside);
                 for (name, n) in inside {
                     if name != m.name {
                         *class_side.entry(name.clone()).or_default() += n - outside.get(&name).copied().unwrap_or(0);
