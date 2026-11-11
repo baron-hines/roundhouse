@@ -187,6 +187,25 @@ pub(super) fn omits_statement_on_failure(known: &HashSet<String>, statement: &Ex
 /// Devise's mapping, as its controllers reach it: `request.env["devise.mapping"]`, which the `devise_scope`
 /// constraint writes (`Devise.mappings[scope]`), is a `Devise::Mapping`, and its `to` is the class one of the
 /// app's `devise` models is: Devise reads the mapping's class name back as a constant (`Devise::Getter`).
+/// `Devise::ParameterSanitizer#sanitize(action)` answers the request's permitted `ActionController::Parameters`, as
+/// Rails' `permit` does: its branches (`permissions.call(...)`, `permit_keys`) type nothing the analysis can follow,
+/// and what reads it (`update_with_password(params)`'s `params[:password]`, `params.delete(:current_password)`) reads
+/// Parameters, indifferently.
+pub(super) fn devise_sanitized_params(app: &mut App) {
+    let owner = crate::ident::ClassId(crate::ident::Symbol::from("Devise::ParameterSanitizer"));
+    if !app.library_classes.iter().any(|c| c.name == owner && c.methods.iter().any(|m| m.name.as_str() == "sanitize")) {
+        return;
+    }
+    let parameters = crate::ty::Ty::Class { id: crate::ident::ClassId(crate::ident::Symbol::from("ActionController::Parameters")), args: vec![].into() };
+    let sig = crate::ty::Ty::Fn {
+        params: vec![crate::ty::Param { name: crate::ident::Symbol::from("action"), ty: std::sync::Arc::new(crate::ty::Ty::Sym), kind: crate::ty::ParamKind::Required }].into(),
+        block: None,
+        ret: std::sync::Arc::new(parameters),
+        effects: crate::effect::EffectSet::default(),
+    };
+    app.rbs_signatures.entry(owner).or_default().entry(crate::ident::Symbol::from("sanitize")).or_insert(sig);
+}
+
 pub(super) fn devise_mapping_types(app: &mut App) {
     if !app.library_classes.iter().any(|c| c.name.0.as_str() == "Devise::Mapping") {
         return;
@@ -331,6 +350,15 @@ pub(super) fn fold_devise_view_scope(app: &mut App, mappings: &[(String, String)
     {
         return;
     }
+    // Devise's own controllers read it the same way (`send("current_#{resource_name}")`): every request they serve
+    // carries the one mapping.
+    if let [(name, _)] = mappings {
+        for c in app.controllers.iter_mut().filter(|c| c.name.0.as_str().starts_with("Devise")) {
+            for a in c.actions_mut() {
+                fold_scope_reads(&mut a.body, name);
+            }
+        }
+    }
     for view in app.views.iter_mut() {
         if let [(name, _)] = mappings {
             fold_scope_reads(&mut view.body, name);
@@ -411,6 +439,45 @@ pub(super) fn fold_devise_failure_route(app: &mut App, mappings: &[(String, Stri
             if !router_named {
                 fold_router_send(&mut m.body);
             }
+        }
+    }
+}
+
+/// `router_name ? send(router_name) : self` (Devise's `after_inactive_sign_up_path_for`, `signed_in_root_path`) and
+/// `send(Devise.available_router_name)`, where the app names no router: a mapping's `router_name` is then nil, and
+/// the available one `main_app`. An emitted program sends no name it learns at run time.
+pub(super) fn fold_devise_unnamed_router(app: &mut App) {
+    if app.boot_program.iter().any(|e| sends(e, "router_name=")) {
+        return;
+    }
+    fn fold(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| fold(c));
+        if let ExprNode::If { cond, then_branch, else_branch } = &*e.node
+            && matches!(&*cond.node, ExprNode::Var { name, .. } if name.as_str() == "router_name")
+            && matches!(&*then_branch.node, ExprNode::Send { recv: None, method, args, .. }
+                if method.as_str() == "send" && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Var { name, .. } if name.as_str() == "router_name")))
+        {
+            *e = else_branch.clone();
+            return;
+        }
+        if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+            && method.as_str() == "send"
+            && let [arg] = args.as_slice()
+            && matches!(&*arg.node, ExprNode::Send { recv: Some(r), method, args, .. }
+                if method.as_str() == "available_router_name" && args.is_empty()
+                    && matches!(&*r.node, ExprNode::Const { path } if path.iter().filter(|p| !p.as_str().is_empty()).map(|p| p.as_str()).eq(["Devise"])))
+        {
+            *e.node = ExprNode::Send { recv: None, method: crate::ident::Symbol::from("main_app"), args: Vec::new(), block: None, parenthesized: false };
+        }
+    }
+    for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str().starts_with("Devise")) {
+        for m in &mut lc.methods {
+            fold(&mut m.body);
+        }
+    }
+    for c in app.controllers.iter_mut().filter(|c| c.name.0.as_str().starts_with("Devise")) {
+        for a in c.actions_mut() {
+            fold(&mut a.body);
         }
     }
 }

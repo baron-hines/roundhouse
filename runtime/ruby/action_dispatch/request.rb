@@ -228,6 +228,12 @@ module ActionDispatch
       @session = value
     end
 
+    # Rails' `Request#reset_session` (Warden's `reset_session!` on sign-out): the session emptied in place, so what
+    # holds it sees it empty too.
+    def reset_session
+      session.clear
+    end
+
     # Whether the dispatcher should leave the session cookie alone this
     # response (Rails: the session middleware skips its commit).
     def session_skip?

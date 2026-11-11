@@ -961,7 +961,8 @@ impl<'a> BodyTyper<'a> {
             && let Some(answer) = self.constant_predicate(cond, ctx)
             && let ExprNode::If { then_branch, else_branch, .. } = &*expr.node
         {
-            *expr = if answer { then_branch.clone() } else { else_branch.clone() };
+            let (kept, dropped) = if answer { (then_branch.clone(), else_branch.clone()) } else { (else_branch.clone(), then_branch.clone()) };
+            *expr = declare_dropped_locals(kept, &dropped, ctx);
         }
         // `a && b` whose left answers false (`resource.respond_to?(:m) && resource.m`): Ruby answers the left and never
         // evaluates the right, which, typed, would report what never runs.
@@ -8364,4 +8365,37 @@ fn builtin_never_answers(ty: &Ty, method: &Symbol) -> bool {
             Ty::Hash { .. } => !answers.contains(&"Hash"),
             _ => false,
         })
+}
+
+/// `kept`, with `x = nil` ahead of it for each local the untaken branch first assigns: Ruby defines a local an
+/// assignment names wherever the parser meets it, a branch that never runs included (`x = y if false` leaves `x` nil).
+fn declare_dropped_locals(kept: Expr, dropped: &Expr, ctx: &Ctx) -> Expr {
+    fn assigned(e: &Expr, out: &mut Vec<(crate::ident::VarId, Symbol)>) {
+        if let ExprNode::Assign { target: crate::expr::LValue::Var { id, name }, .. } = &*e.node
+            && !out.iter().any(|(_, n)| n == name)
+        {
+            out.push((*id, name.clone()));
+        }
+        // Not a block's own: its locals are its body's.
+        if matches!(&*e.node, ExprNode::Lambda { .. }) {
+            return;
+        }
+        e.node.for_each_child(&mut |c| assigned(c, out));
+    }
+    let mut names = Vec::new();
+    assigned(dropped, &mut names);
+    let fresh: Vec<_> = names.into_iter().filter(|(_, n)| !ctx.local_bindings.contains_key(n)).collect();
+    if fresh.is_empty() {
+        return kept;
+    }
+    let span = kept.span;
+    let mut exprs: Vec<Expr> = fresh
+        .into_iter()
+        .map(|(id, name)| {
+            let nil = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+            Expr::new(span, ExprNode::Assign { target: crate::expr::LValue::Var { id, name }, value: nil })
+        })
+        .collect();
+    exprs.push(kept);
+    Expr::new(span, ExprNode::Seq { exprs })
 }

@@ -11337,7 +11337,8 @@ fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
     };
     for model in &app.models {
         let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
-        let Some(init) = lc.methods.iter_mut().find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize") else { continue };
+        // Not `initialize` alone: `update(attrs)` reads the same Symbol keys (Devise's `update_with_password(params)`).
+        for init in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance && matches!(m.name.as_str(), "initialize" | "update")) {
         if init.params.first().is_none_or(|p| p.name.as_str() != "attrs") {
             continue;
         }
@@ -11366,6 +11367,7 @@ fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
             }
             other => sp_expr(ExprNode::Seq { exprs: vec![guarded, Expr::new(body.span, other)] }),
         };
+        }
     }
 }
 

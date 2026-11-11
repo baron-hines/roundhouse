@@ -787,3 +787,102 @@ fn a_devise_password_resets_over_http_natively() {
     let (secret, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
     assert_eq!(secret.status, 200, "{}", server.log());
 }
+
+/// `:registerable`, as Rails 8.1.4 with Devise 4.9.4 answers it: a bad sign-up renders its errors, a good one signs the
+/// user in, the edit form updates the email past the current password, and cancelling deletes the user and signs out.
+const REGISTERABLE_MODULES: &str = ":database_authenticatable, :registerable, :recoverable, :validatable";
+
+const REGISTERABLE_ROUTES: &str = "  devise_for :users\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n";
+
+const RACK_REGISTER: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+token_of = ->(page) { URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1]) }
+
+status, _, page = req("GET", "/users/sign_up")
+raise "sign-up page #{status}" unless status == 200 && page.include?(%(action="/users"))
+status, _, bad = req("POST", "/users", "authenticity_token=#{token_of.(page)}&user%5Bemail%5D=bad&user%5Bpassword%5D=123&user%5Bpassword_confirmation%5D=123")
+errors = bad.scan(%r{<li>([^<]*)</li>}).flatten
+raise "bad #{status} #{errors.inspect}" unless status == 200 && errors == ["Email is invalid", "Password is too short (minimum is 6 characters)"]
+status, headers, = req("POST", "/users", "authenticity_token=#{token_of.(page)}&user%5Bemail%5D=new%40example.com&user%5Bpassword%5D=secret123&user%5Bpassword_confirmation%5D=secret123")
+raise "create #{status} #{headers.inspect}" unless status == 302 && headers["location"] == "http://localhost/"
+status, = req("GET", "/secret")
+raise "signed up #{status}" unless status == 200
+status, _, edit = req("GET", "/users/edit")
+raise "edit #{status}" unless status == 200 && edit.include?(%(value="new@example.com"))
+status, headers, = req("POST", "/users", "_method=put&authenticity_token=#{token_of.(edit)}&user%5Bemail%5D=renamed%40example.com&user%5Bcurrent_password%5D=secret123")
+raise "update #{status} #{headers.inspect}" unless status == 302 && headers["location"] == "http://localhost/"
+raise "renamed" if User.find_by(email: "renamed@example.com").nil?
+status, headers, = req("POST", "/users", "_method=delete&authenticity_token=#{token_of.(edit)}")
+raise "cancel #{status} #{headers.inspect}" unless status == 302 && headers["location"] == "http://localhost/" && User.count == 0
+status, = req("GET", "/secret")
+raise "cancelled #{status}" unless status == 302
+puts "devise registration over rack passed"
+"##;
+
+#[test]
+fn a_devise_user_registers_edits_and_cancels_over_rack_on_the_ruby_family() {
+    let run = app(REGISTERABLE_MODULES, REGISTERABLE_ROUTES).run_ruby(RACK_REGISTER);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise registration over rack passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_devise_user_registers_edits_and_cancels_over_http_natively() {
+    let tree = app(REGISTERABLE_MODULES, REGISTERABLE_ROUTES).native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    let form_type = ("Content-Type", "application/x-www-form-urlencoded");
+    let mut jar = Vec::new();
+    let post = |jar: &mut Vec<(String, String)>, body: String| {
+        let cookie = header(jar);
+        let (answer, cookies) = server.request_with_set_cookies("POST", "/users", &[form_type, ("Cookie", cookie.as_str())], &body);
+        kept(jar, &cookies);
+        answer
+    };
+
+    let (page, cookies) = server.request_with_set_cookies("GET", "/users/sign_up", &[], "");
+    assert_eq!(page.status, 200, "{}", server.log());
+    kept(&mut jar, &cookies);
+    let token = form_encode(between(&page.body, "name=\"authenticity_token\" value=\"", "\""));
+    let bad = post(&mut jar, format!("authenticity_token={token}&user%5Bemail%5D=bad&user%5Bpassword%5D=123&user%5Bpassword_confirmation%5D=123"));
+    assert_eq!(bad.status, 200, "{}\n{}", bad.body, server.log());
+    assert!(bad.body.contains("<li>Email is invalid</li>"), "{}", bad.body);
+    assert!(bad.body.contains("<li>Password is too short (minimum is 6 characters)</li>"), "{}", bad.body);
+    let created = post(
+        &mut jar,
+        format!("authenticity_token={token}&user%5Bemail%5D=new%40example.com&user%5Bpassword%5D=secret123&user%5Bpassword_confirmation%5D=secret123"),
+    );
+    assert_eq!(created.status, 302, "{}\n{}", created.body, server.log());
+    let cookie = header(&jar);
+    let (secret, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(secret.status, 200, "{}", server.log());
+
+    let (edit, cookies) = server.request_with_set_cookies("GET", "/users/edit", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(edit.status, 200, "{}\n{}", edit.body, server.log());
+    assert!(edit.body.contains(r#"value="new@example.com""#), "{}", edit.body);
+    kept(&mut jar, &cookies);
+    let token = form_encode(between(&edit.body, "name=\"authenticity_token\" value=\"", "\""));
+    let updated = post(&mut jar, format!("_method=put&authenticity_token={token}&user%5Bemail%5D=renamed%40example.com&user%5Bcurrent_password%5D=secret123"));
+    assert_eq!(updated.status, 302, "{}\n{}", updated.body, server.log());
+    let cancelled = post(&mut jar, format!("_method=delete&authenticity_token={token}"));
+    assert_eq!(cancelled.status, 302, "{}\n{}", cancelled.body, server.log());
+    let cookie = header(&jar);
+    let (secret, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(secret.status, 302, "{}", server.log());
+}

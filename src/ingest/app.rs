@@ -5093,9 +5093,33 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
             for method in module_methods.get(module).into_iter().flatten() {
-                if !defined.insert(method.name.clone()) {
-                    continue;
-                }
+                let renamed;
+                let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
+                    method
+                } else {
+                    // Not dropped where the winning copy calls `super` (Devise's `Helpers#expire_data_after_sign_out!`
+                    // over `SignInOut`'s): Ruby runs this one there, which the flattened controller keeps under its own name.
+                    let Some(winner) = methods.iter_mut().chain(actions.iter_mut()).find_map(|item| match item {
+                        ControllerBodyItem::Action { action, .. } if action.name == method.name && calls_super(&action.body) => Some(action),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    let target = crate::ident::Symbol::from(format!("__super_{}", method.name.as_str()));
+                    if !defined.insert(target.clone()) {
+                        continue;
+                    }
+                    let forwarded: Vec<crate::expr::Expr> = winner
+                        .params
+                        .fields
+                        .keys()
+                        .chain(winner.opt_params.iter().map(|(n, _)| n))
+                        .map(|n| crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Var { id: crate::ident::VarId(0), name: n.clone() }))
+                        .collect();
+                    redirect_super(&mut winner.body, &target, &forwarded);
+                    renamed = crate::dialect::MethodDef { name: target, ..(*method).clone() };
+                    &renamed
+                };
                 let mut body = method.body.clone();
                 if let Some(consts) = module_constants.get(module) {
                     qualify_lexical_consts(&mut body, module, consts);
@@ -5475,6 +5499,23 @@ fn read_primary_key_sends(body: &mut crate::expr::Expr) {
     {
         *method = crate::ident::Symbol::from("[]");
     }
+}
+
+fn calls_super(e: &crate::expr::Expr) -> bool {
+    let mut found = matches!(&*e.node, crate::expr::ExprNode::Super { .. });
+    e.node.for_each_child(&mut |c| found |= calls_super(c));
+    found
+}
+
+/// Each `super` of a spliced method, as the call to the shadowed definition kept under `target`; a bare one passes
+/// the method's own arguments, as Ruby's does.
+fn redirect_super(e: &mut crate::expr::Expr, target: &crate::ident::Symbol, forwarded: &[crate::expr::Expr]) {
+    if let crate::expr::ExprNode::Super { args } = &*e.node {
+        let args = args.clone().unwrap_or_else(|| forwarded.to_vec());
+        *e.node = crate::expr::ExprNode::Send { recv: None, method: target.clone(), args, block: None, parenthesized: true };
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| redirect_super(c, target, forwarded));
 }
 
 /// A modelled hook has nothing left to do at load, and the emitted
