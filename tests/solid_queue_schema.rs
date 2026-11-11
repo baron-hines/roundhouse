@@ -165,14 +165,11 @@ fn a_sqlite_check_in_the_schema_does_not_hide_queue_tables() {
     let jobs = "create_table :solid_queue_jobs do |t|; t.text :arguments; t.check_constraint \"arguments GLOB '{*'\"; end\n";
     let sqlite = "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
     let both = format!("{items}{jobs}");
-    for database in [None, Some(sqlite)] {
-        let mut files = vec![("db/schema.rb", both.as_str())];
-        files.extend(database.map(|yml| ("config/database.yml", yml)));
-        assert!(has_job(&app(&files)), "primary schema, {database:?}");
-        let mut files = vec![("db/schema.rb", items), ("db/queue_schema.rb", jobs)];
-        files.extend(database.map(|yml| ("config/database.yml", yml)));
-        let app = app(&files);
-        assert!(has_job(&app), "queue schema, {database:?}");
+    let database = ("config/database.yml", sqlite);
+    assert!(has_job(&app(&[("db/schema.rb", both.as_str()), database])), "primary schema");
+    {
+        let app = app(&[("db/schema.rb", items), ("db/queue_schema.rb", jobs), database]);
+        assert!(has_job(&app), "queue schema");
         assert_eq!(app.schema.tables[&roundhouse::Symbol::from("solid_queue_jobs")].check_constraints.len(), 1);
     }
 }

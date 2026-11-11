@@ -115,7 +115,6 @@ const PREDICATES: &[Predicate] = &[
 
 /// Main's Portable grammar already reads these; the others are SQLite's own.
 const SHARED: &[&str] = &["between", "not_between", "concat", "substr", "precedence"];
-const USES_LIKE: &[&str] = &["like", "not_like", "like_column", "combinations"];
 
 fn predicate(name: &str) -> &'static Predicate {
     PREDICATES.iter().find(|p| p.name == name).unwrap()
@@ -299,13 +298,16 @@ fn native_spinel_enforces_all_predicate_inserts_and_updates() {
         .assert_passes();
 }
 
-/// The three reductions carry no `config/database.yml`; none uses `LIKE`.
+/// The three reductions, in an application whose `config/database.yml` is sqlite3.
 #[test]
-fn reductions_emit_strictly_without_a_database_configuration() {
+fn reductions_emit_strictly_for_a_sqlite_application() {
     for name in ["not_glob", "json_type", "simple_case"] {
         let predicate = predicate(name);
         for target in [roundhouse::project::BuildTarget::Ruby, roundhouse::project::BuildTarget::Spinel] {
-            let (tree, errors) = emit_and_run::empty_app().write("db/schema.rb", &schema(predicate)).emit(target);
+            let (tree, errors) = emit_and_run::empty_app()
+                .write("db/schema.rb", &schema(predicate))
+                .write("config/database.yml", SQLITE)
+                .emit(target);
             assert!(errors.is_empty(), "{name}: {errors:?}");
             let ddl = std::fs::read_to_string(tree.join("config/schema.rb")).unwrap();
             assert!(ddl.contains(predicate.sql) || ddl.contains(&predicate.sql.replace('"', "\\\"")), "{ddl}");
@@ -464,13 +466,11 @@ fn words_are_operators_or_names_by_position() {
         let ddl = sqlite_ddl(&check(sql, Some(SQLITE)).unwrap_or_else(|error| panic!("{sql}: {error}")));
         assert!(ddl.contains(&format!("CHECK ({sql})")), "{ddl}");
     }
-    // Without a configuration the operator stays refused beside the column;
-    // the column alone, and GLOB, read as written.
-    for sql in ["CASE WHEN code LIKE 'a%' THEN true ELSE false END", "char(65) = code AND code LIKE like", "json_type(code) IS NULL OR code NOT LIKE glob"] {
+    // Without a configuration nothing of SQLite's own is read, beside such columns or not.
+    for sql in ["CASE WHEN code LIKE 'a%' THEN true ELSE false END", "char(65) = code AND code LIKE like", "json_type(code) IS NULL OR code NOT LIKE glob", "like IS NULL OR glob GLOB 'a*' AND CASE like WHEN glob THEN end END > 0"] {
         assert!(check(sql, None).is_err(), "{sql}");
+        assert!(check(sql, Some(SQLITE)).is_ok(), "{sql}");
     }
-    let sql = "like IS NULL OR glob GLOB 'a*' AND CASE like WHEN glob THEN end END > 0";
-    assert!(sqlite_ddl(&check(sql, None).unwrap()).contains(&format!("CHECK ({sql})")));
     // An operand cannot follow an operand, nor an operator an operator.
     let plain = |sql: &str| app_schema(&schema_with(predicate("glob"), &format!("t.check_constraint {sql:?}")), Some(SQLITE));
     for sql in ["code GLOB GLOB 'a'", "code glob 'a' 'b'", "code GLOB 'a*' = * 1", "GLOB 'a*'", "WHEN code GLOB 'a*'", "code GLOB 'a*' (mode)", "mode code GLOB 'a*'", "code GLOB", "code NOT GLOB 'a*' AND"] {
@@ -478,18 +478,18 @@ fn words_are_operators_or_names_by_position() {
     }
 }
 
-/// With no configuration the database is not known: `LIKE`, which PostgreSQL
-/// reads with case, stays refused; what PostgreSQL rejects or reads alike emits.
+/// With no configuration the database is not known, so the schema keeps
+/// main's grammar: nothing of SQLite's own is read.
 #[test]
-fn an_unconfigured_application_keeps_like_refused() {
+fn an_unconfigured_application_keeps_the_portable_grammar() {
     // `like_column` is left out: main's gate already reads it, taking the operator for the column.
     for predicate in PREDICATES.iter().filter(|p| p.name != "like_column") {
         let read = app_schema(&schema(predicate), None);
-        if USES_LIKE.contains(&predicate.name) {
-            assert!(read.unwrap_err().contains("unsupported schema expression"), "{}", predicate.name);
-        } else {
+        if SHARED.contains(&predicate.name) {
             let ddl = sqlite_ddl(&read.unwrap_or_else(|error| panic!("{}: {error}", predicate.name)));
             assert!(ddl.contains(&format!("CHECK ({})", predicate.sql)), "{ddl}");
+        } else {
+            assert!(read.unwrap_err().contains("unsupported schema expression"), "{}", predicate.name);
         }
     }
 }
@@ -532,6 +532,9 @@ fn only_a_file_naming_sqlite3_throughout_reads_sqlite_grammar() {
         ("PostgreSQL beside the primary", "test:\n  primary:\n    adapter: sqlite3\n    database: storage/test.sqlite3\n  reports:\n    adapter: postgresql\n    database: reports\n"),
         ("a computed adapter", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\nproduction:\n  adapter: <%= ENV[\"DB_ADAPTER\"] %>\n  database: predicates\n"),
         ("a computed URL", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\nproduction:\n  url: <%= ENV[\"DATABASE_URL\"] %>\n"),
+        // The second reviewer's file: Rails takes the adapter from the URL at boot, whatever the anchor says.
+        ("a computed URL beside an inherited adapter", "default: &default\n  adapter: sqlite3\n  pool: 5\ndevelopment:\n  <<: *default\n  database: storage/development.sqlite3\ntest:\n  <<: *default\n  database: storage/test.sqlite3\nproduction:\n  <<: *default\n  url: <%= ENV[\"DATABASE_URL\"] %>\n"),
+        ("a computed URL in the test environment", "test:\n  adapter: sqlite3\n  url: <%= ENV[\"DATABASE_URL\"] %>\n"),
     ] {
         for predicate in PREDICATES.iter().filter(|p| p.name != "like_column") {
             let read = app_schema(&schema(predicate), Some(database));
@@ -552,25 +555,25 @@ fn only_a_file_naming_sqlite3_throughout_reads_sqlite_grammar() {
 /// grammar is refused on those columns rather than carried to other storage.
 #[test]
 fn sqlite_grammar_is_refused_on_columns_stored_differently_from_rails() {
-    const TYPES: &[&str] = &["string", "text", "integer", "bigint", "float", "boolean", "binary", "decimal", "json", "date", "datetime", "time"];
-    const DIFFERENT: &[&str] = &["date", "datetime", "decimal", "json", "time"];
-    let columns = TYPES.iter().map(|ty| format!("t.{ty} :c_{ty}")).collect::<Vec<_>>().join("\n    ");
+    const TYPES: &[&str] = &["string", "text", "integer", "bigint", "float", "boolean", "binary", "decimal", "json", "date", "datetime", "time", "inet", "macaddr"];
+    const DIFFERENT: &[&str] = &["date", "datetime", "decimal", "inet", "json", "macaddr", "time"];
+    let columns = TYPES.iter().map(|ty| format!("t.column :c_{ty}, :{ty}")).collect::<Vec<_>>().join("\n    ");
     let table = |declaration: &str| format!("ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :typed_items, force: true do |t|\n    {columns}\n    {declaration}\n  end\nend\n");
     let check = |sql: &str, database: Option<&str>| app_schema(&table(&format!("t.check_constraint {sql:?}")), database);
     for ty in TYPES {
         for sql in [format!("c_{ty} GLOB '*.*'"), format!("json_type(\"c_{ty}\") = 'real'"), format!("CASE WHEN c_{ty} IS NULL THEN true ELSE c_text GLOB 'a*' END"), format!("char(49) = C_{}", ty.to_uppercase())] {
-            for database in [Some(SQLITE), None] {
-                let read = check(&sql, database);
-                if DIFFERENT.contains(ty) {
-                    let error = read.map(|_| ()).unwrap_err();
-                    assert!(error.contains("db/schema.rb") && error.contains("line 15: unsupported schema expression on typed_items"), "{sql}: {error}");
-                } else {
-                    assert!(sqlite_ddl(&read.unwrap_or_else(|error| panic!("{sql}: {error}"))).contains(&format!("CHECK ({sql})")), "{sql}");
-                }
+            let read = check(&sql, Some(SQLITE));
+            if DIFFERENT.contains(ty) {
+                let error = read.map(|_| ()).unwrap_err();
+                assert!(error.contains("db/schema.rb") && error.contains("line 17: unsupported schema expression on typed_items"), "{sql}: {error}");
+            } else {
+                assert!(sqlite_ddl(&read.unwrap_or_else(|error| panic!("{sql}: {error}"))).contains(&format!("CHECK ({sql})")), "{sql}");
             }
         }
         assert_eq!(check(&format!("c_{ty} LIKE '1%'"), Some(SQLITE)).is_ok(), !DIFFERENT.contains(ty), "{ty}");
     }
+    // The second reviewer's column: Rails stores `'10.0'` in an `inet` column as a number.
+    assert!(app_schema("ActiveRecord::Schema[8.1].define do\n  create_table :items do |t|\n    t.column :ip, :inet\n    t.check_constraint \"ip GLOB '*.*'\", name: 'ip_dotted'\n  end\nend\n", Some(SQLITE)).unwrap_err().contains("line 4: unsupported schema expression on items: ip GLOB"));
     // Main's shared grammar reads these columns already, with the same difference; it is left as it was.
     assert!(check("length(c_decimal) >= 4 AND c_decimal || '' <> substr(c_json, 1)", Some(SQLITE)).is_ok());
 
