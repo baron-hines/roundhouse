@@ -515,15 +515,97 @@ fn another_database_keeps_the_portable_grammar() {
     }
 }
 
-/// The environment the emitted tests run in decides, as it does the dialect.
+/// SQLite's own grammar needs the whole file to say SQLite: the test
+/// environment's primary and every other configuration name sqlite3, and
+/// none is left unresolved. Anything less keeps the portable grammar.
 #[test]
-fn the_test_environment_names_the_database() {
+fn only_a_file_naming_sqlite3_throughout_reads_sqlite_grammar() {
     let like = schema(predicate("like"));
-    let sqlite_tests = "production:\n  adapter: postgresql\n  database: predicates\ntest:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
-    let postgres_tests = "production:\n  adapter: sqlite3\n  database: storage/production.sqlite3\ntest:\n  adapter: postgresql\n  database: predicates_test\n";
-    assert!(app_schema(&like, Some(sqlite_tests)).is_ok());
-    assert!(app_schema(&like, Some("production:\n  adapter: sqlite3\n  database: storage/production.sqlite3\n")).is_ok());
-    assert!(app_schema(&like, Some(postgres_tests)).is_err());
+    let rails_default = "default: &default\n  adapter: sqlite3\n  max_connections: <%= ENV.fetch(\"RAILS_MAX_THREADS\") { 5 } %>\n  timeout: 5000\n\ndevelopment:\n  <<: *default\n  database: storage/development.sqlite3\n\ntest:\n  <<: *default\n  database: storage/test.sqlite3\n\nproduction:\n  primary:\n    <<: *default\n    database: storage/production.sqlite3\n  cache:\n    <<: *default\n    database: storage/production_cache.sqlite3\n    migrations_paths: db/cache_migrate\n";
+    assert!(app_schema(&like, Some(rails_default)).is_ok());
+    for (why, database) in [
+        // The reviewer's file: the anchor holder is not a database, and the only real one is PostgreSQL.
+        ("an anchor holder beside PostgreSQL", "default: &default\n  adapter: sqlite3\n  pool: 5\n\nproduction:\n  adapter: postgresql\n  url: <%= ENV[\"DATABASE_URL\"] %>\n"),
+        ("no test environment", "default: &default\n  adapter: sqlite3\n\nproduction:\n  <<: *default\n  database: storage/production.sqlite3\n"),
+        ("PostgreSQL in development", "development:\n  adapter: postgresql\n  database: predicates\ntest:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n"),
+        ("PostgreSQL in production", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\nproduction:\n  adapter: postgresql\n  database: predicates\n"),
+        ("PostgreSQL beside the primary", "test:\n  primary:\n    adapter: sqlite3\n    database: storage/test.sqlite3\n  reports:\n    adapter: postgresql\n    database: reports\n"),
+        ("a computed adapter", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\nproduction:\n  adapter: <%= ENV[\"DB_ADAPTER\"] %>\n  database: predicates\n"),
+        ("a computed URL", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\nproduction:\n  url: <%= ENV[\"DATABASE_URL\"] %>\n"),
+    ] {
+        for predicate in PREDICATES.iter().filter(|p| p.name != "like_column") {
+            let read = app_schema(&schema(predicate), Some(database));
+            assert_eq!(read.is_ok(), SHARED.contains(&predicate.name), "{} with {why}", predicate.name);
+        }
+    }
+    // The reviewer's migration: PostgreSQL rejects `Abc` and SQLite would accept it.
+    let mut tree = std::collections::HashMap::new();
+    tree.insert(std::path::PathBuf::from("db/migrate/20260101000000_create_items.rb"), b"class CreateItems < ActiveRecord::Migration[8.1]\n  def change\n    create_table :items do |t|\n      t.text :code\n    end\n    add_check_constraint :items, \"code LIKE 'a%'\", name: 'code_starts_a'\n  end\nend\n".to_vec());
+    tree.insert(std::path::PathBuf::from("config/database.yml"), b"default: &default\n  adapter: sqlite3\n  pool: 5\n\nproduction:\n  adapter: postgresql\n  url: <%= ENV[\"DATABASE_URL\"] %>\n".to_vec());
+    let error = roundhouse::ingest::ingest_app_from_tree(tree).map(|_| ()).unwrap_err().to_string();
+    assert!(error.contains("unsupported CHECK expression on items"), "{error}");
+}
+
+/// The emitted SQLite types of some columns differ from Rails' (`decimal` is
+/// REAL here and NUMERIC there; `json` and the date and time types are TEXT
+/// here and NUMERIC there), so the same text reads other values. SQLite's own
+/// grammar is refused on those columns rather than carried to other storage.
+#[test]
+fn sqlite_grammar_is_refused_on_columns_stored_differently_from_rails() {
+    const TYPES: &[&str] = &["string", "text", "integer", "bigint", "float", "boolean", "binary", "decimal", "json", "date", "datetime", "time"];
+    const DIFFERENT: &[&str] = &["date", "datetime", "decimal", "json", "time"];
+    let columns = TYPES.iter().map(|ty| format!("t.{ty} :c_{ty}")).collect::<Vec<_>>().join("\n    ");
+    let table = |declaration: &str| format!("ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :typed_items, force: true do |t|\n    {columns}\n    {declaration}\n  end\nend\n");
+    let check = |sql: &str, database: Option<&str>| app_schema(&table(&format!("t.check_constraint {sql:?}")), database);
+    for ty in TYPES {
+        for sql in [format!("c_{ty} GLOB '*.*'"), format!("json_type(\"c_{ty}\") = 'real'"), format!("CASE WHEN c_{ty} IS NULL THEN true ELSE c_text GLOB 'a*' END"), format!("char(49) = C_{}", ty.to_uppercase())] {
+            for database in [Some(SQLITE), None] {
+                let read = check(&sql, database);
+                if DIFFERENT.contains(ty) {
+                    let error = read.map(|_| ()).unwrap_err();
+                    assert!(error.contains("db/schema.rb") && error.contains("line 15: unsupported schema expression on typed_items"), "{sql}: {error}");
+                } else {
+                    assert!(sqlite_ddl(&read.unwrap_or_else(|error| panic!("{sql}: {error}"))).contains(&format!("CHECK ({sql})")), "{sql}");
+                }
+            }
+        }
+        assert_eq!(check(&format!("c_{ty} LIKE '1%'"), Some(SQLITE)).is_ok(), !DIFFERENT.contains(ty), "{ty}");
+    }
+    // Main's shared grammar reads these columns already, with the same difference; it is left as it was.
+    assert!(check("length(c_decimal) >= 4 AND c_decimal || '' <> substr(c_json, 1)", Some(SQLITE)).is_ok());
+
+    // Rails names the types: the same writes land as other values exactly in the refused columns.
+    let ddl = sqlite_ddl(&app_schema(&table(""), Some(SQLITE)).unwrap());
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let script = format!(
+        r#"
+require {helper:?}
+unless RailsOracle.available?('activerecord', sqlite3: '>= 2.9')
+  puts 'skip: Rails or sqlite3 unavailable'
+  exit
+end
+RailsOracle.activate('activerecord', sqlite3: '>= 2.9')
+require 'active_record'
+ActiveRecord::Base.establish_connection(adapter: 'sqlite3', database: ':memory:')
+ActiveRecord::Schema.verbose = false
+{}
+rails = ActiveRecord::Base.connection
+emitted = SQLite3::Database.new(':memory:')
+emitted.execute_batch({ddl:?})
+different = {TYPES:?}.select do |type|
+  ["10", "10.0", "'10.00'", "'1.0'", "'2026-01-02'", "'2026-01-02 03:04:05'"].any? do |value|
+    stored = [rails, emitted].map do |database|
+      database.execute("DELETE FROM typed_items")
+      database.execute("INSERT INTO typed_items (c_#{{type}}) VALUES (#{{value}})")
+    end
+    rails.select_rows("SELECT typeof(c_#{{type}}), c_#{{type}} || '' FROM typed_items") != emitted.execute("SELECT typeof(c_#{{type}}), c_#{{type}} || '' FROM typed_items")
+  end
+end
+puts "stored differently: #{{different.sort.join(',')}}"
+"#,
+        table("")
+    );
+    assert_ruby(&script, &format!("stored differently: {}\n", DIFFERENT.join(",")));
 }
 
 /// The partial-index predicates of the review history, in a PostgreSQL
