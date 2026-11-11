@@ -356,3 +356,16 @@ fn a_scope_render_under_an_unresolved_include_stays_reported() {
     assert!(!rendered.contains("serializable_hash"), "{rendered}");
     assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
 }
+
+/// An include the app doesn't define may define `serialization_scope`
+/// as well as `current_user`: with one, the scope is unknown even when
+/// the controller defines `current_user` itself, so the render is left
+/// as written, and reported.
+#[test]
+fn a_scope_render_under_an_unresolved_include_with_its_own_current_user_stays_reported() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class ArticlesController < ApplicationController\n  include Authentication::Helpers\n\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n";
+    let (_, rendered, messages) = emitted_with(scoped, controller, &[]);
+    assert!(!rendered.contains("serializable_hash"), "{rendered}");
+    assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
+}
