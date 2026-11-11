@@ -489,7 +489,44 @@ fn rewrite_renders(expr: &mut Expr, lowered: &HashSet<String>) {
 /// the render is taken (`None`: left as it was) and the `scope:` it passes
 /// (`Some(None)`: none, so the serializer's scope is nil).
 fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<Expr>>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_renders_with(c, scope_of));
+    let mut taken = HashSet::default();
+    names_in(expr, &mut taken);
+    rewrite_renders_in(expr, scope_of, &taken);
+}
+
+/// Every name `expr` reads, writes or binds: a binding the rewrite adds
+/// takes none of them, so a local of the source keeps its value.
+fn names_in(expr: &Expr, names: &mut HashSet<String>) {
+    let lvalue = |target: &crate::expr::LValue, names: &mut HashSet<String>| {
+        if let crate::expr::LValue::Var { name, .. } = target {
+            names.insert(name.as_str().to_string());
+        }
+    };
+    match &*expr.node {
+        ExprNode::Var { name, .. } | ExprNode::Let { name, .. } => {
+            names.insert(name.as_str().to_string());
+        }
+        ExprNode::Assign { target, .. } => lvalue(target, names),
+        ExprNode::MultiAssign { targets, .. } => targets.iter().for_each(|t| lvalue(t, names)),
+        ExprNode::Lambda { params, .. } => names.extend(params.iter().map(|p| p.as_str().to_string())),
+        ExprNode::Send { recv: None, method, .. } => {
+            names.insert(method.as_str().to_string());
+        }
+        _ => {}
+    }
+    expr.node.for_each_child(&mut |c| names_in(c, names));
+}
+
+/// `base`, or `base_2`, `base_3`, … : the first that `taken` doesn't hold.
+fn fresh(base: &str, taken: &HashSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    (2..).map(|n| format!("{base}_{n}")).find(|name| !taken.contains(name)).unwrap_or_default()
+}
+
+fn rewrite_renders_in(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<Expr>>, taken: &HashSet<String>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_renders_in(c, scope_of, taken));
     let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { return };
     if method.as_str() != "render" || args.len() != 1 {
         return;
@@ -546,7 +583,7 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
                 if chosen(&entries[i].0) || !runs(&entries[i].1) {
                     continue;
                 }
-                let temp = format!("__ams_{}", name(&entries[i].0).unwrap_or_default());
+                let temp = fresh(&format!("__ams_{}", name(&entries[i].0).unwrap_or_default()), taken);
                 if i == json {
                     bindings.push(bound(&temp, value));
                     value = var(&temp);
@@ -555,8 +592,9 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
                     entries[i].1 = var(&temp);
                 }
             }
-            bindings.push(bound("__ams_scope", scope));
-            Some(var("__ams_scope"))
+            let temp = fresh("__ams_scope", taken);
+            bindings.push(bound(&temp, scope));
+            Some(var(&temp))
         }
         scope => scope,
     };
@@ -569,7 +607,7 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
         send(Some(send(Some(class_expr()), "new", args, None)), "serializable_hash", vec![], None)
     };
     let rendered = if collection {
-        let item = Symbol::from("__ams_item");
+        let item = Symbol::from(fresh("__ams_item", taken).as_str());
         let read = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: item.clone() });
         let block = Expr::new(
             span,
