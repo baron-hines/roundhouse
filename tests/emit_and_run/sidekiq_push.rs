@@ -65,7 +65,7 @@ fn a_spinel_tree_on_sidekiq_gets_spinel_redis() {
     assert!(
         client.contains("require \"redis\"")
             && client.contains(
-                "Redis.new(url: url, username: user, password: pass, connect_timeout: connect_timeout, read_timeout: read_timeout)"
+                "Redis.new(url: url, username: user, password: pass, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout)"
             ),
         "{client}"
     );
