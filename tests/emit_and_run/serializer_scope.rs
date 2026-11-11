@@ -245,3 +245,86 @@ fn a_render_reads_the_scope_as_the_gem_does() {
     run.assert_passes();
     assert!(run.stdout.contains("scope reads OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
 }
+
+/// A render's other options run before the scope is read: with a
+/// `status:` that changes `current_user`, active_model_serializers
+/// 0.10.16 (Rails 8.1.4) reads `item, status, current_user` for `json:,
+/// serializer:, status:`, `status, item, current_user` with `status:`
+/// first, and `items, status, current_user` for a collection, and the
+/// scope is the changed user's.
+fn switching_app() -> emit_and_run::Overlay {
+    app()
+        .write(
+            "app/controllers/switching_json_controller.rb",
+            r#"class SwitchingJsonController < ApplicationController
+  def show
+    render json: item, serializer: ScopeOnlySerializer, status: switch_user
+  end
+
+  def first
+    render status: switch_user, json: item, serializer: ScopeOnlySerializer
+  end
+
+  def index
+    render json: items, each_serializer: ScopeOnlySerializer, status: switch_user
+  end
+
+  private
+
+  def item
+    (@reads ||= []) << "item"
+    Article.order(:id).first
+  end
+
+  def items
+    (@reads ||= []) << "items"
+    Article.order(:id)
+  end
+
+  def switch_user
+    (@reads ||= []) << "status"
+    @who = "bob"
+    :ok
+  end
+
+  def current_user
+    (@reads ||= []) << "current_user"
+    @who || "ann"
+  end
+end
+"#,
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"switching\" => \"switching_json#show\"\n  get \"switching/first\" => \"switching_json#first\"\n  get \"switching/all\" => \"switching_json#index\"\n  resources :articles do",
+        )
+}
+
+const SWITCHING_SCRIPT: &str = r##"
+require_relative "app/controllers/switching_json_controller"
+a = Article.create!(title: "Hello", body: "A long body")
+b = Article.create!(title: "World", body: "Another body")
+run = ->(action) { c = SwitchingJsonController.new; c.params = {}; c.process_action(action); c }
+failures = []
+check = ->(label, got, want) { failures << "#{label}: #{got.inspect}, want #{want.inspect}" unless got == want }
+ida, idb = a.id.to_s, b.id.to_s
+c = run.(:show)
+check.("show body", c.body, '{"id":' + ida + ',"scoped":"bob"}')
+check.("show reads", c.instance_variable_get(:@reads), ["item", "status", "current_user"])
+c = run.(:first)
+check.("status first body", c.body, '{"id":' + ida + ',"scoped":"bob"}')
+check.("status first reads", c.instance_variable_get(:@reads), ["status", "item", "current_user"])
+c = run.(:index)
+check.("collection body", c.body, '[{"id":' + ida + ',"scoped":"bob"},{"id":' + idb + ',"scoped":"bob"}]')
+check.("collection reads", c.instance_variable_get(:@reads), ["items", "status", "current_user"])
+raise failures.join("\n") unless failures.empty?
+puts "option order OK"
+"##;
+
+#[test]
+fn a_renders_other_options_run_before_the_scope_is_read() {
+    let run = switching_app().run_ruby(SWITCHING_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("option order OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+}
