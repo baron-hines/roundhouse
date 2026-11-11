@@ -1,5 +1,6 @@
 module Rack
   module Utils
+    def self.status_code: (Integer | Symbol status) -> Integer
     def self.q_values: (String? q_value_header) -> Array[[String?, Float]]
     def self.select_best_encoding: (Array[String] available_encodings, Array[[String?, Float]] accept_encoding) -> String?
     def self.unescape_path: (String s) -> String

@@ -20,6 +20,9 @@ module ActionController
     include UrlFor
     include Redirecting
     include ActionView::Rendering
+
+    def logger: () -> Rails::Logger
+    def _process_format: (Mime::Type format) -> nil
   end
 
   class API < Base

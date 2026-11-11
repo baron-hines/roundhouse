@@ -7,6 +7,10 @@
 //! its own writes fill. Every caller passes a class, so the `||=`
 //! never assigns and `Class.new`, which Spinel cannot build, is dead
 //! once the entry `update` reads back is typed as what `add` stored.
+//! `add` asks `kind.method_defined?(:run)`, a Module query Spinel answers
+//! only on a value proven to be one of those classes: the cycle through
+//! the hash must not keep a `Class` arm from a round where `update`'s
+//! argument was still untyped and the default could still run.
 //!
 //! The expected lines are CRuby's output for the same code.
 
@@ -21,6 +25,36 @@ pub fn overlay() -> super::emit_and_run::Overlay {
         .write(&format!("{gem}/lib/kinds.rb"), "require \"kinds/registry\"\n")
         .write(&format!("{gem}/lib/kinds/registry.rb"), REGISTRY)
         .write("config/initializers/registry.rb", INIT)
+}
+
+/// [`overlay`], with the default answered by a local lambda: its `.call`
+/// gives the lambda its parameter types and retypes the `||=` statement,
+/// which must stay as unknown as the first typing left it. Bound to the
+/// lambda's `Integer` there, `kind` would carry it through the hash.
+pub fn overlay_lambda_default() -> super::emit_and_run::Overlay {
+    let gem = "vendor/bundle/ruby/3.4.0/gems/kinds-1.0";
+    let default = "      kind ||= Class.new(Registry::Base)\n";
+    assert!(REGISTRY.contains(default));
+    let registry = REGISTRY.replace(
+        default,
+        "      fallback = ->(n) { n }\n      kind ||= fallback.call(1)\n",
+    );
+    overlay().write(&format!("{gem}/lib/kinds/registry.rb"), &registry)
+}
+
+/// [`overlay`], with the default in a method of its own whose body is
+/// the one `||=`: `add` takes `pick(kind)`'s return. That body is no
+/// sequence of statements, and its `Class.new` must stay out of the
+/// return the first typing harvests, or `add` stores it in the hash.
+pub fn overlay_default_method() -> super::emit_and_run::Overlay {
+    let gem = "vendor/bundle/ruby/3.4.0/gems/kinds-1.0";
+    let default = "      kind ||= Class.new(Registry::Base)\n";
+    assert!(REGISTRY.contains(default));
+    let registry = REGISTRY.replace(default, "      kind = pick(kind)\n").replace(
+        "    def _kinds\n",
+        "    def pick(kind = nil)\n      kind ||= Class.new(Registry::Base)\n    end\n\n    def _kinds\n",
+    );
+    overlay().write(&format!("{gem}/lib/kinds/registry.rb"), &registry)
 }
 
 const REGISTRY: &str = r##"class Registry
@@ -45,6 +79,7 @@ const REGISTRY: &str = r##"class Registry
   class << self
     def add(label, kind = nil)
       kind ||= Class.new(Registry::Base)
+      raise "#{kind} cannot run" unless kind.method_defined?(:run)
       _kinds[label] = kind
     end
 

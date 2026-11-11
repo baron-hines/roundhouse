@@ -282,3 +282,76 @@ class Array
 
   alias_method :excluding, :without
 end
+
+# Not over ActiveSupport itself where a framework test loads it beside this file: its `with_options` is the one.
+unless Object.method_defined?(:with_options)
+  class Object
+    def with_options(options, &block)
+      merger = ActiveSupport::OptionMerger.new(self, options)
+      return merger unless block
+      block.arity.zero? ? merger.instance_eval(&block) : block.call(merger)
+    end
+  end
+
+  module ActiveSupport
+    # Not a BasicObject: ActiveSupport's own is an Object, and a framework test that loads it after this file reopens it.
+    class OptionMerger
+      instance_methods.each do |method|
+        undef_method(method) unless method.start_with?("__", "instance_eval", "class", "object_id")
+      end
+
+      def initialize(context, options)
+        @context = context
+        @options = options
+      end
+
+      private
+
+      def method_missing(method, *arguments, &block)
+        options = arguments.last.respond_to?(:to_hash) ? deep_merge(@options, arguments.pop.to_hash) : @options
+        @context.__send__(method, *arguments, **options, &block)
+      end
+
+      # Rails' `Hash#deep_merge`, which this runtime does not reopen Hash with.
+      def deep_merge(base, other)
+        base.merge(other) { |_, mine, theirs| mine.is_a?(::Hash) && theirs.is_a?(::Hash) ? deep_merge(mine, theirs) : theirs }
+      end
+
+      def respond_to_missing?(*arguments)
+        @context.respond_to?(*arguments)
+      end
+    end
+  end
+end
+
+# Not for the app's own calls, which the lowering grounds: a gem's file runs this as it loads (Devise's csrf_cleaner).
+# Not over ActiveSupport itself where a framework test loads it beside this file: its `try` is the one.
+unless Object.method_defined?(:try)
+  class Object
+    def try(*args, &block)
+      if args.empty? && block
+        block.arity.zero? ? instance_eval(&block) : yield(self)
+      elsif !args.empty? && respond_to?(args.first)
+        public_send(*args, &block)
+      end
+    end
+
+    def try!(*args, &block)
+      if args.empty? && block
+        block.arity.zero? ? instance_eval(&block) : yield(self)
+      else
+        public_send(*args, &block)
+      end
+    end
+  end
+
+  class NilClass
+    def try(*)
+      nil
+    end
+
+    def try!(*)
+      nil
+    end
+  end
+end

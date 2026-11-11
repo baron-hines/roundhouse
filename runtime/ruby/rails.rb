@@ -807,16 +807,32 @@ module Rails
   class FrameworkConfig
     def initialize
       @assets = AssetConfig.new
+      @action_controller = ActionControllerOptions.new
     end
 
     def assets
       @assets
     end
 
+    def relative_url_root
+      ENV["RAILS_RELATIVE_URL_ROOT"]
+    end
+
+    def action_controller
+      @action_controller
+    end
+
     # `Rails.application.config.filter_parameters` read at run time. The
     # list is the one ingest lifts from the app's `config.filter_parameters`.
     def filter_parameters
       Rails.application.config_filter_parameters
+    end
+  end
+
+  # Not ActionController::ControllerConfig: that one is the Ruby family's alone, and this config is every target's.
+  class ActionControllerOptions
+    def relative_url_root
+      Rails.application.config.relative_url_root
     end
   end
 

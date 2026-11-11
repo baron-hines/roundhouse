@@ -45,11 +45,14 @@ pub fn analyze_and_lower(app: &mut App) -> Vec<Diagnostic> {
 }
 
 fn analyze_and_lower_with_target(app: &mut App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
+    if target == crate::build_target::BuildTarget::Spinel {
+        crate::ingest::source_gem_autoload::answer_nil(app);
+    }
     let mut analyzer = crate::analyze::Analyzer::new(app);
     analyzer.analyze(app);
     // Typed again without the gem code the program does not reach: its calls are no evidence for what the reached code is
     // passed, as Warden's `update(label, &block)`, which nothing calls, would type `add`'s strategy `untyped`.
-    if target == crate::build_target::BuildTarget::Spinel
+    if crate::project::shakes_source_gems(app, target)
         && let Some(trimmed) = crate::source_gem_shake::shake(app)
     {
         *app = trimmed;

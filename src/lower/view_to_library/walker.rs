@@ -868,6 +868,16 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             ));
             return vec![accumulator_append_call(lit_str(String::new()), ctx)];
         }
+        // `form_for(record, as: :user, url: …)`: form_with's `model:` form, with the class and id form_for gives the tag.
+        if method.as_str() == "form_for" {
+            match form_for_record_args(sa) {
+                Ok((args, html)) => return super::form_with::emit_form_for_inline(&args, block, ctx, html),
+                Err(why) => {
+                    crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(inner.span, None, Symbol::from("form_for"), why));
+                    return vec![accumulator_append_call(lit_str(String::new()), ctx)];
+                }
+            }
+        }
         // `<%= form_tag(action, opts) do ...inner... %>` — the
         // builder-less bare form, same inline expansion minus the
         // FormBuilder binding (lobsters' link_post).
@@ -3613,6 +3623,64 @@ fn emit_cached_fragment(
 /// `form_for :scope, k: v, ...` as `form_with(scope: :scope, k: v, ...)`.
 /// None for a record form (`form_for @user`), which names and fills its
 /// fields from the record.
+/// `form_for(record, opts)` as form_with's arguments: `as:` is its `scope:`, the verb is the record's (Rails'
+/// `apply_form_for_options!`), and `html:` (with a top-level `data:`, which Rails moves into it) renders on the tag.
+fn form_for_record_args(args: &[Expr]) -> Result<(Vec<Expr>, super::form_with::FormForHtml), String> {
+    let (record, rest) = args.split_first().ok_or("form_for is lowered only with a record")?;
+    let opts: Vec<(Expr, Expr)> = match rest {
+        [] => Vec::new(),
+        [opts] => match &*opts.node {
+            ExprNode::Hash { entries, .. } => entries.clone(),
+            _ => return Err("form_for is lowered only with its options written as a Hash".into()),
+        },
+        _ => return Err("form_for is lowered only with a record and an options Hash".into()),
+    };
+    let sym = |k: &str| Expr::new(record.span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(k) } });
+    let mut entries = vec![(sym("model"), record.clone())];
+    let mut html = Vec::new();
+    let mut named = false;
+    let mut method = false;
+    for (k, v) in opts {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+            return Err("form_for is lowered only with Symbol option keys".into());
+        };
+        match key.as_str() {
+            "as" => {
+                if super::form_with::str_or_sym_literal(&v).is_none() {
+                    return Err("form_for is lowered only with `as:` a literal name: the field names are written from it".into());
+                }
+                named = true;
+                entries.push((sym("scope"), v));
+            }
+            "url" | "namespace" => entries.push((k, v)),
+            "method" => {
+                method = true;
+                entries.push((k, v));
+            }
+            "html" => match &*v.node {
+                ExprNode::Hash { entries: inner, .. } => {
+                    for (hk, hv) in inner {
+                        if matches!(&*hk.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "method") {
+                            method = true;
+                            entries.push((hk.clone(), hv.clone()));
+                        } else {
+                            html.push((hk.clone(), hv.clone()));
+                        }
+                    }
+                }
+                _ => return Err("form_for is lowered only with `html:` written as a Hash".into()),
+            },
+            "data" => html.push((k, v)),
+            other => return Err(format!("form_for's `{other}:` option is not lowered")),
+        }
+    }
+    if !method {
+        let persisted = Expr::new(record.span, ExprNode::Send { recv: Some(record.clone()), method: Symbol::from("persisted?"), args: Vec::new(), block: None, parenthesized: false });
+        entries.push((sym("method"), Expr::new(record.span, ExprNode::If { cond: persisted, then_branch: sym("patch"), else_branch: sym("post") })));
+    }
+    Ok((vec![Expr::new(record.span, ExprNode::Hash { entries, kwargs: true })], super::form_with::FormForHtml { html, named }))
+}
+
 fn form_for_scope_args(args: &[Expr], ctx: &ViewCtx) -> Option<Vec<Expr>> {
     let (first, rest) = args.split_first()?;
     let ExprNode::Lit { value: Literal::Sym { value: scope } } = &*first.node else { return None };

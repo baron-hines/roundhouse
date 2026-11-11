@@ -125,6 +125,7 @@ SPINEL_TESTS = [
     "plain_class_optional_keywords_spinel",
     "conditional_expression_parens",
     "class_object_return_rbs",
+    "qualified_constant_rbs",
     "class_object_container_rbs",
     "module_self_argument_rbs",
     "jbuilder_array_value_spinel",
@@ -558,6 +559,8 @@ def native_coverage(path):
     focused = re.fullmatch(r"tests/([^/]+)\.(?:rs|rb)", path)
     if focused and focused[1] in SPINEL_TESTS:
         suites.add(focused[1])
+    if path in {"src/emit/ruby/rbs.rs", "src/emit/ruby/library.rs", "src/rbs.rs", "src/ingest/sorbet_sig.rs", "src/app.rs", "src/ingest/app.rs"}:
+        suites.add("qualified_constant_rbs")
     if path in {
         "src/ingest/settled_conditionals.rs",
         "src/lower/defined_const_fold.rs",

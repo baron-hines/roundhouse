@@ -1,0 +1,5 @@
+module ActiveRecord
+  class Base
+    def self.human_attribute_name: (String | Symbol attr, ?Hash[Symbol, untyped] options) -> String
+  end
+end

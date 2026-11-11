@@ -1,0 +1,16 @@
+module ActionController
+  class Base
+    @rack_response: [Integer, untyped, Array[String]]?
+    def self.action: (String | Symbol name) -> ActionController::Endpoint
+    def response=: ([Integer, untyped, Array[String]] rack) -> [Integer, untyped, Array[String]]
+    def rack_response: () -> [Integer, untyped, Array[String]]?
+  end
+
+  class Endpoint
+    @controller_class: singleton(ActionController::Base)
+    @action: Symbol
+
+    def initialize: (singleton(ActionController::Base) controller_class, Symbol action) -> void
+    def call: (Hash[String, untyped] env) -> [Integer, untyped, Array[String]]
+  end
+end

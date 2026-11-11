@@ -199,6 +199,10 @@ module ActiveSupport
       out
     end
 
+    def self.underscore(text)
+      ActiveSupport.underscore(text)
+    end
+
     # Rails' dasherize: every underscore becomes a dash.
     def self.dasherize(text)
       text.to_s.tr("_", "-")

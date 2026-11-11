@@ -39,9 +39,10 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::span::FileId;
 use crate::ty::Ty;
 
-/// Methods Ruby dispatches without a textual call site.
+/// Methods Ruby dispatches without a textual call site, and `process_action`, which the runtime's dispatch sends a
+/// controller (a gem's `Controller.action(name)` endpoint reaches it there).
 const IMPLICIT: &[&str] = &[
-    "initialize", "initialize_copy", "initialize_dup", "initialize_clone", "to_s", "to_str", "to_a", "to_ary",
+    "process_action", "initialize", "initialize_copy", "initialize_dup", "initialize_clone", "to_s", "to_str", "to_a", "to_ary",
     "to_h", "to_hash", "to_proc", "to_sym", "to_i", "to_int", "to_f", "inspect", "hash", "eql?", "==", "===",
     "<=>", "each", "call", "coerce", "method_missing", "respond_to_missing?", "inherited", "included",
     "extended", "prepended", "method_added", "freeze", "dup", "clone",
@@ -658,6 +659,10 @@ impl<'a> Gems<'a> {
         for class in &app.gem_middlewares {
             consts.push((None, class.clone()));
         }
+        // Then Rails finalizes the routes (`ActionDispatch::Routing::RouteSet.finalize_app!`), which a gem prepends to.
+        if !app.gem_middlewares.is_empty() {
+            calls.push((Target::Any, "finalize!".to_string()));
+        }
         // Not parsed: the block is Ruby source, so every name called on something in it is reached on any receiver.
         for block in app.gem_middleware_blocks.values() {
             for name in called_names(block) {
@@ -1032,6 +1037,8 @@ impl Walk<'_, '_> {
                 let c = match c.strip_prefix('\u{0}').and_then(|rest| rest.split_once('\u{0}')) {
                     Some((context, name)) => match gems.resolve((!context.is_empty()).then_some(context), name) {
                         Some(resolved) => resolved,
+                        // An app class a gem's code names (`User.serialize_into_session`): its gem mixins answer.
+                        None if gems.app_classes.contains_key(name.trim_start_matches("::")) => name.trim_start_matches("::").to_string(),
                         None => return,
                     },
                     None => c,

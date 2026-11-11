@@ -131,6 +131,8 @@ module ActionDispatch
     # `host` is a method: it answers `raw_host_with_port`, while `@host`
     # stays the Host header the dispatcher stored.
     attr_accessor :env
+    # Rails' `request.flash`: the flash the controller serving this request holds (Devise asks `request.respond_to?(:flash)`).
+    attr_accessor :flash
     # Rails' `request_parameters`: the BODY's params alone, without the
     # query string or the path captures. ParamsWrapper copies from these
     # (`Params.wrap`); the dispatcher fills them.
@@ -143,6 +145,7 @@ module ActionDispatch
     attr_accessor :query_parameters
 
     def initialize
+      @flash = nil
       @remote_ip = "127.0.0.1"
       @path = "/"
       @query_string = +""
@@ -277,6 +280,19 @@ module ActionDispatch
 
     def path_parameters=(values)
       @path_parameters = RequestPathParameters.new(values)
+    end
+
+    # Rails' `Request.new(env)`: a wrapper over the env, whose state is the request's, so the request the routes
+    # serve for this env (`roundhouse.request`), or a new one where none is.
+    def self.for_env(env)
+      found = env["roundhouse.request"]
+      return found if found.is_a?(ActionDispatch::Request)
+      ActionDispatch::Request.new
+    end
+
+    # Rails' HTTP_METHOD_LOOKUP: the verb as a Symbol, `M-SEARCH` as `:m_search`.
+    def request_method_symbol
+      @request_method.downcase.tr("-", "_").to_sym
     end
 
     def get?
