@@ -221,7 +221,8 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
     // controller; every other rewrite leaves it as it was.
     let scoped: HashMap<String, ScopeReads> =
         decls.iter().filter(|(_, d)| d.reads.any()).map(|(id, d)| (id.0.as_str().to_string(), d.reads)).collect();
-    rewrite_scoped_renders(app, &scoped);
+    let devise = devise_user(app, sources);
+    rewrite_scoped_renders(app, &scoped, devise);
     let lowered: HashSet<String> =
         decls.iter().filter(|(_, d)| !d.reads.any()).map(|(id, _)| id.0.as_str().to_string()).collect();
     for controller in &mut app.controllers {
@@ -880,38 +881,42 @@ fn controller_scope(chain: &[&crate::dialect::Controller]) -> ControllerScope {
 /// the controller's own `serialization_scope` when it defines one;
 /// otherwise its `current_user` when it has one (its own or an
 /// ancestor's method, one an included concern defines, or Devise's from a
-/// `User` model's `devise`), nil without one. Under `serialization_scope
+/// plain `devise_for :users`), nil without one. Under `serialization_scope
 /// nil` the scope is nil and the serializer has no `current_user`, so a
 /// serializer that calls it is left as it was, as is any render under
-/// another named scope, and any whose controller includes a module the
-/// app doesn't define (a gem's), which may define `serialization_scope`
-/// or `current_user`.
-fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeReads>) {
+/// another named scope.
+///
+/// Only a render whose inputs are all known is rewritten: one whose
+/// controller brings in a module the app doesn't define (a gem's,
+/// included directly or from a concern's `included do`), whose scope name
+/// a concern declares, or whose `current_user` would be Devise's under a
+/// mapping other than a plain `devise_for :users`, is left as written,
+/// and reported.
+fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeReads>, devise: DeviseUser) {
     if scoped.is_empty() {
         return;
     }
-    // Devise defines `current_<mapping>` for each model it maps: only the
-    // `User` model's mapping is `current_user`.
-    let devise = app.models.iter().any(|m| {
-        m.name.0.as_str().trim_start_matches("::") == "User"
-            && m.body.iter().any(|item| {
-                matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
-                    if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "devise"))
-            })
-    });
-    let plans: Vec<(ControllerScope, Option<bool>, Option<bool>)> = app
+    let plans: Vec<Option<(ControllerScope, Option<bool>, bool)>> = app
         .controllers
         .iter()
         .map(|c| {
             let chain = controller_chain(app, &c.name);
-            let has_current_user = if devise { Some(true) } else { chain_defines(app, &chain, "current_user") };
-            // `None` when an included module the app doesn't define may
-            // override `serialization_scope`: the scope is then unknown.
-            let own_scope = chain_defines(app, &chain, "serialization_scope");
-            (controller_scope(&chain), has_current_user, own_scope)
+            let facts = chain_facts(app, &chain)?;
+            // The controller's own `current_user`, or a concern's, sits
+            // nearer than Devise's helper.
+            let has_current_user = if facts.current_user {
+                Some(true)
+            } else {
+                match devise {
+                    DeviseUser::Absent => Some(false),
+                    DeviseUser::CurrentUser => Some(true),
+                    DeviseUser::Unknown => None,
+                }
+            };
+            Some((controller_scope(&chain), has_current_user, facts.serialization_scope))
         })
         .collect();
-    for (controller, (scope, has_current_user, own_scope)) in app.controllers.iter_mut().zip(plans) {
+    for (controller, plan) in app.controllers.iter_mut().zip(plans) {
         for action in controller.actions_mut() {
             let span = action.body.span;
             let call = move |name: &str| {
@@ -922,9 +927,9 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
             };
             rewrite_renders_with(&mut action.body, &|class| {
                 let reads = scoped.get(class)?;
-                // An unknown `serialization_scope` leaves the render as
-                // written, as an unknown `current_user` does.
-                if own_scope? {
+                // An unknown input leaves the render as written.
+                let (scope, has_current_user, own_scope) = plan?;
+                if own_scope {
                     // The serializer's `current_user` is the scope only
                     // under the default scope name.
                     return (matches!(scope, ControllerScope::CurrentUser) || !reads.current_user)
@@ -941,18 +946,32 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
     }
 }
 
-/// Whether the controllers in `chain`, or the modules they include (and
-/// those modules' own includes), define `method`: `None` when it isn't
-/// found and an included module isn't one the app defines, whose methods
-/// are unknown.
-fn chain_defines(app: &crate::App, chain: &[&crate::dialect::Controller], method: &str) -> Option<bool> {
-    if chain.iter().any(|c| c.actions().any(|a| a.name.as_str() == method)) {
-        return Some(true);
+/// Which of the methods the scope depends on a controller chain defines.
+struct ChainFacts {
+    current_user: bool,
+    serialization_scope: bool,
+}
+
+/// What the controllers in `chain` and every module they bring in define:
+/// the modules they include, those modules' own includes, and the
+/// includes a concern's `included do` adds, followed to the end. `None`
+/// when one of those modules isn't one the app defines (its methods are
+/// unknown), or a concern's `included do` declares `serialization_scope`
+/// or includes something other than a constant: the scope is then
+/// unknown.
+fn chain_facts(app: &crate::App, chain: &[&crate::dialect::Controller]) -> Option<ChainFacts> {
+    let mut facts = ChainFacts { current_user: false, serialization_scope: false };
+    let mut note = |name: &str| match name {
+        "current_user" => facts.current_user = true,
+        "serialization_scope" => facts.serialization_scope = true,
+        _ => {}
+    };
+    for controller in chain {
+        controller.actions().for_each(|a| note(a.name.as_str()));
     }
     let mut pending: Vec<ClassId> =
         chain.iter().flat_map(|c| crate::analyze::controller_include_groups(c)).flatten().collect();
     let mut seen: HashSet<String> = HashSet::default();
-    let mut unknown = false;
     while let Some(module) = pending.pop() {
         let name = module.0.as_str().trim_start_matches("::").to_string();
         if !seen.insert(name.clone()) {
@@ -961,12 +980,98 @@ fn chain_defines(app: &crate::App, chain: &[&crate::dialect::Controller], method
         let mut found = false;
         for lc in app.library_classes.iter().filter(|lc| lc.name.0.as_str().trim_start_matches("::") == name) {
             found = true;
-            if lc.methods.iter().any(|m| m.name.as_str() == method) {
-                return Some(true);
-            }
+            lc.methods.iter().for_each(|m| note(m.name.as_str()));
             pending.extend(lc.includes.iter().cloned());
+            let items = app.concern_model_items.iter().filter(|(id, _)| id.0.as_str().trim_start_matches("::") == name);
+            for item in items.flat_map(|(_, items)| items) {
+                let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+                match method.as_str() {
+                    "serialization_scope" => return None,
+                    "include" => {
+                        for arg in args {
+                            let ExprNode::Const { path } = &*arg.node else { return None };
+                            pending.push(crate::analyze::mixin_path_id(path));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        unknown |= !found;
+        if !found {
+            return None;
+        }
     }
-    (!unknown).then_some(false)
+    Some(facts)
+}
+
+/// What Devise gives a controller's `current_user`. It defines
+/// `current_<mapping>` for each `devise_for` the routes draw, the
+/// mapping named from the route's resource unless `class_name:`, `as:` or
+/// `singular:` changes it.
+#[derive(Clone, Copy)]
+enum DeviseUser {
+    /// The app doesn't use Devise: no model calls `devise` and no route
+    /// draws `devise_for`.
+    Absent,
+    /// A plain `devise_for :users`, and no mapping renamed.
+    CurrentUser,
+    /// Devise is used, but no route file read here draws a plain
+    /// `devise_for :users`, or one renames a mapping.
+    Unknown,
+}
+
+fn devise_user(app: &crate::App, sources: &[SourceFile]) -> DeviseUser {
+    struct DeviseFor {
+        users: bool,
+        renamed: bool,
+        any: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for DeviseFor {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_none() && constant_id_str(&node.name()) == "devise_for" {
+                self.any = true;
+                let mut users = false;
+                for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                    if let Some(sym) = arg.as_symbol_node() {
+                        users |= sym.unescaped() == b"users";
+                    } else if let Some(hash) = arg.as_keyword_hash_node() {
+                        for element in hash.elements().iter() {
+                            let key = element.as_assoc_node().and_then(|a| a.key().as_symbol_node().map(|k| k.unescaped().to_vec()));
+                            match key.as_deref() {
+                                Some(b"class_name" | b"as" | b"singular") | None => self.renamed = true,
+                                Some(_) => {}
+                            }
+                        }
+                    } else {
+                        self.renamed = true;
+                    }
+                }
+                self.users |= users;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut found = DeviseFor { users: false, renamed: false, any: false };
+    for source in sources.iter().filter(|s| s.path.contains("config/routes") && s.path.ends_with(".rb")) {
+        if !source.text.contains("devise_for") {
+            continue;
+        }
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
+        ruby_prism::Visit::visit(&mut found, &parsed.node());
+    }
+    // A model's `devise` call, as written or as the gem's macro expanded
+    // it, or the gem's own module, says the app uses Devise.
+    let is_devise = |expr: &Expr| matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "devise");
+    let devise_model = app.models.iter().any(|m| {
+        m.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if is_devise(expr)))
+    }) || app.expanded_macro_calls.iter().any(|(_, expr)| is_devise(expr))
+        || app.library_classes.iter().any(|c| c.name.0.as_str().trim_start_matches("::") == "Devise");
+    if !found.any && !devise_model {
+        DeviseUser::Absent
+    } else if found.users && !found.renamed {
+        DeviseUser::CurrentUser
+    } else {
+        DeviseUser::Unknown
+    }
 }
