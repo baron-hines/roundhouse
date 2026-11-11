@@ -857,13 +857,11 @@ module ActionView
     # Methods that delete keys dup first.
     EMPTY_HTML_OPTS = {}.freeze
 
-    # Rails' `url_for(:back)` (`link_to "Back", :back`): the request's referrer, or a step back in the history where
-    # it has none or names a `javascript:` URL.
+    # Rails' `url_for(:back)` (`link_to "Back", :back`): a step back in the history, what Rails answers for a request
+    # with no referrer. A strict target's view has no request in scope (see `url_for_path`); the ruby family reopens
+    # it in `view_helpers_ext.rb` over the request's referrer.
     def self.back_url
-      request = ActionController::Current.request
-      referrer = request.nil? ? nil : request.referrer
-      return "javascript:history.back()" if referrer.nil? || referrer.empty? || referrer.start_with?("javascript:")
-      referrer
+      "javascript:history.back()"
     end
 
     def self.link_to(text, href, opts = EMPTY_HTML_OPTS)
