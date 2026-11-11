@@ -867,6 +867,18 @@ pub(super) fn library_class_and_struct_base(
     }
     // An alias of a builtin captured the superclass's method where the
     // superclass defines it; the delegation can't tell (`OBJECT_BUILTINS`).
+    // Except in the support walk, which captures it as the alias it is for `inherited_alias::settle` to look the original
+    // up along the superclass chain (Hashie's `Dash < Hash` aliasing `inspect`).
+    if class.superclass().is_some() && super::inherited_alias::is_capturing() {
+        let mut kept = Vec::with_capacity(methods.len());
+        for m in methods.drain(..) {
+            match builtin_delegate_target(&m.body) {
+                Some(from) => unknown_calls.push(super::inherited_alias::capture(m.name.as_str(), &from, m.name_span)),
+                None => kept.push(m),
+            }
+        }
+        methods = kept;
+    }
     if class.superclass().is_some() && methods.iter().any(|m| delegates_to_builtin(&m.body)) {
         return Err(IngestError::Unsupported {
             file: file.into(),
@@ -2808,7 +2820,7 @@ pub(super) fn walk_decl_body<'pr>(
     file: &str,
     mode: DeclBodyMode,
 ) -> IngestResult<DeclBody> {
-    let visibility = Visibility::resolve_library(body.as_ref(), file, None, Some(owner))?;
+    let visibility = Visibility::resolve_library_carrying(body.as_ref(), file, None, Some(owner))?;
     walk_decl_body_with_visibility(body, owner, file, mode, &visibility)
 }
 
@@ -2882,7 +2894,7 @@ fn walk_decl_body_with_visibility<'pr>(
         return Ok(out);
     };
 
-    let statements = inline_load_time_definers(flatten_statements(b));
+    let statements = inline_version_gates(inline_load_time_definers(flatten_statements(b)));
     // This body's literal constants, for the `define_method` loops in it
     // and in the bodies it encloses (`class << self`, `included do`).
     let _constants = super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::of(owner, &statements));
@@ -3077,6 +3089,9 @@ fn walk_decl_body_with_visibility<'pr>(
             {
                 module_function_active = false;
                 bare_visibility_marker = true;
+            }
+            if visibility.names_inherited(&statement) {
+                out.unknown_calls.push(ingest_expr(&statement, file)?);
             }
             continue;
         }
@@ -4135,6 +4150,22 @@ pub(crate) const OBJECT_BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Whether a synthesized builtin alias's call is in `e` (`BUILTIN_ALIAS`).
+/// The builtin a `builtin_alias_method` copy calls: the alias's original.
+fn builtin_delegate_target(e: &Expr) -> Option<String> {
+    if e.decisions & crate::expr::BUILTIN_ALIAS != 0
+        && let crate::expr::ExprNode::Send { method, .. } = &*e.node
+    {
+        return Some(method.as_str().to_string());
+    }
+    let mut found = None;
+    e.node.for_each_child(&mut |c| {
+        if found.is_none() {
+            found = builtin_delegate_target(c);
+        }
+    });
+    found
+}
+
 fn delegates_to_builtin(e: &Expr) -> bool {
     if e.decisions & crate::expr::BUILTIN_ALIAS != 0 {
         return true;
@@ -6987,6 +7018,35 @@ fn requires_files(stmt: &ruby_prism::Node<'_>) -> bool {
 /// A bare call in the body to a method of a module the body extends, whose
 /// body only writes `def self.…` (raabro's `make_includable`), defines those
 /// methods on this module as the body loads: each stands in for the call.
+/// Hashie's `with_minimum_ruby('2.5.0') do def slice … end end` (`RubyVersionCheck`, which yields when `RUBY_VERSION`
+/// is at least the version): its `def`s, in the body's place, where every Ruby the emitted app runs on takes the
+/// block. Rails 8.1 needs Ruby 3.2, so a version up to that is met.
+// Not a later version: whether the block runs is the running Ruby's, which the body cannot tell.
+fn inline_version_gates<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    const FLOOR: [u32; 3] = [3, 2, 0];
+    let gate = |s: &ruby_prism::Node<'pr>| -> Option<Vec<ruby_prism::Node<'pr>>> {
+        let call = s.as_call_node()?;
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "with_minimum_ruby" {
+            return None;
+        }
+        let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+        let [version] = args.as_slice() else { return None };
+        let text = String::from_utf8_lossy(version.as_string_node()?.unescaped()).into_owned();
+        let parts: Vec<u32> = text.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+        let padded: Vec<u32> = (0..3).map(|i| parts.get(i).copied().unwrap_or(0)).collect();
+        if padded.as_slice() > FLOOR.as_slice() {
+            return None;
+        }
+        let body = call.block()?.as_block_node()?.body()?;
+        let inner = flatten_statements(body);
+        inner.iter().all(|n| n.as_def_node().is_some()).then_some(inner)
+    };
+    if !statements.iter().any(|s| gate(s).is_some()) {
+        return statements;
+    }
+    statements.into_iter().flat_map(|s| gate(&s).unwrap_or_else(|| vec![s])).collect()
+}
+
 fn inline_load_time_definers<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
     let extended: Vec<String> = statements
         .iter()
