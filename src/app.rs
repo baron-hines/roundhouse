@@ -202,6 +202,13 @@ pub struct App {
     /// Empty when the app ships no `sig/` directory.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rbs_signatures: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    /// How the `sig/` sidecars and inline signatures behind
+    /// `rbs_signatures` spelled each class name (`crate::rbs::Spellings`).
+    /// Provenance only: the Ruby RBS writer reads it to keep a declared
+    /// name as written when its lexical nesting is preserved; identity
+    /// and every other reader use the ids.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rbs_spellings: crate::rbs::MethodSpellings,
     /// What a `sig/**/*.rbs` sidecar says a class INCLUDES, keyed by
     /// the declaring class and holding the module names as written.
     ///
@@ -427,6 +434,10 @@ pub struct App {
     /// their instance methods are class-method macros on every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_extended_macros: Vec<ClassId>,
+    /// Constants written on ActiveRecord::Base inside `ActiveSupport.on_load(:active_record)` (`self::X = Const`,
+    /// orm_adapter's `self::OrmAdapter = ::OrmAdapter::ActiveRecord`): the name and the constant path it holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_constants: Vec<(Symbol, Vec<Symbol>)>,
     /// Class methods a model took from a module only it extends
     /// (`ingest::extend_splice`), by name.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
@@ -1321,6 +1332,7 @@ impl App {
             vite_manifest: None,
             stylesheets: Vec::new(),
             rbs_signatures: HashMap::default(),
+            rbs_spellings: HashMap::default(),
             rbs_includes: HashMap::default(),
             gem_lock: None,
             loaded_frameworks: None,
@@ -1345,6 +1357,7 @@ impl App {
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             load_hook_extended_macros: Vec::new(),
+            load_hook_constants: Vec::new(),
             macro_includes: Vec::new(),
             expanded_macro_calls: Vec::new(),
             spliced_class_methods: Default::default(),

@@ -24,7 +24,17 @@ class SignedCookiesTest < Minitest::Test
 
   def test_a_signed_session_round_trips
     raw = signed_session("_csrf_token" => "abc", "return_to" => "/rooms/1?x=a&b")
-    assert_equal "_csrf_token=abc&return_to=%2Frooms%2F1%3Fx%3Da%26b", restored(raw)
+    session = ActionDispatch::Session.from_signed_cookie(raw, NAME)
+    assert_equal "abc", session["_csrf_token"]
+    assert_equal "/rooms/1?x=a&b", session["return_to"]
+  end
+
+  # Rails' cookie store keeps each value as JSON: Devise's `[[id], salt]` reads back as the Array it wrote.
+  def test_a_session_value_reads_back_as_written
+    raw = signed_session("warden.user.user.key" => [[1], "salt"], "count" => 2)
+    session = ActionDispatch::Session.from_signed_cookie(raw, NAME)
+    assert_equal [[1], "salt"], session["warden.user.user.key"]
+    assert_equal 2, session["count"]
   end
 
   def test_the_cookie_does_not_carry_the_plain_encoding

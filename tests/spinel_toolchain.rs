@@ -324,6 +324,10 @@ mod file_level_struct;
 mod concern_class_side_contract;
 #[path = "spinel_toolchain/concern_class_side.rs"]
 mod concern_class_side;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "spinel_toolchain/library_concern_included_include.rs"]
+mod library_concern_included_include;
 #[path = "support/concern_define_loop.rs"]
 mod concern_define_loop_contract;
 #[path = "spinel_toolchain/concern_define_loop.rs"]

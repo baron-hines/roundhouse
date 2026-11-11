@@ -55,7 +55,7 @@ fn the_spinel_tree_stacks_the_app_middleware() {
         with_application_lines(emit_and_run::real_blog(), "    config.middleware.use ProbeUse\n").emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
-    assert!(stack.contains("@stack ||= ProbeUse.new(App.new)"), "{stack}");
+    assert!(stack.contains("stack = ProbeUse.new(App.new)"), "{stack}");
 }
 
 /// The repro's app: no model, no view, one controller, and a
@@ -77,7 +77,7 @@ fn bare_app() -> emit_and_run::Overlay {
 
 #[test]
 fn reading_the_middleware_registers_no_source_after_the_snapshot() {
-    for (target, stacked) in [(BuildTarget::Ruby, "ProbeUse.new(app)"), (BuildTarget::Spinel, "@stack ||= ProbeUse.new(App.new)")] {
+    for (target, stacked) in [(BuildTarget::Ruby, "ProbeUse.new(app)"), (BuildTarget::Spinel, "stack = ProbeUse.new(App.new)")] {
         let (tree, _errors) = bare_app().emit(target);
         let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
         assert!(stack.contains(stacked), "{target:?}: {stack}");

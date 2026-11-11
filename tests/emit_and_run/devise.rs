@@ -85,6 +85,8 @@ fn app(modules: &str, routes: &str) -> emit_and_run::Overlay {
         rb_files(&gem, &gem.join("lib"), &mut files);
         // Not lib/ alone: an installed engine has its app/ too, devise's controllers and views.
         all_files(&gem, &gem.join("app"), &mut files);
+        // And config/: an engine's locales are on Rails' load path (devise's `devise.sessions.signed_in`).
+        all_files(&gem, &gem.join("config"), &mut files);
         for file in files {
             let text = std::fs::read_to_string(gem.join(&file)).unwrap();
             overlay = overlay.write(&format!("vendor/bundle/ruby/3.4.0/gems/{name}-{version}/{}", file.display()), &text);
@@ -403,4 +405,151 @@ fn devise_answers_its_mappings_modules_and_leaves_out_what_no_model_uses() {
     let has = |needle: &str| files.iter().any(|f| f.to_string_lossy().contains(needle));
     assert!(has("devise/mailer"), "the gem's mailer: {files:#?}");
     assert!(has("email_changed"), "an action DatabaseAuthenticatable's callback sends: {files:#?}");
+}
+
+/// The same requests over Rack on the ruby family, which compiles Devise, Warden and responders from source as the
+/// Spinel tree does (`project::compiled_on_the_ruby_family`: a gem that needs railties cannot load as the real gem).
+const RACK_SIGN_IN: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+form = ->(token, password) { "authenticity_token=#{URI.encode_www_form_component(token)}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=#{password}&commit=Log+in" }
+
+status, = req("GET", "/account/new")
+raise "account #{status}" unless status == 200
+status, headers, = req("GET", "/secret")
+raise "secret #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+status, _, page = req("GET", "/users/sign_in")
+raise "sign-in page #{status}" unless status == 200
+token = page[/name="authenticity_token" value="([^"]*)"/, 1]
+status, _, failed = req("POST", "/users/sign_in", form.(token, "wrong"))
+raise "wrong password #{status}" unless status == 200
+raise "email kept #{failed}" unless failed.include?(%(name="user[email]" id="user_email" value="a@example.com"))
+status, headers, = req("POST", "/users/sign_in", form.(token, "secret123"))
+raise "sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
+status, = req("GET", "/secret")
+raise "secret signed in #{status}" unless status == 200
+status, = req("GET", "/dash")
+raise "dash signed in #{status}" unless status == 200
+puts "devise sign-in over rack passed"
+"##;
+
+#[test]
+fn a_devise_user_signs_in_over_rack_on_the_ruby_family() {
+    let run = app(
+        ":database_authenticatable",
+        "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n  authenticated :user do\n    get \"/dash\", to: \"articles#index\"\n  end\n",
+    )
+    .write("app/controllers/accounts_controller.rb", ACCOUNTS)
+    .run_ruby(RACK_SIGN_IN);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise sign-in over rack passed"), "{}", run.stdout);
+}
+
+const ACCOUNTS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\nend\n";
+
+fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let at = text.find(start).unwrap_or_else(|| panic!("no {start:?} in:\n{text}")) + start.len();
+    &text[at..at + text[at..].find(end).expect("unterminated")]
+}
+
+// The cookies a browser keeps: each Set-Cookie's `name=value`, the later one of a name in place of the earlier.
+fn kept(jar: &mut Vec<(String, String)>, set_cookies: &[String]) {
+    for cookie in set_cookies {
+        let pair = cookie.split(';').next().unwrap_or_default();
+        let Some((name, value)) = pair.split_once('=') else { continue };
+        jar.retain(|(n, _)| n != name);
+        jar.push((name.to_string(), value.to_string()));
+    }
+}
+
+fn header(jar: &[(String, String)]) -> String {
+    jar.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ")
+}
+
+fn form_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Devise compiled from its source, served natively: the user's password is hashed by its `password=`, the sign-in
+/// page is its view, its strategy authenticates the form's params through Warden, the session keeps the user
+/// (`[[id], salt]`), and `authenticated :user` routes only a signed-in request, as in Rails.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_devise_user_signs_in_over_http_natively() {
+    let tree = app(
+        ":database_authenticatable",
+        "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n  authenticated :user do\n    get \"/dash\", to: \"articles#index\"\n  end\n",
+    )
+    .write("app/controllers/accounts_controller.rb", ACCOUNTS)
+    .native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    assert_eq!(server.get("/account/new").status, 200, "{}", server.log());
+    assert_eq!(server.get("/dash").status, 404, "{}", server.log());
+    // `authenticate` sends a visitor to sign in through Warden's failure app (Devise's FailureApp#redirect).
+    let secret = server.get("/secret");
+    assert_eq!(secret.status, 302, "{}\n{}", secret.body, server.log());
+    assert!(secret.headers.get("location").is_some_and(|l| l.ends_with("/users/sign_in")), "{:?}", secret.headers);
+
+    let mut jar = Vec::new();
+    let (page, cookies) = server.request_with_set_cookies("GET", "/users/sign_in", &[], "");
+    assert_eq!(page.status, 200, "{}", server.log());
+    assert!(page.body.contains(r#"<form class="new_user" id="new_user" action="/users/sign_in" accept-charset="UTF-8" method="post">"#), "{}", page.body);
+    assert!(page.body.contains(r#"name="user[email]" id="user_email""#), "{}", page.body);
+    kept(&mut jar, &cookies);
+    let token = between(&page.body, "name=\"authenticity_token\" value=\"", "\"");
+    // A wrong password renders the form again (FailureApp#recall, at the responder's `error_status`, :ok).
+    let wrong = format!("authenticity_token={}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=wrong&commit=Log+in", form_encode(token));
+    let cookie = header(&jar);
+    let (failed, cookies) = server.request_with_set_cookies(
+        "POST",
+        "/users/sign_in",
+        &[("Content-Type", "application/x-www-form-urlencoded"), ("Cookie", cookie.as_str())],
+        &wrong,
+    );
+    assert_eq!(failed.status, 200, "{}\n{}", failed.body, server.log());
+    assert!(failed.body.contains(r#"<form class="new_user" id="new_user" action="/users/sign_in""#), "{}", failed.body);
+    assert!(failed.body.contains(r#"name="user[email]" id="user_email" value="a@example.com""#), "{}", failed.body);
+    kept(&mut jar, &cookies);
+    let form = format!("authenticity_token={}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=secret123&commit=Log+in", form_encode(token));
+    let cookie = header(&jar);
+    let (signed, cookies) = server.request_with_set_cookies(
+        "POST",
+        "/users/sign_in",
+        &[("Content-Type", "application/x-www-form-urlencoded"), ("Cookie", cookie.as_str())],
+        &form,
+    );
+    assert_eq!(signed.status, 302, "{}\n{}", signed.body, server.log());
+    assert!(signed.headers.get("location").is_some_and(|l| l.ends_with("/")), "{:?}", signed.headers);
+    kept(&mut jar, &cookies);
+
+    let cookie = header(&jar);
+    let (home, _) = server.request_with_set_cookies("GET", "/", &[("Cookie", cookie.as_str())], "");
+    assert!(home.body.contains("Signed in successfully."), "{}", home.body);
+    let (dash, _) = server.request_with_set_cookies("GET", "/dash", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(dash.status, 200, "{}", server.log());
+    let (secret, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(secret.status, 200, "{}", server.log());
+    // Signed in, the sign-in page sends the user on (`require_no_authentication`).
+    let (again, _) = server.request_with_set_cookies("GET", "/users/sign_in", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(again.status, 302, "{}", server.log());
 }

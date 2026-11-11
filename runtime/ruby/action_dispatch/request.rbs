@@ -38,7 +38,8 @@ module ActionDispatch
     @user_agent: String
     @session_options: Hash[Symbol, bool]
     @session: Session?
-    @params: Hash[String, untyped]
+    @flash: ActionDispatch::Flash?
+    @params: Hash[String, Roundhouse::ParamValue]
     @csp_ready: bool
     @content_security_policy: ContentSecurityPolicy?
 
@@ -70,6 +71,8 @@ module ActionDispatch
     def body=: (String) -> String
     def raw_post: () -> String
     def env: () -> Hash[String, untyped]
+    def flash: () -> ActionDispatch::Flash?
+    def flash=: (ActionDispatch::Flash?) -> ActionDispatch::Flash?
     def env=: (Hash[String, untyped]) -> Hash[String, untyped]
     def headers: () -> ActionDispatch::Http::Headers
     def request_id: () -> String?
@@ -83,6 +86,8 @@ module ActionDispatch
     def query_parameters: () -> Hash[String, Roundhouse::ParamValue]
     def query_parameters=: (Hash[String, Roundhouse::ParamValue]) -> Hash[String, Roundhouse::ParamValue]
     def initialize: () -> void
+    def self.for_env: (Hash[String, untyped] env) -> ActionDispatch::Request
+    def request_method_symbol: () -> Symbol
     def get?: () -> bool
     def post?: () -> bool
     def put?: () -> bool
@@ -108,9 +113,9 @@ module ActionDispatch
     def session=: (Session) -> Session
     def session_skip?: () -> bool
     def user_agent=: (String) -> String
-    def params: () -> Hash[String, untyped]
+    def params: () -> Hash[String, Roundhouse::ParamValue]
     def filtered_parameters: () -> Hash[String, untyped]
-    def params=: (Hash[String, untyped]) -> Hash[String, untyped]
+    def params=: (Hash[String, Roundhouse::ParamValue]) -> Hash[String, Roundhouse::ParamValue]
     def self.for: (Hash[String, untyped] env, ?Hash[String, untyped] params) -> Request
   end
 end

@@ -117,7 +117,7 @@ fn the_spinel_tree_stacks_the_railtie_middleware() {
     let (tree, errors) = app().emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
-    assert!(stack.contains("@stack ||= Rack::Attack.new(App.new)"), "{stack}");
+    assert!(stack.contains("stack = Rack::Attack.new(App.new)"), "{stack}");
     let attack = std::fs::read_to_string(tree.join("app/models/rack/attack.rb")).expect("the compiled gem");
     // Each nested class under its own namespace.
     assert!(attack.contains("class Configuration\n"), "{attack}");
@@ -130,7 +130,7 @@ fn the_app_middleware_sits_outside_the_railtie_middleware() {
     let (tree, errors) = overlay.emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
-    assert!(stack.contains("@stack ||= ProbeUse.new(Rack::Attack.new(App.new))"), "{stack}");
+    assert!(stack.contains("stack = ProbeUse.new(Rack::Attack.new(App.new))"), "{stack}");
 }
 
 // Not through an emitted app: the ruby family loads rack's own Rack::Request, so only Spinel runs the port.
@@ -178,6 +178,11 @@ module Tep
 end
 module ActionDispatch
   class Session
+  end
+  module Routing
+    class RouteSet
+      def self.finalize_app! = nil
+    end
   end
 end
 Res = Struct.new(:status, :headers, :body, :file_path, :streaming, :set_cookies, :header_fields)
