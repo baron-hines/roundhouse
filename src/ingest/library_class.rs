@@ -3989,7 +3989,7 @@ fn walk_decl_body_with_visibility<'pr>(
 
     // The `def`s a `class_eval` string loop makes, after the body's own: Ruby runs the loop where it stands, and a
     // later `def` of the body replaces one of them only by name, which no target here orders by.
-    for source in evaled {
+    for ((start, end), source) in evaled {
         let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
         let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
         let mut classes = parsed?;
@@ -3999,6 +3999,8 @@ fn walk_decl_body_with_visibility<'pr>(
             if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
                 method.receiver = MethodReceiver::Class;
             }
+            // At the loop: the carrier spans (`ingest_concern_class_method_spans`) name it, as they do the body's `def`s.
+            method.name_span = Span { file: super::sources::file_id(file), start, end };
             if !out.methods.iter().any(|m| m.name == method.name && m.receiver == method.receiver) {
                 out.methods.push(method);
             }
@@ -4013,8 +4015,24 @@ fn walk_decl_body_with_visibility<'pr>(
 /// body Ruby evaluates it in. The loop leaves the body; each string's source comes back to be walked as one.
 // Not a loop over anything but a literal of Strings or Symbols, nor a string that reads anything else: the text is
 // known now only then.
-fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<String>) {
-    let unrolled = |s: &ruby_prism::Node<'pr>| -> Option<Vec<String>> {
+fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), String)>) {
+    let mut kept = Vec::with_capacity(statements.len());
+    let mut evaled = Vec::new();
+    for s in statements {
+        match class_eval_loop_sources(&s) {
+            Some(sources) => {
+                let at = (s.location().start_offset() as u32, s.location().end_offset() as u32);
+                evaled.extend(sources.into_iter().map(|source| (at, source)));
+            }
+            None => kept.push(s),
+        }
+    }
+    (kept, evaled)
+}
+
+/// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
+fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<String>> {
         let call = s.as_call_node()?;
         if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
             return None;
@@ -4066,15 +4084,7 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
         }
         Some(elements.iter().map(|el| pieces.iter().map(|p| p.clone().unwrap_or_else(|| el.clone())).collect()).collect())
     };
-    let mut kept = Vec::with_capacity(statements.len());
-    let mut evaled = Vec::new();
-    for s in statements {
-        match unrolled(&s) {
-            Some(sources) => evaled.extend(sources),
-            None => kept.push(s),
-        }
-    }
-    (kept, evaled)
+    unrolled(s)
 }
 
 /// Outcome of claiming a library-class `mattr_*` / `cattr_*` declaration.
@@ -5374,6 +5384,10 @@ pub fn ingest_concern_class_method_spans(
         for stmt in flatten_statements(body) {
             // A `define_method` loop's methods carry its name argument's span.
             out.extend(super::define_method_loop::name_spans(&stmt, file));
+            // A `class_eval` string loop's, the loop's (`unroll_class_eval_loops`).
+            if class_eval_loop_sources(&stmt).is_some() {
+                out.push(Span { file: super::sources::file_id(file), start: stmt.location().start_offset() as u32, end: stmt.location().end_offset() as u32 });
+            }
             if let Some(def) = visibility::definition(&stmt) {
                 // The carrier's instance definitions become includer
                 // class methods. Its own singletons do not cross.

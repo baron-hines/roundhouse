@@ -125,6 +125,7 @@ pub mod presence_in;
 pub mod relation_ivar_materialize;
 pub mod records_to_relation_arg;
 pub mod save_without_validation;
+pub mod defined_ivar_read;
 pub mod route_param_recall;
 pub mod expect_string_key;
 pub mod defined_ivar_memo;
@@ -887,6 +888,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
         fused::apply_fused_independent_rewrites(app);
     });
     save_without_validation::apply_bare_model_saves(app);
+    defined_ivar_read::apply_defined_ivar_read_lowering(app);
     ran!("pathname_ctor");
     ran!("array_ordinal");
     ran!("save_without_validation");
