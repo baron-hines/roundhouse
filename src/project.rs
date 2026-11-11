@@ -5646,6 +5646,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         // Ruby's autoload when the file raises.
         let header = std::mem::take(&mut out);
         let mut loaded: crate::det::HashSet<String> = Default::default();
+        let mut opened: crate::det::HashSet<String> = Default::default();
         let mut steps = Vec::new();
         program_steps(&program.items, 0, &mut steps);
         for (depth, step) in steps {
@@ -5666,6 +5667,24 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                     for name in names {
                         let anchor = crate::emit::ruby::library_file_anchor(name.0.as_str(), app);
                         if emitted.contains(&anchor) && loaded.insert(anchor.clone()) {
+                            // A module in a namespace the file opens, defined ahead of its declaration file: an autoload
+                            // registered on the namespace at run time (Devise's `add_module`) loads this program while that
+                            // file is loading, and the circular require would leave the constant undefined.
+                            if let Some((owner, leaf)) = name.0.as_str().rsplit_once("::")
+                                && opened.contains(owner)
+                                && app.library_classes.iter().any(|c| c.name == *name && c.is_module)
+                            {
+                                let segments: Vec<&str> = owner.split("::").collect();
+                                let mut open: Vec<String> = (0..segments.len())
+                                    .map(|i| {
+                                        let path = segments[..=i].join("::");
+                                        let class = app.library_classes.iter().any(|c| c.name.0.as_str() == path && !c.is_module);
+                                        format!("{} {}", if class { "class" } else { "module" }, segments[i])
+                                    })
+                                    .collect();
+                                open.push(format!("module {leaf}"));
+                                writeln!(out, "{}; {}", open.join("; "), vec!["end"; open.len()].join("; ")).unwrap();
+                            }
                             writeln!(out, "require RoundhouseAutoload.path({anchor:?})").unwrap();
                         }
                     }
@@ -5713,6 +5732,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                 }
                 crate::app::ProgramItem::Opened(chains) => {
                     for chain in chains {
+                        opened.insert(chain.iter().map(|(segment, _)| segment.as_str()).collect::<Vec<_>>().join("::"));
                         let open: Vec<String> =
                             chain.iter().map(|(segment, is_class)| format!("{} {segment}", if *is_class { "class" } else { "module" })).collect();
                         writeln!(out, "{}; {}", open.join("; "), vec!["end"; chain.len()].join("; ")).unwrap();

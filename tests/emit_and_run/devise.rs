@@ -1008,3 +1008,61 @@ fn a_devise_user_confirms_before_signing_in_over_http_natively() {
     assert_eq!(signed.status, 302, "{}\n{}", signed.body, server.log());
     assert_eq!(get(&mut jar, "/secret").status, 200, "{}", server.log());
 }
+
+/// `:trackable`, as Rails 8.1.4 with Devise 4.9.4 records it: its Warden hook counts each sign-in and moves the current
+/// address and time to the last ones. Its model file is loaded by the autoload `Devise.add_module` registers.
+const TRACKABLE_COLUMNS: &str = "    t.integer \"sign_in_count\", default: 0, null: false\n    t.datetime \"current_sign_in_at\"\n    t.datetime \"last_sign_in_at\"\n    t.string \"current_sign_in_ip\"\n    t.string \"last_sign_in_ip\"\n";
+
+fn trackable_app() -> emit_and_run::Overlay {
+    app(":database_authenticatable, :trackable", "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n")
+        .edit("db/schema.rb", "    t.datetime \"reset_password_sent_at\"\n", &format!("    t.datetime \"reset_password_sent_at\"\n{TRACKABLE_COLUMNS}"))
+        .write("app/controllers/accounts_controller.rb", ACCOUNTS)
+}
+
+const RACK_TRACK: &str = r##"require "uri"
+$ip = "10.0.0.1"
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "REMOTE_ADDR" => $ip,
+          "rack.input" => StringIO.new(body), "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+sign_in = lambda do
+  $jar = {}
+  _, _, page = req("GET", "/users/sign_in")
+  token = URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1])
+  req("POST", "/users/sign_in", "authenticity_token=#{token}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=secret123")
+end
+
+$jar = {}
+req("GET", "/account/new")
+status, = sign_in.()
+raise "first sign in #{status}" unless status == 302
+user = User.find_by(email: "a@example.com")
+first = [user.sign_in_count, user.current_sign_in_ip, user.last_sign_in_ip]
+raise "first #{first.inspect}" unless first == [1, "10.0.0.1", "10.0.0.1"] && user.current_sign_in_at == user.last_sign_in_at
+$ip = "10.0.0.2"
+status, = sign_in.()
+raise "second sign in #{status}" unless status == 302
+user = User.find_by(email: "a@example.com")
+second = [user.sign_in_count, user.current_sign_in_ip, user.last_sign_in_ip]
+raise "second #{second.inspect}" unless second == [2, "10.0.0.2", "10.0.0.1"] && user.last_sign_in_at <= user.current_sign_in_at
+puts "devise tracking over rack passed"
+"##;
+
+#[test]
+fn a_devise_sign_in_is_tracked_over_rack_on_the_ruby_family() {
+    let run = trackable_app().run_ruby(RACK_TRACK);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise tracking over rack passed"), "{}", run.stdout);
+}
