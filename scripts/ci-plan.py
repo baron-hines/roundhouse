@@ -855,6 +855,7 @@ def select(
             "src/ingest/library_class.rs",
             "src/ingest/file_program.rs",
             "src/ingest/visibility.rs",
+            "src/lower/class_body_new.rs",
             "tests/data_factory_constants.rs",
             "tests/emit_and_run/data_record_siblings.rs",
             "tests/support/data_record_siblings.rs",

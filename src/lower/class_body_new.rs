@@ -120,6 +120,8 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     // receiver bound here name the same class.
     let sole_includer = app.sole_includer_of_modules();
     for lc in &mut app.library_classes {
+        // Data constructors can be private; keep their implicit-self calls.
+        let keep_implicit_self = lc.data_define().is_some();
         let owner = if lc.is_module {
             sole_includer.get(&lc.name).unwrap_or(&lc.name).0.as_str().to_string()
         } else {
@@ -129,7 +131,7 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
             rewrite(value, &owner);
         }
         for m in &mut lc.methods {
-            if matches!(m.receiver, MethodReceiver::Class) {
+            if matches!(m.receiver, MethodReceiver::Class) && !keep_implicit_self {
                 rewrite(&mut m.body, &owner);
             }
         }
