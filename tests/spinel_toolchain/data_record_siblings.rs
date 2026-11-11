@@ -8,7 +8,8 @@ fn data_composition_runs_natively_with_generated_signatures() {
         let (tree, errors) = super::emit_and_run::real_blog()
             .write("lib/artifact.rb", source).emit(roundhouse::project::BuildTarget::Spinel);
         assert!(errors.is_empty(), "{errors:?}");
-        std::fs::write(tree.join("driver.rb"), format!("require_relative \"app/models/artifact\"\n{assertions}")).unwrap();
+        let child = if tree.join("app/models/child.rb").is_file() { "require_relative \"app/models/child\"\n" } else { "" };
+        std::fs::write(tree.join("driver.rb"), format!("require_relative \"app/models/artifact\"\n{child}{assertions}")).unwrap();
         let output = Command::new(std::env::var("SPINEL").unwrap_or("spinel".into()))
             .args(["--strict-require", "--rbs", "app/models", "driver.rb", "-o", "driver"])
             .current_dir(&tree).output().unwrap();
