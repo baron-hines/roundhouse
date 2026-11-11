@@ -573,6 +573,7 @@ module Main
       res.body = "<h1>400 Bad Request</h1>"
       return
     end
+    RouteTable.route_defaults(matched.defaults, params, matched.path_params)
     controller.params = params
     controller.path_parameters = matched.path_params
     Main.nest_upload_parts(controller.params, req.upload_parts) if req.upload_parts.length > 0

@@ -97,7 +97,8 @@ module Rails
         matched = nil if request_path != "/" && request_path.end_with?("/")
         raise ActionController::RoutingError, "No route matches #{path.inspect}" if matched.nil?
 
-        params = matched.path_params
+        params = matched.path_params.dup
+        ::RouteTable.route_defaults(matched.defaults, params, matched.path_params)
         controller = CONTROLLER_PATHS[matched.controller] ||
                      (defined?(::RouteTable) ? ::RouteTable::CONTROLLER_PATHS[matched.controller] : nil)
         recognized = { controller: controller || matched.controller.to_s, action: matched.action.to_s }

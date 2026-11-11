@@ -1598,6 +1598,7 @@ module ActionDispatch
         # is one of the route's defaults, which Rails recognizes too.
         format = matched.req_format.to_s if format.empty? && !matched.req_format.nil?
         recognized["format"] = format unless format.empty?
+        RouteTable.route_defaults(matched.defaults, recognized, matched.path_params)
         recognized
       end
 
@@ -2558,6 +2559,7 @@ module RequestDispatch
     end
     # Rails' `params.merge!(path_parameters)`: the route's own segments win over both.
     path_params.each { |k, v| merged[k.to_s] = v }
+    RouteTable.route_defaults(matched.defaults, merged, matched.path_params)
     controller.params  = merged
     controller.path_parameters = path_params
     controller.session = @__session ||= ActionDispatch::Session.new

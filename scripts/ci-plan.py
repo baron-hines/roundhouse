@@ -77,6 +77,7 @@ JRUBY_BIND_INPUTS = {
 }
 PARAM_BIND_TESTS = ["param_binds", "param_binds_values", "param_binds_planner", "param_binds_cleanup"]
 SPINEL_TESTS = [
+    "route_request_defaults",
     "spinel_chunked_body",
     "spinel_stream_error",
     "did_you_mean",
@@ -520,6 +521,13 @@ def native_coverage(path):
         or path == "tests/support/full_forwarding.rs"
     ) and not interpreter_only
     suites = set()
+    if path in {
+        "src/ingest/routes.rs", "src/lower/routes.rs", "src/lower/routes_to_library/mod.rs", "src/dialect.rs",
+        "src/build_target.rs", "src/lower/route_guards.rs", "src/project.rs", "runtime/ruby/action_dispatch/router.rb",
+        "runtime/ruby/action_dispatch/router.rbs", "runtime/spinel/scaffold/main.rb", "runtime/spinel/test/test_helper.rb",
+        "tests/emit_and_run/route_request_defaults.rs",
+    } or path.startswith("tests/support/route_request_defaults/"):
+        suites.add("route_request_defaults")
     if path in {
         "src/analyze/registry/stdlib.rs", "src/analyze/registry/library.rs", "src/project.rs",
         "tests/openssl_registrations.rs", "tests/support/openssl_registrations.rb",
