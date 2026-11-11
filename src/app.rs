@@ -155,6 +155,10 @@ pub struct App {
     /// as brace-block Ruby the stack hands the constructor.
     #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
     pub gem_middleware_blocks: crate::det::HashMap<String, String>,
+    /// The arguments a `use` passes its middleware after the app it wraps, by class, as Ruby source
+    /// (`*Devise.omniauth_configs[:github].args` for a provider Devise's loop unrolled to).
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub gem_middleware_args: crate::det::HashMap<String, String>,
     /// The Rack env keys a stacked middleware writes, and the class there (`"warden"` → `Warden::Proxy`).
     #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
     pub rack_env_writes: crate::det::HashMap<String, String>,
@@ -1324,6 +1328,7 @@ impl App {
             boot_gem_constants: Vec::new(),
             gem_middlewares: Vec::new(),
             gem_middleware_blocks: Default::default(),
+            gem_middleware_args: Default::default(),
             rack_env_writes: Default::default(),
             gem_middleware_refusals: Vec::new(),
             included_hoist_conflicts: Vec::new(),

@@ -35,6 +35,8 @@ pub(super) struct Facts {
     devise_models: HashMap<String, Vec<String>>,
     /// The options each model's `devise` calls pass (`unlock_strategy: :time`), which set that model's own config; `*` when one cannot be named.
     devise_configured: HashMap<String, HashSet<String>>,
+    /// The `omniauth_providers: [:a, :b]` a model's own `devise` call writes as a literal.
+    devise_providers: HashMap<String, Vec<String>>,
 }
 
 impl Facts {
@@ -66,7 +68,29 @@ impl Facts {
                 }
             }
         }
-        Facts { devise_models: devise_modules(&parents, &calls), devise_configured }
+        let mut devise_providers: HashMap<String, Vec<String>> = HashMap::default();
+        for (class, args) in &calls {
+            for arg in args.iter() {
+                let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+                for (key, value) in entries {
+                    let ExprNode::Lit { value: Literal::Sym { value: k } } = &*key.node else { continue };
+                    let ExprNode::Array { elements, .. } = &*value.node else { continue };
+                    let names: Option<Vec<String>> = elements
+                        .iter()
+                        .map(|e| match &*e.node {
+                            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    if k.as_str() == "omniauth_providers"
+                        && let Some(names) = names
+                    {
+                        devise_providers.insert(class.to_string(), names);
+                    }
+                }
+            }
+        }
+        Facts { devise_models: devise_modules(&parents, &calls), devise_configured, devise_providers }
     }
 
     /// Whether `class`'s own `devise` calls set `option`, which then is not Devise's.
@@ -482,6 +506,55 @@ pub(super) fn fold_devise_unnamed_router(app: &mut App) {
     }
 }
 
+/// The strategy a Devise OmniAuth provider's config stacks (`Devise::OmniAuth::Config#strategy_class`), as Devise finds
+/// it: its `strategy_class:` option, else the strategy whose name ends with the camelized strategy name or whose
+/// `option :name` is it (`find_strategy` over `OmniAuth.strategies`, the classes `OmniAuth::Strategy` was included in,
+/// in load order), else `OmniAuth::Strategies::<Provider>`.
+// Not evaluated: `OmniAuth.strategies` is filled by the module's `included` hook as each gem file loads, which the
+// evaluation of the boot does not run. Nor `OmniAuth.config.camelizations` read: a strategy gem's `add_camelization`
+// (omniauth-github's `GitHub`) is not, so its provider is found by the strategy's `option :name` alone.
+pub(super) fn devise_strategy_class(app: &App, class: &str, ivars: &HashMap<String, Val>) -> Option<String> {
+    if class.trim_start_matches("::") != "Devise::OmniAuth::Config" {
+        return None;
+    }
+    if let Some(Val::Class(c)) = ivars.get("strategy_class") {
+        return Some(c.trim_start_matches("::").to_string());
+    }
+    let text = |v: Option<&Val>| match v {
+        Some(Val::Sym(s) | Val::Str(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let name = text(ivars.get("strategy_name"))?;
+    let provider = text(ivars.get("provider"))?;
+    let camelize = |word: &str| -> String {
+        word.split('/')
+            .map(|part| part.split('_').map(|w| {
+                let mut c = w.chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            }).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("::")
+    };
+    let wanted = camelize(&name);
+    let named = |c: &crate::dialect::LibraryClass| {
+        c.unknown_calls.iter().any(|call| matches!(&*call.node, ExprNode::Send { recv: None, method, args, .. }
+            if method.as_str() == "option" && matches!(args.as_slice(), [k, v]
+                if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "name")
+                && matches!(&*v.node, ExprNode::Lit { value: Literal::Str { value } } if *value == name)
+                || matches!(&*v.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name))))
+    };
+    let found = app
+        .library_classes
+        .iter()
+        .filter(|c| c.includes.iter().any(|i| i.0.as_str().trim_start_matches("::") == "OmniAuth::Strategy"))
+        .find(|c| c.name.0.as_str().ends_with(&wanted) || named(c));
+    if let Some(c) = found {
+        return Some(c.name.0.as_str().to_string());
+    }
+    let autoloaded = format!("OmniAuth::Strategies::{}", camelize(&provider));
+    app.library_classes.iter().any(|c| c.name.0.as_str() == autoloaded).then_some(autoloaded)
+}
+
 /// `resource.respond_to?(:remember_me)` in Devise's own code (`Controllers::Rememberable#remember_me_is_active?`, which
 /// the `:timeoutable` hook asks): Devise asks whether the model has a module by a method the module gives it, and its
 /// resource is a model, so the answer is whether every Devise model has that module, or none does.
@@ -750,6 +823,10 @@ pub(super) fn class_answer(facts: &Facts, class: &str, method: &str, argv: &[Val
     match (method, argv) {
         // `Devise::Models::Omniauthable::ClassMethods`: the model's providers are Devise's (`config.omniauth :github`) unless its own `devise` call names them.
         ("omniauth_providers", []) if modules.iter().any(|m| m == "omniauthable") && !facts.sets_option(class, "omniauth_providers") => config("omniauth_providers").map(Ok),
+        // Its own call's list, where it writes one.
+        ("omniauth_providers", []) if modules.iter().any(|m| m == "omniauthable") && facts.devise_providers.contains_key(class) => {
+            Some(Ok(Val::Array(facts.devise_providers[class].iter().cloned().map(Val::Sym).collect())))
+        }
         // `Devise::Models::Lockable::ClassMethods`: the model's `unlock_strategy` is Devise's unless its own `devise` call sets one.
         ("unlock_strategy_enabled?", [Val::Sym(strategy)]) if modules.iter().any(|m| m == "lockable") && !facts.sets_option(class, "unlock_strategy") => {
             let Val::Sym(set) = config("unlock_strategy")? else { return None };
@@ -818,6 +895,14 @@ pub(super) fn confined_writes(
     writer: &dyn Fn(&str) -> Option<Result<String, ()>>,
     yields_other: &dyn Fn(&str) -> bool,
 ) -> Option<HashSet<(String, bool, String)>> {
+    // `set_omniauth_path_prefix!(path_prefix)` in Devise's OmniAuth routes: it checks or sets OmniAuth's `config.path_prefix` (a
+    // `Singleton` whose defaults build a logger and an AuthHash), and nothing the routes read.
+    if known.contains("Devise")
+        && caller == Some(("ActionDispatch::Routing::Mapper", "devise_omniauth_callback"))
+        && matches!(&*statement.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "set_omniauth_path_prefix!")
+    {
+        return Some(HashSet::from_iter([("OmniAuth::Configuration".to_string(), false, "path_prefix".to_string())]));
+    }
     // `Devise.setup do |config| … end` (`yield self`): what it runs configures Devise. An app's `if ENV[…]` around a setting leaves that setting unsure.
     let is_devise = |p: &[crate::ident::Symbol]| p.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["Devise"]);
     let mut devise = devise.clone();

@@ -677,7 +677,7 @@ impl<'a> Gems<'a> {
             calls.push((Target::Any, "finalize!".to_string()));
         }
         // Not parsed: the block is Ruby source, so every name called on something in it is reached on any receiver.
-        for block in app.gem_middleware_blocks.values() {
+        for block in app.gem_middleware_blocks.values().chain(app.gem_middleware_args.values()) {
             for name in called_names(block) {
                 calls.push((Target::Any, format!("{BLOCK}{name}")));
                 // Not parsed, so what it passes is not known either.

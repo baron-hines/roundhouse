@@ -45,6 +45,13 @@ struct Use {
     at_load: bool,
 }
 
+pub(super) struct MiddlewareLoop {
+    pub collection: Expr,
+    pub statement: Option<Expr>,
+    pub app_param: String,
+    pub refusal: Diagnostic,
+}
+
 /// What the app's gems put on its stack, outermost first.
 pub(super) struct Stack {
     pub classes: Vec<String>,
@@ -56,8 +63,9 @@ pub(super) struct Stack {
     pub application_taken: Vec<u32>,
     pub diags: Vec<Diagnostic>,
     /// An initializer's loop that inserts a middleware per element (`Devise.omniauth_configs.each do … use … end`): the
-    /// collection, and the refusal that stands unless the app's settings leave it empty.
-    pub loops: Vec<(Expr, Diagnostic)>,
+    /// collection, the loop as written with the initializer's `app` parameter, and the refusal that stands unless the
+    /// app's settings leave it empty or the loop unrolls.
+    pub loops: Vec<MiddlewareLoop>,
 }
 
 pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -> Stack {
@@ -573,7 +581,7 @@ fn read_initializer(
     lexical: &[String],
     uses: &mut Vec<Use>,
     diags: &mut Vec<Diagnostic>,
-    loops: &mut Vec<(Expr, Diagnostic)>,
+    loops: &mut Vec<MiddlewareLoop>,
 ) {
     let Some(call) = stmt.as_call_node() else { return };
     if constant_id_str(&call.name()) != "initializer" || call.receiver().is_some() {
@@ -622,7 +630,12 @@ fn read_initializer(
                     !statements[..at].iter().any(|before| String::from_utf8_lossy(before.location().as_slice()).contains(root.as_str()))
                 });
                 match collection.and_then(|(c, _)| super::expr::ingest_expr(&c, path).ok()) {
-                    Some(collection) => loops.push((collection, refusal)),
+                    Some(collection) => loops.push(MiddlewareLoop {
+                        collection,
+                        statement: super::expr::ingest_expr(&inner, path).ok(),
+                        app_param: app.clone(),
+                        refusal,
+                    }),
                     None => diags.push(refusal),
                 }
             }
