@@ -50,6 +50,82 @@ fn schema_folds_from_sequel_migrations() {
     assert!(matches!(&article_id.col_type, ColumnType::Reference { table } if table.0.as_str() == "articles"));
 }
 
+fn sequel_table(body: &str) -> Result<roundhouse::schema::Table, roundhouse::ingest::IngestError> {
+    let source = format!("Sequel.migration do\n change do\n create_table(:links) do\n{body}\n end\n end\nend");
+    let mut schema = roundhouse::schema::Schema::default();
+    roundhouse::ingest::ingest_sequel_migration(source.as_bytes(), "db/migrate/001_links.rb", &mut schema)?;
+    Ok(schema.tables.shift_remove(&roundhouse::Symbol::from("links")).unwrap())
+}
+
+#[test]
+fn sequel_primary_key_arrays_are_constraints_on_existing_columns() {
+    for keys in ["[:b, :a]", "%i[b a]", "[Sequel.identifier(:b), Sequel.identifier(:a)]"] {
+        let table = sequel_table(&format!("Integer :a\nInteger :b\nprimary_key {keys}")).unwrap();
+        assert_eq!(table.primary_key_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(table.columns.len(), 2, "a constraint must not add columns");
+        assert!(table.columns.iter().all(|c| !c.primary_key));
+        assert!(table.columns.iter().all(|c| c.nullable == keys.contains("Sequel.identifier")));
+    }
+    let table = sequel_table("self.primary_key [:b, :a]\nInteger :a\nInteger :b").unwrap();
+    assert!(table.columns.iter().all(|c| !c.nullable));
+    assert_eq!(table.primary_key_columns[0].as_str(), "b");
+}
+
+#[test]
+fn sequel_foreign_key_arrays_and_scalar_targets_keep_order_and_timing() {
+    use roundhouse::schema::Deferrable::{Deferred, Immediate};
+    for (timing, expected) in [("true", Some(Deferred)), (":deferred", Some(Deferred)),
+        (":immediate", Some(Immediate)), ("false", None), ("nil", None)] {
+        let table = sequel_table(&format!(
+            "Integer :a\nInteger :b\nforeign_key [:b, :a], :parents, key: [:y, :x], deferrable: {timing}, on_delete: :cascade, on_update: :restrict"
+        )).unwrap();
+        assert_eq!(table.columns.len(), 2);
+        let fk = &table.foreign_keys[0];
+        assert_eq!(fk.from_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(fk.to_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["y", "x"]);
+        assert_eq!(fk.to_table.0.as_str(), "parents");
+        assert_eq!(fk.deferrable, expected);
+        assert_eq!(fk.on_delete, ReferentialAction::Cascade);
+        assert_eq!(fk.on_update, ReferentialAction::Restrict);
+        for key in [":code", "[:code]"] {
+            let table = sequel_table(&format!("foreign_key :parent_code, :parents, key: {key}, deferrable: {timing}")).unwrap();
+            assert_eq!(table.columns.len(), 1);
+            assert_eq!(table.foreign_keys[0].to_columns[0].as_str(), "code");
+            assert_eq!(table.foreign_keys[0].deferrable, expected);
+        }
+    }
+    let table = sequel_table("Integer :a\nforeign_key [:a], :parents, key: :code").unwrap();
+    assert_eq!(table.columns.len(), 1, "an array with one name is still a constraint");
+    assert_eq!(table.foreign_keys[0].to_columns[0].as_str(), "code");
+    let table = sequel_table("self.foreign_key :parent_code, :parents, {key: :code, deferrable: true}").unwrap();
+    assert_eq!(table.foreign_keys[0].to_columns[0].as_str(), "code");
+    assert_eq!(table.foreign_keys[0].deferrable, Some(Deferred));
+}
+
+#[test]
+fn sequel_unread_key_forms_are_refused() {
+    for body in [
+        "primary_key []", "primary_key [:a, key_column]", "primary_key key_columns",
+        "primary_key [[ :a ]]", "primary_key [Sequel.identifier(:a, :b)]",
+        "primary_key [Other.identifier(:a)]", "primary_key [Sequel.identifier(key_column)]",
+        "primary_key [:missing]", "primary_key [:a], deferrable: true",
+        "foreign_key [], :parents, key: []", "foreign_key [:a, :b], :parents, key: [:x]",
+        "foreign_key [:a, key_column], :parents, key: [:x, :y]",
+        "foreign_key [:a, :b], :parents", "foreign_key [:a], :parents", "foreign_key :a, :parents, key: []",
+        "foreign_key :a, :parents, key: key_column", "foreign_key :a, :parents, key: [:x, key_column]",
+        "foreign_key :a, :parents, key: [:x, :y]", "foreign_key :a, :parents, deferrable: timing",
+        "foreign_key :a, :parents, deferrable: :unknown", "foreign_key :a, :parents, **options",
+        "foreign_key :a, :parents, key_options", "foreign_key :a, :parents, type: :String",
+        "foreign_key [:missing], :parents, key: :id",
+        "primary_key [:a] do\n unsupported\nend", "Other.primary_key [:a]",
+        "Other.foreign_key [:a], :parents, key: :id",
+    ] {
+        let error = sequel_table(&format!("Integer :a\nInteger :b\n{body}"))
+            .expect_err(body).to_string();
+        assert!(error.contains("db/migrate/001_links.rb"), "{error}");
+    }
+}
+
 #[test]
 fn sequel_models_converge_on_rails_shape() {
     let app = ingest();

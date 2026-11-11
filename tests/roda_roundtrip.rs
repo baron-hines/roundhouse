@@ -85,6 +85,42 @@ fn route_rows(app: &App) -> Vec<(String, String, String, String)> {
 }
 
 #[test]
+fn schema_keys_roundtrip_through_sequel_migrations() {
+    use roundhouse::schema::ColumnType;
+    let source = include_str!("support/schema_keys_schema.rb");
+    let named_key = source
+        .replace("create_table \"parents\" do", "create_table \"parents\", primary_key: :parent_key do")
+        .replace("\"parents\", column:", "\"parents\", primary_key: :parent_key, column:");
+    for source in [source, named_key.as_str()] {
+        let mut app = App::new();
+        app.schema = roundhouse::ingest::ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+        let scratch = scratch_dir("schema-keys");
+        for file in roundhouse::emit::roda::emit(&app) {
+            let path = scratch.join(file.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file.content).unwrap();
+        }
+        let mut converted = roundhouse::ingest::ingest_app(&scratch)
+            .expect("composite and deferred keys must re-ingest");
+        // Same normalization as the blog round-trip: SQLite's integer PK
+        // and Reference carriers differ, but every schema fact must survive.
+        for schema in [&mut app.schema, &mut converted.schema] {
+            for table in schema.tables.values_mut() {
+                for column in &mut table.columns {
+                    if matches!(column.col_type, ColumnType::Reference { .. })
+                        || (column.primary_key && column.col_type == ColumnType::BigInt)
+                    {
+                        column.col_type = ColumnType::Integer;
+                    }
+                }
+            }
+        }
+        assert_eq!(app.schema, converted.schema, "all keys, targets and timing must round-trip");
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+}
+
+#[test]
 fn conversion_roundtrips_through_ingest() {
     let scratch = scratch_dir("roundtrip");
     write_conversion(&scratch);
