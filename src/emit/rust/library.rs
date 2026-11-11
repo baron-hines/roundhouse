@@ -207,7 +207,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // still work alongside; Rust disambiguates field vs method
     // by trailing parens at the call site.
     for (fname, ty) in &ivars {
-        writeln!(out, "    pub {fname}: {},", rust_ty(ty)).unwrap();
+        writeln!(out, "    pub {}: {},", crate::emit::rust::expr::util::escape_rust_keyword(fname), rust_ty(ty)).unwrap();
     }
     out.push_str("}\n\n");
 

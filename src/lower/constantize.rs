@@ -47,13 +47,21 @@ fn app_constants(app: &App) -> BTreeSet<String> {
 }
 
 fn constantize_method(expr: &Expr) -> Option<&'static str> {
-    let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*expr.node else { return None };
-    if !args.is_empty() {
-        return None;
-    }
-    match method.as_str() {
-        "constantize" => Some("constantize"),
-        "safe_constantize" => Some("safe_constantize"),
+    constantized(expr).map(|(method, _)| method)
+}
+
+/// The method and the name it resolves: `name.constantize`, or Active Support's own spelling of it,
+/// `ActiveSupport::Inflector.constantize(name)` (Devise's FailureApp builds its recall's controller so).
+fn constantized(expr: &Expr) -> Option<(&'static str, &Expr)> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else { return None };
+    let method = match method.as_str() {
+        "constantize" => "constantize",
+        "safe_constantize" => "safe_constantize",
+        _ => return None,
+    };
+    match args.as_slice() {
+        [] => Some((method, recv)),
+        [name] if matches!(&*recv.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>() == ["ActiveSupport", "Inflector"]) => Some((method, name)),
         _ => None,
     }
 }
@@ -86,10 +94,9 @@ fn rewrite(expr: &mut Expr, runs: bool, target: &str) {
         return;
     }
     expr.node.for_each_child_mut(&mut |child| rewrite(child, runs, target));
-    let Some(method) = constantize_method(expr) else { return };
+    let Some((method, name)) = constantized(expr) else { return };
     let span = expr.span;
-    let ExprNode::Send { recv: Some(recv), .. } = &*expr.node else { return };
-    let recv = recv.clone();
+    let recv = name.clone();
     *expr = if runs {
         Expr::new(
             span,

@@ -9,3 +9,5 @@ require_relative "action_dispatch/exceptions"
 # stamped by both ruby-family dispatchers around every app response.
 require_relative "action_dispatch/request_id"
 require_relative "action_dispatch/content_security_policy"
+# RouteSet#finalize!, which a gem prepends to (Devise's configure_warden!).
+require_relative "action_dispatch/route_set"

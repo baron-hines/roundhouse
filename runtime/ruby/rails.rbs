@@ -122,9 +122,16 @@ module Rails
 
   class FrameworkConfig
     @assets: AssetConfig
+    @action_controller: ActionControllerOptions
     def initialize: () -> void
     def assets: () -> AssetConfig
+    def relative_url_root: () -> String?
+    def action_controller: () -> ActionControllerOptions
     def filter_parameters: () -> Array[String | Regexp]
+  end
+
+  class ActionControllerOptions
+    def relative_url_root: () -> String?
   end
 
   class ImportmapMap

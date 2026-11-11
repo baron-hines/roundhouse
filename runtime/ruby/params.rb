@@ -380,6 +380,19 @@ module Params
   end
 
   # Permitted scalar keys, including matching multiparameter keys.
+  # A Symbol read of a value that may be Rails' Parameters (String-keyed here) or a Symbol-keyed Hash: the key as
+  # given, else its String.
+  def self.indifferent_read(hash, key)
+    return nil if hash.nil?
+    return hash[key] if hash.key?(key)
+    hash[key.to_s]
+  end
+
+  # `params.permit(*names)` over names a program computes (Symbols or Strings): the scalars under them.
+  def self.permitted_names(hash, names)
+    Params.allowed_scalars(hash, names.map { |name| name.to_s })
+  end
+
   def self.allowed_scalars(hash, allowed)
     out = {}
     i = 0

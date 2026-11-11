@@ -9,6 +9,11 @@ module GemMiddleware
     nil
   end
 
+  # No middleware of a gem calls an endpoint where none is on the stack.
+  def self.endpoint(controller, action, env)
+    raise NotImplementedError, "no middleware of a gem is on the stack to call an endpoint"
+  end
+
   # The test harness's request through the stack (Rails' integration tests run it): with no gem
   # middleware, the block is the whole stack.
   def self.around(env)

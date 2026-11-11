@@ -206,6 +206,60 @@ pub(super) fn emit_form_with_inline(
     block: &Expr,
     ctx: &ViewCtx,
 ) -> Vec<Expr> {
+    emit_form_inline(args, block, ctx, None)
+}
+
+/// What `form_for(record, as:, html:)` adds to the form_with it lowers to: Rails' `apply_form_for_options!` gives the
+/// `<form>` a class and id from the record's state (`new_user`, `edit_user`), under the `html:` the call passes.
+pub(super) struct FormForHtml {
+    pub(super) html: Vec<(Expr, Expr)>,
+    pub(super) named: bool,
+}
+
+pub(super) fn emit_form_for_inline(args: &[Expr], block: &Expr, ctx: &ViewCtx, html: FormForHtml) -> Vec<Expr> {
+    emit_form_inline(args, block, ctx, Some(html))
+}
+
+fn form_for_lead(comps: &FormWithComponents, record_var: &Symbol, form_for: FormForHtml) -> Vec<(Expr, Expr)> {
+    let record = || Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() });
+    let persisted = send(Some(record()), "persisted?", Vec::new(), None, false);
+    let by_state = |edit: Expr, new: Expr| Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: edit, else_branch: new });
+    let name = &comps.model_name;
+    let class = by_state(lit_str(format!("edit_{name}")), lit_str(format!("new_{name}")));
+    let prefix = if comps.id_prefix.is_empty() { String::new() } else { format!("{}_", comps.id_prefix) };
+    // Without `as:` the id is `dom_id(record, :edit)`, which carries the record's key.
+    let edit_id = if form_for.named {
+        lit_str(format!("{prefix}edit_{name}"))
+    } else {
+        Expr::new(Span::synthetic(), ExprNode::StringInterp {
+            parts: vec![
+                InterpPart::Text { value: format!("{prefix}edit_{name}_") },
+                InterpPart::Expr { expr: send(Some(record()), "id", Vec::new(), None, false) },
+            ],
+        })
+    };
+    let id = by_state(edit_id, lit_str(format!("{prefix}new_{name}")));
+    let key = |k: &str| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(k) } });
+    let key_of = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let mut out = vec![(key("class"), class), (key("id"), id)];
+    for (k, v) in form_for.html {
+        match out.iter().position(|(o, _)| key_of(o).is_some() && key_of(o) == key_of(&k)) {
+            Some(i) => out[i].1 = v,
+            None => out.push((k, v)),
+        }
+    }
+    out
+}
+
+fn emit_form_inline(
+    args: &[Expr],
+    block: &Expr,
+    ctx: &ViewCtx,
+    form_for: Option<FormForHtml>,
+) -> Vec<Expr> {
     let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
@@ -226,7 +280,8 @@ pub(super) fn emit_form_with_inline(
         .cloned()
         .unwrap_or_else(|| Symbol::from("form"));
 
-    let record_local = find_kwarg_local_name(args);
+    // A form_for record is often a helper (Devise's `resource`), which a local of its name would not call.
+    let record_local = find_kwarg_local_name(args).filter(|name| form_for.is_none() || ctx.locals.iter().any(|l| l == name));
 
     let Some(comps) = classify_form_with_components(args, ctx) else {
         // Non-resource form_with (no `model:` kwarg) — fall back to a
@@ -278,7 +333,8 @@ pub(super) fn emit_form_with_inline(
     //    action, accept-charset, method, then user opts. The HTML
     //    `method` attribute is "post" for resource forms (PATCH/DELETE
     //    flow through `_method` override below), "get" for a GET form.
-    out.push(emit_open_form_tag(&comps, ctx, block_has_file_field(body, form_param_str, ctx)));
+    let lead = form_for.map(|html| form_for_lead(&comps, &record_var, html)).unwrap_or_default();
+    out.push(emit_open_form_tag_led(&comps, ctx, block_has_file_field(body, form_param_str, ctx), &lead));
 
     // 2. Method override: `<input type="hidden" name="_method"
     //    value="patch">` for non-get/post methods, empty string
@@ -455,9 +511,15 @@ fn sends_token(entries: &[(Expr, Expr)]) -> bool {
 }
 
 fn emit_open_form_tag(comps: &FormWithComponents, ctx: &ViewCtx, multipart: bool) -> Expr {
-    let mut parts: Vec<InterpPart> = Vec::new();
+    emit_open_form_tag_led(comps, ctx, multipart, &[])
+}
+
+/// `lead` renders before `action`: form_for's html options, which Rails merges its defaults under.
+fn emit_open_form_tag_led(comps: &FormWithComponents, ctx: &ViewCtx, multipart: bool, lead: &[(Expr, Expr)]) -> Expr {
+    let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: "<form".to_string() }];
+    append_attr_parts(&mut parts, lead);
     parts.push(InterpPart::Text {
-        value: "<form action=\"".to_string(),
+        value: " action=\"".to_string(),
     });
     parts.push(InterpPart::Expr {
         expr: view_helpers_call("html_escape", vec![comps.action.clone()]),
@@ -1030,7 +1092,7 @@ fn classify_form_with_components(
         // `method:` steers the form verb (captured out of opts above);
         // default POST like the url-only branch.
         return Some(FormWithComponents {
-            model_name: record_model_name(&model, ctx, &singular),
+            model_name: scope.clone().unwrap_or_else(|| record_model_name(&model, ctx, &singular)),
             model,
             action: route_helperize(url, &route_helpers, ctx),
             method: method_expr.clone().unwrap_or_else(default_post),
@@ -1118,7 +1180,7 @@ fn classify_form_with_components(
     });
 
     Some(FormWithComponents {
-        model_name: record_model_name(&model, ctx, &singular),
+        model_name: scope.unwrap_or_else(|| record_model_name(&model, ctx, &singular)),
         model,
         action,
         method,
