@@ -388,7 +388,7 @@ end
 lines = SidekiqPush.recorded
 raise "the block's error: #{lines.inspect}" unless raised
 raise "a raised slice was pushed: #{lines.inspect}" unless lines.length == 2 && lines[1].split('"jid":').length == 3 && !lines[1].include?('"args":[3,')
-raise "the batch stayed open" unless SidekiqPush.bulk_limit[0] == 0 && SidekiqPush.bulk.length == 0
+raise "the batch stayed open" unless SidekiqPush.bulks.length == 0
 SidekiqPush.stop_recording
 puts "bulk block passed"
 "##,
@@ -442,6 +442,52 @@ puts "mixed passed"
     assert!(run.stdout.contains("mixed passed"), "{}", run.stdout);
     let registry = std::fs::read_to_string(run.emitted.join("runtime/job_registry.rb")).unwrap();
     assert!(registry.contains("SidekiqPush.native_value(label)"), "{registry}");
+}
+
+/// Under `:sidekiq` a worker whose queue or retry can't be read, its own
+/// or inherited, is an error: the push would write the default in its
+/// place. So is enqueueing a worker that defines its own `perform_async`,
+/// which isn't lowered to a push.
+#[test]
+fn unreadable_options_and_an_own_perform_async_are_errors_under_sidekiq() {
+    let errors_for = |files: &[(&str, &str)], call: &str| {
+        let mut overlay = with_workers(emit_and_run::real_blog());
+        for (path, source) in files {
+            overlay = overlay.write(path, source);
+        }
+        let (_, errors) = overlay
+            .edit(
+                "app/models/article.rb",
+                "  validates :title, presence: true\n",
+                &format!("  validates :title, presence: true\n\n  def self.enqueue_native\n    {call}\n  end\n"),
+            )
+            .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+            .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
+            .emit(BuildTarget::Ruby);
+        errors
+    };
+    let perform = "\n  def perform(n)\n    nil\n  end\nend\n";
+    let queue_worker = format!("class QueueWorker\n  include Sidekiq::Job\n  sidekiq_options queue: ENV.fetch(\"Q\", \"low\")\n{perform}");
+    let base_worker = "class BaseWorker\n  include Sidekiq::Job\n  sidekiq_options retry: ENV.fetch(\"R\", \"3\").to_i\nend\n";
+    let sub_worker = format!("class SubWorker < BaseWorker\n{perform}");
+    let hash_worker = format!("class HashWorker\n  include Sidekiq::Job\n  sidekiq_options(Hash.new)\n{perform}");
+    let custom_worker =
+        format!("class CustomWorker\n  include Sidekiq::Job\n\n  def self.perform_async(n)\n    new.perform(n)\n  end\n{perform}");
+    let cases: Vec<(Vec<(&str, &str)>, &str, &str)> = vec![
+        (vec![("app/workers/queue_worker.rb", queue_worker.as_str())], "QueueWorker.perform_async(1)", "sidekiq_options `queue:` is not a literal"),
+        (
+            vec![("app/workers/base_worker.rb", base_worker), ("app/workers/sub_worker.rb", sub_worker.as_str())],
+            "SubWorker.perform_async(1)",
+            "sidekiq_options `retry:` (inherited from `BaseWorker`) is not a literal",
+        ),
+        (vec![("app/workers/hash_worker.rb", hash_worker.as_str())], "HashWorker.perform_async(1)", "is not one literal Hash"),
+        (vec![("app/workers/custom_worker.rb", custom_worker.as_str())], "CustomWorker.perform_in(60, 1)", "`CustomWorker` defines its own `perform_async`"),
+        (vec![("app/workers/custom_worker.rb", custom_worker.as_str())], "CustomWorker.perform_async(1)", "`CustomWorker` defines its own `perform_async`"),
+    ];
+    for (files, call, want) in cases {
+        let errors = errors_for(&files, call);
+        assert!(errors.iter().any(|e| e.contains(want)), "{call}: {errors:#?}");
+    }
 }
 
 /// An app not on `:sidekiq` keeps #746's inline workers: no

@@ -116,9 +116,11 @@ module SidekiqPush
   # job is held: another push the bulk block makes goes out as it would
   # anywhere else.
   def self.enqueue_native(job_class, retry_json, queue, extra, at, shape, args_json)
-    if shape == 2 && bulk_limit[0] > 0
-      bulk.push(HeldNative.new(job_class, retry_json, queue, extra, args_json))
-      flush_bulk if bulk.length >= bulk_limit[0]
+    open = bulks
+    if shape == 2 && open.length > 0
+      batch = open[open.length - 1]
+      batch.jobs.push(HeldNative.new(job_class, retry_json, queue, extra, args_json))
+      flush_batch(batch.jobs) if batch.jobs.length >= batch.limit
       return nil
     end
     now = Time.now.to_f
@@ -194,58 +196,71 @@ module SidekiqPush
   end
 
   # A bulk push (`perform_bulk`, the sidekiq-bulk gem's `push_bulk`):
-  # between `bulk_begin(limit)` and `bulk_end` this thread's bulk jobs
-  # are held and pushed `limit` at a time, as Sidekiq's
+  # its jobs are held and pushed `limit` at a time, as Sidekiq's
   # `Client#push_bulk` pushes a batch: one `SADD queues` and one `LPUSH`
   # of every envelope, which share one `created_at` and one
   # `enqueued_at`, with `class` before `args`.
+  #
+  # Each bulk push has its own batch on this thread's stack, so one
+  # nested in another's block neither pushes nor closes the outer one.
+  # `bulk_begin` opens it; `bulk_end`, once the block has built every
+  # job, pushes what is left; `bulk_abort`, on every exit, closes it,
+  # dropping a slice the block raised in.
+  class BulkBatch
+    def initialize(limit)
+      @limit = limit
+      @jobs = [HeldNative.new("", "", "", "", "")]
+      @jobs.clear
+    end
+
+    def limit
+      @limit
+    end
+
+    def jobs
+      @jobs
+    end
+  end
+
   def self.bulk_begin(limit)
-    flush_bulk
-    bulk_limit[0] = limit
+    bulks.push(BulkBatch.new(limit))
     nil
   end
 
   def self.bulk_end
-    bulk_limit[0] = 0
-    flush_bulk
-    nil
-  end
-
-  # After a bulk push however it ends: the batch is closed, and the jobs
-  # of a slice the block raised in are dropped, as sidekiq-bulk pushes a
-  # slice only once its block has built every job in it.
-  def self.bulk_abort
-    bulk_limit[0] = 0
-    bulk.clear
-    nil
-  end
-
-  def self.bulk_limit
-    l = Thread.current[:sidekiq_bulk_limit]
-    if l.nil?
-      l = [0]
-      Thread.current[:sidekiq_bulk_limit] = l
+    open = bulks
+    if open.length > 0
+      flush_batch(open[open.length - 1].jobs)
     end
-    l
+    nil
   end
 
-  def self.bulk
-    b = Thread.current[:sidekiq_bulk]
+  def self.bulk_abort
+    open = bulks
+    if open.length > 0
+      open.pop
+    end
+    nil
+  end
+
+  # This thread's open bulk pushes, innermost last.
+  def self.bulks
+    b = Thread.current[:sidekiq_bulks]
     if b.nil?
-      b = [HeldNative.new("", "", "", "", "")]
+      b = [BulkBatch.new(0)]
       b.clear
-      Thread.current[:sidekiq_bulk] = b
+      Thread.current[:sidekiq_bulks] = b
     end
     b
   end
 
-  def self.flush_bulk
-    b = bulk
-    if b.length == 0
+  # Push a batch's held jobs, emptying it.
+  def self.flush_batch(held)
+    if held.length == 0
       return nil
     end
-    jobs = b.dup
-    b.clear
+    jobs = held.dup
+    held.clear
     created = now_ms.to_s
     enqueued = now_ms.to_s
     queue = jobs[0].queue + ""

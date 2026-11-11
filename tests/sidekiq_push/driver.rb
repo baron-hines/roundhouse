@@ -209,7 +209,7 @@ lines = SidekiqPush.recorded
 check("bulk: one sadd and one lpush per batch", lines.length == 4 && lines[0] == "sadd queues pull" && lines[2] == "sadd queues pull", lines.length.to_s)
 check("bulk: a full batch of two", lines[1].to_s.split("\"jid\":").length == 3, lines[1].to_s)
 check("bulk: the rest at bulk_end", lines[3].to_s.split("\"jid\":").length == 2 && lines[3].to_s.include?("\"class\":\"OkWorker\",\"args\":[3]"), lines[3].to_s)
-check("bulk: limit cleared", SidekiqPush.bulk_limit[0] == 0, SidekiqPush.bulk_limit[0].to_s)
+check("bulk: batch closed", SidekiqPush.bulks.length == 0, SidekiqPush.bulks.length.to_s)
 SidekiqPush.start_recording
 SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, 0, "[4]")
 check("after bulk_end: pushed at once", SidekiqPush.recorded.length == 2, SidekiqPush.recorded.length.to_s)
@@ -224,7 +224,7 @@ SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 300.0, 1, "[7]")
 lines = SidekiqPush.recorded
 check("bulk: a Setter push in the block goes out at once", lines.length == 3 && lines[0] == "sadd queues other" && lines[1].to_s.start_with?("lpush queue:other ") && lines[1].to_s.include?("\"args\":[6]"), lines.join(" | "))
 check("bulk: a perform_in in the block is scheduled", lines[2].to_s.start_with?("zadd schedule ") && lines[2].to_s.include?("\"args\":[7]"), lines[2].to_s)
-check("bulk: only the bulk job is held", SidekiqPush.bulk.length == 1, SidekiqPush.bulk.length.to_s)
+check("bulk: only the bulk job is held", SidekiqPush.bulks[0].jobs.length == 1, SidekiqPush.bulks[0].jobs.length.to_s)
 SidekiqPush.bulk_end
 SidekiqPush.bulk_abort
 lines = SidekiqPush.recorded
@@ -240,7 +240,26 @@ SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, 2, "[10]")
 SidekiqPush.bulk_abort
 lines = SidekiqPush.recorded
 check("bulk_abort: the full slice was pushed, the open one dropped", lines.length == 2 && !lines[1].to_s.include?("\"args\":[10]"), lines.join(" | "))
-check("bulk_abort: batch closed", SidekiqPush.bulk_limit[0] == 0 && SidekiqPush.bulk.length == 0, SidekiqPush.bulk_limit[0].to_s)
+check("bulk_abort: batch closed", SidekiqPush.bulks.length == 0, SidekiqPush.bulks.length.to_s)
+
+# A bulk push nested in another's block has its own batch: it neither
+# pushes the outer one's held jobs nor closes it.
+SidekiqPush.start_recording
+SidekiqPush.bulk_begin(2)
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, 2, "[11]")
+SidekiqPush.bulk_begin(5)
+SidekiqPush.enqueue_native("OkWorker", "5", "inner", "", 0.0, 2, "[12]")
+SidekiqPush.bulk_end
+SidekiqPush.bulk_abort
+lines = SidekiqPush.recorded
+check("nested bulk: the inner batch pushed alone", lines.length == 2 && lines[1].to_s.start_with?("lpush queue:inner ") && lines[1].to_s.split("\"jid\":").length == 2, lines.join(" | "))
+check("nested bulk: the outer job still held", SidekiqPush.bulks.length == 1 && SidekiqPush.bulks[0].jobs.length == 1, SidekiqPush.bulks.length.to_s)
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, 2, "[13]")
+SidekiqPush.enqueue_native("OkWorker", "5", "pull", "", 0.0, 2, "[14]")
+SidekiqPush.bulk_abort
+lines = SidekiqPush.recorded
+check("nested bulk: the outer batch at its own limit", lines.length == 4 && lines[3].to_s.include?("\"args\":[11]") && lines[3].to_s.include?("\"args\":[13]"), lines.join(" | "))
+check("nested bulk: the outer raise drops its open slice", !lines.join(" ").include?("\"args\":[14]") && SidekiqPush.bulks.length == 0, lines.join(" | "))
 
 # A native argument of mixed JSON kinds, as JSON.generate writes each.
 mixed = { "s" => "a\"b", "i" => 2, "f" => 1.5, "t" => true, "u" => false, "n" => nil }

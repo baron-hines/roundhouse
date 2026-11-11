@@ -95,9 +95,18 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     // Under `:sidekiq` a native worker's literal `sidekiq_options` go
     // into its envelope (`lower::sidekiq_native`). Read before the loop
     // below strips them from the classes.
+    // A worker with a class-side `perform_async` of its own isn't folded,
+    // so its calls keep dispatching to it; enqueueing one under `:sidekiq`
+    // is an error (found by folding a copy of each body, below).
+    let own_async =
+        if sidekiq { super::sidekiq_native::own_perform_async(app, &wrapped) } else { std::collections::BTreeMap::new() };
+    let refused: BTreeSet<String> = own_async.keys().cloned().collect();
+    let refused_delay: BTreeSet<String> = delay_folds.intersection(&refused).cloned().collect();
+    let native_wrapped: BTreeSet<String> = wrapped.difference(&refused).cloned().collect();
+    let native_delay: BTreeSet<String> = delay_folds.difference(&refused).cloned().collect();
     let mut native_options: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
     if sidekiq {
-        for lc in app.library_classes.iter().filter(|lc| wrapped.contains(lc.name.0.as_str())) {
+        for lc in app.library_classes.iter().filter(|lc| native_wrapped.contains(lc.name.0.as_str())) {
             let (opts, warnings) = super::sidekiq_native::options(app, lc);
             native_options.insert(lc.name.0.as_str().to_string(), opts);
             diags.extend(warnings);
@@ -108,6 +117,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     let mut delayed: Vec<crate::span::Span> = Vec::new();
     let mut scheduled = SetFolds::default();
     let mut native = super::sidekiq_native::NativeFolds::default();
+    let mut refused_folds = super::sidekiq_native::NativeFolds::default();
     let native_models = super::sidekiq_native::native_models(app);
     super::for_each_hook_body(app, &mut |body| {
         fold_set_chains(body, &jobs, &mut unfolded, &mut folded, (sidekiq || solid_queue).then_some(&mut scheduled));
@@ -115,11 +125,20 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         // and retry, folded to `perform_async_with`; what's left (a
         // splat) drops its delay below, as before.
         if sidekiq {
-            super::sidekiq_native::fold_sites(body, &wrapped, &delay_folds, &mut native, &native_models);
+            if !refused.is_empty() {
+                let mut probe = body.clone();
+                super::sidekiq_native::fold_sites(&mut probe, &refused, &refused_delay, &mut refused_folds, &native_models);
+            }
+            super::sidekiq_native::fold_sites(body, &native_wrapped, &native_delay, &mut native, &native_models);
         }
         fold_delayed_enqueues(body, &delay_folds, &mut delayed);
     });
     diags.extend(super::sidekiq_native::rejected_diagnostics(&native));
+    for worker in &refused_folds.workers {
+        if let Some(span) = own_async.get(worker) {
+            diags.push(super::sidekiq_native::own_perform_async_error(worker, *span));
+        }
+    }
     for span in scheduled.waits.iter().filter(|_| !sidekiq) {
         diags.push(crate::lower::residue_diagnostic(
             "job_class_side",

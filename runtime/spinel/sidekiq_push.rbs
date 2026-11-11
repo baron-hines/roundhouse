@@ -25,12 +25,17 @@ module SidekiqPush
 
   def self.enqueue_native: (String job_class, String retry_json, String queue, String extra, Float at, Integer shape, String args_json) -> nil
   def self.native_value: (String | Integer | Float | bool | nil value) -> String
+  class BulkBatch
+    def initialize: (Integer limit) -> void
+    def limit: () -> Integer
+    def jobs: () -> Array[SidekiqPush::HeldNative]
+  end
+
   def self.bulk_begin: (Integer limit) -> nil
   def self.bulk_end: () -> nil
   def self.bulk_abort: () -> nil
-  def self.bulk_limit: () -> Array[Integer]
-  def self.bulk: () -> Array[SidekiqPush::HeldNative]
-  def self.flush_bulk: () -> nil
+  def self.bulks: () -> Array[SidekiqPush::BulkBatch]
+  def self.flush_batch: (Array[SidekiqPush::HeldNative] held) -> nil
   def self.push_many: (String queue, Array[String] jsons) -> nil
   def self.enqueue_after_commit: (String job_class, String queue, Float at, String aj_json) -> nil
   def self.held: () -> Array[SidekiqPush::HeldPush]

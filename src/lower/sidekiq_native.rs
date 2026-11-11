@@ -113,21 +113,47 @@ const HONORED_KEYS: &[&str] = &["queue", "retry", "dead", "backtrace", "retry_qu
 
 /// A worker's literal `sidekiq_options`, its ancestors' first and a later
 /// key replacing an earlier one in place, each value as JSON text. Plus
-/// the warnings for keys that are carried but not honored, and for
-/// values that aren't literal (those aren't carried). Only the worker's
-/// own declarations warn; an ancestor's warn for the ancestor.
+/// the diagnostics:
+///
+/// - an error for a `sidekiq_options` that isn't one literal Hash, and
+///   for an honored key (`queue:`, `retry:`, …) whose value isn't a
+///   literal, the worker's own or inherited: the push would write the
+///   default in its place, so the job would go to another queue or retry
+///   another way;
+/// - a warning for any other key whose value isn't a literal (not
+///   carried), the worker's own or inherited, and for a key of its own
+///   that is carried but not honored.
 pub fn options(app: &App, lc: &LibraryClass) -> (Vec<(String, String)>, Vec<Diagnostic>) {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut diags = Vec::new();
+    let worker = lc.name.0.as_str();
     for class in ancestry(app, lc).iter().rev() {
         let own = class.name == lc.name;
+        let whose = if own { String::new() } else { format!(" (inherited from `{}`)", class.name.0.as_str()) };
         for call in &class.unknown_calls {
             let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { continue };
             if method.as_str() != "sidekiq_options" {
                 continue;
             }
-            let [opts] = args.as_slice() else { continue };
-            let ExprNode::Hash { entries, .. } = &*opts.node else { continue };
+            let entries = match args.as_slice() {
+                [] => continue,
+                [opts] => match &*opts.node {
+                    ExprNode::Hash { entries, .. } => Some(entries),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(entries) = entries else {
+                diags.push(error(
+                    call.span,
+                    "worker-options",
+                    "options not a literal Hash",
+                    format!(
+                        "sidekiq_native: `{worker}`'s sidekiq_options{whose} is not one literal Hash, so its queue and retry can't be known; under queue_adapter :sidekiq the push writes them into the envelope"
+                    ),
+                ));
+                continue;
+            };
             for (k, v) in entries {
                 let key = match &*k.node {
                     ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
@@ -135,14 +161,22 @@ pub fn options(app: &App, lc: &LibraryClass) -> (Vec<(String, String)>, Vec<Diag
                     _ => continue,
                 };
                 let Some(json) = literal_json(v) else {
-                    if own {
+                    if HONORED_KEYS.contains(&key.as_str()) {
+                        diags.push(error(
+                            k.span,
+                            "worker-options",
+                            "not a literal option",
+                            format!(
+                                "sidekiq_native: `{worker}`'s sidekiq_options `{key}:`{whose} is not a literal; under queue_adapter :sidekiq the push writes it into the envelope, and would write the default in its place"
+                            ),
+                        ));
+                    } else {
                         diags.push(warning(
                             k.span,
                             "worker-options",
                             "not a literal option",
                             format!(
-                                "sidekiq_native: `{}`'s sidekiq_options `{key}:` is not a literal, so it is not carried into the envelope",
-                                lc.name.0.as_str()
+                                "sidekiq_native: `{worker}`'s sidekiq_options `{key}:`{whose} is not a literal, so it is not carried into the envelope"
                             ),
                         ));
                     }
@@ -211,6 +245,38 @@ fn ancestry<'a>(app: &'a App, lc: &'a LibraryClass) -> Vec<&'a LibraryClass> {
         cursor = parent.parent.clone();
     }
     out
+}
+
+/// The workers in `workers` that define a class-side `perform_async` of
+/// their own or inherit one, each with where it is defined. Their calls
+/// aren't folded, so they keep dispatching to it; enqueueing one under
+/// `:sidekiq` is an error ([`own_perform_async_error`]).
+pub fn own_perform_async(app: &App, workers: &BTreeSet<String>) -> std::collections::BTreeMap<String, Span> {
+    app.library_classes
+        .iter()
+        .filter(|lc| workers.contains(lc.name.0.as_str()))
+        .filter_map(|lc| {
+            ancestry(app, lc).into_iter().find_map(|c| {
+                c.methods
+                    .iter()
+                    .find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "perform_async")
+                    .map(|m| (lc.name.0.as_str().to_string(), m.name_span))
+            })
+        })
+        .collect()
+}
+
+/// A worker with its own `perform_async`, enqueued under `:sidekiq`: its
+/// jobs would run where that method sends them, not in Redis.
+pub fn own_perform_async_error(worker: &str, span: Span) -> Diagnostic {
+    error(
+        span,
+        "job-own-perform-async",
+        "own perform_async not lowered",
+        format!(
+            "sidekiq_native: `{worker}` defines its own `perform_async`, which isn't lowered to a push; under queue_adapter :sidekiq its jobs must be pushed to Redis in Sidekiq's envelope"
+        ),
+    )
 }
 
 /// The `perform` a worker runs: its own, or the nearest ancestor's.

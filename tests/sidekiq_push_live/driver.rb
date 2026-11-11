@@ -88,5 +88,6 @@ SidekiqPush.bulk_begin(2)
   SidekiqPush.enqueue_native("NativeWorker", "true", "native", "", 0.0, 2, "[" + i.to_s + "]")
 end
 SidekiqPush.bulk_end
+SidekiqPush.bulk_abort
 
 puts "pushed to " + SidekiqPush.redacted_url(SidekiqPush.url)
