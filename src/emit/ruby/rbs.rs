@@ -145,16 +145,7 @@ fn render_class(
 
     if let Some((members, _)) = lc.data_define() {
         if !lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "new") {
-            let visibility = lc.unknown_calls.iter().rev().find_map(|expr| {
-                let ExprNode::Send { method, args, .. } = &*expr.node else { return None };
-                let names_new = args.iter().any(|arg| match &*arg.node {
-                    ExprNode::Lit { value: Literal::Sym { value } } => value.as_str() == "new",
-                    ExprNode::Lit { value: Literal::Str { value } } => value == "new", _ => false,
-                });
-                (names_new && matches!(method.as_str(), "private_class_method" | "public_class_method"))
-                    .then_some(if method.as_str() == "private_class_method" { "private " } else { "" })
-            }).unwrap_or("");
-            writeln!(s, "{body_pad}{visibility}def self.new: (*untyped, **untyped) -> instance").unwrap();
+            writeln!(s, "{body_pad}def self.new: (*untyped, **untyped) -> instance").unwrap();
         }
         // A `def` in the `Data.define` block replaces the reader, and RBS
         // rejects a second declaration of one method.

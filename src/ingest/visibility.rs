@@ -445,7 +445,11 @@ impl Visibility {
     ) -> IngestResult<Self> {
         let out = Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)?;
         match out.inherited.first() {
-            Some((_, name, _)) => Err(Self::undefined(file, name)),
+            Some((_, name, at)) => {
+                let err = Self::undefined(file, name);
+                super::error_site::note(&err, *at, *at + 1);
+                Err(err)
+            }
             None => Ok(out),
         }
     }
@@ -453,24 +457,6 @@ impl Visibility {
     /// Whether this body's load-time conditional definitions are admitted.
     pub(super) fn admits_conditionals(&self) -> bool {
         self.conditionals
-    }
-
-    /// A Data factory has these class-side constructors before its block runs.
-    pub(super) fn resolve_data(body: Option<&Node<'_>>, file: &str, owner: &ClassId) -> IngestResult<Self> {
-        let out = Self::resolve_carrying_inherited_with(body, file, None, Some(owner), true)?;
-        for statement in body.and_then(|body| body.as_statements_node()).map(|body| flatten_statements(body.as_node())).unwrap_or_default() {
-            let Some(call) = statement.as_call_node().filter(|call| constant_id_str(&call.name()) == "private_class_method") else { continue };
-            let args: Vec<_> = call.arguments().map(|args| args.arguments().iter().collect()).unwrap_or_default();
-            if args.iter().any(|arg| symbol_or_string_value(arg).is_some_and(|name| matches!(name.as_str(), "new" | "[]" | "allocate")))
-                && (args.len() != 3 || ["new", "[]", "allocate"].iter().any(|&name| !args.iter().any(|arg| super::util::symbol_value(arg).as_deref() == Some(name)))) {
-                return Err(super::error_site::at(Self::unsupported(file,
-                    format!("Data.define private_class_method requires exactly :new, :[], :allocate (in any order) at {file}:{}", super::sources::line_at(file, statement.location().start_offset()).unwrap_or(1))), &statement));
-            }
-        }
-        if let Some((_, name, _)) = out.inherited.iter().find(|(class_side, name, _)| {
-            !*class_side || !matches!(name.as_str(), "new" | "[]" | "allocate")
-        }) { return Err(Self::undefined(file, name)); }
-        Ok(out)
     }
 
     pub(super) fn resolve_owned(

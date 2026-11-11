@@ -21,7 +21,6 @@ fn file_data_composition_strictly_emits() {
         "require \"stringio\"\nArtifact = Data.define(:digest)\n",
         "require('set')\nrequire 'digest/sha2'\nArtifact = Data.define(:digest)\n",
         "Artifact = Data.define(:digest)\nclass Artifact; def label = digest; end\n",
-        "Artifact = Data.define(:digest) do\n def self.build(digest) = new(digest:)\n private_class_method :new, :[], :allocate\nend\n",
     ] {
         for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
             let mut app = review_record(source, path, None);
@@ -30,32 +29,45 @@ fn file_data_composition_strictly_emits() {
             let files = roundhouse::emit::ruby::emit_library(&app);
             let ruby = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rb")).unwrap().content;
             assert_eq!(ruby.matches("Data.define").count(), 1, "{ruby}");
-            if source.contains("private_class_method") {
-                let rbs = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rbs")).unwrap().content;
-                assert!(rbs.contains("private def self.new:"), "{rbs}");
-            }
         }
     }
 }
 
 #[test]
-fn data_constructor_visibility_requires_the_complete_symbol_set() {
+fn inherited_data_constructor_visibility_is_refused_at_the_call() {
     for names in [":new", ":[]", ":allocate", ":new, :[]", ":new, :allocate", ":[], :allocate",
-        ":new, :new, :[]", ":new, :[], :allocate, :allocate", "'new', '[]', 'allocate'"] {
-        let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
-        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
-            assert_review_refusal(&source, path, "Data.define private_class_method", Some(source.find("private_class_method").unwrap()));
-        }
-    }
-}
-
-#[test]
-fn data_constructor_visibility_accepts_each_permutation() {
-    for names in [":new, :[], :allocate", ":new, :allocate, :[]", ":[], :new, :allocate",
+        ":new, :new, :[]", ":new, :[], :allocate, :allocate", "'new', '[]', 'allocate'",
+        ":new, :[], :allocate", ":new, :allocate, :[]", ":[], :new, :allocate",
         ":[], :allocate, :new", ":allocate, :new, :[]", ":allocate, :[], :new"] {
         let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
-        let mut app = review_record(&source, "lib/artifact.rb", None);
-        assert!(errors(&mut app).is_empty(), "{source}");
+        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
+            Some(source.find("private_class_method").unwrap()));
+    }
+}
+
+#[test]
+fn private_data_constructors_refuse_subclasses_toggles_and_reopenings_at_the_call() {
+    let parent = "Artifact = Data.define(:digest) do\n  def self.build(digest) = new(digest:)\n  private_class_method :new, :[], :allocate\nend\n";
+    for suffix in [
+        "class Child < Artifact; def self.make(digest) = new(digest:); end\n",
+        "class Child < Artifact; DEFAULT = new(digest: 'default'); end\n",
+        "class Child < Artifact; def self.make(digest) = new(digest:); end\nx = Child.make('a'); p x; p x.with(digest: 'b').class\n",
+        "class Artifact; def label = 'L:' + digest; end\n",
+    ] {
+        let source = format!("{parent}{suffix}");
+        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
+            Some(source.find("private_class_method").unwrap()));
+    }
+    for marker in ["public_class_method :new", "public_class_method :[]",
+        "public_class_method :new, :[], :allocate"] {
+        let source = parent.replace("end\n", &format!("  {marker}\nend\n"));
+        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
+            Some(source.find("private_class_method").unwrap()));
+    }
+    for work in ["def self.make(digest) = new(digest:)", "DEFAULT = new(digest: 'default')"] {
+        let source = format!("module Shop; end\nShop::Artifact = Data.define(:digest) do\n  private_class_method :new, :[], :allocate\nend\nmodule Shop\n  class Child < Artifact\n    {work}\n  end\nend\n");
+        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
+            Some(source.find("private_class_method").unwrap()));
     }
 }
 
@@ -78,16 +90,13 @@ fn assert_review_refusal(source: &str, path: &str, shape: &str, marker: Option<u
             let diagnostics = errors(&mut app);
             assert!(diagnostics.iter().any(|d| !d.span.is_synthetic() && d.message.contains(shape)
                 && marker.is_none_or(|at| d.span.start as usize == at)), "{source}: {diagnostics:?}");
-            if marker.is_some() {
-                assert!(diagnostics.iter().any(|d| d.message.contains(":new, :[], :allocate")));
-            }
         }
         Err(roundhouse::ingest::IngestError::Unsupported { file, message }) => {
             assert_eq!(file, path);
             assert!(message.contains(shape), "{source}: {message}");
             if let Some(at) = marker {
                 let line = source[..at].bytes().filter(|&c| c == b'\n').count() + 1;
-                assert!(message.contains(&format!("{path}:{line}")) && message.contains(":new, :[], :allocate"), "{message}");
+                assert!(message.contains(&format!("{path}:{line}")), "{message}");
             }
         }
         other => panic!("{source}: expected a source-located refusal, got {other:?}"),

@@ -61,43 +61,7 @@ class Artifact
   def extra = "reopened:" + label
 end
 "#;
-pub const PRIVATE_SOURCE: &str = r#"Artifact = Data.define(:digest) do
-  def self.build(digest) = new(digest:)
-  private_class_method :new, :[], :allocate
-end
-"#;
 pub const REDEFINED_SOURCE: &str = "Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; def label = 'first'; end\nclass Artifact; def label = digest; end\n";
-pub const DEFAULT_SOURCE: &str = r#"Artifact = Data.define(:digest) do
-  private_class_method :new, :[], :allocate
-  DEFAULT_RECORD = new("abc")
-  def self.default = DEFAULT_RECORD
-end
-"#;
-pub const INHERITED_SOURCE: &str = r#"Artifact = Data.define(:digest) do
-  def self.build(digest) = new(digest:)
-  private_class_method :new, :[], :allocate
-end
-class Child < Artifact
-end
-"#;
-pub const CHILD_FACTORY_SOURCE: &str = r#"Artifact = Data.define(:digest) do
-  private_class_method :new, :[], :allocate
-end
-class Child < Artifact
-  def self.make(digest) = new(digest: digest + "!")
-  def self.literal(digest) = self.new(digest: digest + "?")
-end
-class Grandchild < Child
-end
-"#;
-pub const CHILD_CONSTANT_SOURCE: &str = r#"Artifact = Data.define(:digest) do
-  private_class_method :new, :[], :allocate
-end
-class Child < Artifact
-  DEFAULT = new(digest: "default")
-  def self.default = DEFAULT
-end
-"#;
 pub const PUBLIC_CHILD_SOURCE: &str = r#"Artifact = Data.define(:digest)
 class Child < Artifact
   def self.make(digest) = new(digest:)
@@ -105,36 +69,10 @@ end
 "#;
 pub const MEMBER_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").digest\n";
 pub const REOPEN_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").extra\n";
-pub const PRIVATE_ASSERTIONS: &str = r#"puts Artifact.members == [:digest]
-puts Artifact.build("abc").digest
-begin
-  Artifact.new(digest: "direct")
-  raise "new is public"
-rescue NoMethodError
-  puts "new refused"
-end
-begin
-  Artifact["direct"]
-  raise "[] is public"
-rescue NoMethodError
-  puts "[] refused"
-end
-begin
-  Artifact.allocate
-  raise "allocate is public"
-rescue NoMethodError
-  puts "allocate refused"
-end
-"#;
 pub const COMPOSITION_CASES: &[(&str, &str, &str)] = &[
     (REQUIRE_SOURCE, MEMBER_ASSERTIONS, "true\nabc\n"),
     (REOPEN_SOURCE, REOPEN_ASSERTIONS, "true\nreopened:abc!\n"),
-    (PRIVATE_SOURCE, PRIVATE_ASSERTIONS, "true\nabc\nnew refused\n[] refused\nallocate refused\n"),
     (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\n", "abc\n"),
-    (DEFAULT_SOURCE, "puts Artifact.default.digest\n", "abc\n"),
-    (INHERITED_SOURCE, "record = Child.build('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
-    (CHILD_FACTORY_SOURCE, "record = Child.make('abc')\nputs record.digest\nputs record.class == Child\nputs Child.literal('abc').digest\nrecord = Grandchild.make('abc')\nputs record.digest\nputs record.class == Grandchild\n", "abc!\ntrue\nabc?\nabc!\ntrue\n"),
-    (CHILD_CONSTANT_SOURCE, "puts Child.default.digest\nputs Child.default.class == Child\n", "default\ntrue\n"),
     (PUBLIC_CHILD_SOURCE, "record = Child.make('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
     ("Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; private; def hidden = digest; public; def label = hidden; end\n", "puts Artifact.new('abc').label\n", "abc\n"),
 ];

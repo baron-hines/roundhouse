@@ -857,7 +857,6 @@ def select(
             "src/ingest/app.rs",
             "src/ingest/file_program.rs",
             "src/ingest/visibility.rs",
-            "src/lower/class_body_new.rs",
             "src/emit/ruby/library.rs",
             "src/emit/ruby/rbs.rs",
             "tests/data_factory_constants.rs",

@@ -608,19 +608,8 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
             });
         }
     }
-    let visibility = Visibility::resolve_data(body().as_ref(), file, &owner)?;
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
-        walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
-    let mut carried = HashSet::default();
-    for statement in body().map(flatten_statements).unwrap_or_default() {
-        if visibility.names_inherited(&statement) {
-            carried.insert(statement.location().start_offset());
-            let mut expr = ingest_expr(&statement, file)?;
-            expr.decisions |= crate::expr::REPLAYED_CLASS_BODY;
-            unknown_calls.push(expr);
-        }
-    }
-    visibility.uncarried_inherited(&carried, file)?;
+        walk_decl_body(body(), &owner, file, DeclBodyMode::Instance)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok(Some(LibraryClass {
         name: owner,
