@@ -613,7 +613,7 @@ def native_coverage(path):
     ):
         suites.add("generated_columns_spinel")
     if path in {
-        "tests/schema_constraints.rs", "src/schema.rs", "src/ingest/schema.rs",
+        "tests/schema_constraints.rs", "src/schema.rs", "src/ingest/schema.rs", "src/ingest/app.rs",
         "src/schema/generated.rs", "tests/support/emit_and_run.rs",
         "src/emit/shared/schema_sql.rs", "src/lower/model_to_library/schema.rs", "src/lower/scope_chain.rs",
         "src/emit/roda.rs", "src/emit/ruby/library.rs",
