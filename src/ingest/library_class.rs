@@ -2895,6 +2895,8 @@ fn walk_decl_body_with_visibility<'pr>(
     };
 
     let statements = inline_version_gates(inline_load_time_definers(flatten_statements(b)));
+    // Not in `class << self`, where the string defines on the singleton.
+    let (statements, evaled) = if matches!(mode, DeclBodyMode::Instance | DeclBodyMode::ClassMethods) { unroll_class_eval_loops(statements) } else { (statements, Vec::new()) };
     // This body's literal constants, for the `define_method` loops in it
     // and in the bodies it encloses (`class << self`, `included do`).
     let _constants = super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::of(owner, &statements));
@@ -3985,8 +3987,94 @@ fn walk_decl_body_with_visibility<'pr>(
         }
     }
 
+    // The `def`s a `class_eval` string loop makes, after the body's own: Ruby runs the loop where it stands, and a
+    // later `def` of the body replaces one of them only by name, which no target here orders by.
+    for source in evaled {
+        let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
+        let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
+        let mut classes = parsed?;
+        let Some(class) = classes.pop() else { continue };
+        for mut method in class.methods {
+            // A `module ClassMethods` body's methods are the includer's class side, as its own `def`s are.
+            if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
+                method.receiver = MethodReceiver::Class;
+            }
+            if !out.methods.iter().any(|m| m.name == method.name && m.receiver == method.receiver) {
+                out.methods.push(method);
+            }
+        }
+    }
     out.finalize_classvars(&class_attributes, &class_attr_defaults, file)?;
     Ok(out)
+}
+
+/// `%w[uid info].each do |fetcher| class_eval <<-RUBY, __FILE__, __LINE__ + 1 … RUBY end` (OmniAuth's
+/// `Strategy::ClassMethods`): the string once per element, its interpolations the loop's variable alone, as the class
+/// body Ruby evaluates it in. The loop leaves the body; each string's source comes back to be walked as one.
+// Not a loop over anything but a literal of Strings or Symbols, nor a string that reads anything else: the text is
+// known now only then.
+fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<String>) {
+    let unrolled = |s: &ruby_prism::Node<'pr>| -> Option<Vec<String>> {
+        let call = s.as_call_node()?;
+        if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
+            return None;
+        }
+        let elements: Vec<String> = call
+            .receiver()?
+            .as_array_node()?
+            .elements()
+            .iter()
+            .map(|e| {
+                e.as_string_node()
+                    .map(|n| String::from_utf8_lossy(n.unescaped()).into_owned())
+                    .or_else(|| e.as_symbol_node().map(|n| String::from_utf8_lossy(n.unescaped()).into_owned()))
+            })
+            .collect::<Option<_>>()?;
+        let block = call.block()?.as_block_node()?;
+        let params: Vec<_> = block.parameters()?.as_block_parameters_node()?.parameters()?.requireds().iter().collect();
+        let [param] = params.as_slice() else { return None };
+        let var = constant_id_str(&param.as_required_parameter_node()?.name()).to_string();
+        let inner = flatten_statements(block.body()?);
+        let [eval] = inner.as_slice() else { return None };
+        let eval = eval.as_call_node()?;
+        if !matches!(constant_id_str(&eval.name()).as_ref(), "class_eval" | "module_eval")
+            || eval.receiver().is_some_and(|r| r.as_self_node().is_none())
+            || eval.block().is_some()
+        {
+            return None;
+        }
+        let args: Vec<_> = eval.arguments()?.arguments().iter().collect();
+        let template = args.first()?;
+        // The pieces of the string, with `None` where the loop's variable goes.
+        let mut pieces: Vec<Option<String>> = Vec::new();
+        if let Some(plain) = template.as_string_node() {
+            pieces.push(Some(String::from_utf8_lossy(plain.unescaped()).into_owned()));
+        } else {
+            for part in template.as_interpolated_string_node()?.parts().iter() {
+                if let Some(text) = part.as_string_node() {
+                    pieces.push(Some(String::from_utf8_lossy(text.unescaped()).into_owned()));
+                    continue;
+                }
+                let embedded = part.as_embedded_statements_node()?;
+                let stmts: Vec<_> = embedded.statements()?.body().iter().collect();
+                let [read] = stmts.as_slice() else { return None };
+                if read.as_local_variable_read_node().is_none_or(|r| constant_id_str(&r.name()) != var) {
+                    return None;
+                }
+                pieces.push(None);
+            }
+        }
+        Some(elements.iter().map(|el| pieces.iter().map(|p| p.clone().unwrap_or_else(|| el.clone())).collect()).collect())
+    };
+    let mut kept = Vec::with_capacity(statements.len());
+    let mut evaled = Vec::new();
+    for s in statements {
+        match unrolled(&s) {
+            Some(sources) => evaled.extend(sources),
+            None => kept.push(s),
+        }
+    }
+    (kept, evaled)
 }
 
 /// Outcome of claiming a library-class `mattr_*` / `cattr_*` declaration.
