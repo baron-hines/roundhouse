@@ -328,3 +328,57 @@ fn a_renders_other_options_run_before_the_scope_is_read() {
     run.assert_passes();
     assert!(run.stdout.contains("option order OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
 }
+
+/// The bindings the option order needs are the rewrite's own: a local
+/// the action already has, whatever its name, keeps its value. Rails
+/// renders this with status 202 and the controller's `current_user` as
+/// the scope; the action's `__ams_json` and `__ams_scope` are its own
+/// locals, which the generated bindings must not take over.
+fn locals_app() -> emit_and_run::Overlay {
+    app().write(
+        "app/controllers/locals_json_controller.rb",
+        r#"class LocalsJsonController < ApplicationController
+  def show
+    __ams_json = :accepted
+    __ams_scope = "local"
+    render json: item, serializer: ScopeOnlySerializer, status: __ams_json
+    @after = [__ams_json, __ams_scope]
+  end
+
+  private
+
+  def item
+    Article.order(:id).first
+  end
+
+  def current_user
+    "ann"
+  end
+end
+"#,
+    )
+    .edit("config/routes.rb", "  resources :articles do", "  get \"locals\" => \"locals_json#show\"\n  resources :articles do")
+}
+
+#[test]
+fn a_renders_bindings_leave_the_actions_own_locals_alone() {
+    let run = locals_app().run_ruby(
+        r##"
+require_relative "app/controllers/locals_json_controller"
+a = Article.create!(title: "Hello", body: "A long body")
+c = LocalsJsonController.new
+c.params = {}
+c.process_action(:show)
+failures = []
+failures << "status #{c.status.inspect}, want 202" unless c.status == 202
+want = '{"id":' + a.id.to_s + ',"scoped":"ann"}'
+failures << "body #{c.body.inspect}, want #{want.inspect}" unless c.body == want
+after = c.instance_variable_get(:@after)
+failures << "locals after #{after.inspect}, want [:accepted, \"local\"]" unless after == [:accepted, "local"]
+raise failures.join("\n") unless failures.empty?
+puts "locals OK"
+"##,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("locals OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+}
