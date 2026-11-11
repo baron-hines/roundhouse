@@ -219,6 +219,37 @@ fn nested_extensions_compile_with_unmodified_signatures() {
 }
 
 #[test]
+fn mixed_stored_receivers_dispatch_each_union_arm_on_its_own_side() {
+    let source = r#"class Loader
+  def self.load(value) = 17
+  def load(value) = 17
+end
+class Formatter
+  def self.load(value) = false
+  def load(value) = "instance"
+end
+class Probe
+  def initialize(flag)
+    @loader = flag ? Loader : Formatter.new
+  end
+  def reference = [nil].map(&@loader.method(:load))
+  def direct = @loader.load(nil)
+end
+"#;
+    let signatures = rbs(source, "probe");
+    for expected in [
+        "def reference: () -> Array[(Integer | String)]",
+        "def direct: () -> (Integer | String)",
+    ] {
+        assert!(signatures.contains(expected), "{signatures}");
+    }
+    let run = app(source).run_ruby(
+        "p [Probe.new(true).reference, Probe.new(false).reference, Probe.new(true).direct, Probe.new(false).direct]\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "[[17], [\"instance\"], 17, \"instance\"]\n");
+}
+
+#[test]
 fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls
   def load(value) = "instance"

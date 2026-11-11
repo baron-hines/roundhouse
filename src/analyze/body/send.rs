@@ -2882,7 +2882,8 @@ impl<'a> BodyTyper<'a> {
                     if matches!(v, Ty::Nil | Ty::Var { .. }) {
                         continue;
                     }
-                    let r = self.dispatch_on(Some(v), method, block_ret, args, instance_receiver);
+                    let r = self.dispatch_on(Some(v), method, block_ret, args,
+                        instance_receiver && super::instance_shaped(v));
                     if !matches!(r, Ty::Var { .. }) {
                         resolved.push(r);
                     }

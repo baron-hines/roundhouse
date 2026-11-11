@@ -2178,7 +2178,8 @@ impl<'a> BodyTyper<'a> {
                     Some(r) => Some(self.analyze_receiver(r, ctx)),
                     None => ctx.self_ty.clone(),
                 };
-                let instance_receiver = recv.as_ref().map_or(ctx.instance_body, |r| self.is_instance(r, ctx))
+                let receiver_is_instance = recv.as_ref().map_or(ctx.instance_body, |r| self.is_instance(r, ctx));
+                let instance_receiver = receiver_is_instance
                     && recv_ty.as_ref().is_some_and(instance_shaped);
                 if self.inquirers.is_some() && matches!(crate::expr::ExprCold::diagnostic(&expr.cold), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "buffered zlib result") {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
@@ -2188,7 +2189,8 @@ impl<'a> BodyTyper<'a> {
                         target: None, construct: Symbol::from("buffered zlib result"), detail: detail.to_string(),
                     }));
                 }
-                let dispatched = self.dispatch_on(recv_ty.as_ref(), name, None, &[], instance_receiver);
+                let dispatched = self.dispatch_on(recv_ty.as_ref(), name, None, &[], instance_receiver
+                    || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
                 if matches!(dispatched, Ty::Var { .. })
                     && let Some(Ty::Class { id, .. }) = recv_ty.as_ref()
                     && self.open_classes.is_some_and(|o| o.open(id, !instance_receiver).is_some())
@@ -2903,7 +2905,8 @@ impl<'a> BodyTyper<'a> {
                     }
                 }
                 let mut dispatched =
-                    self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver);
+                    self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver
+                        || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
                 // One controller arm cannot supply a missing writer on a
                 // different concrete receiver in the same union.
                 if controller_writer
