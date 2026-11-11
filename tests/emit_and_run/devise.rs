@@ -1066,3 +1066,103 @@ fn a_devise_sign_in_is_tracked_over_rack_on_the_ruby_family() {
     run.assert_passes();
     assert!(run.stdout.contains("devise tracking over rack passed"), "{}", run.stdout);
 }
+
+/// `:lockable`, as Rails 8.1.4 with Devise 4.9.4 answers it with `config.maximum_attempts = 3`: the third wrong
+/// password locks the account and mails an unlock link, the right password is refused while it is locked, and the link
+/// unlocks it. Its `delegate ..., to: "self.class"` forwards the strategy, as Rails' generated method does.
+const LOCKABLE_COLUMNS: &str = "    t.integer \"failed_attempts\", default: 0, null: false\n    t.string \"unlock_token\"\n    t.datetime \"locked_at\"\n";
+
+fn lockable_app() -> emit_and_run::Overlay {
+    app(":database_authenticatable, :lockable", RECOVERABLE_ROUTES)
+        .edit("db/schema.rb", "    t.datetime \"reset_password_sent_at\"\n", &format!("    t.datetime \"reset_password_sent_at\"\n{LOCKABLE_COLUMNS}"))
+        .write("config/initializers/devise.rb", "Devise.setup do |config|\n  config.mailer_sender = \"please-change-me@example.com\"\n  config.maximum_attempts = 3\n  require \"devise/orm/active_record\"\nend\n")
+        .write("app/controllers/accounts_controller.rb", RESETS)
+}
+
+const RACK_LOCK: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  path, query = path.split("?", 2)
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => query.to_s, "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+sign_in = lambda do |password|
+  _, _, page = req("GET", "/users/sign_in")
+  token = URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1])
+  req("POST", "/users/sign_in", "authenticity_token=#{token}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=#{password}")
+end
+
+req("GET", "/account/new")
+[[1, false], [2, false], [3, true]].each do |count, locked|
+  status, = sign_in.("wrong")
+  user = User.find_by(email: "a@example.com")
+  raise "wrong #{count}: #{[status, user.failed_attempts, user.locked_at.nil?].inspect}" unless status == 200 && user.failed_attempts == count && user.locked_at.nil? != locked
+end
+_, _, mailed = req("GET", "/account/mailed")
+subject, from, to, body = mailed.split("|", 4)
+raise "mail #{[subject, from, to].inspect}" unless [subject, from, to] == ["Unlock instructions", "please-change-me@example.com", "a@example.com"]
+raw = body[/unlock_token=([^"&]+)"/, 1]
+raise "no token in #{body}" if raw.nil?
+status, = sign_in.("secret123")
+raise "locked sign in #{status}" unless status == 200
+status, = req("GET", "/secret")
+raise "locked signed in #{status}" unless status == 302
+status, headers, = req("GET", "/users/unlock?unlock_token=#{raw}")
+raise "unlock #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+user = User.find_by(email: "a@example.com")
+raise "unlocked #{[user.failed_attempts, user.locked_at].inspect}" unless user.failed_attempts == 0 && user.locked_at.nil?
+status, headers, = sign_in.("secret123")
+raise "sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
+puts "devise locking over rack passed"
+"##;
+
+#[test]
+fn a_devise_account_locks_and_unlocks_over_rack_on_the_ruby_family() {
+    let run = lockable_app().run_ruby(RACK_LOCK);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise locking over rack passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_devise_account_locks_and_unlocks_over_http_natively() {
+    let tree = lockable_app().native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    assert_eq!(server.get("/account/new").status, 200, "{}", server.log());
+    let form_type = ("Content-Type", "application/x-www-form-urlencoded");
+    let sign_in = |password: &str| {
+        let mut jar = Vec::new();
+        let (page, cookies) = server.request_with_set_cookies("GET", "/users/sign_in", &[], "");
+        kept(&mut jar, &cookies);
+        let token = form_encode(between(&page.body, "name=\"authenticity_token\" value=\"", "\""));
+        let cookie = header(&jar);
+        let body = format!("authenticity_token={token}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D={password}");
+        server.request_with_set_cookies("POST", "/users/sign_in", &[form_type, ("Cookie", cookie.as_str())], &body).0
+    };
+    for _ in 0..3 {
+        let wrong = sign_in("wrong");
+        assert_eq!(wrong.status, 200, "{}\n{}", wrong.body, server.log());
+    }
+    let mailed = server.get("/account/mailed");
+    let mut parts = mailed.body.splitn(4, '|');
+    let head: Vec<&str> = parts.by_ref().take(3).collect();
+    assert_eq!(head, ["Unlock instructions", "please-change-me@example.com", "a@example.com"], "{}", mailed.body);
+    let raw = between(parts.next().unwrap_or_default(), "unlock_token=", "\"").to_string();
+    assert_eq!(sign_in("secret123").status, 200, "{}", server.log());
+    let unlocked = server.get(&format!("/users/unlock?unlock_token={raw}"));
+    assert_eq!(unlocked.status, 302, "{}\n{}", unlocked.body, server.log());
+    let signed = sign_in("secret123");
+    assert_eq!(signed.status, 302, "{}\n{}", signed.body, server.log());
+}

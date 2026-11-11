@@ -1129,14 +1129,27 @@ module ActiveRecord
     # `Model.update_counters(id, col: delta, …)` — atomic column
     # increments (`col = col + delta`) on one row, skipping validations
     # and callbacks. Returns the affected-row count.
+    # Not `col + delta`: a NULL counter would stay NULL, where Rails' `COALESCE` starts it at 0.
     def self.update_counters(id, counters)
       parts = []
       counters.each do |col, delta|
-        parts.push("#{col} = #{col} + #{delta.to_i}")
+        parts.push("#{col} = COALESCE(#{col}, 0) + #{delta.to_i}")
       end
       sql = "UPDATE #{table_name} SET #{parts.join(", ")} WHERE id = #{ActiveRecord.adapter.escape_value(id)}"
       ActiveRecord.adapter.execute_ddl(sql)
       ActiveRecord.adapter.changes
+    end
+
+    # `Model.increment_counter(:col, id, by: n)` / `decrement_counter`: Rails' `update_counters(id, col => ±n)`.
+    # Not with `touch:`, which also writes timestamps this one does not.
+    def self.increment_counter(counter_name, id, by: 1, touch: nil)
+      raise NotImplementedError, "increment_counter's touch: is not supported" unless touch.nil?
+      update_counters(id, { counter_name.to_sym => by })
+    end
+
+    def self.decrement_counter(counter_name, id, by: 1, touch: nil)
+      raise NotImplementedError, "decrement_counter's touch: is not supported" unless touch.nil?
+      update_counters(id, { counter_name.to_sym => -by })
     end
 
     # `Model.upsert(attrs, …)` — INSERT that folds into an UPDATE when it
