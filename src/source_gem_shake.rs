@@ -330,6 +330,8 @@ fn file_of_class(c: &LibraryClass) -> Option<FileId> {
 /// The gems' classes and the class graph reach walks; none of it changes as reach grows.
 struct Gems<'a> {
     names: HashSet<String>,
+    /// Every constant the program writes, as written: a module only these name is a value no call of unknown receiver holds.
+    written_consts: HashSet<String>,
     entries: HashMap<String, Vec<&'a LibraryClass>>,
     /// `(owner, class side, method)` for every method a class defines.
     defined: HashSet<(&'a str, bool, &'a str)>,
@@ -403,7 +405,20 @@ impl<'a> Gems<'a> {
                 model_copies.entry((model.name.0.to_string(), m.receiver == MethodReceiver::Class, m.name.to_string())).or_default().push(m);
             }
         }
-        let mut gems = Gems { names, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes, unloadable, model_copies };
+        let mut written_consts: HashSet<String> = HashSet::default();
+        fn consts_in(e: &crate::expr::Expr, out: &mut HashSet<String>) {
+            if let ExprNode::Const { path } = &*e.node {
+                out.insert(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"));
+            }
+            e.node.for_each_child(&mut |c| consts_in(c, out));
+        }
+        for c in &app.library_classes {
+            for e in c.methods.iter().map(|m| &m.body).chain(c.unknown_calls.iter()).chain(c.constants.iter().map(|(_, v)| v)).chain(c.class_ivar_initializers.iter()) {
+                consts_in(e, &mut written_consts);
+            }
+        }
+        crate::lower::for_each_emit_body_ref(app, &mut |e| consts_in(e, &mut written_consts));
+        let mut gems = Gems { names, written_consts, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes, unloadable, model_copies };
         gems.app_mixins = gems.mixed_into_the_app(app);
         Some(gems)
     }
@@ -941,6 +956,11 @@ impl Walk<'_, '_> {
         }
     }
 
+    fn unnamed_module(&self, name: &str) -> bool {
+        let is_module = self.gems.entries.get(name).is_some_and(|e| !e.is_empty() && e.iter().all(|c| c.is_module));
+        is_module && !self.gems.written_consts.iter().any(|written| written == name || name.ends_with(&format!("::{written}")))
+    }
+
     fn found(&mut self, calls: Vec<Call>, consts: Vec<Const>) {
         for call in calls {
             self.call(call);
@@ -983,7 +1003,7 @@ impl Walk<'_, '_> {
         for a in ancestors.iter() {
             for entry in gems.entries.get(a.as_str()).into_iter().flatten() {
                 for m in &entry.methods {
-                    if self.any.contains(m.name.as_str()) {
+                    if self.any.contains(m.name.as_str()) && !(m.receiver == MethodReceiver::Class && self.unnamed_module(&d)) {
                         self.answer(&d, m.receiver == MethodReceiver::Class, m.name.as_str());
                     }
                 }
@@ -1075,6 +1095,12 @@ impl Walk<'_, '_> {
                 }
                 for d in receivers {
                     for side in [false, true] {
+                        // Not a module's own class-side method a constant of it never reaches: a module is no other
+                        // object's class, so a receiver of unknown type answers it only as the module itself, a value the
+                        // program reads somewhere (rack-protection's `Rack::Protection.new`, which nothing names).
+                        if side && self.unnamed_module(&d) {
+                            continue;
+                        }
                         self.answer(&d, side, &method);
                     }
                 }

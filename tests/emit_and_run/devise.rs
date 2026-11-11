@@ -65,11 +65,19 @@ fn all_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::p
 }
 
 fn app(modules: &str, routes: &str) -> emit_and_run::Overlay {
+    app_with(modules, routes, &[], "", &[])
+}
+
+/// [`app`] with more gems in the bundle: their lock specs (before `rack`'s), the names the Gemfile lists, and the
+/// installed gems written into `vendor/bundle`.
+fn app_with(modules: &str, routes: &str, gems: &[(&str, &str)], specs: &str, listed: &[&str]) -> emit_and_run::Overlay {
     let fixture = roundhouse::fixtures::real_blog();
     let lock = std::fs::read_to_string(fixture.join("Gemfile.lock")).unwrap();
+    let dependencies: String = std::iter::once("devise").chain(listed.iter().copied()).map(|g| format!("  {g}\n")).collect();
     // Not a bare "    rack (": a dependency line ("      rack (>= 2.2.4)") holds it too.
-    let lock = lock.replacen("\n    rack (", &format!("\n{SPECS}    rack ("), 1).replacen("DEPENDENCIES\n", "DEPENDENCIES\n  devise\n", 1);
-    let gemfile = std::fs::read_to_string(fixture.join("Gemfile")).unwrap() + "gem \"devise\"\n";
+    let lock = lock.replacen("\n    rack (", &format!("\n{SPECS}{specs}    rack ("), 1).replacen("DEPENDENCIES\n", &format!("DEPENDENCIES\n{dependencies}"), 1);
+    let gemfile = std::fs::read_to_string(fixture.join("Gemfile")).unwrap()
+        + &std::iter::once("devise").chain(listed.iter().copied()).map(|g| format!("gem \"{g}\"\n")).collect::<String>();
     let mut overlay = emit_and_run::real_blog()
         .write("Gemfile", &gemfile)
         .write("Gemfile.lock", &lock)
@@ -79,7 +87,7 @@ fn app(modules: &str, routes: &str) -> emit_and_run::Overlay {
         .write("config/initializers/devise.rb", "Devise.setup do |config|\n  config.mailer_sender = \"please-change-me@example.com\"\n  require \"devise/orm/active_record\"\nend\n")
         .write("app/models/user.rb", &format!("class User < ApplicationRecord\n  devise {modules}\nend\n"))
         .edit("config/routes.rb", "  root \"articles#index\"\n", &format!("  root \"articles#index\"\n{routes}"));
-    for (name, version) in GEMS {
+    for (name, version) in GEMS.iter().chain(gems) {
         let gem = installed(name, version);
         let mut files = Vec::new();
         rb_files(&gem, &gem.join("lib"), &mut files);
@@ -1273,4 +1281,102 @@ fn a_devise_session_times_out_over_rack_on_the_ruby_family() {
         .run_ruby(RACK_TIMEOUT);
     run.assert_passes();
     assert!(run.stdout.contains("devise timeout over rack passed"), "{}", run.stdout);
+}
+
+/// `:omniauthable` with OmniAuth's `developer` strategy, as Rails 8.1.4 with Devise 4.9.4 and OmniAuth 2.1.4 answer
+/// it: the sign-in page links the provider, Devise's engine puts the strategy on the stack per `config.omniauth`
+/// (`app.middleware.use config.strategy_class, *config.args`), the strategy answers the request phase under the
+/// path prefix Devise's routes set, and its callback reaches the app's `OmniauthCallbacksController`, which signs the
+/// user `find_or_create_by` made in. OmniAuth runs as the installed gem on the Ruby family.
+const OMNIAUTH_GEMS: [(&str, &str); 3] = [("omniauth", "2.1.4"), ("hashie", "5.1.0"), ("rack-protection", "4.2.1")];
+
+const OMNIAUTH_SPECS: &str = "    hashie (5.1.0)
+      logger
+    omniauth (2.1.4)
+      hashie (>= 3.4.6)
+      logger
+      rack (>= 2.2.3)
+      rack-protection
+    rack-protection (4.2.1)
+      base64 (>= 0.1.0)
+      logger (>= 1.6.0)
+      rack (>= 3.0.0, < 4)
+";
+
+const OMNIAUTH_USER: &str = "class User < ApplicationRecord
+  devise :database_authenticatable, :omniauthable, omniauth_providers: [:developer]
+
+  def self.from_omniauth(auth)
+    find_or_create_by(provider: auth.provider, uid: auth.uid) do |user|
+      user.email = auth.info.email
+      user.password = Devise.friendly_token[0, 20]
+    end
+  end
+end
+";
+
+const OMNIAUTH_CALLBACKS: &str = "class Users::OmniauthCallbacksController < Devise::OmniauthCallbacksController
+  skip_forgery_protection only: :developer
+
+  def developer
+    @user = User.from_omniauth(request.env[\"omniauth.auth\"])
+    sign_in_and_redirect @user, event: :authentication
+  end
+end
+";
+
+fn omniauth_app() -> emit_and_run::Overlay {
+    app_with(
+        ":database_authenticatable",
+        "  devise_for :users, controllers: { omniauth_callbacks: \"users/omniauth_callbacks\" }\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n",
+        &OMNIAUTH_GEMS,
+        OMNIAUTH_SPECS,
+        &["omniauth"],
+    )
+    .edit("db/schema.rb", "    t.string \"encrypted_password\", default: \"\", null: false\n", "    t.string \"encrypted_password\", default: \"\", null: false\n    t.string \"provider\"\n    t.string \"uid\"\n")
+    .write("config/initializers/devise.rb", "Devise.setup do |config|\n  config.mailer_sender = \"please-change-me@example.com\"\n  require \"devise/orm/active_record\"\n  config.omniauth :developer\nend\n")
+    // Not OmniAuth's own request check: it reads a session key Rails does not write, which omniauth-rails_csrf_protection replaces.
+    .write("config/initializers/omniauth.rb", "OmniAuth.config.request_validation_phase = nil\n")
+    .write("app/models/user.rb", OMNIAUTH_USER)
+    .write("app/controllers/users/omniauth_callbacks_controller.rb", OMNIAUTH_CALLBACKS)
+}
+
+const RACK_OMNIAUTH: &str = r##"$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+
+_, _, page = req("GET", "/users/sign_in")
+raise "no provider button in #{page}" unless page.include?(%(<form action="/users/auth/developer" method="post" class="button_to">))
+status, _, form = req("POST", "/users/auth/developer")
+raise "request phase #{status} #{form[0, 200]}" unless status == 200 && form.include?(%(action='/users/auth/developer/callback'))
+status, = req("GET", "/secret")
+raise "signed in before the callback #{status}" unless status == 302
+status, headers, = req("POST", "/users/auth/developer/callback", "name=Dev&email=dev%40example.com")
+raise "callback #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
+user = User.find_by(provider: "developer", uid: "dev@example.com")
+raise "user #{user.inspect}" unless user && user.email == "dev@example.com"
+status, = req("GET", "/secret")
+raise "signed in #{status}" unless status == 200
+puts "devise omniauth over rack passed"
+"##;
+
+#[test]
+fn a_devise_user_signs_in_through_omniauth_over_rack_on_the_ruby_family() {
+    let run = omniauth_app().run_ruby(RACK_OMNIAUTH);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise omniauth over rack passed"), "{}", run.stdout);
 }

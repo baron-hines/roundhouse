@@ -407,7 +407,8 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
                     *expanded.entry(method.clone()).or_default() += 1;
                 }
                 // An extended module's method the call reaches is left to the replay it had before: `extend` and the calls after it run as the class loads.
-                Err(_) if from_module.contains(method) => {
+                // So is the class's own (OmniAuth's `KeyStore.override_logging`, which `require`s), which Ruby runs as the class loads.
+                Err(_) if from_module.contains(method) || own.contains(&(method.clone(), MethodReceiver::Class)) => {
                     consumed.remove(&index);
                     failed.insert(method.clone());
                 }
