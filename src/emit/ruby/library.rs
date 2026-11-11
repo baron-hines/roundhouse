@@ -7795,8 +7795,14 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
+        // A parameter's default is evaluated in the method's lexical
+        // scope, as its body is: `def tag(value = Util.tag)` in a
+        // compact `class Gadget::Thing` reads `::Util`.
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, name, &shadowing, &prefixes, &known);
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                root_shadowed_constants(default, name, &shadowing, &prefixes, &known);
+            }
         }
     }
 }
@@ -11198,6 +11204,7 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
 pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &App) {
     apply_enum_raw_input_lowering(lcs, app);
     apply_string_keyed_attrs_lowering(lcs, app);
+    apply_dynamic_human_attribute_name(lcs, app);
     for model in &app.models {
         let table = app.schema.tables.get(&model.table.0);
         let mut casts: HashMap<Symbol, &'static str> = table
@@ -11365,6 +11372,33 @@ fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
             }
             other => sp_expr(ExprNode::Seq { exprs: vec![guarded, Expr::new(body.span, other)] }),
         };
+    }
+}
+
+/// Ruby-family pre-emit pass: `Model.human_attribute_name(attr)` of an attribute only known when it runs (Devise's
+/// `scope_class.human_attribute_name(key)`) answers the locale's name for it, as Rails does. `lower::
+/// human_attribute_name` folds a literal attribute; the runtime's ActiveRecord::Base answer humanizes, which is
+/// Rails' too where the locale names no attribute, so only a model whose locale names one gets its own.
+fn apply_dynamic_human_attribute_name(lcs: &mut [LibraryClass], app: &App) {
+    for model in &app.models {
+        let names = model.i18n.translated_attribute_names();
+        if names.is_empty() {
+            continue;
+        }
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "human_attribute_name") {
+            continue;
+        }
+        let arms: String = names.iter().map(|(attr, name)| format!("    when {attr:?} then {name:?}\n")).collect();
+        let src = format!(
+            "def self.human_attribute_name(attr, options = {{}})\n  case attr.to_s\n{arms}  else ActiveSupport.humanize(attr.to_s.tr(\".\", \"_\"))\n  end\nend\n"
+        );
+        let Ok(mut methods) = crate::runtime_src::parse_methods(&src) else { continue };
+        for m in &mut methods {
+            m.receiver = MethodReceiver::Class;
+            m.enclosing_class = Some(model.name.0.clone());
+        }
+        lc.methods.extend(methods);
     }
 }
 

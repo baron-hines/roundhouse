@@ -226,6 +226,7 @@ fn tiny_blog_round_trips() {
         pending_attachment_on_load: Vec::new(),
         load_hook_class_macros: Vec::new(),
         load_hook_extended_macros: Vec::new(),
+        load_hook_constants: Vec::new(),
         macro_includes: Vec::new(),
         expanded_macro_calls: Vec::new(),
         spliced_class_methods: Default::default(),

@@ -25,6 +25,8 @@ mod controller_content_type_writer;
 mod time_change_usec_contract;
 #[path = "emit_and_run/time_change_usec.rs"]
 mod time_change_usec;
+#[path = "emit_and_run/controller_constant_rooting.rs"]
+mod controller_constant_rooting;
 #[path = "emit_and_run/rate_limits.rs"]
 mod rate_limits;
 #[path = "emit_and_run/config_for.rs"]
@@ -155,6 +157,10 @@ mod constant_branches;
 mod defined_method_query;
 #[path = "emit_and_run/metal_subclass.rs"]
 mod metal_subclass;
+#[path = "emit_and_run/association_reflection.rs"]
+mod association_reflection;
+#[path = "emit_and_run/human_attribute_name_dynamic.rs"]
+mod human_attribute_name_dynamic;
 #[path = "emit_and_run/boot_with_options.rs"]
 mod boot_with_options;
 #[path = "support/class_param_or_assign.rs"]
@@ -22154,3 +22160,5 @@ mod form_for_record;
 mod library_concern_included_include_contract;
 #[path = "emit_and_run/library_concern_included_include.rs"]
 mod library_concern_included_include;
+#[path = "emit_and_run/param_default_constant_rooting.rs"]
+mod param_default_constant_rooting;

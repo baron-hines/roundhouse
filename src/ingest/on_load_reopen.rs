@@ -91,6 +91,18 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
 
         if let Some(statements) = body.as_statements_node() {
             for stmt in statements.body().iter() {
+                if hook == "active_record"
+                    && let Some(write) = stmt.as_constant_path_write_node()
+                    && write.target().parent().is_some_and(|p| p.as_self_node().is_some())
+                    && let Some(value) = constant_path_of(&write.value())
+                {
+                    let name = Symbol::from(String::from_utf8_lossy(write.target().name().map(|n| n.as_slice()).unwrap_or_default()).into_owned());
+                    let path: Vec<Symbol> = value.iter().filter(|s| !s.is_empty()).map(|s| Symbol::from(s.as_str())).collect();
+                    if !app.load_hook_constants.iter().any(|(n, _)| *n == name) {
+                        app.load_hook_constants.push((name, path));
+                    }
+                    continue;
+                }
                 let Some(include) = stmt.as_call_node() else { continue };
                 if hook == "active_record" {
                     for id in extended_modules(&include) {
