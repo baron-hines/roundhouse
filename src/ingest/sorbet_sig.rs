@@ -127,7 +127,7 @@ type MethodSides = HashMap<(ClassId, Symbol), (bool, bool)>;
 /// there, not an instance of it.
 fn walk(
     statements: &[Node<'_>],
-    scope: Option<&str>,
+    scope: Option<(&str, bool)>,
     in_singleton_class: bool,
     aliases: &HashMap<String, Ty>,
     rbs_aliases: &crate::rbs::AliasTable,
@@ -136,6 +136,7 @@ fn walk(
     sides: &mut MethodSides,
     source: &[u8],
 ) {
+    let (scope, nesting_matches) = scope.map_or((None, true), |(name, matches)| (Some(name), matches));
     // The `sig` immediately above a `def` is the one that applies to
     // it; anything else between them (a comment is not a statement,
     // but another call is) means the pairing is not ours to guess.
@@ -165,7 +166,7 @@ fn walk(
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, class.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
+                    walk(&statements, Some((&name, nesting_matches && class.constant_path().as_constant_read_node().is_some())), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -178,7 +179,7 @@ fn walk(
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, module.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
+                    walk(&statements, Some((&name, nesting_matches && module.constant_path().as_constant_read_node().is_some())), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -193,7 +194,8 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, sides, source);
+                    // The sidecar has no eigenclass lexical scope.
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope.map(|name| (name, false)), true, aliases, rbs_aliases, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -201,6 +203,8 @@ fn walk(
         }
         if let Some(def) = statement.as_def_node() {
             if let Some(scope) = scope {
+                // A replacement without an accepted signature owns no spellings.
+                crate::rbs::file_spellings(&ClassId(Symbol::new(scope)), &Symbol::new(constant_id_str(&def.name())), Default::default(), nesting_matches);
                 let entry = sides
                     .entry((ClassId(Symbol::new(scope)), Symbol::new(constant_id_str(&def.name()))))
                     .or_default();
@@ -217,17 +221,19 @@ fn walk(
                         .or_default()
                         .insert(Symbol::new(constant_id_str(&def.name())));
                 }
-                if let Some(ty) = signature_ty(&statements[sig], &def, in_singleton_class, aliases) {
-                    out.entry(ClassId(Symbol::new(scope)))
-                        .or_default()
-                        .insert(Symbol::new(constant_id_str(&def.name())), ty);
+                let (ty, spelled) = crate::rbs::spelled(|| signature_ty(&statements[sig], &def, in_singleton_class, aliases));
+                if let Some(ty) = ty {
+                    let name = Symbol::new(constant_id_str(&def.name()));
+                    crate::rbs::file_spellings(&ClassId(Symbol::new(scope)), &name, spelled, nesting_matches);
+                    out.entry(ClassId(Symbol::new(scope))).or_default().insert(name, ty);
                 }
             }
             else if let Some(scope) = scope {
-                if let Some(ty) = rbs_comment_signature(source, &def, in_singleton_class, rbs_aliases) {
-                    out.entry(ClassId(Symbol::new(scope)))
-                        .or_default()
-                        .insert(Symbol::new(constant_id_str(&def.name())), ty);
+                let (ty, spelled) = crate::rbs::spelled(|| rbs_comment_signature(source, &def, in_singleton_class, rbs_aliases));
+                if let Some(ty) = ty {
+                    let name = Symbol::new(constant_id_str(&def.name()));
+                    crate::rbs::file_spellings(&ClassId(Symbol::new(scope)), &name, spelled, nesting_matches);
+                    out.entry(ClassId(Symbol::new(scope))).or_default().insert(name, ty);
                 }
             }
             continue;
@@ -654,10 +660,15 @@ pub(super) fn sorbet_ty(
         if let Some(ty) = aliases.get(name) {
             return Some(ty.clone());
         }
+        crate::rbs::note_spelling(name, name.to_string());
         return Some(named_ty(name));
     }
     if let Some(path) = node.as_constant_path_node() {
         let name = constant_path_name(node);
+        fn rooted(node: &Node<'_>) -> bool {
+            node.as_constant_path_node().is_some_and(|p| p.parent().is_none_or(|parent| rooted(&parent)))
+        }
+        crate::rbs::note_spelling(&name, format!("{}{name}", if rooted(node) { "::" } else { "" }));
         // `T::Boolean` is a type of its own; every other `T::…`
         // constant in a signature position is a container handled
         // below or something this grammar does not read.

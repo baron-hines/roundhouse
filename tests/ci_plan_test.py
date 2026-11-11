@@ -77,6 +77,22 @@ class EncryptsRefusalCoverage(unittest.TestCase):
 
 
 class PublicationBoundary(unittest.TestCase):
+    def test_rbs_writer_paths_run_the_qualified_name_contracts(self):
+        for path in (
+            "src/emit/ruby/rbs.rs",
+            "src/emit/ruby/library.rs",
+            "src/rbs.rs",
+            "src/ingest/sorbet_sig.rs",
+            "src/app.rs",
+            "src/ingest/app.rs",
+            "tests/qualified_constant_rbs.rs",
+        ):
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("qualified_constant_rbs", plan["spinel_tests"])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("unit", plan["jobs"])
+
     def test_scheduled_full_on_canonical_main_may_publish(self):
         for event in ("schedule", "workflow_dispatch"):
             with self.subTest(event=event):
@@ -886,7 +902,7 @@ class Routing(unittest.TestCase):
         # must too when that file is the only change.
         self.assertEqual(
             ci.select(["src/emit/ruby/library.rs"])["spinel_tests"],
-            [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_constraints"],
+            [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_constraints", "qualified_constant_rbs"],
         )
         self.assertEqual(
             ci.select(["runtime/spinel/db.rb"])["spinel_tests"],

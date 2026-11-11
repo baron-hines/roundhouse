@@ -151,6 +151,11 @@ module ActiveSupport
   # anything that answers `duplicable?` with false is itself; anything
   # else is its `dup` (an Integer's, nil's or a Symbol's is itself).
   # `lower::symbolize_keys` routes a typed Hash or Array receiver here.
+  # Not a table of hooks to run: an `on_load` block is carried into its class when the app is read, or reported.
+  def self.run_load_hooks(name, base = nil)
+    nil
+  end
+
   def self.deep_dup(value)
     case value
     when Array then value.map { |item| ActiveSupport.deep_dup(item) }
@@ -584,6 +589,18 @@ module ActiveSupport
   # Hash, removed from the Array it was called on, or a new empty one.
   # Only a plain Hash, as Rails' `Hash#extractable_options?` answers
   # (`instance_of?(Hash)`): a subclass stays in the Array.
+  # AS `Hash#assert_valid_keys`: the first key outside the list raises, naming the list.
+  def self.assert_valid_keys(hash, valid_keys)
+    # Not the list as given: Rails flattens it, so `assert_valid_keys(KEYS)` and `(:a, [:b])` name the same keys.
+    keys = valid_keys.flatten
+    hash.keys.each do |key|
+      unless keys.include?(key)
+        raise ArgumentError, "Unknown key: #{key.inspect}. Valid keys are: #{keys.map { |valid| valid.inspect }.join(", ")}"
+      end
+    end
+    hash
+  end
+
   def self.extract_options!(list)
     last = list.last
     return list.pop if last.instance_of?(Hash)

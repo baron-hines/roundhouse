@@ -5677,9 +5677,25 @@ pub fn thread_rel_into_class_method_calls(
 ) {
     let Some(per_model) = assoc_class_methods.get(self_model) else { return };
     fn walk(e: &mut Expr, rel: &Symbol, per_model: &HashMap<Symbol, AssocScopedMethod>) {
+        // Not into a block that rebinds `self` (`obj.instance_exec { helper }`): its calls are on that object, not the model.
+        if let ExprNode::Send { recv, method, args, block: Some(_), .. } = &mut *e.node
+            && matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec")
+        {
+            if let Some(r) = recv {
+                walk(r, rel, per_model);
+            }
+            for a in args.iter_mut() {
+                walk(a, rel, per_model);
+            }
+            return;
+        }
         e.node.for_each_child_mut(&mut |c| walk(c, rel, per_model));
         let span = e.span;
-        if let ExprNode::Send { recv: None, method, args, .. } = &mut *e.node {
+        // Not a bare send alone: typed against the model, an implicit-self call is the model's `self.` one (a concern's
+        // `class_methods` body, `find_by_token_for(:share, id)`).
+        if let ExprNode::Send { recv, method, args, .. } = &mut *e.node
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        {
             if let Some(entry) = per_model.get(method) {
                 let already = args.iter().any(|a| matches!(&*a.node, ExprNode::Var { name, .. } if name == rel));
                 if !already {

@@ -1161,6 +1161,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     for module in ["ActionController::UrlFor", "ActionController::Redirecting", "AbstractController::Callbacks", "ActionView::Rendering"] {
         register_stdlib_class(classes, module, &[], &[]);
     }
+    // `runtime/ruby/action_dispatch/route_set.rb`: `main_app` is the app's routes.
+    let route_helpers = Ty::Class {
+        id: ClassId(Symbol::from("Class")),
+        args: vec![Ty::Class { id: ClassId(Symbol::from("RouteHelpers")), args: vec![].into() }].into(),
+    };
+    register_stdlib_class(classes, "ActionDispatch::Routing::MountedHelpers", &[], &[("main_app", route_helpers)]);
+    register_stdlib_class(classes, "ActionDispatch::Routing::RouteSet", &[("finalize_app!", Ty::Nil)], &[("finalize!", Ty::Nil)]);
     register_stdlib_class(classes, crate::analyze::indifferent::CLASS, &[], &[]);
     // Not answered here beyond `new`: the dispatch arm for `ActiveSupport::StringInquirer` types its predicates and String surface.
     register_stdlib_class(classes, "ActiveSupport::StringInquirer", &[("new", Ty::Str)], &[]);

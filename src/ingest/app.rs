@@ -2875,7 +2875,8 @@ end
                 }
                 let Some(source) = read_to_string_or_ledger(vfs, &entry)? else { continue };
                 let path_str = entry.display().to_string();
-                let parsed = crate::rbs::parse_app_signatures(&source).map_err(|message| {
+                let (parsed, spellings) = crate::rbs::collect_spellings(|| crate::rbs::parse_app_signatures(&source));
+                let parsed = parsed.map_err(|message| {
                     IngestError::Parse {
                         file: path_str.clone(),
                         message,
@@ -2887,6 +2888,9 @@ end
                             .entry(class_id)
                             .or_default()
                             .extend(methods);
+                    }
+                    for (class_id, methods) in spellings {
+                        app.rbs_spellings.entry(class_id).or_default().extend(methods);
                     }
                 }
                 // The same file's `include`s. A gem's base class is
@@ -2932,6 +2936,8 @@ end
     // because it is written for this analyzer while a `sig` is written
     // for Sorbet. A `sig` outside the grammar the reader models is
     // dropped whole and the method is inferred as before.
+    let external_methods: HashSet<_> = app.rbs_signatures.iter()
+        .flat_map(|(owner, methods)| methods.keys().map(move |name| (owner.clone(), name.clone()))).collect();
     for root in ["app", "lib"] {
         let tree = dir.join(root);
         if !vfs.is_dir(&tree) {
@@ -2940,12 +2946,25 @@ end
         let Ok(entries) = read_rb_files(vfs, &tree) else { continue };
         for entry in entries {
             let Ok(source) = vfs.read(&entry) else { continue };
-            let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(&source);
+            let ((signatures, abstracts), spellings) =
+                crate::rbs::collect_spellings(|| super::sorbet_sig::ingest_sorbet_declarations(&source));
             drop_abstract_stubs(&mut app, &abstracts);
-            for (class_id, methods) in signatures {
-                let declared = app.rbs_signatures.entry(class_id).or_default();
+            for (class_id, methods) in &signatures {
+                let declared = app.rbs_signatures.entry(class_id.clone()).or_default();
                 for (name, ty) in methods {
-                    declared.entry(name).or_insert(ty);
+                    declared.entry(name.clone()).or_insert_with(|| ty.clone());
+                }
+            }
+            // Provenance follows definitions, even when the shared signature
+            // table keeps an earlier seed. Sidecars and façades still win.
+            for (class_id, methods) in spellings {
+                for (name, mut spelled) in methods {
+                    if external_methods.contains(&(class_id.clone(), name.clone())) { continue; }
+                    let current = signatures.get(&class_id).and_then(|m| m.get(&name));
+                    let selected = app.rbs_signatures.get(&class_id).and_then(|m| m.get(&name));
+                    if selected.is_none() { continue; }
+                    if current != selected { spelled.clear(); }
+                    app.rbs_spellings.entry(class_id.clone()).or_default().insert(name, spelled);
                 }
             }
         }
@@ -3212,10 +3231,12 @@ end
     super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops);
     super::gem_routes::expand(vfs, dir, &path_gems, &mut app);
     super::class_macros::drop_expanded_hook_macros(&mut app, &hook_macros_called, &mentions);
+    super::extend_splice::splice_load_hook_extended_calls(&mut app);
     super::model_callbacks::expand_model_callbacks(&mut app);
     // After the macros: an expanded `has_ancestry` is what writes the `extend`.
     super::extend_splice::splice_sole_extended_modules(&mut app);
     super::included_extend::splice_included_extends(&mut app);
+    super::metal_actions::synthesize(&mut app);
     super::absence_guards::raise_undefined_capitalized_calls(&mut app);
     // Not asked at `absence_guards::mark`: by then a source gem's methods no longer resolve their file.
     let source_gem_classes = super::absence_guards::source_gem_classes(&app);
@@ -3519,7 +3540,7 @@ fn report_unmodelled_records(app: &App) {
     }
 }
 
-const APP_REQUIRABLE_STDLIB: &[&str] = &[
+pub(crate) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "base64", "benchmark", "bigdecimal", "cgi", "csv", "date", "delegate", "digest",
     "digest/md5", "digest/sha1", "digest/sha2", "English", "erb", "etc", "fileutils", "find",
     "forwardable", "io/console", "io/nonblock", "io/wait", "ipaddr", "json", "logger",

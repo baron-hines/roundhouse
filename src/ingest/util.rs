@@ -631,7 +631,17 @@ fn body_has_route_helpers_include(body: Option<Node<'_>>) -> bool {
 /// Match the `Rails.application.routes.url_helpers` receiver chain (a
 /// nested CallNode ladder rooted at the `Rails` constant).
 pub(super) fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
-    let mut expected = ["url_helpers", "routes", "application"].iter();
+    is_rails_routes_chain(node, "url_helpers")
+}
+
+/// `Rails.application.routes.mounted_helpers`: the module that answers `main_app`, the app's routes.
+pub(super) fn is_rails_mounted_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
+    is_rails_routes_chain(node, "mounted_helpers")
+}
+
+fn is_rails_routes_chain(node: &ruby_prism::Node<'_>, last: &str) -> bool {
+    let names = [last, "routes", "application"];
+    let mut expected = names.iter();
     let mut cur = match node.as_call_node() {
         Some(c) => c,
         None => return false,
