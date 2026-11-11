@@ -265,13 +265,23 @@ pub fn own_perform_async(app: &App, workers: &BTreeSet<String>) -> std::collecti
     let defined = |c: &LibraryClass, receiver: MethodReceiver| {
         c.methods.iter().find(|m| m.receiver == receiver && m.name.as_str() == "perform_async").map(|m| m.name_span)
     };
+    // As Ruby resolves a constant in a class body: nested in the class,
+    // then in each enclosing namespace, innermost first, then at the top
+    // level. A leading `::` names the top level only.
     let module_named = |owner: &str, path: &[Symbol]| -> Option<&LibraryClass> {
         let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
         let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
-        let nested = (!rooted).then(|| format!("{owner}::{written}"));
-        nested
+        let mut candidates: Vec<String> = Vec::new();
+        if !rooted {
+            let mut scope: Vec<&str> = owner.split("::").collect();
+            while !scope.is_empty() {
+                candidates.push(format!("{}::{written}", scope.join("::")));
+                scope.pop();
+            }
+        }
+        candidates.push(written);
+        candidates
             .iter()
-            .chain(std::iter::once(&written))
             .find_map(|name| app.library_classes.iter().find(|c| c.is_module && c.name.0.as_str() == name.as_str()))
     };
     app.library_classes

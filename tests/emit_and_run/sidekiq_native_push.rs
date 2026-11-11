@@ -476,6 +476,10 @@ fn unreadable_options_and_an_own_perform_async_are_errors_under_sidekiq() {
         format!("class CustomWorker\n  include Sidekiq::Job\n\n  def self.perform_async(n)\n    new.perform(n)\n  end\n{perform}");
     let fast_enqueue = "module FastEnqueue\n  def perform_async(n)\n    nil\n  end\nend\n";
     let extended_worker = format!("class ExtendedWorker\n  include Sidekiq::Job\n  extend FastEnqueue\n{perform}");
+    // `extend Enqueue` in `Feeds::NestedWorker` names `Feeds::Enqueue`.
+    let feeds_enqueue = "module Feeds\n  module Enqueue\n    def perform_async(n)\n      nil\n    end\n  end\nend\n";
+    let nested_worker =
+        format!("module Feeds\n  class NestedWorker\n    include Sidekiq::Job\n    extend Enqueue\n\n    def perform(n)\n      nil\n    end\n  end\nend\n");
     let cases: Vec<(Vec<(&str, &str)>, &str, &str)> = vec![
         (vec![("app/workers/queue_worker.rb", queue_worker.as_str())], "QueueWorker.perform_async(1)", "sidekiq_options `queue:` is not a literal"),
         (
@@ -490,6 +494,11 @@ fn unreadable_options_and_an_own_perform_async_are_errors_under_sidekiq() {
             vec![("app/workers/fast_enqueue.rb", fast_enqueue), ("app/workers/extended_worker.rb", extended_worker.as_str())],
             "ExtendedWorker.perform_async(1)",
             "`ExtendedWorker` gets its own `perform_async` from `FastEnqueue`",
+        ),
+        (
+            vec![("app/workers/feeds/enqueue.rb", feeds_enqueue), ("app/workers/feeds/nested_worker.rb", nested_worker.as_str())],
+            "Feeds::NestedWorker.perform_async(1)",
+            "`Feeds::NestedWorker` gets its own `perform_async` from `Feeds::Enqueue`",
         ),
     ];
     for (files, call, want) in cases {
