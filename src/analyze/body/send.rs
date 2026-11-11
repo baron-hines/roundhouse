@@ -1263,6 +1263,20 @@ impl<'a> BodyTyper<'a> {
         false
     }
 
+    /// Whether `of`'s chain ends at `Object`, whose `try` (Active Support's) answers nil for a method it lacks.
+    pub(super) fn reaches_object(&self, of: &ClassId) -> bool {
+        let mut current = Some(of.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { return true };
+            if id.0.as_str().trim_start_matches("::") == "BasicObject" {
+                return false;
+            }
+            let Some(cls) = self.classes().get(&id) else { return id.0.as_str().trim_start_matches("::") == "Object" };
+            current = cls.parent.clone();
+        }
+        false
+    }
+
     fn defines_instance_method(&self, of: &ClassId, method: &Symbol) -> bool {
         let mut current = Some(of.clone());
         for _ in 0..32 {

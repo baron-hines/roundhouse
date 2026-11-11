@@ -557,6 +557,7 @@ pub struct BodyTyper<'a> {
     class_factories: Option<&'a HashMap<crate::span::Span, Ty>>,
     /// Instance methods whose body is a literal `true` or `false` and whose name nothing else defines.
     constant_predicates: Option<&'a HashMap<(ClassId, Symbol), bool>>,
+    predicate_bodies: Option<&'a HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>>,
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
@@ -709,6 +710,7 @@ impl<'a> BodyTyper<'a> {
             data_factories: None,
             class_factories: None,
             constant_predicates: None,
+            predicate_bodies: None,
             inquirers: None,
             i18n: None,
             helper_modules: None,
@@ -890,6 +892,11 @@ impl<'a> BodyTyper<'a> {
         self
     }
 
+    pub(super) fn with_predicate_bodies(mut self, bodies: &'a HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>) -> Self {
+        self.predicate_bodies = Some(bodies);
+        self
+    }
+
     /// Name the app's inquirer-returning methods, so their predicates
     /// type as Bool instead of failing dispatch on `Str`.
     pub fn with_inquirers(
@@ -955,6 +962,15 @@ impl<'a> BodyTyper<'a> {
             && let ExprNode::If { then_branch, else_branch, .. } = &*expr.node
         {
             *expr = if answer { then_branch.clone() } else { else_branch.clone() };
+        }
+        // `a && b` whose left answers false (`resource.respond_to?(:m) && resource.m`): Ruby answers the left and never
+        // evaluates the right, which, typed, would report what never runs.
+        if let ExprNode::BoolOp { left, op, .. } = &mut *expr.node
+            && let Some(answer) = self.constant_predicate(left, ctx)
+            && answer == matches!(op, crate::expr::BoolOpKind::Or)
+        {
+            let left = left.clone();
+            *expr = left;
         }
         // A direct self receiver keeps main's lookup type and identity evidence.
         let ty = if receiver && matches!(&*expr.node, ExprNode::SelfRef) {
@@ -1286,7 +1302,32 @@ impl<'a> BodyTyper<'a> {
             };
         }
         let predicates = self.constant_predicates?;
+        // `if unlockable?(resource)`: a predicate of the class's own whose body is a condition over what it is passed.
+        if let Some(answer) = self.inlined_predicate(cond, ctx) {
+            return Some(answer);
+        }
         let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *cond.node else { return None };
+        // `resource.respond_to?(:unlock_access!)` on a model that is not `:lockable`: nothing in its chain answers it.
+        if method.as_str() == "respond_to?"
+            && let [name] = args.as_slice()
+            && let ExprNode::Lit { value: Literal::Sym { value: asked } } = &*name.node
+        {
+            let asked = asked.clone();
+            self.analyze_expr(r, ctx);
+            return match r.ty.as_ref() {
+                // Not past a `respond_to?` of the program's own, which may answer otherwise, nor a class object's, whose class side answers.
+                Some(t @ Ty::Class { id, .. })
+                    if self.is_instance(r, ctx)
+                        && self.never_responds(t, &asked)
+                        && !self.chain_defines(id, &Symbol::from("respond_to?"))
+                        && self.reaches_object(id) =>
+                {
+                    Some(false)
+                }
+                Some(t) if builtin_never_answers(t, &asked) => Some(false),
+                _ => None,
+            };
+        }
         // `x.try(:m)` on a class nothing in whose chain answers `m` is nil (Devise's mailer views'
         // `@resource.try(:unconfirmed_email?)` on a model that is not `:confirmable`).
         if method.as_str() == "try"
@@ -1321,6 +1362,57 @@ impl<'a> BodyTyper<'a> {
         };
         // Nor a name another class of the registry answers (a column's `admin?`, a framework method).
         self.only_answered_by(&definer, method).then_some(answer)
+    }
+
+    /// `m(a, b)`, receiverless, where `m` is the one definition of the name in the class's chain, takes exactly those
+    /// positional parameters and is one condition over them: that condition, with what is passed written in.
+    fn inlined_predicate(&self, cond: &Expr, ctx: &Ctx) -> Option<bool> {
+        thread_local! { static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*cond.node else { return None };
+        if args.is_empty() || ctx.class_side || DEPTH.with(|d| d.get()) > 4 {
+            return None;
+        }
+        // Not an argument that may run code: the fold drops the call with it.
+        let read = |e: &Expr| matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
+            || matches!(&*e.node, ExprNode::Send { recv: None, args, block: None, .. } if args.is_empty());
+        if !args.iter().all(read) {
+            return None;
+        }
+        let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return None };
+        let ((owner, _), (params, body)) = self.predicate_bodies?.iter().find(|((_, m), _)| m == method)?;
+        if params.len() != args.len() || !self.in_chain(id, owner) {
+            return None;
+        }
+        let bound: HashMap<Symbol, Expr> = params.iter().cloned().zip(args.iter().cloned()).collect();
+        let mut written = crate::lower::controller_to_library::util::map_expr(body, &|e| match &*e.node {
+            ExprNode::Var { name, .. } => bound.get(name).cloned(),
+            _ => None,
+        });
+        DEPTH.with(|d| d.set(d.get() + 1));
+        let answer = self.constant_predicate(&mut written, ctx);
+        DEPTH.with(|d| d.set(d.get() - 1));
+        answer
+    }
+
+    /// Whether `owner` is `class`, one of its parents, or a module they include.
+    fn in_chain(&self, class: &ClassId, owner: &ClassId) -> bool {
+        let classes = self.classes();
+        let mut seen: Vec<ClassId> = Vec::new();
+        let mut pending = vec![class.clone()];
+        while let Some(c) = pending.pop() {
+            if c == *owner {
+                return true;
+            }
+            if seen.contains(&c) || seen.len() > 64 {
+                continue;
+            }
+            seen.push(c.clone());
+            if let Some(info) = classes.get(&c) {
+                pending.extend(info.parent.iter().cloned());
+                pending.extend(info.includes.iter().cloned());
+            }
+        }
+        false
     }
 
     /// Whether a source definition of `method` is in `class`'s chain: itself, its parents, the modules they include.
@@ -8206,4 +8298,25 @@ fn set_discarded(e: &mut Expr, discarded: bool) {
         }
         _ => {}
     }
+}
+
+/// Whether no value of `ty`, of Ruby's built-in kinds only, answers `method`: a conversion protocol whose answering
+/// classes are known (`to_proc` only Symbol, Hash, Method and Proc answer). Any other method is not known here.
+fn builtin_never_answers(ty: &Ty, method: &Symbol) -> bool {
+    let answers: &[&str] = match method.as_str() {
+        "to_proc" => &["Symbol", "Hash", "Proc", "Method"],
+        "call" => &["Proc", "Method"],
+        _ => return false,
+    };
+    let variants: Vec<&Ty> = match ty {
+        Ty::Union { variants } => variants.iter().collect(),
+        t => vec![t],
+    };
+    !variants.is_empty()
+        && variants.iter().all(|v| match v {
+            Ty::Str | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil | Ty::Array { .. } => true,
+            Ty::Sym => !answers.contains(&"Symbol"),
+            Ty::Hash { .. } => !answers.contains(&"Hash"),
+            _ => false,
+        })
 }

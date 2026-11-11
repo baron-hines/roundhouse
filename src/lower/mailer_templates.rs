@@ -76,6 +76,19 @@ pub fn apply_mailer_templates(app: &mut App) -> Vec<Diagnostic> {
         }
         let chain = ancestry(&class, &parents, &mailers);
         let (defaults, layout) = class_settings(&chain, &calls, &mut diags);
+        // Rails' `default_params`, which a mailer's own code may read (Devise's `mailer_sender`): ActionMailer's merged
+        // with the chain's `default` entries.
+        if !defaults.is_empty() && !lc.methods.iter().any(|m| m.name.as_str() == "default_params" && m.receiver == crate::dialect::MethodReceiver::Instance) {
+            lc.methods.push(default_params_method(&lc.name, &defaults));
+        }
+        // `_prefixes`, the directories a lookup of the mailer's templates searches (Devise's `template_paths`): each
+        // mailer of its chain, nearest first, as `AbstractController::ViewPaths` lists their `mailer_name`s.
+        if !lc.methods.iter().any(|m| m.name.as_str() == "_prefixes" && m.receiver == crate::dialect::MethodReceiver::Instance) {
+            let span = crate::span::Span::synthetic();
+            let elements = chain.iter().map(|c| str_lit(span, &view_dir(c))).collect();
+            let body = Expr::new(span, ExprNode::Array { elements, style: Default::default() });
+            lc.methods.push(synthesized(&lc.name, "_prefixes", body));
+        }
         let layout = layout.unwrap_or_else(|| implied_layout(&chain, &has_view));
         let dir = view_dir(&class);
         let module = crate::naming::camelize_path(&dir);
@@ -493,6 +506,35 @@ fn ancestry(class: &str, parents: &HashMap<String, Option<String>>, mailers: &BT
         current = parent.clone();
     }
     out
+}
+
+fn default_params_method(owner: &crate::ident::ClassId, defaults: &[(Expr, Expr)]) -> crate::dialect::MethodDef {
+    let span = crate::span::Span::synthetic();
+    let base = Expr::new(span, ExprNode::Const { path: vec![crate::ident::Symbol::from("ActionMailer"), crate::ident::Symbol::from("Base")] });
+    let base = send(Some(base), "base_default_params", vec![], span);
+    let hash = Expr::new(span, ExprNode::Hash { entries: defaults.to_vec(), kwargs: false });
+    synthesized(owner, "default_params", send(Some(base), "merge", vec![hash], span))
+}
+
+fn synthesized(owner: &crate::ident::ClassId, name: &str, body: Expr) -> crate::dialect::MethodDef {
+    let span = crate::span::Span::synthetic();
+    crate::dialect::MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: span,
+        name: crate::ident::Symbol::from(name),
+        receiver: crate::dialect::MethodReceiver::Instance,
+        params: Vec::new(),
+        body,
+        signature: None,
+        effects: crate::effect::EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
 }
 
 /// `default k: v` entries (a nearer class's key wins) and the nearest
