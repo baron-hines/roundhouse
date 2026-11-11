@@ -350,9 +350,28 @@ fn every_sqlite_target_carries_the_checks_as_sql() {
     }
 }
 
+/// The emitted Roda application, booted the way it boots itself: its own
+/// `db.rb` opens the database and runs its migrations. Sequel's SQLite
+/// connection makes `LIKE` case-sensitive unless told otherwise and Rails'
+/// does not, so the emitted connection has to say so for the same rows to pass.
 #[test]
 fn roda_sqlite_migrations_enforce_the_same_predicates() {
-    let mut script = String::from(
+    let roda = |source: &str, database: Option<&str>| {
+        let mut tree = std::collections::HashMap::new();
+        tree.insert(std::path::PathBuf::from("db/schema.rb"), source.as_bytes().to_vec());
+        if let Some(database) = database {
+            tree.insert(std::path::PathBuf::from("config/database.yml"), database.as_bytes().to_vec());
+        }
+        roundhouse::emit::roda::emit(&roundhouse::ingest::ingest_app_from_tree(tree).unwrap())
+    };
+    let source: String = PREDICATES.iter().map(|p| schema(p).replace("predicate_items", &format!("predicate_{}", p.name))).collect();
+    let dir = std::env::temp_dir().join(format!("roundhouse-roda-predicates-{}", std::process::id()));
+    for emitted in roda(&source, Some(SQLITE)).iter().filter(|f| f.path.starts_with("db") || f.path.ends_with("db.rb")) {
+        let path = dir.join(&emitted.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &emitted.content).unwrap();
+    }
+    let mut script = format!(
         r#"
 begin
   gem 'sequel', '>= 5.0'
@@ -361,22 +380,30 @@ rescue Gem::LoadError
   puts 'skip: Sequel or sqlite3 unavailable'
   exit
 end
-require 'sequel'
-require 'sequel/extensions/migration'
-DB = Sequel.sqlite
+ENV['DATABASE'] = ':memory:'
+require {:?}
 def execute(sql) = DB.run(sql)
 def scalar(sql) = DB.fetch(sql).first.values.first
 "#,
+        dir.join("db.rb")
     );
     for predicate in PREDICATES {
-        let mut app = roundhouse::App::default();
-        app.schema = app_schema(&schema(predicate), Some(SQLITE)).unwrap();
-        let files = roundhouse::emit::roda::emit(&app);
-        let migration = files.iter().find(|f| f.path.to_string_lossy().contains("create_predicate_items")).unwrap();
-        script.push_str(&format!("DB.drop_table?(:predicate_items)\neval({:?}).apply(DB, :up)\n", migration.content));
-        script.push_str(&contract(predicate));
+        script.push_str(&contract(predicate).replace("predicate_items", &format!("predicate_{}", predicate.name)));
     }
     assert_ruby(&script, "nested_case inserts and updates passed");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Only a SQLite application's connection changes: any other keeps the one main writes.
+    let connection = |files: Vec<roundhouse::emit::EmittedFile>| {
+        let db = files.into_iter().find(|f| f.path.ends_with("db.rb")).unwrap().content;
+        db.lines().find(|line| line.starts_with("DB = ")).unwrap().to_string()
+    };
+    let shared = schema(predicate("between"));
+    let default = r#"DB = Sequel.sqlite(ENV.fetch("DATABASE", File.expand_path("db/blog.db", __dir__)))"#;
+    assert_eq!(connection(roda(&shared, Some(SQLITE))), default.replace("__dir__)))", "__dir__)), case_sensitive_like: false)"));
+    for database in [None, Some(POSTGRES)] {
+        assert_eq!(connection(roda(&shared, database)), default, "{database:?}");
+    }
 }
 
 #[test]
