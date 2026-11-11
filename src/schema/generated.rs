@@ -30,10 +30,6 @@ pub enum GeneratedExpressionDialect {
     /// in the application's `config/database.yml` is sqlite3, so SQLite DDL
     /// carries the text to the engine it was written for.
     Sqlite,
-    /// As [`Sqlite`](Self::Sqlite) for an application with no
-    /// `config/database.yml`, whose database is not known: without `LIKE`,
-    /// which PostgreSQL also reads, and reads differently.
-    Unconfigured,
 }
 
 impl GeneratedExpressionDialect {

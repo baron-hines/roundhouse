@@ -70,6 +70,9 @@ const ERB_VALUE: &str = "__roundhouse_erb_value__";
 pub(crate) struct Configurations {
     pub databases: Vec<Database>,
     pub refusals: Vec<DatabaseRefusal>,
+    /// Some `url:` is computed. Its configuration is still read from the
+    /// keys beside it, but Rails takes its adapter from the URL at boot.
+    pub computed_url: bool,
 }
 
 /// `config/database.yml`'s configurations, resolved at build time; empty
@@ -153,6 +156,7 @@ pub(crate) fn database_configurations(text: &str, file: FileId) -> Configuration
                 // The rest of the URL isn't known until boot. A scheme written out still wins, and without
                 // one a literal `adapter:` beside it is what the file declares.
                 (Some(Value::String(url)), adapter) if url.contains(ERB_VALUE) => {
+                    out.computed_url = true;
                     // ERB where the query could name the adapter leaves it unknown.
                     let query_computed = DatabaseAdapter::query_pairs(&url).any(|(key, value)| key.contains(ERB_VALUE) || (key == "adapter" && value.contains(ERB_VALUE)));
                     let declared = if query_computed {

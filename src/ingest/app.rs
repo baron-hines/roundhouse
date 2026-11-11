@@ -13309,18 +13309,15 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
 /// schema. SQLite's own needs `config/database.yml`, as
 /// `database_configurations` resolves it, to say SQLite throughout: the
 /// test environment has a primary, every configuration names sqlite3, and
-/// none was left out as unresolved. A file that says less keeps the
-/// portable grammar, since some database of the app may not be SQLite.
-/// Without the file nothing names a database at all.
+/// none was left out as unresolved or takes a computed `url:`. A file that
+/// says less, or no file, keeps the portable grammar, since some database
+/// of the app may not be SQLite.
 fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
-    use crate::schema::generated::GeneratedExpressionDialect::{Portable, Sqlite, Unconfigured};
-    let path = dir.join("config/database.yml");
-    if !vfs.exists(&path) {
-        return Unconfigured;
-    }
-    let Ok(text) = vfs.read_to_string(&path) else { return Portable };
+    use crate::schema::generated::GeneratedExpressionDialect::{Portable, Sqlite};
+    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Portable };
     let read = super::database_yml::database_configurations(&text, crate::span::FileId(0));
     let sqlite = read.refusals.is_empty()
+        && !read.computed_url
         && read.databases.iter().any(|d| d.env == "test" && d.primary)
         && read.databases.iter().all(|d| d.adapter == crate::database::DatabaseAdapter::Sqlite3);
     if sqlite { Sqlite } else { Portable }
