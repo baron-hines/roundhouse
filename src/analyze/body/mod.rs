@@ -2290,13 +2290,13 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                 }
-                // Bare-name Kernel calls (no explicit receiver). `require`,
-                // `require_relative`, etc. — Ruby treats these as private
-                // module methods, but the body-typer otherwise resolves
-                // `recv=None` against `self_ty`, which would dispatch
-                // them as instance methods on the enclosing class (and
-                // miss). Catch them here before the recv_ty fall-through.
-                if recv.is_none() {
+                // Bare Kernel calls are fallbacks: own, included and inherited
+                // methods on the receiver's dispatch side take precedence.
+                if recv.is_none()
+                    && matches!(method.as_str(), "require" | "require_relative" | "load" | "autoload"
+                        | "puts" | "print" | "warn" | "format" | "sprintf" | "`")
+                    && !self.app_defines_on_side(ctx.self_ty.as_ref(), method, ctx.instance_body)
+                {
                     if matches!(
                         method.as_str(),
                         "require" | "require_relative" | "load" | "autoload"
@@ -2320,7 +2320,7 @@ impl<'a> BodyTyper<'a> {
                     // spells the literal as this call): the command's
                     // standard output, a String, with `$?` set. An app class
                     // that defines its own ` is dispatched to it instead.
-                    if method.as_str() == "`" && args.len() == 1 && !self.app_defines_on_side(ctx.self_ty.as_ref(), method, ctx.instance_body) {
+                    if method.as_str() == "`" && args.len() == 1 {
                         for a in args.iter_mut() { self.analyze_expr(a, ctx); }
                         return Ty::Str;
                     }

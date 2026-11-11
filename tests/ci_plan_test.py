@@ -76,6 +76,15 @@ class EncryptsRefusalCoverage(unittest.TestCase):
                 self.assertIn("build-roundhouse", plan["jobs"])
 
 
+class KernelMethodShadowingCoverage(unittest.TestCase):
+    def test_bare_call_lookup_keeps_its_native_signature_contract(self):
+        for path in ["src/analyze/mod.rs", "src/analyze/body/mod.rs", "src/analyze/body/send.rs", "tests/kernel_method_shadowing.rs"]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("kernel_method_shadowing", plan["spinel_tests"])
+
+
 class PublicationBoundary(unittest.TestCase):
     def test_scheduled_full_on_canonical_main_may_publish(self):
         for event in ("schedule", "workflow_dispatch"):

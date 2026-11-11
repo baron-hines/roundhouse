@@ -1983,6 +1983,12 @@ impl<'a> BodyTyper<'a> {
                 }
                 // Class-side defs stay a fallback: a value typed as an instance may still be a class object (`@klass = Post`).
                 let instance_side = instance_receiver && self.defines_instance_method(id, method);
+                // A Kernel-named singleton in an ancestor precedes the instance
+                // fallback too; a class object cannot call the child's instance method.
+                let kernel_class_side = !instance_receiver
+                    && matches!(method.as_str(), "require" | "require_relative" | "load" | "autoload"
+                        | "puts" | "print" | "warn" | "format" | "sprintf" | "`")
+                    && self.class_side_defines(id, method);
                 let mut current_id: Option<&ClassId> = Some(id);
                 let mut depth = 0usize;
                 // Set when the chain reaches a *named* superclass we don't
@@ -2191,7 +2197,7 @@ impl<'a> BodyTyper<'a> {
                         }
                         return unwrap_fn_ret(&subst(ty));
                     }
-                    if !class_dynamic_finder && let Some(ty) = cls.instance_methods.get(method) {
+                    if !kernel_class_side && !class_dynamic_finder && let Some(ty) = cls.instance_methods.get(method) {
                         if !controller_writer || instance_receiver {
                             return unwrap_fn_ret(&subst(ty));
                         }
@@ -2202,7 +2208,7 @@ impl<'a> BodyTyper<'a> {
                     // Checked after the class's own methods, before the
                     // parent — Ruby's ancestor order puts an included
                     // module between the class and its superclass.
-                    for module_id in cls.includes.iter().filter(|_| !class_dynamic_finder) {
+                    for module_id in cls.includes.iter().filter(|_| !kernel_class_side && !class_dynamic_finder) {
                         if controller_writer && !instance_receiver {
                             continue;
                         }

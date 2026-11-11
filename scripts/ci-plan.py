@@ -126,6 +126,7 @@ SPINEL_TESTS = [
     "class_object_return_rbs",
     "class_object_container_rbs",
     "module_self_argument_rbs",
+    "kernel_method_shadowing",
     "jbuilder_array_value_spinel",
     "active_job_payload",
     "render_json_encoder_spinel",
@@ -530,6 +531,9 @@ def native_coverage(path):
     if path in {"src/analyze/mod.rs", "src/analyze/body/mod.rs"}:
         suites.add("module_self_argument_rbs")
         suites.add("class_object_container_rbs")
+        suites.add("kernel_method_shadowing")
+    if path == "src/analyze/body/send.rs":
+        suites.add("kernel_method_shadowing")
     if path in {
         "src/dialect.rs",
         "src/ingest/model.rs",
