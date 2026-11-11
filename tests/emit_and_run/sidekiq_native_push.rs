@@ -373,11 +373,11 @@ SidekiqPush.start_recording
 Article.native_bulk_with_others
 lines = SidekiqPush.recorded
 scheduled = lines.select { |l| l.start_with?("zadd schedule ") }
-raise "perform_in in the block: #{lines.inspect}" unless scheduled.length == 3 && scheduled.all? { |l| l.include?(""class":"PlainWorker"") }
+raise "perform_in in the block: #{lines.inspect}" unless scheduled.length == 3 && scheduled.all? { |l| l.include?('"class":"PlainWorker"') }
 others = lines.select { |l| l.start_with?("lpush queue:default ") }
-raise "another worker's push: #{lines.inspect}" unless others.length == 3 && others.all? { |l| l.split(""jid":").length == 2 }
+raise "another worker's push: #{lines.inspect}" unless others.length == 3 && others.all? { |l| l.split('"jid":').length == 2 }
 bulk = lines.select { |l| l.start_with?("lpush queue:pull ") }
-raise "the bulk's batches: #{lines.inspect}" unless bulk.map { |l| l.split(""jid":").length - 1 } == [2, 1]
+raise "the bulk's batches: #{lines.inspect}" unless bulk.map { |l| l.split('"jid":').length - 1 } == [2, 1]
 SidekiqPush.start_recording
 raised = false
 begin
@@ -387,7 +387,7 @@ rescue ArgumentError
 end
 lines = SidekiqPush.recorded
 raise "the block's error: #{lines.inspect}" unless raised
-raise "a raised slice was pushed: #{lines.inspect}" unless lines.length == 2 && lines[1].split(""jid":").length == 3 && !lines[1].include?(""args":[3,")
+raise "a raised slice was pushed: #{lines.inspect}" unless lines.length == 2 && lines[1].split('"jid":').length == 3 && !lines[1].include?('"args":[3,')
 raise "the batch stayed open" unless SidekiqPush.bulk_limit[0] == 0 && SidekiqPush.bulk.length == 0
 SidekiqPush.stop_recording
 puts "bulk block passed"
