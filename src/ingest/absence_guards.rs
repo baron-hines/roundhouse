@@ -13,7 +13,7 @@ pub(super) fn source_gem_classes(app: &App) -> crate::det::HashSet<String> {
         .collect()
 }
 
-fn is_source_gem_path(p: &str) -> bool {
+pub(crate) fn is_source_gem_path(p: &str) -> bool {
     p.contains("/.roundhouse/source_gems/") || p.starts_with(".roundhouse/source_gems/")
 }
 

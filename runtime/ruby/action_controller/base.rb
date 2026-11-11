@@ -21,6 +21,12 @@ module ActionController
   # set `allow_forgery_protection = true` explicitly.
   FORGERY_SLOT = [false]
 
+  # A status symbol's code (`:see_other` is 303), or nil for a name Rack does not know.
+  def self.symbol_status_code(status)
+    return nil unless STATUS_CODES.key?(status)
+    STATUS_CODES.fetch(status, 500)
+  end
+
   def self.forgery_flag
     FORGERY_SLOT[0] == true
   end

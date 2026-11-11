@@ -123,11 +123,21 @@ fn apply_param_selector_dispatch(
     // while every call passes a Symbol literal there, None once one
     // does not.
     type Key = (ClassId, Symbol, bool);
-    let mut targets: HashMap<Key, usize> = HashMap::default();
+    // Not unknown for a call that leaves a positional out: it passes the Symbol default (Warden's `method = :push`).
+    let mut targets: HashMap<Key, Vec<Option<String>>> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
-            let positional = m.params.iter().filter(|p| !p.keyword && !p.rest && !p.forwarding).count();
-            if positional > 0 && body_has_param_send(&m.body, &m.params) {
+            let positional: Vec<Option<String>> = m
+                .params
+                .iter()
+                .filter(|p| !p.keyword && !p.rest && !p.forwarding)
+                .map(|p| match p.default.as_ref().map(|d| &*d.node) {
+                    Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.as_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            // Or one with a Symbol default, which may hand it on to one that sends it.
+            if !positional.is_empty() && (body_has_param_send(&m.body, &m.params) || positional.iter().any(Option::is_some)) {
                 targets.insert((lc.name.clone(), m.name.clone(), m.receiver == MethodReceiver::Class), positional);
             }
         }
@@ -175,6 +185,23 @@ fn apply_param_selector_dispatch(
             _ => None,
         }
     };
+    // Not the class alone: a call on it reaches the modules it extends (`Warden::Manager.after_set_user`, of `Warden::Hooks`).
+    let mut extended: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for lc in &app.library_classes {
+        for call in &lc.unknown_calls {
+            if let ExprNode::Send { recv: None, method, args, .. } = &*call.node
+                && method.as_str() == "extend"
+            {
+                for a in args {
+                    if let ExprNode::Const { path } = &*a.node
+                        && let Some(m) = resolve(path.iter().filter(|s| !s.as_str().is_empty()).cloned().collect::<Vec<_>>().as_slice())
+                    {
+                        extended.entry(lc.name.clone()).or_default().push(m);
+                    }
+                }
+            }
+        }
+    }
     // The per-send questions about `targets`, answered from an index.
     let target_classes: crate::det::HashSet<&ClassId> = targets.keys().map(|k| &k.0).collect();
     let mut targets_by_method: HashMap<&Symbol, Vec<&Key>> = HashMap::default();
@@ -183,13 +210,32 @@ fn apply_param_selector_dispatch(
     }
     let mut seen: HashMap<Key, Vec<Option<Vec<String>>>> = HashMap::default();
     let mut poisoned: crate::det::HashSet<Key> = crate::det::HashSet::default();
-    let record = |key: &Key, args: &[Expr], seen: &mut HashMap<Key, Vec<Option<Vec<String>>>>| {
-        let Some(&positional) = targets.get(key) else { return };
-        let slots = seen.entry(key.clone()).or_insert_with(|| vec![Some(Vec::new()); positional]);
+    // A library method's body, by its span: the key and positional names an argument it hands on names.
+    let mut enclosing_by_span: HashMap<(crate::span::FileId, u32, u32), (Key, Vec<Symbol>)> = HashMap::default();
+    for lc in &app.library_classes {
+        for m in &lc.methods {
+            let names = m.params.iter().filter(|p| !p.keyword && !p.rest && !p.forwarding).map(|p| p.name.clone()).collect();
+            enclosing_by_span.insert((m.body.span.file, m.body.span.start, m.body.span.end), ((lc.name.clone(), m.name.clone(), m.receiver == MethodReceiver::Class), names));
+        }
+    }
+    // Not unknown for an argument a caller hands on: it takes that caller's names (`after_authentication`'s `method`).
+    let mut forwards: Vec<(Key, usize, Key, usize)> = Vec::new();
+    let record = |key: &Key, args: &[Expr], enclosing: Option<&(Key, Vec<Symbol>)>, seen: &mut HashMap<Key, Vec<Option<Vec<String>>>>, forwards: &mut Vec<(Key, usize, Key, usize)>| {
+        let Some(defaults) = targets.get(key) else { return };
+        let slots = seen.entry(key.clone()).or_insert_with(|| vec![Some(Vec::new()); defaults.len()]);
+        // Not past a splat: where the positionals end is the run time's.
+        let plain = args.iter().all(|a| !matches!(&*a.node, ExprNode::Splat { .. }));
         for (i, slot) in slots.iter_mut().enumerate() {
-            match (slot.as_mut(), args.get(i).map(|a| &*a.node)) {
-                (Some(names), Some(ExprNode::Lit { value: Literal::Sym { value } })) => {
+            match (slot.as_mut(), args.get(i).map(|a| &*a.node), &defaults[i]) {
+                (Some(names), Some(ExprNode::Lit { value: Literal::Sym { value } }), _) => {
                     push_unique(names, value.as_str().to_string());
+                }
+                (Some(names), None, Some(default)) if plain => push_unique(names, default.clone()),
+                (Some(_), Some(ExprNode::Var { name, .. }), _)
+                    if let Some((from, params)) = enclosing
+                        && let Some(j) = params.iter().position(|p| p == name) =>
+                {
+                    forwards.push((key.clone(), i, from.clone(), j));
                 }
                 _ => *slot = None,
             }
@@ -197,10 +243,12 @@ fn apply_param_selector_dispatch(
     };
     {
         let mut visit = |owner: Option<&ClassId>, body: &Expr| {
+            let enclosing = enclosing_by_span.get(&(body.span.file, body.span.start, body.span.end));
             fn walk(
                 e: &Expr,
                 owner: Option<&ClassId>,
                 resolve: &dyn Fn(&[Symbol]) -> Option<ClassId>,
+                extended: &HashMap<ClassId, Vec<ClassId>>,
                 target_classes: &crate::det::HashSet<&ClassId>,
                 targets_by_method: &HashMap<&Symbol, Vec<&Key>>,
                 f: &mut dyn FnMut(Key, &[Expr], bool),
@@ -209,6 +257,9 @@ fn apply_param_selector_dispatch(
                     match recv.as_ref().map(|r| (&*r.node, r.ty.as_ref())) {
                         Some((ExprNode::Const { path }, _)) => {
                             if let Some(c) = resolve(path) {
+                                for m in extended.get(&c).map(Vec::as_slice).unwrap_or_default() {
+                                    f((m.clone(), method.clone(), false), args, false);
+                                }
                                 f((c, method.clone(), true), args, false);
                             }
                         }
@@ -234,18 +285,54 @@ fn apply_param_selector_dispatch(
                     }
                 }
                 e.node.for_each_child(&mut |c| {
-                    walk(c, owner, resolve, target_classes, targets_by_method, f)
+                    walk(c, owner, resolve, extended, target_classes, targets_by_method, f)
                 });
             }
-            walk(body, owner, &resolve, &target_classes, &targets_by_method, &mut |key, args, poison| {
+            walk(body, owner, &resolve, &extended, &target_classes, &targets_by_method, &mut |key, args, poison| {
                 if poison {
                     poisoned.insert(key);
                 } else {
-                    record(&key, args, &mut seen);
+                    record(&key, args, enclosing, &mut seen, &mut forwards);
                 }
             });
         };
         super::for_each_owned_hook_body(app, &mut |owner, body| visit(owner, &*body));
+    }
+    // A forwarded position takes its caller's names; one the caller's own callers left unknown is unknown.
+    for _ in 0..16 {
+        let mut changed = false;
+        for (to, i, from, j) in &forwards {
+            // Not "never called" for a caller that is no target: its calls were not recorded, so what it is handed is unknown.
+            let given = match seen.get(from) {
+                Some(slots) => slots.get(*j).cloned().unwrap_or(None),
+                None if targets.contains_key(from) => Some(Vec::new()),
+                None => None,
+            };
+            let Some(slot) = seen.get_mut(to).and_then(|slots| slots.get_mut(*i)) else { continue };
+            match (slot.as_mut(), given) {
+                (Some(names), Some(more)) => {
+                    for n in more {
+                        if !names.contains(&n) {
+                            names.push(n);
+                            changed = true;
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    *slot = None;
+                    changed = true;
+                }
+                (None, _) => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (to, _, from, _) in &forwards {
+        if poisoned.contains(from) {
+            poisoned.insert(to.clone());
+        }
     }
     for lc in &mut app.library_classes {
         for m in &mut lc.methods {
@@ -458,7 +545,7 @@ fn body_has_param_send(body: &Expr, params: &[crate::dialect::Param]) -> bool {
             return;
         }
         if let ExprNode::Send { method, args, .. } = &*e.node {
-            if is_send_method(method.as_str()) {
+            if is_send_method(method.as_str()) || method.as_str() == "try" {
                 if let Some(ExprNode::Var { name, .. }) = args.first().map(|a| &*a.node) {
                     if params.iter().any(|p| &p.name == name) {
                         *found = true;
@@ -654,6 +741,37 @@ fn rewrite(
     let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node else {
         return;
     };
+    // Not left as a `try` of a computed name: per known name, ActiveSupport's `respond_to?(name) ? public_send(name) : nil`.
+    if method.as_str() == "try"
+        && let Some((target, rest)) = args.split_first()
+        && let ExprNode::Var { name, .. } = &*target.node
+        && let Some(binding) = bindings.iter().find(|b| b.name == name)
+        && let Some(recv_expr) = recv.as_ref().filter(|_| recv_is_duplicable(recv))
+    {
+        let names: Option<Vec<String>> = binding.elems.iter().map(|el| match &*el.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+            _ => None,
+        }).collect();
+        let Some(names) = names else { return };
+        let span = e.span;
+        let nil = || Expr { ty: Some(Ty::Nil), ..Expr::new(span, ExprNode::Lit { value: Literal::Nil }) };
+        let class = recv_class(recv);
+        let mut arms: Vec<Arm> = names.iter().map(|n| {
+            let sym = Expr { ty: Some(Ty::Sym), ..Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n.as_str()) } }) };
+            // Not unstamped: the audit after lowering reads an unstamped send on a typed receiver as a failed dispatch (`build_arms` stamps its own).
+            let responds = Expr { ty: Some(Ty::Bool), ..Expr::new(span, ExprNode::Send { recv: Some(recv_expr.clone()), method: Symbol::from("respond_to?"), args: vec![sym], block: None, parenthesized: true }) };
+            let mut call = Expr::new(span, ExprNode::Send { recv: Some(recv_expr.clone()), method: Symbol::from(n.as_str()), args: rest.to_vec(), block: None, parenthesized: !rest.is_empty() });
+            call.ty = Some(class.as_ref().and_then(|c| method_return_via_registry(registry, c, n.as_str())).unwrap_or(Ty::Untyped));
+            Arm {
+                pattern: Pattern::Lit { value: Literal::Sym { value: Symbol::from(n.as_str()) } },
+                guard: None,
+                body: Expr::new(span, ExprNode::If { cond: responds, then_branch: call, else_branch: nil() }),
+            }
+        }).collect();
+        arms.push(Arm { pattern: Pattern::Wildcard, guard: None, body: nil() });
+        *e.node = ExprNode::Case { scrutinee: target.clone(), arms };
+        return;
+    }
     if !is_send_method(method.as_str()) || args.is_empty() {
         return;
     }

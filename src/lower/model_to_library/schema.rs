@@ -5021,6 +5021,12 @@ pub(super) fn permitted_assocs(
 /// callers that route it differently skip it themselves.
 fn virtual_writer_fields(model: &Model, table: &Table) -> std::collections::BTreeSet<Symbol> {
     let mut virtuals = super::writable_field_set(model, table);
+    // A module's public writer is assignable too (Devise's `DatabaseAuthenticatable#password=`): Rails assigns through `public_send`.
+    for module in crate::analyze::model_includes(model) {
+        for writer in super::included_module_writers(module.0.as_str()) {
+            virtuals.insert(writer);
+        }
+    }
     for item in &model.body {
         let crate::dialect::ModelBodyItem::Method { method, .. } = item else { continue };
         // Rails assigns through `public_send`: a private or protected

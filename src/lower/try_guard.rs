@@ -165,6 +165,17 @@ pub(crate) fn rewrite_node(
         || (!super::core_method_names::core_value_definers(name.as_str()).is_empty()
             && recv.ty.as_ref().is_none_or(may_hold_a_core_value));
     let arms = if bang || core_receiver { None } else { narrowing(&name, definers, parents) };
+    // Not the app's definers alone where the receiver's class is not known: a runtime object answers the name too
+    // (Devise's `Rails.application.config.try(:relative_url_root)`), which `is_a?(Devise::FailureApp)` answered nil for.
+    let arms = match arms {
+        Some(mut arms) if !arms.is_empty() && recv.ty.as_ref().is_none_or(|t| matches!(t, Ty::Untyped | Ty::Var { .. })) => {
+            let mut runtime: Vec<Symbol> = runtime_definers(name.as_str()).into_iter().filter(|c| !arms.contains(c)).collect();
+            runtime.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            arms.extend(runtime);
+            (arms.len() <= MAX_ARMS).then_some(arms)
+        }
+        other => other,
+    };
     let mut replaced = match arms {
         // Nothing in the tree defines it and it is not `try!`: the only
         // answer `try` can give is nil. Folding rather than emitting a
@@ -219,6 +230,29 @@ pub(crate) fn rewrite_node(
         replaced.ty = try_ty;
     }
     *expr = replaced;
+}
+
+/// The runtime classes (`runtime/ruby`, which every target carries) whose instances answer `name`.
+fn runtime_definers(name: &str) -> Vec<Symbol> {
+    static TABLE: std::sync::OnceLock<HashMap<Symbol, Vec<Symbol>>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut files = Vec::new();
+        let _ = crate::runtime_files::walk_into("runtime/ruby", "", &mut files);
+        let mut out: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
+        for (_, source) in files.iter().filter(|(p, _)| p.ends_with(".rbs")) {
+            let Ok(classes) = crate::rbs::parse_instance_method_names(source) else { continue };
+            for (class, names) in classes {
+                for method in names {
+                    let owners = out.entry(method).or_default();
+                    if !owners.contains(&class.0) {
+                        owners.push(class.0.clone());
+                    }
+                }
+            }
+        }
+        out
+    });
+    table.get(&Symbol::from(name)).cloned().unwrap_or_default()
 }
 
 fn may_hold_a_core_value(ty: &Ty) -> bool {

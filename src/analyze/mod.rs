@@ -135,6 +135,18 @@ pub struct Analyzer {
     /// they pass, not its default too: Warden's `add(label, strategy =
     /// nil)` is never called without the class. Grows only.
     defaulted_param_slots: std::sync::Mutex<BTreeSet<(ParamKey, usize)>>,
+    /// Set for the typing pass before the first unification only: no
+    /// method has a parameter row yet, so a parameter no default types is
+    /// one its call sites have not been read for, not one nobody passes
+    /// (`Ctx::unseen_params`).
+    seeding_unseen_params: bool,
+    /// Set for the production rounds' typing passes: a `p ||= v` over a
+    /// parameter whose row slot is still pending is left untyped too. The
+    /// passes after that loop retype every production body without it.
+    deferring_pending_slots: bool,
+    /// The classes that pass left a `p ||= v` untyped in: the first
+    /// fixpoint round retypes them whatever else moved.
+    unseen_or_assign_classes: std::sync::Mutex<crate::det::HashSet<ClassId>>,
     /// The classes compiled from a gem's source. Only their slots drop a default no caller leaves:
     /// an app method's callers include its tests and the console, which no site here records.
     source_gem_classes: crate::det::HashSet<ClassId>,
@@ -1388,6 +1400,9 @@ impl Analyzer {
             open_param_slots: BTreeSet::new(),
             pinned_param_slots: BTreeSet::new(),
             defaulted_param_slots: Default::default(),
+            seeding_unseen_params: false,
+            deferring_pending_slots: false,
+            unseen_or_assign_classes: Default::default(),
             source_gem_classes: source_gem_classes(app),
             declared_signatures: app
                 .rbs_signatures
@@ -1614,6 +1629,11 @@ impl Analyzer {
             .map(|c| (c.name.clone(), c.parent.clone()))
             .collect();
 
+        // No parameter row exists yet: a `p ||= v` over a parameter the
+        // call sites will type is left untyped rather than bound to `v`
+        // (`Ctx::unseen_params`).
+        self.seeding_unseen_params = true;
+        self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         crate::timings::phase("typing passes (initial)", || {
             self.run_typing_passes(
                 app,
@@ -1625,6 +1645,11 @@ impl Analyzer {
                 TypingMode::Production { dirty: None },
             )
         });
+        self.seeding_unseen_params = false;
+        self.deferring_pending_slots = true;
+        // Those bodies were typed against no rows, so the first round
+        // retypes them even where no row or return moved.
+        let mut unseen = std::mem::take(&mut *self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()));
 
         let mut rounds = FixpointRounds {
             production: LoopEnd::RanToCap,
@@ -1657,7 +1682,8 @@ impl Analyzer {
             // verdicts (`DirtyHints`); both must be quiet before the
             // loop stops, or a newly block-valued method leaves its
             // callers on the registered return instead of the block.
-            if self.inference_matches(&prev_hints.sig)
+            if unseen.is_empty()
+                && self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
                 rounds.production = LoopEnd::Settled(round);
@@ -1673,7 +1699,11 @@ impl Analyzer {
             // so the later rounds retype the whole app for a handful of
             // returns. `dirty_classes_for_retype` is that handful plus
             // everything that reads it.
-            let dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            let mut dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            if let Some(dirty) = dirty.as_mut() {
+                dirty.extend(unseen.drain());
+            }
+            unseen.clear();
             crate::timings::note(match &dirty {
                 Some(dirty) => format!("round {round}: retype frontier {} classes", dirty.len()),
                 None => format!("round {round}: retype frontier everything"),
@@ -1691,6 +1721,7 @@ impl Analyzer {
                 )
             });
         }
+        self.deferring_pending_slots = false;
         let round_inputs = fixpoint_check::RoundInputs {
             dynamic_render_ivars: &dynamic_render_ivars,
             existing_view_names: &existing_view_names,
@@ -2156,6 +2187,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
                 in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -2521,6 +2553,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: shared.clone(),
                     annotate_self_dispatch: false,
                     in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -2818,6 +2851,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -2837,6 +2871,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: class_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -2859,7 +2894,7 @@ impl Analyzer {
                     }
                 }
                 let mctx = self.seed_method_params(&class_ctx, &model_name, method, true);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
+                self.body_typer().analyze_method_body(&mut method.body, &mctx);
             }
 
             // Pass B: gather every ivar assignment across the model's
@@ -2869,9 +2904,8 @@ impl Analyzer {
             // `@x ||= ...` lowered to `@x || (@x = ...)`) still resolve
             // cleanly.
             let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::default();
-            for method in model.methods() {
-                extract_ivar_assignments(&method.body, &mut flow_ivars);
-            }
+            let methods: Vec<&crate::dialect::MethodDef> = model.methods().collect();
+            extract_methods_ivar_assignments(methods.iter().copied(), methods.iter().copied(), &mut flow_ivars);
             for scope in model.scopes() {
                 extract_ivar_assignments(&scope.body, &mut flow_ivars);
             }
@@ -2909,6 +2943,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: class_constants.clone(),
                     annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                 };
@@ -2916,9 +2951,11 @@ impl Analyzer {
                 // The class body has run before any class method does, so its writes are not nilable there.
                 // Nor do an instance method's writes reach the class object's ivars.
                 let mut class_method_ivars: HashMap<Symbol, Ty> = HashMap::default();
-                for method in model.methods().filter(|m| m.receiver == MethodReceiver::Class) {
-                    extract_ivar_assignments(&method.body, &mut class_method_ivars);
-                }
+                extract_methods_ivar_assignments(
+                    methods.iter().copied().filter(|m| m.receiver == MethodReceiver::Class),
+                    methods.iter().copied(),
+                    &mut class_method_ivars,
+                );
                 let mut class_side_ctx = reseeded_ctx.clone();
                 for (name, ty) in class_body_ivars {
                     // Merged: a class method's own write (`@state = "ready"`) is a value too.
@@ -2934,7 +2971,7 @@ impl Analyzer {
                 for method in model.methods_mut() {
                     let side = if method.receiver == MethodReceiver::Class { &class_side_ctx } else { &reseeded_ctx };
                     let mctx = self.seed_method_params(side, &model_name, method, true);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
             self.harvest_one_model(model);
@@ -2977,6 +3014,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -3000,6 +3038,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: class_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -3065,7 +3104,7 @@ impl Analyzer {
                         }
                     }
                     let mctx = self.seed_method_params(&ctx, &ctrl_id, method, false);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
 
@@ -3179,6 +3218,7 @@ impl Analyzer {
                     owned: Some(&action_bodies),
                     lookup: None,
                     models_by_ivar: Some(&models_by_ivar),
+                    hash_readers: None,
                 };
                 for (name, body) in &action_bodies {
                     let mut ivars = HashMap::default();
@@ -3444,6 +3484,7 @@ impl Analyzer {
                     owned: None,
                     lookup: Some(&lookup),
                     models_by_ivar: Some(&models_by_ivar),
+                    hash_readers: None,
                 };
                 for (name, body) in &chained_bodies {
                     let mut ivars = HashMap::default();
@@ -3604,6 +3645,7 @@ impl Analyzer {
                             class_objects: Default::default(),
                             query_class_objects: Default::default(),
                             call_site_params: Default::default(),
+                            unseen_params: Default::default(),
                             constants: meta.class_constants.clone(),
                             annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                         };
@@ -3641,6 +3683,7 @@ impl Analyzer {
                     owned: None,
                     lookup: None,
                     models_by_ivar: Some(&models_by_ivar),
+                    hash_readers: None,
                 };
                 for action in controller.actions() {
                     let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
@@ -3770,6 +3813,7 @@ impl Analyzer {
                     owned: None,
                     lookup: None,
                     models_by_ivar: Some(&models_by_ivar),
+                    hash_readers: None,
                 };
                 extract_ivar_assignments_in(&action.body, &mut ivars, &env);
                 bind_framework_assigned_ivars(&action.body, &mut ivars);
@@ -4088,6 +4132,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         call_site_params: Default::default(),
+                        unseen_params: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
                         in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -4161,6 +4206,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         call_site_params: Default::default(),
+                        unseen_params: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
                         in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -4397,6 +4443,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: self.helper_modules.contains(&lc.name),
             };
 
@@ -4425,14 +4472,12 @@ impl Analyzer {
                             self.body_typer().analyze_expr(default, &mctx);
                         }
                     }
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
 
             let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::default();
-            for method in &lc.methods {
-                extract_ivar_assignments(&method.body, &mut flow_ivars);
-            }
+            extract_methods_ivar_assignments(&lc.methods, &lc.methods, &mut flow_ivars);
             if mailer_names.contains(&lc_name) {
                 let mut pending: Vec<ClassId> = lc.includes.clone();
                 let mut seen: crate::det::HashSet<ClassId> = crate::det::HashSet::default();
@@ -4577,11 +4622,12 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: class_ctx.helper_body,
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
             views
@@ -5078,7 +5124,7 @@ impl Analyzer {
         fn writes(e: &Expr, out: &mut HashMap<Symbol, Ty>) {
             if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node
                 && let Some(cvar) = name.as_str().strip_prefix("@@")
-                && let Some(ty) = value.ty.clone().filter(|t| !t.is_open() && !matches!(t, Ty::Untyped))
+                && let Some(ty) = value.ty.clone().filter(|t| !t.is_open() && !matches!(t, Ty::Untyped)).map(|t| class_object_arg_ty(value, t))
             {
                 let key = Symbol::from(cvar);
                 let joined = match out.remove(&key) {
@@ -5256,6 +5302,25 @@ impl Analyzer {
             .filter(|p| !p.rest && !rebound.contains(&p.name) && observed.is_some())
             .map(|p| p.name.clone())
             .collect();
+        // Before the first unification no row exists; in the production
+        // rounds after it, a row whose slot is still pending (`Var`) names
+        // callers whose argument is not typed yet. A method no call site
+        // reaches has no row then, and keeps its default from round one.
+        let unseen_slot = |i: usize| match observed {
+            None => self.seeding_unseen_params,
+            Some(row) => self.deferring_pending_slots && row.get(i).is_none_or(|t| matches!(t, Ty::Var { .. })),
+        };
+        if self.seeding_unseen_params || (self.deferring_pending_slots && observed.is_some()) {
+            let or_assigned = body::or_assigned_locals(&method.body);
+            ctx.unseen_params = method.params.iter().enumerate()
+                .filter(|(i, p)| !p.rest && !rebound.contains(&p.name) && or_assigned.contains(&p.name) && unseen_slot(*i))
+                .filter(|(_, p)| !ctx.local_bindings.contains_key(&p.name))
+                .map(|(_, p)| p.name.clone())
+                .collect();
+            if self.seeding_unseen_params && !ctx.unseen_params.is_empty() {
+                self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).insert(class_id.clone());
+            }
+        }
         ctx
     }
 
@@ -9252,6 +9317,15 @@ fn class_object_union(answers: &[Option<&Ty>]) -> Option<Ty> {
 
 // Recorded flat, a class object argument would type its parameter as an instance of that class.
 fn class_object_arg_ty(arg: &Expr, ty: Ty) -> Ty {
+    // `x.class` is typed as x's own class (so `self.class.find` dispatches), which as a parameter declared an instance.
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*arg.node
+        && method.as_str() == "class"
+        && args.is_empty()
+        && r.decisions & crate::expr::CLASS_OBJECT_VALUE == 0
+        && matches!(&ty, Ty::Class { id, args } if args.is_empty() && !matches!(id.0.as_str(), "Class" | "Module"))
+    {
+        return Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![ty].into() };
+    }
     match ty {
         Ty::Class { ref args, .. }
             if arg.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 && args.is_empty() =>
@@ -10580,6 +10654,94 @@ fn is_clean_binding(ty: &Ty) -> bool {
     }
 }
 
+/// [`extract_ivar_assignments`] over `methods`, where an index write
+/// through one of the class's memoizing readers on the method's own side
+/// (`_kinds[label] = kind`, `def self._kinds = @kinds ||= {}`) joins the
+/// reader's ivar as `@kinds[label] = kind` does. `class_methods` is every
+/// method of the class, whose readers are looked up.
+pub(crate) fn extract_methods_ivar_assignments<'a>(
+    methods: impl IntoIterator<Item = &'a crate::dialect::MethodDef>,
+    class_methods: impl IntoIterator<Item = &'a crate::dialect::MethodDef> + Clone,
+    out: &mut HashMap<Symbol, Ty>,
+) {
+    let readers = [crate::dialect::MethodReceiver::Instance, crate::dialect::MethodReceiver::Class]
+        .map(|side| hash_readers(class_methods.clone().into_iter(), side));
+    for method in methods {
+        let env = ivar_set::IvarNameEnv {
+            self_class: None,
+            owned: None,
+            lookup: None,
+            models_by_ivar: None,
+            hash_readers: Some(&readers[(method.receiver == crate::dialect::MethodReceiver::Class) as usize]),
+        };
+        extract_ivar_assignments_in(&method.body, out, &env);
+    }
+}
+
+/// The methods on one side of a class that answer a single ivar and do
+/// nothing else, keyed by name: `def _kinds = @kinds ||= {}` (the
+/// memoized registry) or `def kinds = @kinds`. `_kinds[k] = v` through
+/// one writes `@kinds`'s hash as `@kinds[k] = v` would, so the index-write
+/// join in [`extract_ivar_assignments_in`] can count it. A name defined
+/// more than once on the side is a reader only when every definition
+/// reads the same ivar: any other definition may be the one that runs
+/// (a later `def` overrides, and reopened bodies don't fix an order here).
+pub(crate) fn hash_readers<'a>(
+    methods: impl Iterator<Item = &'a crate::dialect::MethodDef>,
+    side: crate::dialect::MethodReceiver,
+) -> HashMap<Symbol, Symbol> {
+    let mut out: HashMap<Symbol, Symbol> = HashMap::default();
+    let mut ambiguous: BTreeSet<Symbol> = BTreeSet::new();
+    for m in methods.filter(|m| m.receiver == side) {
+        let ivar = (m.params.is_empty() && m.block_param.is_none())
+            .then(|| reader_ivar(&m.body))
+            .flatten();
+        let Some(ivar) = ivar else {
+            ambiguous.insert(m.name.clone());
+            continue;
+        };
+        if out.get(&m.name).is_some_and(|prev| *prev != ivar) {
+            ambiguous.insert(m.name.clone());
+        }
+        out.insert(m.name.clone(), ivar);
+    }
+    for name in ambiguous {
+        out.remove(&name);
+    }
+    out
+}
+
+/// The ivar a reader body answers: `@x`, or `@x ||= {}`.
+fn reader_ivar(body: &Expr) -> Option<Symbol> {
+    let body = match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => body,
+    };
+    match &*body.node {
+        ExprNode::Ivar { name } => Some(name.clone()),
+        ExprNode::OpAssign { target: LValue::Ivar { name }, op: crate::expr::OpAssignOp::OrOr, value }
+            if matches!(&*value.node, ExprNode::Hash { entries, .. } if entries.is_empty()) =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The ivar whose hash an index write's receiver names: `@x` itself, or
+/// a receiverless (or `self.`) call of a reader in `env.hash_readers`.
+fn index_write_ivar(recv: &Expr, env: &ivar_set::IvarNameEnv<'_>) -> Option<Symbol> {
+    match &*recv.node {
+        ExprNode::Ivar { name } => Some(name.clone()),
+        ExprNode::Send { recv: reader_recv, method, args, block: None, .. }
+            if args.is_empty() && reader_recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) =>
+        {
+            env.hash_readers?.get(method).cloned()
+        }
+        _ => None,
+    }
+}
+
 /// The ivars `initialize` assigns as statements of its own, across `methods`.
 fn ivars_initialized_by<'a>(
     methods: impl Iterator<Item = &'a crate::dialect::MethodDef>,
@@ -10689,7 +10851,8 @@ fn walk_ivar_assignments(
             let empty_indifferent = matches!(&*value.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
                 if method.as_str() == "new" && args.is_empty() && matches!(&*r.node, ExprNode::Const { path }
                     if matches!(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().as_slice(), ["HashWithIndifferentAccess"] | ["ActiveSupport", "HashWithIndifferentAccess"])));
-            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { value.ty.clone() };
+            // A class object stored is the class (`@responder = Devise::Controllers::Responder`), as a method answering it is.
+            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { value.ty.clone().map(|t| class_object_arg_ty(value, t)) };
             if let Some(ty) = ty {
                 // Union with existing entry so repeated assignments to
                 // the same ivar accumulate (rather than the last write
@@ -10747,9 +10910,9 @@ fn walk_ivar_assignments(
         // `[]=` Send form is handled by the arm below.
         ExprNode::Assign { target: LValue::Index { recv, index }, value }
         | ExprNode::OpAssign { target: LValue::Index { recv, index }, value, .. } => {
-            if let ExprNode::Ivar { name } = &*recv.node {
+            if let Some(name) = index_write_ivar(recv, env) {
                 if let Some(v_ty) = &value.ty {
-                    walk.index_writes.push((name.clone(), index.ty.clone(), v_ty.clone()));
+                    walk.index_writes.push((name, index.ty.clone(), v_ty.clone()));
                 }
             }
             walk_ivar_assignments(recv, out, env, walk);
@@ -10765,9 +10928,9 @@ fn walk_ivar_assignments(
         ExprNode::Send { recv: Some(recv), method, args, block, .. }
             if method.as_str() == "[]=" && args.len() == 2 =>
         {
-            if let ExprNode::Ivar { name } = &*recv.node {
+            if let Some(name) = index_write_ivar(recv, env) {
                 if let Some(v_ty) = &args[1].ty {
-                    walk.index_writes.push((name.clone(), args[0].ty.clone(), v_ty.clone()));
+                    walk.index_writes.push((name, args[0].ty.clone(), v_ty.clone()));
                 }
             }
             walk_ivar_assignments(recv, out, env, walk);
@@ -12222,7 +12385,7 @@ impl Analyzer {
     /// is measured on a copy. Destructured without `..`, so a new field has
     /// to be listed here; `Copy` fields own no heap.
     pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
-        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, source_gem_classes, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
+        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, source_gem_classes, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("module_self_types", crate::memory_census::freed_by(|| drop(module_self_types))),
@@ -12232,6 +12395,7 @@ impl Analyzer {
             ("open_param_slots", crate::memory_census::freed_by(|| drop(open_param_slots))),
             ("pinned_param_slots", crate::memory_census::freed_by(|| drop(pinned_param_slots))),
             ("defaulted_param_slots", crate::memory_census::freed_by(|| drop(defaulted_param_slots))),
+            ("unseen_or_assign_classes", crate::memory_census::freed_by(|| drop(unseen_or_assign_classes))),
             ("source_gem_classes", crate::memory_census::freed_by(|| drop(source_gem_classes))),
             ("declared_signatures", crate::memory_census::freed_by(|| drop(declared_signatures))),
             ("adapter", crate::memory_census::freed_by(|| drop(adapter))),

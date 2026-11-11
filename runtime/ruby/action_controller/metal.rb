@@ -33,6 +33,17 @@ module ActionController
     include UrlFor
     include Redirecting
     include ActionView::Rendering
+
+    def logger
+      Rails.logger
+    end
+
+    # ActionView::Rendering's: the format respond_with negotiated is the one the response's templates are looked up in.
+    def _process_format(format)
+      negotiated = format.to_sym
+      @request_format = negotiated unless negotiated.nil?
+      nil
+    end
   end
 
   class API < Base
@@ -49,7 +60,8 @@ module ActionController
     end
 
     # What Rails' AbstractController::Callbacks registers, so a Metal subclass's body loads (Devise's FailureApp,
-    # which the boot names). Not run: a Metal action is reached through `action(:name)`, which is not modeled.
+    # which the boot names). Not kept here: `ingest::metal_actions` writes a single around block into the class's own
+    # `process_action`.
     def self.around_action(*names, &block)
       nil
     end
