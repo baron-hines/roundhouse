@@ -10,6 +10,162 @@ const REFERENCE_CONTRACT: &str = include_str!("support/schema_keys_reference_con
 const CONTRACT: &str = include_str!("support/schema_keys_contract.rb");
 const EXPECTED: &str = "deferred commit and composite keys match Rails";
 const EXECUTE: &str = "def execute(sql)\n  Db.exec(sql)\nend\ndef scalar(sql)\n  stmt = Db.prepare(sql)\n  raise 'no row' unless Db.step?(stmt)\n  value = Db.column_int(stmt, 0)\n  Db.finalize(stmt)\n  value\nend\n";
+const IMPLICIT_SCHEMA: &str = include_str!("support/schema_keys_implicit.rb");
+const IMPLICIT_CONTRACT: &str = include_str!("support/schema_keys_implicit_contract.rb");
+const SCALAR_KEY_CASES: &[(&str, &str)] = &[
+    ("primary_key: :shop_id", "cart_id"),
+    ("primary_key: [:shop_id]", "cart_shop_id"),
+    ("primary_key: :shop_id, column: [:cart_shop_id]", "cart_shop_id"),
+    ("primary_key: [:shop_id], column: :cart_id", "cart_id"),
+];
+
+const INVALID_IMPLICIT_KEYS: &[(&str, &str)] = &[
+    ("add_foreign_key :orders, :carts, primary_key: [:shop_id, :missing]", "add_foreign_key"),
+    ("add_foreign_key :orders, :carts, column: :cart_id, primary_key: [:shop_id, :user_id]", "add_foreign_key"),
+    ("add_foreign_key :orders, :carts, column: [:cart_id]", "add_foreign_key"),
+    ("add_foreign_key :orders, :carts, {primary_key: [:shop_id, :user_id]}", "add_foreign_key"),
+    ("add_foreign_key :orders, :carts, on_delete: :invalid", "add_foreign_key"),
+    ("create_table(:more_orders) do |t|\n t.foreign_key :carts, primary_key: [:shop_id, :user_id]\n t.integer :cart_shop_id\nend", "t.foreign_key"),
+    ("create_table(:more_orders) do |t|\n foreign_key :carts, primary_key: [:shop_id, :user_id]\n t.integer :cart_shop_id\n t.integer :cart_user_id\nend", "foreign_key :carts"),
+    ("create_table(:more_orders) do |t|\n t.references :cart\n t.foreign_key :carts, column: :cart, primary_key: :shop_id\nend", "t.foreign_key"),
+    ("create_table(:more_orders) do |t|\n t.references :cart, foreign_key: {primary_key: [:shop_id, :user_id]}\nend", "t.references"),
+    ("create_table(:more_orders) do |t|\n t.belongs_to :cart, foreign_key: {primary_key: [:shop_id, :user_id], column: [:cart_shop_id, :cart_user_id]}\nend", "t.belongs_to"),
+    ("create_table(:more_orders) do |t|\n t.references :cart, polymorphic: true, foreign_key: true\nend", "t.references"),
+    ("change_table(:orders) do |t|\n t.foreign_key :carts, primary_key: [:shop_id, :missing]\nend", "t.foreign_key"),
+    ("add_reference :orders, :cart, foreign_key: {primary_key: [:shop_id, :user_id]}", "add_reference"),
+    ("change_table(:orders) do |t|\n t.belongs_to :cart, foreign_key: {primary_key: [:shop_id, :user_id]}\nend", "t.belongs_to"),
+];
+
+fn key_case(statement: &str) -> String {
+    format!("ActiveRecord::Schema[8.1].define do\ncreate_table(:carts, primary_key: [:shop_id, :user_id]) do |t|\n t.integer :shop_id\n t.integer :user_id\nend\ncreate_table(:orders) do |t|\n t.integer :cart_shop_id\n t.integer :cart_user_id\n t.integer :cart_id\nend\n{statement}\nend")
+}
+
+fn key_migration(source: &str) -> String {
+    format!("class CreateKeys < ActiveRecord::Migration[8.1]\n def change\n{}\nend",
+        source.lines().skip(1).collect::<Vec<_>>().join("\n"))
+}
+
+#[test]
+fn implicit_foreign_keys_follow_rails_in_every_declaration_path() {
+    let mut sources = vec![IMPLICIT_SCHEMA.to_string()];
+    sources.push(IMPLICIT_SCHEMA.replace("|t|", "|definition|").replace("t.", "definition."));
+    sources.push(IMPLICIT_SCHEMA.replace("add_foreign_key :orders", "self.add_foreign_key :orders"));
+    sources.push(IMPLICIT_SCHEMA.replace("add_foreign_key :orders, :carts, primary_key: [:shop_id, :user_id]",
+        "change_table(:orders) do |t|\n t.foreign_key :carts, primary_key: [:shop_id, :user_id]\nend"));
+    sources.push(IMPLICIT_SCHEMA.replace("t.references :person", "t.belongs_to :person"));
+    sources.push(IMPLICIT_SCHEMA.replace(
+        "    t.references :person, index: false, foreign_key: {to_table: :people, primary_key: [:code], column: [:ignored, :also_ignored]}",
+        "  end\n  add_reference :reference_orders, :person, index: false, foreign_key: {to_table: :people, primary_key: [:code]}\n  create_table :extra_orders do |t|"));
+    for source in sources {
+        let migration = key_migration(&source);
+        let mut folded = roundhouse::schema::Schema::default();
+        roundhouse::ingest::ingest_migration(migration.as_bytes(), "db/migrate/1_keys.rb", &mut folded).unwrap();
+        let schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+        for schema in [&schema, &folded] {
+            for table in ["orders", "inline_orders"] {
+                let key = &schema.tables[&roundhouse::Symbol::from(table)].foreign_keys[0];
+                assert_eq!(key.from_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["cart_shop_id", "cart_user_id"]);
+                assert_eq!(key.to_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["shop_id", "user_id"]);
+            }
+            let key = &schema.tables[&roundhouse::Symbol::from("reference_orders")].foreign_keys[0];
+            assert_eq!(key.from_columns[0].as_str(), "person_id");
+            assert_eq!(key.to_columns[0].as_str(), "code");
+        }
+    }
+}
+
+#[test]
+fn invalid_implicit_foreign_keys_refuse_at_the_declaration_line() {
+    for &(statement, marker) in INVALID_IMPLICIT_KEYS {
+        let source = key_case(statement);
+        let migration = key_migration(&source);
+        for (text, is_migration) in [(&source, false), (&migration, true)] {
+            let file = if is_migration { "db/migrate/1_keys.rb" } else { "db/schema.rb" };
+            let error = if is_migration {
+                roundhouse::ingest::ingest_migration(text.as_bytes(), file, &mut roundhouse::schema::Schema::default())
+            } else { ingest_schema(text.as_bytes(), file).map(|_| ()) }.expect_err(statement).to_string();
+            let line = text.lines().position(|line| line.contains(marker)).unwrap() + 1;
+            assert!(error.contains(file) && error.contains(&format!("line {line}:")), "{statement}: {error}");
+        }
+    }
+}
+
+#[test]
+fn scalar_and_single_element_keys_derive_different_source_columns() {
+    for &(options, expected) in SCALAR_KEY_CASES {
+        let source = key_case(&format!("add_foreign_key :orders, :carts, {options}"));
+        let schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+        let key = &schema.tables[&roundhouse::Symbol::from("orders")].foreign_keys[0];
+        assert_eq!(key.from_columns[0].as_str(), expected);
+        assert_eq!(key.to_columns[0].as_str(), "shop_id");
+    }
+}
+
+#[test]
+fn rails_verifies_implicit_foreign_keys_and_invalid_forms() {
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let mut script = format!(r#"
+require {helper:?}
+unless RailsOracle.available?("activerecord", sqlite3: ">= 2.9")
+  puts "skip: Rails oracle and sqlite3 are unavailable"
+  exit
+end
+RailsOracle.activate("activerecord", sqlite3: ">= 2.9")
+require "active_record"
+ActiveRecord::Schema.verbose = false
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+{IMPLICIT_SCHEMA}
+db = ActiveRecord::Base.connection
+def execute(sql); ActiveRecord::Base.connection.execute(sql); end
+{IMPLICIT_CONTRACT}
+raise "direct columns" unless db.foreign_keys(:orders).first.column == %w[cart_shop_id cart_user_id]
+raise "inline columns" unless db.foreign_keys(:inline_orders).first.column == %w[cart_shop_id cart_user_id]
+raise "reference override" unless db.foreign_keys(:reference_orders).first.column == "person_id"
+"#);
+    for &(statement, _) in INVALID_IMPLICIT_KEYS {
+        let source = key_case(statement);
+        script.push_str(&format!(r#"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+begin
+  eval({source:?})
+  raise "invalid foreign key accepted"
+rescue ArgumentError, ActiveRecord::StatementInvalid, NoMethodError
+end
+"#));
+    }
+    for &(options, expected) in SCALAR_KEY_CASES {
+        let source = key_case(&format!("add_foreign_key :orders, :carts, {options}"));
+        script.push_str(&format!(r#"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+eval({source:?})
+key = ActiveRecord::Base.connection.foreign_keys(:orders).first
+raise "scalar source default" unless Array(key.column) == [{expected:?}]
+raise "scalar target" unless Array(key.primary_key) == ["shop_id"]
+"#));
+    }
+    script.push_str("puts 'implicit key forms verified with Rails'\n");
+    let out = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("implicit key forms verified with Rails") || stdout.contains("skip:"), "{stdout}");
+}
+
+#[test]
+fn emitted_ruby_enforces_implicit_foreign_keys() {
+    let run = emit_and_run::empty_app().write("db/schema.rb", IMPLICIT_SCHEMA)
+        .run_ruby(&format!("{EXECUTE}{IMPLICIT_CONTRACT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains("implicit foreign keys match Rails"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn native_spinel_enforces_implicit_foreign_keys() {
+    let run = emit_and_run::empty_app().write("db/schema.rb", IMPLICIT_SCHEMA)
+        .run_spinel_with_db(&format!("{EXECUTE}{IMPLICIT_CONTRACT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains("implicit foreign keys match Rails"));
+}
 
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app().write("db/schema.rb", SCHEMA)

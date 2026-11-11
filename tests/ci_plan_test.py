@@ -1079,6 +1079,7 @@ class Routing(unittest.TestCase):
     def test_schema_keys_owns_declarations_and_consumers(self):
         for path in [
             "tests/schema_keys.rs", "tests/support/schema_keys_schema.rb", "tests/support/schema_keys_contract.rb",
+            "tests/support/schema_keys_implicit.rb", "tests/support/schema_keys_implicit_contract.rb",
             "src/schema.rs", "src/ingest/schema.rs", "src/emit/shared/schema_sql.rs", "src/emit/roda.rs",
             "src/ingest/sequel_model.rs", "src/analyze/graphql.rs",
         ]:
