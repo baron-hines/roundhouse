@@ -21,8 +21,8 @@
 //! `RecordInvalid` (nothing validated), and the runtime's
 //! `save_after_validation` has no abortable callbacks to turn into
 //! `RecordNotSaved`. A `validate: true` — Rails' default, written out —
-//! is left as the plain call it means. Any other kwarg is not this
-//! pass's to read.
+//! is the plain call it means, and a computed value picks between the
+//! two at run time. Any other kwarg is not this pass's to read.
 //!
 //! Shape-directed, not type-directed: `save(validate: false)` names no
 //! method but ActiveRecord's, so the receiver's type adds nothing the
@@ -111,7 +111,8 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
 }
 
 fn rewrite_kwarg(expr: &mut Expr) {
-    let ExprNode::Send { method, args, block: None, .. } = &mut *expr.node else {
+    let span = expr.span;
+    let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else {
         return;
     };
     if !matches!(method.as_str(), "save" | "save!") {
@@ -122,10 +123,27 @@ fn rewrite_kwarg(expr: &mut Expr) {
     let [(k, v)] = entries.as_slice() else { return };
     let key_is_validate = matches!(&*k.node,
         ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "validate");
-    let value_is_false = matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } });
-    if !(key_is_validate && value_is_false) {
+    if !key_is_validate {
         return;
     }
-    *method = Symbol::from("save_after_validation");
-    args.clear();
+    match &*v.node {
+        ExprNode::Lit { value: Literal::Bool { value: false } } => {
+            *method = Symbol::from("save_after_validation");
+            args.clear();
+        }
+        ExprNode::Lit { value: Literal::Bool { value: true } } => args.clear(),
+        // Not for a receiver the branches would evaluate twice; Rails skips validation only for `false` itself (`options[:validate] == false`), not for nil.
+        _ if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)) => {
+            let value = v.clone();
+            let call = |name: &str| {
+                Expr::new(span, ExprNode::Send { recv: recv.clone(), method: Symbol::from(name), args: Vec::new(), block: None, parenthesized: true })
+            };
+            let skipped = call("save_after_validation");
+            let validated = call(method.as_str());
+            let falsy = Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: false } });
+            let cond = Expr::new(span, ExprNode::Send { recv: Some(value), method: Symbol::from("=="), args: vec![falsy], block: None, parenthesized: true });
+            *expr = Expr::new(span, ExprNode::If { cond, then_branch: skipped, else_branch: validated });
+        }
+        _ => {}
+    }
 }

@@ -482,6 +482,31 @@ pub(super) fn fold_devise_unnamed_router(app: &mut App) {
     }
 }
 
+/// `Devise::TimeInflector.time_ago_in_words(t)` (`:confirmable`'s expiry message): the class only hands the call to an
+/// instance that includes `ActionView::Helpers::DateHelper`, whose method the runtime carries as the view helper's.
+// Not through the class: its `delegate` sits in `class << self` and forwards arguments, which the delegate expansion's
+// zero-argument instance forwarders cannot spell.
+pub(super) fn fold_devise_time_inflector(app: &mut App) {
+    fn fold(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| fold(c));
+        if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *e.node
+            && method.as_str() == "time_ago_in_words"
+            && args.len() == 1
+            && matches!(&*r.node, ExprNode::Const { path } if path.iter().filter(|p| !p.as_str().is_empty()).map(|p| p.as_str()).eq(["Devise", "TimeInflector"]))
+        {
+            let span = r.span;
+            let mut helpers = Expr::new(span, ExprNode::Const { path: vec![crate::ident::Symbol::from("ActionView"), crate::ident::Symbol::from("ViewHelpers")] });
+            helpers.decisions |= crate::expr::GENERATED_CONST_REF;
+            *r = helpers;
+        }
+    }
+    for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str().starts_with("Devise")) {
+        for m in &mut lc.methods {
+            fold(&mut m.body);
+        }
+    }
+}
+
 fn sends(e: &Expr, name: &str) -> bool {
     let mut found = matches!(&*e.node, ExprNode::Send { method, .. } if method.as_str() == name);
     e.node.for_each_child(&mut |c| found |= sends(c, name));
@@ -647,7 +672,20 @@ fn includes_module(body: &Expr) -> Option<String> {
 /// and every Rails the compiler takes (7.0 on) is past 5.1.
 pub(super) fn module_answer(facts: &Facts, class: &str, method: &str, argv: &[Val]) -> Option<Val> {
     match (class.trim_start_matches("::"), method, argv) {
-        ("Devise::Orm", "active_record?" | "active_record_51?", [Val::Class(model)]) if facts.devise_models.contains_key(model.trim_start_matches("::")) => Some(Val::Bool(true)),
+        (module, method, [Val::Class(model)]) if asks_of_the_model(module, method) && facts.devise_models.contains_key(model.trim_start_matches("::")) => Some(Val::Bool(true)),
+        _ => None,
+    }
+}
+
+/// The module predicates [`module_answer`] answers of a model.
+pub(super) fn asks_of_the_model(module: &str, method: &str) -> bool {
+    matches!((module.trim_start_matches("::"), method), ("Devise::Orm", "active_record?" | "active_record_51?"))
+}
+
+/// [`module_answer`] for a concern's `included do` guard (`if Devise::Orm.active_record?(self)`), asked of the includer.
+pub(super) fn includer_answer(facts: &Facts, module: &str, method: &str, includer: &str) -> Option<bool> {
+    match module_answer(facts, module, method, &[Val::Class(includer.to_string())])? {
+        Val::Bool(answer) => Some(answer),
         _ => None,
     }
 }

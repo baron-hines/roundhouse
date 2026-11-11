@@ -865,6 +865,14 @@ module ActiveSupport
     out
   end
 
+  # A Hash a parameter takes where an indifferent one reaches it too: one keyed by Symbol converted, one keyed by String
+  # kept, as the caller's indifferent hash is the one Rails writes in place.
+  def self.indifferent_param(hash)
+    return hash if hash.nil?
+    return hash if hash.keys.all? { |key| key.is_a?(String) }
+    ActiveSupport.indifferent(hash)
+  end
+
   # Not a copy for every Array: Rails converts one written by `[]=` in place, unless it is frozen.
   def self.indifferent_value(value, in_place)
     if value.is_a?(Hash)

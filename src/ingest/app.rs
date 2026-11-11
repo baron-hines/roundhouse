@@ -4143,6 +4143,7 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         .collect();
 
     let dependencies = concern_dependencies(app, carriers);
+    let facts = super::gem_hooks::Facts::of(app);
 
     for model in &mut app.models {
         if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
@@ -4203,7 +4204,12 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                     for i in 0..=plain.len() {
                         for g in guarded {
                             let here = if i == plain.len() { g.at >= i } else { g.at == i };
-                            if here && g.guard.admits(includer) {
+                            // Not admitted where the module's question goes unanswered: neither branch is known to run.
+                            let admitted = match &g.guard.asked {
+                                Some((module, method)) => super::gem_hooks::includer_answer(&facts, module, method, includer).is_some_and(|answer| answer != g.guard.negate),
+                                None => g.guard.admits(includer),
+                            };
+                            if here && admitted {
                                 ordered.push(&g.item);
                             }
                         }

@@ -886,3 +886,125 @@ fn a_devise_user_registers_edits_and_cancels_over_http_natively() {
     let (secret, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
     assert_eq!(secret.status, 302, "{}", server.log());
 }
+
+/// `:confirmable`, as Rails 8.1.4 with Devise 4.9.4 answers it: a sign-up mails a confirmation link from its
+/// `after_commit` (declared under `if Devise::Orm.active_record?(self)`), signs no one in, and refuses a sign-in until
+/// the link confirms the account.
+const CONFIRMABLE_MODULES: &str = ":database_authenticatable, :registerable, :recoverable, :validatable, :confirmable";
+
+const CONFIRMABLE_COLUMNS: &str = "    t.datetime \"reset_password_sent_at\"\n    t.string \"confirmation_token\"\n    t.datetime \"confirmed_at\"\n    t.datetime \"confirmation_sent_at\"\n    t.string \"unconfirmed_email\"\n";
+
+fn confirmable_app() -> emit_and_run::Overlay {
+    app(CONFIRMABLE_MODULES, RECOVERABLE_ROUTES)
+        .edit("db/schema.rb", "    t.datetime \"reset_password_sent_at\"\n", CONFIRMABLE_COLUMNS)
+        .write("app/controllers/accounts_controller.rb", RESETS)
+}
+
+const RACK_CONFIRM: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  path, query = path.split("?", 2)
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => query.to_s, "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+token_of = ->(page) { URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1]) }
+sign_in = lambda do
+  _, _, page = req("GET", "/users/sign_in")
+  req("POST", "/users/sign_in", "authenticity_token=#{token_of.(page)}&user%5Bemail%5D=new%40example.com&user%5Bpassword%5D=secret123")
+end
+
+_, _, page = req("GET", "/users/sign_up")
+status, headers, = req("POST", "/users", "authenticity_token=#{token_of.(page)}&user%5Bemail%5D=new%40example.com&user%5Bpassword%5D=secret123&user%5Bpassword_confirmation%5D=secret123")
+raise "sign up #{status} #{headers.inspect}" unless status == 302 && headers["location"] == "http://localhost/"
+_, _, home = req("GET", "/")
+raise "inactive notice" unless home.include?("A message with a confirmation link has been sent to your email address.")
+status, = req("GET", "/secret")
+raise "unconfirmed signed in #{status}" unless status == 302
+_, _, mailed = req("GET", "/account/mailed")
+subject, from, to, body = mailed.split("|", 4)
+raise "mail #{[subject, from, to].inspect}" unless [subject, from, to] == ["Confirmation instructions", "please-change-me@example.com", "new@example.com"]
+raw = body[/confirmation_token=([^"&]+)"/, 1]
+raise "no token in #{body}" if raw.nil?
+status, headers, = sign_in.()
+raise "unconfirmed sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+status, = req("GET", "/secret")
+raise "refused sign in kept #{status}" unless status == 302
+status, headers, = req("GET", "/users/confirmation?confirmation_token=#{raw}")
+raise "confirm #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+raise "confirmed_at" if User.find_by(email: "new@example.com").confirmed_at.nil?
+status, headers, = sign_in.()
+raise "sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
+status, = req("GET", "/secret")
+raise "confirmed signed in #{status}" unless status == 200
+puts "devise confirmation over rack passed"
+"##;
+
+#[test]
+fn a_devise_user_confirms_before_signing_in_over_rack_on_the_ruby_family() {
+    let run = confirmable_app().run_ruby(RACK_CONFIRM);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise confirmation over rack passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_devise_user_confirms_before_signing_in_over_http_natively() {
+    let tree = confirmable_app().native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    let form_type = ("Content-Type", "application/x-www-form-urlencoded");
+    let mut jar = Vec::new();
+    let get = |jar: &mut Vec<(String, String)>, path: &str| {
+        let cookie = header(jar);
+        let (answer, cookies) = server.request_with_set_cookies("GET", path, &[("Cookie", cookie.as_str())], "");
+        kept(jar, &cookies);
+        answer
+    };
+    let post = |jar: &mut Vec<(String, String)>, path: &str, body: String| {
+        let cookie = header(jar);
+        let (answer, cookies) = server.request_with_set_cookies("POST", path, &[form_type, ("Cookie", cookie.as_str())], &body);
+        kept(jar, &cookies);
+        answer
+    };
+    let token_of = |page: &str| form_encode(between(page, "name=\"authenticity_token\" value=\"", "\""));
+    let sign_in = |jar: &mut Vec<(String, String)>| {
+        let page = get(jar, "/users/sign_in");
+        post(jar, "/users/sign_in", format!("authenticity_token={}&user%5Bemail%5D=new%40example.com&user%5Bpassword%5D=secret123", token_of(&page.body)))
+    };
+
+    let page = get(&mut jar, "/users/sign_up");
+    assert_eq!(page.status, 200, "{}", server.log());
+    let created = post(
+        &mut jar,
+        "/users",
+        format!("authenticity_token={}&user%5Bemail%5D=new%40example.com&user%5Bpassword%5D=secret123&user%5Bpassword_confirmation%5D=secret123", token_of(&page.body)),
+    );
+    assert_eq!(created.status, 302, "{}\n{}", created.body, server.log());
+    assert_eq!(get(&mut jar, "/secret").status, 302, "{}", server.log());
+    let mailed = get(&mut jar, "/account/mailed");
+    let mut parts = mailed.body.splitn(4, '|');
+    let head: Vec<&str> = parts.by_ref().take(3).collect();
+    assert_eq!(head, ["Confirmation instructions", "please-change-me@example.com", "new@example.com"], "{}", mailed.body);
+    let raw = between(parts.next().unwrap_or_default(), "confirmation_token=", "\"").to_string();
+
+    let refused = sign_in(&mut jar);
+    assert_eq!(refused.status, 302, "{}\n{}", refused.body, server.log());
+    assert!(refused.headers.get("location").is_some_and(|l| l.ends_with("/users/sign_in")), "{:?}", refused.headers);
+    assert_eq!(get(&mut jar, "/secret").status, 302, "{}", server.log());
+    let confirmed = get(&mut jar, &format!("/users/confirmation?confirmation_token={raw}"));
+    assert_eq!(confirmed.status, 302, "{}\n{}", confirmed.body, server.log());
+    let signed = sign_in(&mut jar);
+    assert_eq!(signed.status, 302, "{}\n{}", signed.body, server.log());
+    assert_eq!(get(&mut jar, "/secret").status, 200, "{}", server.log());
+}

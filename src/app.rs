@@ -27,11 +27,15 @@ use crate::ty::Ty;
 
 /// A condition on the including class, read from a concern's
 /// `included do`: `self == A` / `self != A` / `in?([A, B])`, under `if`
-/// or `unless`. `classes` are the constants as written.
+/// or `unless`. `classes` are the constants as written. `asked` is instead
+/// a module's predicate of the includer, `Devise::Orm.active_record?(self)`:
+/// the module and the method, which a gem hook answers per includer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IncluderGuard {
     pub classes: Vec<String>,
     pub negate: bool,
+    #[serde(default)]
+    pub asked: Option<(String, String)>,
 }
 
 impl IncluderGuard {
@@ -1434,7 +1438,7 @@ mod includer_guard_tests {
     use super::IncluderGuard;
 
     fn guard(classes: &[&str], negate: bool) -> IncluderGuard {
-        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate }
+        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate, asked: None }
     }
 
     #[test]

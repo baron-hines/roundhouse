@@ -6324,17 +6324,15 @@ pub type ConcernGuardedItems = Vec<(ClassId, Vec<crate::app::ConcernGuardedItem>
 fn includer_guarded_stmts<'pr>(
     stmt: &ruby_prism::Node<'pr>,
     file: &str,
-) -> Option<(crate::app::IncluderGuard, Vec<ruby_prism::Node<'pr>>)> {
-    let (predicate, body, unless) = if let Some(n) = stmt.as_if_node() {
-        if n.subsequent().is_some() {
-            return None;
-        }
-        (n.predicate(), n.statements()?, false)
+) -> Option<Vec<(crate::app::IncluderGuard, Vec<ruby_prism::Node<'pr>>)>> {
+    let (predicate, body, otherwise, unless) = if let Some(n) = stmt.as_if_node() {
+        let otherwise = match n.subsequent() {
+            None => None,
+            Some(other) => Some(other.as_else_node()?.statements()?),
+        };
+        (n.predicate(), n.statements()?, otherwise, false)
     } else if let Some(n) = stmt.as_unless_node() {
-        if n.else_clause().is_some() {
-            return None;
-        }
-        (n.predicate(), n.statements()?, true)
+        (n.predicate(), n.statements()?, n.else_clause().and_then(|e| e.statements()), true)
     } else {
         return None;
     };
@@ -6343,8 +6341,31 @@ fn includer_guarded_stmts<'pr>(
         return None;
     }
     let cond = super::expr::ingest_expr(&predicate, file).ok()?;
-    let (classes, negate) = includer_guard_classes(&cond)?;
-    Some((crate::app::IncluderGuard { classes, negate: negate != unless }, body))
+    let (guard, negate) = match includer_guard_classes(&cond) {
+        Some((classes, negate)) => (crate::app::IncluderGuard { classes, negate: false, asked: None }, negate),
+        None => (crate::app::IncluderGuard { classes: Vec::new(), negate: false, asked: Some(includer_predicate(&cond)?) }, false),
+    };
+    let held = negate != unless;
+    let mut out = vec![(crate::app::IncluderGuard { negate: held, ..guard.clone() }, body)];
+    if let Some(otherwise) = otherwise {
+        out.push((crate::app::IncluderGuard { negate: !held, ..guard }, otherwise.body().iter().collect()));
+    }
+    Some(out)
+}
+
+/// `Module.predicate?(self)`: a module's question about the includer, as Devise's `Devise::Orm.active_record?(self)`.
+// Not any such question: one no hook answers would drop both branches without a word, where the statement is otherwise reported.
+fn includer_predicate(cond: &crate::expr::Expr) -> Option<(String, String)> {
+    use crate::expr::ExprNode;
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*cond.node else { return None };
+    let ExprNode::Const { path } = &*recv.node else { return None };
+    let module = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    match args.as_slice() {
+        [arg] if matches!(&*arg.node, ExprNode::SelfRef) && super::gem_hooks::asks_of_the_model(&module, method.as_str()) => {
+            Some((module, method.as_str().to_string()))
+        }
+        _ => None,
+    }
 }
 
 fn includer_guard_classes(cond: &crate::expr::Expr) -> Option<(Vec<String>, bool)> {
@@ -6611,27 +6632,31 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 // includers it admits. Every statement under the guard
                 // must be one of those items, or the guard is left to
                 // today's handling as a whole.
-                if let Some((guard, stmts)) = includer_guarded_stmts(&inner, file) {
-                    let parsed: Option<Vec<ModelBodyItem>> = stmts.iter().try_fold(Vec::new(), |mut acc, stmt| {
-                        let parsed = super::model::ingest_model_body_items(stmt, &id, file, Vec::new(), None, &concern_consts).ok()?;
-                        let claimed = !parsed.is_empty()
-                            && parsed.iter().all(|item| matches!(item,
-                                ModelBodyItem::Association { .. }
-                                | ModelBodyItem::Scope { .. }
-                                | ModelBodyItem::Validation { .. }
-                                | ModelBodyItem::Callback { .. }));
-                        claimed.then(|| {
-                            acc.extend(parsed);
-                            acc
+                if let Some(groups) = includer_guarded_stmts(&inner, file) {
+                    let parsed: Option<Vec<(crate::app::IncluderGuard, Vec<ModelBodyItem>)>> = groups
+                        .into_iter()
+                        .map(|(guard, stmts)| {
+                            let items = stmts.iter().try_fold(Vec::new(), |mut acc, stmt| {
+                                let parsed = super::model::ingest_model_body_items(stmt, &id, file, Vec::new(), None, &concern_consts).ok()?;
+                                let claimed = !parsed.is_empty()
+                                    && parsed.iter().all(|item| matches!(item,
+                                        ModelBodyItem::Association { .. }
+                                        | ModelBodyItem::Scope { .. }
+                                        | ModelBodyItem::Validation { .. }
+                                        | ModelBodyItem::Callback { .. }));
+                                claimed.then(|| {
+                                    acc.extend(parsed);
+                                    acc
+                                })
+                            })?;
+                            Some((guard, items))
                         })
-                    });
+                        .collect();
                     if let Some(parsed) = parsed {
                         let at = items.len();
-                        guarded.extend(parsed.into_iter().map(|item| crate::app::ConcernGuardedItem {
-                            guard: guard.clone(),
-                            item,
-                            at,
-                        }));
+                        for (guard, group) in parsed {
+                            guarded.extend(group.into_iter().map(|item| crate::app::ConcernGuardedItem { guard: guard.clone(), item, at }));
+                        }
                         continue;
                     }
                 }
