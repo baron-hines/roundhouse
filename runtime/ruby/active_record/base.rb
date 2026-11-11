@@ -155,6 +155,8 @@ module ActiveRecord
         @kind = kind
         @foreign_key = foreign_key
         @polymorphic = polymorphic
+        @options = {}
+        @options[:polymorphic] = true if polymorphic
       end
 
       def macro
@@ -174,11 +176,9 @@ module ActiveRecord
       end
 
       # Not every option the association was declared with: only `polymorphic:` is kept, as Rails holds it (present only when given).
-      # Not a ternary of two Hash literals: a strict target types the filled one apart from the empty one.
+      # Not a Hash literal built here: a strict target types a local literal apart from the declared return, the slot carries the type.
       def options
-        opts = { polymorphic: true }
-        opts.delete(:polymorphic) unless @polymorphic
-        opts
+        @options
       end
 
       # Rails' `"#{name}_type"`, of a polymorphic belongs_to only.
