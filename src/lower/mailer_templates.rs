@@ -39,6 +39,12 @@ use crate::ty::Ty;
 use super::view_to_library::{ViewArgs, ViewKey};
 
 pub fn apply_mailer_templates(app: &mut App) -> Vec<Diagnostic> {
+    apply_mailer_templates_for(app, crate::build_target::BuildTarget::Ruby)
+}
+
+pub fn apply_mailer_templates_for(app: &mut App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
+    // Not on a strict target: `default_params` and `_prefixes` read the ruby family's ActionMailer runtime.
+    let ruby_family = target.has_runtime_relation();
     let mut diags = Vec::new();
     let mailers = super::mailer_class_side::mailer_names(app);
     if mailers.is_empty() {
@@ -78,12 +84,12 @@ pub fn apply_mailer_templates(app: &mut App) -> Vec<Diagnostic> {
         let (defaults, layout) = class_settings(&chain, &calls, &mut diags);
         // Rails' `default_params`, which a mailer's own code may read (Devise's `mailer_sender`): ActionMailer's merged
         // with the chain's `default` entries.
-        if !defaults.is_empty() && !lc.methods.iter().any(|m| m.name.as_str() == "default_params" && m.receiver == crate::dialect::MethodReceiver::Instance) {
+        if ruby_family && !defaults.is_empty() && !lc.methods.iter().any(|m| m.name.as_str() == "default_params" && m.receiver == crate::dialect::MethodReceiver::Instance) {
             lc.methods.push(default_params_method(&lc.name, &defaults));
         }
         // `_prefixes`, the directories a lookup of the mailer's templates searches (Devise's `template_paths`): each
         // mailer of its chain, nearest first, as `AbstractController::ViewPaths` lists their `mailer_name`s.
-        if !lc.methods.iter().any(|m| m.name.as_str() == "_prefixes" && m.receiver == crate::dialect::MethodReceiver::Instance) {
+        if ruby_family && !lc.methods.iter().any(|m| m.name.as_str() == "_prefixes" && m.receiver == crate::dialect::MethodReceiver::Instance) {
             let span = crate::span::Span::synthetic();
             let elements = chain.iter().map(|c| str_lit(span, &view_dir(c))).collect();
             let body = Expr::new(span, ExprNode::Array { elements, style: Default::default() });
