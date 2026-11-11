@@ -523,21 +523,38 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
     let class_expr = || {
         Expr::new(Span::synthetic(), ExprNode::Const { path: class.split("::").map(Symbol::from).collect() })
     };
-    // A collection reads the scope once, after the collection, as the
-    // gem's render does: both are bound before the map, which passes the
+    // The gem reads the scope inside `render`, after every option's value
+    // has run in source order, and once for a collection. When an option
+    // other than `json:` runs code, or the render maps a collection, each
+    // option that isn't a literal is bound in source order, then the
+    // scope, and the render reads the bindings: the map passes the one
     // bound scope to each item's serializer.
     let var = |name: &str| Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) });
     let bound = |name: &str, value: Expr| {
         let target = crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from(name) };
         Expr::new(span, ExprNode::Assign { target, value })
     };
+    let runs = |v: &Expr| !matches!(&*v.node, ExprNode::Lit { .. });
+    let chosen = |k: &Expr| matches!(name(k).as_deref(), Some("serializer" | "each_serializer"));
+    let options_run = entries.iter().enumerate().any(|(i, (k, v))| i != json && !chosen(k) && runs(v));
     let mut bindings = Vec::new();
     let mut value = entries[json].1.clone();
     let scope = match scope {
-        Some(scope) if collection => {
-            bindings.push(bound("__ams_items", value));
+        Some(scope) if collection || options_run => {
+            for i in 0..entries.len() {
+                if chosen(&entries[i].0) || !runs(&entries[i].1) {
+                    continue;
+                }
+                let temp = format!("__ams_{}", name(&entries[i].0).unwrap_or_default());
+                if i == json {
+                    bindings.push(bound(&temp, value));
+                    value = var(&temp);
+                } else {
+                    bindings.push(bound(&temp, entries[i].1.clone()));
+                    entries[i].1 = var(&temp);
+                }
+            }
             bindings.push(bound("__ams_scope", scope));
-            value = var("__ams_items");
             Some(var("__ams_scope"))
         }
         scope => scope,
