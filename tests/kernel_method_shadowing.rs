@@ -280,7 +280,44 @@ end
     );
 }
 
-const REPORT: &str = "puts Catalog::Row.load_reference(\"kept\").code\nputs Loader.reference\nputs Loader.new.reference\nputs Loader.formatted\nputs Loader.new.printed\n";
+/// TypeScript calls the app's method where analysis typed the call with it,
+/// so the emitted call and the declared return type agree; Kernel's
+/// `puts` stays `console.log`.
+#[test]
+fn typescript_calls_the_method_whose_type_it_declares() {
+    let source = r#"class Probe
+  def self.puts(value) = 17
+  def print(value) = "printed"
+  def self.reference = puts(nil)
+  def printed = print(nil)
+end
+class Loader
+  def self.load(value) = 23
+  def self.reference = load(nil)
+  def self.logged = puts(nil)
+end
+"#;
+    let (tree, errors) = app(source).emit(BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let read = |class: &str| std::fs::read_to_string(tree.join(format!("app/models/{class}.ts"))).unwrap();
+    let probe = read("probe");
+    for method in [
+        "static reference(): number {\n    return this.puts(null);\n  }",
+        "printed(): string {\n    return this.print(null);\n  }",
+    ] {
+        assert!(probe.contains(method), "{method}\n{probe}");
+    }
+    assert!(!probe.contains("console.log"), "{probe}");
+    let loader = read("loader");
+    for method in [
+        "static reference(): number {\n    return this.load(null);\n  }",
+        "static logged(): void {\n    console.log(null);\n  }",
+    ] {
+        assert!(loader.contains(method), "{method}\n{loader}");
+    }
+}
+
+const REPORT: &str ="puts Catalog::Row.load_reference(\"kept\").code\nputs Loader.reference\nputs Loader.new.reference\nputs Loader.formatted\nputs Loader.new.printed\n";
 
 #[test]
 fn emitted_calls_match_cruby() {

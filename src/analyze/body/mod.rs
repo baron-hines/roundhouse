@@ -2294,11 +2294,12 @@ impl<'a> BodyTyper<'a> {
                 }
                 // Bare Kernel calls are fallbacks: own, included and inherited
                 // methods on the receiver's dispatch side take precedence.
-                if recv.is_none()
+                let kernel_named = recv.is_none()
                     && matches!(method.as_str(), "require" | "require_relative" | "load" | "autoload"
-                        | "puts" | "print" | "warn" | "format" | "sprintf" | "`")
-                    && !self.app_defines_on_side(ctx.self_ty.as_ref(), method, ctx.instance_body)
-                {
+                        | "puts" | "print" | "warn" | "format" | "sprintf" | "`");
+                let shadowed = kernel_named && self.app_defines_on_side(ctx.self_ty.as_ref(), method, ctx.instance_body);
+                expr.decisions = (expr.decisions & !crate::expr::APP_KERNEL_NAME) | if shadowed { crate::expr::APP_KERNEL_NAME } else { 0 };
+                if kernel_named && !shadowed {
                     if matches!(
                         method.as_str(),
                         "require" | "require_relative" | "load" | "autoload"
