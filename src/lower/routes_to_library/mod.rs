@@ -1538,6 +1538,15 @@ fn build_helper_function(
     } else {
         build_path_expr(path, &seg_params, &slug_params)
     };
+    // A single optional segment is omitted when its supplied value equals its default.
+    if let Some(p) = seg_params.get(required).filter(|_| seg_params.len() == required + 1) {
+        if let Some((_, value, _)) = route.request_defaults.iter().find(|(name, _, _)| name == p) {
+            let default = Expr::new(Span::synthetic(), ExprNode::Lit { value: value.clone() });
+            let cond = with_ty(send_method(send_method(var_ref(p), "to_s", vec![]), "==", vec![send_method(default, "to_s", vec![])]), Ty::Bool);
+            let omitted = build_path_expr(route.required_path.as_deref().unwrap_or("/"), &seg_params[..required], &slug_params);
+            body = with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: omitted, else_branch: body }), Ty::Str);
+        }
+    }
     // Rails' `(.:format)`: a route path spelled the `rails routes` way
     // ends in `(.:format)`, which gives the helper a trailing optional
     // positional — `comments_path(:rss)` → "/comments.rss".
@@ -1712,6 +1721,7 @@ fn build_helper_function(
                 kind: crate::ty::ParamKind::Keyword { required: false },
             });
         }
+        let plain_keys: Vec<_> = plain_keys.into_iter().filter(|key| !route.request_defaults.iter().any(|(name, _, _)| name == &key.name)).collect();
         body = append_query_string(body, &plain_keys);
         if let Some(anchor) = anchor_keys.first() {
             body = append_anchor(body, &anchor.name);

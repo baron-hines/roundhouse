@@ -51,20 +51,61 @@ end
 }
 
 #[test]
-fn controller_requests_keep_typed_defaults() {
+fn controller_requests_do_not_apply_route_defaults() {
     app().write("test/controllers/defaults_controller_test.rb", r#"require "test_helper"
 class DefaultsControllerTest < ActionController::TestCase
-  test "controller requests keep typed defaults" do
+  test "controller requests do not apply route defaults" do
     get :show, params: { text: "query" }
-    assert_equal '"fixed"|:staff|1|true|false|nil', response.body
+    assert_equal '"query"|nil|nil|nil|nil|nil', response.body
   end
 end
 "#).run_test("test/controllers/defaults_controller_test.rb").assert_passes();
 }
+
+#[test]
+fn routing_assertions_do_not_count_route_defaults_as_extras() {
+    app().write("test/controllers/defaults_controller_test.rb", r#"require "test_helper"
+class DefaultsControllerTest < ActionDispatch::IntegrationTest
+  test "routing recognizes and generates defaults" do
+    options = { controller: "defaults", action: "routing", text: "fixed", symbol: :staff, number: 1, yes: true, no: false, absent: nil }
+    assert_routing "/routing", options
+  end
+  test "generation excludes every default key even with a different value" do
+    assert_generates "/routing", { controller: "defaults", action: "routing", text: "other" }
+    assert_generates "/routing", { controller: "defaults", action: "routing", text: "other", extra: "kept" }, {}, { extra: "kept" }
+  end
+end
+"#).run_test("test/controllers/defaults_controller_test.rb").assert_passes();
+}
+
+#[test]
+fn recognition_unescapes_string_defaults_once_without_changing_dispatch() {
+    app().run_ruby(&format!(r#"{CHECKS}
+raise "escaped recognition" unless Rails.application.routes.recognize_path("/escaped")[:text] == "a b+%20"
+raise "byte recognition" unless Rails.application.routes.recognize_path("/byte")[:text].bytes == [255]
+raise "unchanged dispatch" unless answer("GET", "/escaped", "", "", {{}})[1] == '"a%20b+%2520"|nil|nil|nil|nil|nil'
+"#)).assert_passes();
+    app().write("test/controllers/defaults_controller_test.rb", r#"require "test_helper"
+class DefaultsControllerTest < ActionDispatch::IntegrationTest
+  test "recognition unescapes defaults once" do
+    assert_recognizes({ controller: "defaults", action: "show", text: "a b+%20" }, "/escaped")
+    assert_recognizes({ controller: "defaults", action: "show", text: [255].pack("C*") }, "/byte")
+  end
+end
+"#).run_test("test/controllers/defaults_controller_test.rb").assert_passes();
+}
+
+#[test]
+fn helpers_omit_optional_defaults_and_default_options() {
+    app().run_ruby(&format!(r#"{CHECKS}
+raise "default helpers" unless answer("GET", "/links", "", "", {{}})[1] == "/optional|/optional|/optional/2|/optional/2|/optional|/literal|/entry/9|/entry/9/page/2|/catalog|/fr/catalog"
+"#)).assert_passes();
+}
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn typed_defaults_reach_native_params() {
-    let script = r#"matched = ActionDispatch::Router.match("GET", "/literal", [RouteTable.root] + RouteTable.table)
+    let script = r#"require_relative "test/test_helper"
+matched = ActionDispatch::Router.match("GET", "/literal", [RouteTable.root] + RouteTable.table)
 raise "match" if matched.nil?
 params = ParamBuilder.from_query_string("text=query&number=9")
 raise "query" if params.nil?
@@ -73,9 +114,28 @@ controller = DefaultsController.new
 controller.params = params
 controller.show
 raise "types: " + controller.response.body.inspect unless controller.response.body == '"fixed"|:staff|1|true|false|nil'
+probe = ActionDispatch::IntegrationTest.new
+probe.assert_recognizes({ controller: "defaults", action: "show", text: "a b+%20" }, "/escaped")
+probe.assert_routing("/routing", { controller: "defaults", action: "routing", text: "fixed", symbol: :staff, number: 1, yes: true, no: false, absent: nil })
 puts "kind=fixed"
 "#;
     app().run_spinel_with_rbs(script).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn route_defaults_win_over_native_multipart_uploads() {
+    let tree = app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+        .native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    let body = "--route-upload\r\nContent-Disposition: form-data; name=\"text\"; filename=\"sample.txt\"\r\nContent-Type: text/plain\r\n\r\nquery\r\n--route-upload--\r\n";
+    let response = server.post_without_session("/matched", "multipart/form-data; boundary=route-upload", body);
+    assert_eq!(response.status, 200, "{}", server.log());
+    assert_eq!(response.body, "\"fixed\"|nil|nil|nil|nil|nil", "{}", server.log());
+    let links = server.get("/links");
+    assert_eq!(links.status, 200, "{}", server.log());
+    assert_eq!(links.body, "/optional|/optional|/optional/2|/optional/2|/optional|/literal|/entry/9|/entry/9/page/2|/catalog|/fr/catalog", "{}", server.log());
 }
 
 #[test]

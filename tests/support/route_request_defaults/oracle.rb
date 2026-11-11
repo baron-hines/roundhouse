@@ -1,9 +1,9 @@
 require_relative "../rails_oracle"
-unless RailsOracle.available?("railties", "actionpack")
-  warn "skipping #{RailsOracle.label}: railties and actionpack are required"
+unless RailsOracle.available?("railties", "actionpack", minitest: ">= 5.1")
+  warn "skipping #{RailsOracle.label}: railties, actionpack and minitest are required"
   exit 77
 end
-RailsOracle.activate("railties", "actionpack")
+RailsOracle.activate("railties", "actionpack", minitest: ">= 5.1")
 require "rails"
 require "action_controller/railtie"
 require "rack/mock"
@@ -34,8 +34,17 @@ recognized = DefaultsApplication.routes.recognize_path("/literal")
 end
 raise "required helper" unless DefaultsApplication.routes.url_helpers.number_path == "/number/1"
 raise "optional helper" unless DefaultsApplication.routes.url_helpers.optional_path == "/optional"
+links = Rack::MockRequest.new(DefaultsApplication).get("/links")
+raise "default helpers: #{links.body}" unless links.body == "/optional|/optional|/optional/2|/optional/2|/optional|/literal|/entry/9|/entry/9/page/2|/catalog|/fr/catalog"
+raise "unescaped recognition" unless DefaultsApplication.routes.recognize_path("/escaped")[:text] == "a b+%20"
+raise "byte recognition" unless DefaultsApplication.routes.recognize_path("/byte")[:text].bytes == [255]
+escaped = Rack::MockRequest.new(DefaultsApplication).get("/escaped")
+raise "dispatch must not unescape" unless escaped.body == '"a%20b+%2520"|nil|nil|nil|nil|nil'
 post = Rack::MockRequest.new(DefaultsApplication).post("/matched?text=query")
 raise "match via" unless post.body == '"fixed"|nil|nil|nil|nil|nil'
+upload = "--route-upload\r\nContent-Disposition: form-data; name=\"text\"; filename=\"sample.txt\"\r\nContent-Type: text/plain\r\n\r\nquery\r\n--route-upload--\r\n"
+multipart = Rack::MockRequest.new(DefaultsApplication).post("/matched", "CONTENT_TYPE" => "multipart/form-data; boundary=route-upload", input: upload)
+raise "multipart default" unless multipart.status == 200 && multipart.body == '"fixed"|nil|nil|nil|nil|nil'
 puts "Rails route defaults contract passed"
 [nil, false].each do |value|
   routes = ActionDispatch::Routing::RouteSet.new
@@ -44,5 +53,27 @@ puts "Rails route defaults contract passed"
     routes.url_helpers.required_path
     raise "#{value.inspect} supplied a required segment"
   rescue ActionController::UrlGenerationError
+  end
+end
+
+require "minitest/autorun"
+require "action_controller/test_case"
+require "action_dispatch/testing/integration"
+class DefaultsControllerTest < ActionController::TestCase
+  tests DefaultsController
+  setup { @routes = DefaultsApplication.routes }
+  test "controller requests do not apply route defaults" do
+    get :show, params: { text: "query" }
+    assert_equal '"query"|nil|nil|nil|nil|nil', response.body
+  end
+end
+class DefaultsRoutingTest < ActionDispatch::IntegrationTest
+  setup { @routes = DefaultsApplication.routes }
+  test "routing recognizes and generates defaults" do
+    assert_routing "/routing", { controller: "defaults", action: "routing", text: "fixed", symbol: :staff, number: 1, yes: true, no: false, absent: nil }
+    assert_generates "/routing", { controller: "defaults", action: "routing", text: "other" }
+    assert_generates "/routing", { controller: "defaults", action: "routing", text: "other", extra: "kept" }, {}, { extra: "kept" }
+    assert_recognizes({ controller: "defaults", action: "show", text: "a b+%20" }, "/escaped")
+    assert_recognizes({ controller: "defaults", action: "show", text: [255].pack("C*") }, "/byte")
   end
 end

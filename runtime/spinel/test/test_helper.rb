@@ -1598,7 +1598,9 @@ module ActionDispatch
         # is one of the route's defaults, which Rails recognizes too.
         format = matched.req_format.to_s if format.empty? && !matched.req_format.nil?
         recognized["format"] = format unless format.empty?
-        RouteTable.route_defaults(matched.defaults, recognized, matched.path_params)
+        defaults = {}
+        RouteTable.route_defaults(matched.defaults, defaults, matched.path_params)
+        defaults.each { |name, value| recognized[name] = value.is_a?(String) ? ActionDispatch::Router.percent_bytes(value.bytes).pack("C*") : value }
         recognized
       end
 
@@ -1742,6 +1744,9 @@ module ActionDispatch
       def generated_query_keys(route, options)
         used = generation_segment_names(route.pattern) + ["controller", "action"]
         used << "format" if !route.req_format.nil? || route.pattern != "/"
+        defaults = {}
+        RouteTable.route_defaults(route.defaults, defaults, {})
+        used.concat(defaults.keys)
         options.keys.reject { |key| used.include?(key) }
       end
     end
@@ -2173,7 +2178,7 @@ module ActionController
         headers["HTTP_X_REQUESTED_WITH"] = "XMLHttpRequest"
         headers["HTTP_ACCEPT"] = "text/javascript, text/html, application/xml, text/xml, */*"
       end
-      run_controller(@controller, route.action, path_params, nil, method, method, path, "", rest, headers, as, route.defaults)
+      run_controller(@controller, route.action, path_params, nil, method, method, path, "", rest, headers, as)
     end
 
     # A param value as a request carries it: what Rails' TestRequest
