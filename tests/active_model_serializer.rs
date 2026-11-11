@@ -375,3 +375,38 @@ fn a_scope_name_a_concern_declares_stays_reported() {
         assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{helper}: {messages:#?}");
     }
 }
+
+/// A module's `def self.current_user` is the module's own method, not an
+/// instance helper the including controller answers, so with nothing
+/// else giving `current_user` the scope is nil. A method `extend self`
+/// or `module_function` exposes is an instance method there too, and the
+/// scope is that `current_user`.
+#[test]
+fn only_a_modules_instance_helpers_give_the_controller_current_user() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class ArticlesController < ApplicationController\n  include Authn\n\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\nend\n";
+    let singleton = "module Authn\n  def self.current_user\n    \"ann\"\n  end\nend\n";
+    let (_, rendered, _) = emitted_with(scoped, controller, &[("app/controllers/concerns/authn.rb", singleton)]);
+    assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{rendered}");
+    for helper in ["module Authn\n  extend self\n\n  def current_user\n    \"ann\"\n  end\nend\n", "module Authn\n  module_function\n\n  def current_user\n    \"ann\"\n  end\nend\n"] {
+        let (_, rendered, _) = emitted_with(scoped, controller, &[("app/controllers/concerns/authn.rb", helper)]);
+        assert!(rendered.contains("{ scope: ") && rendered.contains("current_user }).serializable_hash"), "{helper}: {rendered}");
+    }
+}
+
+/// An action a subclass inherits renders through the same body: when a
+/// descendant that doesn't override it has another scope (here its own
+/// `serialization_scope :viewer`), no one rewrite answers for both, so
+/// the render is left as written, and reported.
+#[test]
+fn an_inherited_render_under_a_descendants_other_scope_stays_reported() {
+    let scoped = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class ArticlesController < ApplicationController\n  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n";
+    let child = "class ScopedArticlesController < ArticlesController\n  serialization_scope :viewer\n\n  private\n\n  def viewer\n    \"vic\"\n  end\nend\n";
+    let (_, rendered, messages) = emitted_with(scoped, controller, &[("app/controllers/scoped_articles_controller.rb", child)]);
+    assert!(!rendered.contains("serializable_hash"), "{rendered}");
+    assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
+    // Without the descendant, the parent's render is rewritten.
+    let (_, rendered, _) = emitted_with(scoped, controller, &[]);
+    assert!(rendered.contains("{ scope: self.current_user }"), "{rendered}");
+}

@@ -558,8 +558,11 @@ fn a_devise_user_signs_in_over_http_natively() {
 /// gives `current_user`, the scope active_model_serializers' default
 /// `serialization_scope` reads. `class_name:`, `as:` or `singular:`
 /// changes what the mapping is called or which model it answers, and a
-/// `devise` model with no mapping drawn gives no helper: under any of
-/// those the scope is left unknown, and the render as written, reported.
+/// `devise` model with no mapping drawn gives no helper. Only a single
+/// `devise_for :users` drawn unconditionally at the top of the routes
+/// counts: under a namespace, a condition or a second one, as under any
+/// of the others, the scope is left unknown, and the render as written,
+/// reported.
 #[test]
 fn a_serializer_scope_is_devises_current_user_only_under_devise_for_users() {
     let serializer = "class CardSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
@@ -573,7 +576,18 @@ fn a_serializer_scope_is_devises_current_user_only_under_devise_for_users() {
     };
     let (cards, errors) = rendered("  devise_for :users\n");
     assert!(cards.contains("CardSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).serializable_hash"), "{cards}\n{errors:#?}");
-    for routes in ["  devise_for :users, class_name: \"User\"\n", "  devise_for :users, as: :member\n", "  devise_for :users, singular: :member\n", ""] {
+    for routes in [
+        "  devise_for :users, class_name: \"User\"\n",
+        "  devise_for :users, as: :member\n",
+        "  devise_for :users, singular: :member\n",
+        "",
+        // Not one unconditional mapping drawn at the top of the routes:
+        // under a namespace Devise maps `admin_user`, a conditional one
+        // may not be drawn, and a second `devise_for :users` redraws it.
+        "  namespace :admin do\n    devise_for :users\n  end\n",
+        "  if ENV[\"DEVISE\"]\n    devise_for :users\n  end\n",
+        "  devise_for :users\n  devise_for :users, path: \"accounts\"\n",
+    ] {
         let (cards, errors) = rendered(routes);
         assert!(!cards.contains("serializable_hash"), "{routes:?}: {cards}");
         assert!(errors.iter().any(|e| e.contains("rendering through an active_model_serializers")), "{routes:?}: {errors:#?}");
