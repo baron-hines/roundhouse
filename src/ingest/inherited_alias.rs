@@ -140,6 +140,31 @@ pub(super) fn settle(app: &mut App, held: Vec<Held>) {
             break;
         }
     }
+    // An alias Ruby resolves outside the app's classes (`answered_outside_the_app`) gets no copy, so every Ruby tree
+    // writes it where the source has it, Spinel's too (an `alias_method` of a Hash subclass's `[]`).
+    let mut outside: Vec<(usize, usize)> = Vec::new();
+    {
+        let candidates: Vec<&LibraryClass> = app.library_classes.iter().collect();
+        for (_, h) in held.iter().enumerate().filter(|(i, _)| carried[*i]) {
+            for k in h.classes.clone() {
+                let lc = &app.library_classes[k];
+                for (j, call) in lc.unknown_calls.iter().enumerate() {
+                    let Some((receiver, _, from)) = alias_call(call) else { continue };
+                    // Not a class-side one (`class << self; alias [] new; end`): the in-place replay writes the class body.
+                    if receiver == MethodReceiver::Instance
+                        && h.spans.contains(&call.span)
+                        && ancestor_method(&candidates, lc, from, receiver, call.span).is_none()
+                        && answered_outside_the_app(&candidates, lc, from, receiver)
+                    {
+                        outside.push((k, j));
+                    }
+                }
+            }
+        }
+    }
+    for (k, j) in outside {
+        app.library_classes[k].unknown_calls[j].decisions |= crate::expr::REPLAYED_CLASS_BODY;
+    }
     let mut refused: Vec<(usize, Span)> =
         (0..held.len()).filter(|i| !carried[*i]).filter_map(|i| Some((i, unresolved(app, &carried, i)?))).collect();
     refused.sort_by_key(|(i, _)| std::cmp::Reverse(held[*i].classes.start));

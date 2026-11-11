@@ -551,8 +551,9 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             .collect()
     };
     if !spent.is_empty() {
+        // Not another class's method of the name, which defines nothing (OmniAuth's `default_options` reader).
         for lc in app.library_classes.iter_mut().filter(|lc| !lc.is_module) {
-            lc.methods.retain(|m| !(m.receiver == MethodReceiver::Class && spent.contains(&m.name)));
+            lc.methods.retain(|m| !(m.receiver == MethodReceiver::Class && spent.contains(&m.name) && defines(&m.body)));
         }
     }
     // An extended module's macro (doorkeeper's `Option#option`), by the same IR count over the classes that extend it.
