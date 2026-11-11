@@ -139,9 +139,18 @@ pub(super) fn push_validate_method(
                     };
                     // Not the `@attr` slot a column has: a typed_store attribute lives in its store column, behind the reader Rails validates through.
                     // A defaulted `attribute` holds nil in `@attr` until its reader applies the default.
-                    if store_attrs.contains(&v.attribute) || defaulted_attrs.contains(&v.attribute) {
+                    // Nor for an attribute no column holds (Devise's `password`): Rails validates what its reader answers.
+                    let virtual_attr = attr_ty.is_none() && !is_assoc && attachment.is_none() && !is_collection;
+                    if store_attrs.contains(&v.attribute) || defaulted_attrs.contains(&v.attribute) || virtual_attr {
                         for check in &mut produced {
                             read_through_reader(check, &v.attribute);
+                        }
+                    }
+                    // Rails reads the confirmation through its reader (`public_send("#{attr}_confirmation")`).
+                    if matches!(rule, ValidationRule::Confirmation { .. }) {
+                        let confirmation = Symbol::from(format!("{}_confirmation", v.attribute.as_str()));
+                        for check in &mut produced {
+                            read_through_reader(check, &confirmation);
                         }
                     }
                     if v.if_cond.is_some() || v.unless_cond.is_some() {
@@ -659,6 +668,7 @@ fn validation_rule_to_calls(
     match rule {
         ValidationRule::Presence => vec![inline_presence_check(msgs, attr, attr_ty, runtime_relation)],
         ValidationRule::Absence => vec![inline_absence_check(msgs, attr, attr_ty, runtime_relation)],
+        ValidationRule::Confirmation { case_sensitive } => vec![inline_confirmation_check(msgs, attr, *case_sensitive != Some(false), attr_ty)],
         ValidationRule::Acceptance { accept, allow_nil } => {
             vec![inline_acceptance_check(msgs, attr, accept, *allow_nil != Some(false), attr_ty, runtime_relation)]
         }
@@ -1452,6 +1462,26 @@ fn inline_exclusion_check(
 /// ruby family compares them all, as Rails' `include?` does, except on a
 /// Boolean column: its writer stores the input uncast, so the check reads
 /// `ActiveSupport.cast_boolean(@attr)` (`"yes"` is `true`, `""` nil).
+/// Rails' `ConfirmationValidator`: a `<attr>_confirmation` that was given and differs (by `casecmp` for a String
+/// when not case-sensitive) is an error on the confirmation, naming the attribute.
+fn inline_confirmation_check(msgs: Messages, attr: &Symbol, case_sensitive: bool, attr_ty: Option<&Ty>) -> Expr {
+    let confirmation_name = format!("{}_confirmation", attr.as_str());
+    let confirmation = ivar(&Symbol::from(confirmation_name.as_str()));
+    let value = ivar(attr);
+    let string = matches!(peel_nilable(attr_ty).0, Some(Ty::Str));
+    let same = if !case_sensitive && string {
+        send(send(value.clone(), "casecmp", vec![confirmation.clone()]), "==", vec![Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 0 } })])
+    } else {
+        send(value, "==", vec![confirmation.clone()])
+    };
+    let differs = bool_op(BoolOpKind::And, send(send(confirmation, "nil?", vec![]), "!", vec![]), send(same, "!", vec![]));
+    let human = msgs.0.map(|m| m.human_attribute_name(attr.as_str())).unwrap_or_else(|| crate::i18n::humanize(attr.as_str()));
+    if_with_nil_else(
+        differs,
+        errors_push(&confirmation_name, msgs.error(&confirmation_name, "confirmation", &ErrorOpts { attribute: Some(human), ..Default::default() })),
+    )
+}
+
 fn inline_acceptance_check(
     msgs: Messages,
     attr: &Symbol,

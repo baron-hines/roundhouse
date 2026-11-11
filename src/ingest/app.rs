@@ -3090,13 +3090,14 @@ end
     // `User::Avatar`. The passes above leave both as written.
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
     // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
-    super::configured_superclass::expand_model_mixin_macros(vfs, dir, &path_gems, &mut app);
     for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {
         if let Some(carrier) = concern_class_method_spans.iter_mut().find(|c| c.owner == owner) {
             carrier.methods.push(span);
         }
         app.concern_class_side_spans.insert(span);
     }
+    // After the definers: a hook the macro runs reads what they define (Validatable's `email_regexp`).
+    super::configured_superclass::expand_model_mixin_macros(vfs, dir, &path_gems, &mut app);
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
@@ -3334,6 +3335,8 @@ end
     // `numericality:` on an untyped attribute is decided per target
     // (`refuse_numericality_allow_on_untyped`, `session::analyze_and_lower_for`).
     gap_acceptance_on_undeclared(&mut app);
+    define_confirmation_accessors(&mut app);
+    record_mixin_sends(&mut app);
     // Not at model ingest: the `select` naming a model's aliases can sit in another model, class, controller or view.
     super::select_aliases::stamp(&mut app);
     gap_uniqueness_on_polymorphic_attribute(&mut app);
@@ -3698,7 +3701,7 @@ pub(crate) fn refuse_numericality_allow_on_untyped(app: &mut App, target: &str) 
 /// Rails casts it (`true` is `"t"` on a String attribute). Refused as a
 /// whole call, as the numericality gap is.
 fn gap_acceptance_on_undeclared(app: &mut App) {
-    use crate::dialect::{MethodReceiver, ModelBodyItem, ValidationRule};
+    use crate::dialect::{ModelBodyItem, ValidationRule};
     use crate::expr::{ExprNode, Literal};
     let mut attribute_api: Vec<(crate::span::Span, String)> = Vec::new();
     for model in &mut app.models {
@@ -3711,26 +3714,7 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
                 _ => false,
             })
         };
-        let declared = |attr: &crate::ident::Symbol| {
-            let setter = crate::ident::Symbol::from(format!("{}=", attr.as_str()));
-            model.attributes.fields.contains_key(attr)
-                || model.body.iter().any(|item| match item {
-                    ModelBodyItem::Method { method, .. } => {
-                        method.receiver == MethodReceiver::Instance && (method.name == *attr || method.name == setter)
-                    }
-                    ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
-                        ExprNode::Send { recv: None, method, args, .. }
-                            if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") =>
-                        {
-                            args.iter().any(|arg| {
-                                matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)
-                            })
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                })
-        };
+        let declared = |attr: &crate::ident::Symbol| model_declares_attr(model, attr);
         let mut refused_attribute_api: Vec<(usize, crate::span::Span, String)> = Vec::new();
         let mut virtual_attrs: Vec<(usize, crate::ident::Symbol, crate::span::Span)> = Vec::new();
         for (i, item) in model.body.iter().enumerate() {
@@ -3777,6 +3761,105 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
         attribute_api,
         "acceptance: on an `attribute` the model declares, whose writer stores the input uncast where Rails casts it",
     );
+}
+
+/// A column, an `attr_*` or an instance method of the model names `attr` (or its writer).
+fn model_declares_attr(model: &crate::dialect::Model, attr: &crate::ident::Symbol) -> bool {
+    use crate::dialect::{MethodReceiver, ModelBodyItem};
+    use crate::expr::{ExprNode, Literal};
+let setter = crate::ident::Symbol::from(format!("{}=", attr.as_str()));
+    model.attributes.fields.contains_key(attr)
+        || model.body.iter().any(|item| match item {
+            ModelBodyItem::Method { method, .. } => {
+                method.receiver == MethodReceiver::Instance && (method.name == *attr || method.name == setter)
+            }
+            ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Send { recv: None, method, args, .. }
+                    if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") =>
+                {
+                    args.iter().any(|arg| {
+                        matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)
+                    })
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+/// `confirmation:` on `attr`: Rails' `ConfirmationValidator#setup!` defines a plain `<attr>_confirmation` reader and
+/// writer where the model has none, so the model gains that `attr_accessor`, ahead of the validation.
+fn define_confirmation_accessors(app: &mut App) {
+    use crate::dialect::{ModelBodyItem, ValidationRule};
+    use crate::expr::{ExprNode, Literal};
+    for model in &mut app.models {
+        let mut wanted: Vec<(usize, crate::ident::Symbol, crate::span::Span)> = Vec::new();
+        for (i, item) in model.body.iter().enumerate() {
+            let ModelBodyItem::Validation { validation, .. } = item else { continue };
+            if !validation.rules.iter().any(|rule| matches!(rule, ValidationRule::Confirmation { .. })) {
+                continue;
+            }
+            let name = crate::ident::Symbol::from(format!("{}_confirmation", validation.attribute.as_str()));
+            if !model_declares_attr(model, &name) && !wanted.iter().any(|(_, n, _)| *n == name) {
+                wanted.push((i, name, item.span()));
+            }
+        }
+        for (i, name, span) in wanted.into_iter().rev() {
+            let accessor = crate::expr::Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: None,
+                    method: crate::ident::Symbol::from("attr_accessor"),
+                    args: vec![crate::expr::Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: name } })],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            model.body.insert(i, ModelBodyItem::Unknown { expr: accessor, leading_comments: Vec::new(), leading_blank_line: false });
+        }
+    }
+}
+
+/// Each model's [`crate::dialect::Model::mixin_sends`]: the Dirty spellings the instance methods of the modules it
+/// includes send, through the modules those include.
+fn record_mixin_sends(app: &mut App) {
+    use crate::dialect::MethodReceiver;
+    use crate::expr::{Expr, ExprNode};
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<crate::ident::Symbol>) {
+        if let ExprNode::Send { method, .. } = &*e.node {
+            out.insert(method.clone());
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let modules: HashMap<&crate::ident::ClassId, Vec<&crate::dialect::LibraryClass>> =
+        app.library_classes.iter().filter(|c| c.is_module).fold(HashMap::default(), |mut by, c| {
+            by.entry(&c.name).or_default().push(c);
+            by
+        });
+    let mut found: Vec<Vec<crate::ident::Symbol>> = Vec::new();
+    for model in &app.models {
+        let mut pending = crate::analyze::model_includes(model);
+        let mut seen = crate::det::HashSet::default();
+        let mut sends = crate::det::HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            for module in modules.get(&id).into_iter().flatten() {
+                for method in module.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance) {
+                    walk(&method.body, &mut sends);
+                }
+                pending.extend(module.includes.iter().cloned());
+            }
+        }
+        // Only the names the model's demand reads: the per-column Dirty spellings it synthesizes on demand.
+        let mut sends: Vec<_> = sends.into_iter().filter(|s| crate::lower::model_to_library::schema::is_pending_change_spelling(s.as_str())).collect();
+        sends.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        found.push(sends);
+    }
+    for (model, sends) in app.models.iter_mut().zip(found) {
+        model.mixin_sends = sends;
+    }
 }
 
 /// Drop every Validation item of each refused `validates` call, as an
