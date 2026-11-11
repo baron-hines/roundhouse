@@ -2188,7 +2188,7 @@ impl<'a> BodyTyper<'a> {
                         target: None, construct: Symbol::from("buffered zlib result"), detail: detail.to_string(),
                     }));
                 }
-                let dispatched = self.dispatch(recv_ty.as_ref(), name, None, &[]);
+                let dispatched = self.dispatch_on(recv_ty.as_ref(), name, None, &[], instance_receiver);
                 if matches!(dispatched, Ty::Var { .. })
                     && let Some(Ty::Class { id, .. }) = recv_ty.as_ref()
                     && self.open_classes.is_some_and(|o| o.open(id, !instance_receiver).is_some())

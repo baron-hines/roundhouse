@@ -115,6 +115,38 @@ end
 }
 
 #[test]
+fn method_references_keep_the_receivers_instance_side() {
+    let source = r#"class Parent
+  def self.load(value) = 7
+end
+module Loading
+  def load(value) = "included"
+end
+class Child < Parent
+  def load(value) = "instance"
+  def reference = [nil].map(&CALLmethod(:load))
+end
+class Mixed < Parent
+  include Loading
+  def reference = [nil].map(&CALLmethod(:load))
+end
+"#;
+    for receiver in ["", "self."] {
+        let source = source.replace("CALL", receiver);
+        for class in ["child", "mixed"] {
+            let signatures = rbs(&source, class);
+            assert!(
+                signatures.contains("def reference: () -> Array[String]"),
+                "{signatures}"
+            );
+        }
+        let run = app(&source).run_ruby("p Child.new.reference\np Mixed.new.reference\n");
+        run.assert_passes();
+        assert_eq!(run.stdout, "[\"instance\"]\n[\"included\"]\n");
+    }
+}
+
+#[test]
 fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls
   def load(value) = "instance"
