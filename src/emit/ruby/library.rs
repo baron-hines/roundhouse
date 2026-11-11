@@ -8595,6 +8595,19 @@ fn emit_library_class_decl_inner(
         if !requires.contains(&rel) {
             requires.push(rel);
         }
+        // So is every segment between the runtime's and this one (rack-protection's `Rack::Protection` around
+        // `class Rack::Protection::Base`): the compound header looks it up too.
+        for end in 2..outer_segments.len() {
+            let path: Vec<String> = outer_segments[..end].iter().map(|s| s.to_string()).collect();
+            let Some(inner) = require_path_for_body_const(&path, app, classes, "") else { continue };
+            if inner == self_anchor || inner.starts_with("runtime/") || inner.starts_with(&format!("{self_anchor}/")) {
+                continue;
+            }
+            let rel = relpath(&out_dir, &inner);
+            if !requires.contains(&rel) {
+                requires.push(rel);
+            }
+        }
     }
     // `include`d modules must be LOADED before the `include` executes at
     // class-definition time — unlike body const-refs (request-time), so we

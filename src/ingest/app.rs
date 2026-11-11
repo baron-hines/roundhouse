@@ -746,6 +746,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let stack = super::railtie_middleware::read(vfs, dir, &gem_libs);
     let stacked_application_uses = stack.application_taken;
     let middleware_loops = stack.loops;
+    let env_writes_by_class = stack.env_writes_by_class;
     (app.gem_middlewares, app.gem_middleware_blocks, app.rack_env_writes, app.gem_middleware_refusals) =
         (stack.classes, stack.blocks, stack.env_writes, stack.diags);
     // `enum` columns declared inside a concern's `included do`, keyed by
@@ -3229,7 +3230,7 @@ end
     // After the macros: a configured object's readers and its builder's writers are methods by now.
     super::configured_superclass::fold(vfs, dir, &mut app);
     super::configured_superclass::fold_class_names(vfs, dir, &mut app);
-    super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops);
+    super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops, &env_writes_by_class);
     super::gem_routes::expand(vfs, dir, &path_gems, &mut app);
     super::class_macros::drop_expanded_hook_macros(&mut app, &hook_macros_called, &mentions);
     super::extend_splice::splice_load_hook_extended_calls(&mut app);

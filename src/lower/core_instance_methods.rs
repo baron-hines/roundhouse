@@ -88,3 +88,33 @@ pub(crate) const OBJECT: &[&str] = &[
     "remove_instance_variable", "respond_to?", "send", "singleton_class", "singleton_method", "singleton_methods", "tap", "then",
     "to_enum", "to_s", "yield_self",
 ];
+
+/// `Enumerable`'s public instance methods: what a class including it answers without `method_missing`.
+pub(crate) const ENUMERABLE: &[&str] = &[
+    "all?", "any?", "chain", "chunk", "chunk_while", "collect", "collect_concat", "compact",
+    "count", "cycle", "detect", "drop", "drop_while", "each_cons", "each_entry", "each_slice",
+    "each_with_index", "each_with_object", "entries", "filter", "filter_map", "find", "find_all", "find_index",
+    "first", "flat_map", "grep", "grep_v", "group_by", "include?", "inject", "lazy",
+    "map", "max", "max_by", "member?", "min", "min_by", "minmax", "minmax_by",
+    "none?", "one?", "partition", "reduce", "reject", "reverse_each", "select", "slice_after",
+    "slice_before", "slice_when", "sort", "sort_by", "sum", "take", "take_while", "tally",
+    "to_a", "to_h", "to_set", "uniq", "zip",
+];
+
+/// `Comparable`'s.
+pub(crate) const COMPARABLE: &[&str] = &[
+    "<", "<=", "==", ">", ">=", "between?", "clamp",
+];
+
+/// `Kernel`'s private instance methods: what a receiverless call answers without `method_missing` (`block_given?`).
+pub(crate) const KERNEL_PRIVATE: &[&str] = &[
+    "Array", "Complex", "Float", "Hash", "Integer", "Pathname", "Rational", "String",
+    "__callee__", "__dir__", "__method__", "`", "abort", "at_exit", "autoload", "autoload?",
+    "binding", "block_given?", "caller", "caller_locations", "catch", "eval", "exec", "exit",
+    "exit!", "fail", "fork", "format", "gem", "gem_original_require", "gets", "global_variables",
+    "initialize_clone", "initialize_copy", "initialize_dup", "instance_variables_to_inspect", "iterator?", "lambda", "load", "local_variables",
+    "loop", "open", "p", "pp", "print", "printf", "proc", "putc",
+    "puts", "raise", "rand", "readline", "readlines", "require", "require_relative", "respond_to_missing?",
+    "select", "set_trace_func", "sleep", "spawn", "sprintf", "srand", "syscall", "system",
+    "test", "throw", "trace_var", "trap", "untrace_var", "warn",
+];

@@ -47,6 +47,30 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         }
         super::core_instance_methods::OBJECT
     };
+    // The core modules each class includes along its written chain (Warden's `Errors` takes `entries` from Enumerable).
+    let includes: HashMap<String, Vec<String>> = app
+        .library_classes
+        .iter()
+        .map(|c| (c.name.0.as_str().to_string(), c.includes.iter().map(|m| m.0.as_str().trim_start_matches("::").to_string()).collect()))
+        .collect();
+    let module_answers = |id: &ClassId, method: &str| {
+        let mut current = Some(id.0.as_str().to_string());
+        for _ in 0..32 {
+            let Some(name) = current else { break };
+            for m in includes.get(&name).into_iter().flatten() {
+                let answers = match m.as_str() {
+                    "Enumerable" => super::core_instance_methods::ENUMERABLE,
+                    "Comparable" => super::core_instance_methods::COMPARABLE,
+                    _ => &[][..],
+                };
+                if answers.contains(&method) {
+                    return true;
+                }
+            }
+            current = parents.get(&name).cloned().flatten();
+        }
+        false
+    };
     for lc in &mut app.library_classes {
         let owner = lc.name.clone();
         let own_missing = answers_missing(&owner);
@@ -56,9 +80,12 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
                 continue;
             }
             let locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
-            rewrite(&mut m.body, &owner, own_missing, &locals, registry, &answers_missing, &core_of);
+            rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers);
         }
     }
+    // Every other body reaches such a class through a receiver (`auth.provider` on OmniAuth's AuthHash in a model).
+    let nobody = ClassId(Symbol::from(""));
+    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], true, registry, &answers_missing, &core_of, &module_answers));
 }
 
 fn rewrite(
@@ -66,16 +93,27 @@ fn rewrite(
     owner: &ClassId,
     own_missing: bool,
     locals: &[Symbol],
+    typed: bool,
     registry: &HashMap<ClassId, crate::analyze::ClassInfo>,
     answers_missing: &dyn Fn(&ClassId) -> bool,
     core_of: &dyn Fn(&ClassId) -> &'static [&'static str],
+    module_answers: &dyn Fn(&ClassId, &str) -> bool,
 ) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, registry, answers_missing, core_of));
-    if !crate::analyze::diagnostics::is_unknown_ty(e.ty.as_ref()) {
+    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, typed, registry, answers_missing, core_of, module_answers));
+    // Typed too where `typed` (the analysis answers a call no method takes with `method_missing`'s type), but not on a
+    // receiver spelled as a class object (`Errors.new`, `self.class.new`): `Ty::Class` alone does not tell it from an instance.
+    let instance_read = |r: &Expr| {
+        r.decisions & crate::expr::CLASS_OBJECT_VALUE == 0
+            && !matches!(&*r.node, ExprNode::Const { .. })
+            && !matches!(&*r.node, ExprNode::Send { method, args, .. } if method.as_str() == "class" && args.is_empty())
+    };
+    let untyped = crate::analyze::diagnostics::is_unknown_ty(e.ty.as_ref());
+    let ExprNode::Send { recv, method, args, parenthesized, .. } = &mut *e.node else { return };
+    // (a receiverless call in an instance method is self's, an instance)
+    if !untyped && !(typed && recv.as_ref().is_none_or(instance_read)) {
         return;
     }
-    let ExprNode::Send { recv, method, args, .. } = &mut *e.node else { return };
-    if method.as_str() == "method_missing" || method.as_str().starts_with(|c: char| !c.is_ascii_alphabetic() && c != '_') {
+    if method.as_str() == "method_missing" || method.as_str() == "new" || method.as_str().starts_with(|c: char| !c.is_ascii_alphabetic() && c != '_') {
         return;
     }
     let class = match recv.as_ref() {
@@ -86,8 +124,12 @@ fn rewrite(
         None if own_missing && args.is_empty() && !locals.contains(method) => owner.clone(),
         None => return,
     };
-    // Not a method the core class it descends from answers (`options.merge(...)` on a Hash subclass).
-    if core_of(&class).contains(&method.as_str()) {
+    // Not a method the core class it descends from answers (`options.merge(...)` on a Hash subclass), a core module it
+    // includes does, or Kernel's private one a receiverless call reaches (`block_given?`).
+    if core_of(&class).contains(&method.as_str())
+        || module_answers(&class, method.as_str())
+        || (recv.is_none() && super::core_instance_methods::KERNEL_PRIVATE.contains(&method.as_str()))
+    {
         return;
     }
     let class_ty = Ty::Class { id: class, args: vec![].into() };
@@ -97,4 +139,6 @@ fn rewrite(
     let name = Expr::new(e.span, ExprNode::Lit { value: Literal::Sym { value: method.clone() } });
     args.insert(0, name);
     *method = Symbol::from("method_missing");
+    // Not the source's bare `auth.provider`: an argument written without parens does not parse inside another call's.
+    *parenthesized = true;
 }

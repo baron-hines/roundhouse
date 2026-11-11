@@ -3206,7 +3206,13 @@ pub(super) fn draw_routes(app: &App, def: &MethodDef, scope: String, call: &Expr
 
 /// An engine initializer's loop that inserts a middleware per element: over a collection the app's own
 /// initializers leave empty (no `config.omniauth` for `Devise.omniauth_configs`), Rails inserts none.
-pub(super) fn fold_middleware_loops<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App, loops: Vec<super::railtie_middleware::MiddlewareLoop>) {
+pub(super) fn fold_middleware_loops<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    app: &mut App,
+    loops: Vec<super::railtie_middleware::MiddlewareLoop>,
+    env_writes_by_class: &crate::det::HashMap<String, crate::det::HashMap<String, String>>,
+) {
     if loops.is_empty() {
         return;
     }
@@ -3226,6 +3232,7 @@ pub(super) fn fold_middleware_loops<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &
                     if let Some(block) = block {
                         app.gem_middleware_blocks.insert(class.clone(), block);
                     }
+                    super::railtie_middleware::stacked_env_writes(env_writes_by_class, std::slice::from_ref(&class), &mut app.rack_env_writes);
                     app.gem_middlewares.push(class);
                 }
             }

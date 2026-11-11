@@ -2248,10 +2248,16 @@ impl<'a> BodyTyper<'a> {
                     // instance sends; applying them here would type an
                     // undefined class-side call from an RBS instance sig.
                     if method_missing_ty.is_none() {
-                        method_missing_ty = cls
-                            .class_methods
-                            .get(&Symbol::from("method_missing"))
-                            .cloned();
+                        let missing = Symbol::from("method_missing");
+                        method_missing_ty = if instance_receiver {
+                            // An instance send that no method answers goes to the instance-side `method_missing` (hashie's
+                            // Mash, which OmniAuth's AuthHash answers `provider` with).
+                            cls.instance_methods.get(&missing).cloned().or_else(|| {
+                                cls.includes.iter().find_map(|m| self.lookup_in_module(m, &missing))
+                            })
+                        } else {
+                            cls.class_methods.get(&missing).cloned()
+                        };
                     }
                     current_id = cls.parent.as_ref();
                 }
