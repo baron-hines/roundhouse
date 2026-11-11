@@ -63,16 +63,12 @@ impl Dialect {
     /// environment with a primary). PostgreSQL when that is postgresql,
     /// SQLite otherwise, as before the file was read.
     pub fn for_app(app: &crate::App) -> Dialect {
-        match Self::database(&app.databases).map(|d| &d.adapter) {
+        let primary = app.databases.iter().filter(|d| d.primary);
+        let chosen = primary.clone().find(|d| d.env == "test").or_else(|| primary.clone().next());
+        match chosen.map(|d| &d.adapter) {
             Some(crate::database::DatabaseAdapter::Postgresql) => Dialect::Postgres,
             _ => Dialect::Sqlite,
         }
-    }
-
-    /// The configuration [`Dialect::for_app`] reads the adapter of.
-    pub(crate) fn database(databases: &[crate::database::Database]) -> Option<&crate::database::Database> {
-        let primary = databases.iter().filter(|d| d.primary);
-        primary.clone().find(|d| d.env == "test").or_else(|| primary.clone().next())
     }
 
     /// A literal boolean: SQLite stores 1/0; PostgreSQL's boolean takes
@@ -605,6 +601,13 @@ fn sqlite_expression(predicate: &str, table: Option<&Table>) -> bool {
 /// anywhere else a column or a call (`like IS NULL`). A column of the
 /// same name never stands in for the operator. Comments, `ESCAPE`,
 /// `REGEXP`, casts and every unlisted call stay refused.
+///
+/// "As the application read it" also needs the column stored as there.
+/// [`sqlite_type`] declares `decimal` REAL and `json`, dates and times
+/// TEXT, where Rails' SQLite adapter gives each NUMERIC affinity, so
+/// `price GLOB '*.*'` would meet other values. A CHECK naming such a
+/// column is refused here; what [`sqlite_expression`] already read of
+/// them (`length(price)`) is unchanged.
 pub(crate) fn sqlite_check_expression(sql: &str, table: &Table, source: crate::schema::generated::GeneratedExpressionDialect) -> bool {
     use crate::schema::generated::GeneratedExpressionDialect::{Portable, Postgres, Sqlite, Unconfigured};
     const FUNCTIONS: &[&str] = &["LOWER", "UPPER", "LENGTH", "COALESCE", "NULLIF", "ABS", "PRINTF", "HEX", "JSON_VALID", "JSON_TYPE", "CHAR", "SUBSTR"];
@@ -614,7 +617,8 @@ pub(crate) fn sqlite_check_expression(sql: &str, table: &Table, source: crate::s
         Portable | Postgres => return false,
     };
     let tokens = regex::Regex::new(r#"\A(?:'(?:''|[^'])*'|[0-9]+(?:\.[0-9]+)?|"((?:""|[^"])*)"|([a-zA-Z_][a-zA-Z0-9_]*)|<>|!=|<=|>=|==|\|\||[-+=<>*/%(),])"#).unwrap();
-    let column = |name: &str, quoted: bool| table.columns.iter().any(|c| if quoted { c.name.as_str() == name } else { c.name.as_str().eq_ignore_ascii_case(name) });
+    let stored_as_rails = |ct: &ColumnType| matches!(ct, ColumnType::String { .. } | ColumnType::Text | ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. } | ColumnType::Float | ColumnType::Boolean | ColumnType::Binary);
+    let column = |name: &str, quoted: bool| table.columns.iter().any(|c| stored_as_rails(&c.col_type) && if quoted { c.name.as_str() == name } else { c.name.as_str().eq_ignore_ascii_case(name) });
     // SQLite's whitespace; any other character outside a literal is refused.
     let space = |c: char| matches!(c, ' ' | '\t'..='\r');
     // `operand`: the last token ended an operand, so an operator comes next.

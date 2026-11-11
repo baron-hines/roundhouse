@@ -39,8 +39,8 @@ pub fn ingest_schema(source: &[u8], file: &str) -> IngestResult<Schema> {
 }
 
 /// Ingest a Rails schema while validating generated expressions for an
-/// explicit DDL source dialect. Application ingestion continues to call
-/// [`ingest_schema`] and therefore retains the Portable default.
+/// explicit DDL source dialect. Application ingestion passes the one its
+/// `config/database.yml` settles, never Postgres; [`ingest_schema`] is Portable.
 pub fn ingest_schema_with_generated_expression_dialect(
     source: &[u8],
     file: &str,
@@ -146,7 +146,7 @@ pub fn ingest_migration(source: &[u8], file: &str, schema: &mut Schema) -> Inges
 }
 
 /// Fold one migration using an explicit generated-expression grammar.
-/// The default [`ingest_migration`] remains Portable for application ingest.
+/// Application ingest passes its schema's; [`ingest_migration`] is Portable.
 pub fn ingest_migration_with_generated_expression_dialect(
     source: &[u8],
     file: &str,

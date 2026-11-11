@@ -34,8 +34,7 @@ use super::library_class::{
 use super::model::ingest_model_with_enum_constants;
 use super::routes::{EngineRouteSource, RouteHelperSource, ingest_route_file, merge_route_files};
 use super::schema::{
-    ingest_migration_with_generated_expression_dialect, ingest_schema,
-    ingest_schema_with_generated_expression_dialect,
+    ingest_migration_with_generated_expression_dialect, ingest_schema_with_generated_expression_dialect,
 };
 use super::structure_sql::ingest_structure_sql;
 use super::test::{ingest_test_bases, ingest_test_files};
@@ -871,7 +870,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     if solid_queue_root.is_some() && vfs.exists(&dir.join("db/queue_schema.rb")) {
         let queue_schema = dir.join("db/queue_schema.rb");
         if let Some(source) = read_or_ledger(vfs, &queue_schema)? {
-            if let Some(queue) = unwrap_or_record(ingest_schema(&source, &queue_schema.display().to_string()))? {
+            if let Some(queue) = unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &queue_schema.display().to_string(), expression_dialect))? {
                 for (name, table) in queue.tables {
                     app.schema.tables.entry(name).or_insert(table);
                 }
@@ -13306,19 +13305,25 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
     Some(literal.then(|| name.to_string()))
 }
 
-/// The grammar the app's CHECKs are read under. SQLite's own needs the
-/// app's database to be SQLite: `config/database.yml` names sqlite3 for
-/// the configuration `Dialect::for_app` reads. Without the file nothing
-/// names another database; a file naming one, or not resolved at build
-/// time, keeps the portable grammar.
+/// The grammar the app's CHECKs are read under, for every reader of its
+/// schema. SQLite's own needs `config/database.yml`, as
+/// `database_configurations` resolves it, to say SQLite throughout: the
+/// test environment has a primary, every configuration names sqlite3, and
+/// none was left out as unresolved. A file that says less keeps the
+/// portable grammar, since some database of the app may not be SQLite.
+/// Without the file nothing names a database at all.
 fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
     use crate::schema::generated::GeneratedExpressionDialect::{Portable, Sqlite, Unconfigured};
-    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Unconfigured };
-    let databases = super::database_yml::database_configurations(&text, crate::span::FileId(0)).databases;
-    match crate::emit::shared::schema_sql::Dialect::database(&databases).map(|d| &d.adapter) {
-        Some(crate::database::DatabaseAdapter::Sqlite3) => Sqlite,
-        _ => Portable,
+    let path = dir.join("config/database.yml");
+    if !vfs.exists(&path) {
+        return Unconfigured;
     }
+    let Ok(text) = vfs.read_to_string(&path) else { return Portable };
+    let read = super::database_yml::database_configurations(&text, crate::span::FileId(0));
+    let sqlite = read.refusals.is_empty()
+        && read.databases.iter().any(|d| d.env == "test" && d.primary)
+        && read.databases.iter().all(|d| d.adapter == crate::database::DatabaseAdapter::Sqlite3);
+    if sqlite { Sqlite } else { Portable }
 }
 
 /// Use the ordinary schema readers for selection too. The normal primary schema
@@ -13330,7 +13335,7 @@ fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
     let marks = (super::survey::mark(), super::prism::mark());
     let file = path.display().to_string();
     let schema = if path.extension().is_some_and(|ext| ext == "rb") {
-        ingest_schema(&source, &file)
+        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
     } else {
         ingest_structure_sql(&source, &file)
     };
