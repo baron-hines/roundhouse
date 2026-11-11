@@ -311,7 +311,7 @@ fn a_scope_render_passes_the_controllers_scope() {
     let helper = "\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n";
     let show = "  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n";
     let (_, controller, _) = emitted(scoped, &format!("class ArticlesController < ApplicationController\n{show}{helper}"));
-    assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"]), { scope: self.current_user }).serializable_hash"), "{controller}");
+    assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"]), { scope: self.current_user }).as_json_str"), "{controller}");
     let (_, controller, _) = emitted(scoped, &format!("class ArticlesController < ApplicationController\n  serialization_scope nil\n\n{show}{helper}"));
     assert!(controller.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{controller}");
     let (_, controller, _) = emitted(SERIALIZER, &format!("class ArticlesController < ApplicationController\n{show}{helper}"));
@@ -390,7 +390,7 @@ fn only_a_modules_instance_helpers_give_the_controller_current_user() {
     assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{rendered}");
     for helper in ["module Authn\n  extend self\n\n  def current_user\n    \"ann\"\n  end\nend\n", "module Authn\n  module_function\n\n  def current_user\n    \"ann\"\n  end\nend\n"] {
         let (_, rendered, _) = emitted_with(scoped, controller, &[("app/controllers/concerns/authn.rb", helper)]);
-        assert!(rendered.contains("{ scope: ") && rendered.contains("current_user }).serializable_hash"), "{helper}: {rendered}");
+        assert!(rendered.contains("{ scope: ") && rendered.contains("current_user }).as_json_str"), "{helper}: {rendered}");
     }
 }
 
