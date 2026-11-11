@@ -123,6 +123,7 @@ module ActiveRecord
     def id=: (Integer) -> Integer
     def _primary_key_value: () -> Integer
     def to_param: () -> String
+    def to_key: () -> Array[Integer]?
 
     # Error message accumulator populated by the lowerer-emitted
     # `validate` body. Phase 2.5(a) inlines every `validates :x, …`

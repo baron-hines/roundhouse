@@ -37,6 +37,18 @@ module ActionDispatch
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
     attr_reader :path_parameters
+    # Rails' `request.flash`, the flash of the controller serving this request — see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    attr_accessor :flash
+
+    # Rails' `Request.new(env)`, a wrapper over the env whose state is the request's: the one the routes serve for
+    # this env (Warden's `request`, which Devise's strategies read the params of), else one over the env's params.
+    def self.for_env(env)
+      found = env["roundhouse.request"]
+      return found if found.is_a?(ActionDispatch::Request)
+      parsed = env["roundhouse.parsed_request"]
+      new(env, parsed.nil? ? {} : parsed[:params])
+    end
 
     def initialize(env, params = {})
       @env = env

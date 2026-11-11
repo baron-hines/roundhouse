@@ -325,6 +325,13 @@ module ActiveRecord
       raise NotImplementedError, "to_param: subclasses must override"
     end
 
+    # ActiveModel::Conversion's `to_key`: the key in a list, nil for a record not yet saved (Devise keeps it in the
+    # session as `[[id], salt]`).
+    def to_key
+      return nil unless persisted?
+      [id]
+    end
+
     # Error message accumulator populated by the lowerer-emitted
     # `validate` method (one `errors << "..."` per failed rule). Lives
     # on Base directly — Phase 2.5(a) inlined every `validates :x, …`

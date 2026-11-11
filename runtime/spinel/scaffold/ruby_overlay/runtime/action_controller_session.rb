@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "json"
 # CRuby overlay session codec (`from_cookie` / `to_cookie`). CSRF
 # minting lives in `runtime/ruby/action_controller/authenticity_token.rb`.
 #
@@ -18,16 +19,24 @@ module ActionDispatch
         next if eq.nil?
         k = CgiIo.url_decode(pair[0, eq])
         v = CgiIo.url_decode(pair[(eq + 1)..].to_s)
-        data[k] = v unless k.empty?
+        data[k] = Session.json_value(v) unless k.empty?
       end
       Session.new(data)
+    end
+
+    # Not a 500 for a cookie of the earlier shape, whose values were their `to_s`: that text is the value.
+    def self.json_value(text)
+      JSON.parse(text)
+    rescue JSON::ParserError
+      text
     end
 
     # Inverse of from_cookie. Deterministic (insertion order), so
     # dispatch can compare inbound-vs-outbound encodings to decide
     # whether a Set-Cookie is needed at all.
+    # Not `v.to_s`: Rails' cookie store keeps each value as JSON, so Devise's `[[id], salt]` reads back as an Array.
     def to_cookie
-      to_h.map { |k, v| "#{CgiIo.url_encode(k)}=#{CgiIo.url_encode(v.to_s)}" }.join("&")
+      to_h.map { |k, v| "#{CgiIo.url_encode(k)}=#{CgiIo.url_encode(JSON.generate(v))}" }.join("&")
     end
   end
 end

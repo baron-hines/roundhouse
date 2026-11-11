@@ -14,6 +14,9 @@ mod data_record_siblings;
 mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/native_http.rs"]
+#[allow(dead_code)]
+mod native_http;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
 #[path = "emit_and_run/controller_content_type_writer.rs"]
@@ -22143,3 +22146,11 @@ mod array_grep_extract_options;
 mod load_time_string_definer;
 #[path = "emit_and_run/mime_extension_lookup.rs"]
 mod mime_extension_lookup;
+#[path = "emit_and_run/self_class_argument.rs"]
+mod self_class_argument;
+#[path = "emit_and_run/form_for_record.rs"]
+mod form_for_record;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "emit_and_run/library_concern_included_include.rs"]
+mod library_concern_included_include;

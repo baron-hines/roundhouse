@@ -91,6 +91,14 @@ module Rack
       511 => "Network Authentication Required",
     }.freeze
 
+    # Not rack's table derived from the reason phrases: the same names, written out once in ActionController's.
+    def self.status_code(status)
+      return status if status.is_a?(Integer)
+      code = ActionController.symbol_status_code(status)
+      raise ArgumentError, "Unrecognized status code #{status.inspect}" if code.nil?
+      code
+    end
+
     def self.q_values(q_value_header)
       out = []
       q_value_header.to_s.split(",").each do |part|

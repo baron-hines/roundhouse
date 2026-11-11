@@ -140,6 +140,12 @@ impl Server {
         Response { status, headers: response_headers, body }
     }
 
+    /// Any request, with the cookies the response sets, for a flow that carries them on.
+    pub fn request_with_set_cookies(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (Response, Vec<String>) {
+        let (status, set_cookies, response_headers, body) = self.send(method, path, headers, body);
+        (Response { status, headers: response_headers, body }, set_cookies)
+    }
+
     /// A POST with neither cookie nor token.
     pub fn post_without_session(&self, path: &str, content_type: &str, body: &str) -> Response {
         let headers = [("Content-Type", content_type), ("Accept", "application/json")];

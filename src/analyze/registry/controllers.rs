@@ -388,10 +388,13 @@ pub(in crate::analyze) fn register(
         for (key, class) in &app.rack_env_writes {
             request.env_keys.insert(key.clone(), Ty::Class { id: ClassId(Symbol::from(class.as_str())), args: vec![].into() });
         }
-        // The runtime's `Request#params` (runtime/ruby/action_dispatch/request.rbs).
+        // The runtime's `Request#params` (runtime/ruby/action_dispatch/request.rbs): the request's values, as a controller's `params` holds them.
         request.instance_methods.insert(
             Symbol::from("params"),
-            Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Untyped) },
+            Ty::Hash {
+                key: std::sync::Arc::new(Ty::Str),
+                value: std::sync::Arc::new(Ty::Class { id: ClassId(Symbol::from(crate::analyze::PARAM_VALUE)), args: vec![].into() }),
+            },
         );
         for m in ["headers", "cookie_jar", "session",
                   "path_parameters", "body", "variant",

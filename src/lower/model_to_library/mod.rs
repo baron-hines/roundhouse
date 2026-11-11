@@ -286,6 +286,42 @@ impl Drop for RequestFinderRegistryGuard<'_> {
     }
 }
 
+thread_local! {
+    static MODULE_WRITERS: std::cell::RefCell<HashMap<String, Vec<Symbol>>> = std::cell::RefCell::new(HashMap::default());
+}
+
+/// The public writers (`def x=`) of each library module, for the mass assignment of the models that include them,
+/// held for the guard's life.
+pub(crate) struct ModuleWritersGuard(HashMap<String, Vec<Symbol>>);
+
+impl Drop for ModuleWritersGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        MODULE_WRITERS.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub(crate) fn share_module_writers(app: &crate::App) -> ModuleWritersGuard {
+    let mut writers: HashMap<String, Vec<Symbol>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|c| c.is_module) {
+        for m in lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public) {
+            let Some(base) = m.name.as_str().strip_suffix('=') else { continue };
+            let mut chars = base.chars();
+            if chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let list = writers.entry(lc.name.0.as_str().to_string()).or_default();
+                if !list.iter().any(|w| w.as_str() == base) {
+                    list.push(Symbol::from(base));
+                }
+            }
+        }
+    }
+    ModuleWritersGuard(MODULE_WRITERS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), writers)))
+}
+
+pub(crate) fn included_module_writers(module: &str) -> Vec<Symbol> {
+    MODULE_WRITERS.with(|slot| slot.borrow().get(module).cloned().unwrap_or_default())
+}
+
 /// Share [`request_finder_registry`] of `models` and `schema` among its
 /// callers for the guard's life. The Spinel and Ruby-family assembly asks
 /// for it once per controller lowering and once for the tests, each of

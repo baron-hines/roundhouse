@@ -12,6 +12,35 @@ fn is_param_value(ty: Option<&Ty>) -> bool {
     matches!(ty, Some(Ty::Class { id, .. }) if id.0.as_str() == crate::analyze::PARAM_VALUE)
 }
 
+/// Rails' `ActionController::Parameters`, which a gem's code names (Devise's `ParameterSanitizer`), or a value read
+/// out of one: on the emitted program both are the request's String-keyed Hash.
+fn is_parameters(ty: Option<&Ty>) -> bool {
+    match ty {
+        Some(Ty::Class { id, .. }) => id.0.as_str() == "ActionController::Parameters" || id.0.as_str() == crate::analyze::PARAM_VALUE,
+        Some(Ty::Union { variants }) => variants.iter().all(|v| *v == Ty::Nil || is_parameters(Some(v))),
+        _ => false,
+    }
+}
+
+/// Parameters beside another Hash (Devise's `parse_authentication_key_values(hash, keys)`, handed a request's
+/// params and a Symbol-keyed Hash): which one a read meets is the run time's.
+/// Parameters among other values: only Parameters answer `permit`.
+fn holds_parameters(ty: Option<&Ty>) -> bool {
+    matches!(ty, Some(Ty::Union { variants }) if variants.iter().any(|v| is_parameters(Some(v))))
+}
+
+fn may_be_parameters(ty: Option<&Ty>) -> bool {
+    matches!(ty, Some(Ty::Union { variants }) if variants.iter().any(|v| is_parameters(Some(v)))
+        && variants.iter().all(|v| is_parameters(Some(v)) || matches!(v, Ty::Hash { .. } | Ty::Nil)))
+}
+
+/// A request's own params, read through `params` (Warden's strategies' `request.params`), which Rails reads by a
+/// Symbol as by its String. Not any `Hash[String, …]` a variable holds: a permitted Symbol-keyed Hash reaches those too.
+fn is_request_params_read(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { method, args, .. } if method.as_str() == "params" && args.is_empty())
+        && matches!(e.ty.as_ref(), Some(Ty::Hash { key, value }) if **key == Ty::Str && is_param_value(Some(value)))
+}
+
 fn is_request_params(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Send { recv: None, method, args, .. } => method.as_str() == "params" && args.is_empty(),
@@ -121,6 +150,9 @@ fn rewrite(expr: &mut Expr) {
                 *arg = permitted;
             }
         }
+    }
+    if parameters_on_hash(expr) {
+        return;
     }
     let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return };
     let nested = is_param_value(r.ty.as_ref());
@@ -300,4 +332,97 @@ fn send(span: crate::span::Span, recv: Option<Expr>, method: &str, args: Vec<Exp
         span,
         ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true },
     )
+}
+
+/// Rails' `Parameters` API as a gem writes it, on the Hash the emitted program holds:
+/// `Parameters.new(hash)` is the hash, a nested Parameters is a Hash (`respond_to?(:permit)`), a key a Symbol
+/// names is its String (`@params[@resource_name]`), and `permit(*names)` keeps the scalars under those names.
+fn parameters_on_hash(expr: &mut Expr) -> bool {
+    let span = expr.span;
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node else { return false };
+    let is_parameters_const = matches!(&*r.node, ExprNode::Const { path }
+        if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>() == ["ActionController", "Parameters"]);
+    // Not a fresh Request: Rails' wraps the env, whose state is the request the routes serve (Devise's warden_compat).
+    let is_request_const = matches!(&*r.node, ExprNode::Const { path }
+        if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>() == ["ActionDispatch", "Request"]);
+    if is_request_const && method.as_str() == "new" && args.len() == 1 {
+        *method = Symbol::from("for_env");
+        return true;
+    }
+    if is_parameters_const && method.as_str() == "new" {
+        if let [hash] = args.as_slice() {
+            let mut hash = hash.clone();
+            hash.ty = expr.ty.clone();
+            *expr = hash;
+            return true;
+        }
+        return false;
+    }
+    if method.as_str() == "respond_to?" && holds_parameters(r.ty.as_ref()) && let [name] = args.as_slice() && sym_name(name).as_deref() == Some("permit") {
+        let hash = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Hash")] });
+        let mut test = send(span, Some(r.clone()), "is_a?", vec![hash]);
+        test.ty = Some(Ty::Bool);
+        *expr = test;
+        return true;
+    }
+    // `permit(*names)` on a value that may be Parameters (Devise's `permit_keys(parameters, keys)`): only Parameters answers it.
+    if method.as_str() == "permit"
+        && holds_parameters(r.ty.as_ref())
+        && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. })
+        && let [arg] = args.as_slice()
+        && let ExprNode::Splat { value } = &*arg.node
+    {
+        let names = value.clone();
+        let params = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] });
+        let ty = expr.ty.clone();
+        *expr = send(span, Some(params), "permitted_names", vec![r.clone(), names]);
+        expr.ty = ty;
+        return true;
+    }
+    // Not a String read of a value that may be either: Parameters hold String keys here, the Hash beside them Symbols.
+    let value_holder = !matches!(&*r.node, ExprNode::Send { method, .. } if method.as_str() == "params");
+    if value_holder && may_be_parameters(r.ty.as_ref()) && !is_parameters(r.ty.as_ref()) {
+        // Not a literal String key, which reads alike either way.
+        let symbol_key = |k: &Expr| !matches!(&*k.node, ExprNode::Lit { value: Literal::Str { .. } }) && !matches!(k.ty, Some(Ty::Str | Ty::Int));
+        if method.as_str() == "[]" && let [key] = args.as_slice() && symbol_key(key) {
+            let params = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] });
+            let ty = expr.ty.clone();
+            *expr = send(span, Some(params), "indifferent_read", vec![r.clone(), key.clone()]);
+            expr.ty = ty;
+            return true;
+        }
+        return false;
+    }
+    if !is_parameters(r.ty.as_ref()) && !is_request_params_read(r) {
+        return false;
+    }
+    match (method.as_str(), args.as_mut_slice()) {
+        ("respond_to?", [name]) if sym_name(name).as_deref() == Some("permit") => {
+            let hash = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Hash")] });
+            let mut test = send(span, Some(r.clone()), "is_a?", vec![hash]);
+            test.ty = Some(Ty::Bool);
+            *expr = test;
+            true
+        }
+        // Not a literal key: the emit's coercion writes those as Rails reads them.
+        ("[]" | "fetch" | "key?" | "has_key?", [key, ..])
+            if !matches!(key.ty, Some(Ty::Str)) && !matches!(&*key.node, ExprNode::Lit { .. }) =>
+        {
+            let sym = key.clone();
+            let mut text = send(span, Some(sym), "to_s", vec![]);
+            text.ty = Some(Ty::Str);
+            *key = text;
+            false
+        }
+        // Not a request's `params.require(:x).permit(*names)`: the controller lowering types that one.
+        ("permit", [arg]) if let ExprNode::Splat { value } = &*arg.node && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. }) => {
+            let names = value.clone();
+            let params = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] });
+            let ty = expr.ty.clone();
+            *expr = send(span, Some(params), "permitted_names", vec![r.clone(), names]);
+            expr.ty = ty;
+            true
+        }
+        _ => false,
+    }
 }

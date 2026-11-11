@@ -202,6 +202,13 @@ pub struct App {
     /// Empty when the app ships no `sig/` directory.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rbs_signatures: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    /// How the `sig/` sidecars and inline signatures behind
+    /// `rbs_signatures` spelled each class name (`crate::rbs::Spellings`).
+    /// Provenance only: the Ruby RBS writer reads it to keep a declared
+    /// name as written when its lexical nesting is preserved; identity
+    /// and every other reader use the ids.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rbs_spellings: crate::rbs::MethodSpellings,
     /// What a `sig/**/*.rbs` sidecar says a class INCLUDES, keyed by
     /// the declaring class and holding the module names as written.
     ///
@@ -1321,6 +1328,7 @@ impl App {
             vite_manifest: None,
             stylesheets: Vec::new(),
             rbs_signatures: HashMap::default(),
+            rbs_spellings: HashMap::default(),
             rbs_includes: HashMap::default(),
             gem_lock: None,
             loaded_frameworks: None,

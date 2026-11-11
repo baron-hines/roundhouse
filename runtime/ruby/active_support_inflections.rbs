@@ -21,6 +21,7 @@ module ActiveSupport
   module Inflector
     # Default Rails 8.1.4 behavior without configured acronym tables.
     def self.camelize: (String text, ?bool uppercase_first_letter) -> String
+    def self.underscore: (String text) -> String
     def self.dasherize: (String text) -> String
     # Singular from the regular-suffix ActiveSupport.singularize.
     def self.classify: (String table_name) -> String

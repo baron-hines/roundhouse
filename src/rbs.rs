@@ -94,6 +94,35 @@ pub fn parse_app_signatures(
     Ok(out)
 }
 
+/// The instance methods each class or module of an RBS source declares, by name only (a class's `def self.x` is
+/// not one: an instance of it answers no `x`).
+pub fn parse_instance_method_names(source: &str) -> Result<crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>, String> {
+    fn walk(decl: &Node<'_>, parent: Option<&str>, out: &mut crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>) {
+        let (name, members): (String, Vec<Node<'_>>) = match decl {
+            Node::Class(class) => (namespace_join(parent, &declared_name(&class.name())), class.members().iter().collect()),
+            Node::Module(module) => (namespace_join(parent, &declared_name(&module.name())), module.members().iter().collect()),
+            _ => return,
+        };
+        for member in members {
+            match &member {
+                Node::MethodDefinition(method)
+                    if matches!(method.kind(), ruby_rbs::node::MethodDefinitionKind::Instance | ruby_rbs::node::MethodDefinitionKind::SingletonInstance) =>
+                {
+                    out.entry(ClassId(Symbol::new(&name))).or_default().insert(Symbol::new(method.name().as_str()));
+                }
+                Node::Class(_) | Node::Module(_) => walk(&member, Some(&name), out),
+                _ => {}
+            }
+        }
+    }
+    let signature = parse(source)?;
+    let mut out = crate::det::HashMap::default();
+    for decl in signature.declarations().iter() {
+        walk(&decl, None, &mut out);
+    }
+    Ok(out)
+}
+
 /// Parse RBS `@ivar: T` declarations grouped by enclosing class/module.
 /// Names are stored without the leading `@` so they match
 /// `ExprNode::Ivar` / `Ctx::ivar_bindings` keys.
@@ -217,22 +246,23 @@ fn declared_name(type_name: &ruby_rbs::node::TypeNameNode<'_>) -> String {
 
 fn walk_decl(
     decl: &Node<'_>,
-    parent: Option<&str>,
+    parent: Option<(&str, bool)>,
     aliases: &AliasTable,
     out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
+    let (parent, nesting_matches) = parent.map_or((None, true), |(name, matches)| (Some(name), matches));
     match decl {
         Node::Class(class) => {
             let name = namespace_join(parent, &declared_name(&class.name()));
-            collect_class_methods(class.members().iter(), &name, aliases, out)?;
+            collect_class_methods(class.members().iter(), &name, nesting_matches && !class.name().namespace().absolute() && !declared_name(&class.name()).contains("::"), aliases, out)?;
         }
         Node::Module(module) => {
             let name = namespace_join(parent, &declared_name(&module.name()));
-            collect_class_methods(module.members().iter(), &name, aliases, out)?;
+            collect_class_methods(module.members().iter(), &name, nesting_matches && !module.name().namespace().absolute() && !declared_name(&module.name()).contains("::"), aliases, out)?;
         }
         Node::Interface(iface) => {
             let name = namespace_join(parent, &declared_name(&iface.name()));
-            collect_class_methods(iface.members().iter(), &name, aliases, out)?;
+            collect_class_methods(iface.members().iter(), &name, nesting_matches && !iface.name().namespace().absolute() && !declared_name(&iface.name()).contains("::"), aliases, out)?;
         }
         _ => {}
     }
@@ -311,6 +341,7 @@ fn collect_class_ivars<'a, I: Iterator<Item = Node<'a>>>(
 fn collect_class_methods<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
+    nesting_matches: bool,
     outer: &AliasTable,
     out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
@@ -322,13 +353,14 @@ fn collect_class_methods<'a, I: Iterator<Item = Node<'a>>>(
         match member {
             Node::MethodDefinition(method) => {
                 let name = Symbol::new(method.name().as_str());
-                let ty = method_signature_ty(&method, Some(class_name), aliases)?;
-                out.entry(class_id.clone()).or_default().insert(name, ty);
+                let (ty, spelled) = spelled(|| method_signature_ty(&method, Some(class_name), aliases));
+                file_spellings(&class_id, &name, spelled, nesting_matches);
+                out.entry(class_id.clone()).or_default().insert(name, ty?);
             }
             // Nested class/module inside this one — recurse with the
             // combined namespace.
             Node::Class(_) | Node::Module(_) | Node::Interface(_) => {
-                walk_decl(&member, Some(class_name), aliases, out)?;
+                walk_decl(&member, Some((class_name, nesting_matches)), aliases, out)?;
             }
             _ => {}
         }
@@ -681,7 +713,15 @@ fn qualify_class_ref(
             }
         })
         .collect();
-    if ns.absolute() {
+    let root = if ns.absolute() { "::" } else { "" };
+    let written = format!("{root}{}", path_segments.iter().chain([&bare_name]).cloned().collect::<Vec<_>>().join("::"));
+    let resolved = resolve_class_ref(bare_name, &path_segments, ns.absolute(), scope);
+    note_spelling(&resolved, written);
+    resolved
+}
+
+fn resolve_class_ref(bare_name: String, path_segments: &[String], absolute: bool, scope: Option<&str>) -> String {
+    if absolute {
         // `::Foo::Bar` — explicit top-level. Use path-as-written
         // joined with the bare name; ignore enclosing scope.
         if path_segments.is_empty() {
@@ -768,6 +808,54 @@ struct TyCtx<'a> {
 
 /// `type name = ...` declarations in scope, keyed by the name as written.
 pub(crate) type AliasTable = crate::det::HashMap<String, Ty>;
+
+/// Resolved name to (written name, lexical nesting matches emitted nesting).
+/// A leading `::` is kept; the name is empty where two spellings met.
+/// Only simple enclosing declarations prove matching nesting; qualified
+/// headers fall back to main's rule for relative names in the Ruby writer.
+pub type Spellings = crate::det::HashMap<String, (String, bool)>;
+/// [`Spellings`] by owner and method, as `App::rbs_spellings` holds them.
+pub type MethodSpellings = crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Spellings>>;
+
+thread_local! {
+    static READ: std::cell::RefCell<Option<Spellings>> = const { std::cell::RefCell::new(None) };
+    static FILED: std::cell::RefCell<Option<MethodSpellings>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `read`'s value and the class names it spelled.
+pub(crate) fn spelled<T>(read: impl FnOnce() -> T) -> (T, Spellings) {
+    let outer = READ.with(|r| r.replace(Some(Spellings::default())));
+    let value = read();
+    (value, READ.with(|r| r.replace(outer)).unwrap_or_default())
+}
+
+pub(crate) fn note_spelling(resolved: &str, written: String) {
+    READ.with(|r| {
+        if let Some(read) = r.borrow_mut().as_mut() {
+            let (entry, _) = read.entry(resolved.to_string()).or_insert_with(|| (written.clone(), false));
+            if *entry != written {
+                entry.clear();
+            }
+        }
+    });
+}
+
+/// Files `owner#method`'s spellings for an enclosing [`collect_spellings`].
+pub(crate) fn file_spellings(owner: &ClassId, method: &Symbol, mut spellings: Spellings, nesting_matches: bool) {
+    for (_, matches) in spellings.values_mut() { *matches = nesting_matches; }
+    FILED.with(|f| {
+        if let Some(filed) = f.borrow_mut().as_mut() {
+            filed.entry(owner.clone()).or_default().insert(method.clone(), spellings);
+        }
+    });
+}
+
+/// `run`'s value and the spellings of the signatures it read.
+pub fn collect_spellings<T>(run: impl FnOnce() -> T) -> (T, MethodSpellings) {
+    let outer = FILED.with(|f| f.replace(Some(MethodSpellings::default())));
+    let value = run();
+    (value, FILED.with(|f| f.replace(outer)).unwrap_or_default())
+}
 
 fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
     match node {

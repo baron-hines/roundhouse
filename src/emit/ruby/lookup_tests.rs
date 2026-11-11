@@ -336,6 +336,7 @@ fn installed_indexes_keep_the_app_and_models_slice_immutably_borrowed() {
         #![allow(dead_code)]
         use std::collections::BTreeSet;
         mod det { pub use std::collections::{HashMap, HashSet}; }
+        mod rbs { pub type Spellings = crate::det::HashMap<String, (String, bool)>; }
         use det::{HashMap, HashSet};
         type Symbol = String;
         #[derive(Default)] struct ClassId(String);
@@ -350,6 +351,7 @@ fn installed_indexes_keep_the_app_and_models_slice_immutably_borrowed() {
         }
         fn walk_const_paths(_: &(), _: &mut BTreeSet<Vec<String>>) {}
         fn model_body_names(_: &[Model]) -> HashSet<Symbol> { HashSet::default() }
+        fn declared_spellings(_: &App) -> HashMap<String, rbs::Spellings> { HashMap::default() }
     "#;
     let dir = std::env::temp_dir().join(format!("lookup-borrows-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

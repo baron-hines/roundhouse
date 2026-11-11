@@ -3613,7 +3613,9 @@ fn walk_decl_body_with_visibility<'pr>(
                             // replays it, the rest see a class body they
                             // cannot model.
                             if args.iter().any(|arg| {
-                                constant_path_of(&arg).is_none() && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
+                                constant_path_of(&arg).is_none()
+                                    && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
+                                    && !crate::ingest::util::is_rails_mounted_helpers_chain(&arg)
                             }) {
                                 if let Ok(e) = ingest_expr(&stmt, file) {
                                     out.unknown_calls.push(e);
@@ -3654,6 +3656,10 @@ fn walk_decl_body_with_visibility<'pr>(
                                     // ruby emit rewrites `X.<helper>` call
                                     // sites through RouteHelpers.
                                     out.includes.push(ClassId(Symbol::from("RouteHelpers")));
+                                    out.include_spans.push(super::util::node_span(&stmt, file));
+                                } else if crate::ingest::util::is_rails_mounted_helpers_chain(&arg) {
+                                    // Not an unresolved include: `routes.mounted_helpers` is the module answering `main_app` (route_set.rb).
+                                    out.includes.push(ClassId(Symbol::from("ActionDispatch::Routing::MountedHelpers")));
                                     out.include_spans.push(super::util::node_span(&stmt, file));
                                 }
                             }

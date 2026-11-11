@@ -13,6 +13,7 @@ module ActiveSupport
     def self.utc_zone_name?: (String name) -> bool
     UTC_ZONE_NAMES: Array[String]
   end
+  def self.run_load_hooks: (Symbol name, ?untyped base) -> nil
   def self.deep_dup: (untyped value) -> untyped
   def self.blank?: (untyped value) -> bool
 
@@ -72,6 +73,7 @@ module ActiveSupport
   def self.index_by: (untyped list) { (untyped) -> untyped } -> Hash[untyped, untyped]
   def self.excluding: [A] (Array[A] list, *A elements) -> Array[A]
   # `untyped list`, as `sole`'s: an `Array[String]` argument does not link against `Array[untyped]` on Spinel.
+  def self.assert_valid_keys: (Hash[Symbol, untyped] hash, Array[untyped] valid_keys) -> Hash[Symbol, untyped]
   def self.extract_options!: (untyped list) -> Hash[untyped, untyped]
   def self.pluck: (untyped list, *(Symbol | String | Integer) keys) -> Array[untyped]
   # The lowerer routes Array receivers here, Relation receivers to
