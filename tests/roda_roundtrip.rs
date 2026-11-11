@@ -150,9 +150,9 @@ fn conversion_roundtrips_through_ingest() {
                 .iter()
                 .map(|fk| {
                     (
-                        fk.from_column.to_string(),
+                        fk.from_columns[0].to_string(),
                         fk.to_table.0.to_string(),
-                        fk.to_column.to_string(),
+                        fk.to_columns[0].to_string(),
                     )
                 })
                 .collect()

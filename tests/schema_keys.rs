@@ -1,0 +1,237 @@
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
+use roundhouse::emit::shared::schema_sql::{Dialect, render_schema_statements_for};
+use roundhouse::ingest::ingest_schema;
+
+const SCHEMA: &str = include_str!("support/schema_keys_schema.rb");
+const CONTRACT: &str = include_str!("support/schema_keys_contract.rb");
+const EXPECTED: &str = "deferred commit and composite keys match Rails";
+const EXECUTE: &str = "def execute(sql)\n  Db.exec(sql)\nend\ndef scalar(sql)\n  stmt = Db.prepare(sql)\n  raise 'no row' unless Db.step?(stmt)\n  value = Db.column_int(stmt, 0)\n  Db.finalize(stmt)\n  value\nend\n";
+
+fn app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app().write("db/schema.rb", SCHEMA)
+}
+
+#[test]
+fn deferred_foreign_key_keeps_its_timing() {
+    let schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+    assert!(ddl.contains("DEFERRABLE INITIALLY DEFERRED"), "{ddl}");
+    assert!(ddl.contains("DEFERRABLE INITIALLY IMMEDIATE"), "{ddl}");
+}
+
+#[test]
+fn composite_primary_key_reaches_both_dialects() {
+    let schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+        let ddl = render_schema_statements_for(&schema, dialect).unwrap();
+        let identities = ddl.iter().find(|s| s.contains("identities")).unwrap();
+        let keys = if dialect == Dialect::Sqlite { "PRIMARY KEY (a, b)" } else { "PRIMARY KEY (\"a\", \"b\")" };
+        assert!(identities.contains(keys), "{identities}");
+        assert!(!identities.contains("AUTOINCREMENT"), "{identities}");
+        assert!(!identities.contains("BIGSERIAL"), "{identities}");
+    }
+}
+
+#[test]
+fn composite_foreign_key_preserves_both_ordered_column_lists() {
+    let schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+    assert!(ddl.contains("FOREIGN KEY (tenant_id, item_id) REFERENCES scopes (tenant_id, item_id)"), "{ddl}");
+}
+
+#[test]
+fn unsupported_key_options_do_not_silently_become_id() {
+    for primary_key in ["[]", "[key_column, :b]", "key_columns"] {
+        let source = SCHEMA.replace("primary_key: [:a, :b]", &format!("primary_key: {primary_key}"));
+        let error = ingest_schema(source.as_bytes(), "db/schema.rb").expect_err("computed keys must be refused").to_string();
+        assert!(error.contains("db/schema.rb"), "{error}");
+    }
+    for options in [
+        "column: [], primary_key: []", "column: [:a, :b], primary_key: :id",
+        "column: key_columns", "deferrable: true", "deferrable: timing", "**key_options",
+    ] {
+        let source = format!("{SCHEMA}\nadd_foreign_key :children, :parents, {options}\n");
+        assert!(ingest_schema(source.as_bytes(), "db/schema.rb").is_err(), "{options}");
+    }
+}
+
+#[test]
+fn a_foreign_key_to_an_absent_or_renamed_table_is_still_skipped() {
+    use roundhouse::ingest::ingest_migration;
+    let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let migration = "class RenameParent < ActiveRecord::Migration[8.1]\n def change\n rename_table :parents, :renamed_parents\n end\nend";
+    ingest_migration(migration.as_bytes(), "db/migrate/1_rename.rb", &mut schema).unwrap();
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+    assert!(!ddl.contains("REFERENCES parents"), "{ddl}");
+    assert!(ddl.contains("FOREIGN KEY (tenant_id, item_id) REFERENCES scopes"), "{ddl}");
+}
+
+#[test]
+fn removing_a_composite_foreign_key_matches_the_whole_key() {
+    use roundhouse::ingest::ingest_migration;
+    let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let migration = "class RemoveKey < ActiveRecord::Migration[8.1]\n def change\n remove_foreign_key :scope_links, :scopes, column: [:tenant_id, :item_id], primary_key: [:tenant_id, :item_id]\n end\nend";
+    ingest_migration(migration.as_bytes(), "db/migrate/1_remove.rb", &mut schema).unwrap();
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+    assert!(!ddl.contains("REFERENCES scopes"), "{ddl}");
+    assert!(ddl.contains("REFERENCES parents"), "{ddl}");
+}
+
+#[test]
+fn false_deferrable_and_postgres_fk_policy_stay_unchanged() {
+    let source = SCHEMA.replace("deferrable: :deferred", "deferrable: false");
+    let schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+    let sqlite = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap();
+    let children = sqlite.iter().find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS children ")).unwrap();
+    assert!(!children.contains("DEFERRABLE"), "{children}");
+    let postgres = render_schema_statements_for(&schema, Dialect::Postgres).unwrap().join(";\n");
+    assert!(!postgres.contains("FOREIGN KEY"), "{postgres}");
+}
+
+#[test]
+fn serialized_single_column_foreign_keys_remain_readable() {
+    let schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let key = &schema.tables[&roundhouse::Symbol::from("children")].foreign_keys[0];
+    let mut value = serde_json::to_value(key).unwrap();
+    let object = value.as_object_mut().unwrap();
+    let from = object.remove("from_columns").unwrap();
+    let to = object.remove("to_columns").unwrap();
+    object.insert("from_column".into(), from.as_array().unwrap()[0].clone());
+    object.insert("to_column".into(), to.as_array().unwrap()[0].clone());
+    object.remove("deferrable");
+    let decoded: roundhouse::schema::ForeignKey = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.from_columns, key.from_columns);
+    assert_eq!(decoded.to_columns, key.to_columns);
+    assert_eq!(decoded.deferrable, None);
+}
+
+#[test]
+fn renaming_a_composite_primary_key_column_is_refused() {
+    use roundhouse::ingest::ingest_migration_with_generated_expression_dialect;
+    use roundhouse::schema::generated::GeneratedExpressionDialect;
+    let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let migration = "class RenameKey < ActiveRecord::Migration[8.1]\n def change\n rename_column :identities, :b, :code\n end\nend";
+    let error = ingest_migration_with_generated_expression_dialect(migration.as_bytes(), "db/migrate/1_rename.rb", &mut schema, GeneratedExpressionDialect::Postgres).expect_err("a composite key must not name a missing column").to_string();
+    assert!(error.contains("db/migrate/1_rename.rb") && error.contains("composite primary key"), "{error}");
+    let ddl = render_schema_statements_for(&schema, Dialect::Postgres).unwrap().join(";\n");
+    assert!(ddl.contains("PRIMARY KEY (\"a\", \"b\")"), "{ddl}");
+}
+
+#[test]
+fn removing_a_composite_primary_key_column_is_refused() {
+    use roundhouse::ingest::ingest_migration_with_generated_expression_dialect;
+    use roundhouse::schema::generated::GeneratedExpressionDialect;
+    let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let migration = "class RemoveKey < ActiveRecord::Migration[8.1]\n def change\n remove_column :identities, :b\n end\nend";
+    let error = ingest_migration_with_generated_expression_dialect(migration.as_bytes(), "db/migrate/1_remove.rb", &mut schema, GeneratedExpressionDialect::Postgres).expect_err("a composite key must not name a missing column").to_string();
+    assert!(error.contains("db/migrate/1_remove.rb") && error.contains("composite primary key"), "{error}");
+}
+
+fn refuse_reference_key_removal(verb: &str) {
+    use roundhouse::ingest::ingest_migration;
+    let source = SCHEMA.replace("t.string \"label\"", "t.string \"label\"\n    t.integer :b_id");
+    let mut schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+    let migration = format!("class RemoveReference < ActiveRecord::Migration[8.1]\n def change\n {verb} :identities, :b\n end\nend");
+    let error = ingest_migration(migration.as_bytes(), "db/migrate/1_reference.rb", &mut schema)
+        .expect_err("reference removal must not invalidate the composite key").to_string();
+    assert!(error.contains("db/migrate/1_reference.rb") && error.contains("composite primary key"), "{error}");
+    assert!(schema.tables[&roundhouse::Symbol::from("identities")].columns.iter().any(|c| c.name.as_str() == "b"));
+}
+
+#[test]
+fn removing_a_reference_that_would_remove_a_composite_key_is_refused() {
+    refuse_reference_key_removal("remove_reference");
+}
+
+#[test]
+fn removing_a_belongs_to_that_would_remove_a_composite_key_is_refused() {
+    refuse_reference_key_removal("remove_belongs_to");
+}
+
+#[test]
+fn non_key_column_mutations_preserve_the_composite_primary_key() {
+    use roundhouse::ingest::ingest_migration;
+    let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    for change in ["rename_column :identities, :label, :title", "remove_column :identities, :title"] {
+        let migration = format!("class ChangeLabel < ActiveRecord::Migration[8.1]\n def change\n {change}\n end\nend");
+        ingest_migration(migration.as_bytes(), "db/migrate/1_label.rb", &mut schema).unwrap();
+        let ddl = render_schema_statements_for(&schema, Dialect::Postgres).unwrap().join(";\n");
+        assert!(ddl.contains("PRIMARY KEY (\"a\", \"b\")"), "{ddl}");
+    }
+}
+
+#[test]
+fn roda_migrations_keep_composite_keys_and_deferral() {
+    let mut app = roundhouse::App::default();
+    app.schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+    let files = roundhouse::emit::roda::emit(&app);
+    let migrations: Vec<&str> = files.iter().filter(|f| f.path.starts_with("db/migrate")).map(|f| f.content.as_str()).collect();
+    let script = format!(r#"
+begin
+  gem "sequel", ">= 5.0"
+rescue Gem::LoadError
+  puts "skip: Sequel is unavailable"
+  exit
+end
+require "sequel"
+require "sequel/extensions/migration"
+DB = Sequel.sqlite
+ARGV.each {{ |source| eval(source).apply(DB, :up) }}
+def execute(sql)
+  DB.run(sql)
+end
+def scalar(sql)
+  DB.fetch(sql).first.values.first.to_i
+end
+{CONTRACT}
+"#);
+    let out = emit_and_run::ruby().args(["-e", &script]).args(&migrations).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(EXPECTED) || stdout.contains("skip:"), "{stdout}");
+}
+
+#[test]
+fn emitted_ruby_keeps_key_writes_and_commit_timing() {
+    let run = app().run_ruby(&format!("{EXECUTE}{CONTRACT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains(EXPECTED));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn native_spinel_keeps_key_writes_and_commit_timing() {
+    let run = app().run_spinel_with_db(&format!("{EXECUTE}{CONTRACT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains(EXPECTED));
+}
+
+#[test]
+fn rails_keeps_key_writes_and_commit_timing() {
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let script = format!(r#"
+require {helper:?}
+unless RailsOracle.available?("activerecord", sqlite3: ">= 2.9")
+  puts "skip: Rails oracle and sqlite3 are unavailable"
+  exit
+end
+RailsOracle.activate("activerecord", sqlite3: ">= 2.9")
+require "active_record"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Schema.verbose = false
+{SCHEMA}
+def execute(sql)
+  ActiveRecord::Base.connection.execute(sql)
+end
+def scalar(sql)
+  ActiveRecord::Base.connection.select_value(sql).to_i
+end
+{CONTRACT}
+"#);
+    let out = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(EXPECTED) || stdout.contains("skip:"), "{stdout}");
+}

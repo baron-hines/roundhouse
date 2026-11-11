@@ -98,7 +98,7 @@ pub fn ingest_schema_with_generated_expression_dialect(
                     .arguments()
                     .map(|a| a.arguments().iter().collect())
                     .unwrap_or_default();
-                apply_add_foreign_key(&args, &mut schema);
+                if let Err(gap) = apply_add_foreign_key(&args, &mut schema, file) { gaps.push(gap); }
             }
             verb @ ("add_check_constraint" | "add_index") => {
                 if let Err(gap) = apply_table_verb(verb, &call_arguments(call), file, &mut schema, dialect) { gaps.push(gap); }
@@ -532,6 +532,7 @@ fn apply_table_verb(
         "rename_column" => {
             if let (Some(t), Some(old), Some(new)) = (arg_name(0), arg_name(1), arg_name(2)) {
                 if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
+                    refuse_composite_primary_key_mutation(verb, table, &old, file)?;
                     refuse_predicate_column(verb, table, &old, file)?;
                     if old != new {
                         refuse_indexed_generated_column_mutation(verb, table, &old, file)?;
@@ -647,6 +648,7 @@ fn apply_table_verb(
         "remove_reference" | "remove_belongs_to" => {
             if let (Some(t), Some(name)) = (arg_name(0), arg_name(1)) {
                 if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
+                    refuse_composite_primary_key_mutation(verb, table, &name, file)?;
                     if table.columns.iter().any(|column| {
                         column.name.as_str() == name && column.generated.is_some()
                     }) {
@@ -737,7 +739,7 @@ fn apply_table_verb(
         // conversion emits real `foreign_key` migration lines from it).
         // Column typing itself is unaffected: the FK column is already an
         // ordinary integer column from `create_table`.
-        "add_foreign_key" => apply_add_foreign_key(args, schema),
+        "add_foreign_key" => apply_add_foreign_key(args, schema, file)?,
         "remove_foreign_key" => apply_remove_foreign_key(args, file, schema)?,
         "add_check_constraint" | "remove_check_constraint" => {
             if let Some(table) = arg_name(0).and_then(|n| schema.tables.get_mut(&Symbol::from(n))) {
@@ -920,6 +922,7 @@ fn remove_named_column(
     });
     let removed = stored.as_deref().unwrap_or(c);
     if let Some(table) = schema.tables.get(&Symbol::from(t)) {
+        refuse_composite_primary_key_mutation(verb, table, removed, file)?;
         refuse_predicate_column(verb, table, c, file)?;
         refuse_indexed_generated_column_mutation(verb, table, removed, file)?;
         if table.columns.iter().any(|column| column.generated.is_some()) {
@@ -934,6 +937,16 @@ fn remove_named_column(
         // left here, the schema SQL indexes a column that is not there).
         let columns = &table.columns;
         table.indexes.retain(|idx| idx.columns.iter().all(|name| columns.iter().any(|col| col.name == *name)));
+    }
+    Ok(())
+}
+
+fn refuse_composite_primary_key_mutation(verb: &str, table: &Table, column: &str, file: &str) -> IngestResult<()> {
+    if table.primary_key_columns.iter().any(|key| key.as_str() == column) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("migration `{verb}` on {}.{column} changes a composite primary key; run `rails db:migrate` to materialize db/schema.rb", table.name),
+        });
     }
     Ok(())
 }
@@ -1330,24 +1343,48 @@ fn table_name_value(node: &Node<'_>) -> Option<String> {
 /// Shared by the schema.rb walk and the migration fold; column typing
 /// itself is unaffected (the FK column is already an ordinary integer
 /// column from `create_table`).
-fn apply_add_foreign_key(args: &[Node<'_>], schema: &mut Schema) {
+fn literal_key_columns(node: &Node<'_>, file: &str) -> IngestResult<Vec<Symbol>> {
+    let columns = column_name_list(node);
+    let expected = node.as_array_node().map(|a| a.elements().len()).unwrap_or(1);
+    if columns.is_empty() || columns.len() != expected || columns.iter().any(|c| c.as_str().is_empty()) {
+        return Err(IngestError::Unsupported { file: file.into(), message: "key columns must be a literal name or nonempty list of literal names".into() });
+    }
+    Ok(columns)
+}
+
+fn apply_add_foreign_key(args: &[Node<'_>], schema: &mut Schema, file: &str) -> IngestResult<()> {
     let arg_name = |i: usize| args.get(i).and_then(table_name_value);
-    let (Some(from_t), Some(to_t)) = (arg_name(0), arg_name(1)) else { return };
+    let gap = || IngestError::Unsupported { file: file.into(), message: "foreign key requires literal tables and options".into() };
+    let (Some(from_t), Some(to_t)) = (arg_name(0), arg_name(1)) else { return Err(gap()) };
+    if has_column_option_splats(&args[2..]) || args[2..].iter().any(|n| n.as_keyword_hash_node().is_none()) { return Err(gap()); }
     let kw = |key: &str| kwarg_value(args.iter().skip(2), key).and_then(|v| name_value(&v));
-    let from_column =
-        kw("column").unwrap_or_else(|| format!("{}_id", crate::naming::singularize(&to_t)));
-    let to_column = kw("primary_key").unwrap_or_else(|| "id".to_string());
+    let keys = |key: &str, fallback: String| kwarg_value(args.iter().skip(2), key)
+        .map(|n| literal_key_columns(&n, file)).unwrap_or_else(|| Ok(vec![Symbol::from(fallback)]));
+    let from_columns = keys("column", format!("{}_id", crate::naming::singularize(&to_t)))?;
+    let to_columns = keys("primary_key", "id".into())?;
+    if from_columns.len() != to_columns.len() { return Err(gap()); }
+    let deferrable = match kwarg_value(args.iter().skip(2), "deferrable") {
+        None => None,
+        Some(n) if bool_value(&n) == Some(false) => None,
+        Some(n) => Some(match symbol_value(&n).as_deref() {
+            Some("deferred") => crate::schema::Deferrable::Deferred,
+            Some("immediate") => crate::schema::Deferrable::Immediate,
+            _ => return Err(gap()),
+        }),
+    };
     let on_delete = kw("on_delete").map(|s| referential_action(&s)).unwrap_or_default();
     let on_update = kw("on_update").map(|s| referential_action(&s)).unwrap_or_default();
     if let Some(table) = schema.tables.get_mut(&Symbol::from(from_t)) {
         table.foreign_keys.push(crate::schema::ForeignKey {
-            from_column: Symbol::from(from_column),
+            from_columns,
             to_table: TableRef(Symbol::from(to_t)),
-            to_column: Symbol::from(to_column),
+            to_columns,
             on_delete,
             on_update,
+            deferrable,
         });
     }
+    Ok(())
 }
 
 /// `remove_foreign_key "comments", "articles"` (or `to_table:`,
@@ -1366,13 +1403,14 @@ fn apply_remove_foreign_key(args: &[Node<'_>], file: &str, schema: &mut Schema) 
     let Some(from_t) = args.first().and_then(table_name_value) else {
         return Err(gap("names its table by a non-literal"));
     };
+    if has_column_option_splats(&args[1..]) { return Err(gap("uses keyword splats")); }
     let positional_to = args.get(1).filter(|arg| arg.as_keyword_hash_node().is_none());
     let to_table = match positional_to {
         Some(arg) => Some(table_name_value(arg).ok_or_else(|| gap("names its target table by a non-literal"))?),
         None => kwarg_value(args.iter().skip(1), "to_table").map(|v| table_name_value(&v).ok_or_else(|| gap("names its target table by a non-literal"))).transpose()?,
     };
     let kw = |key: &str| kwarg_value(args.iter().skip(1), key);
-    let literal = |key: &str| kw(key).map(|v| name_value(&v).ok_or_else(|| gap(&format!("gives a non-literal `{key}:`")))).transpose();
+    let literal = |key: &str| kw(key).map(|v| literal_key_columns(&v, file)).transpose();
     let column = literal("column")?;
     let primary_key = literal("primary_key")?;
     if kw("name").is_some() {
@@ -1384,8 +1422,8 @@ fn apply_remove_foreign_key(args: &[Node<'_>], file: &str, schema: &mut Schema) 
     if let Some(table) = schema.tables.get_mut(&Symbol::from(from_t)) {
         let matches = |fk: &crate::schema::ForeignKey| {
             to_table.as_deref().is_none_or(|to| fk.to_table.0.as_str() == to)
-                && column.as_deref().is_none_or(|c| fk.from_column.as_str() == c)
-                && primary_key.as_deref().is_none_or(|pk| fk.to_column.as_str() == pk)
+                && column.as_ref().is_none_or(|c| &fk.from_columns == c)
+                && primary_key.as_ref().is_none_or(|pk| &fk.to_columns == pk)
         };
         // Without `column:`, Rails first narrows to the keys on the
         // default column (`author_id` for `:authors`), when any exist.
@@ -1394,7 +1432,7 @@ fn apply_remove_foreign_key(args: &[Node<'_>], file: &str, schema: &mut Schema) 
             _ => None,
         };
         let on_default = |fk: &crate::schema::ForeignKey| {
-            default_column.as_deref().is_some_and(|c| fk.from_column.as_str() == c)
+            default_column.as_deref().is_some_and(|c| fk.from_columns.len() == 1 && fk.from_columns[0].as_str() == c)
         };
         let narrowed = table.foreign_keys.iter().any(on_default);
         if let Some(at) = table.foreign_keys.iter().position(|fk| (!narrowed || on_default(fk)) && matches(fk)) {
@@ -1626,6 +1664,19 @@ fn table_from_create_table(
     }
 
     let table_options: Vec<_> = args.arguments().iter().skip(1).collect();
+    if has_column_option_splats(&table_options) {
+        gaps.push(IngestError::Unsupported { file: file.into(), message: format!("key options for {table_name} cannot use keyword splats") });
+    }
+    let mut primary_key_columns = Vec::new();
+    if has_id {
+        if let Some(value) = kwarg_value(table_options.iter(), "primary_key").filter(|n| n.as_nil_node().is_none()) {
+            match literal_key_columns(&value, file) {
+                Ok(keys) if value.as_array_node().is_some() => { primary_key_columns = keys; has_id = false; }
+                Ok(_) => {}
+                Err(gap) => gaps.push(gap),
+            }
+        }
+    }
     let mut known_keyless = !has_id
         && !has_column_option_splats(&table_options)
         && kwarg_value(table_options.iter(), "primary_key").is_none();
@@ -1762,8 +1813,11 @@ fn table_from_create_table(
         check_constraints,
         virtual_module: None,
         known_keyless,
-        primary_key_columns: Vec::new(),
+        primary_key_columns,
     };
+    if table.primary_key_columns.iter().any(|k| !table.columns.iter().any(|c| &c.name == k)) {
+        gaps.push(IngestError::Unsupported { file: file.into(), message: format!("primary key on {table_name} names a column the schema does not model") });
+    }
     let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
     for (column, reason) in &invalid_generated {
         gaps.push(IngestError::Unsupported {
@@ -2982,7 +3036,7 @@ mod tests {
             schema.tables[&Symbol::from("posts")]
                 .foreign_keys
                 .iter()
-                .map(|fk| (fk.from_column.as_str().to_string(), fk.to_table.0.as_str().to_string()))
+                .map(|fk| (fk.from_columns[0].as_str().to_string(), fk.to_table.0.as_str().to_string()))
                 .collect()
         };
         let create = r#"

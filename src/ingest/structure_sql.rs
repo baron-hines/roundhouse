@@ -848,11 +848,12 @@ fn handle_add_foreign_key(
         let on_update = action_after(words, close2, "UPDATE");
         if let Some(table) = schema.tables.get_mut(&table_sym) {
             table.foreign_keys.push(ForeignKey {
-                from_column: Symbol::from(from_cols[0].clone()),
+                from_columns: vec![Symbol::from(from_cols[0].clone())],
                 to_table: TableRef(Symbol::from(ref_table_raw)),
-                to_column: Symbol::from(to_cols[0].clone()),
+                to_columns: vec![Symbol::from(to_cols[0].clone())],
                 on_delete,
                 on_update,
+                deferrable: None,
             });
         }
     } else {

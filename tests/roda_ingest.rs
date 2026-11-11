@@ -41,7 +41,7 @@ fn schema_folds_from_sequel_migrations() {
 
     let comments = &app.schema.tables[&roundhouse::Symbol::from("comments")];
     let fk = comments.foreign_keys.first().expect("comments has an FK");
-    assert_eq!(fk.from_column.as_str(), "article_id");
+    assert_eq!(fk.from_columns[0].as_str(), "article_id");
     assert_eq!(fk.to_table.0.as_str(), "articles");
     assert_eq!(fk.on_delete, ReferentialAction::Cascade);
     assert_eq!(comments.indexes.len(), 1);

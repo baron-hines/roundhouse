@@ -234,9 +234,9 @@ fn ingests_tables_columns_indexes_fk_and_pk() {
 
     // Foreign key.
     let fk = widgets.foreign_keys.first().expect("one foreign key");
-    assert_eq!(fk.from_column.as_str(), "company_id");
+    assert_eq!(fk.from_columns[0].as_str(), "company_id");
     assert_eq!(fk.to_table.0.as_str(), "companies");
-    assert_eq!(fk.to_column.as_str(), "id");
+    assert_eq!(fk.to_columns[0].as_str(), "id");
     assert!(matches!(fk.on_delete, roundhouse::schema::ReferentialAction::Cascade));
 
     // Ledgered gaps: the dropped tstzrange column and the unmodeled view.

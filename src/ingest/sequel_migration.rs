@@ -228,11 +228,12 @@ fn ingest_column_stmt(
                 array_stored: false,
             });
             table.foreign_keys.push(ForeignKey {
-                from_column: Symbol::from(name.as_str()),
+                from_columns: vec![Symbol::from(name.as_str())],
                 to_table: TableRef(Symbol::from(target.as_str())),
-                to_column: Symbol::from("id"),
+                to_columns: vec![Symbol::from("id")],
                 on_delete: referential_action(opt_sym("on_delete").as_deref()),
                 on_update: referential_action(opt_sym("on_update").as_deref()),
+                deferrable: None,
             });
         }
         "index" => {
