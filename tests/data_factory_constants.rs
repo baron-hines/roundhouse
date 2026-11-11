@@ -39,6 +39,69 @@ fn file_data_composition_strictly_emits() {
 }
 
 #[test]
+fn data_constructor_visibility_requires_the_complete_symbol_set() {
+    for names in [":new", ":[]", ":allocate", ":new, :[]", ":new, :allocate", ":[], :allocate",
+        ":new, :new, :[]", ":new, :[], :allocate, :allocate", "'new', '[]', 'allocate'"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "Data.define private_class_method", Some(source.find("private_class_method").unwrap()));
+        }
+    }
+}
+
+#[test]
+fn data_constructor_visibility_accepts_each_permutation() {
+    for names in [":new, :[], :allocate", ":new, :allocate, :[]", ":[], :new, :allocate",
+        ":[], :allocate, :new", ":allocate, :new, :[]", ":allocate, :[], :new"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
+        let mut app = review_record(&source, "lib/artifact.rb", None);
+        assert!(errors(&mut app).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn data_reopenings_refuse_block_load_time_calls() {
+    for work in ["FIRST = new(digest: 'x').label", "FIRST = [new(digest: 'x').label]",
+        "FIRST = {value: new(digest: 'x').label}", "FIRST = ('x'.freeze)",
+        "@first = new(digest: 'x').label", "puts new(digest: 'x').label"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  def label = 'block'\n  {work}\nend\nclass Artifact\n  def label = 'reopen'\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "Data.define reopening with load-time", None);
+        }
+    }
+}
+
+fn assert_review_refusal(source: &str, path: &str, shape: &str, marker: Option<usize>) {
+    let tree = [(PathBuf::from(path), source.as_bytes().to_vec())].into_iter().collect();
+    match roundhouse::ingest::ingest_app_from_tree(tree) {
+        Ok(mut app) => {
+            let diagnostics = errors(&mut app);
+            assert!(diagnostics.iter().any(|d| !d.span.is_synthetic() && d.message.contains(shape)
+                && marker.is_none_or(|at| d.span.start as usize == at)), "{source}: {diagnostics:?}");
+            if marker.is_some() {
+                assert!(diagnostics.iter().any(|d| d.message.contains(":new, :[], :allocate")));
+            }
+        }
+        Err(roundhouse::ingest::IngestError::Unsupported { file, message }) => {
+            assert_eq!(file, path);
+            assert!(message.contains(shape), "{source}: {message}");
+            if let Some(at) = marker {
+                let line = source[..at].bytes().filter(|&c| c == b'\n').count() + 1;
+                assert!(message.contains(&format!("{path}:{line}")) && message.contains(":new, :[], :allocate"), "{message}");
+            }
+        }
+        other => panic!("{source}: expected a source-located refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn data_reopenings_keep_pure_constants_and_deferred_method_calls() {
+    let source = "Artifact = Data.define(:digest) do\n  FIRST = 'constant'\n  def label = digest.to_s\nend\nclass Artifact\n  def label = digest\nend\n";
+    let mut app = review_record(source, "lib/artifact.rb", None);
+    assert!(errors(&mut app).is_empty());
+}
+
+#[test]
 fn private_data_constructors_do_not_allow_unproven_inherited_methods() {
     for marker in ["private_class_method :missing", "private :new", "private_class_method ENV.fetch('NAME')",
         "class << self; private :new; end"] {

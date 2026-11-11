@@ -851,6 +851,8 @@ class Routing(unittest.TestCase):
                 plan = ci.select([path])
                 self.assertIn("unit", plan["jobs"])
                 self.assertIn("spinel-toolchain", plan["jobs"])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("data_record_composition", plan["spinel_tests"])
         # This is a toolchain test, not a framework-suite binary.
         self.assertNotIn("data_record_siblings", ci.SPINEL_TESTS)
 
@@ -892,7 +894,7 @@ class Routing(unittest.TestCase):
         # must too when that file is the only change.
         self.assertEqual(
             ci.select(["src/emit/ruby/library.rs"])["spinel_tests"],
-            [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_constraints"],
+            ["data_record_composition", *ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_constraints"],
         )
         self.assertEqual(
             ci.select(["runtime/spinel/db.rb"])["spinel_tests"],

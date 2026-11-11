@@ -68,7 +68,7 @@ end
 "#;
 pub const REDEFINED_SOURCE: &str = "Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; def label = 'first'; end\nclass Artifact; def label = digest; end\n";
 pub const DEFAULT_SOURCE: &str = r#"Artifact = Data.define(:digest) do
-  private_class_method :new
+  private_class_method :new, :[], :allocate
   DEFAULT_RECORD = new("abc")
   def self.default = DEFAULT_RECORD
 end
@@ -78,6 +78,29 @@ pub const INHERITED_SOURCE: &str = r#"Artifact = Data.define(:digest) do
   private_class_method :new, :[], :allocate
 end
 class Child < Artifact
+end
+"#;
+pub const CHILD_FACTORY_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  private_class_method :new, :[], :allocate
+end
+class Child < Artifact
+  def self.make(digest) = new(digest: digest + "!")
+  def self.literal(digest) = self.new(digest: digest + "?")
+end
+class Grandchild < Child
+end
+"#;
+pub const CHILD_CONSTANT_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  private_class_method :new, :[], :allocate
+end
+class Child < Artifact
+  DEFAULT = new(digest: "default")
+  def self.default = DEFAULT
+end
+"#;
+pub const PUBLIC_CHILD_SOURCE: &str = r#"Artifact = Data.define(:digest)
+class Child < Artifact
+  def self.make(digest) = new(digest:)
 end
 "#;
 pub const MEMBER_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").digest\n";
@@ -110,4 +133,8 @@ pub const COMPOSITION_CASES: &[(&str, &str, &str)] = &[
     (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\n", "abc\n"),
     (DEFAULT_SOURCE, "puts Artifact.default.digest\n", "abc\n"),
     (INHERITED_SOURCE, "record = Child.build('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
+    (CHILD_FACTORY_SOURCE, "record = Child.make('abc')\nputs record.digest\nputs record.class == Child\nputs Child.literal('abc').digest\nrecord = Grandchild.make('abc')\nputs record.digest\nputs record.class == Grandchild\n", "abc!\ntrue\nabc?\nabc!\ntrue\n"),
+    (CHILD_CONSTANT_SOURCE, "puts Child.default.digest\nputs Child.default.class == Child\n", "default\ntrue\n"),
+    (PUBLIC_CHILD_SOURCE, "record = Child.make('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
+    ("Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; private; def hidden = digest; public; def label = hidden; end\n", "puts Artifact.new('abc').label\n", "abc\n"),
 ];

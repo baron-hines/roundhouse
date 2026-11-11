@@ -3,6 +3,14 @@ mod prerequisite;
 use super::data_record_siblings_contract as contract;
 
 #[test]
+fn a_subclass_constant_can_call_its_inherited_private_constructor() {
+    let run = super::emit_and_run::real_blog().write("lib/artifact.rb", contract::CHILD_CONSTANT_SOURCE)
+        .run_ruby("puts Child.default.digest\nputs Child.default.class == Child\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "default\ntrue\n");
+}
+
+#[test]
 fn data_composition_keeps_members_initializers_methods_and_constructor_visibility() {
     for (source, assertions, expected) in contract::COMPOSITION_CASES {
         for path in ["lib/artifact.rb", "app/models/artifact.rb"] {

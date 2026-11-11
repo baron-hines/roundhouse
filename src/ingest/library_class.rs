@@ -390,6 +390,14 @@ fn ingest_library_classes_impl(
                 let reopenings = find_all_classes_with_scope(&root).into_iter().filter(|(scope, node)| {
                     class_name_path(node).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == class.name.0.as_str())
                 }).collect::<Vec<_>>();
+                if !reopenings.is_empty() && let Some((_, call)) = file_data_declaration(&statement)
+                    && let Some(body) = call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body()) {
+                    let mut calls = LoadTimeCalls(false);
+                    ruby_prism::Visit::visit(&mut calls, &body);
+                    if calls.0 { return Err(super::error_site::at(IngestError::Unsupported {
+                        file: file.into(), message: "Data.define reopening with load-time method calls in its block is not modeled".into(),
+                    }, &statement)); }
+                }
                 let invalid_reopen = reopenings.iter().any(|(_, node)| {
                     node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
                         || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| {
@@ -410,10 +418,8 @@ fn ingest_library_classes_impl(
                     }, &statement));
                 }
                 // Only later, method-only reopenings can join the factory without moving load-time work.
-                let mut index = 0;
-                while index < out.len() {
-                    if out[index].name == class.name { class.methods.extend(out.remove(index).methods); }
-                    else { index += 1; }
+                for reopening in out.extract_if(.., |other| other.name == class.name) {
+                    class.methods.extend(reopening.methods);
                 }
                 class.methods.sort_by_key(|method| method.name_span.start);
                 made.push((class.name.0.clone(), class));
@@ -567,6 +573,12 @@ fn data_block_classes(
         });
     }
     Ok(out)
+}
+
+struct LoadTimeCalls(bool);
+impl<'pr> ruby_prism::Visit<'pr> for LoadTimeCalls {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) { self.0 |= visibility::definition(&node.as_node()).is_none(); }
+    fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
 }
 
 /// The class a file-level statement `X = Data.define(:a, :b)` creates.
