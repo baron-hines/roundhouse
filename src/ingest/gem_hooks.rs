@@ -433,63 +433,6 @@ pub(super) fn devise_warden_compat(app: &mut App) {
     }
 }
 
-/// orm_adapter's ActiveRecord adapter, which Devise's models reach through `to_adapter` (`extend ::OrmAdapter::ToAdapter`
-/// in an `on_load(:active_record)` block that is not carried, and a `self::OrmAdapter` constant it reads): `find_first`
-/// with plain conditions is `where(conditions).first`, and `get(id)` is the row of that primary key
-/// (`OrmAdapter::ActiveRecord#find_first` / `#get`, orm_adapter 0.5.0).
-pub(super) fn devise_orm_adapter(app: &mut App) {
-    if !app.library_classes.iter().any(|c| c.name.0.as_str() == "Devise::Mapping") {
-        return;
-    }
-    let src = "class OrmAdapterProbe\n  def find_first(klass, conditions)\n    klass.where(conditions).first\n  end\n\n  def get(klass, id)\n    klass.where(klass.primary_key => (id.is_a?(Array) ? id.first : id)).first\n  end\nend\n";
-    let Ok(probe) = super::prism::scope(|| super::ingest_library_classes(src.as_bytes(), "<orm_adapter active_record>")).0 else { return };
-    let body = |name: &str| probe.iter().flat_map(|c| c.methods.iter()).find(|m| m.name.as_str() == name).map(|m| m.body.clone());
-    let (Some(find_first), Some(get)) = (body("find_first"), body("get")) else { return };
-    let devise = |m: &crate::dialect::MethodDef| super::sources::path_of(m.name_span.file).is_some_and(|p| p.contains("/devise-") && super::absence_guards::is_source_gem_path(&p));
-    for lc in app.library_classes.iter_mut() {
-        for m in lc.methods.iter_mut().filter(|m| devise(m)) {
-            rewrite_to_adapter(&mut m.body, &find_first, &get);
-        }
-    }
-    // A model's `devise` call splices the modules' methods into it.
-    for model in app.models.iter_mut() {
-        for m in model.methods_mut().filter(|m| devise(m)) {
-            rewrite_to_adapter(&mut m.body, &find_first, &get);
-        }
-    }
-}
-
-fn rewrite_to_adapter(e: &mut Expr, find_first: &Expr, get: &Expr) {
-    e.node.for_each_child_mut(&mut |c| rewrite_to_adapter(c, find_first, get));
-    let ExprNode::Send { recv: Some(adapter), method, args, block: None, .. } = &*e.node else { return };
-    let ExprNode::Send { recv: klass, method: to_adapter, args: none, block: None, .. } = &*adapter.node else { return };
-    if to_adapter.as_str() != "to_adapter" || !none.is_empty() {
-        return;
-    }
-    let template = match (method.as_str(), args.as_slice()) {
-        ("find_first", [_]) => find_first,
-        ("get", [_]) => get,
-        _ => return,
-    };
-    let klass = klass.clone().unwrap_or_else(|| Expr::new(e.span, ExprNode::SelfRef));
-    let arg = args[0].clone();
-    let mut out = template.clone();
-    substitute_vars(&mut out, &klass, &arg);
-    *e = out;
-}
-
-fn substitute_vars(e: &mut Expr, klass: &Expr, arg: &Expr) {
-    if let ExprNode::Var { name, .. } = &*e.node {
-        match name.as_str() {
-            "klass" => *e = klass.clone(),
-            "conditions" | "id" => *e = arg.clone(),
-            _ => {}
-        }
-        return;
-    }
-    e.node.for_each_child_mut(&mut |c| substitute_vars(c, klass, arg));
-}
-
 fn fold_scope_reads(e: &mut Expr, name: &str) {
     if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
         && args.is_empty()

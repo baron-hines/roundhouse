@@ -3375,46 +3375,7 @@ fn without_auto_source_gems(app: &App, target: BuildTarget) -> Option<App> {
     Some(trimmed)
 }
 
-/// Does `target`'s tree carry only the part of a gem compiled from source the program reaches? Spinel's does, and the
-/// ruby family's where it compiles a gem too (`compiled_on_the_ruby_family`).
-pub(crate) fn shakes_source_gems(app: &App, target: BuildTarget) -> bool {
-    target == BuildTarget::Spinel
-        || (matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) && !compiled_on_the_ruby_family(app).is_empty())
-}
-
-/// The automatically sourced gems the ruby family compiles too: a gem that needs Rails' railties cannot load as
-/// the real gem over the runtime, which is not Rails (Devise, responders), and a sourced gem one of them depends on
-/// (Warden) comes with it, since the compiled gem calls its compiled classes.
-pub(crate) fn compiled_on_the_ruby_family(app: &App) -> crate::det::HashSet<String> {
-    let Some(lock) = app.gem_lock.as_ref() else { return Default::default() };
-    let deps = |gem: &str| lock.spec_deps.get(gem).cloned().unwrap_or_default();
-    let needs_railties = |gem: &str| {
-        let mut seen: crate::det::HashSet<String> = Default::default();
-        let mut stack = vec![gem.to_string()];
-        while let Some(g) = stack.pop() {
-            if g == "railties" {
-                return true;
-            }
-            if seen.insert(g.clone()) {
-                stack.extend(deps(&g));
-            }
-        }
-        false
-    };
-    let mut kept: crate::det::HashSet<String> = app.auto_source_gems.iter().filter(|g| needs_railties(g)).cloned().collect();
-    loop {
-        let more: Vec<String> = app
-            .auto_source_gems
-            .iter()
-            .filter(|g| !kept.contains(*g) && kept.iter().any(|k| deps(k).iter().any(|d| d == *g)))
-            .cloned()
-            .collect();
-        if more.is_empty() {
-            return kept;
-        }
-        kept.extend(more);
-    }
-}
+pub(crate) use crate::source_gem_shake::{compiled_on_the_ruby_family, shakes_source_gems};
 
 fn target_files_inner(
     app: &App,
@@ -6140,7 +6101,7 @@ fn all_program_items(items: &[crate::app::ProgramItem]) -> Vec<&crate::app::Prog
 /// A feature of the Rails frameworks (`active_support/core_ext/…`,
 /// `rails`): the runtime ports are the framework in an emitted tree, and
 /// no such file is on its load path.
-fn is_framework_feature(feature: &str) -> bool {
+pub(crate) fn is_framework_feature(feature: &str) -> bool {
     let root = feature.split('/').next().unwrap_or(feature);
     matches!(
         root,
