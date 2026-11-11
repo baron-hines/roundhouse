@@ -1221,3 +1221,56 @@ fn a_devise_user_is_remembered_by_cookie_over_rack_on_the_ruby_family() {
     run.assert_passes();
     assert!(run.stdout.contains("devise remember-me over rack passed"), "{}", run.stdout);
 }
+
+/// `:timeoutable`, as Rails 8.1.4 with Devise 4.9.4 answers it with `config.timeout_in = 2.seconds`: a request past
+/// the timeout signs the user out and redirects back to the page, the redirect to sign in that follows keeps the
+/// flash's `:timedout` and its alert (`flash.keep`), and the alert is the session-expired one.
+const RACK_TIMEOUT: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+flashes = lambda do
+  $jar.select { |k, _| k.start_with?("flash_") }.map { |k, v| ActionDispatch::Flash.cookie_flashes(URI.decode_www_form_component(v), k) }.reduce({}, :merge)
+end
+
+req("GET", "/account/new")
+_, _, page = req("GET", "/users/sign_in")
+token = URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1])
+status, = req("POST", "/users/sign_in", "authenticity_token=#{token}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=secret123")
+raise "sign in #{status}" unless status == 302
+status, = req("GET", "/secret")
+raise "fresh #{status}" unless status == 200
+sleep 3
+status, headers, = req("GET", "/secret")
+raise "timed out #{status} #{headers.inspect}" unless status == 302 && headers["location"] == "http://localhost/secret"
+expired = { "alert" => "Your session expired. Please sign in again to continue.", "timedout" => true }
+raise "timed-out flash #{flashes.().inspect}" unless flashes.() == expired
+status, headers, = req("GET", "/secret")
+raise "signed out #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+raise "kept flash #{flashes.().inspect}" unless flashes.() == expired
+puts "devise timeout over rack passed"
+"##;
+
+#[test]
+fn a_devise_session_times_out_over_rack_on_the_ruby_family() {
+    let run = app(":database_authenticatable, :timeoutable", "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n")
+        .write("config/initializers/devise.rb", "Devise.setup do |config|\n  config.mailer_sender = \"please-change-me@example.com\"\n  config.timeout_in = 2.seconds\n  require \"devise/orm/active_record\"\nend\n")
+        .write("app/controllers/accounts_controller.rb", ACCOUNTS)
+        .run_ruby(RACK_TIMEOUT);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise timeout over rack passed"), "{}", run.stdout);
+}

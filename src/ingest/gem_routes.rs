@@ -225,6 +225,7 @@ fn write_devise_url_helpers(app: &mut App, draws: DeviseDraws) {
     super::gem_hooks::fold_devise_failure_route(app, &named);
     super::gem_hooks::fold_devise_unnamed_router(app);
     super::gem_hooks::fold_devise_time_inflector(app);
+    super::gem_hooks::fold_devise_module_probes(app);
     super::gem_hooks::devise_warden_compat(app);
     let scope_defined_by_program = app.library_classes.iter().filter(|c| c.name.0.as_str() != "ActionDispatch::Routing::Mapper").any(|c| c.methods.iter().any(|m| m.name.as_str() == "devise_scope"))
         || app.models.iter().any(|m| m.methods().any(|d| d.name.as_str() == "devise_scope"));

@@ -482,6 +482,55 @@ pub(super) fn fold_devise_unnamed_router(app: &mut App) {
     }
 }
 
+/// `resource.respond_to?(:remember_me)` in Devise's own code (`Controllers::Rememberable#remember_me_is_active?`, which
+/// the `:timeoutable` hook asks): Devise asks whether the model has a module by a method the module gives it, and its
+/// resource is a model, so the answer is whether every Devise model has that module, or none does.
+// Not left to the call: its receiver is not typed, so the gem shake keeps every method of that name the program
+// defines (the Proxy's own `remember_me`), whose body calls the module's class methods no model defines.
+pub(super) fn fold_devise_module_probes(app: &mut App) {
+    let facts = Facts::of(app);
+    if facts.devise_models.is_empty() {
+        return;
+    }
+    let module_of: HashMap<String, String> = app
+        .library_classes
+        .iter()
+        .filter_map(|c| c.name.0.as_str().strip_prefix("Devise::Models::").filter(|m| !m.contains("::")).map(|m| (c, m)))
+        .flat_map(|(c, m)| {
+            let module = crate::naming::snake_case(m);
+            c.methods.iter().filter(|d| d.receiver == crate::dialect::MethodReceiver::Instance).map(move |d| (d.name.as_str().to_string(), module.clone()))
+        })
+        .collect();
+    let answer = |method: &str| -> Option<bool> {
+        let module = module_of.get(method)?;
+        let has = facts.devise_models.values().filter(|mods| mods.iter().any(|m| m == module)).count();
+        if has == 0 {
+            Some(false)
+        } else if has == facts.devise_models.len() {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    fn fold(e: &mut Expr, answer: &dyn Fn(&str) -> Option<bool>) {
+        e.node.for_each_child_mut(&mut |c| fold(c, answer));
+        if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node
+            && method.as_str() == "respond_to?"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if matches!(name.as_str(), "resource" | "record"))
+            && let [arg] = args.as_slice()
+            && let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node
+            && let Some(known) = answer(value.as_str())
+        {
+            *e.node = ExprNode::Lit { value: Literal::Bool { value: known } };
+        }
+    }
+    for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str().starts_with("Devise::")) {
+        for m in &mut lc.methods {
+            fold(&mut m.body, &answer);
+        }
+    }
+}
+
 /// `Devise::TimeInflector.time_ago_in_words(t)` (`:confirmable`'s expiry message): the class only hands the call to an
 /// instance that includes `ActionView::Helpers::DateHelper`, whose method the runtime carries as the view helper's.
 // Not through the class: its `delegate` sits in `class << self` and forwards arguments, which the delegate expansion's
