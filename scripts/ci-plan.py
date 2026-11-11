@@ -857,7 +857,6 @@ def select(
             "src/ingest/app.rs",
             "src/ingest/file_program.rs",
             "src/ingest/mod.rs",
-            "src/bin/roundhouse.rs",
             "src/ingest/visibility.rs",
             "src/emit/ruby/library.rs",
             "src/emit/ruby/rbs.rs",
