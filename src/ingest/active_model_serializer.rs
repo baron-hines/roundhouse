@@ -523,6 +523,25 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
     let class_expr = || {
         Expr::new(Span::synthetic(), ExprNode::Const { path: class.split("::").map(Symbol::from).collect() })
     };
+    // A collection reads the scope once, after the collection, as the
+    // gem's render does: both are bound before the map, which passes the
+    // bound scope to each item's serializer.
+    let var = |name: &str| Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) });
+    let bound = |name: &str, value: Expr| {
+        let target = crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from(name) };
+        Expr::new(span, ExprNode::Assign { target, value })
+    };
+    let mut bindings = Vec::new();
+    let mut value = entries[json].1.clone();
+    let scope = match scope {
+        Some(scope) if collection => {
+            bindings.push(bound("__ams_items", value));
+            bindings.push(bound("__ams_scope", scope));
+            value = var("__ams_items");
+            Some(var("__ams_scope"))
+        }
+        scope => scope,
+    };
     let hashed = |value: Expr| {
         let mut args = vec![value];
         if let Some(scope) = &scope {
@@ -531,7 +550,6 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
         }
         send(Some(send(Some(class_expr()), "new", args, None)), "serializable_hash", vec![], None)
     };
-    let value = entries[json].1.clone();
     let rendered = if collection {
         let item = Symbol::from("__ams_item");
         let read = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: item.clone() });
@@ -552,6 +570,11 @@ fn rewrite_renders_with(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Optio
     };
     entries[json].1 = rendered;
     entries.retain(|(k, _)| !matches!(name(k).as_deref(), Some("serializer" | "each_serializer")));
+    if !bindings.is_empty() {
+        let render = expr.clone();
+        bindings.push(render);
+        *expr = Expr::new(expr.span, ExprNode::Seq { exprs: bindings });
+    }
 }
 
 /// What an ActiveModel::Serializer instance answers from the gem rather
@@ -837,47 +860,93 @@ fn controller_scope(chain: &[&crate::dialect::Controller]) -> ControllerScope {
 /// as active_model_serializers renders it: the controller's
 /// `serialization_scope` is the `scope:`, and under the default
 /// `:current_user` the serializer's `current_user` reads it. The scope is
-/// the controller's `current_user` when it has one (its own or an
-/// ancestor's method, or Devise's from a model's `devise`), nil without
-/// one. Under `serialization_scope nil` the scope is nil and the
-/// serializer has no `current_user`, so a serializer that calls it is left
-/// as it was, as is any render under another named scope.
+/// the controller's own `serialization_scope` when it defines one;
+/// otherwise its `current_user` when it has one (its own or an
+/// ancestor's method, one an included concern defines, or Devise's from a
+/// `User` model's `devise`), nil without one. Under `serialization_scope
+/// nil` the scope is nil and the serializer has no `current_user`, so a
+/// serializer that calls it is left as it was, as is any render under
+/// another named scope, and any whose controller includes a module the
+/// app doesn't define (a gem's), which may answer `current_user`.
 fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeReads>) {
     if scoped.is_empty() {
         return;
     }
+    // Devise defines `current_<mapping>` for each model it maps: only the
+    // `User` model's mapping is `current_user`.
     let devise = app.models.iter().any(|m| {
-        m.body.iter().any(|item| {
-            matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
-                if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "devise"))
-        })
+        m.name.0.as_str().trim_start_matches("::") == "User"
+            && m.body.iter().any(|item| {
+                matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                    if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "devise"))
+            })
     });
-    let plans: Vec<(ControllerScope, bool)> = app
+    let plans: Vec<(ControllerScope, Option<bool>, bool)> = app
         .controllers
         .iter()
         .map(|c| {
             let chain = controller_chain(app, &c.name);
-            let own = chain.iter().any(|c| c.actions().any(|a| a.name.as_str() == "current_user"));
-            (controller_scope(&chain), devise || own)
+            let has_current_user = if devise { Some(true) } else { chain_defines(app, &chain, "current_user") };
+            // A gem's module is taken not to override the gem's own
+            // `serialization_scope`.
+            let own_scope = chain_defines(app, &chain, "serialization_scope") == Some(true);
+            (controller_scope(&chain), has_current_user, own_scope)
         })
         .collect();
-    for (controller, (scope, has_current_user)) in app.controllers.iter_mut().zip(plans) {
+    for (controller, (scope, has_current_user, own_scope)) in app.controllers.iter_mut().zip(plans) {
         for action in controller.actions_mut() {
             let span = action.body.span;
-            let current_user = move || {
+            let call = move |name: &str| {
                 Expr::new(
                     span,
-                    ExprNode::Send { recv: None, method: Symbol::from("current_user"), args: vec![], block: None, parenthesized: false },
+                    ExprNode::Send { recv: None, method: Symbol::from(name), args: vec![], block: None, parenthesized: false },
                 )
             };
             rewrite_renders_with(&mut action.body, &|class| {
                 let reads = scoped.get(class)?;
-                match scope {
-                    ControllerScope::CurrentUser => Some(has_current_user.then(current_user)),
-                    ControllerScope::Nil if !reads.current_user => Some(None),
+                if own_scope {
+                    // The serializer's `current_user` is the scope only
+                    // under the default scope name.
+                    return (matches!(scope, ControllerScope::CurrentUser) || !reads.current_user)
+                        .then(|| Some(call("serialization_scope")));
+                }
+                match (scope, has_current_user) {
+                    (ControllerScope::CurrentUser, Some(true)) => Some(Some(call("current_user"))),
+                    (ControllerScope::CurrentUser, Some(false)) => Some(None),
+                    (ControllerScope::Nil, _) if !reads.current_user => Some(None),
                     _ => None,
                 }
             });
         }
     }
+}
+
+/// Whether the controllers in `chain`, or the modules they include (and
+/// those modules' own includes), define `method`: `None` when it isn't
+/// found and an included module isn't one the app defines, whose methods
+/// are unknown.
+fn chain_defines(app: &crate::App, chain: &[&crate::dialect::Controller], method: &str) -> Option<bool> {
+    if chain.iter().any(|c| c.actions().any(|a| a.name.as_str() == method)) {
+        return Some(true);
+    }
+    let mut pending: Vec<ClassId> =
+        chain.iter().flat_map(|c| crate::analyze::controller_include_groups(c)).flatten().collect();
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut unknown = false;
+    while let Some(module) = pending.pop() {
+        let name = module.0.as_str().trim_start_matches("::").to_string();
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let mut found = false;
+        for lc in app.library_classes.iter().filter(|lc| lc.name.0.as_str().trim_start_matches("::") == name) {
+            found = true;
+            if lc.methods.iter().any(|m| m.name.as_str() == method) {
+                return Some(true);
+            }
+            pending.extend(lc.includes.iter().cloned());
+        }
+        unknown |= !found;
+    }
+    (!unknown).then_some(false)
 }
