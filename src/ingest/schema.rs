@@ -942,7 +942,7 @@ fn remove_named_column(
 }
 
 fn refuse_composite_primary_key_mutation(verb: &str, table: &Table, column: &str, file: &str) -> IngestResult<()> {
-    if table.primary_key_columns.iter().any(|key| key.as_str() == column) {
+    if table.primary_key_columns.iter().any(|key| key.as_str() == column || (matches!(verb, "remove_reference" | "remove_belongs_to") && key.as_str() == format!("{column}_id"))) {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: format!("migration `{verb}` on {}.{column} changes a composite primary key; run `rails db:migrate` to materialize db/schema.rb", table.name),
@@ -1799,6 +1799,11 @@ fn table_from_create_table(
                 }
             }
         }
+    }
+
+    for col in columns.iter_mut().filter(|col| matches!(col.col_type, ColumnType::Reference { .. })) {
+        let physical = Symbol::from(format!("{}_id", col.name).as_str());
+        if primary_key_columns.contains(&physical) { col.name = physical; }
     }
 
     // An index over a column the walk dropped (unsupported type,

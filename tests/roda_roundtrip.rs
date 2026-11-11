@@ -91,7 +91,7 @@ fn schema_keys_roundtrip_through_sequel_migrations() {
     let named_key = source
         .replace("create_table \"parents\" do", "create_table \"parents\", primary_key: :parent_key do")
         .replace("\"parents\", column:", "\"parents\", primary_key: :parent_key, column:");
-    for source in [source, named_key.as_str()] {
+    for source in [source, named_key.as_str(), include_str!("support/schema_keys_references.rb")] {
         let mut app = App::new();
         app.schema = roundhouse::ingest::ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
         let scratch = scratch_dir("schema-keys");

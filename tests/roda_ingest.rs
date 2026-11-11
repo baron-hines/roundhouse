@@ -103,6 +103,58 @@ fn sequel_foreign_key_arrays_and_scalar_targets_keep_order_and_timing() {
 }
 
 #[test]
+fn sequel_implicit_foreign_keys_resolve_the_targets_primary_key() {
+    use roundhouse::{Symbol, schema::Schema};
+    for (parent, from, expected) in [
+        ("Integer :x\nInteger :y\nprimary_key [:y, :x]", "[:b, :a]", vec!["y", "x"]),
+        ("primary_key :code", "[:a]", vec!["code"]),
+        ("primary_key :code", ":a", vec!["code"]),
+        ("primary_key :id", "[:a]", vec!["id"]),
+    ] {
+        for options in ["", ", {deferrable: true}"] {
+            let columns = if from.starts_with('[') { "Integer :a\nInteger :b" } else { "Integer :b" };
+            let source = format!("Sequel.migration do\n change do\n create_table(:parents) do\n{parent}\n end\n create_table(:links) do\n{columns}\n self.foreign_key {from}, :parents{options}\n end\n end\nend");
+            let mut schema = Schema::default();
+            roundhouse::ingest::ingest_sequel_migration(source.as_bytes(), "db/migrate/001_links.rb", &mut schema).unwrap();
+            let table = &schema.tables[&Symbol::from("links")];
+            assert_eq!(table.columns.len(), 2, "constraint must reuse its existing columns");
+            let fk = &table.foreign_keys[0];
+            assert_eq!(fk.to_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), expected);
+        }
+    }
+}
+
+#[test]
+fn sequel_implicit_self_references_resolve_keys_declared_later() {
+    for (body, expected) in [
+        ("Integer :a\nInteger :b\nInteger :c\nInteger :d\nforeign_key [:c, :d], :links\nprimary_key [:b, :a]", vec!["b", "a"]),
+        ("foreign_key [:c, :d], :links\nprimary_key [:b, :a]\nInteger :a\nInteger :b\nInteger :c\nInteger :d", vec!["b", "a"]),
+        ("foreign_key :parent_code, :links\nprimary_key :code", vec!["code"]),
+    ] {
+        let table = sequel_table(body).unwrap();
+        assert_eq!(table.foreign_keys[0].to_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), expected);
+    }
+}
+
+#[test]
+fn sequel_implicit_foreign_keys_refuse_unknown_or_incompatible_keys() {
+    use roundhouse::schema::Schema;
+    for (parent, from) in [
+        ("", ":a"),
+        ("", "[:a]"),
+        ("create_table(:parents) { Integer :id }", "[:a]"),
+        ("create_table(:parents) { Integer :a; Integer :b; primary_key [:b, :a] }", "[:a]"),
+        ("create_table(:parents) { Integer :a; Integer :b; primary_key [:b, :a] }", ":a"),
+        ("create_table(:parents) { primary_key :id }", "[:missing]"),
+    ] {
+        let columns = if from.starts_with('[') { "Integer :a" } else { "" };
+        let source = format!("Sequel.migration do\n change do\n{parent}\n create_table(:links) do\n{columns}\n foreign_key {from}, :parents\n end\n end\nend");
+        let error = roundhouse::ingest::ingest_sequel_migration(source.as_bytes(), "db/migrate/001_links.rb", &mut Schema::default()).expect_err(&source).to_string();
+        assert!(error.contains("db/migrate/001_links.rb"), "{error}");
+    }
+}
+
+#[test]
 fn sequel_unread_key_forms_are_refused() {
     for body in [
         "primary_key []", "primary_key [:a, key_column]", "primary_key key_columns",

@@ -119,11 +119,20 @@ fn ingest_table_stmt(
                 call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body())
             {
                 let mut statements = flatten_statements(body);
-                statements.sort_by_key(|n| n.as_call_node().is_some_and(|c| constant_id_str(&c.name()) == "primary_key"
+                statements.sort_by_key(|n| n.as_call_node().is_some_and(|c| matches!(constant_id_str(&c.name()), "primary_key" | "foreign_key")
                     && c.arguments().is_some_and(|a| a.arguments().iter().next().is_some_and(|n| n.as_array_node().is_some()))));
                 for col_stmt in statements {
                     ingest_column_stmt(&col_stmt, file, &mut table)?;
                 }
+            }
+            for at in 0..table.foreign_keys.len() {
+                let fk = &table.foreign_keys[at];
+                if !fk.to_columns.is_empty() { continue; }
+                let target = if fk.to_table.0 == table.name { Some(&table) } else { schema.tables.get(&fk.to_table.0) };
+                let keys = target.map(|t| if t.primary_key_columns.is_empty() { t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect() } else { t.primary_key_columns.clone() })
+                    .filter(|keys: &Vec<Symbol>| !keys.is_empty() && keys.len() == fk.from_columns.len())
+                    .ok_or_else(|| IngestError::Unsupported { file: file.into(), message: "Sequel foreign key target requires a known matching primary key".into() })?;
+                table.foreign_keys[at].to_columns = keys;
             }
             schema.tables.insert(Symbol::from(name.as_str()), table);
         }
@@ -210,8 +219,8 @@ fn ingest_column_stmt(
             // `foreign_key :article_id, :articles, null: false, on_delete: :cascade`
             let from_columns = key_columns(args.first().ok_or_else(gap)?, false).ok_or_else(gap)?;
             let target = args.get(1).and_then(symbol_value).ok_or_else(gap)?;
-            let to_columns = opt_value("key").map(|n| key_columns(&n, false).ok_or_else(gap)).transpose()?.unwrap_or_else(|| vec![Symbol::from("id")]);
-            if from_columns.len() != to_columns.len() || (col_name.is_none() && (opt_value("key").is_none() || from_columns.iter().any(|n| !table.columns.iter().any(|c| c.name == *n)))) { return Err(gap()); }
+            let to_columns = opt_value("key").map(|n| key_columns(&n, false).ok_or_else(gap)).transpose()?.unwrap_or_default();
+            if (!to_columns.is_empty() && from_columns.len() != to_columns.len()) || (col_name.is_none() && from_columns.iter().any(|n| !table.columns.iter().any(|c| c.name == *n))) { return Err(gap()); }
             let deferrable = match opt_value("deferrable").filter(|n| bool_value(n) != Some(false) && n.as_nil_node().is_none()) {
                 None => None,
                 Some(n) if bool_value(&n) == Some(true) || symbol_value(&n).as_deref() == Some("deferred") => Some(Deferrable::Deferred),

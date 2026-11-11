@@ -5,6 +5,8 @@ use roundhouse::emit::shared::schema_sql::{Dialect, render_schema_statements_for
 use roundhouse::ingest::ingest_schema;
 
 const SCHEMA: &str = include_str!("support/schema_keys_schema.rb");
+const REFERENCE_SCHEMA: &str = include_str!("support/schema_keys_references.rb");
+const REFERENCE_CONTRACT: &str = include_str!("support/schema_keys_reference_contract.rb");
 const CONTRACT: &str = include_str!("support/schema_keys_contract.rb");
 const EXPECTED: &str = "deferred commit and composite keys match Rails";
 const EXECUTE: &str = "def execute(sql)\n  Db.exec(sql)\nend\ndef scalar(sql)\n  stmt = Db.prepare(sql)\n  raise 'no row' unless Db.step?(stmt)\n  value = Db.column_int(stmt, 0)\n  Db.finalize(stmt)\n  value\nend\n";
@@ -32,6 +34,78 @@ fn composite_primary_key_reaches_both_dialects() {
         assert!(!identities.contains("AUTOINCREMENT"), "{identities}");
         assert!(!identities.contains("BIGSERIAL"), "{identities}");
     }
+}
+
+#[test]
+fn composite_primary_keys_use_physical_reference_columns() {
+    for source in [REFERENCE_SCHEMA.to_string(), REFERENCE_SCHEMA.replace("belongs_to", "references").replace("t.references :product,", "t.references \"product\",")] {
+        let schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+        let table = &schema.tables[&roundhouse::Symbol::from("links")];
+        assert_eq!(table.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["product_id", "client_id", "label"]);
+        assert_eq!(table.primary_key_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["product_id", "client_id"]);
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            let ddl = render_schema_statements_for(&schema, dialect).unwrap().join(";\n");
+            let key = if dialect == Dialect::Sqlite { "PRIMARY KEY (product_id, client_id)" } else { "PRIMARY KEY (\"product_id\", \"client_id\")" };
+            assert!(ddl.contains(key), "{ddl}");
+            assert!(!ddl.contains("AUTOINCREMENT") && !ddl.contains("BIGSERIAL"), "{ddl}");
+        }
+        for verb in ["remove_reference :links, :product", "remove_belongs_to :links, :client", "remove_column :links, :product_id", "rename_column :links, :client_id, :buyer_id"] {
+            let mut schema = schema.clone();
+            let migration = format!("class ChangeKey < ActiveRecord::Migration[8.1]\n def change\n {verb}\n end\nend");
+            let error = roundhouse::ingest::ingest_migration(migration.as_bytes(), "db/migrate/1_key.rb", &mut schema).expect_err(verb).to_string();
+            assert!(error.contains("composite primary key"), "{error}");
+        }
+    }
+    let missing = REFERENCE_SCHEMA.replace(":client_id]", ":missing_id]");
+    assert!(ingest_schema(missing.as_bytes(), "db/schema.rb").is_err());
+}
+
+#[test]
+fn emitted_ruby_keeps_reference_composite_keys() {
+    let run = emit_and_run::empty_app().write("db/schema.rb", REFERENCE_SCHEMA)
+        .run_ruby(&format!("{EXECUTE}{REFERENCE_CONTRACT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains("reference composite key matches Rails"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn native_spinel_keeps_reference_composite_keys() {
+    let run = emit_and_run::empty_app().write("db/schema.rb", REFERENCE_SCHEMA)
+        .run_spinel_with_db(&format!("{EXECUTE}{REFERENCE_CONTRACT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains("reference composite key matches Rails"));
+}
+
+#[test]
+fn rails_materializes_reference_columns_in_composite_keys() {
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let script = format!(r#"
+require {helper:?}
+unless RailsOracle.available?("activerecord", sqlite3: ">= 2.9")
+  puts "skip: Rails oracle and sqlite3 are unavailable"
+  exit
+end
+RailsOracle.activate("activerecord", sqlite3: ">= 2.9")
+require "active_record"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Schema.verbose = false
+{REFERENCE_SCHEMA}
+db = ActiveRecord::Base.connection
+raise "key order" unless db.primary_keys(:links) == %w[product_id client_id]
+raise "physical columns" unless db.columns(:links).map(&:name) == %w[product_id client_id label]
+db.execute("INSERT INTO links (product_id, client_id) VALUES (1, 2)")
+begin
+  db.execute("INSERT INTO links (product_id, client_id) VALUES (1, 2)")
+  raise "duplicate composite key accepted"
+rescue ActiveRecord::RecordNotUnique
+end
+puts "reference key matches Rails #{{ActiveRecord.version}}"
+"#);
+    let out = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("reference key matches Rails") || stdout.contains("skip:"), "{stdout}");
 }
 
 #[test]
