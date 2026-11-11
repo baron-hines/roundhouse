@@ -67,6 +67,19 @@ pub const PRIVATE_SOURCE: &str = r#"Artifact = Data.define(:digest) do
 end
 "#;
 pub const REDEFINED_SOURCE: &str = "Artifact = Data.define(:digest) do; def label = 'block'; end\nclass Artifact; def label = 'first'; end\nclass Artifact; def label = digest; end\n";
+pub const DEFAULT_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  private_class_method :new
+  DEFAULT_RECORD = new("abc")
+  def self.default = DEFAULT_RECORD
+end
+"#;
+pub const INHERITED_SOURCE: &str = r#"Artifact = Data.define(:digest) do
+  def self.build(digest) = new(digest:)
+  private_class_method :new, :[], :allocate
+end
+class Child < Artifact
+end
+"#;
 pub const MEMBER_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").digest\n";
 pub const REOPEN_ASSERTIONS: &str = "puts Artifact.members == [:digest]\nputs Artifact.new(digest: \"abc\").extra\n";
 pub const PRIVATE_ASSERTIONS: &str = r#"puts Artifact.members == [:digest]
@@ -95,4 +108,6 @@ pub const COMPOSITION_CASES: &[(&str, &str, &str)] = &[
     (REOPEN_SOURCE, REOPEN_ASSERTIONS, "true\nreopened:abc!\n"),
     (PRIVATE_SOURCE, PRIVATE_ASSERTIONS, "true\nabc\nnew refused\n[] refused\nallocate refused\n"),
     (REDEFINED_SOURCE, "puts Artifact.new(digest: 'abc').label\n", "abc\n"),
+    (DEFAULT_SOURCE, "puts Artifact.default.digest\n", "abc\n"),
+    (INHERITED_SOURCE, "record = Child.build('abc')\nputs record.digest\nputs record.class == Child\n", "abc\ntrue\n"),
 ];
