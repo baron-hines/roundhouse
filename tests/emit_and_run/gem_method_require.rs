@@ -65,3 +65,14 @@ fn the_spinel_emit_raises_load_error_in_a_controller_copy_of_a_gems_mixin_method
     assert!(!controller.contains("require \"fancy_printer\""), "{controller}");
     assert!(controller.contains("raise LoadError.new(\"cannot load such file -- fancy_printer\")"), "{controller}");
 }
+
+/// An absent gem's own path (tzinfo-data's `tzinfo/data`) that another locked, installed gem ships is that file:
+/// Ruby's `require` loads it, so the `require` stays.
+#[test]
+fn the_spinel_emit_keeps_a_require_of_an_absent_gems_path_another_gem_ships() {
+    let (emitted, errors) = contract::app_with_shipped_absent_path().emit(BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("tzinfo/data")), "{errors:#?}");
+    let zones = std::fs::read_to_string(emitted.join("app/models/shelf/zones.rb")).expect("zones.rb");
+    assert!(zones.contains("require \"tzinfo/data\""), "{zones}");
+    assert!(!zones.contains("cannot load such file -- tzinfo/data"), "{zones}");
+}

@@ -137,6 +137,26 @@ fn with_gems(gems: &[&str]) -> emit_and_run::Overlay {
         .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
 }
 
+/// `tzinfo/data` is the absent tzinfo-data's own path (`TZInfo::Data`), but a locked, installed gem unrelated to it
+/// ships `lib/tzinfo/data.rb`, so Ruby's `require` loads that file: the gem's method answers true.
+pub const SHELF_ZONES: &str = r#"module Shelf
+  module Zones
+    def self.data!
+      require "tzinfo/data"
+      true
+    rescue LoadError
+      nil
+    end
+  end
+end
+"#;
+
+const ZONEPACK: &str = "vendor/bundle/ruby/3.4.0/gems/zonepack-1.0.0/lib/tzinfo/data.rb";
+
+pub const ZONEPACK_DATA: &str = "module ZonePack\n  SOURCE = \"zonepack\"\nend\n";
+
+pub const ARTICLE_ZONES: &str = "class ArticleZones\n  def self.loaded\n    Shelf::Zones.data!.inspect\n  end\nend\n";
+
 #[allow(dead_code)]
 pub fn app() -> emit_and_run::Overlay {
     with_gems(&["shelf"]).write(GEM, SHELF).write("app/models/article_box.rb", ARTICLE_BOX)
@@ -178,4 +198,14 @@ pub fn app_with_controller() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
         .write("app/controllers/boxes_controller.rb", BOXES_CONTROLLER)
         .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  resources :boxes, only: :index\n")
+}
+
+/// [`app`] with `Shelf::Zones` in the gem and the `zonepack` gem, which ships `lib/tzinfo/data.rb`, beside it.
+#[allow(dead_code)]
+pub fn app_with_shipped_absent_path() -> emit_and_run::Overlay {
+    with_gems(&["shelf", "zonepack"])
+        .write(GEM, &format!("{SHELF}{SHELF_ZONES}"))
+        .write(ZONEPACK, ZONEPACK_DATA)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+        .write("app/models/article_zones.rb", ARTICLE_ZONES)
 }
