@@ -460,6 +460,69 @@ fn a_devise_user_signs_in_over_rack_on_the_ruby_family() {
     assert!(run.stdout.contains("devise sign-in over rack passed"), "{}", run.stdout);
 }
 
+/// Two mappings: Devise's shared views and its failure app read `resource_name` / `scope` per request, which the
+/// ingest spells out as a `case` over the mappings (`gem_hooks::fold_devise_view_scope`, `fold_devise_failure_route`).
+const RACK_TWO_MAPPINGS: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+def sign_in(scope, email, password)
+  _, _, page = req("GET", "/#{scope}s/sign_in")
+  token = page[/name="authenticity_token" value="([^"]*)"/, 1]
+  [page, req("POST", "/#{scope}s/sign_in", "authenticity_token=#{URI.encode_www_form_component(token)}&#{scope}%5Bemail%5D=#{URI.encode_www_form_component(email)}&#{scope}%5Bpassword%5D=#{password}&commit=Log+in")]
+end
+
+req("GET", "/account/new")
+req("GET", "/account/admin")
+status, headers, = req("GET", "/console")
+raise "console #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/admins/sign_in")
+page, (status, _, failed) = sign_in("admin", "root@example.com", "wrong")
+raise "admin form" unless page.include?(%(name="admin[email]" id="admin_email"))
+raise "admin wrong #{status}" unless status == 200 && failed.include?(%(value="root@example.com"))
+_, (status, headers, _) = sign_in("admin", "root@example.com", "secret123")
+raise "admin sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/console")
+status, = req("GET", "/console")
+raise "console admin #{status}" unless status == 200
+status, headers, = req("GET", "/secret")
+raise "secret as admin #{status}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+page, (status, headers, _) = sign_in("user", "a@example.com", "secret123")
+raise "user form" unless page.include?(%(name="user[email]" id="user_email"))
+raise "user sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
+status, = req("GET", "/secret")
+raise "secret user #{status}" unless status == 200
+puts "two devise mappings over rack passed"
+"##;
+
+const TWO_ACCOUNTS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def admin\n    Admin.create!(email: \"root@example.com\", password: \"secret123\")\n    head :ok\n  end\nend\n";
+
+#[test]
+fn two_devise_mappings_sign_in_over_rack_on_the_ruby_family() {
+    let run = app(
+        ":database_authenticatable",
+        "  devise_for :users\n  devise_for :admins\n  get \"/account/new\", to: \"accounts#create\"\n  get \"/account/admin\", to: \"accounts#admin\"\n  authenticate :admin do\n    get \"/console\", to: \"articles#index\"\n  end\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n",
+    )
+    .edit("db/schema.rb", "  create_table \"articles\"", &format!("{}  create_table \"articles\"", USERS.replace("\"users\"", "\"admins\"")))
+    .write("app/models/admin.rb", "class Admin < ApplicationRecord\n  devise :database_authenticatable\nend\n")
+    .write("app/controllers/accounts_controller.rb", TWO_ACCOUNTS)
+    .run_ruby(RACK_TWO_MAPPINGS);
+    run.assert_passes();
+    assert!(run.stdout.contains("two devise mappings over rack passed"), "{}", run.stdout);
+}
+
 const ACCOUNTS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\nend\n";
 
 fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
@@ -552,4 +615,60 @@ fn a_devise_user_signs_in_over_http_natively() {
     // Signed in, the sign-in page sends the user on (`require_no_authentication`).
     let (again, _) = server.request_with_set_cookies("GET", "/users/sign_in", &[("Cookie", cookie.as_str())], "");
     assert_eq!(again.status, 302, "{}", server.log());
+}
+
+/// `:validatable`: Devise's `included` hook `class_eval`s its `validates_*_of` calls onto the model, with
+/// `email_regexp` and `password_length` read as the hook runs. Each case's errors are Rails 8.1.4's with Devise 4.9.4.
+const CHECKS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def check\n    user = User.new(email: params[:email], password: params[:password])\n    user.password_confirmation = params[:confirmation] if params[:confirmation]\n    user.valid?\n    render plain: user.errors.full_messages.join(\"|\")\n  end\nend\n";
+
+const VALIDATABLE_ROUTES: &str = "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  get \"/account/check\", to: \"accounts#check\"\n";
+
+/// The query of each case, and the errors Rails answers for it.
+const VALIDATABLE_CASES: [(&str, &str); 6] = [
+    ("email=bad&password=123", "Email is invalid|Password is too short (minimum is 6 characters)"),
+    ("email=&password=", "Email can't be blank|Password can't be blank"),
+    ("email=b%40example.com&password=secret123&confirmation=other", "Password confirmation doesn't match Password"),
+    ("email=b%40example.com&password=secret123&confirmation=secret123", ""),
+    ("email=b%40example.com&password=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "Password is too long (maximum is 128 characters)"),
+    ("email=a%40example.com&password=secret123", "Email has already been taken"),
+];
+
+#[test]
+fn devise_validatable_answers_rails_errors_on_the_ruby_family() {
+    let cases = VALIDATABLE_CASES.iter().map(|(query, want)| format!("[{query:?}, {want:?}]")).collect::<Vec<_>>().join(",\n  ");
+    let script = format!(
+        r##"def get(path, query)
+  env = {{ "REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => query, "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new("") }}
+  status, _headers, chunks = Main.run_rack(env)
+  [status, chunks.join]
+end
+status, = get("/account/new", "")
+raise "account #{{status}}" unless status == 200
+[
+  {cases}
+].each do |query, want|
+  status, body = get("/account/check", query)
+  raise "#{{query}}: #{{status}} #{{body.inspect}}" unless status == 200 && body == want
+end
+puts "devise validatable passed"
+"##
+    );
+    let run = app(":database_authenticatable, :validatable", VALIDATABLE_ROUTES).write("app/controllers/accounts_controller.rb", CHECKS).run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise validatable passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn devise_validatable_answers_rails_errors_natively() {
+    let tree = app(":database_authenticatable, :validatable", VALIDATABLE_ROUTES)
+        .write("app/controllers/accounts_controller.rb", CHECKS)
+        .native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    assert_eq!(server.get("/account/new").status, 200, "{}", server.log());
+    for (query, want) in VALIDATABLE_CASES {
+        let answer = server.get(&format!("/account/check?{query}"));
+        assert_eq!((answer.status, answer.body.as_str()), (200, want), "{query}\n{}", server.log());
+    }
 }

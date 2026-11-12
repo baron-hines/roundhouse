@@ -3390,6 +3390,9 @@ fn target_files_inner(
                 expr.decisions &= !(crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_CLASS_BODY);
             }
         });
+        // On this copy, before any later pass or emitter reads a constant,
+        // so no target without a `::` to print sees a rooted one.
+        crate::lower::rooted_constants::unroot_for_target(&mut trimmed, target);
         without_inherited_replay = trimmed;
         &without_inherited_replay
     } else { app };

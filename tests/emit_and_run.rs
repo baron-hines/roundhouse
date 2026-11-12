@@ -580,6 +580,8 @@ mod format_allow_nil_blank;
 mod format_value_to_s;
 #[path = "emit_and_run/validates_acceptance.rs"]
 mod validates_acceptance;
+#[path = "emit_and_run/validates_of_confirmation.rs"]
+mod validates_of_confirmation;
 #[path = "emit_and_run/attribute_api_boolean_cast.rs"]
 mod attribute_api_boolean_cast;
 #[path = "emit_and_run/hash_fetch_one_arg.rs"]
@@ -22166,5 +22168,7 @@ mod library_concern_included_include_contract;
 mod library_concern_included_include;
 #[path = "emit_and_run/param_default_constant_rooting.rs"]
 mod param_default_constant_rooting;
+#[path = "emit_and_run/compiled_rooted_constants.rs"]
+mod compiled_rooted_constants;
 #[path = "emit_and_run/serializable_resource_as_json.rs"]
 mod serializable_resource_as_json;

@@ -607,6 +607,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         let mut app = match ingest_rails_app(vfs, dir, &auto) {
             Ok(app) => app,
             Err(err) => {
+                let site = super::error_site::of(&err);
+                let source = match &err {
+                    IngestError::Unsupported { file, .. } => super::sources::text_of(file), _ => None,
+                };
                 let strict = super::prism::mark();
                 // Not the strict pass's first refusal as the answer: it can be a gem's DSL (`devise_for`) that only the gem's source, which this pass has not read yet, defines.
                 let more: Vec<String> = super::concern_accessors::not_deferring(|| super::survey::surveying(|| {
@@ -617,6 +621,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 .collect();
                 if more.is_empty() || auto.len() >= 32 {
                     super::prism::rewind(strict);
+                    if let (Some(source), IngestError::Unsupported { file, .. }) = (source, &err) {
+                        super::sources::register(file, &source);
+                    }
+                    if let Some((start, end)) = site { super::error_site::note(&err, start, end); }
                     return Err(err);
                 }
                 super::prism::rewind(marks.1);
@@ -3090,13 +3098,14 @@ end
     // `User::Avatar`. The passes above leave both as written.
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
     // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
-    super::configured_superclass::expand_model_mixin_macros(vfs, dir, &path_gems, &mut app);
     for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {
         if let Some(carrier) = concern_class_method_spans.iter_mut().find(|c| c.owner == owner) {
             carrier.methods.push(span);
         }
         app.concern_class_side_spans.insert(span);
     }
+    // After the definers: a hook the macro runs reads what they define (Validatable's `email_regexp`).
+    super::configured_superclass::expand_model_mixin_macros(vfs, dir, &path_gems, &mut app);
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
@@ -3277,6 +3286,10 @@ end
     refuse_unread_concern_filters(&app)?;
     drop_modelled_included_hooks(&mut app);
     splice_concerns_into_controllers(&mut app);
+    // After the splice: a concern's filter reads the key as the controller's own body does.
+    if every_primary_key_is_id(&app) {
+        crate::lower::for_each_hook_body(&mut app, &mut read_primary_key_sends);
+    }
     // After the splice: an action a concern provides is not implicit.
     synthesize_template_only_actions(&mut app);
     // After the splice: a macro has to resolve against the concern's
@@ -3335,6 +3348,8 @@ end
     // `numericality:` on an untyped attribute is decided per target
     // (`refuse_numericality_allow_on_untyped`, `session::analyze_and_lower_for`).
     gap_acceptance_on_undeclared(&mut app);
+    define_confirmation_accessors(&mut app);
+    record_mixin_sends(&mut app);
     // Not at model ingest: the `select` naming a model's aliases can sit in another model, class, controller or view.
     super::select_aliases::stamp(&mut app);
     gap_uniqueness_on_polymorphic_attribute(&mut app);
@@ -3549,8 +3564,8 @@ pub(crate) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "strscan", "tempfile", "time", "timeout", "tmpdir", "uri", "weakref", "yaml", "zlib",
 ];
 
-/// [`App::app_requires`]: every literal top-level `require "lib"` of a
-/// standard library in the ingested Ruby sources under the app and
+/// [`App::app_requires`]: every literal `require "lib"` at file level or
+/// in a class or module body for a standard library under the app and
 /// support roots, including files loaded by the boot chain. A terminal
 /// channel that requires `pty` and `io/console` needs the second for `IO#winsize=`,
 /// which io/console adds and no constant names, so the bundled requires
@@ -3564,21 +3579,8 @@ fn collect_app_requires(sources: &[crate::span::SourceFile], roots: &[PathBuf]) 
         {
             continue;
         }
-        for line in source.text.lines() {
-            let Some(rest) = line.strip_prefix("require ") else { continue };
-            // `require "io/console" # why`: the literal, then nothing but
-            // a comment
-            let rest = rest.trim_start();
-            let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
-            let Some(end) = rest[1..].find(q) else { continue };
-            let after = rest[end + 2..].trim_start();
-            let quoted = (after.is_empty() || after.starts_with('#')).then(|| &rest[1..end + 1]);
-            if let Some(lib) = quoted {
-                if APP_REQUIRABLE_STDLIB.contains(&lib) {
-                    out.insert(lib.to_string());
-                }
-            }
-        }
+        out.extend(super::file_program::literal_requires(source.text.as_bytes(), &source.path)
+            .into_iter().filter(|lib| APP_REQUIRABLE_STDLIB.contains(&lib.as_str())));
     }
     out.into_iter().collect()
 }
@@ -3699,7 +3701,7 @@ pub(crate) fn refuse_numericality_allow_on_untyped(app: &mut App, target: &str) 
 /// Rails casts it (`true` is `"t"` on a String attribute). Refused as a
 /// whole call, as the numericality gap is.
 fn gap_acceptance_on_undeclared(app: &mut App) {
-    use crate::dialect::{MethodReceiver, ModelBodyItem, ValidationRule};
+    use crate::dialect::{ModelBodyItem, ValidationRule};
     use crate::expr::{ExprNode, Literal};
     let mut attribute_api: Vec<(crate::span::Span, String)> = Vec::new();
     for model in &mut app.models {
@@ -3712,26 +3714,7 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
                 _ => false,
             })
         };
-        let declared = |attr: &crate::ident::Symbol| {
-            let setter = crate::ident::Symbol::from(format!("{}=", attr.as_str()));
-            model.attributes.fields.contains_key(attr)
-                || model.body.iter().any(|item| match item {
-                    ModelBodyItem::Method { method, .. } => {
-                        method.receiver == MethodReceiver::Instance && (method.name == *attr || method.name == setter)
-                    }
-                    ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
-                        ExprNode::Send { recv: None, method, args, .. }
-                            if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") =>
-                        {
-                            args.iter().any(|arg| {
-                                matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)
-                            })
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                })
-        };
+        let declared = |attr: &crate::ident::Symbol| model_declares_attr(model, attr);
         let mut refused_attribute_api: Vec<(usize, crate::span::Span, String)> = Vec::new();
         let mut virtual_attrs: Vec<(usize, crate::ident::Symbol, crate::span::Span)> = Vec::new();
         for (i, item) in model.body.iter().enumerate() {
@@ -3778,6 +3761,161 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
         attribute_api,
         "acceptance: on an `attribute` the model declares, whose writer stores the input uncast where Rails casts it",
     );
+}
+
+/// A column, an `attr_*` or an instance method of the model names `attr` (or its writer).
+fn model_declares_attr(model: &crate::dialect::Model, attr: &crate::ident::Symbol) -> bool {
+    model_declares_side(model, attr, true) || model_declares_side(model, attr, false)
+}
+
+/// The model answers `attr` (`reader`) or `attr=` itself: a column, its own `def`, or the `attr_*` that defines that side.
+fn model_declares_side(model: &crate::dialect::Model, attr: &crate::ident::Symbol, reader: bool) -> bool {
+    use crate::dialect::{MethodReceiver, ModelBodyItem};
+    use crate::expr::{ExprNode, Literal};
+    let name = if reader { attr.clone() } else { crate::ident::Symbol::from(format!("{}=", attr.as_str())) };
+    let macros: &[&str] = if reader { &["attr_accessor", "attr_reader"] } else { &["attr_accessor", "attr_writer"] };
+    model.attributes.fields.contains_key(attr)
+        || model.body.iter().any(|item| match item {
+            ModelBodyItem::Method { method, .. } => method.receiver == MethodReceiver::Instance && method.name == name,
+            ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Send { recv: None, method, args, .. } if macros.contains(&method.as_str()) => {
+                    args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr))
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+/// The module `written` names in `from`'s body: looked up from `from`'s namespace outward, then as written.
+fn lexical_module(app: &App, from: &crate::ident::ClassId, written: &crate::ident::ClassId) -> crate::ident::ClassId {
+    let name = written.0.as_str();
+    if let Some(top) = name.strip_prefix("::") {
+        return crate::ident::ClassId(crate::ident::Symbol::from(top));
+    }
+    let mut scope = Some(from.0.as_str());
+    while let Some(prefix) = scope {
+        let candidate = format!("{prefix}::{name}");
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == candidate) {
+            return crate::ident::ClassId(crate::ident::Symbol::from(candidate.as_str()));
+        }
+        scope = prefix.rsplit_once("::").map(|(p, _)| p);
+    }
+    written.clone()
+}
+
+/// `confirmation:` on `attr`: Rails' `ConfirmationValidator#setup!` defines a plain `<attr>_confirmation` reader and
+/// writer where the model has none, so the model gains that `attr_accessor`, ahead of the validation.
+fn define_confirmation_accessors(app: &mut App) {
+    use crate::dialect::{ModelBodyItem, ValidationRule};
+    use crate::expr::{ExprNode, Literal};
+    // What the modules each model includes define, which Ruby's `method_defined?` counts as the model's.
+    let mixed_in: Vec<crate::det::HashSet<crate::ident::Symbol>> = app
+        .models
+        .iter()
+        .map(|model| {
+            let mut out = crate::det::HashSet::default();
+            let mut pending = crate::analyze::model_includes(model);
+            let mut seen = crate::det::HashSet::default();
+            while let Some(id) = pending.pop() {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                for lc in app.library_classes.iter().filter(|c| c.name == id) {
+                    out.extend(lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.clone()));
+                    // Not as written: a module includes a sibling by its short name, which names it from its own namespace outward.
+                    pending.extend(lc.includes.iter().map(|written| lexical_module(app, &lc.name, written)));
+                }
+            }
+            out
+        })
+        .collect();
+    for (model, mixed_in) in app.models.iter_mut().zip(mixed_in) {
+        let mut wanted: Vec<(usize, crate::ident::Symbol, crate::span::Span, &'static str)> = Vec::new();
+        for (i, item) in model.body.iter().enumerate() {
+            let ModelBodyItem::Validation { validation, .. } = item else { continue };
+            if !validation.rules.iter().any(|rule| matches!(rule, ValidationRule::Confirmation { .. })) {
+                continue;
+            }
+            let name = crate::ident::Symbol::from(format!("{}_confirmation", validation.attribute.as_str()));
+            if wanted.iter().any(|(_, n, _, _)| *n == name) {
+                continue;
+            }
+            // Each side on its own, as `setup!` asks `method_defined?` of the reader and of the writer.
+            let writer = crate::ident::Symbol::from(format!("{}=", name.as_str()));
+            let reader_declared = model_declares_side(model, &name, true) || mixed_in.contains(&name);
+            let writer_declared = model_declares_side(model, &name, false) || mixed_in.contains(&writer);
+            let macro_name = match (reader_declared, writer_declared) {
+                (true, true) => continue,
+                (true, false) => "attr_writer",
+                (false, true) => "attr_reader",
+                (false, false) => "attr_accessor",
+            };
+            wanted.push((i, name, item.span(), macro_name));
+        }
+        for (i, name, span, macro_name) in wanted.into_iter().rev() {
+            let accessor = crate::expr::Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: None,
+                    method: crate::ident::Symbol::from(macro_name),
+                    args: vec![crate::expr::Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: name } })],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            model.body.insert(i, ModelBodyItem::Unknown { expr: accessor, leading_comments: Vec::new(), leading_blank_line: false });
+        }
+    }
+}
+
+/// Each model's [`crate::dialect::Model::mixin_sends`]: the Dirty spellings the instance methods of the modules it
+/// includes send, through the modules those include.
+fn record_mixin_sends(app: &mut App) {
+    use crate::dialect::MethodReceiver;
+    use crate::expr::{Expr, ExprNode};
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<crate::ident::Symbol>) {
+        match &*e.node {
+            ExprNode::Send { method, .. } => {
+                out.insert(method.clone());
+            }
+            // A name sent by its Symbol (`public_send(:email_changed?)`) demands the method as a spelled call does.
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => {
+                out.insert(value.clone());
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let modules: HashMap<&crate::ident::ClassId, Vec<&crate::dialect::LibraryClass>> =
+        app.library_classes.iter().filter(|c| c.is_module).fold(HashMap::default(), |mut by, c| {
+            by.entry(&c.name).or_default().push(c);
+            by
+        });
+    let mut found: Vec<Vec<crate::ident::Symbol>> = Vec::new();
+    for model in &app.models {
+        let mut pending = crate::analyze::model_includes(model);
+        let mut seen = crate::det::HashSet::default();
+        let mut sends = crate::det::HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            for module in modules.get(&id).into_iter().flatten() {
+                for method in module.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance) {
+                    walk(&method.body, &mut sends);
+                }
+                pending.extend(module.includes.iter().cloned());
+            }
+        }
+        // Only the names the model's demand reads: the per-column Dirty spellings it synthesizes on demand.
+        let mut sends: Vec<_> = sends.into_iter().filter(|s| crate::lower::model_to_library::schema::is_pending_change_spelling(s.as_str())).collect();
+        sends.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        found.push(sends);
+    }
+    for (model, sends) in app.models.iter_mut().zip(found) {
+        model.mixin_sends = sends;
+    }
 }
 
 /// Drop every Validation item of each refused `validates` call, as an
@@ -5354,6 +5492,48 @@ fn answers_callback_macro(app: &App, name: &crate::ident::ClassId) -> bool {
         cur = parts.iter().find_map(|lc| lc.parent.clone()).or_else(|| model.and_then(|m| m.parent.clone()));
     }
     false
+}
+
+/// `record.send(record.class.primary_key)` (orm_adapter's `conditions_to_fields`) where every model's key is `id`:
+/// `record.id`, the same method the send names, an override of `id` included.
+// Not `record[key]`: that reads the column past a reader the model overrides.
+fn read_primary_key_sends(body: &mut crate::expr::Expr) {
+    use crate::expr::ExprNode;
+    body.node.for_each_child_mut(&mut read_primary_key_sends);
+    if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *body.node
+        && matches!(method.as_str(), "send" | "public_send" | "__send__")
+        && matches!(&*recv.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
+        && let [name] = args.as_slice()
+        && let ExprNode::Send { recv: Some(class), method: key, args: key_args, block: None, .. } = &*name.node
+        && key.as_str() == "primary_key"
+        && key_args.is_empty()
+        // Only the record's own class's key: another class's (`KeySource.primary_key`) names any column.
+        && matches!(&*class.node, ExprNode::Send { recv: Some(of), method, args, block: None, .. }
+            if method.as_str() == "class" && args.is_empty() && same_read(of, recv))
+    {
+        *method = crate::ident::Symbol::from("id");
+        args.clear();
+    }
+}
+
+fn same_read(a: &crate::expr::Expr, b: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    match (&*a.node, &*b.node) {
+        (ExprNode::Var { name: x, .. }, ExprNode::Var { name: y, .. }) | (ExprNode::Ivar { name: x }, ExprNode::Ivar { name: y }) => x == y,
+        (ExprNode::SelfRef, ExprNode::SelfRef) => true,
+        _ => false,
+    }
+}
+
+fn every_primary_key_is_id(app: &App) -> bool {
+    // Nor where a class of the app answers `primary_key` itself: the send then names whatever that method answers.
+    let own_primary_key = app.library_classes.iter().flat_map(|c| c.methods.iter()).any(|m| m.name.as_str() == "primary_key")
+        || app.models.iter().any(|m| m.methods().any(|d| d.name.as_str() == "primary_key"));
+    !own_primary_key
+        && app.models.iter().all(|m| m.primary_key.as_ref().is_none_or(|k| k.as_str() == "id"))
+        && app.schema.tables.values().all(|t| {
+            t.primary_key_columns.is_empty() && t.columns.iter().filter(|c| c.primary_key).all(|c| c.name.as_str() == "id")
+        })
 }
 
 /// A modelled hook has nothing left to do at load, and the emitted
