@@ -593,14 +593,16 @@ fn literal_text(e: &Expr) -> Option<String> {
 /// parameter of that name only shadows it there, which `rewrite` already
 /// keeps out of the block.
 fn rebinds(body: &Expr, name: &Symbol) -> bool {
+    bindings(body, name, false) > 0
+}
+
+/// How many times `body` binds the local `name`, as `rebinds` counts, and
+/// with `blocks` also each block parameter of that name.
+fn bindings(body: &Expr, name: &Symbol, blocks: bool) -> usize {
     use crate::expr::LValue;
-    let mut found = false;
-    fn walk(e: &Expr, name: &Symbol, found: &mut bool) {
-        if *found {
-            return;
-        }
+    fn walk(e: &Expr, name: &Symbol, blocks: bool, count: &mut usize) {
         let is = |target: &LValue| matches!(target, LValue::Var { name: n, .. } if n == name);
-        *found = match &*e.node {
+        let binds = match &*e.node {
             ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is(target),
             ExprNode::MultiAssign { targets, .. } => targets.iter().any(is),
             ExprNode::Let { name: n, .. } => n == name,
@@ -609,14 +611,17 @@ fn rebinds(body: &Expr, name: &Symbol) -> bool {
                 || matches!(&a.pattern, Pattern::Array { rest: Some(n), .. } if n == name)),
             ExprNode::CaseMatch { arms, .. } => arms.iter().any(|a| pattern_binds(&a.pattern, name)),
             ExprNode::MatchPredicate { pattern, .. } | ExprNode::MatchRequired { pattern, .. } => pattern_binds(pattern, name),
+            ExprNode::Lambda { params, extra_params, rest_param, block_param, .. } => {
+                blocks && block_binds(params, extra_params, rest_param, block_param, name)
+            }
             _ => false,
         };
-        if !*found {
-            e.node.for_each_child(&mut |c| walk(c, name, found));
-        }
+        *count += usize::from(binds);
+        e.node.for_each_child(&mut |c| walk(c, name, blocks, count));
     }
-    walk(body, name, &mut found);
-    found
+    let mut count = 0;
+    walk(body, name, blocks, &mut count);
+    count
 }
 
 /// True when a `case … in` pattern binds the local `name`.
@@ -691,93 +696,154 @@ fn residue(expr: &Expr, reason: &str) -> Diagnostic {
 // elements while the block does not bind it again. A name interpolated
 // from it is one of the Strings the elements spell.
 
-/// Per-local-variable literal element sets for one method body: the
-/// variable was initialized to an array literal and only ever grown by
-/// `push`/`<<`. Any other use of the variable (reassignment from a
-/// non-literal, passing it as an argument, an un-allowlisted method
-/// call) poisons the entry — the set can no longer be proven complete.
+/// Per-local-variable literal element sets for one method body. A local
+/// holds the elements it was given, plus what `push`/`<<` adds, wherever
+/// it is walked when
+///
+/// 1. a statement of the body itself binds it once, to an array literal,
+///    and nothing reads it before that: bound in a branch, a loop or a
+///    block, or bound again (`+=`, a block parameter of the same name), it
+///    may hold another list, and a read before it reads a parameter;
+/// 2. every read of it is the receiver of `push`/`<<`, or of a walk
+///    (`each`, `each_with_index`, `map`, `flat_map`) with a block;
+/// 3. what `push`, `<<`, `each` and `each_with_index` return, the list
+///    itself, is dropped, or is what the method returns while no block
+///    reads the list: nothing else can reach the list to change it;
+/// 4. with a String element, every walk reads its element parameter only
+///    as an interpolated piece: no code can reach an element to change it
+///    in place. A Symbol element cannot change.
 fn collect_var_element_sets(body: &Expr) -> HashMap<Symbol, Vec<Expr>> {
-    let mut sets: HashMap<Symbol, Vec<Expr>> = HashMap::default();
-    let mut poisoned: BTreeSet<Symbol> = BTreeSet::new();
-    walk_var_uses(body, &mut sets, &mut poisoned);
-    for name in poisoned {
-        sets.remove(&name);
+    let mut uses = ListUses::default();
+    let statements = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.as_slice(),
+        _ => std::slice::from_ref(body),
+    };
+    for (i, statement) in statements.iter().enumerate() {
+        if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*statement.node
+            && let ExprNode::Array { elements, .. } = &*value.node
+        {
+            walk_var_uses(value, true, &mut uses);
+            uses.sets.insert(name.clone(), elements.clone());
+            continue;
+        }
+        // The last statement's value is the method's. The caller can then
+        // change a list handed back, but only a block can walk it again.
+        let last = i + 1 == statements.len();
+        let returned = last && list_returned(statement).is_some_and(|name| !read_in_block(body, name));
+        walk_var_uses(statement, last && !returned, &mut uses);
     }
+    let ListUses { mut sets, poisoned, exposed } = uses;
+    sets.retain(|name, elems| {
+        let strings = elems.iter().any(|el| matches!(&*el.node, ExprNode::Lit { value: Literal::Str { .. } }));
+        !poisoned.contains(name) && bindings(body, name, true) == 1 && !(strings && exposed.contains(name))
+    });
     sets
 }
 
-fn walk_var_uses(
-    e: &Expr,
-    sets: &mut HashMap<Symbol, Vec<Expr>>,
-    poisoned: &mut BTreeSet<Symbol>,
-) {
+#[derive(Default)]
+struct ListUses {
+    sets: HashMap<Symbol, Vec<Expr>>,
+    poisoned: BTreeSet<Symbol>,
+    /// Lists a walk hands an element to other than as an interpolated piece.
+    exposed: BTreeSet<Symbol>,
+}
+
+/// `used`: the value of `e` is read, not dropped as a statement's.
+fn walk_var_uses(e: &Expr, used: bool, uses: &mut ListUses) {
     match &*e.node {
-        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
-            match &*value.node {
-                ExprNode::Array { elements, .. } => {
-                    // A reassignment replaces the set (last literal
-                    // wins is not provable in general — poison on
-                    // redefinition instead).
-                    if sets.insert(name.clone(), elements.clone()).is_some() {
-                        poisoned.insert(name.clone());
+        // Read anywhere but as a receiver below, the list escapes: another
+        // local, an instance variable, an argument, an Array or Hash
+        // element, or a value a block or method returns then holds it, and
+        // a change through that holder is a change to the list.
+        ExprNode::Var { name, .. } => {
+            uses.poisoned.insert(name.clone());
+        }
+        ExprNode::Send { recv: Some(r), method, args, block, .. } if let ExprNode::Var { name, .. } = &*r.node => {
+            match method.as_str() {
+                // Growth: every arg joins the element set.
+                "push" | "<<" => {
+                    if let Some(set) = uses.sets.get_mut(name) {
+                        set.extend(args.iter().cloned());
+                    } else {
+                        uses.poisoned.insert(name.clone());
+                    }
+                }
+                // Reads the rewrite understands, once the list is bound.
+                "each" | "map" | "flat_map" | "each_with_index" if uses.sets.contains_key(name) => {
+                    let exposes = match block.as_ref().map(|b| &*b.node) {
+                        Some(ExprNode::Lambda { params, extra_params, rest_param, body, .. }) => {
+                            !extra_params.is_empty()
+                                || rest_param.is_some()
+                                || params.first().is_some_and(|p| read_besides_interpolation(body, p))
+                        }
+                        _ => true,
+                    };
+                    if exposes {
+                        uses.exposed.insert(name.clone());
+                    }
+                    // Without a block, a walk returns an Enumerator over the list.
+                    if block.is_none() {
+                        uses.poisoned.insert(name.clone());
                     }
                 }
                 _ => {
-                    poisoned.insert(name.clone());
+                    uses.poisoned.insert(name.clone());
                 }
             }
-            // `other = statuses` aliases the list: a change through
-            // `other` is a change to `statuses`.
-            poison_bare_var(value, poisoned);
-            walk_var_uses(value, sets, poisoned);
-        }
-        ExprNode::Send { recv: Some(r), method, args, block, .. } => {
-            if let ExprNode::Var { name, .. } = &*r.node {
-                match method.as_str() {
-                    // Growth: every arg joins the element set.
-                    "push" | "<<" => {
-                        if let Some(set) = sets.get_mut(name) {
-                            set.extend(args.iter().cloned());
-                        } else {
-                            poisoned.insert(name.clone());
-                        }
-                    }
-                    // Non-mutating reads the rewrite understands.
-                    "each" | "map" | "flat_map" | "each_with_index" => {}
-                    _ => {
-                        poisoned.insert(name.clone());
-                    }
-                }
-            } else {
-                walk_var_uses(r, sets, poisoned);
+            // `push`, `<<`, `each` and `each_with_index` return the list.
+            if used && !matches!(method.as_str(), "map" | "flat_map") {
+                uses.poisoned.insert(name.clone());
             }
             for a in args {
-                poison_bare_var(a, poisoned);
-                walk_var_uses(a, sets, poisoned);
+                walk_var_uses(a, true, uses);
             }
             if let Some(b) = block {
-                walk_var_uses(b, sets, poisoned);
+                walk_var_uses(b, true, uses);
             }
         }
-        _ => {
-            // A tracked var read bare anywhere else escapes: an
-            // instance variable, an Array or Hash element, or a value a
-            // block or method returns all alias the list, and a change
-            // through the alias (`<<`, or a String element's `replace`)
-            // is a change to the list. The Send arm above already
-            // poisons a bare argument.
-            e.node.for_each_child(&mut |c| {
-                poison_bare_var(c, poisoned);
-                walk_var_uses(c, sets, poisoned)
-            });
+        ExprNode::Seq { exprs } => {
+            for (i, x) in exprs.iter().enumerate() {
+                walk_var_uses(x, used && i + 1 == exprs.len(), uses);
+            }
         }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            walk_var_uses(cond, true, uses);
+            walk_var_uses(then_branch, used, uses);
+            walk_var_uses(else_branch, used, uses);
+        }
+        _ => e.node.for_each_child(&mut |c| walk_var_uses(c, true, uses)),
     }
 }
 
-fn poison_bare_var(e: &Expr, poisoned: &mut BTreeSet<Symbol>) {
-    if let ExprNode::Var { name, .. } = &*e.node {
-        poisoned.insert(name.clone());
+/// The local a statement hands back as its value: `push`, `<<`, `each`
+/// and `each_with_index` return their receiver.
+fn list_returned(statement: &Expr) -> Option<&Symbol> {
+    match &*statement.node {
+        ExprNode::Send { recv: Some(r), method, .. }
+            if matches!(method.as_str(), "push" | "<<" | "each" | "each_with_index") =>
+        {
+            match &*r.node {
+                ExprNode::Var { name, .. } => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
     }
+}
+
+/// True when a block in `body` reads the local `name`: a block may run
+/// after the method returns.
+fn read_in_block(body: &Expr, name: &Symbol) -> bool {
+    fn walk(e: &Expr, name: &Symbol, in_block: bool) -> bool {
+        if let ExprNode::Var { name: n, .. } = &*e.node {
+            return in_block && n == name;
+        }
+        let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || walk(c, name, in_block));
+        found
+    }
+    walk(body, name, false)
 }
 
 /// One in-scope iteration binding: block param `name` ranges over the

@@ -443,29 +443,74 @@ end
     assert!(diags.is_empty(), "{diags:?}");
 }
 
-/// A list held in a local is a proof only while nothing else holds it:
-/// an alias can grow the list or change a String element in place, so
-/// the walk over the local keeps its built name.
+/// The walk a list-local source ends with, and the host it runs in on
+/// CRuby: each `*_execution` answers its status.
+const LIST_WALK: &str = "statuses.map { |status| public_send(\"#{status}_execution\") }";
+const LIST_HOST: &str = "\nclass Host\n  include Executable\n\n  def ready_execution = :ready\n  def claimed_execution = :claimed\n  def failed_execution = :failed\nend\n";
+
+/// A list held in a local is a proof only while nothing else can reach
+/// the list, or a String element to change in place: otherwise the walk
+/// over the local keeps its built name. Each source calls
+/// `failed_execution` on CRuby, a name its literal never spells.
 #[test]
 fn a_list_local_that_escapes_stays_dynamic() {
-    for (label, escape) in [
-        ("another local", "other = statuses\n    other << \"failed\""),
-        ("an instance variable", "@kept = statuses\n    @kept.first.replace(\"failed\")"),
-        ("an Array element", "box = [statuses]\n    box.first << \"failed\""),
+    let run = "p Host.new.execution";
+    let later = "host = Host.new\nhost.execution << :failed\np host.instance_variable_get(:@later).call";
+    for (label, method, driver) in [
+        ("another local", "def execution\n    statuses = %w[ ready claimed ]\n    other = statuses\n    other << \"failed\"\n    WALK\n  end", run),
+        ("an instance variable", "def execution\n    statuses = %w[ ready claimed ]\n    @kept = statuses\n    @kept.first.replace(\"failed\")\n    WALK\n  end", run),
+        ("an Array element", "def execution\n    statuses = %w[ ready claimed ]\n    box = [statuses]\n    box.first << \"failed\"\n    WALK\n  end", run),
+        ("the list `each` returns", "def execution\n    statuses = %i[ ready claimed ]\n    other = statuses.each { |status| status }\n    other << :failed\n    WALK\n  end", run),
+        ("the list `push` returns", "def execution\n    statuses = %i[ ready ]\n    other = statuses.push(:claimed)\n    other << :failed\n    WALK\n  end", run),
+        ("the list the method returns, walked later by a block", "def execution\n    statuses = %i[ ready claimed ]\n    @later = -> { WALK }\n    statuses.each { |status| status }\n  end", later),
+        ("a walk without a block", "def execution\n    statuses = %w[ ready claimed ]\n    walker = statuses.map\n    walker.each { |status| status.replace(\"failed\") }\n    WALK\n  end", run),
+        ("an element another walk stores", "def execution\n    statuses = %w[ ready claimed ]\n    statuses.each { |status| @kept = status }\n    @kept.replace(\"failed\")\n    WALK\n  end", run),
+        ("an element a `map` result shares", "def execution\n    statuses = %w[ ready claimed ]\n    kept = statuses.map { |status| status }\n    kept.last.replace(\"failed\")\n    WALK\n  end", run),
+        ("the only element, changed by another walk", "def execution\n    statuses = %w[ ready ]\n    statuses.each { |status| status.replace(\"failed\") }\n    WALK\n  end", run),
+        ("a list bound again by `+=`", "def execution\n    statuses = %w[ ready claimed ]\n    statuses += %w[ failed ]\n    WALK\n  end", run),
+        ("a block parameter of the same name", "def execution\n    statuses = %w[ ready claimed ]\n    [%w[ failed ]].flat_map { |statuses| WALK }\n  end", run),
+        ("a parameter the body binds on one path only", "def execution(statuses = %w[ failed ], reset: false)\n    statuses = %w[ ready claimed ] if reset\n    WALK\n  end", run),
     ] {
-        let (out, diags) = ground_and_emit(&format!(
-            "module Executable\n  def execution\n    statuses = %w[ ready claimed ]\n    {escape}\n    statuses.each {{ |status| public_send(\"#{{status}}_execution\") }}\n  end\nend\n"
-        ));
+        let source = format!("module Executable\n  {}\nend\n", method.replace("WALK", LIST_WALK));
+        let (out, diags) = ground_and_emit(&source);
         assert!(out.contains("public_send(\"#{status}_execution\")"), "{label}: the send must survive untouched:\n{out}");
-        assert!(!out.contains("when "), "{label}: rewritten without a proof:\n{out}");
+        assert!(!out.contains("when ") && !out.contains("public_send(\"ready_execution\")"), "{label}: rewritten without a proof:\n{out}");
         assert_eq!(diags.len(), 1, "{label}: expected one residue entry: {diags:?}");
+        if let Some(ran) = cruby(&format!("{source}{LIST_HOST}{driver}\n")) {
+            assert!(ran.contains(":failed"), "{label}: the source calls failed_execution:\n{ran}");
+        }
     }
-    // The same list, read only by its walk, still proves its names.
-    let (out, diags) = ground_and_emit(
-        "module Executable\n  def execution\n    statuses = %w[ ready claimed ]\n    statuses.each { |status| public_send(\"#{status}_execution\") }\n  end\nend\n",
-    );
-    assert!(out.contains("public_send(\"ready_execution\")") && out.contains("public_send(\"claimed_execution\")"), "{out}");
-    assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// A list nothing else can change still proves its names: a Symbol list
+/// whose element another walk stores, as a Symbol cannot change; a String
+/// list another walk reads only as an interpolated piece; and a walk the
+/// method ends with, whose list no block reads. The emitted module answers
+/// as the source does.
+#[test]
+fn a_list_local_nothing_else_can_change_still_proves_its_names() {
+    let run = "p Host.new.execution";
+    for (label, method, driver) in [
+        ("a stored Symbol element", "statuses = %i[ ready claimed ]\n    statuses.each { |status| @kept = status }\n    WALK", run),
+        ("a String element read only in interpolation", "statuses = %w[ ready claimed ]\n    statuses.each { |status| @seen = \"#{status} seen\" }\n    WALK", run),
+        (
+            "a walk the method ends with",
+            "statuses = %w[ ready claimed ]\n    @calls = []\n    statuses.each { |status| @calls << public_send(\"#{status}_execution\") }",
+            "host = Host.new\np host.execution\np host.instance_variable_get(:@calls)",
+        ),
+    ] {
+        let source = format!("module Executable\n  def execution\n    {}\n  end\nend\n", method.replace("WALK", LIST_WALK));
+        let (out, diags) = ground_and_emit(&source);
+        for name in ["ready_execution", "claimed_execution"] {
+            assert!(out.contains(&format!("public_send(\"{name}\")")), "{label}: send of {name} missing:\n{out}");
+        }
+        assert!(!out.contains("public_send(\"#{"), "{label}: the built name survived:\n{out}");
+        assert!(diags.is_empty(), "{label}: {diags:?}");
+        let Some(want) = cruby(&format!("{source}{LIST_HOST}{driver}\n")) else { return };
+        assert!(want.contains(":ready") && want.contains(":claimed"), "{label}: {want}");
+        let Some(got) = cruby(&format!("{out}\n{LIST_HOST}{driver}\n")) else { return };
+        assert_eq!(got, want, "{label}:\n{out}");
+    }
 }
 
 /// Without a finite proof the name stays built, and the site joins the
