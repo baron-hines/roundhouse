@@ -604,6 +604,8 @@ jobs:
           # Gem extensions whose finders the native controls run (tests/finder_ownership_and_form_keys.rs).
           gem install --no-document friendly_id -v 5.5.1
           gem install --no-document sorbet-runtime -v 0.5.11934
+          # Digest::BLAKE3, which the digest Ruby bundles (3.2.1) lacks (tests/binary_digest.rs).
+          gem install --no-document digest -v 3.3.0
       - name: Download current-run test bundle
         uses: actions/download-artifact@v8
         with:

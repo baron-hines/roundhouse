@@ -252,6 +252,25 @@ module Roundhouse
       s.nil? ? "NULL" : escape_string(s)
     end
 
+    # `t.binary` columns: the text methods. Crystal's String is UTF-8
+    # with no encoding to tell bytes by, and no value here reaches the
+    # column as bytes (`Digest::BLAKE3` is not emitted for this target).
+    def self.escape_binary(s : String) : String
+      escape_string(s)
+    end
+
+    def self.escape_binary_opt(s : String?) : String
+      escape_string_opt(s)
+    end
+
+    def self.column_binary(stmt_id : Int64, i : Int64) : String
+      column_text(stmt_id, i)
+    end
+
+    def self.column_binary_opt(stmt_id : Int64, i : Int64) : String?
+      column_text_opt(stmt_id, i)
+    end
+
     def self.escape_int_opt(n : Int?) : String
       n.nil? ? "NULL" : escape_int(n)
     end

@@ -155,6 +155,13 @@ defmodule Db do
   def escape_string_opt(nil), do: "NULL"
   def escape_string_opt(s), do: escape_string(s)
 
+  # `t.binary` columns: the text functions. No value here reaches the
+  # column as bytes (`Digest::BLAKE3` is not emitted for this target).
+  def escape_binary(s), do: escape_string(s)
+  def escape_binary_opt(s), do: escape_string_opt(s)
+  def column_binary(id, i), do: column_text(id, i)
+  def column_binary_opt(id, i), do: column_text_opt(id, i)
+
   def escape_int_opt(nil), do: "NULL"
   def escape_int_opt(n), do: escape_int(n)
 

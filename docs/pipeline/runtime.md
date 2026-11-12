@@ -478,6 +478,33 @@ string column, at the one site that already knows the type — and it
 changes what every reader sees, so it is a change to make deliberately
 rather than as a side effect.
 
+### A `t.binary` column is bytes in a String, through its own Db pair
+
+A binary column reads through `Db.column_binary` (`_opt` when nullable)
+and writes through `Db.escape_binary`, and the Arel and adapter lowerings
+type its values `ValueType::Binary`. A digest such as
+`Digest::BLAKE3.digest(content)` is the usual tenant, and it can hold a
+NUL byte, which no quoted SQL literal carries.
+
+**Why a pair of its own.** In the Ruby family a String carries its
+encoding, so `escape_string` already writes an `X'…'` literal for a value
+that holds a NUL or is non-ASCII BINARY. Those shims, and every target
+without a byte type in its String, alias the binary pair to the text
+pair. Rust's `String` is UTF-8 with no encoding tag. There the pair is
+real: a binary value is held one char per byte (U+0000–U+00FF),
+`escape_binary` writes `X'…'` for any NUL or high byte, and
+`column_binary` reads a BLOB back the same way. `find_by` on a binary
+column escapes through the same method, so a lookup by digest matches
+the bytes the INSERT stored. Spinel binds parameters, so `Binary` binds
+through `bind_text`.
+
+**`Digest::BLAKE3`** is typed in the stdlib registry next to MD5/SHA1/
+SHA256, and it exists only where a runtime has it: CRuby, from the digest
+gem 3.3.0 or later (an emitted Gemfile that uses it declares the gem), and
+Rust, from the `blake3` crate (declared in Cargo.toml only when a body
+calls it). Every other target refuses the call with an error
+(`project.rs::report_digest_blake3`). Pinned by `tests/binary_digest.rs`.
+
 ### An absent UNSIGNED cookie reads as `""`, not `nil`
 
 `cookies[:missing]` answers `""`; Rails answers `nil`.

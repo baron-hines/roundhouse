@@ -224,6 +224,13 @@ public static class Db
     public static string EscapeBoolOpt(bool? value) =>
         value is null ? "NULL" : (value.Value ? "1" : "0");
 
+    // `t.binary` columns: the text methods. No value here reaches the
+    // column as bytes (`Digest::BLAKE3` is not emitted for this target).
+    public static string EscapeBinary(string? value) => EscapeString(value);
+    public static string EscapeBinaryOpt(string? value) => EscapeStringOpt(value);
+    public static string ColumnBinary(long stmt, long index) => ColumnText(stmt, index);
+    public static string? ColumnBinaryOpt(long stmt, long index) => ColumnTextOpt(stmt, index);
+
     // Comma-joined ids for an `IN (...)` clause (the association preload).
     // Empty → `NULL` so `IN (NULL)` stays valid SQL and matches nothing.
     public static string EscapeIntList(List<long> ids) =>

@@ -253,6 +253,24 @@ class Db:
         rather than `''`, so a nullable column round-trips as None."""
         return "NULL" if s is None else Db.escape_string(s)
 
+    # `t.binary` columns: the text methods. No value here reaches the
+    # column as bytes (`Digest::BLAKE3` is not emitted for this target).
+    @staticmethod
+    def escape_binary(s: str) -> str:
+        return Db.escape_string(s)
+
+    @staticmethod
+    def escape_binary_opt(s: "str | None") -> str:
+        return Db.escape_string_opt(s)
+
+    @classmethod
+    def column_binary(cls, stmt: int, i: int) -> str:
+        return cls.column_text(stmt, i)
+
+    @classmethod
+    def column_binary_opt(cls, stmt: int, i: int) -> "str | None":
+        return cls.column_text_opt(stmt, i)
+
     @staticmethod
     def escape_int_opt(n: "int | None") -> str:
         return "NULL" if n is None else str(int(n))

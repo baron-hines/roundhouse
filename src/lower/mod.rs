@@ -23,6 +23,7 @@ pub mod array_columns;
 pub mod associations;
 pub mod association_new;
 pub mod blank;
+pub mod respond_to;
 pub mod broadcast_calls;
 pub mod module_mixins;
 pub mod broadcasts;

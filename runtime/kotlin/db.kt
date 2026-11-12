@@ -168,6 +168,12 @@ object Db {
     fun escapeIntOpt(n: Long?): String = n?.toString() ?: "NULL"
     fun escapeFloatOpt(f: Double?): String = f?.toString() ?: "NULL"
     fun escapeBoolOpt(b: Boolean?): String = if (b == null) "NULL" else if (b) "1" else "0"
+    // `t.binary` columns: the text methods. No value here reaches the
+    // column as bytes (`Digest::BLAKE3` is not emitted for this target).
+    fun escapeBinary(s: String): String = escapeString(s)
+    fun escapeBinaryOpt(s: String?): String = escapeStringOpt(s)
+    fun columnBinary(stmtId: Long, i: Long): String = columnText(stmtId, i)
+    fun columnBinaryOpt(stmtId: Long, i: Long): String? = columnTextOpt(stmtId, i)
     // `IN (...)` list for a preload query: comma-joined integer ids.
     fun escapeIntList(ids: MutableList<Long>): String = ids.joinToString(", ") { it.toString() }
 }

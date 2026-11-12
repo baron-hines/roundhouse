@@ -455,6 +455,10 @@ pub fn lower_test_modules_with_inner_opts(
             // send is `undefined method 'present?' for an instance of
             // String` and takes every test behind it.
             rewritten |= crate::lower::blank::ground_body(&mut method.body, &blank_defs);
+            // The `respond_to?` that `assert_respond_to` /
+            // `refute_respond_to` inlined, on a receiver the first typed
+            // pass gave a class: answered from that class's surface.
+            rewritten |= crate::lower::respond_to::fold_body(&mut method.body, &classes);
             rewritten |= lowercase_header_reads(&mut method.body);
             if rewritten || !ivars.is_empty() {
                 crate::lower::typing::type_method_body(method, &classes, &ivars);

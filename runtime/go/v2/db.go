@@ -540,6 +540,25 @@ func Db_escape_string_opt(s *string) string {
 	return Db_escape_string(*s)
 }
 
+// `t.binary` columns: the text functions. A Go string holds bytes as
+// they are, and no value here reaches the column as bytes
+// (`Digest::BLAKE3` is not emitted for this target).
+func Db_escape_binary(s string) string {
+	return Db_escape_string(s)
+}
+
+func Db_escape_binary_opt(s *string) string {
+	return Db_escape_string_opt(s)
+}
+
+func Db_column_binary(stmtID int64, i int64) string {
+	return Db_column_text(stmtID, i)
+}
+
+func Db_column_binary_opt(stmtID int64, i int64) *string {
+	return Db_column_text_opt(stmtID, i)
+}
+
 func Db_escape_int_opt(n *int64) string {
 	if n == nil {
 		return "NULL"
