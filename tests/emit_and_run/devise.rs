@@ -1535,7 +1535,10 @@ fn a_devise_user_signs_in_through_omniauth_over_rack_on_the_ruby_family() {
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn a_devise_user_signs_in_through_omniauth_over_http_natively() {
-    let tree = omniauth_app().native_http_tree();
+    let tree = omniauth_app()
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"/account/me\", to: \"accounts#me\"\n")
+        .write("app/controllers/accounts_controller.rb", "class AccountsController < ApplicationController\n  def me\n    render plain: \"#{current_user.provider}|#{current_user.uid}|#{current_user.email}\"\n  end\nend\n")
+        .native_http_tree();
     let server = super::native_http::Server::start(&tree);
     let mut jar = Vec::new();
     let (page, cookies) = server.request_with_set_cookies("GET", "/users/sign_in", &[], "");
@@ -1562,4 +1565,7 @@ fn a_devise_user_signs_in_through_omniauth_over_http_natively() {
     let cookie = header(&jar);
     let (after, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
     assert_eq!(after.status, 200, "{}", server.log());
+    // The user `from_omniauth` made from the callback's `email`, signed in.
+    let (me, _) = server.request_with_set_cookies("GET", "/account/me", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(me.body, "developer|dev@example.com|dev@example.com", "{}", server.log());
 }
