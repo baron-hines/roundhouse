@@ -296,6 +296,9 @@ module ActionDispatch
       # Not a request of its own env: what it is asked for and writes (its cookie jar) is the env's, as Rails' is.
       request = ActionDispatch::Request.new
       request.env = env
+      # The session the dispatcher restored into the env, so a reset here is the one it persists.
+      restored = env["rack.session"]
+      request.session = restored if restored.is_a?(ActionDispatch::Session)
       request
     end
 
