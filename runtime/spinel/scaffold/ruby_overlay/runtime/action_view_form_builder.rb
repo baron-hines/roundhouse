@@ -102,15 +102,25 @@ module ActionView
       "<#{ActionView::ViewHelpers.content_tag_name(name.to_s)}#{ActionView::ViewHelpers.render_attrs(Helpers::FormBuilder.tag_options(options))} />".html_safe
     end
 
+    # Rails' `submit_tag` and `set_default_disable_with`: the caption disables the button, under the `data` given.
     def submit_tag(value = "Save changes", options = {})
       opts = { "type" => "submit", "name" => "commit", "value" => value }.merge(ActionView::Helpers::FormBuilder.stringify(options))
-      opts["data-disable-with"] = value unless opts.key?("data-disable-with") || opts.delete("data") == false
+      data = (opts["data"] || {}).to_h.transform_keys(&:to_s)
+      if opts["data-disable-with"] == false || data["disable_with"] == false
+        data.delete("disable_with")
+      else
+        data["disable_with"] = opts["data-disable-with"] || data["disable_with"] || value.to_s
+      end
+      opts.delete("data-disable-with")
+      opts["data"] = data unless data.empty? && !opts.key?("data")
       tag(:input, opts)
     end
 
-    def button_tag(content = nil, options = {})
+    # Rails' `button_tag`: an options Hash alone is the options, and also the caption, as Rails renders it.
+    def button_tag(content_or_options = nil, options = nil, &block)
+      options = content_or_options.is_a?(Hash) ? content_or_options : (options || {})
       opts = { "name" => "button", "type" => "submit" }.merge(ActionView::Helpers::FormBuilder.stringify(options))
-      content_tag(:button, content || "Button", opts)
+      block ? content_tag(:button, opts, &block) : content_tag(:button, content_or_options || "Button", opts)
     end
   end
 
@@ -150,11 +160,12 @@ module ActionView
 
       # Rails' `Tags::Base#tag_id`: the name with each run of other characters an underscore.
       def field_id(method)
-        "#{@object_name.to_s.gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").delete_suffix("_")}_#{method}"
+        object = @object_name.to_s.gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").delete_suffix("_")
+        object.empty? ? method.to_s.delete_suffix("?") : "#{object}_#{method.to_s.delete_suffix("?")}"
       end
 
       def field_name(method)
-        "#{@object_name}[#{method}]"
+        @object_name.to_s.empty? ? method.to_s.delete_suffix("?") : "#{@object_name}[#{method.to_s.delete_suffix("?")}]"
       end
 
       %w[text password email url telephone phone number search color range date time datetime_local month week].each do |kind|
@@ -175,16 +186,27 @@ module ActionView
       end
       alias textarea text_area
 
+      # Rails' `Tags::CheckBox`: a `checked:` given wins over the record, and the hidden input takes the box's name,
+      # `disabled` and `form` unless `include_hidden: false`.
       def check_box(method, options = {}, checked_value = "1", unchecked_value = "0")
         opts = FormBuilder.stringify(options)
-        hidden = unchecked_value.nil? ? "" : @template.tag(:input, "name" => field_name(method), "type" => "hidden", "value" => unchecked_value, "autocomplete" => "off")
         opts["type"] = "checkbox"
         opts["value"] = checked_value
+        checked = if opts.key?("checked")
+          given = opts.delete("checked")
+          given == true || given == "checked"
+        else
+          current = value_for_tag(method)
+          current == true || (!current.nil? && current != false && current.to_s == checked_value.to_s)
+        end
+        opts["checked"] = "checked" if checked
         opts["name"] ||= field_name(method)
         opts["id"] ||= field_id(method)
-        current = value_for_tag(method)
-        opts["checked"] = "checked" if current == true || (!current.nil? && current != false && current.to_s == checked_value.to_s)
-        wrap_field_errors(method, (hidden + @template.tag(:input, opts)).html_safe)
+        include_hidden = opts.key?("include_hidden") ? opts.delete("include_hidden") : true
+        box = @template.tag(:input, opts)
+        return wrap_field_errors(method, box) unless include_hidden && !unchecked_value.nil?
+        hidden = @template.tag(:input, opts.slice("name", "disabled", "form").merge("type" => "hidden", "value" => unchecked_value, "autocomplete" => "off"))
+        wrap_field_errors(method, (hidden + box).html_safe)
       end
       alias checkbox check_box
 
@@ -223,8 +245,18 @@ module ActionView
 
       private
 
+      # Rails' `Tags::TextField` and its subclasses: `NumberField`'s `in:` as `min`/`max`, `DatetimeField`'s value
+      # in the input's own format.
       def tag_for_input(type, method, options)
         opts = FormBuilder.stringify(options)
+        if %w[number range].include?(type) && (range = opts.delete("in") || opts.delete("within"))
+          opts = { "min" => range.min, "max" => range.max }.merge(opts)
+        end
+        # Not after `type`: Rails' DatetimeField writes the value into the options before TextField adds the type.
+        if (format = { "date" => "%Y-%m-%d", "datetime-local" => "%Y-%m-%dT%T", "month" => "%Y-%m", "week" => "%Y-W%V", "time" => "%T.%L" }[type])
+          value = opts.key?("value") ? opts["value"] : value_for_tag(method)
+          opts["value"] = value.respond_to?(:strftime) ? value.strftime(format) : value
+        end
         opts["size"] = opts["maxlength"] unless opts.key?("size")
         opts["type"] ||= type
         opts["value"] = opts.key?("value") ? opts["value"] : value_for_tag(method) unless type == "password"

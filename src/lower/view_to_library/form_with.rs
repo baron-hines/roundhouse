@@ -369,15 +369,27 @@ fn emit_form_inline(
     if let Some(builder) = custom_builder(args)
         && calls_unexpanded(body, form_param_str)
     {
-        let sym = |s: &str| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(s) } });
+        // Rails' object name is the model's `param_key`, a String.
+        let object_name = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: comps.model_name.clone() } });
         let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
         let record = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() });
-        let options = Expr::new(Span::synthetic(), ExprNode::Hash { entries: Vec::new(), kwargs: false });
+        // The form's own options, which Rails hands the builder (`layout: :horizontal` a builder reads).
+        let entries: Vec<(Expr, Expr)> = args
+            .iter()
+            .filter_map(|arg| match &*arg.node {
+                ExprNode::Hash { entries, .. } => Some(entries.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(k, _)| !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "builder"))
+            .map(|(k, v)| (k.clone(), rewrite_helpers_in_expr(v, ctx)))
+            .collect();
+        let options = Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false });
         out.push(Expr::new(
             Span::synthetic(),
             ExprNode::Assign {
                 target: LValue::Var { id: VarId(0), name: Symbol::from(form_param_str) },
-                value: send(Some(builder), "new", vec![sym(&comps.model_name), record, template, options], None, true),
+                value: send(Some(builder), "new", vec![object_name, record, template, options], None, true),
             },
         ));
     }
@@ -1508,14 +1520,17 @@ fn custom_builder(args: &[Expr]) -> Option<Expr> {
     })
 }
 
-/// Whether the body calls a method of the builder the form lowering does not expand.
+/// Whether the body calls a method of the builder the form lowering does not expand, or hands the builder to a call
+/// (`render_money(form)`), which may call one.
 fn calls_unexpanded(body: &Expr, form_param: &str) -> bool {
     let mut found = false;
     fn walk(e: &Expr, form_param: &str, found: &mut bool) {
-        if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
-            && matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == form_param)
-            && method.as_str() != "object"
-            && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+        let is_form = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == form_param);
+        if let ExprNode::Send { recv, method, args, .. } = &*e.node
+            && (recv.as_ref().is_some_and(|r| is_form(r))
+                && method.as_str() != "object"
+                && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+                || args.iter().any(is_form))
         {
             *found = true;
         }

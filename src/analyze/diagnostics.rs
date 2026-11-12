@@ -91,11 +91,18 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         }
         if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
             && !expr.span.is_synthetic()
-            && matches!(&r.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionView::Helpers::FormBuilder")
+            && let Some(Ty::Class { id, .. }) = &r.ty
+            // A builder subclass's stock fields are expanded as the base's; its own methods are reported above.
+            && (id.0.as_str() == "ActionView::Helpers::FormBuilder" || descends_from_form_builder(app, id))
             && !FORM_BUILDER_HANDLED_ELSEWHERE.contains(&method.as_str())
         {
+            let base = id.0.as_str() == "ActionView::Helpers::FormBuilder";
             let m = method.as_str();
             if crate::lower::classify_form_builder_method(m).is_none() {
+                if !base {
+                    expr.node.for_each_child(&mut |child| visit(app, child, out));
+                    return;
+                }
                 out.push(Diagnostic::unsupported(
                     expr.span,
                     None,
