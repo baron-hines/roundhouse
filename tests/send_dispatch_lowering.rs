@@ -443,6 +443,31 @@ end
     assert!(diags.is_empty(), "{diags:?}");
 }
 
+/// A list held in a local is a proof only while nothing else holds it:
+/// an alias can grow the list or change a String element in place, so
+/// the walk over the local keeps its built name.
+#[test]
+fn a_list_local_that_escapes_stays_dynamic() {
+    for (label, escape) in [
+        ("another local", "other = statuses\n    other << \"failed\""),
+        ("an instance variable", "@kept = statuses\n    @kept.first.replace(\"failed\")"),
+        ("an Array element", "box = [statuses]\n    box.first << \"failed\""),
+    ] {
+        let (out, diags) = ground_and_emit(&format!(
+            "module Executable\n  def execution\n    statuses = %w[ ready claimed ]\n    {escape}\n    statuses.each {{ |status| public_send(\"#{{status}}_execution\") }}\n  end\nend\n"
+        ));
+        assert!(out.contains("public_send(\"#{status}_execution\")"), "{label}: the send must survive untouched:\n{out}");
+        assert!(!out.contains("when "), "{label}: rewritten without a proof:\n{out}");
+        assert_eq!(diags.len(), 1, "{label}: expected one residue entry: {diags:?}");
+    }
+    // The same list, read only by its walk, still proves its names.
+    let (out, diags) = ground_and_emit(
+        "module Executable\n  def execution\n    statuses = %w[ ready claimed ]\n    statuses.each { |status| public_send(\"#{status}_execution\") }\n  end\nend\n",
+    );
+    assert!(out.contains("public_send(\"ready_execution\")") && out.contains("public_send(\"claimed_execution\")"), "{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
 /// Without a finite proof the name stays built, and the site joins the
 /// residue ledger: a list that is not a literal, an element parameter
 /// the block rebinds or changes in place, or one an inner block's own

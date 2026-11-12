@@ -726,6 +726,9 @@ fn walk_var_uses(
                     poisoned.insert(name.clone());
                 }
             }
+            // `other = statuses` aliases the list: a change through
+            // `other` is a change to `statuses`.
+            poison_bare_var(value, poisoned);
             walk_var_uses(value, sets, poisoned);
         }
         ExprNode::Send { recv: Some(r), method, args, block, .. } => {
@@ -757,11 +760,16 @@ fn walk_var_uses(
             }
         }
         _ => {
-            // A tracked var escaping into any other context (argument,
-            // return value, interpolation) is handled conservatively by
-            // the Send arm above for calls; other bare-var reads don't
-            // let the collection mutate, so they're safe to ignore.
-            e.node.for_each_child(&mut |c| walk_var_uses(c, sets, poisoned));
+            // A tracked var read bare anywhere else escapes: an
+            // instance variable, an Array or Hash element, or a value a
+            // block or method returns all alias the list, and a change
+            // through the alias (`<<`, or a String element's `replace`)
+            // is a change to the list. The Send arm above already
+            // poisons a bare argument.
+            e.node.for_each_child(&mut |c| {
+                poison_bare_var(c, poisoned);
+                walk_var_uses(c, sets, poisoned)
+            });
         }
     }
 }
