@@ -61,6 +61,29 @@ end
 
 pub const ARTICLE_BACKEND: &str = "class ArticleBackend\n  def self.loaded\n    Shelf::Backend.load!.inspect\n  end\nend\n";
 
+/// The gem's loaders of a standard-library feature (`net/http`) and of a feature under the same root that only an
+/// absent gem ships (net-http-persistent's `net/http/persistent`): Ruby loads the first and raises `LoadError` at the second.
+pub const SHELF_HTTP: &str = r#"module Shelf
+  module Http
+    def self.plain!
+      require "net/http"
+      true
+    rescue LoadError
+      nil
+    end
+
+    def self.persistent!
+      require "net/http/persistent"
+      true
+    rescue LoadError
+      nil
+    end
+  end
+end
+"#;
+
+pub const ARTICLE_HTTP: &str = "class ArticleHttp\n  def self.loaded\n    [Shelf::Http.plain!, Shelf::Http.persistent!].inspect\n  end\nend\n";
+
 /// real-blog with the `gems` locked and installed under `vendor/bundle`.
 fn with_gems(gems: &[&str]) -> emit_and_run::Overlay {
     let fixture = roundhouse::fixtures::real_blog();
@@ -89,4 +112,13 @@ pub fn app_with_backend() -> emit_and_run::Overlay {
         .write(BACKENDS, OPTIONAL_BACKEND)
         .write("app/models/article_box.rb", ARTICLE_BOX)
         .write("app/models/article_backend.rb", ARTICLE_BACKEND)
+}
+
+/// [`app`] with `Shelf::Http` in the gem.
+#[allow(dead_code)]
+pub fn app_with_http() -> emit_and_run::Overlay {
+    with_gems(&["shelf"])
+        .write(GEM, &format!("{SHELF}{SHELF_HTTP}"))
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+        .write("app/models/article_http.rb", ARTICLE_HTTP)
 }

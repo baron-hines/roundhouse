@@ -28,3 +28,16 @@ fn the_spinel_emit_keeps_a_require_another_locked_gem_ships() {
     assert!(!backend.contains("cannot load such file -- optional_backend"), "{backend}");
     assert!(backend.contains("require \"optional_backend\""), "{backend}");
 }
+
+/// A feature under a standard-library root (`net`) is the standard library's only where it ships that path:
+/// `net/http` stays a `require`, and `net/http/persistent`, which only the absent net-http-persistent ships,
+/// becomes Ruby's `LoadError`.
+#[test]
+fn the_spinel_emit_raises_load_error_for_an_absent_feature_under_a_standard_library_root() {
+    let (emitted, errors) = contract::app_with_http().emit(BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("net/http")), "{errors:#?}");
+    let http = std::fs::read_to_string(emitted.join("app/models/shelf/http.rb")).expect("http.rb");
+    assert!(!http.contains("require \"net/http/persistent\""), "{http}");
+    assert!(http.contains("raise LoadError.new(\"cannot load such file -- net/http/persistent\")"), "{http}");
+    assert!(http.contains("require \"net/http\""), "{http}");
+}
