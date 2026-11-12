@@ -2208,7 +2208,7 @@ mod tests {
             .split('/')
             .filter_map(|s| s.strip_prefix(':').map(|p| p.to_string()))
             .collect();
-        FlatRoute {
+        FlatRoute { request_defaults: Vec::new(),
             method,
             source_path: path.to_string(),
             path: path.to_string(),

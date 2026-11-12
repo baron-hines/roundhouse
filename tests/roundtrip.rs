@@ -131,7 +131,7 @@ fn tiny_blog_round_trips() {
     };
 
     let routes = RouteTable {
-        entries: vec![roundhouse::RouteSpec::Explicit {
+        entries: vec![roundhouse::RouteSpec::Explicit { defaults: indexmap::IndexMap::new(),
             method: HttpMethod::Get,
             path: "/posts".into(),
             controller: ClassId(Symbol::from("PostsController")),

@@ -842,6 +842,27 @@ class Routing(unittest.TestCase):
         self.assertEqual(plan["smoke"], ["ruby", "jruby"])
         self.assertTrue(set(ci.CORE).issubset(plan["jobs"]))
 
+    def test_route_defaults_select_the_native_contract(self):
+        for path in [
+            "src/ingest/routes.rs", "src/lower/routes.rs", "src/lower/routes_to_library/mod.rs", "src/dialect.rs",
+            "src/build_target.rs", "src/lower/route_guards.rs", "src/project.rs", "runtime/ruby/action_dispatch/router.rb",
+            "runtime/ruby/action_dispatch/router.rbs", "runtime/spinel/scaffold/main.rb", "runtime/spinel/test/test_helper.rb", "runtime/spinel/test/test_helper.rbs",
+            "tests/emit_and_run/route_request_defaults.rs", "tests/support/route_request_defaults/oracle.rb",
+            "tests/support/route_request_defaults/routes.rb", "tests/support/route_request_defaults.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                # The framework suite keeps the native params test; spinel-toolchain runs the HTTP server test.
+                self.assertIn("route_request_defaults", plan["spinel_tests"])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("spinel-toolchain", plan["jobs"])
+
+    def test_route_defaults_http_test_runs_in_the_toolchain_lane(self):
+        plan = ci.select(["tests/spinel_toolchain/route_request_defaults.rs"])
+        self.assertIn("spinel-toolchain", plan["jobs"])
+        # Not a framework-suite binary: spinel-framework lacks the jemalloc `spin build` links.
+        self.assertNotIn("route_request_defaults", plan["spinel_tests"])
+
     def test_focused_tests_select_only_themselves(self):
         for binary in ci.SPINEL_TESTS:
             with self.subTest(binary=binary):

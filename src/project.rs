@@ -3665,6 +3665,9 @@ fn target_files_inner(
     for d in crate::lower::relation_residue::default_scope_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
+    for d in crate::lower::route_guards::route_default_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
     for d in crate::lower::route_guards::route_guard_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
@@ -15268,7 +15271,7 @@ mod tests {
             .collect::<Vec<_>>()
         };
         let mut app = App::new();
-        app.routes.entries.push(crate::dialect::RouteSpec::Explicit {
+        app.routes.entries.push(crate::dialect::RouteSpec::Explicit { defaults: indexmap::IndexMap::new(),
             method: crate::dialect::HttpMethod::Get,
             path: "/widgets".to_string(),
             controller: crate::ident::ClassId(crate::ident::Symbol::from("WidgetsController")),
@@ -15308,7 +15311,7 @@ mod tests {
     #[test]
     fn controller_paths_land_only_in_the_routes_file() {
         let mut app = App::new();
-        app.routes.entries.push(crate::dialect::RouteSpec::Explicit {
+        app.routes.entries.push(crate::dialect::RouteSpec::Explicit { defaults: indexmap::IndexMap::new(),
             method: crate::dialect::HttpMethod::Get,
             path: "/admin/posts".to_string(),
             controller: crate::ident::ClassId(crate::ident::Symbol::from("Admin::PostsController")),
