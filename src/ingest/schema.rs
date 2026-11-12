@@ -653,6 +653,10 @@ fn apply_table_verb(
         }
         "remove_reference" | "remove_belongs_to" => {
             if let (Some(t), Some(name)) = (arg_name(0), arg_name(1)) {
+                // Rails removes `<name>_id` and its foreign key. The fold keeps a
+                // reference under its logical name until a foreign key renames it.
+                let physical = format!("{name}_id");
+                let removed = |column: &Column| column.name.as_str() == name || column.name.as_str() == physical;
                 if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
                     refuse_composite_primary_key_mutation(verb, table, &name, file)?;
                     if table.columns.iter().any(|column| {
@@ -668,14 +672,13 @@ fn apply_table_verb(
                     }
                     if table.columns.iter().any(|column| column.generated.is_some()) {
                         let mut candidate = table.clone();
-                        candidate
-                            .columns
-                            .retain(|column| column.name.as_str() != name);
+                        candidate.columns.retain(|column| !removed(column));
                         validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
                     }
                 }
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
-                    table.columns.retain(|x| x.name.as_str() != name);
+                    table.columns.retain(|x| !removed(x));
+                    table.foreign_keys.retain(|fk| !matches!(fk.from_columns.as_slice(), [key] if key.as_str() == physical));
                 }
             }
         }
@@ -944,6 +947,8 @@ fn remove_named_column(
         // left here, the schema SQL indexes a column that is not there).
         let columns = &table.columns;
         table.indexes.retain(|idx| idx.columns.iter().all(|name| columns.iter().any(|col| col.name == *name)));
+        // So does a foreign key on that column alone, as Rails' SQLite adapter drops it.
+        table.foreign_keys.retain(|fk| !matches!(fk.from_columns.as_slice(), [key] if key.as_str() == removed || key.as_str() == c));
     }
     Ok(())
 }

@@ -298,6 +298,66 @@ fn a_foreign_key_to_an_absent_or_renamed_table_is_still_skipped() {
     assert!(ddl.contains("FOREIGN KEY (tenant_id, item_id) REFERENCES scopes"), "{ddl}");
 }
 
+/// Each removes a reference that carries a foreign key; Rails drops the
+/// `<name>_id` column and its key, and keeps the table's other keys.
+const REFERENCE_REMOVALS: &[(&str, &str, &[&str], &[&str])] = &[
+    ("posts", "add_reference :posts, :author, foreign_key: true\n remove_reference :posts, :author", &["id", "title"], &[]),
+    ("posts", "add_belongs_to :posts, :author, foreign_key: true\n remove_belongs_to :posts, :author", &["id", "title"], &[]),
+    ("posts", "add_reference :posts, :author, foreign_key: true\n remove_column :posts, :author_id", &["id", "title"], &[]),
+    ("notes", "create_table(:notes) { |t| t.references :author, foreign_key: true }\n remove_reference :notes, :author", &["id"], &[]),
+    ("posts", "change_table(:posts) { |t| t.references :author, foreign_key: true }\n change_table(:posts) { |t| t.remove_references :author }", &["id", "title"], &[]),
+    ("posts", "add_column :posts, :author_id, :integer\n add_foreign_key :posts, :authors\n remove_column :posts, :author_id", &["id", "title"], &[]),
+    ("posts", "add_reference :posts, :author, foreign_key: true\n add_reference :posts, :editor, foreign_key: {to_table: :authors}\n remove_reference :posts, :author", &["id", "title", "editor_id"], &["editor_id"]),
+];
+
+fn reference_removal_migration(body: &str) -> String {
+    format!("class RemoveAuthor < ActiveRecord::Migration[8.1]\n def change\n create_table(:authors)\n create_table(:posts) {{ |t| t.string :title }}\n {body}\n end\nend")
+}
+
+#[test]
+fn removing_a_reference_drops_its_column_and_foreign_key() {
+    for &(table, body, columns, keys) in REFERENCE_REMOVALS {
+        let mut schema = roundhouse::schema::Schema::default();
+        roundhouse::ingest::ingest_migration(reference_removal_migration(body).as_bytes(), "db/migrate/1_author.rb", &mut schema).unwrap();
+        let folded = &schema.tables[&roundhouse::Symbol::from(table)];
+        assert_eq!(folded.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), columns, "{body}");
+        let from: Vec<&str> = folded.foreign_keys.iter().flat_map(|fk| fk.from_columns.iter().map(|c| c.as_str())).collect();
+        assert_eq!(from, keys, "{body}");
+        render_schema_statements_for(&schema, Dialect::Sqlite).unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+}
+
+#[test]
+fn rails_drops_a_removed_references_column_and_foreign_key() {
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let mut script = format!(r#"
+require {helper:?}
+unless RailsOracle.available?("activerecord", sqlite3: ">= 2.9")
+  puts "skip: Rails oracle and sqlite3 are unavailable"
+  exit
+end
+RailsOracle.activate("activerecord", sqlite3: ">= 2.9")
+require "active_record"
+ActiveRecord::Migration.verbose = false
+"#);
+    for &(table, body, columns, keys) in REFERENCE_REMOVALS {
+        let migration = reference_removal_migration(body);
+        script.push_str(&format!(r#"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+eval({migration:?})
+RemoveAuthor.migrate(:up)
+db = ActiveRecord::Base.connection
+raise "columns after {table}" unless db.columns({table:?}).map(&:name) == {columns:?}
+raise "keys after {table}" unless db.foreign_keys({table:?}).map(&:column) == {keys:?}
+"#));
+    }
+    script.push_str("puts 'reference removals verified with Rails'\n");
+    let out = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("reference removals verified with Rails") || stdout.contains("skip:"), "{stdout}");
+}
+
 #[test]
 fn removing_a_composite_foreign_key_matches_the_whole_key() {
     use roundhouse::ingest::ingest_migration;

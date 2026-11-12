@@ -846,6 +846,18 @@ fn handle_add_foreign_key(
     if from_cols.len() == 1 && to_cols.len() == 1 {
         let on_delete = action_after(words, close2, "DELETE");
         let on_update = action_after(words, close2, "UPDATE");
+        // PostgreSQL: `NOT DEFERRABLE` is the default, `DEFERRABLE` starts
+        // immediate, and `INITIALLY DEFERRED` implies `DEFERRABLE`.
+        let after_refs = |seq: &[&str]| word_seq_pos_after(words, close2, seq).is_some();
+        let deferrable = if after_refs(&["NOT", "DEFERRABLE"]) {
+            None
+        } else if after_refs(&["INITIALLY", "DEFERRED"]) {
+            Some(crate::schema::Deferrable::Deferred)
+        } else if after_refs(&["DEFERRABLE"]) {
+            Some(crate::schema::Deferrable::Immediate)
+        } else {
+            None
+        };
         if let Some(table) = schema.tables.get_mut(&table_sym) {
             table.foreign_keys.push(ForeignKey {
                 from_columns: vec![Symbol::from(from_cols[0].clone())],
@@ -853,7 +865,7 @@ fn handle_add_foreign_key(
                 to_columns: vec![Symbol::from(to_cols[0].clone())],
                 on_delete,
                 on_update,
-                deferrable: None,
+                deferrable,
             });
         }
     } else {

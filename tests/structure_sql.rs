@@ -333,6 +333,33 @@ ALTER TABLE ONLY public.assignments
 }
 
 #[test]
+fn foreign_key_timing_follows_postgres() {
+    use roundhouse::emit::shared::schema_sql::{Dialect, render_schema_statements_for};
+    use roundhouse::schema::Deferrable::{Deferred, Immediate};
+    // The timing PostgreSQL 18 records for each clause. pg_dump spells a
+    // deferrable key only the first two ways.
+    let cases = [
+        ("deferred", "ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED", Some(Deferred)),
+        ("bare", "DEFERRABLE", Some(Immediate)),
+        ("immediate", "DEFERRABLE INITIALLY IMMEDIATE", Some(Immediate)),
+        ("implied", "INITIALLY DEFERRED", Some(Deferred)),
+        ("never", "NOT DEFERRABLE", None),
+        ("plain", "", None),
+    ];
+    let mut sql = String::from("CREATE TABLE public.parents (\n    id bigint NOT NULL\n);\n\nALTER TABLE ONLY public.parents\n    ADD CONSTRAINT parents_pkey PRIMARY KEY (id);\n");
+    for (name, clause, _) in cases {
+        sql.push_str(&format!("\nCREATE TABLE public.{name}_children (\n    parent_id bigint\n);\n\nALTER TABLE ONLY public.{name}_children\n    ADD CONSTRAINT fk_{name} FOREIGN KEY (parent_id) REFERENCES public.parents(id) {clause};\n"));
+    }
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").unwrap();
+    for (name, _, timing) in cases {
+        assert_eq!(schema.tables[&Symbol::from(format!("{name}_children"))].foreign_keys[0].deferrable, timing, "{name}");
+    }
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap();
+    let deferred = ddl.iter().find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS deferred_children ")).unwrap();
+    assert!(deferred.contains("ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"), "{deferred}");
+}
+
+#[test]
 fn unrecognized_statement_heads_are_ledgered_once_per_head() {
     let sql = "ALTER TABLE ONLY public.widgets REPLICA IDENTITY FULL;\nALTER TABLE ONLY public.companies REPLICA IDENTITY FULL;\n";
     survey::activate();
