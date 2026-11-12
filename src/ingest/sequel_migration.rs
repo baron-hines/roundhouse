@@ -38,7 +38,9 @@ use super::{IngestError, IngestResult};
 
 /// Fold one Sequel migration file into `schema`. Files are applied in
 /// filename order by the caller (Sequel's integer prefixes sort the
-/// same way Rails' timestamps do).
+/// same way Rails' timestamps do). A `foreign_key` without `key:` whose
+/// target a later file creates has no target columns until that file is
+/// folded; the caller settles the rest once every file is folded.
 pub fn ingest_sequel_migration(
     source: &[u8],
     file: &str,
@@ -125,16 +127,8 @@ fn ingest_table_stmt(
                     ingest_column_stmt(&col_stmt, file, &mut table)?;
                 }
             }
-            for at in 0..table.foreign_keys.len() {
-                let fk = &table.foreign_keys[at];
-                if !fk.to_columns.is_empty() { continue; }
-                let target = if fk.to_table.0 == table.name { Some(&table) } else { schema.tables.get(&fk.to_table.0) };
-                let keys = target.map(|t| if t.primary_key_columns.is_empty() { t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect() } else { t.primary_key_columns.clone() })
-                    .filter(|keys: &Vec<Symbol>| !keys.is_empty() && keys.len() == fk.from_columns.len())
-                    .ok_or_else(|| IngestError::Unsupported { file: file.into(), message: "Sequel foreign key target requires a known matching primary key".into() })?;
-                table.foreign_keys[at].to_columns = keys;
-            }
             schema.tables.insert(Symbol::from(name.as_str()), table);
+            resolve_implicit_keys(schema, file)?;
         }
         // alter_table / drop_table land when a fixture forces them.
         other => {
@@ -146,6 +140,46 @@ fn ingest_table_stmt(
                 return Err(err);
             }
             super::survey::record(&err);
+        }
+    }
+    Ok(())
+}
+
+/// Sequel's `foreign_key` without `key:` references the target's primary
+/// key, which SQLite reads when rows are written, so the target may come
+/// from a later migration. Resolve each such key whose target is folded.
+fn resolve_implicit_keys(schema: &mut Schema, file: &str) -> IngestResult<()> {
+    let primary_key = |t: &Table| if t.primary_key_columns.is_empty() {
+        t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect()
+    } else {
+        t.primary_key_columns.clone()
+    };
+    let targets: std::collections::HashMap<Symbol, Vec<Symbol>> = schema.tables.values()
+        .flat_map(|t| t.foreign_keys.iter().filter(|fk| fk.to_columns.is_empty()))
+        .filter_map(|fk| schema.tables.get(&fk.to_table.0).map(|t| (fk.to_table.0.clone(), primary_key(t))))
+        .collect();
+    for table in schema.tables.values_mut() {
+        for fk in table.foreign_keys.iter_mut().filter(|fk| fk.to_columns.is_empty()) {
+            let Some(keys) = targets.get(&fk.to_table.0) else { continue };
+            if keys.is_empty() || keys.len() != fk.from_columns.len() {
+                return Err(IngestError::Unsupported { file: file.into(), message: format!("Sequel foreign key from {} requires a primary key on {} that matches its columns", table.name, fk.to_table.0) });
+            }
+            fk.to_columns = keys.clone();
+        }
+    }
+    Ok(())
+}
+
+/// Once every migration is folded, a one-column key without `key:` whose
+/// target no migration creates references `id`, the conventional key. A
+/// composite one has no such default and is refused.
+pub(super) fn settle_absent_targets(schema: &mut Schema, file: &str) -> IngestResult<()> {
+    for table in schema.tables.values_mut() {
+        for fk in table.foreign_keys.iter_mut().filter(|fk| fk.to_columns.is_empty()) {
+            if fk.from_columns.len() != 1 {
+                return Err(IngestError::Unsupported { file: file.into(), message: format!("Sequel foreign key from {} needs key: because no migration creates {}", table.name, fk.to_table.0) });
+            }
+            fk.to_columns = vec![Symbol::from("id")];
         }
     }
     Ok(())
@@ -177,7 +211,9 @@ fn ingest_column_stmt(
     let opt_bool = |key: &str| opt_value(key).as_ref().and_then(bool_value);
     let opt_sym = |key: &str| opt_value(key).as_ref().and_then(symbol_value);
     let gap = || IngestError::Unsupported { file: file.into(), message: "Sequel key requires literal columns, target and supported options".into() };
-    if matches!(method.as_str(), "primary_key" | "foreign_key") {
+    // Array (composite) keys accept only the literal options read below.
+    // Scalar keys ignore the options they don't read, such as `type:` and `index:`.
+    if matches!(method.as_str(), "primary_key" | "foreign_key") && args.first().is_some_and(|n| n.as_array_node().is_some()) {
         let offset = if method == "primary_key" { 1 } else { 2 };
         if call.block().is_some() || call.receiver().is_some_and(|r| r.as_self_node().is_none()) || args.len() > offset + 1 || args.iter().skip(offset).any(|n| n.as_keyword_hash_node().is_none() && n.as_hash_node().is_none())
             || opts.as_ref().is_some_and(|h| h.iter().any(|n| n.as_assoc_node().is_none_or(|a|

@@ -84,6 +84,28 @@ fn route_rows(app: &App) -> Vec<(String, String, String, String)> {
     rows
 }
 
+/// schema.rb lists tables alphabetically, so a migration can name a
+/// target that a later migration creates.
+const LATER_TARGETS: &str = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "badges" do |t|
+    t.integer "team_org_id"
+    t.integer "team_code"
+  end
+  create_table "posts" do |t|
+    t.integer "user_id"
+  end
+  create_table "teams", primary_key: [:org_id, :code] do |t|
+    t.integer "org_id", null: false
+    t.integer "code", null: false
+  end
+  create_table "users" do |t|
+    t.string "name"
+  end
+  add_foreign_key "badges", "teams", column: [:team_org_id, :team_code], primary_key: [:org_id, :code], deferrable: :deferred
+  add_foreign_key "posts", "users"
+end
+"#;
+
 #[test]
 fn schema_keys_roundtrip_through_sequel_migrations() {
     use roundhouse::schema::ColumnType;
@@ -91,7 +113,7 @@ fn schema_keys_roundtrip_through_sequel_migrations() {
     let named_key = source
         .replace("create_table \"parents\" do", "create_table \"parents\", primary_key: :parent_key do")
         .replace("\"parents\", column:", "\"parents\", primary_key: :parent_key, column:");
-    for source in [source, named_key.as_str(), include_str!("support/schema_keys_references.rb"), include_str!("support/schema_keys_implicit.rb")] {
+    for source in [source, named_key.as_str(), include_str!("support/schema_keys_references.rb"), include_str!("support/schema_keys_implicit.rb"), LATER_TARGETS] {
         let mut app = App::new();
         app.schema = roundhouse::ingest::ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
         let scratch = scratch_dir("schema-keys");
@@ -117,6 +139,50 @@ fn schema_keys_roundtrip_through_sequel_migrations() {
         }
         assert_eq!(app.schema, converted.schema, "all keys, targets and timing must round-trip");
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+}
+
+/// Hand-written Sequel migrations folded in order through the Roda app ingest.
+fn fold_sequel_migrations(tables: &[&str]) -> Result<roundhouse::schema::Schema, String> {
+    let scratch = scratch_dir("sequel-keys");
+    for file in roundhouse::emit::roda::emit(&App::new()) {
+        let path = scratch.join(file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.content).unwrap();
+    }
+    std::fs::create_dir_all(scratch.join("db/migrate")).unwrap();
+    for (at, table) in tables.iter().enumerate() {
+        let source = format!("Sequel.migration do\n  change do\n{table}\n  end\nend\n");
+        std::fs::write(scratch.join(format!("db/migrate/{:03}_keys.rb", at + 1)), source).unwrap();
+    }
+    let result = roundhouse::ingest::ingest_app(&scratch).map(|app| app.schema).map_err(|e| e.to_string());
+    std::fs::remove_dir_all(scratch).unwrap();
+    result
+}
+
+#[test]
+fn sequel_implicit_keys_resolve_after_every_migration_is_folded() {
+    let target = |schema: &roundhouse::schema::Schema| {
+        schema.tables[&roundhouse::Symbol::from("links")].foreign_keys[0].to_columns.iter().map(|c| c.to_string()).collect::<Vec<_>>()
+    };
+    let scopes = "create_table(:scopes) do\n Integer :x\n Integer :y\n primary_key [:y, :x]\n end";
+    // Without `key:`, the reference is the target's primary key when rows are written.
+    let schema = fold_sequel_migrations(&["create_table(:links) do\n foreign_key :parent_code, :parents\n end",
+        "create_table(:parents) do\n primary_key :code\n end"]).unwrap();
+    assert_eq!(target(&schema), ["code"]);
+    let schema = fold_sequel_migrations(&["create_table(:links) do\n Integer :a\n Integer :b\n foreign_key [:a, :b], :scopes\n end", scopes]).unwrap();
+    assert_eq!(target(&schema), ["y", "x"]);
+    // No migration creates the target: one column keeps `id`, as before composite keys.
+    for from in [":ghost_id", "[:a]"] {
+        let schema = fold_sequel_migrations(&[&format!("create_table(:links) do\n Integer :a\n foreign_key {from}, :ghosts\n end")]).unwrap();
+        assert_eq!(target(&schema), ["id"], "{from}");
+    }
+    for tables in [
+        &["create_table(:links) do\n foreign_key :scope_id, :scopes\n end", scopes][..],
+        &["create_table(:links) do\n Integer :a\n Integer :b\n foreign_key [:a, :b], :ghosts\n end"],
+    ] {
+        let error = fold_sequel_migrations(tables).expect_err(tables[0]);
+        assert!(error.contains("links"), "{error}");
     }
 }
 

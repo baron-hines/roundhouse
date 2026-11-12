@@ -140,8 +140,6 @@ fn sequel_implicit_self_references_resolve_keys_declared_later() {
 fn sequel_implicit_foreign_keys_refuse_unknown_or_incompatible_keys() {
     use roundhouse::schema::Schema;
     for (parent, from) in [
-        ("", ":a"),
-        ("", "[:a]"),
         ("create_table(:parents) { Integer :id }", "[:a]"),
         ("create_table(:parents) { Integer :a; Integer :b; primary_key [:b, :a] }", "[:a]"),
         ("create_table(:parents) { Integer :a; Integer :b; primary_key [:b, :a] }", ":a"),
@@ -155,6 +153,27 @@ fn sequel_implicit_foreign_keys_refuse_unknown_or_incompatible_keys() {
 }
 
 #[test]
+fn scalar_sequel_keys_ignore_the_options_they_do_not_read() {
+    use roundhouse::{Symbol, schema::Schema};
+    let source = "Sequel.migration do\n change do\n create_table(:parents) do\n primary_key :id, type: :Bignum\n end\n create_table(:links) do\n primary_key :id, :Bignum, auto_increment: true\n foreign_key :parent_id, :parents, type: :Bignum, index: true, default: 1, null: false\n foreign_key :spread_id, :parents, **options\n foreign_key :hashed_id, :parents, key_options\n end\n end\nend";
+    let mut schema = Schema::default();
+    roundhouse::ingest::ingest_sequel_migration(source.as_bytes(), "db/migrate/001_links.rb", &mut schema).unwrap();
+    let columns = |table: &str| schema.tables[&Symbol::from(table)].columns.iter()
+        .map(|c| (c.name.to_string(), c.col_type.clone(), c.nullable, c.primary_key)).collect::<Vec<_>>();
+    let parents = ColumnType::Reference { table: roundhouse::TableRef(Symbol::from("parents")) };
+    assert_eq!(columns("parents"), [("id".to_string(), ColumnType::Integer, false, true)]);
+    assert_eq!(columns("links"), [("id".to_string(), ColumnType::Integer, false, true), ("parent_id".to_string(), parents.clone(), false, false),
+        ("spread_id".to_string(), parents.clone(), true, false), ("hashed_id".to_string(), parents, true, false)]);
+    let links = &schema.tables[&Symbol::from("links")];
+    assert!(links.indexes.is_empty() && links.primary_key_columns.is_empty());
+    for (fk, from) in links.foreign_keys.iter().zip(["parent_id", "spread_id", "hashed_id"]) {
+        assert_eq!((fk.from_columns.as_slice(), fk.to_table.0.as_str(), fk.to_columns.as_slice()), ([Symbol::from(from)].as_slice(), "parents", [Symbol::from("id")].as_slice()));
+        assert_eq!((&fk.on_delete, &fk.on_update, fk.deferrable), (&ReferentialAction::NoAction, &ReferentialAction::NoAction, None));
+    }
+    assert_eq!(links.foreign_keys.len(), 3);
+}
+
+#[test]
 fn sequel_unread_key_forms_are_refused() {
     for body in [
         "primary_key []", "primary_key [:a, key_column]", "primary_key key_columns",
@@ -163,11 +182,11 @@ fn sequel_unread_key_forms_are_refused() {
         "primary_key [:missing]", "primary_key [:a], deferrable: true",
         "foreign_key [], :parents, key: []", "foreign_key [:a, :b], :parents, key: [:x]",
         "foreign_key [:a, key_column], :parents, key: [:x, :y]",
-        "foreign_key [:a, :b], :parents", "foreign_key [:a], :parents", "foreign_key :a, :parents, key: []",
+        "foreign_key [:a, :b], :parents, **options", "foreign_key [:a], :parents, key_options",
+        "foreign_key [:a], :parents, key: :id, type: :String", "foreign_key :a, :parents, key: []",
         "foreign_key :a, :parents, key: key_column", "foreign_key :a, :parents, key: [:x, key_column]",
         "foreign_key :a, :parents, key: [:x, :y]", "foreign_key :a, :parents, deferrable: timing",
-        "foreign_key :a, :parents, deferrable: :unknown", "foreign_key :a, :parents, **options",
-        "foreign_key :a, :parents, key_options", "foreign_key :a, :parents, type: :String",
+        "foreign_key :a, :parents, deferrable: :unknown",
         "foreign_key [:missing], :parents, key: :id",
         "primary_key [:a] do\n unsupported\nend", "Other.primary_key [:a]",
         "Other.foreign_key [:a], :parents, key: :id",

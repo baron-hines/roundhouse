@@ -14,6 +14,7 @@ rescue StandardError
 end
 execute("ROLLBACK")
 raise "deferred orphan committed" unless orphan_rejected
+execute("INSERT INTO immediate_children (parent_id) VALUES (42)")
 immediate_rejected = false
 begin
   execute("INSERT INTO immediate_children (parent_id) VALUES (999)")
