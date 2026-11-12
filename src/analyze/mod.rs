@@ -8566,7 +8566,8 @@ fn collect_transitive_filter_ivars(
         | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
             let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
             if !own {
-                if let Some(ty) = value.ty.clone() {
+                // A class object stored is the class, as `walk_ivar_assignments` records the same write.
+                if let Some(ty) = value.ty.clone().map(|t| class_object_arg_ty(value, t)) {
                     union_ivar_maps(&mut out, HashMap::from_iter([(name.clone(), ty)]));
                 }
             }
@@ -11127,7 +11128,7 @@ fn walk_ivar_assignments(
         // a plain assignment so a controller's `@story ||= Story.find(..)`
         // still flows its type to before_action seeds and views.
         ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
-            if let Some(ty) = value.ty.clone() {
+            if let Some(ty) = value.ty.clone().map(|t| class_object_arg_ty(value, t)) {
                 let merged = match out.remove(name) {
                     Some(prev) => crate::analyze::body::join_ivar_slot(prev, ty),
                     None => ty,
