@@ -419,6 +419,12 @@ fn ingest_library_classes_impl(
                     class.methods.extend(reopening.methods);
                 }
                 class.methods.sort_by_key(|method| method.name_span.start);
+                // Nothing runs between the block's definitions and the reopenings', so a later
+                // definition replaces an earlier one before any call can reach it, as in Ruby.
+                let mut seen = HashSet::default();
+                class.methods.reverse();
+                class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
+                class.methods.reverse();
                 made.push((class.name.0.clone(), class));
             }
         }

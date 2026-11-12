@@ -290,6 +290,23 @@ fn data_reopening_parameters_use_the_last_definition() {
     }
 }
 
+/// A replaced definition never runs, so neither its block use nor its calls reach analysis.
+#[test]
+fn a_replaced_data_definition_reaches_no_caller_or_callee() {
+    let source = "module Sink\n  def self.take(value) = value\nend\nArtifact = Data.define(:digest) do\n  def pick = yield\n  def feed = Sink.take(\"old\")\nend\nclass Artifact\n  def pick = 1\n  def feed = Sink.take(1)\nend\nmodule Builder\n  def self.make = Artifact.new(digest: \"a\").pick { \"text\" }\nend\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        assert!(errors(&mut app).is_empty());
+        let methods: Vec<_> = app.library_classes.iter().filter(|class| class.name.0.as_str() == "Artifact")
+            .flat_map(|class| &class.methods).map(|method| method.name.as_str()).collect();
+        assert_eq!(methods, ["pick", "feed"], "{path}");
+        let rbs: String = roundhouse::emit::ruby::emit_library(&app).into_iter()
+            .filter(|file| file.path.extension().is_some_and(|ext| ext == "rbs")).map(|file| file.content).collect();
+        assert!(rbs.contains("def self.make: () -> Integer"), "{rbs}");
+        assert!(rbs.contains("def self.take: (Integer value) -> Integer"), "{rbs}");
+    }
+}
+
 #[test]
 fn data_reopening_keeps_a_declared_return_signature() {
     let source = "Artifact = Data.define(:digest) do\n  def label = 'old'\nend\nclass Artifact\n  def label = digest\nend\n";

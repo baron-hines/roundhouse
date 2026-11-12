@@ -5679,15 +5679,7 @@ impl Analyzer {
         });
         for (lc, rets) in app.library_classes.iter().zip(returns) {
             let class_id = &lc.name;
-            for (index, (method, ret)) in lc.methods.iter().zip(rets).enumerate() {
-                // Data reopenings replace the earlier definition, even when the new return is untyped.
-                if lc.data_define().is_some()
-                    && lc.methods[index + 1..].iter().any(|later| {
-                        later.name == method.name && later.receiver == method.receiver
-                    })
-                {
-                    continue;
-                }
+            for (method, ret) in lc.methods.iter().zip(rets) {
                 let target = match method.receiver {
                     crate::dialect::MethodReceiver::Instance => {
                         &mut self.classes.entry(class_id.clone()).or_default().instance_methods
@@ -6989,13 +6981,7 @@ impl Analyzer {
             }
         }
         for lc in &app.library_classes {
-            for (index, m) in lc.methods.iter().enumerate() {
-                // A Data reopening replaces the earlier definition, parameters included.
-                if lc.data_define().is_some()
-                    && lc.methods[index + 1..].iter().any(|later| later.name == m.name && later.receiver == m.receiver)
-                {
-                    continue;
-                }
+            for m in &lc.methods {
                 record(&lc.name, m);
             }
         }
