@@ -2675,9 +2675,9 @@ fn native_classvar_initialization_beside_autoloads_blocks_and_an_own_class_metho
     let source = b"module Probe\n  extend ActiveSupport::Autoload\n  autoload :Helpers\n  eager_autoload do\n    autoload :Inputs\n  end\n  @@label = ->(label, required) { \"#{required} #{label}\" }\n  @@error = proc do |tag, _| tag end\n  @@wrappers = {}\n  def self.wrappers(name, &block)\n    @@wrappers[name] = block\n  end\n  wrappers :default do |b| b end\nend\n";
     roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
     let closing = b"module Probe\n  prefix = \"x\"\n  @@label = ->(label) { prefix + label }\nend\n";
-    // Not carried as an initializer: the lambda reads the body's local, whichever way the body is refused.
+    // Not a library class at all: a body that assigns a local is left to the file's program.
     let closed = roundhouse::ingest::ingest_library_classes(closing, "probe.rb");
-    assert!(closed.as_ref().map_or(true, |classes| classes.iter().all(|c| c.class_ivar_initializers.is_empty())), "{closed:?}");
+    assert!(matches!(&closed, Ok(classes) if classes.is_empty()), "{closed:?}");
 }
 
 #[test]

@@ -2389,9 +2389,16 @@ fn closes_over_nothing(e: &Expr) -> bool {
                 let depth = bound.len();
                 bound.extend(params.iter().cloned());
                 bound.extend(rest_param.iter().cloned());
-                bound.extend(extra_params.iter().map(|p| p.name.clone()));
+                // A default reads what is bound before it (`->(label = prefix) { … }` closes over `prefix`).
+                let mut ok = true;
+                for param in extra_params {
+                    if let Some(default) = &param.default {
+                        ok = ok && free(default, bound);
+                    }
+                    bound.push(param.name.clone());
+                }
                 bound.extend(block_param.iter().cloned());
-                let ok = free(body, bound);
+                let ok = ok && free(body, bound);
                 bound.truncate(depth);
                 return ok;
             }
