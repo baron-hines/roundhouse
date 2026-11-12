@@ -27,11 +27,15 @@ use crate::ty::Ty;
 
 /// A condition on the including class, read from a concern's
 /// `included do`: `self == A` / `self != A` / `in?([A, B])`, under `if`
-/// or `unless`. `classes` are the constants as written.
+/// or `unless`. `classes` are the constants as written. `asked` is instead
+/// a module's predicate of the includer, `Devise::Orm.active_record?(self)`:
+/// the module and the method, which a gem hook answers per includer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IncluderGuard {
     pub classes: Vec<String>,
     pub negate: bool,
+    #[serde(default)]
+    pub asked: Option<(String, String)>,
 }
 
 impl IncluderGuard {
@@ -136,6 +140,9 @@ pub struct App {
     /// the file's program, which runs them where the file is required.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_load_statements: Vec<crate::span::Span>,
+    /// The gem files the boot loads, as `ingest::gem_load_program` walks them (normalized source paths).
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub gem_loaded_files: crate::det::HashSet<String>,
     /// The constants an initializer statement held by a gem not compiled
     /// from source calls (`Rack::Attack` of `Rack::Attack.throttle`):
     /// `ingest::auto_source_gems` brings that gem in, and the statement
@@ -151,6 +158,10 @@ pub struct App {
     /// as brace-block Ruby the stack hands the constructor.
     #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
     pub gem_middleware_blocks: crate::det::HashMap<String, String>,
+    /// The arguments a `use` passes its middleware after the app it wraps, by class, as Ruby source
+    /// (`*Devise.omniauth_configs[:github].args` for a provider Devise's loop unrolled to).
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub gem_middleware_args: crate::det::HashMap<String, String>,
     /// The Rack env keys a stacked middleware writes, and the class there (`"warden"` → `Warden::Proxy`).
     #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
     pub rack_env_writes: crate::det::HashMap<String, String>,
@@ -435,9 +446,10 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_extended_macros: Vec<ClassId>,
     /// Constants written on ActiveRecord::Base inside `ActiveSupport.on_load(:active_record)` (`self::X = Const`,
-    /// orm_adapter's `self::OrmAdapter = ::OrmAdapter::ActiveRecord`): the name and the constant path it holds.
+    /// orm_adapter's `self::OrmAdapter = ::OrmAdapter::ActiveRecord`): the name, the constant path it holds as written
+    /// (a leading empty segment when rooted), and the hook's lexical nesting outermost first, one full name per header.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub load_hook_constants: Vec<(Symbol, Vec<Symbol>)>,
+    pub load_hook_constants: Vec<(Symbol, Vec<Symbol>, Vec<Symbol>)>,
     /// Class methods a model took from a module only it extends
     /// (`ingest::extend_splice`), by name.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
@@ -1317,9 +1329,11 @@ impl App {
             seeds: None,
             boot_program: Vec::new(),
             gem_load_statements: Vec::new(),
+            gem_loaded_files: Default::default(),
             boot_gem_constants: Vec::new(),
             gem_middlewares: Vec::new(),
             gem_middleware_blocks: Default::default(),
+            gem_middleware_args: Default::default(),
             rack_env_writes: Default::default(),
             gem_middleware_refusals: Vec::new(),
             included_hoist_conflicts: Vec::new(),
@@ -1434,7 +1448,7 @@ mod includer_guard_tests {
     use super::IncluderGuard;
 
     fn guard(classes: &[&str], negate: bool) -> IncluderGuard {
-        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate }
+        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate, asked: None }
     }
 
     #[test]
