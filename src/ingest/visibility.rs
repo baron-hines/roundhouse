@@ -457,13 +457,26 @@ impl Visibility {
     /// [`Self::resolve_library`] for a class body whose walk carries a marker naming an inherited method as a body
     /// statement (Hashie's `private :_regular_reader` after `alias _regular_reader []`), which the Ruby family writes
     /// back and Ruby resolves along the ancestors.
+    /// Only a marker naming what an `alias` of the same body defines, or a class-side one in a body that `extend`s a
+    /// module (rack-protection's `public :escape_html` over `extend Rack::Utils`): any other inherited name is
+    /// [`Self::resolve_library`]'s refusal (a Data block's `private_class_method :new`).
     pub(super) fn resolve_library_carrying(
         body: Option<&Node<'_>>,
         file: &str,
         module_owner: Option<&ClassId>,
         owner: Option<&ClassId>,
     ) -> IngestResult<Self> {
-        Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)
+        let out = Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)?;
+        let aliased = body.map(alias_names).unwrap_or_default();
+        let extends = body.is_some_and(extends_a_module);
+        match out.inherited.iter().find(|(class_side, name, _)| !aliased.contains(name) && !(*class_side && extends)) {
+            Some((_, name, at)) => {
+                let err = Self::undefined(file, name);
+                super::error_site::note(&err, *at, *at + 1);
+                Err(err)
+            }
+            None => Ok(out),
+        }
     }
 
     /// Whether this body's load-time conditional definitions are admitted.
@@ -1275,4 +1288,40 @@ pub(super) fn console_only(node: &Node<'_>) -> bool {
             || p.as_constant_path_node().is_some_and(|cp| cp.parent().is_none() && cp.name().is_some_and(|n| n.as_slice() == b"Rails"))
     });
     parent_is_rails && path.name().is_some_and(|n| n.as_slice() == b"Console")
+}
+
+/// The names a body's `alias` / `alias_method` statements define.
+fn alias_names(body: &Node<'_>) -> Vec<String> {
+    let Some(statements) = body.as_statements_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    for stmt in statements.body().iter() {
+        if let Some(alias) = stmt.as_alias_method_node()
+            && let Some(sym) = alias.new_name().as_symbol_node()
+        {
+            out.push(String::from_utf8_lossy(sym.unescaped()).into_owned());
+        } else if let Some(call) = stmt.as_call_node()
+            && call.receiver().is_none()
+            && call.name().as_slice() == b"alias_method"
+            && let Some(first) = call.arguments().and_then(|a| a.arguments().iter().next())
+        {
+            if let Some(sym) = first.as_symbol_node() {
+                out.push(String::from_utf8_lossy(sym.unescaped()).into_owned());
+            } else if let Some(text) = first.as_string_node() {
+                out.push(String::from_utf8_lossy(text.unescaped()).into_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Whether a body calls `extend` with a constant, whose methods the class side then answers.
+fn extends_a_module(body: &Node<'_>) -> bool {
+    let Some(statements) = body.as_statements_node() else { return false };
+    statements.body().iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none()
+                && call.name().as_slice() == b"extend"
+                && call.arguments().is_some_and(|a| a.arguments().iter().any(|x| x.as_constant_read_node().is_some() || x.as_constant_path_node().is_some()))
+        })
+    })
 }

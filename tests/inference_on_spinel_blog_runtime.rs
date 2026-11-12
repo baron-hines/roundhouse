@@ -567,7 +567,10 @@ fn untyped_subexpressions_baseline() {
     // `clear_attribute_change` no longer reads `attributes` directly (-3).
     // These are vars on this RBS-less probe; connection.rbs types them for
     // the RBS-paired gate.
-    const CEILING: usize = 1238;
+    // MEASURED 1242 on 2026-11-12 (devise-lockable, on 1238): `increment_counter`/`decrement_counter` in
+    // active_record/connection.rb read the counter name, id, `by:` and `touch:` they are given (+4), vars on
+    // this RBS-less probe; connection.rbs types them for the RBS-paired gate.
+    const CEILING: usize = 1242;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
