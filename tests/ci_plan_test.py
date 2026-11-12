@@ -1070,6 +1070,7 @@ class Routing(unittest.TestCase):
     def test_schema_constraints_owns_ddl_and_index_consumers(self):
         for path in [
             "tests/schema_constraints.rs", "tests/support/schema_constraints_schema.rb",
+            "tests/support/schema_constraints_predicates.rs", "src/ingest/app.rs", "src/ingest/database_yml.rs",
             "tests/support/schema_constraints_contract.rb", "src/schema.rs", "src/ingest/schema.rs",
             "src/schema/generated.rs", "tests/support/emit_and_run.rs",
             "src/emit/shared/schema_sql.rs", "src/lower/model_to_library/schema.rs", "src/lower/scope_chain.rs",
