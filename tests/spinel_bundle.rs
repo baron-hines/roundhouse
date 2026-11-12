@@ -36,6 +36,8 @@ fn a_table_declared_twice_differently_does_not_share_a_build() {
     let a = "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n";
     let b = "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.integer \"rank\"\n  end\nend\n";
     assert_eq!(merged("db/schema.rb", a, b), None);
+    let symbol = "ActiveRecord::Schema.define do\n  create_table :widgets, force: :cascade do |t|\n    t.integer \"rank\"\n  end\nend\n";
+    assert_eq!(merged("db/schema.rb", a, symbol), None);
     let versioned = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"members\" do |t|\n  end\nend\n";
     assert_eq!(merged("db/schema.rb", a, versioned), None);
 }

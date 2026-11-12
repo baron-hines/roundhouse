@@ -765,10 +765,15 @@ pub mod bundle {
         let mut seen: std::collections::BTreeSet<(&str, &str, &str)> = std::collections::BTreeSet::new();
         let mut out = Vec::new();
         for case in cases {
+            let mut own: BTreeMap<&str, &[u8]> = BTreeMap::new();
             for edit in &case.edits {
                 match edit {
                     Edit::Write { path, content } => {
                         if removed.contains(path.as_str()) || files.contains_key(path.as_str()) {
+                            return None;
+                        }
+                        // Not merged with the case's own earlier write: in its own build the later one replaces it.
+                        if own.insert(path.as_str(), content.as_slice()).is_some_and(|before| before != content.as_slice()) {
                             return None;
                         }
                         match written.get_mut(path.as_str()) {
@@ -871,7 +876,9 @@ pub mod bundle {
         let verb = words.next().unwrap_or("");
         match verb {
             "create_table" | "get" | "post" | "put" | "patch" | "delete" | "match" | "resources" | "resource" | "namespace" | "scope" => {
-                format!("{verb} {}", words.next().unwrap_or("").trim_end_matches(','))
+                // Not the spelling: `:widgets`, `"widgets"` and `'widgets'` name one table.
+                let name = words.next().unwrap_or("").trim_end_matches(',').trim_start_matches(':');
+                format!("{verb} {}", name.trim_matches(|c| c == '"' || c == '\''))
             }
             "root" => "root".to_string(),
             _ => first.to_string(),

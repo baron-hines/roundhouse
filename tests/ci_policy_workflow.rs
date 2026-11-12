@@ -986,6 +986,84 @@ fn framework_loop_stops_a_slow_suite_and_compiles_at_its_opt_level() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn framework_loop_builds_a_suites_shared_cases_before_running_it() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = scratch::dir(&format!("framework-bundle-{unique}"));
+    let executable = |path: &std::path::Path, body: &str| {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    executable(
+        &root.join("cargo"),
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        ),
+    );
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    executable(
+        &stubs.join("shared"),
+        concat!(
+            "#!/bin/sh\n",
+            "if [ -n \"$RH_SPINEL_BUNDLE_COLLECT\" ]; then echo '{\"test\":\"shared::case\"}' > \"$RH_SPINEL_BUNDLE_COLLECT/k.json\"; exit 101; fi\n",
+            "printf 'shared %s bundle=%s\\n' \"$*\" \"$RH_SPINEL_BUNDLE\" >> \"$RUN_LOG\"\n",
+        ),
+    );
+    executable(&stubs.join("alone"), "#!/bin/sh\n[ -n \"$RH_SPINEL_BUNDLE_COLLECT\" ] || printf 'alone %s\\n' \"$*\" >> \"$RUN_LOG\"\n");
+    executable(
+        &stubs.join("spinel_bundle"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'spinel_bundle %s cases=%s\\n' \"$*\" \"$(ls \"$RH_SPINEL_BUNDLE_COLLECT\")\" >> \"$RUN_LOG\"\n",
+            "mkdir -p \"$RH_SPINEL_BUNDLE_OUT\"\n",
+            "echo '{\"shared::case\": 40}' > \"$RH_SPINEL_BUNDLE_OUT/seconds.json\"\n",
+        ),
+    );
+    let log = root.join("run.log");
+    let timings = root.join("timings.jsonl");
+    let result = Command::new("bash")
+        .args(["-e", "-o", "pipefail", "-c", "scripts/ci-spinel-framework.sh"])
+        .env("TESTS", "shared alone")
+        .env("RUN_LOG", &log)
+        .env("STUBS", &stubs)
+        .env("RUNNER_TEMP", &root)
+        .env("CI_SPINEL_TIMINGS_OUT", &timings)
+        .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let ran = fs::read_to_string(&log).unwrap();
+    let bundle = ran.lines().position(|l| l == "spinel_bundle --ignored --exact spinel_bundle_build --nocapture cases=k.json");
+    let shared = ran.lines().position(|l| {
+        l == format!("shared --ignored --nocapture bundle={}/spinel-framework/bundles", root.display())
+    });
+    assert!(bundle.is_some() && shared.is_some() && bundle < shared, "{ran}");
+    assert!(ran.lines().any(|l| l == "alone --ignored --nocapture"), "{ran}");
+    let recorded = fs::read_to_string(&timings).unwrap();
+    let seconds = recorded
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|r| r["name"] == "shared")
+        .map(|r| r["seconds"].as_u64().unwrap());
+    assert!(seconds.is_some_and(|s| s >= 40), "the shared build is charged to its suite: {recorded}");
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// The PostgreSQL Db gate runs in the native framework loop: the job has
 /// a PostgreSQL service, checks spinel-pg out at a pinned commit only when
 /// the plan selects the gate, and hands both to the loop step.
