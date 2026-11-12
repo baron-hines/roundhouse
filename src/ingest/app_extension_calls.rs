@@ -352,6 +352,8 @@ fn reads_no_local(expr: &crate::expr::Expr) -> bool {
 fn reads_only(expr: &crate::expr::Expr, bound: &mut Vec<crate::ident::Symbol>) -> bool {
     match &*expr.node {
         ExprNode::Var { name, .. } => return bound.contains(name),
+        // `x += 1` reads `x` too, which the target alone does not show.
+        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } if !bound.contains(name) => return false,
         // Not left to `for_each_child`, which does not enter a `defined?` operand.
         ExprNode::Defined { operand } => return reads_only(operand, bound),
         ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {

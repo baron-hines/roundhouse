@@ -3086,7 +3086,8 @@ impl<'a> BodyTyper<'a> {
             if let Some(ty) = m.instance_methods.get(method) {
                 return Some(unwrap_fn_ret(ty));
             }
-            stack.extend(m.includes.iter().rev().cloned());
+            // In declaration order: the stack pops the latest include first, as Ruby looks it up.
+            stack.extend(m.includes.iter().cloned());
         }
         None
     }
