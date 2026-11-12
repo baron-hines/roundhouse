@@ -581,10 +581,11 @@ module ActiveSupport
 
     def generate_key(salt, key_size = 64)
       cache_key = "#{salt}|#{key_size}"
-      cached = @cache_keys[cache_key]
-      return cached unless cached.nil?
-      key = @key_generator.generate_key(salt, key_size)
-      @cache_keys[cache_key] = key
+      key = @cache_keys[cache_key]
+      if key.nil?
+        key = @key_generator.generate_key(salt, key_size)
+        @cache_keys[cache_key] = key
+      end
       key
     end
   end
