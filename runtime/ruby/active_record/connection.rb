@@ -1539,12 +1539,14 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).find_or_initialize_by(conditions.to_h, &block)
     end
 
+    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call.
     def self.find_or_create_by(conditions, &block)
-      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h, &block)
+      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h) { |record| block.call(record) unless block.nil? }
     end
 
+    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call.
     def self.find_or_create_by!(conditions, &block)
-      ActiveRecord::Relation.new(self).find_or_create_by!(conditions.to_h, &block)
+      ActiveRecord::Relation.new(self).find_or_create_by!(conditions.to_h) { |record| block.call(record) unless block.nil? }
     end
 
     def self.create_or_find_by(conditions)

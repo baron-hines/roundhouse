@@ -649,20 +649,17 @@ mod tests {
     }
 
     #[test]
-    fn a_self_call_with_arguments_declines_a_zero_argument_delegate() {
+    fn a_self_call_with_arguments_takes_a_forwarder_of_that_arity() {
         let mut lc = library_class(
             "class Filter\n  delegate :title, to: :article\n  def render\n    self.title(\"caption\")\n  end\nend\n",
         );
-        assert!(take_delegate_decls(&mut lc).is_empty());
-        assert_eq!(
-            lc.unknown_calls.len(),
-            1,
-            "the unsupported forwarding stays visible"
-        );
+        let delegates = take_delegate_decls(&mut lc);
+        assert_eq!(delegates.len(), 1, "Rails forwards the argument");
+        assert_eq!(delegates[0].arity, 1);
     }
 
     #[test]
-    fn a_concern_method_call_with_arguments_declines_model_delegate_expansion() {
+    fn a_concern_method_call_with_arguments_takes_a_forwarder_of_that_arity() {
         let mut model = library_class("class Post\n  delegate :title, to: :leaf\nend\n");
         let concern = library_class(
             "class Rendering\n  def render_title\n    title(\"caption\")\n  end\nend\n",
@@ -678,15 +675,8 @@ mod tests {
         let mut eligibility =
             DelegateEligibility::new(&model.methods, &called_with_args, &blocked_names, None, &no_targets, &[]);
         let delegates = take_delegate_decls_from_calls(&mut model.unknown_calls, &mut eligibility);
-        assert!(
-            delegates.is_empty(),
-            "the concern's call needs argument forwarding"
-        );
-        assert_eq!(
-            model.unknown_calls.len(),
-            1,
-            "the declaration remains unexpanded"
-        );
+        assert_eq!(delegates.len(), 1, "the concern's call forwards its argument");
+        assert_eq!(delegates[0].arity, 1);
     }
 
     #[test]

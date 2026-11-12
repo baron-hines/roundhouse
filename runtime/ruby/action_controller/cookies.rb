@@ -16,6 +16,9 @@
 # `Tep.str_hash` route through one store. This replaces the former CRuby-only
 # overlay CookieJar; one typed implementation now serves all three ruby-family
 # targets.
+require_relative "../active_support_ext"
+require_relative "../rack_utils"
+
 module ActionController
   class CookieJar
     def initialize(inbound = {})
@@ -465,7 +468,7 @@ module ActionDispatch
     def cookie_jar
       found = @env["action_dispatch.cookies"]
       return found if found.is_a?(ActionController::CookieJar)
-      jar = ActionController::CookieJar.new(CgiIo.parse_cookies(@env["HTTP_COOKIE"].to_s))
+      jar = ActionController::CookieJar.new(Rack::Utils.parse_cookies(@env["HTTP_COOKIE"].to_s))
       @env["action_dispatch.cookies"] = jar
       jar
     end

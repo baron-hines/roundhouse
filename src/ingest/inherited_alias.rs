@@ -142,7 +142,7 @@ pub(super) fn settle(app: &mut App, held: Vec<Held>) {
     }
     // An alias Ruby resolves outside the app's classes (`answered_outside_the_app`) gets no copy, so every Ruby tree
     // writes it where the source has it, Spinel's too (an `alias_method` of a Hash subclass's `[]`).
-    let mut outside: Vec<(usize, usize)> = Vec::new();
+    let mut outside: Vec<(usize, usize, String)> = Vec::new();
     {
         let candidates: Vec<&LibraryClass> = app.library_classes.iter().collect();
         for (_, h) in held.iter().enumerate().filter(|(i, _)| carried[*i]) {
@@ -156,14 +156,18 @@ pub(super) fn settle(app: &mut App, held: Vec<Held>) {
                         && ancestor_method(&candidates, lc, from, receiver, call.span).is_none()
                         && answered_outside_the_app(&candidates, lc, from, receiver)
                     {
-                        outside.push((k, j));
+                        outside.push((k, j, h.path.clone()));
                     }
                 }
             }
         }
     }
-    for (k, j) in outside {
+    for (k, j, path) in outside {
         app.library_classes[k].unknown_calls[j].decisions |= crate::expr::REPLAYED_CLASS_BODY;
+        // Still the gap's on the other targets, which get no copy of what the alias names.
+        if super::survey::is_active() {
+            super::survey::record(&super::IngestError::Unsupported { file: path, message: REFUSAL.into() });
+        }
     }
     let mut refused: Vec<(usize, Span)> =
         (0..held.len()).filter(|i| !carried[*i]).filter_map(|i| Some((i, unresolved(app, &carried, i)?))).collect();

@@ -43,6 +43,8 @@ require_relative "active_support_number_helper"
 #
 # Other objects use Rails' optional `empty?` protocol. Their `to_s`
 # says nothing about blankness and may even return nil.
+require_relative "json_builder"
+
 module ActiveSupport
   # `ActiveSupport::JSON` — Rails' JSON coder over the json library.
   #
@@ -581,10 +583,11 @@ module ActiveSupport
 
     def generate_key(salt, key_size = 64)
       cache_key = "#{salt}|#{key_size}"
-      cached = @cache_keys[cache_key]
-      return cached unless cached.nil?
-      key = @key_generator.generate_key(salt, key_size)
-      @cache_keys[cache_key] = key
+      key = @cache_keys[cache_key]
+      if key.nil?
+        key = @key_generator.generate_key(salt, key_size)
+        @cache_keys[cache_key] = key
+      end
       key
     end
   end
