@@ -1729,6 +1729,7 @@ mod tests {
             store_readers: Default::default(),
             route_helper_names: Default::default(),
             app_helper_names: Default::default(),
+            view_context_helpers: Default::default(),
             direct_route_helpers: Default::default(),
             i18n: Default::default(),
             route_helper_arity: Default::default(),
