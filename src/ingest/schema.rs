@@ -677,8 +677,11 @@ fn apply_table_verb(
                         });
                     }
                     if table.columns.iter().any(|column| column.generated.is_some()) {
+                        // Without a `<name>_id`, PostgreSQL fails the removal (SQLite skips
+                        // it), so a generated column reading an ordinary `<name>` still refuses.
+                        let no_id = !table.columns.iter().any(|column| column.name.as_str() == physical);
                         let mut candidate = table.clone();
-                        candidate.columns.retain(|column| !removed(column));
+                        candidate.columns.retain(|column| !removed(column) && !(no_id && column.name.as_str() == name));
                         validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
                     }
                 }
