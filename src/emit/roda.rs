@@ -164,7 +164,14 @@ fn migration_for(app: &App, table: &Table) -> String {
                 .find(|fk| fk.from_columns.as_slice() == std::slice::from_ref(&col.name))
                 .unwrap();
             let mut l = format!("      foreign_key :{}, :{}", col.name, fk.to_table);
-            if fk.to_columns.len() != 1 || fk.to_columns[0].as_str() != "id" {
+            // Without `key:`, Sequel references the target's primary key, so
+            // `key:` is left out only when that key is exactly `id`.
+            let target_key_is_id = app.schema.tables.get(&fk.to_table.0).is_some_and(|t| if t.primary_key_columns.is_empty() {
+                t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.as_str()).eq(["id"])
+            } else {
+                t.primary_key_columns.iter().map(|c| c.as_str()).eq(["id"])
+            });
+            if !target_key_is_id || fk.to_columns.len() != 1 || fk.to_columns[0].as_str() != "id" {
                 l.push_str(&format!(", key: [{}]", fk.to_columns.iter().map(|c| crate::emit::ruby::expr::ruby_sym_literal(c.as_str())).collect::<Vec<_>>().join(", ")));
             }
             if let Some(timing) = fk.deferrable { l.push_str(&format!(", deferrable: :{}", if timing == crate::schema::Deferrable::Deferred { "deferred" } else { "immediate" })); }

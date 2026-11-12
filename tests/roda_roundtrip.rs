@@ -106,6 +106,21 @@ const LATER_TARGETS: &str = r#"ActiveRecord::Schema[8.1].define(version: 1) do
 end
 "#;
 
+/// A scalar key to `id` on a table whose primary key is (shop_id, id), with
+/// `id` unique on its own: Sequel's default target would be the whole key.
+const ID_IN_COMPOSITE_TARGET: &str = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "carts", primary_key: [:shop_id, :id] do |t|
+    t.integer "shop_id", null: false
+    t.integer "id", null: false
+    t.index ["id"], unique: true
+  end
+  create_table "orders" do |t|
+    t.integer "cart_id"
+  end
+  add_foreign_key "orders", "carts"
+end
+"#;
+
 #[test]
 fn schema_keys_roundtrip_through_sequel_migrations() {
     use roundhouse::schema::ColumnType;
@@ -113,7 +128,7 @@ fn schema_keys_roundtrip_through_sequel_migrations() {
     let named_key = source
         .replace("create_table \"parents\" do", "create_table \"parents\", primary_key: :parent_key do")
         .replace("\"parents\", column:", "\"parents\", primary_key: :parent_key, column:");
-    for source in [source, named_key.as_str(), include_str!("support/schema_keys_references.rb"), include_str!("support/schema_keys_implicit.rb"), LATER_TARGETS] {
+    for source in [source, named_key.as_str(), include_str!("support/schema_keys_references.rb"), include_str!("support/schema_keys_implicit.rb"), LATER_TARGETS, ID_IN_COMPOSITE_TARGET] {
         let mut app = App::new();
         app.schema = roundhouse::ingest::ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
         let scratch = scratch_dir("schema-keys");

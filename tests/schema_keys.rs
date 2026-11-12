@@ -343,6 +343,8 @@ const REFERENCE_REMOVALS: &[(&str, &str, &[&str], &[&str])] = &[
     ("posts", "change_table(:posts) { |t| t.references :author, foreign_key: true }\n change_table(:posts) { |t| t.remove_references :author }", &["id", "title"], &[]),
     ("posts", "add_column :posts, :author_id, :integer\n add_foreign_key :posts, :authors\n remove_column :posts, :author_id", &["id", "title"], &[]),
     ("posts", "add_reference :posts, :author, foreign_key: true\n add_reference :posts, :editor, foreign_key: {to_table: :authors}\n remove_reference :posts, :author", &["id", "title", "editor_id"], &["editor_id"]),
+    ("posts", "add_reference :posts, :author, foreign_key: true\n add_column :posts, :author, :string\n remove_reference :posts, :author", &["id", "title", "author"], &[]),
+    ("notes", "create_table(:notes) { |t| t.string :author; t.references :author, foreign_key: true }\n remove_reference :notes, :author", &["id", "author"], &[]),
 ];
 
 /// Indexes over a removed reference's column go with it; others stay.
@@ -425,6 +427,60 @@ raise "indexes after {table}" unless ActiveRecord::Base.connection.indexes({tabl
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("reference removals verified with Rails") || stdout.contains("skip:"), "{stdout}");
+}
+
+/// Each removes one column of the `scope_links` composite foreign key.
+const COMPOSITE_KEY_COLUMN_REMOVALS: &[&str] = &[
+    "remove_column :scope_links, :tenant_id",
+    "remove_reference :scope_links, :tenant",
+    "change_table(:scope_links) { |t| t.remove :tenant_id }",
+];
+
+#[test]
+fn removing_a_column_of_a_composite_foreign_key_is_refused() {
+    use roundhouse::ingest::ingest_migration;
+    for change in COMPOSITE_KEY_COLUMN_REMOVALS {
+        let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
+        let migration = format!("class RemoveTenant < ActiveRecord::Migration[8.1]\n def change\n {change}\n end\nend");
+        let error = ingest_migration(migration.as_bytes(), "db/migrate/1_tenant.rb", &mut schema).expect_err(change).to_string();
+        assert!(error.contains("db/migrate/1_tenant.rb") && error.contains("composite foreign key"), "{change}: {error}");
+        let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+        assert!(ddl.contains("FOREIGN KEY (tenant_id, item_id) REFERENCES scopes"), "{change}: {ddl}");
+    }
+}
+
+#[test]
+fn rails_on_sqlite_fails_to_remove_a_column_of_a_composite_foreign_key() {
+    // PostgreSQL 18 drops the whole key instead, so the fold refuses.
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let mut script = format!(r#"
+require {helper:?}
+unless RailsOracle.available?("activerecord", sqlite3: ">= 2.9")
+  puts "skip: Rails oracle and sqlite3 are unavailable"
+  exit
+end
+RailsOracle.activate("activerecord", sqlite3: ">= 2.9")
+require "active_record"
+ActiveRecord::Schema.verbose = false
+ActiveRecord::Migration.verbose = false
+"#);
+    for change in COMPOSITE_KEY_COLUMN_REMOVALS {
+        script.push_str(&format!(r#"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+{SCHEMA}
+begin
+  Class.new(ActiveRecord::Migration[8.1]) {{ define_method(:change) {{ instance_eval({change:?}) }} }}.migrate(:up)
+  raise "removal accepted: {change}"
+rescue ActiveRecord::StatementInvalid => e
+  raise unless e.message.include?("unknown column")
+end
+"#));
+    }
+    script.push_str("puts 'composite key removals verified with Rails'\n");
+    let out = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("composite key removals verified with Rails") || stdout.contains("skip:"), "{stdout}");
 }
 
 #[test]

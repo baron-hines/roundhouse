@@ -660,9 +660,11 @@ fn apply_table_verb(
                 // Rails removes `<name>_id` and its foreign key. The fold keeps a
                 // reference under its logical name until a foreign key renames it.
                 let physical = format!("{name}_id");
-                let removed = |column: &Column| column.name.as_str() == name || column.name.as_str() == physical;
+                let removed = |column: &Column| column.name.as_str() == physical
+                    || (column.name.as_str() == name && matches!(column.col_type, ColumnType::Reference { .. }));
                 if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
                     refuse_composite_primary_key_mutation(verb, table, &name, file)?;
+                    refuse_composite_foreign_key_mutation(verb, table, &[physical.as_str()], file)?;
                     if table.columns.iter().any(|column| {
                         column.name.as_str() == name && column.generated.is_some()
                     }) {
@@ -940,6 +942,7 @@ fn remove_named_column(
     let removed = stored.as_deref().unwrap_or(c);
     if let Some(table) = schema.tables.get(&Symbol::from(t)) {
         refuse_composite_primary_key_mutation(verb, table, removed, file)?;
+        refuse_composite_foreign_key_mutation(verb, table, &[removed, c], file)?;
         refuse_predicate_column(verb, table, c, file)?;
         refuse_indexed_generated_column_mutation(verb, table, removed, file)?;
         if table.columns.iter().any(|column| column.generated.is_some()) {
@@ -956,6 +959,19 @@ fn remove_named_column(
         table.indexes.retain(|idx| idx.columns.iter().all(|name| columns.iter().any(|col| col.name == *name)));
         // So does a foreign key on that column alone, as Rails' SQLite adapter drops it.
         table.foreign_keys.retain(|fk| !matches!(fk.from_columns.as_slice(), [key] if key.as_str() == removed || key.as_str() == c));
+    }
+    Ok(())
+}
+
+/// Removing one column of a composite foreign key has no single Rails
+/// result: the SQLite adapter fails to rebuild the table, while PostgreSQL
+/// drops the whole key.
+fn refuse_composite_foreign_key_mutation(verb: &str, table: &Table, columns: &[&str], file: &str) -> IngestResult<()> {
+    if let Some(fk) = table.foreign_keys.iter().find(|fk| fk.from_columns.len() > 1 && fk.from_columns.iter().any(|c| columns.contains(&c.as_str()))) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("migration `{verb}` on {}.{} removes part of the composite foreign key ({}); SQLite and PostgreSQL disagree on the result", table.name, columns[0], fk.from_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")),
+        });
     }
     Ok(())
 }
