@@ -981,7 +981,7 @@ jobs:
     # Advisory unless ci:spinel focus hardens CORE (+ this suite).
     needs: [generate-fixture, spinel-build, plan]
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-framework') && needs.generate-fixture.result == 'success' && needs.spinel-build.outputs.artifact-id != '' }}
-    # The plan balances the selected suites over up to four shards by their
+    # The plan balances the selected suites over up to five shards by their
     # recorded durations; each shard reports its own output key, as
     # spinel-toolchain's do.
     strategy:
@@ -993,6 +993,7 @@ jobs:
       shard-1: ${{ steps.result.outputs.shard-1 }}
       shard-2: ${{ steps.result.outputs.shard-2 }}
       shard-3: ${{ steps.result.outputs.shard-3 }}
+      shard-4: ${{ steps.result.outputs.shard-4 }}
     runs-on: ubuntu-latest
     # 30m: upstream's shards take 11-14m, but a fork's runners take about
     # 1.7x that (a 20m bound cut a passing shard 2 there, fork run

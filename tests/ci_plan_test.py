@@ -1585,6 +1585,7 @@ class Results(unittest.TestCase):
                         "shard-1": "success",
                         "shard-2": "success",
                         "shard-3": "success",
+                        "shard-4": "success",
                     },
                 }
                 for j in plan["jobs"]
@@ -1709,8 +1710,8 @@ class Results(unittest.TestCase):
 
     def test_each_spinel_framework_shard_must_actually_pass_for_completion(self):
         plan = ci.select([], spinel_lane=True)
-        self.assertEqual(len(plan["spinel_framework_shards"]), 4)
-        for shard in ["shard-0", "shard-1", "shard-2", "shard-3"]:
+        self.assertEqual(len(plan["spinel_framework_shards"]), 5)
+        for shard in ["shard-0", "shard-1", "shard-2", "shard-3", "shard-4"]:
             for status in ["failure", "cancelled", "", None]:
                 with self.subTest(shard=shard, status=status):
                     needs = self.needs(plan)
@@ -1939,7 +1940,7 @@ class Results(unittest.TestCase):
 
     def test_spinel_framework_shards_cover_each_selected_suite_once(self):
         shards = ci.spinel_framework_shards(ci.SPINEL_TESTS)
-        self.assertEqual([s["shard"] for s in shards], [0, 1, 2, 3])
+        self.assertEqual([s["shard"] for s in shards], [0, 1, 2, 3, 4])
         self.assertEqual(
             sorted(t for s in shards for t in s["tests"]), sorted(ci.SPINEL_TESTS)
         )

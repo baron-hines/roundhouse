@@ -231,7 +231,7 @@ SPINEL_TEST_SECONDS = {
     ),
 }
 SPINEL_TEST_DEFAULT_SECONDS = 40
-SPINEL_FRAMEWORK_SHARDS = 4
+SPINEL_FRAMEWORK_SHARDS = 5
 # Not balanced by count: these three take two to three times a typical test (local run, 2026-10-17).
 SPINEL_TOOLCHAIN_SECONDS = {
     "real_blog_spinel_tests_pass": 265,
