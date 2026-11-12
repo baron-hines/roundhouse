@@ -263,7 +263,7 @@ module Roundhouse
     end
 
     def self.escape_binary_opt(s : String?) : String
-      escape_string_opt(s)
+      s.nil? ? "NULL" : escape_binary(s)
     end
 
     # A BLOB cell reads back as `Bytes`; `to_s` would render the slice,

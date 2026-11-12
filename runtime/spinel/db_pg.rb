@@ -1493,19 +1493,41 @@ module Db
     Db.bytea_decode(v)
   end
 
-  # `\x` + hex pairs to the bytes they spell, as an ASCII-8BIT string
-  # (what Rails reads a bytea as); anything else (a value stored before
-  # the column was bytea) as it is.
+  # A bytea cell in the text result format, to the bytes it spells, as
+  # an ASCII-8BIT string (what Rails reads a bytea as). The server writes
+  # `\x` + hex pairs by default, and bytea's older escape format (`\\`
+  # for a backslash, `\ooo` octal for a non-printable byte, everything
+  # else as itself) when `bytea_output` is set to `escape`.
   def self.bytea_decode(s)
-    return s if !s.start_with?("\\x")
     out = "".dup
-    i = 2
     n = s.bytesize
-    while i + 1 < n
-      out = out + (PgUrl.hex(s.getbyte(i)) * 16 + PgUrl.hex(s.getbyte(i + 1))).chr
-      i += 2
+    if s.start_with?("\\x")
+      i = 2
+      while i + 1 < n
+        out = out + (PgUrl.hex(s.getbyte(i)) * 16 + PgUrl.hex(s.getbyte(i + 1))).chr
+        i += 2
+      end
+      return out.force_encoding("ASCII-8BIT")
+    end
+    i = 0
+    while i < n
+      b = s.getbyte(i)
+      if b == 92 && i + 1 < n && s.getbyte(i + 1) == 92
+        out = out + 92.chr
+        i += 2
+      elsif b == 92 && i + 3 < n && Db.octal_digit?(s.getbyte(i + 1)) && Db.octal_digit?(s.getbyte(i + 2)) && Db.octal_digit?(s.getbyte(i + 3))
+        out = out + (((s.getbyte(i + 1) - 48) * 64) + ((s.getbyte(i + 2) - 48) * 8) + (s.getbyte(i + 3) - 48)).chr
+        i += 4
+      else
+        out = out + b.chr
+        i += 1
+      end
     end
     out.force_encoding("ASCII-8BIT")
+  end
+
+  def self.octal_digit?(b)
+    b >= 48 && b <= 55
   end
 
   def self.escape_int_opt(n)

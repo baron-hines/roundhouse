@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -543,11 +544,13 @@ func Db_escape_string_opt(s *string) string {
 
 // `t.binary` columns: a Go string holds bytes as they are
 // (`Digest::BLAKE3` is not emitted for this target). One holding a NUL
-// is written as an `X'…'` blob literal, since a NUL inside a quoted
-// literal ends the SQL text; anything else is the text literal. A BLOB
-// cell scans as []byte, which Db_column_text already converts.
+// or bytes that are not UTF-8 is written as an `X'…'` blob literal: a
+// NUL inside a quoted literal ends the SQL text, and Db_escape_string's
+// rune loop would replace an invalid byte with U+FFFD. Anything else is
+// the text literal. A BLOB cell scans as []byte, which Db_column_text
+// already converts byte for byte.
 func Db_escape_binary(s string) string {
-	if !strings.ContainsRune(s, 0) {
+	if !strings.ContainsRune(s, 0) && utf8.ValidString(s) {
 		return Db_escape_string(s)
 	}
 	return "X'" + strings.ToUpper(hex.EncodeToString([]byte(s))) + "'"

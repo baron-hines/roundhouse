@@ -501,11 +501,14 @@ The other shims treat a value as its UTF-8 bytes (none of them emits
 `Digest::BLAKE3`). Crystal, C#, Elixir, Go, Kotlin and Python write
 `X'…'` when the value holds a NUL, since a NUL inside a quoted literal
 ends the SQL text (Python's sqlite3 refuses it outright), and the text
-literal otherwise. Crystal and Python decode a BLOB cell, which their
-drivers hand back as bytes, as UTF-8. On PostgreSQL (`db_pg.rb`) the
-column is `bytea`: `escape_binary` writes bytea's hex input format,
-`'\x…'`, and `column_binary` decodes the `\x` hex that the text result
-format returns into an ASCII-8BIT string, as Rails reads it.
+literal otherwise. Go and Elixir, whose strings can hold bytes that are
+not UTF-8, also write `X'…'` for those, and Python for the surrogate
+escapes its reader decodes them to. Crystal, C# and Python decode a BLOB
+cell, which their drivers hand back as bytes, as UTF-8. On PostgreSQL
+(`db_pg.rb`) the column is `bytea`: `escape_binary` writes bytea's hex
+input format, `'\x…'`, and `column_binary` decodes the text result
+format, hex or (under `bytea_output = escape`) the escape format, into
+an ASCII-8BIT string, as Rails reads it.
 
 **Known gaps.**
 - **JRuby** reads a binary column through JDBC `getString`, which

@@ -254,14 +254,17 @@ class Db:
         return "NULL" if s is None else Db.escape_string(s)
 
     # `t.binary` columns: a value is its UTF-8 bytes (`Digest::BLAKE3` is
-    # not emitted for this target). One holding a NUL is written as an
-    # `X'...'` blob literal, since sqlite3 refuses SQL text containing a
-    # NUL; anything else is the text literal.
+    # not emitted for this target), with any byte that is not UTF-8 held
+    # as a surrogate escape (what `column_binary` reads one back as). A
+    # value holding a NUL or such a byte is written as an `X'...'` blob
+    # literal, since sqlite3 refuses SQL text containing a NUL and a
+    # surrogate has no UTF-8 form; anything else is the text literal.
     @staticmethod
     def escape_binary(s: str) -> str:
-        if "\0" not in str(s):
+        s = str(s)
+        if "\0" not in s and not any("\udc80" <= c <= "\udcff" for c in s):
             return Db.escape_string(s)
-        return "X'" + str(s).encode("utf-8").hex().upper() + "'"
+        return "X'" + s.encode("utf-8", errors="surrogateescape").hex().upper() + "'"
 
     @staticmethod
     def escape_binary_opt(s: "str | None") -> str:

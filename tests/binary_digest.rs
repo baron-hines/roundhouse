@@ -53,6 +53,18 @@ fn rust_writes_binary_columns_as_bytes_and_hashes_with_blake3() {
     assert_eq!(test.matches(r#"if false { panic!("{}", "refute failed") };"#).count(), 2, "{test}");
 }
 
+/// A test class that defines its own `assert_respond_to` owns the call:
+/// it is not Minitest's, so it is not folded to `assert(false)`.
+#[test]
+fn a_test_class_assertion_override_is_not_folded() {
+    let test = "require \"test_helper\"\n\nclass SnapshotTest < ActiveSupport::TestCase\n  test \"own assertion\" do\n    snapshot = Snapshot.new\n    assert_respond_to snapshot, :nope\n  end\n\n  #: (Snapshot obj, Symbol name) -> void\n  def assert_respond_to(obj, name)\n    assert true\n  end\nend\n";
+    let (emitted, errors) = binary_digest_app::app().write("test/models/snapshot_test.rb", test).emit(BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let body = std::fs::read_to_string(emitted.join("src/tests/snapshot.rs")).expect("test file");
+    assert!(body.contains(r#"self::assert_respond_to(snapshot, "nope");"#), "{body}");
+    assert!(!body.contains("if !(false)"), "{body}");
+}
+
 /// No `Digest::BLAKE3`, no `blake3` crate: the dependency is the call's.
 #[test]
 fn rust_declares_blake3_only_where_a_body_calls_it() {

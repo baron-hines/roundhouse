@@ -5597,10 +5597,6 @@ fn ruby_family_runtime_files(
     // the ruby family is the one that can run the lines.
     apply_module_mixins(&mut files, app, MixinForm::ExplicitReceiver);
     apply_boot_program(&mut files, app, RequireTarget::RubyFamily);
-    // After the boot program, whose initializers may be the only caller.
-    if flavor == RubyFlavor::CRuby {
-        apply_digest_gem(&mut files);
-    }
     // Overlay boot replaced the spinel boot, so the flags written into
     // that file in `spinel_files` are gone. Write them again here.
     apply_environment_flags(&mut files, app);
@@ -5625,6 +5621,12 @@ fn ruby_family_runtime_files(
     }
     apply_conditional_declarations(&mut files, app);
     apply_file_programs(&mut files, app);
+    // After every pass that writes app code into a file: the boot
+    // program (an initializer may be the only caller) and the file
+    // programs (a top-level statement may be).
+    if flavor == RubyFlavor::CRuby {
+        apply_digest_gem(&mut files);
+    }
     drop_solid_queue_standin(app, &mut files);
     Ok(files)
 }
