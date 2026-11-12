@@ -380,56 +380,57 @@ fn presence_reads_unset(model: &crate::dialect::Model, column: &crate::schema::C
 
 /// The `presence_reads_unset` columns this model's lowering can hold
 /// unset until assigned: a scalar integer (a float, a decimal, a
-/// `t.references` column or an array stays the reported gap) whose
-/// writer and reader are the column's own. Not one the model writes or
-/// reads itself (Rails' `new(attrs)` runs that writer, which takes the
-/// column's type), an enum or a `normalizes` attribute (whose writer
-/// converts the value), nor one `numericality:` also checks (the ruby
-/// family's check reads the raw input the held writer's cast replaces).
+/// `t.references` column or an array stays the reported gap) that
+/// the model leaves alone (`touches_column`).
 fn unset_presence_column(model: &crate::dialect::Model, column: &crate::schema::Column) -> bool {
     use crate::schema::ColumnType;
     matches!(column.col_type, ColumnType::Integer | ColumnType::BigInt)
         && !column.array
         && !column.array_stored
         && presence_reads_unset(model, column)
-        && !crate::lower::model_to_library::model_defines_writer(model, &column.name)
-        && !crate::lower::model_to_library::model_defines_instance_method(model, &column.name)
-        && !model.enums.contains_key(&column.name)
-        && !crate::lower::normalizes::normalizations(model).contains_key(&column.name)
-        && !model.validations().any(|v| {
+        && !touches_column(model, column)
+}
+
+/// Whether the model itself does something with the column a held slot
+/// would change: writes or reads it (Rails' `new(attrs)` runs that
+/// writer, which takes the column's type), declares it an enum or a
+/// `normalizes` attribute (whose writer converts the value), or checks
+/// it with `numericality:` (the ruby family's check reads the raw input
+/// the held writer's cast replaces).
+fn touches_column(model: &crate::dialect::Model, column: &crate::schema::Column) -> bool {
+    crate::lower::model_to_library::model_defines_writer(model, &column.name)
+        || crate::lower::model_to_library::model_defines_instance_method(model, &column.name)
+        || model.enums.contains_key(&column.name)
+        || crate::lower::normalizes::normalizations(model).contains_key(&column.name)
+        || model.validations().any(|v| {
             v.attribute == column.name && v.rules.iter().any(|r| matches!(r, ValidationRule::Numericality { .. }))
         })
 }
 
 /// Whether `model` holds `column` unset: it, or the STI ancestor it
 /// inherits its validations from, checks it as `unset_presence_column`
-/// asks, and it does not write or read the column itself.
+/// asks, and neither it nor any ancestor on the way `touches_column`.
 fn holds_through_hierarchy(models: &[crate::dialect::Model], model: &crate::dialect::Model, column: &crate::schema::Column) -> bool {
-    if unset_presence_column(model, column) {
-        return true;
-    }
-    if crate::lower::model_to_library::model_defines_writer(model, &column.name)
-        || crate::lower::model_to_library::model_defines_instance_method(model, &column.name)
-    {
-        return false;
-    }
-    let mut parent = model.parent.as_ref();
+    let mut current = model;
     let mut seen = 0;
-    while let Some(name) = parent {
+    loop {
+        if touches_column(current, column) {
+            return false;
+        }
+        if unset_presence_column(current, column) {
+            return true;
+        }
+        let Some(name) = current.parent.as_ref() else { return false };
         let Some(ancestor) = models.iter().find(|m| m.name == *name) else { return false };
         if ancestor.table != model.table {
             return false;
-        }
-        if unset_presence_column(ancestor, column) {
-            return true;
         }
         seen += 1;
         if seen > models.len() {
             return false;
         }
-        parent = ancestor.parent.as_ref();
+        current = ancestor;
     }
-    false
 }
 
 /// Each target's lowering holds each `unset_presence_column` nilable,

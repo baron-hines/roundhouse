@@ -95,8 +95,9 @@ fn rust_holds_the_columns_unset_and_probes_each_rule() {
 /// The shapes a target does not lower stay the reported gap. `presence:`
 /// (every target) on a NOT NULL float; on an integer the model writes
 /// through its own `<col>=`; on an enum; on one `numericality:` also
-/// checks; on one whose `<col>_raw` name another column has; and on one
-/// a second model over the same table does not check. `uniqueness:` (a
+/// checks, directly or in an STI subclass of the model with `presence:`;
+/// on one whose `<col>_raw` name another column has; and on one a second
+/// model over the same table does not check. `uniqueness:` (a
 /// strict target) over a temporal column, a float, a column the model
 /// reads itself, or a keyless table.
 #[test]
@@ -113,7 +114,6 @@ fn unlowered_shapes_stay_reported() {
   validates :status, presence: true
   validates :qty, presence: true, numericality: { greater_than: 0 }
   validates :bin, presence: true
-  validates :shelf, presence: true
   validates :label, uniqueness: true
 
   def count=(value)
@@ -126,7 +126,10 @@ fn unlowered_shapes_stay_reported() {
   end
 end
 "#)
-            .write("app/models/crate.rb", "class Crate < ApplicationRecord\n  self.table_name = \"parcels\"\nend\n")
+            .write("app/models/box.rb", "class Box < ApplicationRecord\n  validates :depth, presence: true\nend\n")
+            .write("app/models/carton.rb", "class Carton < ApplicationRecord\n  self.table_name = \"boxes\"\nend\n")
+            .write("app/models/item.rb", "class Item < ApplicationRecord\n  validates :size, presence: true\nend\n")
+            .write("app/models/widget.rb", "class Widget < Item\n  validates :size, numericality: { only_integer: true }\nend\n")
             .write("app/models/pair.rb", "class Pair < ApplicationRecord\n  validates :left, uniqueness: true\nend\n")
             .write("db/schema.rb", r#"ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do
   create_table "parcels", force: :cascade do |t|
@@ -137,8 +140,14 @@ end
     t.integer "qty", null: false
     t.integer "bin", null: false
     t.integer "bin_raw"
-    t.integer "shelf", null: false
     t.string "label"
+  end
+  create_table "boxes", force: :cascade do |t|
+    t.integer "depth", null: false
+  end
+  create_table "items", force: :cascade do |t|
+    t.string "type"
+    t.integer "size", null: false
   end
   create_table "pairs", id: false, force: :cascade do |t|
     t.string "left"
@@ -146,8 +155,17 @@ end
 end
 "#)
             .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+            .write("test/models/widget_test.rb", r#"require "test_helper"
+
+class WidgetTest < ActiveSupport::TestCase
+  test "an inherited presence check leaves the subclass's numericality the raw input" do
+    refute_predicate Widget.new(size: "abc"), :valid?
+    assert_predicate Widget.new(size: 3), :valid?
+  end
+end
+"#)
     };
-    let presence = ["weight", "count", "status", "qty", "bin", "shelf"];
+    let presence = ["weight", "count", "status", "qty", "bin", "depth", "size"];
     let uniqueness = ["weight", "shipped_at", "label", "left"];
     let warnings = validates_warnings(overlay(), BuildTarget::Rust);
     for attr in presence {
@@ -164,6 +182,8 @@ end
     let ruby = validates_warnings(overlay(), BuildTarget::Ruby);
     assert_eq!(ruby.len(), presence.len(), "{ruby:?}");
     assert!(ruby.iter().all(|w| w.contains(", presence: not supported (ruby)")), "{ruby:?}");
+    // Left unheld, the subclass's numericality reads the raw `"abc"`.
+    overlay().run_test("test/models/widget_test.rb").assert_passes();
 }
 
 /// The app's tests, as Rails runs them: the ruby target's runtime

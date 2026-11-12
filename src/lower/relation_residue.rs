@@ -234,7 +234,7 @@ pub fn uniqueness_gaps_for_target(app: &App, target: crate::build_target::BuildT
                 item.span(),
                 Some(crate::ident::Symbol::from(target.as_str())),
                 format!("validates :{}, uniqueness:", validation.attribute.as_str()),
-                "this target compares a uniqueness query over plain scalar columns only, and one of these is temporal, JSON, an enum, an array or a polymorphic association; Rails rejects records this build saves",
+                "this target compares a uniqueness query over plain scalar columns of a keyed table only, and one of these is temporal, JSON, a float or decimal, an enum, an array, a polymorphic association or a column the model reads itself, or the table has no key; Rails rejects records this build saves",
             );
             d.severity = crate::diagnostic::Severity::Warning;
             out.push(d);
