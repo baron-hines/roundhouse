@@ -205,6 +205,10 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "emit_and_run/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_method_require.rs"]
+mod gem_method_require_contract;
+#[path = "emit_and_run/gem_method_require.rs"]
+mod gem_method_require;
 #[path = "emit_and_run/pay_exceptions.rs"]
 mod pay_exceptions;
 #[path = "emit_and_run/net_http_patch.rs"]

@@ -312,6 +312,10 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "spinel_toolchain/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_method_require.rs"]
+mod gem_method_require_contract;
+#[path = "spinel_toolchain/gem_method_require.rs"]
+mod gem_method_require;
 #[path = "support/untyped_calendar.rs"]
 mod untyped_calendar_contract;
 #[path = "spinel_toolchain/untyped_calendar.rs"]
