@@ -43,16 +43,27 @@ module ActionView
         html = defaults.merge(html)
         options = options.merge(url: options[:url] || polymorphic_path(record), method: options[:method] || method)
       end
+      # Not answered here: the routes resolve a controller/action Hash at transpile time, not on the view.
+      raise NotImplementedError, "form_for with a url: Hash (#{options[:url].inspect}) is not modeled" if options[:url].is_a?(Hash)
       builder_class = options[:builder] || Helpers::FormBuilder
-      builder = builder_class.new(object_name, object, self, options.except(:builder, :html, :url, :method, :as, :namespace))
+      builder_options = options.except(:builder, :html, :url, :method).merge(skip_default_ids: false, allow_method_names_outside_object: options.fetch(:allow_method_names_outside_object, false))
+      builder = builder_class.new(object_name, object, self, builder_options)
       body = capture(builder, &block)
       method = (html.delete(:method) || options[:method] || :post).to_s
       html[:enctype] = "multipart/form-data" if html.delete(:multipart) || builder.multipart?
       html[:action] = options[:url].is_a?(String) ? options[:url] : polymorphic_path(options[:url])
       html[:"accept-charset"] = "UTF-8"
       html[:method] = method == "get" ? "get" : "post"
-      extra = method == "get" ? "" : ActionView::ViewHelpers.method_override_input(method) + ActionView::ViewHelpers.csrf_token_hidden_input
+      extra = method == "get" ? "" : ActionView::ViewHelpers.method_override_input(method) + token_tag(options.key?(:authenticity_token) ? options[:authenticity_token] : html.delete(:authenticity_token))
       "<form#{ActionView::ViewHelpers.render_attrs(Helpers::FormBuilder.tag_options(html))}>#{extra}#{body}</form>".html_safe
+    end
+
+    # Rails' `token_tag`: none for `authenticity_token: false`, the given token, else the session's.
+    def token_tag(token)
+      return "" if token == false
+      default = ActionView::ViewHelpers.csrf_token_hidden_input
+      return default if token.nil? || token == true || default.empty?
+      tag(:input, "type" => "hidden", "name" => "authenticity_token", "value" => token, "autocomplete" => "off")
     end
 
     # Rails' `polymorphic_path` for a record, a class or a nesting of them, by the app's route helpers: the
@@ -125,15 +136,17 @@ module ActionView
   end
 
   module Helpers
+    # Rails 8.1's FormBuilder: each field is the view's helper of the same name, which renders the `Tags::*` class
+    # (`action_view_tags.rb`) with the builder's object and default options.
     class FormBuilder
-      attr_reader :object, :object_name, :options
+      attr_reader :object, :object_name, :options, :index
 
       def initialize(object_name, object, template, options)
         @object_name = object_name
         @object = object
         @template = template
         @options = options
-        @default_options = options.slice(:index, :namespace, :skip_default_ids, :allow_method_names_outside_object)
+        @default_options = options ? options.slice(:index, :namespace, :skip_default_ids, :allow_method_names_outside_object) : {}
         @default_html_options = @default_options.except(:skip_default_ids, :allow_method_names_outside_object)
         @multipart = nil
         @index = options[:index] || options[:child_index]
@@ -158,149 +171,81 @@ module ActionView
         "<#{n}#{ActionView::ViewHelpers.render_attrs(tag_options(options))}>#{ActionView::ViewHelpers.content_tag_pre(n)}#{body}</#{n}>".html_safe
       end
 
-      # Rails' `Tags::Base#tag_id`: the name with each run of other characters an underscore.
-      def field_id(method)
-        object = @object_name.to_s.gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").delete_suffix("_")
-        object.empty? ? method.to_s.delete_suffix("?") : "#{object}_#{method.to_s.delete_suffix("?")}"
+      def field_id(method, *suffixes, namespace: @options[:namespace], index: @options[:index])
+        @template.field_id(@object_name, method, *suffixes, namespace: namespace, index: index)
       end
 
-      def field_name(method)
-        @object_name.to_s.empty? ? method.to_s.delete_suffix("?") : "#{@object_name}[#{method.to_s.delete_suffix("?")}]"
+      def field_name(method, *methods, multiple: false, index: @options[:index])
+        @template.field_name(@options.fetch(:as) { @object_name }, method, *methods, index: index, multiple: multiple)
       end
 
-      %w[text password email url telephone phone number search color range date time datetime_local month week].each do |kind|
-        type = { "telephone" => "tel", "phone" => "tel", "datetime_local" => "datetime-local" }.fetch(kind, kind)
-        define_method("#{kind}_field") { |method, options = {}| tag_for_input(type, method, options) }
+      %i[text_field password_field email_field url_field telephone_field phone_field number_field range_field search_field
+         color_field date_field time_field datetime_field datetime_local_field month_field week_field text_area textarea].each do |selector|
+        define_method(selector) { |method, options = {}| @template.public_send(selector, @object_name, method, objectify_options(options)) }
       end
 
       def hidden_field(method, options = {})
-        tag_for_input("hidden", method, { "autocomplete" => "off" }.merge(FormBuilder.stringify(options)))
+        @template.hidden_field(@object_name, method, objectify_options(options))
       end
 
-      def text_area(method, options = {})
-        opts = FormBuilder.stringify(options)
-        value = opts.key?("value") ? opts.delete("value") : value_for_tag(method)
-        opts["name"] ||= field_name(method)
-        opts["id"] ||= field_id(method)
-        wrap_field_errors(method, FormBuilder.tag_html(:textarea, value, opts))
+      def checkbox(method, options = {}, checked_value = "1", unchecked_value = "0")
+        @template.checkbox(@object_name, method, objectify_options(options), checked_value, unchecked_value)
       end
-      alias textarea text_area
+      alias check_box checkbox
 
-      # Rails' `Tags::CheckBox`: a `checked:` given wins over the record, and the hidden input takes the box's name,
-      # `disabled` and `form` unless `include_hidden: false`.
-      def check_box(method, options = {}, checked_value = "1", unchecked_value = "0")
-        opts = FormBuilder.stringify(options)
-        opts["type"] = "checkbox"
-        opts["value"] = checked_value
-        checked = if opts.key?("checked")
-          given = opts.delete("checked")
-          given == true || given == "checked"
-        else
-          current = value_for_tag(method)
-          current == true || (!current.nil? && current != false && current.to_s == checked_value.to_s)
-        end
-        opts["checked"] = "checked" if checked
-        opts["name"] ||= field_name(method)
-        opts["id"] ||= field_id(method)
-        include_hidden = opts.key?("include_hidden") ? opts.delete("include_hidden") : true
-        box = @template.tag(:input, opts)
-        return wrap_field_errors(method, box) unless include_hidden && !unchecked_value.nil?
-        hidden = @template.tag(:input, opts.slice("name", "disabled", "form").merge("type" => "hidden", "value" => unchecked_value, "autocomplete" => "off"))
-        wrap_field_errors(method, (hidden + box).html_safe)
-      end
-      alias checkbox check_box
-
-      # Rails' `Tags::RadioButton`: the id carries the value, sanitized.
       def radio_button(method, tag_value, options = {})
-        opts = FormBuilder.stringify(options)
-        opts.delete("skip_default_ids")
-        opts["type"] = "radio"
-        opts["value"] = tag_value
-        checked = opts.key?("checked") ? opts.delete("checked") : value_for_tag(method).to_s == tag_value.to_s
-        opts["checked"] = "checked" if checked == true || checked == "checked"
-        opts["name"] ||= field_name(method)
-        opts["id"] ||= "#{field_id(method)}_#{tag_value.to_s.gsub(/[\s.]/, "_").gsub(/[^-[[:word:]]]/, "").downcase}"
-        wrap_field_errors(method, @template.tag(:input, opts))
+        @template.radio_button(@object_name, method, tag_value, objectify_options(options))
       end
 
-      # Rails' `Tags::Label`: the text given, else the attribute's human name.
       def label(method, text = nil, options = {}, &block)
-        options, text = text, nil if text.is_a?(Hash)
-        opts = FormBuilder.stringify(options)
-        content = block ? @template.capture(&block) : (text || human_attribute_for_tag(method))
-        opts["for"] ||= field_id(method)
-        wrap_field_errors(method, FormBuilder.tag_html(:label, content, opts))
+        @template.label(@object_name, method, text, objectify_options(options), &block)
       end
 
       def submit(value = nil, options = {})
-        options, value = value, nil if value.is_a?(Hash)
+        value, options = nil, value if value.is_a?(Hash)
         @template.submit_tag(value || submit_default_value, options)
       end
 
       def button(value = nil, options = {}, &block)
-        options, value = value, nil if value.is_a?(Hash)
-        content = block ? @template.capture(&block) : (value || submit_default_value)
-        @template.button_tag(content, options)
+        case value
+        when Hash
+          value, options = nil, value
+        when Symbol
+          value, options = nil, { name: field_name(value), id: field_id(value) }.merge!(options.to_h)
+        end
+        value ||= submit_default_value
+        value = @template.capture { yield(value) } if block
+        formmethod = options[:formmethod]
+        if formmethod && !formmethod.to_s.empty? && !/post|get/i.match?(formmethod.to_s) && !options.key?(:name) && !options.key?(:value)
+          options = options.merge(formmethod: :post, name: "_method", value: formmethod)
+        end
+        @template.button_tag(value, options)
       end
 
       private
 
-      # Rails' `Tags::TextField` and its subclasses: `NumberField`'s `in:` as `min`/`max`, `DatetimeField`'s value
-      # in the input's own format.
-      def tag_for_input(type, method, options)
-        opts = FormBuilder.stringify(options)
-        if %w[number range].include?(type) && (range = opts.delete("in") || opts.delete("within"))
-          opts = { "min" => range.min, "max" => range.max }.merge(opts)
-        end
-        # Not after `type`: Rails' DatetimeField writes the value into the options before TextField adds the type.
-        if (format = { "date" => "%Y-%m-%d", "datetime-local" => "%Y-%m-%dT%T", "month" => "%Y-%m", "week" => "%Y-W%V", "time" => "%T.%L" }[type])
-          value = opts.key?("value") ? opts["value"] : value_for_tag(method)
-          opts["value"] = value.respond_to?(:strftime) ? value.strftime(format) : value
-        end
-        opts["size"] = opts["maxlength"] unless opts.key?("size")
-        opts["type"] ||= type
-        opts["value"] = opts.key?("value") ? opts["value"] : value_for_tag(method) unless type == "password"
-        opts["name"] ||= field_name(method)
-        opts["id"] ||= field_id(method)
-        wrap_field_errors(method, @template.tag(:input, opts))
-      end
-
-      # Rails' `value_before_type_cast`, else the reader's value.
-      def value_for_tag(method)
-        return nil if @object.nil?
-        cast = "#{method}_before_type_cast"
-        return @object.public_send(cast) if @object.respond_to?(cast)
-        @object.respond_to?(method) ? @object.public_send(method) : nil
-      end
-
-      # Rails' default `field_error_proc`.
-      def wrap_field_errors(method, html)
-        return html unless field_errors?(method)
-        @template.instance_exec(html, self, &ActionView::Base.field_error_proc)
+      def objectify_options(options)
+        result = @default_options.merge(options)
+        result[:object] = @object
+        result
       end
 
       def convert_to_model(object)
         object.respond_to?(:to_model) ? object.to_model : object
       end
 
-      def field_errors?(method)
-        return false if @object.nil?
-        return @object.error_messages_for(method.to_s).any? if @object.respond_to?(:error_messages_for)
-        @object.respond_to?(:errors) && @object.errors[method].any?
-      end
-
-      def human_attribute_for_tag(method)
-        klass = @object&.class
-        return klass.human_attribute_name(method.to_s) if klass.respond_to?(:human_attribute_name)
-        ActiveSupport.humanize(method.to_s)
-      end
-
       # Rails' `submit_default_value`: Create or Update, and the model's human name.
       def submit_default_value
-        return "Save changes" if @object.nil?
-        model = @object.class.respond_to?(:model_name) ? @object.class.model_name.human : ActiveSupport.humanize(@object_name.to_s)
-        persisted = @object.respond_to?(:persisted?) && @object.persisted?
-        "#{persisted ? "Update" : "Create"} #{model}"
+        object = convert_to_model(@object)
+        key = object ? (object.respond_to?(:persisted?) && object.persisted? ? "Update" : "Create") : "Submit"
+        model = if object.respond_to?(:model_name)
+          object.model_name.human
+        elsif object.class.respond_to?(:model_name)
+          object.class.model_name.human
+        else
+          ActiveSupport.humanize(@object_name.to_s)
+        end
+        "#{key} #{model}"
       end
     end
   end

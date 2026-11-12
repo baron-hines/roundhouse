@@ -22,16 +22,27 @@ module ActionView
       end
     end
 
+    # Rails' FormHelper: each field the `Tags::*` class of its name renders.
+    { text_field: "TextField", password_field: "PasswordField", hidden_field: "HiddenField", email_field: "EmailField",
+      url_field: "UrlField", telephone_field: "TelField", search_field: "SearchField", color_field: "ColorField",
+      number_field: "NumberField", range_field: "RangeField", date_field: "DateField", time_field: "TimeField",
+      datetime_field: "DatetimeLocalField", datetime_local_field: "DatetimeLocalField", month_field: "MonthField",
+      week_field: "WeekField", text_area: "TextArea" }.each do |helper, tag|
+      define_method(helper) { |object_name, method, options = {}| Helpers::Tags.const_get(tag).new(object_name, method, self, options).render }
+    end
+    alias phone_field telephone_field
+    alias textarea text_area
+
     def label(object_name, method, content_or_options = nil, options = nil, &block)
-      view_builder(object_name, options || (content_or_options.is_a?(Hash) ? content_or_options : {})).label(method, content_or_options, options || {}, &block)
+      Helpers::Tags::Label.new(object_name, method, self, content_or_options, options).render(&block)
     end
 
     def radio_button(object_name, method, tag_value, options = {})
-      view_builder(object_name, options).radio_button(method, tag_value, options)
+      Helpers::Tags::RadioButton.new(object_name, method, self, tag_value, options).render
     end
 
     def checkbox(object_name, method, options = {}, checked_value = "1", unchecked_value = "0")
-      view_builder(object_name, options).check_box(method, options, checked_value, unchecked_value)
+      Helpers::Tags::CheckBox.new(object_name, method, self, checked_value, unchecked_value, options).render
     end
     alias check_box checkbox
 
@@ -57,9 +68,6 @@ module ActionView
       name.to_s.delete("]").tr("^-a-zA-Z0-9:.", "_")
     end
 
-    def view_builder(object_name, options)
-      Helpers::FormBuilder.new(object_name, options.is_a?(Hash) ? options.delete(:object) : nil, self, {})
-    end
   end
 
   module Helpers
@@ -77,7 +85,9 @@ module ActionView
 
     module Tags
       class Base
-        attr_reader :object
+        def object
+          @active_model_object ||= @object.respond_to?(:to_model) ? @object.to_model : @object
+        end
 
         def initialize(object_name, method_name, template_object, options = {})
           @object_name, @method_name = object_name.to_s.dup, method_name.to_s.dup
@@ -102,8 +112,42 @@ module ActionView
 
         private
 
+        # Rails' ActiveModelInstanceTag: a field of an attribute with errors runs `field_error_proc`, a hidden one not.
         def tag(name, options)
-          @template_object.tag(name, options)
+          html = @template_object.tag(name, options)
+          options["type"] == "hidden" ? html : error_wrapping(html)
+        end
+
+        def content_tag(name, content, options)
+          error_wrapping(@template_object.content_tag(name, content, options))
+        end
+
+        def error_wrapping(html_tag)
+          return html_tag unless object_has_errors?
+          @template_object.instance_exec(html_tag, self, &ActionView::Base.field_error_proc)
+        end
+
+        def error_message
+          object.errors[@method_name]
+        end
+
+        def object_has_errors?
+          object.respond_to?(:errors) && object.errors.respond_to?(:[]) && error_message.present?
+        end
+
+        def value_before_type_cast
+          return unless object
+          method_before_type_cast = @method_name + "_before_type_cast"
+          if value_came_from_user? && object.respond_to?(method_before_type_cast)
+            object.public_send(method_before_type_cast)
+          else
+            value
+          end
+        end
+
+        def value_came_from_user?
+          method_name = "#{@method_name}_came_from_user?"
+          !object.respond_to?(method_name) || object.public_send(method_name)
         end
 
         def value
@@ -179,6 +223,280 @@ module ActionView
 
         def generate_ids?
           !@skip_default_ids
+        end
+      end
+
+      # Rails' `Tags::Placeholderable`: `placeholder: true` is the attribute's human name.
+      module Placeholderable
+        def initialize(*)
+          super
+          tag_value = @options[:placeholder]
+          return unless tag_value
+          @options[:placeholder] = tag_value.is_a?(String) ? tag_value : Translator.new(object, @object_name, tag_value.is_a?(TrueClass) ? @method_name : "#{@method_name}.#{tag_value}").translate
+        end
+      end
+
+      # Rails' `Tags::Translator`, by the model's `human_attribute_name`; the `helpers.label` I18n lookup is not modeled.
+      class Translator
+        def initialize(object, object_name, method_and_value)
+          @model = object.respond_to?(:to_model) ? object.to_model : nil
+          @method_and_value = method_and_value
+        end
+
+        def translate
+          name = @model.class.human_attribute_name(@method_and_value) if @model && @model.class.respond_to?(:human_attribute_name)
+          name || ActiveSupport.humanize(@method_and_value.to_s)
+        end
+      end
+
+      class TextField < Base
+        include Placeholderable
+
+        def self.field_type
+          @field_type ||= name.split("::").last.sub("Field", "").downcase
+        end
+
+        def render
+          options = @options.transform_keys(&:to_s)
+          options["size"] = options["maxlength"] unless options.key?("size")
+          options["type"] ||= field_type
+          options["value"] = options.fetch("value") { value_before_type_cast } unless field_type == "file"
+          add_default_name_and_field(options)
+          tag("input", options)
+        end
+
+        private
+
+        def field_type
+          self.class.field_type
+        end
+      end
+
+      class PasswordField < TextField
+        def render
+          @options = { value: nil }.merge!(@options)
+          super
+        end
+      end
+
+      class HiddenField < TextField
+        def render
+          @options = { autocomplete: "off" }.merge(@options)
+          super
+        end
+      end
+
+      class EmailField < TextField; end
+      class UrlField < TextField; end
+      class TelField < TextField; end
+      class SearchField < TextField; end
+      class ColorField < TextField; end
+
+      class NumberField < TextField
+        def render
+          options = @options.transform_keys(&:to_s)
+          if (range = options.delete("in") || options.delete("within"))
+            options.update("min" => range.min, "max" => range.max)
+          end
+          @options = options
+          super
+        end
+      end
+
+      class RangeField < NumberField; end
+
+      class DatetimeField < TextField
+        def render
+          options = @options.transform_keys(&:to_s)
+          options["value"] = datetime_value(options.fetch("value") { value })
+          options["min"] = format_datetime(parse_datetime(options["min"]))
+          options["max"] = format_datetime(parse_datetime(options["max"]))
+          @options = options
+          super
+        end
+
+        private
+
+        def datetime_value(value)
+          value.is_a?(String) ? value : format_datetime(value)
+        end
+
+        def parse_datetime(value)
+          value.is_a?(String) ? (DateTime.parse(value) rescue nil) : value
+        end
+      end
+
+      class DateField < DatetimeField
+        private def format_datetime(value) = value&.strftime("%Y-%m-%d")
+      end
+
+      class DatetimeLocalField < DatetimeField
+        def self.field_type = "datetime-local"
+
+        def initialize(object_name, method_name, template_object, options = {})
+          @include_seconds = options.delete(:include_seconds) { true }
+          super
+        end
+
+        private def format_datetime(value) = value&.strftime(@include_seconds ? "%Y-%m-%dT%T" : "%Y-%m-%dT%H:%M")
+      end
+
+      class TimeField < DatetimeField
+        def initialize(object_name, method_name, template_object, options = {})
+          @include_seconds = options.delete(:include_seconds) { true }
+          super
+        end
+
+        private def format_datetime(value) = value&.strftime(@include_seconds ? "%T.%L" : "%H:%M")
+      end
+
+      class MonthField < DatetimeField
+        private def format_datetime(value) = value&.strftime("%Y-%m")
+      end
+
+      class WeekField < DatetimeField
+        private def format_datetime(value) = value&.strftime("%G-W%V")
+      end
+
+      class TextArea < Base
+        include Placeholderable
+
+        def render
+          options = @options.transform_keys(&:to_s)
+          add_default_name_and_field(options)
+          if (size = options.delete("size")) && size.respond_to?(:split)
+            options["cols"], options["rows"] = size.split("x")
+          end
+          content_tag("textarea", options.delete("value") { value_before_type_cast }, options)
+        end
+      end
+
+      module Checkable
+        def input_checked?(options)
+          if options.key?("checked")
+            checked = options.delete("checked")
+            checked == true || checked == "checked"
+          else
+            checked?(value)
+          end
+        end
+      end
+
+      class CheckBox < Base
+        include Checkable
+
+        def initialize(object_name, method_name, template_object, checked_value, unchecked_value, options)
+          @checked_value = checked_value
+          @unchecked_value = unchecked_value
+          super(object_name, method_name, template_object, options)
+        end
+
+        def render
+          options = @options.transform_keys(&:to_s)
+          options["type"] = "checkbox"
+          options["value"] = @checked_value
+          options["checked"] = "checked" if input_checked?(options)
+          if options["multiple"]
+            add_default_name_and_field_for_value(@checked_value, options)
+            options.delete("multiple")
+          else
+            add_default_name_and_field(options)
+          end
+          include_hidden = options.key?("include_hidden") ? options.delete("include_hidden") : true
+          checkbox = tag("input", options)
+          include_hidden ? (hidden_field_for_checkbox(options) + checkbox).html_safe : checkbox
+        end
+
+        private
+
+        def checked?(value)
+          case value
+          when TrueClass, FalseClass then value == !!@checked_value
+          when NilClass then false
+          when String then value == @checked_value
+          else
+            value.respond_to?(:include?) ? value.include?(@checked_value) : value.to_i == @checked_value.to_i
+          end
+        end
+
+        def hidden_field_for_checkbox(options)
+          return "".html_safe unless @unchecked_value
+          tag("input", options.slice("name", "disabled", "form").merge!("type" => "hidden", "value" => @unchecked_value, "autocomplete" => "off"))
+        end
+      end
+
+      class RadioButton < Base
+        include Checkable
+
+        def initialize(object_name, method_name, template_object, tag_value, options)
+          @tag_value = tag_value
+          super(object_name, method_name, template_object, options)
+        end
+
+        def render
+          options = @options.transform_keys(&:to_s)
+          options["type"] = "radio"
+          options["value"] = @tag_value
+          options["checked"] = "checked" if input_checked?(options)
+          add_default_name_and_field_for_value(@tag_value, options)
+          tag("input", options)
+        end
+
+        private
+
+        def checked?(value)
+          value.to_s == @tag_value.to_s
+        end
+      end
+
+      class Label < Base
+        class LabelBuilder
+          attr_reader :object
+
+          def initialize(template_object, object_name, method_name, object, tag_value)
+            @template_object = template_object
+            @object_name = object_name
+            @method_name = method_name
+            @object = object
+            @tag_value = tag_value
+          end
+
+          def translation
+            Translator.new(object, @object_name, @tag_value.present? ? "#{@method_name}.#{@tag_value}" : @method_name).translate
+          end
+
+          def to_s
+            translation
+          end
+        end
+
+        def initialize(object_name, method_name, template_object, content_or_options = nil, options = nil)
+          options ||= {}
+          if content_or_options.is_a?(Hash)
+            options = options.merge(content_or_options)
+            @content = nil
+          else
+            @content = content_or_options
+          end
+          super(object_name, method_name, template_object, options)
+        end
+
+        def render(&block)
+          options = @options.transform_keys(&:to_s)
+          tag_value = options.delete("value")
+          add_default_name_and_field_for_value(tag_value, options, "for")
+          options.delete("index")
+          options.delete("name")
+          options.delete("namespace")
+          builder = LabelBuilder.new(@template_object, @object_name, @method_name, object, tag_value)
+          content = if block
+            @template_object.capture(builder, &block)
+          elsif @content.present?
+            @content.to_s
+          else
+            builder.translation
+          end
+          error_wrapping(@template_object.label_tag(options["for"], content, options))
         end
       end
 
