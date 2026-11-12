@@ -907,7 +907,9 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
         // The suites run side by side, so in any order.
         let mut ran: Vec<String> = fs::read_to_string(log).unwrap().lines().map(String::from).collect();
         ran.sort();
-        let mut expected: Vec<&str> = expected_log.lines().collect();
+        // Not one run per suite: each first runs to record its shareable Spinel cases (`RH_SPINEL_BUNDLE_COLLECT`).
+        let collected: Vec<String> = expected_log.lines().map(|l| l.replace(" --nocapture", "")).collect();
+        let mut expected: Vec<&str> = expected_log.lines().chain(collected.iter().map(String::as_str)).collect();
         expected.sort();
         assert_eq!(ran, expected, "{result:?}");
     }
