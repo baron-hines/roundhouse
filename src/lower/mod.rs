@@ -1015,7 +1015,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("inquiry");
     has_one_builder::apply_has_one_builder_lowering(app);
     ran!("has_one_builder");
-    config_reader::apply_config_reader_lowering(app);
+    config_reader::apply_config_reader_lowering_for(app, target);
     ran!("config_reader");
     ran!("symbolize_keys");
     enum_mapping_keys::apply_enum_mapping_keys(app);

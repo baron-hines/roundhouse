@@ -62,6 +62,21 @@ def git_repository():
             os.chdir(previous)
 
 
+class UntypedKeyConversionCoverage(unittest.TestCase):
+    def test_key_conversion_lowering_and_helpers_run_the_native_suite(self):
+        for path in [
+            "src/lower/symbolize_keys.rs",
+            "src/lower/config_reader.rs",
+            "src/lower/mod.rs",
+            "runtime/ruby/active_support_ext.rb",
+            "tests/untyped_key_conversion.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("untyped_key_conversion", plan["spinel_tests"])
+
+
 class EncryptsRefusalCoverage(unittest.TestCase):
     def test_model_encryption_refusal_runs_in_the_unit_floor(self):
         # These are CLI emission checks; they do not require native compilation.
