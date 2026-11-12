@@ -81,6 +81,8 @@ struct Decl {
 struct ScopeReads {
     scope: bool,
     current_user: bool,
+    /// `self.scope = x`: the gem's writer.
+    writes_scope: bool,
 }
 
 impl ScopeReads {
@@ -457,12 +459,17 @@ fn collect_fields(class: &ruby_prism::ClassNode<'_>, source: &SourceFile) -> Ing
 fn synthesize(class: &mut LibraryClass, decl: &Decl) -> IngestResult<()> {
     let mut src = String::new();
     src.push_str(&format!("class {}\n", class.name.0));
-    src.push_str("  def initialize(object, options = {})\n    @object = object\n    @instance_options = options\n  end\n\n");
+    // The gem's `scope` is an accessor it sets from the `scope:` option
+    // when the serializer is built (`attr_accessor :scope`): a later write
+    // to `instance_options[:scope]` leaves it, and `scope=` changes it.
+    let scoped = decl.reads.any() || decl.reads.writes_scope;
+    let hold = if scoped { "\n    @scope = options[:scope]" } else { "" };
+    src.push_str(&format!("  def initialize(object, options = {{}})\n    @object = object\n    @instance_options = options{hold}\n  end\n\n"));
     src.push_str("  def object\n    @object\n  end\n\n  def instance_options\n    @instance_options\n  end\n");
     // The gem's `scope` is the `scope:` option; `current_user` is the
     // reader the default `serialization_scope :current_user` defines for it.
-    if decl.reads.any() {
-        src.push_str("\n  def scope\n    @instance_options[:scope]\n  end\n");
+    if scoped {
+        src.push_str("\n  def scope\n    @scope\n  end\n\n  def scope=(value)\n    @scope = value\n  end\n");
     }
     if decl.reads.current_user {
         src.push_str("\n  def current_user\n    scope\n  end\n");
@@ -801,8 +808,11 @@ struct GemCalls<'a> {
 impl<'pr> ruby_prism::Visit<'pr> for GemCalls<'_> {
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         let name = constant_id_str(&node.name());
-        let plain = node.receiver().is_none() && node.arguments().is_none() && node.block().is_none();
-        if plain && !self.own.contains(name) && matches!(name, "scope" | "current_user") {
+        let on_self = node.receiver().is_none_or(|r| r.as_self_node().is_some());
+        let plain = on_self && node.arguments().is_none() && node.block().is_none();
+        if on_self && name == "scope=" && !self.own.contains(name) {
+            self.reads.writes_scope = true;
+        } else if plain && !self.own.contains(name) && matches!(name, "scope" | "current_user") {
             if name == "scope" {
                 self.reads.scope = true;
             } else {
@@ -1072,11 +1082,30 @@ fn controller_chain<'a>(app: &'a crate::App, name: &ClassId) -> Vec<&'a crate::d
     chain
 }
 
+/// The framework's controller bases: the end of an app's controller
+/// chain, with no `serialization_scope` of their own.
+fn is_framework_controller(name: &str) -> bool {
+    matches!(name, "ActionController::Base" | "ActionController::API" | "ActionController::Metal")
+}
+
+/// Whether `e` calls `super` (with arguments or without).
+fn calls_super(e: &Expr) -> bool {
+    let mut found = matches!(&*e.node, ExprNode::Super { .. });
+    if !found {
+        e.node.for_each_child(&mut |c| found = found || calls_super(c));
+    }
+    found
+}
+
 fn controller_scope(chain: &[&crate::dialect::Controller]) -> ControllerScope {
     for controller in chain {
         for item in controller.body.iter().rev() {
             let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            let ExprNode::Send { recv, method, args, .. } = &*expr.node else { continue };
+            // `self.serialization_scope x` sets the same class attribute.
+            if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+                continue;
+            }
             if method.as_str() != "serialization_scope" {
                 continue;
             }
@@ -1119,6 +1148,23 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
         .iter()
         .map(|c| {
             let chain = controller_chain(app, &c.name);
+            // The chain ends at the framework's base, or at a parent the
+            // app reads only as a library class (or not at all), whose
+            // `serialization_scope` and `current_user` aren't read: the
+            // scope is then unknown.
+            // An `ApplicationController` the app doesn't define is the
+            // one roundhouse supplies, a bare child of
+            // `ActionController::Base`.
+            let parent = chain.last().and_then(|last| last.parent.as_ref()).map(|p| p.0.as_str().trim_start_matches("::"));
+            let supplied = |name: &str| {
+                name == "ApplicationController"
+                    && !app.library_classes.iter().any(|l| l.name.0.as_str().trim_start_matches("::") == name)
+            };
+            if parent.is_some_and(|p| {
+                !is_framework_controller(p) && !supplied(p) && !chain.iter().any(|c| c.name.0.as_str().trim_start_matches("::") == p)
+            }) {
+                return None;
+            }
             let facts = chain_facts(app, &chain)?;
             // The controller's own `current_user`, or a concern's, sits
             // nearer than Devise's helper.
@@ -1143,6 +1189,13 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
         app.controllers.iter().map(|c| controller_chain(app, &c.name).iter().map(|d| key(&d.name)).collect()).collect();
     let defines: HashMap<String, HashSet<String>> =
         app.controllers.iter().map(|c| (key(&c.name), c.actions().map(|a| a.name.as_str().to_string()).collect())).collect();
+    // The actions whose body calls `super`: an heir's such override runs
+    // its parent's body under its own scope.
+    let supers: HashMap<String, HashSet<String>> = app
+        .controllers
+        .iter()
+        .map(|c| (key(&c.name), c.actions().filter(|a| calls_super(&a.body)).map(|a| a.name.as_str().to_string()).collect()))
+        .collect();
     let action_plans: Vec<HashMap<String, Option<(ControllerScope, Option<bool>, bool)>>> = app
         .controllers
         .iter()
@@ -1154,9 +1207,15 @@ fn rewrite_scoped_renders(app: &mut crate::App, scoped: &HashMap<String, ScopeRe
                     let action = a.name.as_str();
                     let agrees = chains.iter().enumerate().all(|(j, chain)| {
                         let at = chain.iter().position(|d| *d == me);
+                        // Every definer below this controller in the
+                        // heir's chain reaches it through `super`.
                         let inherits = j != i
-                            && at.is_some()
-                            && chain.iter().position(|d| defines.get(d).is_some_and(|names| names.contains(action))) == at;
+                            && at.is_some_and(|at| {
+                                chain[..at].iter().all(|d| {
+                                    !defines.get(d).is_some_and(|names| names.contains(action))
+                                        || supers.get(d).is_some_and(|names| names.contains(action))
+                                })
+                            });
                         !inherits || plans[j] == plans[i]
                     });
                     (action.to_string(), if agrees { plans[i] } else { None })
@@ -1217,6 +1276,20 @@ fn chain_facts(app: &crate::App, chain: &[&crate::dialect::Controller]) -> Optio
     };
     for controller in chain {
         controller.actions().for_each(|a| note(a.name.as_str()));
+        // `attr_reader :current_user` / `attr_accessor`: the reader the
+        // lowering synthesizes later (`collect_attr_accessor_methods`).
+        for item in &controller.body {
+            let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if !matches!(method.as_str(), "attr_reader" | "attr_accessor") {
+                continue;
+            }
+            for arg in args {
+                if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
+                    note(value.as_str());
+                }
+            }
+        }
     }
     let mut pending: Vec<ClassId> =
         chain.iter().flat_map(|c| crate::analyze::controller_include_groups(c)).flatten().collect();
@@ -1249,7 +1322,10 @@ fn chain_facts(app: &crate::App, chain: &[&crate::dialect::Controller]) -> Optio
             let items = app.concern_model_items.iter().filter(|(id, _)| id.0.as_str().trim_start_matches("::") == name);
             for item in items.flat_map(|(_, items)| items) {
                 let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
-                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+                let ExprNode::Send { recv, method, args, .. } = &*expr.node else { continue };
+                if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+                    continue;
+                }
                 match method.as_str() {
                     "serialization_scope" => return None,
                     "include" => {

@@ -560,5 +560,8 @@ fn an_overriding_render_that_calls_super_under_another_scope_stays_reported() {
 fn an_attr_reader_current_user_is_the_scope() {
     let controller = format!("class ArticlesController < ApplicationController\n  attr_reader :current_user\n\n{SHOW}end\n");
     let (_, rendered, _) = emitted(SCOPE_ONLY, &controller);
-    assert!(rendered.contains("{ scope: self.current_user }"), "{rendered}");
+    // The reader is synthesized after the rewrite, so the call keeps its
+    // bare spelling; either one reads `@current_user`.
+    assert!(rendered.contains("{ scope: current_user }") || rendered.contains("{ scope: self.current_user }"), "{rendered}");
+    assert!(rendered.contains("def current_user\n    @current_user\n  end"), "{rendered}");
 }
