@@ -13694,6 +13694,19 @@ fn apply_application_job_queue_adapter(app: &mut App) {
                 warn_sidekiq(format!(
                     "`self.queue_adapter =` in {name} is not honored yet (only ApplicationJob's is read); its jobs use the app's adapter"
                 ));
+            } else if let Some(heir) = app.library_classes.iter().find(|other| {
+                other.parent.as_ref().is_some_and(|p| p.0.as_str().trim_start_matches("::") == name)
+                    && !app.library_classes.iter().any(|same| {
+                        same.name == other.name && same.unknown_calls.iter().any(|c| job_queue_adapter(c).is_some())
+                    })
+            }) {
+                // The class-side lowering honors a literal inline/test
+                // adapter on the job that sets it, not on a subclass that
+                // inherits it: that subclass's jobs still use the app's.
+                warn_sidekiq(format!(
+                    "`self.queue_adapter =` in {name} is honored for {name} only; {} inherits it and its jobs use the app's adapter",
+                    heir.name.0.as_str()
+                ));
             }
         }
     }
