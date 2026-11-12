@@ -2304,6 +2304,17 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_rust.json" \
             --select emit_and_run::render_json_record_writer_runs_on_rust
+      - name: cargo test --test validation_gaps on rust
+        if: ${{ !cancelled() && matrix.target == 'rust' }}
+        env:
+          # One target for every emitted project these steps build, so the dependency graph compiles once.
+          CARGO_BUILD_TARGET_DIR: ${{ runner.temp }}/emitted-rust-target
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_rust.json" \
+            --select validation_gaps::validation_gaps_runs_on_rust
       - name: cargo test --test framework_tests_rust (green subset)
         id: inflector
         if: ${{ !cancelled() && matrix.target == 'rust' }}
@@ -2402,6 +2413,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_crystal.json" \
             --select emit_and_run::render_json_record_writer_runs_on_crystal
+      - name: cargo test --test validation_gaps on crystal
+        if: ${{ !cancelled() && matrix.target == 'crystal' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_crystal.json" \
+            --select validation_gaps::validation_gaps_runs_on_crystal
       - name: cargo test --test framework_tests_kotlin
         if: ${{ !cancelled() && matrix.target == 'kotlin' }}
         run: |
@@ -2418,6 +2437,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_kotlin.json" \
             --select emit_and_run::render_json_record_writer_runs_on_kotlin
+      - name: cargo test --test validation_gaps on kotlin
+        if: ${{ !cancelled() && matrix.target == 'kotlin' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_kotlin.json" \
+            --select validation_gaps::validation_gaps_runs_on_kotlin
       - name: cargo test --test kotlin_toolchain real_blog_i18n_locales_run
         if: ${{ !cancelled() && matrix.target == 'kotlin' }}
         run: |
@@ -2458,6 +2485,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_swift.json" \
             --select emit_and_run::render_json_record_writer_runs_on_swift
+      - name: cargo test --test validation_gaps on swift
+        if: ${{ !cancelled() && matrix.target == 'swift' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_swift.json" \
+            --select validation_gaps::validation_gaps_runs_on_swift
       - name: cargo test --test swift_toolchain real_blog_i18n_locales_run
         if: ${{ !cancelled() && matrix.target == 'swift' }}
         run: |
@@ -2514,6 +2549,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_typescript.json" \
             --select emit_and_run::render_json_record_writer_runs_on_typescript
+      - name: cargo test --test validation_gaps on typescript
+        if: ${{ !cancelled() && matrix.target == 'typescript' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_typescript.json" \
+            --select validation_gaps::validation_gaps_runs_on_typescript
       - name: cargo test --test framework_tests_typescript -- --ignored
         if: ${{ !cancelled() && matrix.target == 'typescript' }}
         run: |
@@ -2538,6 +2581,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_elixir.json" \
             --select emit_and_run::render_json_record_writer_runs_on_elixir
+      - name: cargo test --test validation_gaps on elixir
+        if: ${{ !cancelled() && matrix.target == 'elixir' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_elixir.json" \
+            --select validation_gaps::validation_gaps_runs_on_elixir
       - name: cargo test --test emit_and_run implicit self on rust
         if: ${{ !cancelled() && matrix.target == 'rust' }}
         env:
@@ -2619,6 +2670,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_go.json" \
             --select emit_and_run::render_json_record_writer_runs_on_go
+      - name: cargo test --test validation_gaps on go
+        if: ${{ !cancelled() && matrix.target == 'go' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_go.json" \
+            --select validation_gaps::validation_gaps_runs_on_go
       - name: cargo test --test emit_and_run render json writer on python
         if: ${{ !cancelled() && matrix.target == 'python' }}
         run: |
@@ -2627,6 +2686,14 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_python.json" \
             --select emit_and_run::render_json_record_writer_runs_on_python
+      - name: cargo test --test validation_gaps on python
+        if: ${{ !cancelled() && matrix.target == 'python' }}
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_python.json" \
+            --select validation_gaps::validation_gaps_runs_on_python
       - name: cargo test --test emit_and_run route format on python
         if: ${{ !cancelled() && matrix.target == 'python' }}
         run: |
@@ -2667,6 +2734,18 @@ jobs:
             --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
             --report "$RUNNER_TEMP/compare-select/emit_and_run-render_json_record_writer_runs_on_csharp.json" \
             --select emit_and_run::render_json_record_writer_runs_on_csharp
+      - name: cargo test --test validation_gaps on csharp
+        if: ${{ !cancelled() && matrix.target == 'csharp' }}
+        env:
+          DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+        run: |
+          python3 scripts/ci-unit-tests.py select \
+            --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+            --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+            --report "$RUNNER_TEMP/compare-select/validation_gaps-validation_gaps_runs_on_csharp.json" \
+            --select validation_gaps::validation_gaps_runs_on_csharp
       - name: scripts/compare ${{ matrix.target }}
         if: ${{ !cancelled() }}
         env:
