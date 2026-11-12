@@ -396,15 +396,48 @@ fn unset_presence_column(model: &crate::dialect::Model, column: &crate::schema::
 /// writer, which takes the column's type), declares it an enum or a
 /// `normalizes` attribute (whose writer converts the value), or checks
 /// it with `numericality:` (the ruby family's check reads the raw input
-/// the held writer's cast replaces).
+/// the held writer's cast replaces), or compound-assigns its ivar.
 fn touches_column(model: &crate::dialect::Model, column: &crate::schema::Column) -> bool {
     crate::lower::model_to_library::model_defines_writer(model, &column.name)
         || crate::lower::model_to_library::model_defines_instance_method(model, &column.name)
         || model.enums.contains_key(&column.name)
-        || crate::lower::normalizes::normalizations(model).contains_key(&column.name)
+        || names_in_normalizes(model, &column.name)
+        || compound_assigns_ivar(model, &column.name)
         || model.validations().any(|v| {
             v.attribute == column.name && v.rules.iter().any(|r| matches!(r, ValidationRule::Numericality { .. }))
         })
+}
+
+/// Whether an instance method of the model compound-assigns `@attr`
+/// (`@attr ||= v`, `@attr += 1`). The held column has no `@attr` slot, and
+/// those keep their own read-then-write order, which the reader and writer
+/// rewrite (`read_held_columns_through_readers`) does not model.
+fn compound_assigns_ivar(model: &crate::dialect::Model, attr: &crate::ident::Symbol) -> bool {
+    use crate::expr::{Expr, ExprNode, LValue};
+    fn found(e: &Expr, attr: &crate::ident::Symbol) -> bool {
+        if matches!(&*e.node, ExprNode::OpAssign { target: LValue::Ivar { name }, .. } if name == attr) {
+            return true;
+        }
+        let mut hit = false;
+        e.node.for_each_child(&mut |c| hit = hit || found(c, attr));
+        hit
+    }
+    model.body.iter().any(|item| {
+        matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.receiver == crate::dialect::MethodReceiver::Instance && found(&method.body, attr))
+    })
+}
+
+/// Whether any `normalizes` call in the model body names `attr`, whether
+/// or not `normalizes::normalizations` can reproduce it.
+fn names_in_normalizes(model: &crate::dialect::Model, attr: &crate::ident::Symbol) -> bool {
+    use crate::expr::{ExprNode, Literal};
+    model.body.iter().any(|item| {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return false };
+        method.as_str() == "normalizes"
+            && args.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr))
+    })
 }
 
 /// Whether `model` holds `column` unset: it, or the STI ancestor it

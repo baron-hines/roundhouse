@@ -3640,7 +3640,8 @@ fn read_held_columns_through_readers(methods: &mut [MethodDef], table: Option<&T
     let Some(table) = table else { return };
     for col in table.columns.iter().filter(|c| c.unset_until_assigned) {
         let storage = schema::col_storage_name(col);
-        for method in methods.iter_mut() {
+        // Instance methods only: a class method's `@<col>` is the class's own state.
+        for method in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
             rewrite(&mut method.body, &col.name, &storage);
         }
     }
@@ -3664,6 +3665,57 @@ pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
 mod tests {
     use super::*;
     use std::{collections::HashMap, path::PathBuf};
+
+    /// The held column's `@<col>` reads become reader calls in instance
+    /// methods only; a class method's `@<col>` is the class's own state.
+    #[test]
+    fn held_column_reads_rewrite_in_instance_methods_only() {
+        let method = |receiver| MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from("cached"),
+            receiver,
+            params: Vec::new(),
+            body: Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from("quota") }),
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: None,
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        };
+        let table = crate::schema::Table {
+            name: Symbol::from("plans"),
+            columns: vec![crate::schema::Column {
+                name: Symbol::from("quota"),
+                col_type: crate::schema::ColumnType::Integer,
+                nullable: true,
+                default: None,
+                default_expression: None,
+                legacy_default_persistence: false,
+                primary_key: false,
+                generated: None,
+                generated_text_compatible: None,
+                generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
+                unset_until_assigned: true,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+            known_keyless: false,
+            primary_key_columns: Vec::new(),
+            virtual_module: None,
+        };
+        let mut methods = vec![method(MethodReceiver::Instance), method(MethodReceiver::Class)];
+        read_held_columns_through_readers(&mut methods, Some(&table));
+        assert!(matches!(&*methods[0].body.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "quota"), "{:?}", methods[0].body);
+        assert!(matches!(&*methods[1].body.node, ExprNode::Ivar { name } if name.as_str() == "quota"), "{:?}", methods[1].body);
+    }
 
     /// Framework normalization must not replace a same-named application class.
     #[test]

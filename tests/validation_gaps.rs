@@ -94,7 +94,8 @@ fn rust_holds_the_columns_unset_and_probes_each_rule() {
 
 /// The shapes a target does not lower stay the reported gap. `presence:`
 /// (every target) on a NOT NULL float; on an integer the model writes
-/// through its own `<col>=`; on an enum; on one `numericality:` also
+/// through its own `<col>=` or compound-assigns (`@<col> ||= v`); on an enum; on a `normalizes` attribute,
+/// reproducible or not; on one `numericality:` also
 /// checks, directly or in an STI subclass of the model with `presence:`;
 /// on one whose `<col>_raw` name another column has; and on one a second
 /// model over the same table does not check. `uniqueness:` (a
@@ -114,10 +115,17 @@ fn unlowered_shapes_stay_reported() {
   validates :status, presence: true
   validates :qty, presence: true, numericality: { greater_than: 0 }
   validates :bin, presence: true
+  validates :rank, presence: true
+  validates :tally, presence: true
+  normalizes :rank, with: method(:Integer)
   validates :label, uniqueness: true
 
   def count=(value)
     super(value.to_i)
+  end
+
+  def bump
+    @tally ||= 1
   end
 
   #: () -> String?
@@ -140,6 +148,8 @@ end
     t.integer "qty", null: false
     t.integer "bin", null: false
     t.integer "bin_raw"
+    t.integer "rank", null: false
+    t.integer "tally", null: false
     t.string "label"
   end
   create_table "boxes", force: :cascade do |t|
@@ -165,7 +175,7 @@ class WidgetTest < ActiveSupport::TestCase
 end
 "#)
     };
-    let presence = ["weight", "count", "status", "qty", "bin", "depth", "size"];
+    let presence = ["weight", "count", "status", "qty", "bin", "rank", "tally", "depth", "size"];
     let uniqueness = ["weight", "shipped_at", "label", "left"];
     let warnings = validates_warnings(overlay(), BuildTarget::Rust);
     for attr in presence {
