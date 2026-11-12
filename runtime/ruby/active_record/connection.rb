@@ -1535,18 +1535,22 @@ module ActiveRecord
     # lowered call sites (`lower::first_or_create`) inline the statement
     # forms; these answer the rest (a receiverless call inside a class
     # method, an `||` operand).
-    def self.find_or_initialize_by(conditions, &block)
-      ActiveRecord::Relation.new(self).find_or_initialize_by(conditions.to_h, &block)
+    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call, and a block
+    # parameter is untyped where `yield` takes the RBS block's type.
+    def self.find_or_initialize_by(conditions)
+      ActiveRecord::Relation.new(self).find_or_initialize_by(conditions.to_h) { |record| yield record if block_given? }
     end
 
-    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call.
-    def self.find_or_create_by(conditions, &block)
-      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h) { |record| block.call(record) unless block.nil? }
+    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call, and a block
+    # parameter is untyped where `yield` takes the RBS block's type.
+    def self.find_or_create_by(conditions)
+      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h) { |record| yield record if block_given? }
     end
 
-    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call.
-    def self.find_or_create_by!(conditions, &block)
-      ActiveRecord::Relation.new(self).find_or_create_by!(conditions.to_h) { |record| block.call(record) unless block.nil? }
+    # Not `&block` handed on: the find-or-create lowering takes only a block attached at the call, and a block
+    # parameter is untyped where `yield` takes the RBS block's type.
+    def self.find_or_create_by!(conditions)
+      ActiveRecord::Relation.new(self).find_or_create_by!(conditions.to_h) { |record| yield record if block_given? }
     end
 
     def self.create_or_find_by(conditions)

@@ -408,17 +408,9 @@ fn parameters_on_hash(expr: &mut Expr) -> bool {
             *expr = test;
             true
         }
-        // A Symbol literal read or removed on Parameters (Devise's `update_with_password`): either key, as Rails'
-        // Parameters answer, since the request's Hash holds the String and a `permit` the emit lowered holds the Symbol.
-        ("[]" | "delete", [key]) if matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } }) => {
-            let params = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] });
-            let ty = expr.ty.clone();
-            let via = if method.as_str() == "delete" { "indifferent_delete" } else { "indifferent_read" };
-            *expr = send(span, Some(params), via, vec![r.clone(), key.clone()]);
-            expr.ty = ty;
-            true
-        }
-        ("fetch" | "key?" | "has_key?", [key, ..]) if let ExprNode::Lit { value: Literal::Sym { value } } = &*key.node => {
+        // A Symbol literal read or removed on Parameters (Devise's `update_with_password`): the request's Hash holds the
+        // String, which the emit's coercion writes for a controller's own reads and not for a module's.
+        ("[]" | "delete" | "fetch" | "key?" | "has_key?", [key, ..]) if let ExprNode::Lit { value: Literal::Sym { value } } = &*key.node => {
             let mut text = Expr::new(key.span, ExprNode::Lit { value: Literal::Str { value: value.as_str().to_string() } });
             text.ty = Some(Ty::Str);
             *key = text;
