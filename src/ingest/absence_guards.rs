@@ -88,12 +88,30 @@ pub(super) fn mark(app: &mut App, source_gem_classes: &crate::det::HashSet<Strin
     };
     // A required path is the absent gem's own when its namespace is (tzinfo-data's `tzinfo/data`).
     let unloadable = |path: &str| absent_namespaces.owner(&path.split('/').collect::<Vec<_>>().join("::")).is_some();
+    // Not a feature any locked gem, Ruby or Rails provides: a gem's optional feature's library the app doesn't bundle
+    // (`require "method_source"` in a loader that rescues LoadError). Ruby raises LoadError where the method runs; Spinel
+    // resolves a require statically, and `spin build` refuses one it cannot satisfy.
+    let provided_by_nothing = |path: &str| {
+        let feature = path.trim_end_matches(".rb");
+        let root = feature.split('/').next().unwrap_or(feature);
+        let as_constant: Vec<String> = feature.split('/').map(|s| s.split(['_', '-']).map(capitalized).collect::<String>()).collect();
+        !root.is_empty()
+            && !feature.starts_with('.')
+            && !crate::gems::is_framework_feature(feature)
+            && !RUBY_FEATURE_ROOTS.contains(&root)
+            && !super::app::APP_REQUIRABLE_STDLIB.iter().any(|s| s.split('/').next() == Some(root))
+            && ![root.to_string(), root.replace('_', "-"), feature.replace('/', "-")].iter().any(|n| lock.version_of(n).is_some())
+            && index.owners(&as_constant.join("::")).is_empty()
+    };
     unreached_gated_classes(app, source_gem_classes, &absent);
     for lc in app.library_classes.iter_mut() {
         let owner = lc.name.0.as_str().to_string();
         let gone = |written: &[&Symbol]| gone_in(&owner, written);
         // A gem's own read of a constant nothing locked defines is Ruby's NameError where it runs (rack-attack's `Redis::VERSION`).
         let everywhere: Vec<Vec<Symbol>> = if source_gem_classes.contains(&owner) { vec![Vec::new()] } else { Vec::new() };
+        // Only in a source gem's own methods: its `require` runs when the method does (an app's own is the app's to bundle).
+        let from_gem = source_gem_classes.contains(&owner);
+        let unloadable = |path: &str| unloadable(path) || (from_gem && provided_by_nothing(path));
         for m in lc.methods.iter_mut() {
             walk(&mut m.body, &everywhere, &absent, &gone, &unloadable);
         }
@@ -102,12 +120,31 @@ pub(super) fn mark(app: &mut App, source_gem_classes: &crate::det::HashSet<Strin
     crate::lower::for_each_hook_body(app, &mut |e| walk(e, &[], &absent, &gone, &unloadable));
 }
 
+/// The first segment of a feature Ruby itself provides, as a default or bundled gem or part of the standard
+/// library, beyond `APP_REQUIRABLE_STDLIB` (`net/smtp`, `rbconfig`, `prism`).
+const RUBY_FEATURE_ROOTS: &[&str] = &[
+    "abbrev", "base64", "benchmark", "bigdecimal", "bundler", "cgi", "continuation", "coverage", "csv", "date", "debug",
+    "delegate", "did_you_mean", "digest", "drb", "English", "erb", "error_highlight", "etc", "expect", "fcntl", "fiber",
+    "fiddle", "fileutils", "find", "forwardable", "getoptlong", "io", "ipaddr", "irb", "json", "logger", "matrix",
+    "minitest", "mkmf", "monitor", "mutex_m", "net", "nkf", "objspace", "observer", "open-uri", "open3", "openssl",
+    "optparse", "ostruct", "pathname", "power_assert", "pp", "prettyprint", "prime", "prism", "pstore", "psych", "pty",
+    "racc", "rake", "rbconfig", "rbs", "rdoc", "readline", "reline", "repl_type_completor", "resolv", "rexml", "rinda",
+    "ripper", "rss", "ruby2_keywords", "rubygems", "securerandom", "set", "shellwords", "singleton", "socket",
+    "stringio", "strscan", "syntax_suggest", "syslog", "tempfile", "test", "time", "timeout", "tmpdir", "tsort",
+    "typeprof", "un", "uri", "weakref", "win32ole", "yaml", "zlib",
+];
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
 type Probe<'p> = &'p dyn Fn(&[&Symbol]) -> bool;
 type Gone<'p> = &'p dyn Fn(&[&Symbol]) -> Option<String>;
 type Unloadable<'p> = &'p dyn Fn(&str) -> bool;
 
 fn walk(e: &mut Expr, guarded: &[Vec<Symbol>], absent: Probe<'_>, gone: Gone<'_>, unloadable: Unloadable<'_>) {
-    // Not left as the require: Spinel ignores one it cannot satisfy, so tzinfo's `rescue LoadError` probe would read the gem as present.
+    // Not left as the require: Spinel ignores one it cannot satisfy (and `spin build` refuses it), so tzinfo's `rescue LoadError` probe would read the gem as present.
     if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
         && method.as_str() == "require"
         && let [arg] = args.as_slice()
