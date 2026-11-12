@@ -996,7 +996,7 @@ fn emit_array(elements: &[Expr], _style: &crate::expr::ArrayStyle) -> String {
 ///   - A single argument that's a non-empty Hash literal with all
 ///     simple-Symbol keys.
 ///
-/// `.new` produces: `(__inst = Cls.new(hash); __inst.k1 = v1; …; __inst)`
+/// `.new` produces: `(__v_k1 = v1; …; __inst = Cls.new({:k1 => __v_k1, …}); __inst.k1 = __v_k1; …; __inst)`
 /// `.create` adds an explicit `.save` after the assigns and still
 /// returns the instance; `.create!` raises `RecordInvalid` when it fails.
 ///
@@ -1062,19 +1062,26 @@ fn try_emit_new_or_create_per_field(
         if !is_simple_method_name(name) {
             return None;
         }
-        field_assigns.push((name.to_string(), emit_expr(v)));
+        field_assigns.push((name.to_string(), emit_expr_with_form_hint(v, true)));
     }
-    // Emit the original hash literal (in hashrocket form so it
-    // satisfies AR-inherited `Hash[Symbol, _]` signatures rather
-    // than Crystal's NamedTuple shorthand) so user-defined
-    // `initialize(attrs)` still sees the data. Use the existing
-    // forced-hash emitter via `emit_expr_with_form_hint` so nested
-    // hash values flip too.
-    let hash_arg_s = emit_expr_with_form_hint(arg, true);
+    // Pass the hash too (in hashrocket form so it satisfies
+    // AR-inherited `Hash[Symbol, _]` signatures rather than Crystal's
+    // NamedTuple shorthand) so user-defined `initialize(attrs)` still
+    // sees the data; each value goes through the forced-hash emitter so
+    // a nested hash flips too. Each is evaluated once, into a local the
+    // hash and its setter both read (`create!(code: next_code)` calls
+    // it once).
     let mut body = String::new();
-    body.push_str(&format!("__inst = {}.new({})\n", class_name, hash_arg_s));
     for (field, value_s) in &field_assigns {
-        body.push_str(&format!("__inst.{} = {}\n", field, value_s));
+        body.push_str(&format!("__v_{field} = {value_s}\n"));
+    }
+    let hash_arg_s = format!(
+        "{{{}}}",
+        field_assigns.iter().map(|(field, _)| format!(":{field} => __v_{field}")).collect::<Vec<_>>().join(", ")
+    );
+    body.push_str(&format!("__inst = {}.new({})\n", class_name, hash_arg_s));
+    for (field, _) in &field_assigns {
+        body.push_str(&format!("__inst.{field} = __v_{field}\n"));
     }
     if method == "create" {
         body.push_str("__inst.save\n");

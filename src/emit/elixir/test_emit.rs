@@ -814,7 +814,9 @@ fn emit_model_test_send(
     }
 
     // `assert_predicate rec, :m?` / `refute_predicate rec, :m?` → the
-    // model's `m?(rec)`; `valid?` is dual-return, `{record, ok}`.
+    // model's `m?(rec)`; `valid?` is dual-return, `{record, ok}`, and a
+    // local receiver is rebound to the validated record, so a later
+    // `errors` read sees what the check set.
     if recv.is_none()
         && matches!(method, "assert_predicate" | "refute_predicate")
         && args.len() == 2
@@ -823,7 +825,11 @@ fn emit_model_test_send(
     {
         let verb = if method == "assert_predicate" { "assert" } else { "refute" };
         return if pred.as_str() == "valid?" {
-            format!("{{_record, ok}} = {module}.valid?({})\n{verb} ok", args_s[0])
+            let bound = match &*args[0].node {
+                ExprNode::Var { .. } => args_s[0].clone(),
+                _ => "_record".to_string(),
+            };
+            format!("{{{bound}, ok}} = {module}.valid?({})\n{verb} ok", args_s[0])
         } else {
             format!("{verb} {module}.{}({})", pred.as_str(), args_s[0])
         };

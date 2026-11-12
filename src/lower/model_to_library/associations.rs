@@ -219,6 +219,7 @@ pub(super) fn push_association_methods(
     models: &[Model],
     through_joins: &ThroughJoins,
     runtime_relation: super::RuntimeRelation,
+    table: Option<&crate::schema::Table>,
 ) {
     // The ruby family's belongs_to writer stores nil for a nil value, as
     // Rails does. A strict target's key field is its column's non-nil
@@ -505,7 +506,12 @@ pub(super) fn push_association_methods(
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
                 {
-                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &assoc_pk, sentinel, keeps_nil));
+                    // A key held unset for its presence check has a nilable
+                    // slot on every target, so nil unsets it there too.
+                    let held = table.is_some_and(|t| {
+                        t.columns.iter().any(|c| c.name == *foreign_key && c.unset_until_assigned)
+                    });
+                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &assoc_pk, sentinel, keeps_nil || held));
                 }
                 push_singular_loaded_reader(methods, model, owner, name);
             }

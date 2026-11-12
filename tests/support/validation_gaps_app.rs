@@ -2,7 +2,8 @@
 //! (`tests/validation_gaps.rs`): `presence:` on NOT NULL integer columns
 //! with no default, a scoped `uniqueness:`, and a `case_sensitive:
 //! false, allow_nil:` one on a nullable string, and one scoped by a
-//! `belongs_to` with `allow_blank:`. Its tests call only
+//! `belongs_to` with `allow_blank:`, whose foreign key `presence:` also
+//! checks. Its tests call only
 //! `new`, `create!`, `valid?`, a writer and a reader, so each target's
 //! test emit can run them.
 //! Each test writes its own aisle: the TypeScript harness loads the
@@ -31,6 +32,7 @@ end
         .write("app/models/tag.rb", r#"class Tag < ApplicationRecord
   belongs_to :slot
 
+  validates :slot_id, presence: true
   validates :name, uniqueness: { scope: :slot, allow_blank: true }
 end
 "#)
@@ -152,6 +154,15 @@ class TagTest < ActiveSupport::TestCase
     refute_predicate Tag.new(slot_id: slot.id, name: "x"), :valid?
     assert_predicate Tag.new(slot_id: other.id, name: "x"), :valid?
   end
+
+  test "an assigned slot id is present" do
+    tag = Tag.new(name: "z")
+    refute_predicate tag, :valid?
+    tag.slot_id = Slot.create!(aisle: 83, position: 1).id
+    assert_predicate tag, :valid?
+    tag.slot = nil
+    refute_predicate tag, :valid?
+  end
 end
 "#)
 }
@@ -173,4 +184,5 @@ pub const TESTS: &[&str] = &[
     "a_label_is_unique",
     "a_blank_tag_is_allowed_twice",
     "a_tag_is_unique_per_slot",
+    "an_assigned_slot_id_is_present",
 ];

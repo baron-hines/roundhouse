@@ -378,6 +378,19 @@ fn emit_test_send_go(
             {
                 return format!("{recv_s}.{}Eq({})", go_field_name(col), args_s[0]);
             }
+            // An association writer (`tag.slot = rec`) is the model's
+            // `<Assoc>Eq` method; there is no struct field to assign.
+            if args_s.len() == 1
+                && let Some(assoc) = method.strip_suffix('=')
+                && receiver_model_name(r, ctx).is_some_and(|m| {
+                    ctx.app.models.iter().any(|model| {
+                        model.name.0.as_str().rsplit("::").next() == Some(m.as_str())
+                            && model.associations().any(|a| a.name().as_str() == assoc)
+                    })
+                })
+            {
+                return format!("{recv_s}.{}Eq({})", go_field_name(assoc), args_s[0]);
+            }
             let is_attr = args_s.is_empty()
                 && ctx.model_attrs.iter().any(|s| s.as_str() == method);
             if is_attr {

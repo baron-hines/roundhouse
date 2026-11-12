@@ -136,6 +136,11 @@ Each lowerer:
   `<col>_raw` slot behind a reader of the column's type
   (`validations::hold_unset_presence_columns`), so the check sees nil
   until the record assigns it, as Rails does; the DDL keeps NOT NULL.
+  Only a column nothing else on the model reads or writes is held (no
+  own reader or writer, enum, array, `normalizes` or `numericality`),
+  and on a shared table only when every model qualifies. Model bodies
+  then read it through the reader and write it through the writer
+  (`read_held_columns_through_readers`).
   On a target with no runtime Relation, each `uniqueness:` rule becomes
   a private `_rh_<attr>_taken_<n>?` that runs one fixed
   `SELECT 1 … LIMIT 1` (`adapter_emit::uniqueness`).

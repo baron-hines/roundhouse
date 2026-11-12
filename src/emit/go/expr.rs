@@ -1383,6 +1383,15 @@ pub(super) fn emit_send(
     if is_writer_method_name(method) && args.len() == 1 && recv.is_some() {
         let r = recv.unwrap();
         let recv_s = emit_expr(ctx, r);
+        // A writer the class defines as a real method (a column held
+        // unset: `def <col>=(v) = @<col>_raw = v`) is called, not
+        // bypassed with a write to a field that doesn't exist.
+        if matches!(&*r.node, ExprNode::SelfRef)
+            && ctx.self_methods.as_ref().is_some_and(|m| m.contains(method))
+        {
+            let name = super::library::pascalize_instance_method_name(method);
+            return format!("{recv_s}.{name}({})", args_s[0]);
+        }
         let field_ruby = &method[..method.len() - 1];
         let field_go = go_field_name(field_ruby);
         // If/Case-shaped RHS needs IIFE wrap — Go's `if`/`switch` are

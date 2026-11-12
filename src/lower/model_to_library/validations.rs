@@ -212,7 +212,14 @@ pub(super) fn push_validate_method(
                     name, foreign_key, optional: false, polymorphic, ..
                 } = assoc
                 {
-                    let mut check = inline_belongs_to_check(model_msgs, name, foreign_key, *polymorphic);
+                    // A foreign key held unset for its presence check
+                    // (`hold_unset_presence_columns`) is checked in its slot.
+                    let held = table
+                        .iter()
+                        .flat_map(|t| t.columns.iter())
+                        .find(|c| c.name == *foreign_key && c.unset_until_assigned)
+                        .map(super::schema::col_storage_name);
+                    let mut check = inline_belongs_to_check(model_msgs, name, foreign_key, held.as_ref(), *polymorphic);
                     // `accepts_nested_attributes_for` (`ingest::nested_attributes`)
                     // builds the record before the save, which writes its id:
                     // Rails checks the object it built, so a pending one passes,
@@ -979,6 +986,7 @@ fn inline_belongs_to_check(
     msgs: Messages,
     assoc_name: &Symbol,
     foreign_key: &Symbol,
+    held: Option<&Symbol>,
     polymorphic: bool,
 ) -> Expr {
     let fk_ivar = ivar(foreign_key);
@@ -997,8 +1005,13 @@ fn inline_belongs_to_check(
     let mut message = msgs.error(assoc_name.as_str(), "required", &Default::default());
     message.kind = "blank".to_string();
     let push_err = errors_push(assoc_name.as_str(), message);
+    // A held key's slot is nil until assigned, so it needs no 0 sentinel.
+    let unset = match held {
+        Some(storage) => send(ivar(storage), "nil?", vec![]),
+        None => bool_op(BoolOpKind::Or, nil_check, zero_check),
+    };
     if polymorphic {
-        return if_with_nil_else(bool_op(BoolOpKind::Or, nil_check, zero_check), push_err);
+        return if_with_nil_else(unset, push_err);
     }
     // `article.nil?` — the association reader, on self.
     let reader = Expr::new(
@@ -1012,11 +1025,7 @@ fn inline_belongs_to_check(
         },
     );
     let missing = send(reader, "nil?", vec![]);
-    let cond = bool_op(
-        BoolOpKind::Or,
-        bool_op(BoolOpKind::Or, nil_check, zero_check),
-        missing,
-    );
+    let cond = bool_op(BoolOpKind::Or, unset, missing);
     if_with_nil_else(cond, push_err)
 }
 
@@ -2522,7 +2531,7 @@ mod tests {
     fn belongs_to_inline_emits_must_exist_error() {
         let assoc_name = Symbol::from("article");
         let foreign_key = Symbol::from("article_id");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, false);
+        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, None, false);
         assert_eq!(collect_error_messages(&expr), vec!["Article must exist"]);
     }
 
@@ -2533,7 +2542,7 @@ mod tests {
         // reader goes by the association's `primary_key:` itself.
         let assoc_name = Symbol::from("product");
         let foreign_key = Symbol::from("product_uuid");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, false);
+        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, None, false);
         let rendered = format!("{expr:?}");
         assert!(!rendered.contains("exists?"), "the check must not probe with exists?: {rendered}");
         assert!(rendered.contains("method: Symbol(\"product\")"), "the check reads the association: {rendered}");
@@ -2547,7 +2556,7 @@ mod tests {
         // uninitialized-constant NameError on the first save.
         let assoc_name = Symbol::from("record");
         let foreign_key = Symbol::from("record_id");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, true);
+        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, None, true);
         assert_eq!(collect_error_messages(&expr), vec!["Record must exist"]);
         let rendered = format!("{expr:?}");
         assert!(

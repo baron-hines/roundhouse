@@ -87,49 +87,82 @@ fn rust_holds_the_columns_unset_and_probes_each_rule() {
     }
     assert!(!slot.contains("pub aisle: i64"), "{slot}");
     let tag = read("src/models/tag.rs");
-    assert!(tag.contains("\"SELECT 1 FROM tags WHERE name IS \"") && tag.contains("\" AND slot_id = \""), "{tag}");
+    assert!(tag.contains("\"SELECT 1 FROM tags WHERE name IS \"") && tag.contains("\" AND slot_id IS \"") && tag.contains("pub slot_id_raw: Option<i64>,"), "{tag}");
     let schema = read("src/schema_sql.rs");
     assert!(schema.contains("aisle INTEGER NOT NULL") || schema.contains("\"aisle\" INTEGER NOT NULL"), "{schema}");
 }
 
-/// The shapes a target does not lower stay the reported gap: `presence:`
-/// on a NOT NULL float, or on an integer the model writes through its
-/// own `<col>=` (every target), and `uniqueness:` over a temporal column
-/// (a strict target).
+/// The shapes a target does not lower stay the reported gap. `presence:`
+/// (every target) on a NOT NULL float; on an integer the model writes
+/// through its own `<col>=`; on an enum; on one `numericality:` also
+/// checks; on one whose `<col>_raw` name another column has; and on one
+/// a second model over the same table does not check. `uniqueness:` (a
+/// strict target) over a temporal column, a float, a column the model
+/// reads itself, or a keyless table.
 #[test]
 fn unlowered_shapes_stay_reported() {
     let overlay = || {
         emit_and_run::empty_app()
             .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n")
             .write("app/models/parcel.rb", r#"class Parcel < ApplicationRecord
-  validates :weight, presence: true
+  enum :status, { open: 0, shut: 1 }
+
+  validates :weight, presence: true, uniqueness: true
   validates :count, presence: true
   validates :shipped_at, uniqueness: true
+  validates :status, presence: true
+  validates :qty, presence: true, numericality: { greater_than: 0 }
+  validates :bin, presence: true
+  validates :shelf, presence: true
+  validates :label, uniqueness: true
 
   def count=(value)
     super(value.to_i)
   end
+
+  #: () -> String?
+  def label
+    self[:label]&.strip
+  end
 end
 "#)
+            .write("app/models/crate.rb", "class Crate < ApplicationRecord\n  self.table_name = \"parcels\"\nend\n")
+            .write("app/models/pair.rb", "class Pair < ApplicationRecord\n  validates :left, uniqueness: true\nend\n")
             .write("db/schema.rb", r#"ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do
   create_table "parcels", force: :cascade do |t|
     t.float "weight", null: false
     t.bigint "count", null: false
     t.datetime "shipped_at"
+    t.integer "status", null: false
+    t.integer "qty", null: false
+    t.integer "bin", null: false
+    t.integer "bin_raw"
+    t.integer "shelf", null: false
+    t.string "label"
+  end
+  create_table "pairs", id: false, force: :cascade do |t|
+    t.string "left"
   end
 end
 "#)
             .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
     };
+    let presence = ["weight", "count", "status", "qty", "bin", "shelf"];
+    let uniqueness = ["weight", "shipped_at", "label", "left"];
     let warnings = validates_warnings(overlay(), BuildTarget::Rust);
-    for want in ["validates :weight, presence: not supported (rust)", "validates :count, presence: not supported (rust)", "validates :shipped_at, uniqueness: not supported (rust)"] {
-        assert!(warnings.iter().any(|w| w.starts_with(want)), "{want}: {warnings:?}");
+    for attr in presence {
+        let want = format!("validates :{attr}, presence: not supported (rust)");
+        assert!(warnings.iter().any(|w| w.starts_with(&want)), "{want}: {warnings:?}");
     }
-    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    for attr in uniqueness {
+        let want = format!("validates :{attr}, uniqueness: not supported (rust)");
+        assert!(warnings.iter().any(|w| w.starts_with(&want)), "{want}: {warnings:?}");
+    }
+    assert_eq!(warnings.len(), presence.len() + uniqueness.len(), "{warnings:?}");
     // The ruby family runs Rails' uniqueness query, but its record starts
     // the same columns at 0.
     let ruby = validates_warnings(overlay(), BuildTarget::Ruby);
-    assert_eq!(ruby.len(), 2, "{ruby:?}");
+    assert_eq!(ruby.len(), presence.len(), "{ruby:?}");
     assert!(ruby.iter().all(|w| w.contains(", presence: not supported (ruby)")), "{ruby:?}");
 }
 
