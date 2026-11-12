@@ -5128,7 +5128,7 @@ impl Analyzer {
         fn writes(e: &Expr, out: &mut HashMap<Symbol, Ty>) {
             if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node
                 && let Some(cvar) = name.as_str().strip_prefix("@@")
-                && let Some(ty) = value.ty.clone().filter(|t| !t.is_open() && !matches!(t, Ty::Untyped)).map(|t| class_object_arg_ty(value, t))
+                && let Some(ty) = Analyzer::class_object_expr_ty(value).filter(|t| !t.is_open() && !matches!(t, Ty::Untyped))
             {
                 let key = Symbol::from(cvar);
                 let joined = match out.remove(&key) {
@@ -5950,22 +5950,14 @@ impl Analyzer {
         let module_ids: crate::det::HashSet<&ClassId> =
             app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
         for (id, modules) in wanted {
-            let mut queue = modules;
-            let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
-            let mut qi = 0;
-            while qi < queue.len() {
-                let m = queue[qi].clone();
-                qi += 1;
+            // The concern fold already includes nested methods with Ruby's
+            // precedence. Walking those modules again would overwrite overrides.
+            for m in modules {
                 if !module_ids.contains(&m) {
                     continue;
                 }
                 let Some(module) = self.classes.get(&m) else { continue };
                 let inst = module.instance_methods.clone();
-                for n in module.includes.clone() {
-                    if seen.insert(n.clone()) {
-                        queue.push(n);
-                    }
-                }
                 let folded = self.concern_folded.entry(id.clone()).or_default();
                 let cls = self.classes.entry(id.clone()).or_default();
                 for (name, ty) in inst {
@@ -11077,7 +11069,7 @@ fn walk_ivar_assignments(
                 if method.as_str() == "new" && args.is_empty() && matches!(&*r.node, ExprNode::Const { path }
                     if matches!(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().as_slice(), ["HashWithIndifferentAccess"] | ["ActiveSupport", "HashWithIndifferentAccess"])));
             // A class object stored is the class (`@responder = Devise::Controllers::Responder`), as a method answering it is.
-            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { value.ty.clone().map(|t| class_object_arg_ty(value, t)) };
+            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { Analyzer::class_object_expr_ty(value) };
             if let Some(ty) = ty {
                 // Union with existing entry so repeated assignments to
                 // the same ivar accumulate (rather than the last write
