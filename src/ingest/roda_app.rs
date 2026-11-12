@@ -859,7 +859,7 @@ impl<'f> RouteWalker<'f> {
                     constraints.insert(Symbol::from(name.as_str()), "\\d+".to_string());
                 }
             }
-            entries.push(RouteSpec::Explicit {
+            entries.push(RouteSpec::Explicit { defaults: indexmap::IndexMap::new(),
                 method: leaf.method.clone(),
                 path: path_of(&leaf.segs),
                 controller,

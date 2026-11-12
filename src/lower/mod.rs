@@ -23,6 +23,7 @@ pub mod array_columns;
 pub mod associations;
 pub mod association_new;
 pub mod blank;
+pub mod respond_to;
 pub mod broadcast_calls;
 pub mod module_mixins;
 pub mod broadcasts;
@@ -773,6 +774,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // chain that stays dynamic — and on a relation-less target that is
     // now an error (issue #76), not a suppressed warning.
     ("relation_residue", &["duration", "group_count"]),
+    // `assert_respond_to` / `refute_respond_to` / `respond_to?(:sym)` in
+    // the test tree, answered from the analyzer's registry for a target
+    // with no runtime method table (`respond_to.rs`).
+    ("respond_to", &[]),
 ];
 
 /// True iff `POST_ANALYZE_PASS_ORDER` is a valid topological order —
@@ -1021,7 +1026,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("inquiry");
     has_one_builder::apply_has_one_builder_lowering(app);
     ran!("has_one_builder");
-    config_reader::apply_config_reader_lowering(app);
+    config_reader::apply_config_reader_lowering_for(app, target);
     ran!("config_reader");
     ran!("symbolize_keys");
     enum_mapping_keys::apply_enum_mapping_keys(app);
@@ -1149,6 +1154,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
         relation_residue::apply_relation_residue_ledger(app, registry)
     }));
     ran!("relation_residue");
+    respond_to::apply(app, registry, target);
+    ran!("respond_to");
     #[cfg(debug_assertions)]
     debug_assert_eq!(
         executed,

@@ -1308,6 +1308,12 @@ impl Analyzer {
                 }
             } else {
                 classes.entry(id.clone()).or_default().source_instance_methods.insert(method.name.clone());
+                let by_visibility = if method.visibility == crate::dialect::MethodVisibility::Public {
+                    &mut classes.entry(id.clone()).or_default().public_instance_methods
+                } else {
+                    &mut classes.entry(id.clone()).or_default().nonpublic_instance_methods
+                };
+                by_visibility.insert(method.name.clone());
                 if method.name.as_str() == "each" && forwards_block_to_each(method) {
                     classes.entry(id.clone()).or_default().each_forwards_block = true;
                 }
@@ -1327,9 +1333,43 @@ impl Analyzer {
                 classes.entry(id.clone()).or_default().constructor_calls_super = expr_calls_super(&method.body);
             }
         }
+        use crate::dialect::ControllerBodyItem;
+        // Visibility is positional: a bare `private` makes what follows
+        // private. Any other visibility call (`protected`, `public`,
+        // `private :name`, `private def …`) is not modeled, so every
+        // action then counts as both, which `lower::respond_to` leaves
+        // unanswered. Per controller NAME: such a call in one reopening
+        // (`private :ping`) can name an action another one defines.
+        let unmodeled_visibility: crate::det::HashSet<&ClassId> = app
+            .controllers
+            .iter()
+            .filter(|controller| {
+                controller.body.iter().any(|item| {
+                    matches!(item, ControllerBodyItem::Unknown { expr, .. }
+                        if matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, .. }
+                            if matches!(method.as_str(), "private" | "protected" | "public" | "module_function")))
+                })
+            })
+            .map(|controller| &controller.name)
+            .collect();
         for controller in &app.controllers {
-            for action in controller.actions() {
-                classes.entry(controller.name.clone()).or_default().source_instance_methods.insert(action.name.clone());
+            let unmodeled = unmodeled_visibility.contains(&controller.name);
+            let entry = classes.entry(controller.name.clone()).or_default();
+            let mut private = false;
+            for item in &controller.body {
+                match item {
+                    ControllerBodyItem::PrivateMarker { .. } => private = true,
+                    ControllerBodyItem::Action { action, .. } => {
+                        entry.source_instance_methods.insert(action.name.clone());
+                        if unmodeled || !private {
+                            entry.public_instance_methods.insert(action.name.clone());
+                        }
+                        if unmodeled || private {
+                            entry.nonpublic_instance_methods.insert(action.name.clone());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -5138,7 +5178,7 @@ impl Analyzer {
         fn writes(e: &Expr, out: &mut HashMap<Symbol, Ty>) {
             if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node
                 && let Some(cvar) = name.as_str().strip_prefix("@@")
-                && let Some(ty) = value.ty.clone().filter(|t| !t.is_open() && !matches!(t, Ty::Untyped)).map(|t| class_object_arg_ty(value, t))
+                && let Some(ty) = Analyzer::class_object_expr_ty(value).filter(|t| !t.is_open() && !matches!(t, Ty::Untyped))
             {
                 let key = Symbol::from(cvar);
                 let joined = match out.remove(&key) {
@@ -5960,22 +6000,14 @@ impl Analyzer {
         let module_ids: crate::det::HashSet<&ClassId> =
             app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
         for (id, modules) in wanted {
-            let mut queue = modules;
-            let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
-            let mut qi = 0;
-            while qi < queue.len() {
-                let m = queue[qi].clone();
-                qi += 1;
+            // The concern fold already includes nested methods with Ruby's
+            // precedence. Walking those modules again would overwrite overrides.
+            for m in modules {
                 if !module_ids.contains(&m) {
                     continue;
                 }
                 let Some(module) = self.classes.get(&m) else { continue };
                 let inst = module.instance_methods.clone();
-                for n in module.includes.clone() {
-                    if seen.insert(n.clone()) {
-                        queue.push(n);
-                    }
-                }
                 let folded = self.concern_folded.entry(id.clone()).or_default();
                 let cls = self.classes.entry(id.clone()).or_default();
                 for (name, ty) in inst {
@@ -8544,7 +8576,8 @@ fn collect_transitive_filter_ivars(
         | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
             let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
             if !own {
-                if let Some(ty) = value.ty.clone() {
+                // A class object stored is the class, as `walk_ivar_assignments` records the same write.
+                if let Some(ty) = value.ty.clone().map(|t| class_object_arg_ty(value, t)) {
                     union_ivar_maps(&mut out, HashMap::from_iter([(name.clone(), ty)]));
                 }
             }
@@ -11087,7 +11120,7 @@ fn walk_ivar_assignments(
                 if method.as_str() == "new" && args.is_empty() && matches!(&*r.node, ExprNode::Const { path }
                     if matches!(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().as_slice(), ["HashWithIndifferentAccess"] | ["ActiveSupport", "HashWithIndifferentAccess"])));
             // A class object stored is the class (`@responder = Devise::Controllers::Responder`), as a method answering it is.
-            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { value.ty.clone().map(|t| class_object_arg_ty(value, t)) };
+            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { Analyzer::class_object_expr_ty(value) };
             if let Some(ty) = ty {
                 // Union with existing entry so repeated assignments to
                 // the same ivar accumulate (rather than the last write
@@ -11105,7 +11138,7 @@ fn walk_ivar_assignments(
         // a plain assignment so a controller's `@story ||= Story.find(..)`
         // still flows its type to before_action seeds and views.
         ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
-            if let Some(ty) = value.ty.clone() {
+            if let Some(ty) = value.ty.clone().map(|t| class_object_arg_ty(value, t)) {
                 let merged = match out.remove(name) {
                     Some(prev) => crate::analyze::body::join_ivar_slot(prev, ty),
                     None => ty,

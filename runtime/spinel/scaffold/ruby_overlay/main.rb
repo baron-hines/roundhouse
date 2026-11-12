@@ -221,7 +221,9 @@ module Main
     env["roundhouse.path_params"] ||= matched.path_params
     controller = endpoint.nil? ? Main.instantiate_controller(matched.controller) : endpoint[0]
     merged = matched.path_params.dup
-    request[:params].each { |k, v| merged[k] = v }
+    # Rails' `params.merge!(path_parameters)`: a captured segment wins over the query and body.
+    request[:params].each { |k, v| merged[k] = v unless matched.path_params.key?(k) }
+    RouteTable.route_defaults(matched.defaults, merged, matched.path_params)
     controller.params  = merged
     controller.path_parameters = matched.path_params
 

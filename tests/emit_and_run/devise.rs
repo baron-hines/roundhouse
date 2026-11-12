@@ -625,6 +625,46 @@ fn a_devise_user_signs_in_over_http_natively() {
     assert_eq!(again.status, 302, "{}", server.log());
 }
 
+/// Devise names its helpers from the route mapping: `devise_for :users`
+/// gives `current_user`, the scope active_model_serializers' default
+/// `serialization_scope` reads. `class_name:`, `as:` or `singular:`
+/// changes what the mapping is called or which model it answers, and a
+/// `devise` model with no mapping drawn gives no helper. Only a single
+/// `devise_for :users` drawn unconditionally at the top of the routes
+/// counts: under a namespace, a condition or a second one, as under any
+/// of the others, the scope is left unknown, and the render as written,
+/// reported.
+#[test]
+fn a_serializer_scope_is_devises_current_user_only_under_devise_for_users() {
+    let serializer = "class CardSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+    let controller = "class CardsController < ApplicationController\n  def show\n    render json: Article.find(params[:id]), serializer: CardSerializer\n  end\nend\n";
+    let rendered = |routes: &str| {
+        let (tree, errors) = app(":database_authenticatable", &format!("{routes}  get \"/cards/:id\", to: \"cards#show\"\n"))
+            .write("app/serializers/card_serializer.rb", serializer)
+            .write("app/controllers/cards_controller.rb", controller)
+            .emit(BuildTarget::Ruby);
+        (std::fs::read_to_string(tree.join("app/controllers/cards_controller.rb")).expect("cards_controller.rb"), errors)
+    };
+    let (cards, errors) = rendered("  devise_for :users\n");
+    assert!(cards.contains("CardSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).serializable_hash"), "{cards}\n{errors:#?}");
+    for routes in [
+        "  devise_for :users, class_name: \"User\"\n",
+        "  devise_for :users, as: :member\n",
+        "  devise_for :users, singular: :member\n",
+        "",
+        // Not one unconditional mapping drawn at the top of the routes:
+        // under a namespace Devise maps `admin_user`, a conditional one
+        // may not be drawn, and a second `devise_for :users` redraws it.
+        "  namespace :admin do\n    devise_for :users\n  end\n",
+        "  if ENV[\"DEVISE\"]\n    devise_for :users\n  end\n",
+        "  devise_for :users\n  devise_for :users, path: \"accounts\"\n",
+    ] {
+        let (cards, errors) = rendered(routes);
+        assert!(!cards.contains("serializable_hash"), "{routes:?}: {cards}");
+        assert!(errors.iter().any(|e| e.contains("rendering through an active_model_serializers")), "{routes:?}: {errors:#?}");
+    }
+}
+
 /// `:validatable`: Devise's `included` hook `class_eval`s its `validates_*_of` calls onto the model, with
 /// `email_regexp` and `password_length` read as the hook runs. Each case's errors are Rails 8.1.4's with Devise 4.9.4.
 const CHECKS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def check\n    user = User.new(email: params[:email], password: params[:password])\n    user.password_confirmation = params[:confirmation] if params[:confirmation]\n    user.valid?\n    render plain: user.errors.full_messages.join(\"|\")\n  end\nend\n";

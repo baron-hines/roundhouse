@@ -62,7 +62,7 @@ fn tiny_blog_round_trips() {
             primary_key_columns: Vec::new(),
         },
     );
-    let schema = Schema { tables };
+    let schema = Schema { tables, ..Default::default() };
 
     let mut attrs = IndexMap::new();
     attrs.insert(Symbol::from("id"), Ty::Int);
@@ -131,7 +131,7 @@ fn tiny_blog_round_trips() {
     };
 
     let routes = RouteTable {
-        entries: vec![roundhouse::RouteSpec::Explicit {
+        entries: vec![roundhouse::RouteSpec::Explicit { defaults: indexmap::IndexMap::new(),
             method: HttpMethod::Get,
             path: "/posts".into(),
             controller: ClassId(Symbol::from("PostsController")),
