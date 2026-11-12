@@ -294,11 +294,13 @@ fn descends_from_core_container(app: &App, class: &str) -> bool {
         let Some(parent) = app.library_classes.iter().filter(|c| !c.is_module && c.name.0.as_str() == current).find_map(|c| c.parent.clone()) else {
             return false;
         };
+        let rooted = parent.0.as_str().starts_with("::");
         let written = parent.0.as_str().trim_start_matches("::").to_string();
-        if matches!(written.as_str(), "Hash" | "Array" | "String") && !app.library_classes.iter().any(|c| c.name.0.as_str() == written && c.name.0.as_str() != current) {
+        if rooted && matches!(written.as_str(), "Hash" | "Array" | "String") && !app.library_classes.iter().any(|c| c.name.0.as_str() == written) {
             return true;
         }
-        // The parent as Ruby's lexical lookup would find it from the class's namespace, else as written.
+        // The parent as Ruby's lexical lookup would find it from the class's namespace, else as written: an app's
+        // `A::Hash` before the core one.
         let scope: Vec<&str> = current.split("::").collect();
         let resolved = (0..scope.len())
             .rev()

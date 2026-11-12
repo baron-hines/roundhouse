@@ -33,8 +33,18 @@ fn rewrite(e: &mut Expr) {
     let send = |method: &str, args: Vec<Expr>| {
         Expr::new(span, ExprNode::Send { recv: Some(read()), method: Symbol::from(method), args, block: None, parenthesized: true })
     };
+    // Not the other arguments evaluated in the send's branch only: Ruby evaluates them, in order, before `try` runs.
+    let mut binds = Vec::new();
     let mut sent = vec![name.clone()];
-    sent.extend(rest.iter().cloned());
+    for (i, arg) in rest.iter().enumerate() {
+        if matches!(&*arg.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Lit { .. } | ExprNode::SelfRef) {
+            sent.push(arg.clone());
+            continue;
+        }
+        let local = Symbol::from(format!("__rh_try_{}_{i}", span.start));
+        binds.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: local.clone() }, value: arg.clone() }));
+        sent.push(Expr::new(span, ExprNode::Var { id: VarId(0), name: local }));
+    }
     let answer = Expr::new(span, ExprNode::If {
         cond: send("respond_to?", vec![name.clone()]),
         then_branch: send("public_send", sent),
@@ -42,5 +52,8 @@ fn rewrite(e: &mut Expr) {
     });
     let guarded = Expr::new(span, ExprNode::If { cond: send("nil?", Vec::new()), then_branch: nil(), else_branch: answer });
     let hold = Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: held.clone() }, value: recv.clone() });
-    *e = Expr::new(span, ExprNode::Seq { exprs: vec![hold, guarded] });
+    let mut exprs = vec![hold];
+    exprs.extend(binds);
+    exprs.push(guarded);
+    *e = Expr::new(span, ExprNode::Seq { exprs });
 }

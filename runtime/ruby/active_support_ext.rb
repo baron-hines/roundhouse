@@ -875,6 +875,8 @@ module ActiveSupport
   # kept, as the caller's indifferent hash is the one Rails writes in place.
   def self.indifferent_param(hash)
     return hash if hash.nil?
+    # Not a value of another class a union lets in (a String): only a Hash has keys to convert.
+    return hash unless hash.is_a?(Hash)
     return hash if hash.keys.all? { |key| key.is_a?(String) }
     ActiveSupport.indifferent(hash)
   end

@@ -128,7 +128,8 @@ fn includer_free_target(expr: &Expr) -> bool {
         entries.iter().any(|(k, v)| {
             matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "to")
                 && match &*v.node {
-                    ExprNode::Lit { value: crate::expr::Literal::Str { value } } => value.starts_with("self."),
+                    // Not any `self.` read: `self.profile` may name the includer's association.
+                    ExprNode::Lit { value: crate::expr::Literal::Str { value } } => value == "self.class" || value.starts_with("self.class."),
                     ExprNode::Const { .. } => true,
                     _ => false,
                 }

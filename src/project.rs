@@ -14180,7 +14180,15 @@ fn carry_source_gem_data(app: &App, fixture: &Path, out: &mut Vec<(String, Strin
         walk_dir_into_skipping(&lib, &prefix, &["node_modules", "tmp", "log", "coverage"], &mut found)?;
         found.retain(|(rel, _)| {
             let file = rel.rsplit('/').next().unwrap_or(rel);
-            !rel.ends_with(".rb") && !rel.ends_with(".rbs") && !secret(file)
+            // Not a file reached through a symlink: its target may lie outside the gem.
+            let linked = {
+                let mut at = lib.clone();
+                rel.strip_prefix(&prefix).unwrap_or(rel).split('/').any(|part| {
+                    at.push(part);
+                    fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink())
+                })
+            };
+            !linked && !rel.ends_with(".rb") && !rel.ends_with(".rbs") && !secret(file)
         });
         out.extend(found);
     }

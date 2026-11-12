@@ -89,6 +89,8 @@ fn guarded(e: &mut Expr, records: &crate::det::HashSet<String>, proven: &[Symbol
         guarded(cond, records, proven);
         let mut inner = proven.to_vec();
         record_tests(cond, records, &mut inner);
+        // Not a local the branch binds again (an assignment, a block parameter): the test no longer speaks for it.
+        inner.retain(|name| !rebinds(then_branch, name));
         guarded(then_branch, records, &inner);
         guarded(else_branch, records, proven);
         return;
@@ -116,4 +118,15 @@ fn record_tests(cond: &Expr, records: &crate::det::HashSet<String>, out: &mut Ve
         }
         _ => {}
     }
+}
+
+fn rebinds(e: &Expr, name: &Symbol) -> bool {
+    let here = match &*e.node {
+        ExprNode::Assign { target: crate::expr::LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: crate::expr::LValue::Var { name: n, .. }, .. } => n == name,
+        ExprNode::Lambda { params, .. } => params.contains(name),
+        _ => false,
+    };
+    let mut found = here;
+    e.node.for_each_child(&mut |c| found |= rebinds(c, name));
+    found
 }

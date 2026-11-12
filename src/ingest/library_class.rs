@@ -4047,11 +4047,18 @@ fn walk_decl_body_with_visibility<'pr>(
 
     // The `def`s a `class_eval` string loop makes, after the body's own: Ruby runs the loop where it stands, and a
     // later `def` of the body replaces one of them only by name, which no target here orders by.
+    let mut from_eval: Vec<usize> = Vec::new();
     for ((start, end), source) in evaled {
         let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
         let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
         let mut classes = parsed?;
         let Some(class) = classes.pop() else { continue };
+        // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
+        for include in &class.includes {
+            out.includes.push(include.clone());
+            out.include_spans.push(Span { file: super::sources::file_id(file), start, end });
+        }
+        out.unknown_calls.extend(class.unknown_calls.iter().cloned());
         for mut method in class.methods {
             // A `module ClassMethods` body's methods are the includer's class side, as its own `def`s are.
             if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
@@ -4059,8 +4066,14 @@ fn walk_decl_body_with_visibility<'pr>(
             }
             // At the loop: the carrier spans (`ingest_concern_class_method_spans`) name it, as they do the body's `def`s.
             method.name_span = Span { file: super::sources::file_id(file), start, end };
-            if !out.methods.iter().any(|m| m.name == method.name && m.receiver == method.receiver) {
-                out.methods.push(method);
+            match out.methods.iter().position(|m| m.name == method.name && m.receiver == method.receiver) {
+                // A later string's `def` replaces an earlier string's, as Ruby runs them in order.
+                Some(at) if from_eval.contains(&at) => out.methods[at] = method,
+                Some(_) => {}
+                None => {
+                    from_eval.push(out.methods.len());
+                    out.methods.push(method);
+                }
             }
         }
     }

@@ -2775,7 +2775,7 @@ mod tests {
 
 fn defines_methods(e: &Expr) -> bool {
     let mut found = matches!(&*e.node, ExprNode::Send { method, .. }
-        if matches!(method.as_str(), "define_method" | "class_eval" | "module_eval" | "attr_accessor" | "attr_reader" | "attr_writer" | "alias_method"));
+        if matches!(method.as_str(), "define_method" | "define_singleton_method" | "class_eval" | "module_eval" | "attr_accessor" | "attr_reader" | "attr_writer" | "alias_method"));
     e.node.for_each_child(&mut |c| found = found || defines_methods(c));
     found
 }

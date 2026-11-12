@@ -74,18 +74,28 @@ impl Facts {
                 let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
                 for (key, value) in entries {
                     let ExprNode::Lit { value: Literal::Sym { value: k } } = &*key.node else { continue };
-                    let ExprNode::Array { elements, .. } = &*value.node else { continue };
-                    let names: Option<Vec<String>> = elements
-                        .iter()
-                        .map(|e| match &*e.node {
-                            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
-                            _ => None,
-                        })
-                        .collect();
-                    if k.as_str() == "omniauth_providers"
-                        && let Some(names) = names
-                    {
-                        devise_providers.insert(class.to_string(), names);
+                    if k.as_str() != "omniauth_providers" {
+                        continue;
+                    }
+                    // A later `omniauth_providers` replaces an earlier one, as the class attribute does; one not a
+                    // literal list leaves nothing known.
+                    let names: Option<Vec<String>> = match &*value.node {
+                        ExprNode::Array { elements, .. } => elements
+                            .iter()
+                            .map(|e| match &*e.node {
+                                ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    };
+                    match names {
+                        Some(names) => {
+                            devise_providers.insert(class.to_string(), names);
+                        }
+                        None => {
+                            devise_providers.remove(&class.to_string());
+                        }
                     }
                 }
             }
@@ -540,8 +550,8 @@ pub(super) fn devise_strategy_class(app: &App, class: &str, ivars: &HashMap<Stri
         c.unknown_calls.iter().any(|call| matches!(&*call.node, ExprNode::Send { recv: None, method, args, .. }
             if method.as_str() == "option" && matches!(args.as_slice(), [k, v]
                 if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "name")
-                && matches!(&*v.node, ExprNode::Lit { value: Literal::Str { value } } if *value == name)
-                || matches!(&*v.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name))))
+                && (matches!(&*v.node, ExprNode::Lit { value: Literal::Str { value } } if *value == name)
+                    || matches!(&*v.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name)))))
     };
     let found = app
         .library_classes

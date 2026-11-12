@@ -47,6 +47,29 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         }
         super::core_instance_methods::OBJECT
     };
+    // The classes whose nearest `method_missing` is private, which an explicit receiver reaches only through `__send__`.
+    let private_missing: crate::det::HashSet<String> = {
+        let own: HashMap<String, bool> = app
+            .library_classes
+            .iter()
+            .flat_map(|c| c.methods.iter().filter(|m| m.name == missing && m.receiver == crate::dialect::MethodReceiver::Instance).map(move |m| (c.name.0.as_str().to_string(), m.visibility == crate::dialect::MethodVisibility::Private)))
+            .collect();
+        parents
+            .keys()
+            .filter(|name| {
+                let mut current = Some((*name).clone());
+                for _ in 0..32 {
+                    let Some(c) = current else { break };
+                    if let Some(private) = own.get(&c) {
+                        return *private;
+                    }
+                    current = parents.get(&c).cloned().flatten();
+                }
+                false
+            })
+            .cloned()
+            .collect()
+    };
     // The core modules each class includes along its written chain (Warden's `Errors` takes `entries` from Enumerable).
     let includes: HashMap<String, Vec<String>> = app
         .library_classes
@@ -80,7 +103,7 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
                 continue;
             }
             let locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
-            rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers);
+            rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers, &private_missing);
         }
     }
     // A block a class-body call hands over (`uid do request.params[options.uid_field] end`, replayed and instance_eval'd
@@ -91,12 +114,12 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         for call in &mut lc.unknown_calls {
             let ExprNode::Send { block: Some(block), .. } = &mut *call.node else { continue };
             let ExprNode::Lambda { body, .. } = &mut *block.node else { continue };
-            body_reads(body, info, &answers_missing, &core_of, &module_answers, registry);
+            body_reads(body, info, &answers_missing, &core_of, &module_answers, registry, &private_missing);
         }
     }
     // Every other body reaches such a class through a receiver (`auth.provider` on OmniAuth's AuthHash in a model).
     let nobody = ClassId(Symbol::from(""));
-    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], true, registry, &answers_missing, &core_of, &module_answers));
+    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], true, registry, &answers_missing, &core_of, &module_answers, &private_missing));
 }
 
 fn rewrite(
@@ -109,8 +132,9 @@ fn rewrite(
     answers_missing: &dyn Fn(&ClassId) -> bool,
     core_of: &dyn Fn(&ClassId) -> &'static [&'static str],
     module_answers: &dyn Fn(&ClassId, &str) -> bool,
+    private_missing: &crate::det::HashSet<String>,
 ) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, typed, registry, answers_missing, core_of, module_answers));
+    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, typed, registry, answers_missing, core_of, module_answers, private_missing));
     // Typed too where `typed` (the analysis answers a call no method takes with `method_missing`'s type), but not on a
     // receiver spelled as a class object (`Errors.new`, `self.class.new`): `Ty::Class` alone does not tell it from an instance.
     let instance_read = |r: &Expr| {
@@ -143,6 +167,7 @@ fn rewrite(
     {
         return;
     }
+    let private = recv.is_some() && private_missing.contains(class.0.as_str());
     let class_ty = Ty::Class { id: class, args: vec![].into() };
     if crate::analyze::diagnostics::method_registered_on(registry, Some(&class_ty), method) {
         return;
@@ -150,6 +175,11 @@ fn rewrite(
     let name = Expr::new(e.span, ExprNode::Lit { value: Literal::Sym { value: method.clone() } });
     args.insert(0, name);
     *method = Symbol::from("method_missing");
+    // Not a private `method_missing` called on its receiver, which raises: `__send__` reaches it as Ruby's dispatch does.
+    if private {
+        args.insert(0, Expr::new(e.span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("method_missing") } }));
+        *method = Symbol::from("__send__");
+    }
     // Not the source's bare `auth.provider`: an argument written without parens does not parse inside another call's.
     *parenthesized = true;
 }
@@ -161,8 +191,9 @@ fn body_reads(
     core_of: &dyn Fn(&ClassId) -> &'static [&'static str],
     module_answers: &dyn Fn(&ClassId, &str) -> bool,
     registry: &HashMap<ClassId, crate::analyze::ClassInfo>,
+    private_missing: &crate::det::HashSet<String>,
 ) {
-    e.node.for_each_child_mut(&mut |c| body_reads(c, info, answers_missing, core_of, module_answers, registry));
+    e.node.for_each_child_mut(&mut |c| body_reads(c, info, answers_missing, core_of, module_answers, registry, private_missing));
     let ExprNode::Send { recv: Some(r), method, args, parenthesized, .. } = &mut *e.node else { return };
     let ExprNode::Send { recv: None, method: reader, args: reader_args, block: None, .. } = &*r.node else { return };
     if !reader_args.is_empty() || method.as_str() == "method_missing" || method.as_str() == "new" {
@@ -183,5 +214,9 @@ fn body_reads(
     let name = Expr::new(e.span, ExprNode::Lit { value: Literal::Sym { value: method.clone() } });
     args.insert(0, name);
     *method = Symbol::from("method_missing");
+    if private_missing.contains(id.0.as_str()) {
+        args.insert(0, Expr::new(e.span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("method_missing") } }));
+        *method = Symbol::from("__send__");
+    }
     *parenthesized = true;
 }

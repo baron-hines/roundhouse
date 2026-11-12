@@ -135,7 +135,8 @@ pub(super) fn mark(app: &mut App) {
             let replays = own_call || through_own_reader || on_app_class.is_some();
             // A block only to the class's own class method (OmniAuth's `uid do … end`, spliced from the Strategy's
             // ClassMethods), which takes it as Ruby hands it over.
-            let block_ok = block.is_none() || (own_call && direct.contains(method.as_str()));
+            // Nor a block reading a local of the class body, which the replayed call no longer stands beside.
+            let block_ok = block.as_ref().is_none_or(|b| own_call && direct.contains(method.as_str()) && reads_no_local(b));
             if replays && !hook && block_ok && !expr.span.is_synthetic() {
                 let local_new = own_call && !direct.contains(method.as_str());
                 if local_new && (mixed_body || args.iter().any(|a| !literal_argument(a))

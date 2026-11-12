@@ -1135,7 +1135,8 @@ module ActiveRecord
       counters.each do |col, delta|
         parts.push("#{col} = COALESCE(#{col}, 0) + #{delta.to_i}")
       end
-      sql = "UPDATE #{table_name} SET #{parts.join(", ")} WHERE id = #{ActiveRecord.adapter.escape_value(id)}"
+      key = ActiveRecord.adapter.quote_column_name(primary_key.to_s)
+      sql = "UPDATE #{table_name} SET #{parts.join(", ")} WHERE #{key} = #{ActiveRecord.adapter.escape_value(id)}"
       ActiveRecord.adapter.execute_ddl(sql)
       ActiveRecord.adapter.changes
     end

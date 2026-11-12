@@ -2266,9 +2266,10 @@ impl<'a> BodyTyper<'a> {
                         method_missing_ty = if instance_receiver {
                             // An instance send that no method answers goes to the instance-side `method_missing` (hashie's
                             // Mash, which OmniAuth's AuthHash answers `provider` with).
+                            // The latest include first, as Ruby looks it up; `self` the receiving class.
                             cls.instance_methods.get(&missing).cloned().or_else(|| {
-                                cls.includes.iter().find_map(|m| self.lookup_in_module(m, &missing))
-                            })
+                                cls.includes.iter().rev().find_map(|m| self.lookup_in_module(m, &missing))
+                            }).map(|ty| subst(&ty))
                         } else {
                             cls.class_methods.get(&missing).cloned()
                         };

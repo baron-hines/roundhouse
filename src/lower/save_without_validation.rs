@@ -142,14 +142,26 @@ fn rewrite_kwarg(expr: &mut Expr) {
         // Not for a receiver the branches would evaluate twice; Rails skips validation only for `false` itself (`options[:validate] == false`), not for nil.
         _ if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)) => {
             let value = v.clone();
+            // Not the receiver read after the value: Ruby takes it first, so a value that rebinds it saves the one it had.
+            let plain_value = matches!(&*value.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Lit { .. } | ExprNode::SelfRef);
+            let held = recv.as_ref().filter(|r| !plain_value && !matches!(&*r.node, ExprNode::SelfRef)).map(|r| {
+                let local = Symbol::from(format!("__rh_save_{}", span.start));
+                let bind = Expr::new(span, ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: local.clone() }, value: r.clone() });
+                (bind, Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: local }))
+            });
+            let receiver = held.as_ref().map(|(_, read)| read.clone()).or_else(|| recv.clone());
             let call = |name: &str| {
-                Expr::new(span, ExprNode::Send { recv: recv.clone(), method: Symbol::from(name), args: Vec::new(), block: None, parenthesized: true })
+                Expr::new(span, ExprNode::Send { recv: receiver.clone(), method: Symbol::from(name), args: Vec::new(), block: None, parenthesized: true })
             };
             let skipped = call("save_after_validation");
             let validated = call(method.as_str());
             let falsy = Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: false } });
             let cond = Expr::new(span, ExprNode::Send { recv: Some(value), method: Symbol::from("=="), args: vec![falsy], block: None, parenthesized: true });
-            *expr = Expr::new(span, ExprNode::If { cond, then_branch: skipped, else_branch: validated });
+            let branch = Expr::new(span, ExprNode::If { cond, then_branch: skipped, else_branch: validated });
+            *expr = match held {
+                Some((bind, _)) => Expr::new(span, ExprNode::Seq { exprs: vec![bind, branch] }),
+                None => branch,
+            };
         }
         _ => {}
     }
