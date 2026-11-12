@@ -1529,3 +1529,37 @@ fn a_devise_user_signs_in_through_omniauth_over_rack_on_the_ruby_family() {
     run.assert_passes();
     assert!(run.stdout.contains("devise omniauth over rack passed"), "{}", run.stdout);
 }
+
+/// The same flow natively, with OmniAuth compiled from source on Spinel: the provider button, the developer
+/// strategy's request phase, and its callback signing in the user `from_omniauth` made.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_devise_user_signs_in_through_omniauth_over_http_natively() {
+    let tree = omniauth_app().native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    let mut jar = Vec::new();
+    let (page, cookies) = server.request_with_set_cookies("GET", "/users/sign_in", &[], "");
+    assert_eq!(page.status, 200, "{}", server.log());
+    assert!(page.body.contains(r#"<form action="/users/auth/developer" method="post" class="button_to">"#), "{}", page.body);
+    kept(&mut jar, &cookies);
+    let cookie = header(&jar);
+    let (form, cookies) = server.request_with_set_cookies("POST", "/users/auth/developer", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(form.status, 200, "{}\n{}", form.body, server.log());
+    assert!(form.body.contains("action='/users/auth/developer/callback'"), "{}", form.body);
+    kept(&mut jar, &cookies);
+    let cookie = header(&jar);
+    let (before, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(before.status, 302, "signed in before the callback: {}", server.log());
+    let (callback, cookies) = server.request_with_set_cookies(
+        "POST",
+        "/users/auth/developer/callback",
+        &[("Content-Type", "application/x-www-form-urlencoded"), ("Cookie", cookie.as_str())],
+        "name=Dev&email=dev%40example.com",
+    );
+    assert_eq!(callback.status, 302, "{}\n{}", callback.body, server.log());
+    assert!(callback.headers.get("location").is_some_and(|l| l.ends_with("/secret")), "{:?}", callback.headers);
+    kept(&mut jar, &cookies);
+    let cookie = header(&jar);
+    let (after, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(after.status, 200, "{}", server.log());
+}
