@@ -10118,7 +10118,8 @@ module GemMiddleware
 
   def self.replace_headers(res, headers)
     res.headers = Tep.str_hash
-    res.set_cookies.pop while res.set_cookies.length > 0
+    # Not cleared with the headers: Rails' Cookies middleware sits outside this stack and writes the controller's cookies after the middleware's own.
+    routes_cookie_count = res.set_cookies.length
     res.header_fields.pop while res.header_fields.length > 0
     headers.each do |name, value|
       key = name.to_s
@@ -10129,6 +10130,10 @@ module GemMiddleware
       else
         res.headers[key] = values.join(", ")
       end
+    end
+    while routes_cookie_count > 0
+      res.set_cookies << res.set_cookies.shift
+      routes_cookie_count -= 1
     end
   end
 
