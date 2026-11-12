@@ -41,3 +41,27 @@ fn the_spinel_emit_raises_load_error_for_an_absent_feature_under_a_standard_libr
     assert!(http.contains("raise LoadError.new(\"cannot load such file -- net/http/persistent\")"), "{http}");
     assert!(http.contains("require \"net/http\""), "{http}");
 }
+
+/// A native extension required with its suffix is looked up without it: Ruby's own `io/wait.so` stays a
+/// `require`, and the `LoadError` for one nothing ships keeps the name as written.
+#[test]
+fn the_spinel_emit_looks_up_a_native_extension_without_its_suffix() {
+    let (emitted, errors) = contract::app_with_native().emit(BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("io/wait") || e.contains("fancy_printer")), "{errors:#?}");
+    let native = std::fs::read_to_string(emitted.join("app/models/shelf/native.rb")).expect("native.rb");
+    assert!(native.contains("require \"io/wait.so\""), "{native}");
+    assert!(!native.contains("cannot load such file -- io/wait"), "{native}");
+    assert!(native.contains("raise LoadError.new(\"cannot load such file -- fancy_printer.so\")"), "{native}");
+}
+
+/// The gem's mixin method spliced into an app controller is still the gem's: its copy raises the `LoadError`
+/// the original does, instead of keeping the `require`.
+#[test]
+fn the_spinel_emit_raises_load_error_in_a_controller_copy_of_a_gems_mixin_method() {
+    let (emitted, errors) = contract::app_with_controller().emit(BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("fancy_printer")), "{errors:#?}");
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/boxes_controller.rb")).expect("boxes_controller.rb");
+    assert!(controller.contains("pretty_loaded"), "{controller}");
+    assert!(!controller.contains("require \"fancy_printer\""), "{controller}");
+    assert!(controller.contains("raise LoadError.new(\"cannot load such file -- fancy_printer\")"), "{controller}");
+}

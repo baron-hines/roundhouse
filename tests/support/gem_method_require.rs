@@ -84,6 +84,44 @@ end
 
 pub const ARTICLE_HTTP: &str = "class ArticleHttp\n  def self.loaded\n    [Shelf::Http.plain!, Shelf::Http.persistent!].inspect\n  end\nend\n";
 
+/// The gem's loaders of native extensions written with their suffix: Ruby's own `io/wait.so` loads, and
+/// `fancy_printer.so`, which nothing ships, raises `LoadError` with the name as written.
+pub const SHELF_NATIVE: &str = r#"module Shelf
+  module Native
+    def self.wait!
+      require "io/wait.so"
+      true
+    rescue LoadError
+      nil
+    end
+
+    def self.missing!
+      require "fancy_printer.so"
+      true
+    rescue LoadError
+      nil
+    end
+  end
+end
+"#;
+
+pub const ARTICLE_NATIVE: &str = "class ArticleNative\n  def self.loaded\n    [Shelf::Native.wait!, Shelf::Native.missing!].inspect\n  end\nend\n";
+
+/// A controller mixin the gem ships, whose method loads the optional library: an app controller includes it.
+pub const SHELF_CONTROLLER: &str = r#"module Shelf
+  module PrettyActions
+    def pretty_loaded
+      require "fancy_printer"
+      true
+    rescue LoadError
+      nil
+    end
+  end
+end
+"#;
+
+pub const BOXES_CONTROLLER: &str = "class BoxesController < ApplicationController\n  include Shelf::PrettyActions\n\n  def index\n    render plain: pretty_loaded.inspect\n  end\nend\n";
+
 /// real-blog with the `gems` locked and installed under `vendor/bundle`.
 fn with_gems(gems: &[&str]) -> emit_and_run::Overlay {
     let fixture = roundhouse::fixtures::real_blog();
@@ -121,4 +159,23 @@ pub fn app_with_http() -> emit_and_run::Overlay {
         .write(GEM, &format!("{SHELF}{SHELF_HTTP}"))
         .write("app/models/article_box.rb", ARTICLE_BOX)
         .write("app/models/article_http.rb", ARTICLE_HTTP)
+}
+
+/// [`app`] with `Shelf::Native` in the gem.
+#[allow(dead_code)]
+pub fn app_with_native() -> emit_and_run::Overlay {
+    with_gems(&["shelf"])
+        .write(GEM, &format!("{SHELF}{SHELF_NATIVE}"))
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+        .write("app/models/article_native.rb", ARTICLE_NATIVE)
+}
+
+/// [`app`] with `Shelf::PrettyActions` in the gem and a routed controller that includes it.
+#[allow(dead_code)]
+pub fn app_with_controller() -> emit_and_run::Overlay {
+    with_gems(&["shelf"])
+        .write(GEM, &format!("{SHELF}{SHELF_CONTROLLER}"))
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+        .write("app/controllers/boxes_controller.rb", BOXES_CONTROLLER)
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  resources :boxes, only: :index\n")
 }
