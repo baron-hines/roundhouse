@@ -567,9 +567,10 @@ fn untyped_subexpressions_baseline() {
     // `clear_attribute_change` no longer reads `attributes` directly (-3).
     // These are vars on this RBS-less probe; connection.rbs types them for
     // the RBS-paired gate.
-    // MEASURED 1242 on 2026-11-12 (devise-lockable, on 1238): `increment_counter`/`decrement_counter` in
-    // active_record/connection.rb read the counter name, id, `by:` and `touch:` they are given (+4), vars on
-    // this RBS-less probe; connection.rbs types them for the RBS-paired gate.
+    // MEASURED 1242 on 2026-11-12 (devise-lockable, on 1238): +4 in the runtime this branch changes
+    // (active_record/connection.rb's `increment_counter`/`decrement_counter` and `find_or_*_by`, relation.rb's
+    // `find_or_*_by`), whose parameters are vars on this RBS-less probe; their RBS types them for the
+    // RBS-paired gate, which stays at its ceiling.
     const CEILING: usize = 1242;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
