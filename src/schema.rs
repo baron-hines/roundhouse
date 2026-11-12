@@ -224,11 +224,29 @@ pub struct Index {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ForeignKey {
-    pub from_column: Symbol,
+    #[serde(alias = "from_column", deserialize_with = "deserialize_key_columns")]
+    pub from_columns: Vec<Symbol>,
     pub to_table: TableRef,
-    pub to_column: Symbol,
+    #[serde(alias = "to_column", deserialize_with = "deserialize_key_columns")]
+    pub to_columns: Vec<Symbol>,
     pub on_delete: ReferentialAction,
     pub on_update: ReferentialAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferrable: Option<Deferrable>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deferrable {
+    Immediate,
+    Deferred,
+}
+
+fn deserialize_key_columns<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Vec<Symbol>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Columns { One(Symbol), Many(Vec<Symbol>) }
+    Ok(match Columns::deserialize(input)? { Columns::One(c) => vec![c], Columns::Many(cs) => cs })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
