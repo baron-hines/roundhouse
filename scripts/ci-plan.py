@@ -136,6 +136,7 @@ SPINEL_TESTS = [
     "kernel_method_shadowing",
     "jbuilder_array_value_spinel",
     "active_job_payload",
+    "solid_queue_durability",
     "render_json_encoder_spinel",
     "url_helpers_absolute_spinel",
     "jbuilder_extract_attributes_spinel",
@@ -776,6 +777,9 @@ def native_coverage(path):
         suites.update(owned_tests)
     if path in ACTIVE_JOB_PAYLOAD_INPUTS or path.startswith("tests/active_job_payload/"):
         suites.add("active_job_payload")
+    if path in {"src/ingest/app.rs", "src/lower/job_payload.rs", "src/lower/job_class_side.rs",
+                "runtime/spinel/solid_queue_runner.rb", "tests/support/solid_queue_worker.rs"} or path.startswith("tests/solid_queue_durability/"):
+        suites.add("solid_queue_durability")
     if path in SIDEKIQ_PUSH_INPUTS or path.startswith("tests/sidekiq_push/"):
         suites.add("sidekiq_push")
     if path in SIDEKIQ_WORKER_INPUTS or path.startswith("tests/sidekiq_worker/"):
