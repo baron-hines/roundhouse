@@ -345,20 +345,34 @@ module SidekiqWorker
   def self.supervise
     while true
       sleep POLL_SECONDS
-      if SIGNALS[2] == 1
-        SIGNALS[2] = 0
+      signals = take_signals
+      if signals[2] == 1
         dump_running
       end
-      if SIGNALS[1] == 1 && !QUIET[0]
+      if signals[1] == 1 && !QUIET[0]
         log("INFO", "Received TSTP, no longer accepting new work")
         QUIET[0] = true
       end
-      if SIGNALS[0] == 1
+      if signals[0] == 1
         shutdown
         return nil
       end
     end
     nil
+  end
+
+  # The flags as a trap or the heartbeat left them, read under LOCK, with
+  # TTIN's taken. The heartbeat sets them under LOCK, so a Stop or Quiet
+  # from the Web UI is seen across threads. A trap handler can't take a
+  # lock (Ruby raises ThreadError in trap context), so a trap writes
+  # them bare. Read into a copy because dump_running and shutdown take
+  # LOCK themselves.
+  def self.take_signals
+    LOCK.synchronize do
+      seen = [SIGNALS[0], SIGNALS[1], SIGNALS[2]]
+      SIGNALS[2] = 0
+      seen
+    end
   end
 
   # TERM: stop fetching, give running jobs up to TIMEOUT seconds, then
@@ -1034,16 +1048,31 @@ module SidekiqHeartbeat
     Process.clock_gettime(Process::CLOCK_MONOTONIC, :microsecond) - a
   end
 
-  # The resident set in kB from /proc/self/status, or 0 where there is
-  # no such file, as Sidekiq's `memory_usage` reads it on Linux.
+  # The resident set in kB, as Sidekiq's `memory_usage` reads it: from
+  # /proc/self/status on Linux, and from `ps` where there is no /proc
+  # (macOS, the BSDs).
   def self.rss_kb
-    return 0 unless File.exist?("/proc/self/status")
+    return proc_rss_kb if File.exist?("/proc/self/status")
+    ps_rss_kb(Process.pid)
+  end
+
+  def self.proc_rss_kb
     File.read("/proc/self/status").each_line do |line|
       if line.start_with?("VmRSS:")
         return line.split(" ")[1].to_i
       end
     end
     0
+  end
+
+  # `ps -o rss= -p PID`, in kB on Linux, macOS and the BSDs alike; 0 for
+  # a pid it doesn't list, or without `ps` (its complaint goes nowhere).
+  def self.ps_rss_kb(pid)
+    begin
+      `ps -o rss= -p #{pid} 2>/dev/null`.strip.to_i
+    rescue StandardError
+      0
+    end
   end
 
   # Sidekiq's `flush_stats`: the counts since the last flush, if any,
@@ -1062,15 +1091,21 @@ module SidekiqHeartbeat
   end
 
   # A signal the Web UI left, as the flag its trap would set.
+  # Set under SidekiqWorker::LOCK, which the supervisor reads them under
+  # (`take_signals`).
   def self.act(signal)
+    flag = -1
     if signal == "TERM" || signal == "INT"
-      SidekiqWorker::SIGNALS[0] = 1
+      flag = 0
     elsif signal == "TSTP"
-      SidekiqWorker::SIGNALS[1] = 1
+      flag = 1
     elsif signal == "TTIN"
-      SidekiqWorker::SIGNALS[2] = 1
+      flag = 2
     elsif signal.length > 0
       SidekiqWorker.log("WARN", "Heartbeat: ignoring the signal " + signal)
+    end
+    if flag >= 0
+      SidekiqWorker::LOCK.synchronize { SidekiqWorker::SIGNALS[flag] = 1 }
     end
     nil
   end

@@ -238,5 +238,20 @@ SidekiqWorker::SIGNALS[0] = 0
 SidekiqHeartbeat.act("USR2")
 check("a signal it doesn't know sets nothing", SidekiqWorker::SIGNALS[0] == 0, "")
 
+# The supervisor's side of the handoff: it takes TTIN and leaves the rest set.
+SidekiqWorker::SIGNALS[0] = 0
+SidekiqWorker::SIGNALS[1] = 0
+SidekiqWorker::SIGNALS[2] = 0
+SidekiqHeartbeat.act("TTIN")
+SidekiqHeartbeat.act("TSTP")
+seen = SidekiqWorker.take_signals
+check("the supervisor takes TTIN and keeps TSTP",
+  seen[0] == 0 && seen[1] == 1 && seen[2] == 1 && SidekiqWorker::SIGNALS[1] == 1 && SidekiqWorker::SIGNALS[2] == 0, seen.join(","))
+SidekiqWorker::SIGNALS[1] = 0
+
+# Where there is no /proc, the resident set comes from `ps`.
+check("ps reads this process's resident set", SidekiqHeartbeat.ps_rss_kb(Process.pid) > 0, SidekiqHeartbeat.ps_rss_kb(Process.pid).to_s)
+check("ps answers 0 for a pid it doesn't list", SidekiqHeartbeat.ps_rss_kb(999999999) == 0, SidekiqHeartbeat.ps_rss_kb(999999999).to_s)
+
 timeline.each { |t| puts "trip\t" + t }
 puts "done"
