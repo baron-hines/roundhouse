@@ -1672,6 +1672,7 @@ fn table_from_create_table(
                 generated_int4_compatible: None,
                 array: false,
                 array_stored: false,
+                unset_until_assigned: false,
             }),
             Some(t) => column_with_type(t, id_name.clone(), &opts, &table_name, file),
         };
@@ -1835,6 +1836,7 @@ fn virtual_table_from_call(call: &ruby_prism::CallNode<'_>) -> Option<(Symbol, T
             generated_int4_compatible: None,
             array: false,
             array_stored: false,
+            unset_until_assigned: false,
         })
         .collect();
     Some((
@@ -1949,6 +1951,7 @@ fn view_columns_from_sql(sql: &str, tables: &IndexMap<Symbol, Table>) -> Vec<Col
             generated_int4_compatible: None,
             array,
             array_stored: false,
+            unset_until_assigned: false,
         });
     }
     columns
@@ -2026,6 +2029,7 @@ fn timestamp_columns_with(nullable: bool) -> [Column; 2] {
         generated_int4_compatible: None,
         array: false,
         array_stored: false,
+        unset_until_assigned: false,
     };
     [col("created_at"), col("updated_at")]
 }
@@ -2047,6 +2051,7 @@ fn reference_column(name: &str) -> Column {
         generated_int4_compatible: None,
         array: false,
         array_stored: false,
+        unset_until_assigned: false,
     }
 }
 
@@ -2501,6 +2506,7 @@ fn column_with_type(
         generated_int4_compatible,
         array: opts.array,
         array_stored: false,
+        unset_until_assigned: false,
     })
 }
 
