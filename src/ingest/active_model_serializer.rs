@@ -777,6 +777,8 @@ fn for_each_rewritten_body(app: &mut crate::App, f: &mut dyn FnMut(&mut Expr)) {
 /// cache.
 const GEM_INSTANCE_METHODS: &[&str] = &[
     "scope",
+    // The gem's `initialize` assigns the scope through it; the synthesized one would replace an own.
+    "scope=",
     "scope_name",
     "current_user",
     "serialization_context",
