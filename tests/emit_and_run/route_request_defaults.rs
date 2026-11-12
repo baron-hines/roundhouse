@@ -1,8 +1,6 @@
 //! Literal verb defaults retain Rails' types; captures win and query values lose.
-use super::emit_and_run;
+use super::route_request_defaults_contract::app;
 
-const ROUTES: &str = include_str!("../support/route_request_defaults/routes.rb");
-const CONTROLLER: &str = include_str!("../support/route_request_defaults/controller.rb");
 const CHECKS: &str = r#"require "stringio"
 ActionController::Base.allow_forgery_protection = false
 def answer(method, path, query, body, headers)
@@ -19,11 +17,6 @@ raise "last pair" unless answer("GET", "/duplicate", "", "", {})[1] == '"last"|n
 recognized = Rails.application.routes.recognize_path("/literal")
 raise "recognize type" unless recognized[:symbol] == :staff && recognized[:number] == 1 && recognized.key?(:absent)
 "#;
-fn app() -> emit_and_run::Overlay {
-    emit_and_run::real_blog()
-        .edit("config/routes.rb", "  root \"articles#index\"\n", ROUTES)
-        .write("app/controllers/defaults_controller.rb", CONTROLLER)
-}
 #[test]
 fn typed_defaults_reach_the_ruby_dispatcher_and_recognizer() {
     let expected = include_str!("../support/route_request_defaults/expected.json");
@@ -148,25 +141,6 @@ probe.assert_generates("/archive/2024.json", { controller: "defaults", action: "
 puts "kind=fixed"
 "#;
     app().run_spinel_with_rbs(script).assert_passes();
-}
-
-#[test]
-#[ignore = "requires the Spinel toolchain"]
-fn route_defaults_win_over_native_multipart_uploads() {
-    let tree = app()
-        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
-        .native_http_tree();
-    let server = super::native_http::Server::start(&tree);
-    let body = "--route-upload\r\nContent-Disposition: form-data; name=\"text\"; filename=\"sample.txt\"\r\nContent-Type: text/plain\r\n\r\nquery\r\n--route-upload--\r\n";
-    let response = server.post_without_session("/matched", "multipart/form-data; boundary=route-upload", body);
-    assert_eq!(response.status, 200, "{}", server.log());
-    assert_eq!(response.body, "\"fixed\"|nil|nil|nil|nil|nil", "{}", server.log());
-    let links = server.get("/links");
-    assert_eq!(links.status, 200, "{}", server.log());
-    assert_eq!(links.body, "/optional|/optional|/optional/2|/optional/2|/optional|/literal|/entry/9|/entry/9/page/2|/catalog|/fr/catalog", "{}", server.log());
-    let formatted = server.get("/format_links");
-    assert_eq!(formatted.status, 200, "{}", server.log());
-    assert_eq!(formatted.body, "/optional/1.json|/optional/1.json|/entry/9/page/1.json|/archive/2024.json", "{}", server.log());
 }
 
 #[test]

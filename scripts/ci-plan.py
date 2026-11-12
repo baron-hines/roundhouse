@@ -521,11 +521,13 @@ def native_coverage(path):
         or path == "tests/support/full_forwarding.rs"
     ) and not interpreter_only
     suites = set()
+    # Owning a suite also selects CORE, so these run the native HTTP half
+    # (tests/spinel_toolchain/route_request_defaults.rs) in spinel-toolchain.
     if path in {
         "src/ingest/routes.rs", "src/lower/routes.rs", "src/lower/routes_to_library/mod.rs", "src/dialect.rs",
         "src/build_target.rs", "src/lower/route_guards.rs", "src/project.rs", "runtime/ruby/action_dispatch/router.rb",
         "runtime/ruby/action_dispatch/router.rbs", "runtime/spinel/scaffold/main.rb", "runtime/spinel/test/test_helper.rb", "runtime/spinel/test/test_helper.rbs",
-        "tests/emit_and_run/route_request_defaults.rs",
+        "tests/emit_and_run/route_request_defaults.rs", "tests/support/route_request_defaults.rs",
     } or path.startswith("tests/support/route_request_defaults/"):
         suites.add("route_request_defaults")
     if path in {

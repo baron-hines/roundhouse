@@ -2,7 +2,7 @@
 mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
-#[path = "support/native_http.rs"]
-mod native_http;
+#[path = "support/route_request_defaults.rs"]
+mod route_request_defaults_contract;
 #[path = "emit_and_run/route_request_defaults.rs"]
 mod route_request_defaults;

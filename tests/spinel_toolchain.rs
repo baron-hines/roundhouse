@@ -186,6 +186,10 @@ mod multipart_file_parts;
 mod default_format_dispatch;
 #[path = "spinel_toolchain/route_default_format.rs"]
 mod route_default_format;
+#[path = "support/route_request_defaults.rs"]
+mod route_request_defaults_contract;
+#[path = "spinel_toolchain/route_request_defaults.rs"]
+mod route_request_defaults;
 #[path = "support/json_params.rs"]
 mod json_params_contract;
 #[path = "spinel_toolchain/json_params.rs"]
