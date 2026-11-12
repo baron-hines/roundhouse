@@ -128,6 +128,7 @@ pub mod save_without_validation;
 pub mod defined_ivar_read;
 pub mod method_missing_calls;
 pub mod dynamic_try;
+pub mod primary_key_send;
 mod core_instance_methods;
 pub mod route_param_recall;
 pub mod expect_string_key;
@@ -719,6 +720,9 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // `record.slice(:a, :b)` on a typed model → a Hash of its typed
     // readers. Reads the analyzer's receiver types; nothing keys on it.
     ("record_slice", &[]),
+    // `record.send(record.class.primary_key)` -> `record.id` on an analyzer-typed record, before the dynamic
+    // send would reach send_static_dispatch's residue.
+    ("primary_key_send", &[]),
     ("send_static_dispatch", &[]),
     // Grounds the plural duration-unit calls that send_static_dispatch
     // synthesizes into case arms, so it must observe that pass's output.
@@ -1115,6 +1119,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("module_mattr_storage");
     diags.extend(record_slice::apply_record_slice_lowering(app, registry));
     ran!("record_slice");
+    primary_key_send::apply_primary_key_send(app);
+    ran!("primary_key_send");
     diags.extend(crate::timings::phase("post-analyze: send_dispatch", || {
         send_dispatch::apply_send_static_dispatch(app, registry)
     }));
