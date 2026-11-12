@@ -277,6 +277,28 @@ end
 }
 
 #[test]
+fn a_class_object_self_binding_finds_class_methods_before_kernel() {
+    let source = r#"class Widget
+  def self.load(value) = 17
+end
+class Config
+  def rbs
+    #: self as singleton(Widget)
+    load(nil)
+  end
+  def sorbet
+    T.bind(self, T.class_of(Widget))
+    load(nil)
+  end
+end
+"#;
+    let signatures = rbs(source, "config");
+    for expected in ["def rbs: () -> Integer", "def sorbet: () -> Integer"] {
+        assert!(signatures.contains(expected), "{signatures}");
+    }
+}
+
+#[test]
 fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls
   def load(value) = "instance"

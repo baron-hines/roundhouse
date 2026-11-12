@@ -3712,6 +3712,9 @@ impl<'a> BodyTyper<'a> {
                             }
                             local_ctx.self_ty = e.ty.clone();
                             local_ctx.class_side = e.decisions & crate::expr::SELF_BINDING_CLASS_OBJECT != 0;
+                            if local_ctx.class_side {
+                                local_ctx.instance_body = false;
+                            }
                         }
                         if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
                             let proven = self.is_class_object(value, &local_ctx);
