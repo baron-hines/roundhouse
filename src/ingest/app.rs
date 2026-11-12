@@ -3792,6 +3792,23 @@ fn model_declares_side(model: &crate::dialect::Model, attr: &crate::ident::Symbo
         })
 }
 
+/// The module `written` names in `from`'s body: looked up from `from`'s namespace outward, then as written.
+fn lexical_module(app: &App, from: &crate::ident::ClassId, written: &crate::ident::ClassId) -> crate::ident::ClassId {
+    let name = written.0.as_str();
+    if let Some(top) = name.strip_prefix("::") {
+        return crate::ident::ClassId(crate::ident::Symbol::from(top));
+    }
+    let mut scope = Some(from.0.as_str());
+    while let Some(prefix) = scope {
+        let candidate = format!("{prefix}::{name}");
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == candidate) {
+            return crate::ident::ClassId(crate::ident::Symbol::from(candidate.as_str()));
+        }
+        scope = prefix.rsplit_once("::").map(|(p, _)| p);
+    }
+    written.clone()
+}
+
 /// `confirmation:` on `attr`: Rails' `ConfirmationValidator#setup!` defines a plain `<attr>_confirmation` reader and
 /// writer where the model has none, so the model gains that `attr_accessor`, ahead of the validation.
 fn define_confirmation_accessors(app: &mut App) {
@@ -3811,7 +3828,8 @@ fn define_confirmation_accessors(app: &mut App) {
                 }
                 for lc in app.library_classes.iter().filter(|c| c.name == id) {
                     out.extend(lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.clone()));
-                    pending.extend(lc.includes.iter().cloned());
+                    // Not as written: a module includes a sibling by its short name, which names it from its own namespace outward.
+                    pending.extend(lc.includes.iter().map(|written| lexical_module(app, &lc.name, written)));
                 }
             }
             out

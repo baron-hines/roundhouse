@@ -3484,6 +3484,19 @@ pub(super) fn expand_model_mixin_macros<V: Vfs + ?Sized>(vfs: &V, dir: &Path, ge
             break;
         }
     }
+    // None at all while a macro call stays unexpanded: when it runs it may include a hooked module, whose hook would
+    // then run again on a rewritten model's `include` of it.
+    let expanded: HashSet<(usize, usize)> = rewrites.iter().map(|r| (r.0, r.1)).collect();
+    let unexpanded = app.models.iter().enumerate().any(|(mi, m)| {
+        m.body.iter().enumerate().any(|(bi, item)| !expanded.contains(&(mi, bi)) && matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if {
+            let mut hit = false;
+            visit(expr, &mut |e| if let ExprNode::Send { method, .. } = &*e.node && seen_macros.iter().any(|n| n.as_str() == method.as_str()) { hit = true; });
+            hit
+        }))
+    });
+    if unexpanded {
+        rewrites.clear();
+    }
     let mut hooked_by: HashMap<String, Vec<ClassId>> = HashMap::default();
     for (mi, bi, includes, declared, hooked) in rewrites {
         let owner = app.models[mi].name.clone();
