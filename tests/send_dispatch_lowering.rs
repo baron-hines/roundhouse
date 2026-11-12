@@ -319,3 +319,157 @@ fn a_trailing_name_two_classes_share_counts_no_call_site() {
         "an ambiguous trailing name must not resolve to either class:\n{out}"
     );
 }
+
+/// solid_queue 1.7.0's `Job::Executable#execution`: the name is built
+/// around the element parameter of a `reduce` over a literal list, so it
+/// is one of the names the list spells. The module defines none of them
+/// (its includer's `has_one`s do), so the receiver's methods prove nothing
+/// here; the list does.
+const REDUCE_SOURCE: &str = r##"
+module Executable
+  def execution
+    %w[ ready claimed failed ].reduce(nil) { |acc, status| acc || public_send("#{status}_execution") }
+  end
+end
+"##;
+
+/// A host for the module: the readers record that they ran, and one is
+/// private, which `public_send` refuses as Ruby does.
+const REDUCE_HOST: &str = r##"
+class Host
+  include Executable
+  CALLS = []
+
+  def initialize(ready, claimed)
+    @ready = ready
+    @claimed = claimed
+  end
+
+  def ready_execution
+    CALLS << :ready
+    @ready
+  end
+
+  def claimed_execution
+    CALLS << :claimed
+    @claimed
+  end
+
+  private
+
+  def failed_execution
+    CALLS << :failed
+    :failed
+  end
+end
+
+[[:r, :c], [nil, :c], [nil, nil]].each do |ready, claimed|
+  Host::CALLS.clear
+  result = begin
+    Host.new(ready, claimed).execution.inspect
+  rescue NoMethodError => e
+    "NoMethodError #{e.name}"
+  end
+  puts "#{result} #{Host::CALLS.inspect}"
+end
+"##;
+
+fn cruby(source: &str) -> String {
+    let out = std::process::Command::new("ruby").args(["-e", source]).output().expect("spawn ruby");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn a_name_built_from_a_reduce_blocks_literal_list_rewrites_to_case_dispatch() {
+    // `inject` is `reduce`; `:"…"` is the String's Symbol, and its arms are Symbols.
+    for (iterator, symbol) in [("reduce", false), ("inject", false), ("reduce", true)] {
+        let mut source = REDUCE_SOURCE.replace("reduce", iterator);
+        if symbol {
+            source = source.replace("public_send(\"#{status}_execution\")", "public_send(:\"#{status}_execution\")");
+        }
+        let (out, diags) = ground_and_emit(&source);
+        for name in ["ready_execution", "claimed_execution", "failed_execution"] {
+            let literal = if symbol { format!(":{name}") } else { format!("\"{name}\"") };
+            assert!(out.contains(&format!("when {literal}")), "{iterator}: arm for {name} missing:\n{out}");
+            // Each arm is the same send by the literal name, so visibility and a missing method answer as before.
+            assert!(out.contains(&format!("public_send({literal})")), "{iterator}: send of {name} missing:\n{out}");
+        }
+        assert!(!out.contains("public_send(\"#{") && !out.contains("public_send(:\"#{"), "{iterator}: the built name survived:\n{out}");
+        assert!(diags.is_empty(), "{iterator}: grounded sites must not ledger residue: {diags:?}");
+        // The emitted module answers as the source does, in the same order, stopping at the first reader that answers.
+        let want = cruby(&format!("{source}{REDUCE_HOST}"));
+        assert_eq!(want, ":r [:ready]\n:c [:ready, :claimed]\nNoMethodError failed_execution [:ready, :claimed]\n");
+        assert_eq!(cruby(&format!("{out}\n{REDUCE_HOST}")), want, "{iterator}:\n{out}");
+    }
+}
+
+/// The `define_method` loop solid_queue writes beside it: unrolled, each
+/// body's name is the literal the loop's element spells.
+#[test]
+fn a_name_built_in_an_unrolled_define_method_block_is_the_literal_it_spells() {
+    let (out, diags) = ground_and_emit(
+        r##"
+module Executable
+  %w[ ready claimed ].each do |status|
+    define_method("#{status}?") { public_send("#{status}_execution").nil? }
+    define_method("#{status}_name") { public_send(:"#{status}_label") }
+  end
+
+  def finished?
+    false
+  end
+end
+"##,
+    );
+    for call in [
+        "public_send(\"ready_execution\")",
+        "public_send(\"claimed_execution\")",
+        "public_send(:ready_label)",
+        "public_send(:claimed_label)",
+    ] {
+        assert!(out.contains(call), "{call} missing:\n{out}");
+    }
+    assert!(!out.contains("#{"), "a built name survived:\n{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// Without a finite proof the name stays built, and the site joins the
+/// residue ledger: a list that is not a literal, or an element parameter
+/// the block rebinds or changes in place.
+#[test]
+fn a_built_name_without_a_finite_proof_stays_dynamic() {
+    for (label, body, call) in [
+        (
+            "a list that is not a literal",
+            "def execution(statuses)\n    statuses.reduce(nil) { |acc, status| acc || public_send(\"#{status}_execution\") }\n  end",
+            "public_send(\"#{status}_execution\")",
+        ),
+        (
+            "a reassigned element parameter",
+            "def execution\n    %w[ ready claimed ].reduce(nil) do |acc, status|\n      status = status.upcase\n      acc || public_send(\"#{status}_execution\")\n    end\n  end",
+            "public_send(\"#{status}_execution\")",
+        ),
+        (
+            "an element parameter assigned to in a nested block",
+            "def execution\n    %w[ ready claimed ].reduce(nil) do |acc, status|\n      [1].each { status += \"x\" }\n      acc || public_send(\"#{status}_execution\")\n    end\n  end",
+            "public_send(\"#{status}_execution\")",
+        ),
+        (
+            "an element String changed in place",
+            "def execution\n    %w[ ready claimed ].reduce(nil) do |acc, status|\n      status << \"x\"\n      acc || public_send(\"#{status}_execution\")\n    end\n  end",
+            "public_send(\"#{status}_execution\")",
+        ),
+        (
+            "a reassigned each parameter",
+            "def execution\n    [:ready, :claimed].each do |status|\n      status = :failed\n      send(status)\n    end\n  end",
+            "send(status)",
+        ),
+    ] {
+        let (out, diags) = ground_and_emit(&format!("module Executable\n  {body}\nend\n"));
+        assert!(out.contains(call), "{label}: the send must survive untouched:\n{out}");
+        assert!(!out.contains("when "), "{label}: rewritten without a proof:\n{out}");
+        assert_eq!(diags.len(), 1, "{label}: expected one residue entry: {diags:?}");
+        assert!(diags[0].to_string().contains("not statically enumerable"), "{label}: {}", diags[0]);
+    }
+}

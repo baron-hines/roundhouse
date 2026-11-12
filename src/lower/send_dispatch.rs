@@ -362,7 +362,7 @@ fn apply_param_selector_dispatch(
                 continue;
             }
             let bindings: Vec<IterBinding<'_>> =
-                owned.iter().map(|(n, e)| IterBinding { name: n, elems: e }).collect();
+                owned.iter().map(|(n, e)| IterBinding { name: n, elems: e, in_place: false }).collect();
             rewrite(&mut m.body, &HashMap::default(), providers, &HashMap::default(), &bindings, registry, diags);
         }
     }
@@ -579,6 +579,96 @@ fn param_reassigned(body: &Expr, name: &Symbol) -> bool {
     found
 }
 
+/// What a String or Symbol literal reads as when interpolated.
+fn literal_text(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// True when `body` binds the local `name` again anywhere: an assignment
+/// of any kind, a rescue's binding or a pattern's. A nested block's own
+/// parameter of that name only shadows it there, which `rewrite` already
+/// keeps out of the block.
+fn rebinds(body: &Expr, name: &Symbol) -> bool {
+    use crate::expr::LValue;
+    let mut found = false;
+    fn walk(e: &Expr, name: &Symbol, found: &mut bool) {
+        if *found {
+            return;
+        }
+        let is = |target: &LValue| matches!(target, LValue::Var { name: n, .. } if n == name);
+        *found = match &*e.node {
+            ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is(target),
+            ExprNode::MultiAssign { targets, .. } => targets.iter().any(is),
+            ExprNode::Let { name: n, .. } => n == name,
+            ExprNode::BeginRescue { rescues, .. } => rescues.iter().any(|r| r.binding.as_ref() == Some(name)),
+            ExprNode::Case { arms, .. } => arms.iter().any(|a| matches!(&a.pattern, Pattern::Bind { name: n } if n == name)
+                || matches!(&a.pattern, Pattern::Array { rest: Some(n), .. } if n == name)),
+            ExprNode::CaseMatch { arms, .. } => arms.iter().any(|a| pattern_binds(&a.pattern, name)),
+            ExprNode::MatchPredicate { pattern, .. } | ExprNode::MatchRequired { pattern, .. } => pattern_binds(pattern, name),
+            _ => false,
+        };
+        if !*found {
+            e.node.for_each_child(&mut |c| walk(c, name, found));
+        }
+    }
+    walk(body, name, &mut found);
+    found
+}
+
+/// True when a `case … in` pattern binds the local `name`.
+fn pattern_binds(pattern: &crate::expr::MatchPattern, name: &Symbol) -> bool {
+    use crate::expr::{HashRest, MatchPattern};
+    match pattern {
+        MatchPattern::Value { .. } | MatchPattern::Nil => false,
+        MatchPattern::Bind { name: n } => n == name,
+        MatchPattern::Capture { pattern, name: n } => n == name || pattern_binds(pattern, name),
+        MatchPattern::Alt { alternatives } => alternatives.iter().any(|p| pattern_binds(p, name)),
+        MatchPattern::Array { pre, rest, post, .. } => {
+            matches!(rest, Some(Some(n)) if n == name) || pre.iter().chain(post).any(|p| pattern_binds(p, name))
+        }
+        MatchPattern::Find { pre_rest, middle, post_rest, .. } => {
+            pre_rest.as_ref() == Some(name) || post_rest.as_ref() == Some(name) || middle.iter().any(|p| pattern_binds(p, name))
+        }
+        MatchPattern::Hash { pairs, rest, .. } => {
+            matches!(rest, Some(HashRest::Collect { name: n }) if n == name)
+                || pairs.iter().any(|(key, value)| match value {
+                    Some(p) => pattern_binds(p, name),
+                    None => key == name,
+                })
+        }
+    }
+}
+
+/// True when `body` reads the local `name` other than as a piece of an
+/// interpolation, where a String is only read.
+fn read_besides_interpolation(body: &Expr, name: &Symbol) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, name: &Symbol, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match &*e.node {
+            ExprNode::Var { name: n, .. } if n == name => *found = true,
+            ExprNode::StringInterp { parts } => {
+                for part in parts {
+                    if let crate::expr::InterpPart::Expr { expr } = part
+                        && !matches!(&*expr.node, ExprNode::Var { name: n, .. } if n == name)
+                    {
+                        walk(expr, name, found);
+                    }
+                }
+            }
+            _ => e.node.for_each_child(&mut |c| walk(c, name, found)),
+        }
+    }
+    walk(body, name, &mut found);
+    found
+}
+
 fn residue(expr: &Expr, reason: &str) -> Diagnostic {
     crate::lower::residue_diagnostic(
         "send_static_dispatch",
@@ -595,6 +685,11 @@ fn residue(expr: &Expr, reason: &str) -> Diagnostic {
 // ---------------------------------------------------------------------
 // Shape A/B: block param over a literal collection
 // ---------------------------------------------------------------------
+//
+// The element parameter of `each`/`map`/`flat_map`, or of `reduce`/`inject`
+// (solid_queue's `Job::Executable#execution`), is one of the collection's
+// elements while the block does not bind it again. A name interpolated
+// from it is one of the Strings the elements spell.
 
 /// Per-local-variable literal element sets for one method body: the
 /// variable was initialized to an array literal and only ever grown by
@@ -682,6 +777,10 @@ fn poison_bare_var(e: &Expr, poisoned: &mut BTreeSet<Symbol>) {
 struct IterBinding<'a> {
     name: &'a Symbol,
     elems: &'a [Expr],
+    /// The block may change a String element in place (`status << "x"`):
+    /// it reads the parameter other than as an interpolated piece, so a
+    /// name interpolated from it is not one the list spells.
+    in_place: bool,
 }
 
 fn rewrite(
@@ -697,9 +796,15 @@ fn rewrite(
     // the binding pushed. Everything else recurses plainly; an inner
     // Lambda that rebinds one of our names shadows it.
     if let ExprNode::Send { recv: Some(r), method, args, block: Some(block), .. } = &mut *e.node {
-        if matches!(method.as_str(), "each" | "map" | "flat_map")
-            && args.is_empty()
-        {
+        // The block parameter that takes each element: `each`'s only one,
+        // `reduce`'s second (the first is the memo, with or without an
+        // initial value).
+        let element = match method.as_str() {
+            "each" | "map" | "flat_map" if args.is_empty() => Some(0),
+            "reduce" | "inject" if args.len() <= 1 => Some(1),
+            _ => None,
+        };
+        if let Some(index) = element {
             let elems: Option<Vec<Expr>> = match &*r.node {
                 ExprNode::Array { elements, .. } => Some(elements.clone()),
                 ExprNode::Var { name, .. } => var_sets.get(name).cloned(),
@@ -708,17 +813,25 @@ fn rewrite(
             if let (Some(elems), ExprNode::Lambda { params, extra_params, body, .. }) =
                 (elems, &mut *block.node)
             {
-                if params.len() == 1 && extra_params.is_empty() {
-                    let param = params[0].clone();
+                if params.len() == index + 1 && extra_params.is_empty() {
+                    let param = params[index].clone();
                     let mut inner: Vec<IterBinding<'_>> = Vec::new();
                     for b in bindings {
-                        if *b.name != param {
-                            inner.push(IterBinding { name: b.name, elems: b.elems });
+                        if !params.contains(b.name) {
+                            inner.push(IterBinding { name: b.name, elems: b.elems, in_place: b.in_place });
                         }
                     }
-                    inner.push(IterBinding { name: &param, elems: &elems });
+                    // Not a parameter the block binds again: it may hold another value when it is read.
+                    if !rebinds(body, &param) {
+                        let strings = elems.iter().any(|el| matches!(&*el.node, ExprNode::Lit { value: Literal::Str { .. } }));
+                        let in_place = strings && read_besides_interpolation(body, &param);
+                        inner.push(IterBinding { name: &param, elems: &elems, in_place });
+                    }
                     rewrite(body, var_sets, providers, origins, &inner, registry, diags);
                     rewrite(r, var_sets, providers, origins, bindings, registry, diags);
+                    for a in args.iter_mut() {
+                        rewrite(a, var_sets, providers, origins, bindings, registry, diags);
+                    }
                     return;
                 }
             }
@@ -728,7 +841,7 @@ fn rewrite(
         let survivors: Vec<IterBinding<'_>> = bindings
             .iter()
             .filter(|b| !params.contains(b.name) && !extra_params.iter().any(|p| &p.name == b.name))
-            .map(|b| IterBinding { name: b.name, elems: b.elems })
+            .map(|b| IterBinding { name: b.name, elems: b.elems, in_place: b.in_place })
             .collect();
         rewrite(body, var_sets, providers, origins, &survivors, registry, diags);
         return;
@@ -787,12 +900,20 @@ fn rewrite(
     // The receiver lands in every arm, and the case evaluates the
     // scrutinee before it. Only one arm runs, so the receiver is still
     // evaluated once; what could change is ORDER, and a plain variable
-    // scrutinee has no effect to reorder against.
-    if !recv_is_duplicable(recv) && !matches!(&*target.node, ExprNode::Var { .. }) {
+    // scrutinee, or an interpolation of literals and variables, has no
+    // effect to reorder against. `:"#{status}_x"` is that String's Symbol.
+    let symbol = matches!(&*target.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+        if method.as_str() == "to_sym" && args.is_empty() && matches!(&*r.node, ExprNode::StringInterp { .. }));
+    let interpolated = symbol || matches!(&*target.node, ExprNode::StringInterp { .. });
+    if !recv_is_duplicable(recv) && !matches!(&*target.node, ExprNode::Var { .. }) && !interpolated {
         diags.push(residue(e, "receiver is not an effect-free reader"));
         return;
     }
-    let dispatch = enumerate_names(target, bindings, providers, origins);
+    let spelled = match &*target.node {
+        ExprNode::Send { recv: Some(r), .. } if symbol => r,
+        _ => target,
+    };
+    let dispatch = enumerate_names(spelled, bindings, providers, origins);
     let Some(dispatch) = dispatch else {
         diags.push(residue(e, "method-name set not statically enumerable"));
         return;
@@ -804,6 +925,37 @@ fn rewrite(
         return;
     }
     let span = e.span;
+    if interpolated {
+        // The same send by each name the interpolation spells: what Ruby
+        // does past the name (`public_send`'s visibility, a missing
+        // method, the arguments) is unchanged. One name needs no case.
+        let literal = |name: &str| match symbol {
+            true => Literal::Sym { value: Symbol::from(name) },
+            false => Literal::Str { value: name.to_string() },
+        };
+        let named = |name: &str| {
+            let mut call = Expr::new(span, (*e.node).clone());
+            if let ExprNode::Send { args, .. } = &mut *call.node {
+                let ty = if symbol { Ty::Sym } else { Ty::Str };
+                args[0] = Expr { ty: Some(ty), ..Expr::new(args[0].span, ExprNode::Lit { value: literal(name) }) };
+            }
+            call.ty = recv_class(recv).and_then(|c| method_return_via_registry(registry, &c, name)).or(Some(Ty::Untyped));
+            call
+        };
+        if let [name] = dispatch.names.as_slice() {
+            let call = named(name);
+            *e.node = *call.node;
+            return;
+        }
+        let mut arms: Vec<Arm> = dispatch
+            .names
+            .iter()
+            .map(|name| Arm { pattern: Pattern::Lit { value: literal(name) }, guard: None, body: named(name) })
+            .collect();
+        arms.extend(build_arms(&Dispatch { names: Vec::new(), string_scrutinee: true }, recv, rest, span, registry));
+        *e.node = ExprNode::Case { scrutinee: target.clone(), arms };
+        return;
+    }
     let arms = build_arms(&dispatch, recv, rest, span, registry);
     *e.node = ExprNode::Case { scrutinee: target.clone(), arms };
     // Keep the site type: analyze bounded the dynamic send by the
@@ -890,6 +1042,36 @@ fn enumerate_names(
                 }
             }
             Some(Dispatch { names, string_scrutinee: false })
+        }
+        // send("#{status}_execution") — each interpolated piece is a
+        // literal or a parameter ranging over literals, so the name is one
+        // of the Strings their pieces spell.
+        ExprNode::StringInterp { parts } => {
+            let mut names = vec![String::new()];
+            for part in parts {
+                let pieces: Vec<String> = match part {
+                    crate::expr::InterpPart::Text { value } => vec![value.clone()],
+                    crate::expr::InterpPart::Expr { expr } => match &*expr.node {
+                        ExprNode::Var { name, .. } => {
+                            let b = bindings.iter().find(|b| b.name == name)?;
+                            if b.in_place {
+                                return None;
+                            }
+                            b.elems.iter().map(literal_text).collect::<Option<Vec<_>>>()?
+                        }
+                        _ => vec![literal_text(expr)?],
+                    },
+                };
+                names = names.iter().flat_map(|n| pieces.iter().map(move |p| format!("{n}{p}"))).collect();
+                if names.len() > 64 {
+                    return None;
+                }
+            }
+            let mut unique = Vec::new();
+            for n in names {
+                push_unique(&mut unique, n);
+            }
+            Some(Dispatch { names: unique, string_scrutinee: true })
         }
         // Shape C: send(<hash-read>.downcase) — the string set comes
         // from a helper whose returns are hash literals.
