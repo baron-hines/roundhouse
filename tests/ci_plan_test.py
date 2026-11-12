@@ -1845,6 +1845,23 @@ class Results(unittest.TestCase):
             records = [json.loads(line) for line in out.read_text().splitlines()]
             self.assertEqual([(r["name"], r.get("timed_out")) for r in records], [("slow", True)])
 
+    def test_timed_charges_a_suite_the_bundle_seconds_written_while_it_ran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, bundle, cases = Path(tmp) / "records.jsonl", Path(tmp) / "bundle", Path(tmp) / "cases"
+            bundle.mkdir()
+            cases.mkdir()
+            (cases / "k1.json").write_text('{"test": "suite::a"}')
+            (cases / "k2.json").write_text('{"test": "suite::a"}')
+            (cases / "k3.json").write_text("not json")
+            env = {**os.environ, "CI_SPINEL_TIMINGS_OUT": str(out), "RH_SPINEL_BUNDLE": str(bundle)}
+            seconds = '{"suite::a": 40, "other::b": 99}'
+            subprocess.run(
+                ["python3", spec.origin, "timed", "--kind", "framework", "--name", "suite", "--charge-cases", str(cases),
+                 "--", "sh", "-c", f"echo '{seconds}' > {bundle}/seconds.json"],
+                env=env, check=True,
+            )
+            self.assertEqual([json.loads(line)["seconds"] for line in out.read_text().splitlines()], [40])
+
     def test_merge_averages_passing_records_into_the_last_seconds(self):
         merged = ci.merge_timings(
             {"toolchain": {"a": 100, "b": 50}},

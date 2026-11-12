@@ -56,3 +56,26 @@ fn routes_share_a_build_unless_one_request_goes_two_ways() {
     assert_eq!(merged("config/routes.rb", a, elsewhere), None);
     assert_eq!(merged("app/models/widget.rb", a, b), None);
 }
+
+#[test]
+fn a_shared_case_waits_on_its_own_group_only() {
+    let dir = std::env::temp_dir().join(format!("rh-bundle-wait-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("done")).unwrap();
+    std::fs::write(dir.join("pending.json"), r#"["built", "refused", "unsettled"]"#).unwrap();
+    assert_eq!(emit_and_run::bundle::shared_case(&dir, "alone"), None);
+    std::fs::write(dir.join("done/refused.json"), "null").unwrap();
+    assert_eq!(emit_and_run::bundle::shared_case(&dir, "refused"), None);
+    let writer = {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            std::fs::write(dir.join("done/built.json"), r#"["g0", 1]"#).unwrap();
+        })
+    };
+    assert_eq!(emit_and_run::bundle::shared_case(&dir, "built"), Some(("g0".to_string(), 1)));
+    writer.join().unwrap();
+    std::fs::write(dir.join("finished"), "").unwrap();
+    assert_eq!(emit_and_run::bundle::shared_case(&dir, "unsettled"), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

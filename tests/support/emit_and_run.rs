@@ -745,8 +745,8 @@ pub mod bundle {
 
     // Not the group's tree itself: each test writes its database and its log into the tree, and tests run in parallel.
     pub fn http_shared(overlay: &Overlay) -> Option<PathBuf> {
-        let (dir, map) = manifest()?;
-        let (group, _) = map.get(&key(overlay, "", &[HTTP])?)?;
+        let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
+        let (group, _) = shared_case(&dir, &key(overlay, "", &[HTTP])?)?;
         let emitted = scratch_dir().join("emitted");
         copy_tree(&dir.join(group), &emitted);
         Some(emitted)
@@ -958,22 +958,30 @@ pub mod bundle {
         std::fs::write(dir.join(format!("{key}.json")), case.to_string()).expect("write bundle case");
     }
 
-    fn manifest() -> Option<&'static (PathBuf, BTreeMap<String, (String, usize)>)> {
-        static MANIFEST: std::sync::OnceLock<Option<(PathBuf, BTreeMap<String, (String, usize)>)>> = std::sync::OnceLock::new();
-        MANIFEST
-            .get_or_init(|| {
-                let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
-                let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
-                let map: BTreeMap<String, (String, usize)> = serde_json::from_str(&text).ok()?;
-                Some((dir, map))
-            })
-            .as_ref()
+    // Not read once per process: the suite starts while the bundle still builds, so a case's file appears later.
+    pub fn shared_case(dir: &Path, key: &str) -> Option<(String, usize)> {
+        let pending: Vec<String> = serde_json::from_str(&std::fs::read_to_string(dir.join("pending.json")).ok()?).ok()?;
+        if !pending.iter().any(|k| k == key) {
+            return None;
+        }
+        let done = dir.join("done").join(format!("{key}.json"));
+        loop {
+            // Not left on `finished` alone: the build may finish between this read and that check.
+            let finished = dir.join("finished").exists();
+            if let Ok(text) = std::fs::read_to_string(&done) {
+                return serde_json::from_str::<Option<(String, usize)>>(&text).ok()?;
+            }
+            if finished {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
 
     // Not the group's tree itself: a contract may write into its tree, and tests run in parallel.
     pub fn run_shared(overlay: &Overlay, script: &str, flags: &[&str]) -> Option<Run> {
-        let (dir, map) = manifest()?;
-        let (group, case) = map.get(&key(overlay, script, flags)?)?;
+        let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
+        let (group, case) = shared_case(&dir, &key(overlay, script, flags)?)?;
         let emitted = scratch_dir().join("emitted");
         copy_tree(&dir.join(group), &emitted);
         // Not one spawn: another test thread's fork can still hold the copied binary open for writing, and Linux refuses to run it then.
@@ -1123,12 +1131,28 @@ pub mod bundle {
 
     // Each case's share of the compiles it took part in, failed ones included: a bundled test runs
     // in well under a second, so without this its recorded seconds hide what its shard paid (#1781).
-    fn charge(cases: &[&Case], elapsed: f64, seconds: &Seconds) {
+    fn charge(cases: &[&Case], elapsed: f64, seconds: &Seconds, out: &Path) {
         let mut s = seconds.lock().unwrap();
         for case in cases {
             if let Some(test) = &case.test {
                 *s.entry(test.clone()).or_default() += elapsed / cases.len() as f64;
             }
+        }
+        // Not only once all are built: a suite ends, and is charged its share, while other groups still build.
+        write_atomic(&out.join("seconds.json"), serde_json::to_string(&*s).unwrap().as_bytes());
+    }
+
+    // Not a plain write: a test waiting on the file could read it half written.
+    fn write_atomic(path: &Path, bytes: &[u8]) {
+        let tmp = path.with_extension(format!("tmp{:?}", std::thread::current().id()).replace(['(', ')'], ""));
+        std::fs::write(&tmp, bytes).expect("write bundle file");
+        std::fs::rename(&tmp, path).expect("publish bundle file");
+    }
+
+    fn settle(out: &Path, cases: &[&Case], built: Option<&str>) {
+        for (i, case) in cases.iter().enumerate() {
+            let fate = built.map(|group| (group.to_string(), i));
+            write_atomic(&out.join("done").join(format!("{}.json", case.key)), serde_json::to_string(&fate).unwrap().as_bytes());
         }
     }
 
@@ -1140,11 +1164,12 @@ pub mod bundle {
         seconds: &Seconds,
     ) {
         if cases.len() < 2 {
+            settle(out, &cases, None);
             return;
         }
         let start = std::time::Instant::now();
         let built = if cases[0].flags.iter().any(|f| f == HTTP) { build_http(&cases) } else { build(&cases) };
-        charge(&cases, start.elapsed().as_secs_f64(), seconds);
+        charge(&cases, start.elapsed().as_secs_f64(), seconds, out);
         if let Some(tree) = built {
             let dest = out.join(name);
             let _ = std::fs::remove_dir_all(&dest);
@@ -1154,6 +1179,7 @@ pub mod bundle {
             for (i, case) in cases.iter().enumerate() {
                 m.insert(case.key.clone(), (name.to_string(), i));
             }
+            settle(out, &cases, Some(name));
             eprintln!("spinel bundle {name}: {} cases", cases.len());
             return;
         }
@@ -1222,6 +1248,9 @@ pub mod bundle {
         let manifest = std::sync::Mutex::new(BTreeMap::new());
         let seconds = std::sync::Mutex::new(BTreeMap::new());
         let chunks = chunks(&cases);
+        std::fs::create_dir_all(out.join("done")).expect("bundle done dir");
+        let pending: Vec<&str> = chunks.iter().filter(|c| c.len() > 1).flatten().map(|c| c.key.as_str()).collect();
+        write_atomic(&out.join("pending.json"), serde_json::to_string(&pending).unwrap().as_bytes());
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
@@ -1238,6 +1267,7 @@ pub mod bundle {
         std::fs::write(out.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).expect("write manifest");
         // Read by ci-plan.py run-tests, which adds each test's share to the seconds it records.
         let seconds = seconds.into_inner().unwrap();
-        std::fs::write(out.join("seconds.json"), serde_json::to_string(&seconds).unwrap()).expect("write bundle seconds");
+        write_atomic(&out.join("seconds.json"), serde_json::to_string(&seconds).unwrap().as_bytes());
+        std::fs::write(out.join("finished"), "").expect("mark bundle finished");
     }
 }
