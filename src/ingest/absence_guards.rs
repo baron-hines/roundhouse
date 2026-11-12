@@ -130,13 +130,16 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
     let provided_by_nothing = |path: &str| {
         let feature = path.trim_end_matches(".rb");
         let root = feature.split('/').next().unwrap_or(feature);
+        let under_ruby_root = feature.contains('/') && RUBY_FEATURE_ROOTS.contains(&root);
         let as_constant: Vec<String> = feature.split('/').map(|s| s.split(['_', '-']).map(capitalized).collect::<String>()).collect();
         !root.is_empty()
             && !feature.starts_with('.')
             && !crate::gems::is_framework_feature(feature)
             && !ships_with_ruby(feature)
             && ![root.to_string(), root.replace('_', "-"), feature.replace('/', "-")].iter().any(|n| lock.version_of(n).is_some())
-            && index.owners(&as_constant.join("::")).is_empty()
+            // Under a standard-library root, the first segment (`Net`) is every `net-*` gem's namespace, so the
+            // constant names no gem: the gem's name (net-http-persistent) or a file it ships decides.
+            && (under_ruby_root || index.owners(&as_constant.join("::")).is_empty())
             && !shipped(feature)
     };
     unreached_gated_classes(app, source_gem_classes, &absent);
