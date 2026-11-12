@@ -556,8 +556,10 @@ fn data_block_classes(
             continue;
         }
         let name = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), constant_id_str(&cw.name()))));
+        // Not a carried marker: a Data block's `private_class_method :new` names the constructor Data defines.
+        let visibility = Visibility::resolve_library(block.body().as_ref(), file, None, Some(&name))?;
         let DeclBody { includes, include_spans, methods, constants, unknown_calls, class_initializers, class_attributes: _, conditional_definitions } =
-            walk_decl_body(block.body(), &name, file, DeclBodyMode::Instance)?;
+            walk_decl_body_with_visibility(block.body(), &name, file, DeclBodyMode::Instance, &visibility)?;
         debug_assert!(includes.is_empty() && constants.is_empty() && unknown_calls.is_empty());
         out.push(LibraryClass {
             name,
@@ -625,8 +627,10 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
             }
         }
     }
+    // Not a carried marker: a Data block's `private_class_method :new` names the constructor Data defines.
+    let visibility = Visibility::resolve_library(body().as_ref(), file, None, Some(&owner))?;
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
-        walk_decl_body(body(), &owner, file, DeclBodyMode::Instance)?;
+        walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok(Some(LibraryClass {
         name: owner,
