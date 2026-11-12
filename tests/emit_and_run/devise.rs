@@ -460,6 +460,69 @@ fn a_devise_user_signs_in_over_rack_on_the_ruby_family() {
     assert!(run.stdout.contains("devise sign-in over rack passed"), "{}", run.stdout);
 }
 
+/// Two mappings: Devise's shared views and its failure app read `resource_name` / `scope` per request, which the
+/// ingest spells out as a `case` over the mappings (`gem_hooks::fold_devise_view_scope`, `fold_devise_failure_route`).
+const RACK_TWO_MAPPINGS: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => "", "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+def sign_in(scope, email, password)
+  _, _, page = req("GET", "/#{scope}s/sign_in")
+  token = page[/name="authenticity_token" value="([^"]*)"/, 1]
+  [page, req("POST", "/#{scope}s/sign_in", "authenticity_token=#{URI.encode_www_form_component(token)}&#{scope}%5Bemail%5D=#{URI.encode_www_form_component(email)}&#{scope}%5Bpassword%5D=#{password}&commit=Log+in")]
+end
+
+req("GET", "/account/new")
+req("GET", "/account/admin")
+status, headers, = req("GET", "/console")
+raise "console #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/admins/sign_in")
+page, (status, _, failed) = sign_in("admin", "root@example.com", "wrong")
+raise "admin form" unless page.include?(%(name="admin[email]" id="admin_email"))
+raise "admin wrong #{status}" unless status == 200 && failed.include?(%(value="root@example.com"))
+_, (status, headers, _) = sign_in("admin", "root@example.com", "secret123")
+raise "admin sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/console")
+status, = req("GET", "/console")
+raise "console admin #{status}" unless status == 200
+status, headers, = req("GET", "/secret")
+raise "secret as admin #{status}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+page, (status, headers, _) = sign_in("user", "a@example.com", "secret123")
+raise "user form" unless page.include?(%(name="user[email]" id="user_email"))
+raise "user sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
+status, = req("GET", "/secret")
+raise "secret user #{status}" unless status == 200
+puts "two devise mappings over rack passed"
+"##;
+
+const TWO_ACCOUNTS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def admin\n    Admin.create!(email: \"root@example.com\", password: \"secret123\")\n    head :ok\n  end\nend\n";
+
+#[test]
+fn two_devise_mappings_sign_in_over_rack_on_the_ruby_family() {
+    let run = app(
+        ":database_authenticatable",
+        "  devise_for :users\n  devise_for :admins\n  get \"/account/new\", to: \"accounts#create\"\n  get \"/account/admin\", to: \"accounts#admin\"\n  authenticate :admin do\n    get \"/console\", to: \"articles#index\"\n  end\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n",
+    )
+    .edit("db/schema.rb", "  create_table \"articles\"", &format!("{}  create_table \"articles\"", USERS.replace("\"users\"", "\"admins\"")))
+    .write("app/models/admin.rb", "class Admin < ApplicationRecord\n  devise :database_authenticatable\nend\n")
+    .write("app/controllers/accounts_controller.rb", TWO_ACCOUNTS)
+    .run_ruby(RACK_TWO_MAPPINGS);
+    run.assert_passes();
+    assert!(run.stdout.contains("two devise mappings over rack passed"), "{}", run.stdout);
+}
+
 const ACCOUNTS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\nend\n";
 
 fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
@@ -592,4 +655,175 @@ fn a_serializer_scope_is_devises_current_user_only_under_devise_for_users() {
         assert!(!cards.contains("serializable_hash"), "{routes:?}: {cards}");
         assert!(errors.iter().any(|e| e.contains("rendering through an active_model_serializers")), "{routes:?}: {errors:#?}");
     }
+}
+
+/// `:validatable`: Devise's `included` hook `class_eval`s its `validates_*_of` calls onto the model, with
+/// `email_regexp` and `password_length` read as the hook runs. Each case's errors are Rails 8.1.4's with Devise 4.9.4.
+const CHECKS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def check\n    user = User.new(email: params[:email], password: params[:password])\n    user.password_confirmation = params[:confirmation] if params[:confirmation]\n    user.valid?\n    render plain: user.errors.full_messages.join(\"|\")\n  end\nend\n";
+
+const VALIDATABLE_ROUTES: &str = "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  get \"/account/check\", to: \"accounts#check\"\n";
+
+/// The query of each case, and the errors Rails answers for it.
+const VALIDATABLE_CASES: [(&str, &str); 6] = [
+    ("email=bad&password=123", "Email is invalid|Password is too short (minimum is 6 characters)"),
+    ("email=&password=", "Email can't be blank|Password can't be blank"),
+    ("email=b%40example.com&password=secret123&confirmation=other", "Password confirmation doesn't match Password"),
+    ("email=b%40example.com&password=secret123&confirmation=secret123", ""),
+    ("email=b%40example.com&password=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "Password is too long (maximum is 128 characters)"),
+    ("email=a%40example.com&password=secret123", "Email has already been taken"),
+];
+
+#[test]
+fn devise_validatable_answers_rails_errors_on_the_ruby_family() {
+    let cases = VALIDATABLE_CASES.iter().map(|(query, want)| format!("[{query:?}, {want:?}]")).collect::<Vec<_>>().join(",\n  ");
+    let script = format!(
+        r##"def get(path, query)
+  env = {{ "REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => query, "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new("") }}
+  status, _headers, chunks = Main.run_rack(env)
+  [status, chunks.join]
+end
+status, = get("/account/new", "")
+raise "account #{{status}}" unless status == 200
+[
+  {cases}
+].each do |query, want|
+  status, body = get("/account/check", query)
+  raise "#{{query}}: #{{status}} #{{body.inspect}}" unless status == 200 && body == want
+end
+puts "devise validatable passed"
+"##
+    );
+    let run = app(":database_authenticatable, :validatable", VALIDATABLE_ROUTES).write("app/controllers/accounts_controller.rb", CHECKS).run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise validatable passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn devise_validatable_answers_rails_errors_natively() {
+    let tree = app(":database_authenticatable, :validatable", VALIDATABLE_ROUTES)
+        .write("app/controllers/accounts_controller.rb", CHECKS)
+        .native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    assert_eq!(server.get("/account/new").status, 200, "{}", server.log());
+    for (query, want) in VALIDATABLE_CASES {
+        let answer = server.get(&format!("/account/check?{query}"));
+        assert_eq!((answer.status, answer.body.as_str()), (200, want), "{query}\n{}", server.log());
+    }
+}
+
+/// `:recoverable`, the whole reset as Rails 8.1.4 with Devise 4.9.4 runs it: the request redirects to sign in and mails a
+/// link from `config.mailer_sender`, the link's token opens the edit form, and the new password signs the user in.
+const RESETS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def mailed\n    mail = Devise::Mailer.deliveries.last\n    render plain: \"#{mail.subject}|#{mail.from.join(\",\")}|#{mail.to.join(\",\")}|#{mail.body}\"\n  end\nend\n";
+
+const RECOVERABLE_ROUTES: &str = "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  get \"/account/mailed\", to: \"accounts#mailed\"\n  authenticate :user do\n    get \"/secret\", to: \"articles#index\"\n  end\n";
+
+const RACK_RESET: &str = r##"require "uri"
+$jar = {}
+def req(verb, path, body = "")
+  path, query = path.split("?", 2)
+  env = { "REQUEST_METHOD" => verb, "PATH_INFO" => path, "QUERY_STRING" => query.to_s, "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new(body),
+          "HTTP_COOKIE" => $jar.map { |k, v| "#{k}=#{v}" }.join("; ") }
+  unless body.empty?
+    env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+  end
+  status, headers, chunks = Main.run_rack(env)
+  Array(headers["set-cookie"]).flat_map { |line| line.split("\n") }.each do |line|
+    name, rest = line.split("=", 2)
+    value = rest.split(";").first.to_s
+    value.empty? ? $jar.delete(name) : $jar[name] = value
+  end
+  [status, headers, chunks.join]
+end
+token_of = ->(page) { URI.encode_www_form_component(page[/name="authenticity_token" value="([^"]*)"/, 1]) }
+
+status, = req("GET", "/account/new")
+raise "account #{status}" unless status == 200
+status, _, page = req("GET", "/users/password/new")
+raise "request page #{status}" unless status == 200 && page.include?(%(action="/users/password"))
+status, headers, = req("POST", "/users/password", "authenticity_token=#{token_of.(page)}&user%5Bemail%5D=a%40example.com")
+raise "request #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/users/sign_in")
+_, _, mailed = req("GET", "/account/mailed")
+subject, from, to, body = mailed.split("|", 4)
+raise "mail #{[subject, from, to].inspect}" unless [subject, from, to] == ["Reset password instructions", "please-change-me@example.com", "a@example.com"]
+raw = body[/reset_password_token=([^"&]+)"/, 1]
+raise "no token in #{body}" if raw.nil?
+status, _, edit = req("GET", "/users/password/edit?reset_password_token=#{raw}")
+raise "edit #{status}" unless status == 200 && edit.include?(%(value="#{raw}"))
+form = "_method=put&authenticity_token=#{token_of.(edit)}&user%5Breset_password_token%5D=#{raw}&user%5Bpassword%5D=newsecret1&user%5Bpassword_confirmation%5D=newsecret1"
+status, headers, = req("POST", "/users/password", form)
+raise "reset #{status} #{headers.inspect}" unless status == 302 && headers["location"] == "http://localhost/"
+status, = req("GET", "/secret")
+raise "signed in #{status}" unless status == 200
+raise "new password" unless User.find_by(email: "a@example.com").valid_password?("newsecret1")
+puts "devise reset over rack passed"
+"##;
+
+#[test]
+fn a_devise_password_resets_over_rack_on_the_ruby_family() {
+    let run = app(":database_authenticatable, :recoverable, :validatable", RECOVERABLE_ROUTES)
+        .write("app/controllers/accounts_controller.rb", RESETS)
+        .run_ruby(RACK_RESET);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise reset over rack passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_devise_password_resets_over_http_natively() {
+    let tree = app(":database_authenticatable, :recoverable, :validatable", RECOVERABLE_ROUTES)
+        .write("app/controllers/accounts_controller.rb", RESETS)
+        .native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    assert_eq!(server.get("/account/new").status, 200, "{}", server.log());
+    let form_type = ("Content-Type", "application/x-www-form-urlencoded");
+    let mut jar = Vec::new();
+
+    let (page, cookies) = server.request_with_set_cookies("GET", "/users/password/new", &[], "");
+    assert_eq!(page.status, 200, "{}", server.log());
+    kept(&mut jar, &cookies);
+    let token = between(&page.body, "name=\"authenticity_token\" value=\"", "\"").to_string();
+    let cookie = header(&jar);
+    let (requested, cookies) = server.request_with_set_cookies(
+        "POST",
+        "/users/password",
+        &[form_type, ("Cookie", cookie.as_str())],
+        &format!("authenticity_token={}&user%5Bemail%5D=a%40example.com", form_encode(&token)),
+    );
+    assert_eq!(requested.status, 302, "{}\n{}", requested.body, server.log());
+    assert!(requested.headers.get("location").is_some_and(|l| l.ends_with("/users/sign_in")), "{:?}", requested.headers);
+    kept(&mut jar, &cookies);
+
+    let mailed = server.get("/account/mailed");
+    let mut parts = mailed.body.splitn(4, '|');
+    let head: Vec<&str> = parts.by_ref().take(3).collect();
+    assert_eq!(head, ["Reset password instructions", "please-change-me@example.com", "a@example.com"], "{}", mailed.body);
+    let body = parts.next().unwrap_or_default();
+    let raw = between(body, "reset_password_token=", "\"").to_string();
+
+    let cookie = header(&jar);
+    let (edit, cookies) = server.request_with_set_cookies("GET", &format!("/users/password/edit?reset_password_token={raw}"), &[("Cookie", cookie.as_str())], "");
+    assert_eq!(edit.status, 200, "{}", server.log());
+    assert!(edit.body.contains(&format!("value=\"{raw}\"")), "{}", edit.body);
+    kept(&mut jar, &cookies);
+    let token = between(&edit.body, "name=\"authenticity_token\" value=\"", "\"").to_string();
+    let cookie = header(&jar);
+    let (reset, cookies) = server.request_with_set_cookies(
+        "POST",
+        "/users/password",
+        &[form_type, ("Cookie", cookie.as_str())],
+        &format!(
+            "_method=put&authenticity_token={}&user%5Breset_password_token%5D={raw}&user%5Bpassword%5D=newsecret1&user%5Bpassword_confirmation%5D=newsecret1",
+            form_encode(&token)
+        ),
+    );
+    assert_eq!(reset.status, 302, "{}\n{}", reset.body, server.log());
+    assert!(reset.headers.get("location").is_some_and(|l| l.ends_with("/")), "{:?}", reset.headers);
+    kept(&mut jar, &cookies);
+    let cookie = header(&jar);
+    let (secret, _) = server.request_with_set_cookies("GET", "/secret", &[("Cookie", cookie.as_str())], "");
+    assert_eq!(secret.status, 200, "{}", server.log());
 }
