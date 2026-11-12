@@ -800,7 +800,7 @@ module Rails
 
   # `Rails.application.credentials` with nothing configured: Rails' `EncryptedConfiguration`, whose every key reads
   # nil (`credentials.secret_key_base`, `credentials[:vapid]`, `credentials.dig(:vapid, :public_key)`), and whose
-  # `fetch` of a key it does not hold raises, as a Hash's does.
+  # `fetch` of a key it does not hold answers its block, else its default, else raises, as a Hash's does.
   class Credentials
     def secret_key_base
       nil
@@ -814,7 +814,8 @@ module Rails
       nil
     end
 
-    def fetch(key, *default)
+    def fetch(key, *default, &block)
+      return block.call(key) unless block.nil?
       raise KeyError, "key not found: #{key.inspect}" if default.empty?
       default[0]
     end

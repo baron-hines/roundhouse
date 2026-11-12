@@ -76,13 +76,20 @@ pub fn apply_bare_model_saves(app: &mut App) {
         .filter(|m| m.methods().any(|d| matches!(d.name.as_str(), "save" | "save!")))
         .map(|m| m.name.clone())
         .collect();
-    let elsewhere: crate::det::HashSet<crate::ident::ClassId> = app
+    // Through every module those include as well: a module reached from a saving model is that model's too.
+    let mut elsewhere: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+    let mut pending: Vec<crate::ident::ClassId> = app
         .library_classes
         .iter()
         .filter(|c| !c.is_module)
         .flat_map(|c| c.includes.iter().cloned())
         .chain(app.models.iter().filter(|m| saving_models.contains(&m.name)).flat_map(crate::analyze::model_includes))
         .collect();
+    while let Some(id) = pending.pop() {
+        if elsewhere.insert(id.clone()) {
+            pending.extend(app.library_classes.iter().filter(|c| c.name == id).flat_map(|c| c.includes.iter().cloned()));
+        }
+    }
     for lc in app.library_classes.iter_mut() {
         if !lc.is_module
             || !included.contains(&lc.name)

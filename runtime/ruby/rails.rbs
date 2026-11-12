@@ -124,7 +124,7 @@ module Rails
     def secret_key_base: () -> String?
     def []: (Symbol key) -> untyped
     def dig: (*Symbol keys) -> untyped
-    def fetch: (Symbol key, *untyped default) -> untyped
+    def fetch: (Symbol key, *untyped default) ?{ (Symbol) -> untyped } -> untyped
     def key?: (Symbol key) -> bool
     def has_key?: (Symbol key) -> bool
     def include?: (Symbol key) -> bool

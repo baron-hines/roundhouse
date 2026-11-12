@@ -562,6 +562,9 @@ module ActiveSupport
   # Not SHA1, an older app's: the digest primitives this runtime carries derive by SHA256 only.
   class KeyGenerator
     def initialize(secret, options = {})
+      digest = options[:hash_digest_class]
+      # Not a SHA256 key under another digest's name: it would never match the keys that digest derived.
+      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256" unless digest.nil? || digest.to_s.end_with?("SHA256")
       @secret = secret
       iterations = options[:iterations]
       @iterations = iterations.nil? ? 65536 : iterations.to_i

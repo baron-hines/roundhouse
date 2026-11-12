@@ -71,19 +71,38 @@ fn module_includers(app: &App) -> crate::det::HashMap<ClassId, Vec<ClassId>> {
             pending.extend(app.library_classes.iter().filter(|c| c.name == id).flat_map(|c| c.includes.iter().cloned()));
         }
     }
-    // Not a module a class other than a model includes: its `self` may be that class.
+    // Not a module a class other than a model includes, there or through a module it includes: its `self` may be that class.
     for lc in app.library_classes.iter().filter(|c| !c.is_module) {
-        for inc in &lc.includes {
-            out.remove(inc);
+        let mut pending: Vec<ClassId> = lc.includes.clone();
+        let mut seen = crate::det::HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            out.remove(&id);
+            pending.extend(app.library_classes.iter().filter(|c| c.name == id).flat_map(|c| c.includes.iter().cloned()));
         }
     }
     out
 }
 
-/// Every instance method name the models answer, their own and their modules', and the Dirty spellings of their columns.
+/// Every instance method name the models answer, their own, their parents' and their modules', and the Dirty
+/// spellings of their columns. None where one answers names it does not define (`method_missing`,
+/// `respond_to_missing?`): the set is not closed.
 fn names_of(app: &App, models: &[ClassId]) -> Vec<String> {
     let mut names: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut chain: Vec<&crate::dialect::Model> = Vec::new();
     for model in app.models.iter().filter(|m| models.contains(&m.name)) {
+        let mut at = Some(model);
+        while let Some(m) = at {
+            if chain.iter().any(|c| c.name == m.name) {
+                break;
+            }
+            chain.push(m);
+            at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| x.name == *p));
+        }
+    }
+    for model in chain {
         names.extend(model.methods().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name.as_str().to_string()));
         let mut pending = crate::analyze::model_includes(model);
         let mut seen = crate::det::HashSet::default();
@@ -103,6 +122,9 @@ fn names_of(app: &App, models: &[ClassId]) -> Vec<String> {
                 }
             }
         }
+    }
+    if names.contains("method_missing") || names.contains("respond_to_missing?") {
+        return Vec::new();
     }
     let mut names: Vec<String> = names.into_iter().collect();
     names.sort();
@@ -244,7 +266,11 @@ fn collect_passed(e: &Expr, passed: &mut crate::det::HashMap<(Symbol, usize), Op
         return;
     }
     let ExprNode::Send { recv, method, args, .. } = &*e.node else { return };
+    // Not a call on another receiver left out: it may reach the method with a name this census never sees.
     if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+        for i in 0..4 {
+            passed.insert((method.clone(), i), None);
+        }
         return;
     }
     for (i, arg) in args.iter().enumerate() {
