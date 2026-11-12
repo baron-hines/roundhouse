@@ -39,9 +39,10 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::span::FileId;
 use crate::ty::Ty;
 
-/// Methods Ruby dispatches without a textual call site.
+/// Methods Ruby dispatches without a textual call site, and `process_action`, which the runtime's dispatch sends a
+/// controller (a gem's `Controller.action(name)` endpoint reaches it there).
 const IMPLICIT: &[&str] = &[
-    "initialize", "initialize_copy", "initialize_dup", "initialize_clone", "to_s", "to_str", "to_a", "to_ary",
+    "process_action", "initialize", "initialize_copy", "initialize_dup", "initialize_clone", "to_s", "to_str", "to_a", "to_ary",
     "to_h", "to_hash", "to_proc", "to_sym", "to_i", "to_int", "to_f", "inspect", "hash", "eql?", "==", "===",
     "<=>", "each", "call", "coerce", "method_missing", "respond_to_missing?", "inherited", "included",
     "extended", "prepended", "method_added", "freeze", "dup", "clone",
@@ -340,6 +341,9 @@ struct Gems<'a> {
     app_mixins: HashSet<String>,
     /// The models and controllers, which are no library class: their parent and what they mix in, as written.
     app_classes: HashMap<String, (Option<String>, Vec<String>)>,
+    /// The gem classes whose file requires a gem the app does not have (orm_adapter's `data_mapper.rb`:
+    /// `require 'dm-core'`): Ruby raises LoadError there, so they never exist.
+    unloadable: HashSet<String>,
 }
 
 impl<'a> Gems<'a> {
@@ -389,7 +393,8 @@ impl<'a> Gems<'a> {
             }
         }
         let app_classes = Self::app_classes_of(app);
-        let mut gems = Gems { names, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes };
+        let unloadable = unloadable_classes(app, &names);
+        let mut gems = Gems { names, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes, unloadable };
         gems.app_mixins = gems.mixed_into_the_app(app);
         Some(gems)
     }
@@ -658,6 +663,10 @@ impl<'a> Gems<'a> {
         for class in &app.gem_middlewares {
             consts.push((None, class.clone()));
         }
+        // Then Rails finalizes the routes (`ActionDispatch::Routing::RouteSet.finalize_app!`), which a gem prepends to.
+        if !app.gem_middlewares.is_empty() {
+            calls.push((Target::Any, "finalize!".to_string()));
+        }
         // Not parsed: the block is Ruby source, so every name called on something in it is reached on any receiver.
         for block in app.gem_middleware_blocks.values() {
             for name in called_names(block) {
@@ -865,7 +874,13 @@ impl Walk<'_, '_> {
         if self.classes.insert(c.clone()) {
             // A class with an `inherited` hook hears of each subclass as it loads (rack-attack's store proxies register so).
             if self.gems.defined.contains(&(c.as_str(), true, "inherited")) {
-                let heirs: Vec<String> = self.gems.names.iter().filter(|d| **d != c && self.gems.ancestors(d).contains(&c)).cloned().collect();
+                let heirs: Vec<String> = self
+                    .gems
+                    .names
+                    .iter()
+                    .filter(|d| **d != c && !self.gems.unloadable.contains(*d) && self.gems.ancestors(d).contains(&c))
+                    .cloned()
+                    .collect();
                 for heir in heirs {
                     self.class(heir);
                 }
@@ -1032,6 +1047,8 @@ impl Walk<'_, '_> {
                 let c = match c.strip_prefix('\u{0}').and_then(|rest| rest.split_once('\u{0}')) {
                     Some((context, name)) => match gems.resolve((!context.is_empty()).then_some(context), name) {
                         Some(resolved) => resolved,
+                        // An app class a gem's code names (`User.serialize_into_session`): its gem mixins answer.
+                        None if gems.app_classes.contains_key(name.trim_start_matches("::")) => name.trim_start_matches("::").to_string(),
                         None => return,
                     },
                     None => c,
@@ -1784,5 +1801,98 @@ mod tests {
         for (owner, class_side, name) in [("Notify::Mailer", false, "goodbye"), ("Notify::Hooks", false, "on_halt")] {
             assert!(!reached.methods.contains(&method(owner, class_side, name)), "{owner} {name}: {reached:#?}");
         }
+    }
+}
+
+/// The gem classes defined only in files whose program requires, at its top, a feature no gem of the lockfile, no
+/// standard library and no framework part provides. Conservative: any sign the feature loads counts as provided.
+fn unloadable_classes(app: &App, names: &HashSet<String>) -> HashSet<String> {
+    let Some(lock) = app.gem_lock.as_ref() else { return HashSet::default() };
+    let carried = |feature: &str| {
+        // Not any file of the name: a require resolves against a load path, a gem's `lib/` (orm_adapter's own `adapters/mongoid.rb` is no `mongoid`).
+        let tail = format!("/lib/{feature}.rb");
+        app.sources.iter().any(|f| f.path.ends_with(&tail))
+    };
+    let provided = |feature: &str| {
+        let root = feature.split('/').next().unwrap_or(feature);
+        // Not the gem fate alone: it marks what is compiled from source, and Ruby ships more than it calls Stdlib (`forwardable`).
+        let stdlib = |name: &str| {
+            matches!(crate::gems::fate_of(name), crate::gems::GemFate::Stdlib) || crate::ingest::app::APP_REQUIRABLE_STDLIB.contains(&name)
+        };
+        // Not the gem name alone: a gem may provide a feature of another root (`concurrent-ruby`'s `concurrent`).
+        let gem_named = lock.specs.iter().any(|(gem, _)| {
+            let gem = gem.as_str();
+            gem == root || gem.replace('-', "_") == root || gem.replace('-', "") == root || gem.starts_with(&format!("{root}-")) || gem.starts_with(&format!("{root}_"))
+        });
+        crate::gems::is_framework_feature(feature)
+            || gem_named
+            || stdlib(root)
+            || stdlib(feature)
+            || stdlib(&feature.replace('/', "-"))
+            || carried(feature)
+    };
+    let missing: HashSet<String> = app
+        .file_programs
+        .iter()
+        .filter(|p| {
+            p.items.iter().any(|item| matches!(item, crate::app::ProgramItem::Require { feature, relative: false, .. } if !provided(feature)))
+        })
+        .map(|p| p.source.clone())
+        .collect();
+    if missing.is_empty() {
+        return HashSet::default();
+    }
+    // Not one entry of a name: a class reopened in a file that loads exists, whatever another file of it requires.
+    let mut by_name: HashMap<&str, bool> = HashMap::default();
+    for c in app.library_classes.iter().filter(|c| names.contains(c.name.0.as_str())) {
+        let files: Vec<&str> = std::iter::once(c.parent_span.file)
+            .chain(c.methods.iter().map(|m| m.body.span.file))
+            .filter(|f| f.0 != 0)
+            .filter_map(|f| app.source_path(f))
+            .collect();
+        let only_missing = !files.is_empty() && files.iter().all(|f| missing.contains(*f));
+        by_name.entry(c.name.0.as_str()).and_modify(|all| *all &= only_missing).or_insert(only_missing);
+    }
+    by_name.into_iter().filter(|(_, all)| *all).map(|(name, _)| name.to_string()).collect()
+}
+
+/// Does `target`'s tree carry only the part of a gem compiled from source the program reaches? Spinel's does, and the
+/// ruby family's where it compiles a gem too (`compiled_on_the_ruby_family`).
+pub(crate) fn shakes_source_gems(app: &App, target: crate::build_target::BuildTarget) -> bool {
+    target == crate::build_target::BuildTarget::Spinel
+        || (matches!(target, crate::build_target::BuildTarget::Ruby | crate::build_target::BuildTarget::Jruby) && !compiled_on_the_ruby_family(app).is_empty())
+}
+
+/// The automatically sourced gems the ruby family compiles too: a gem that needs Rails' railties cannot load as
+/// the real gem over the runtime, which is not Rails (Devise, responders), and a sourced gem one of them depends on
+/// (Warden) comes with it, since the compiled gem calls its compiled classes.
+pub(crate) fn compiled_on_the_ruby_family(app: &App) -> crate::det::HashSet<String> {
+    let Some(lock) = app.gem_lock.as_ref() else { return Default::default() };
+    let deps = |gem: &str| lock.spec_deps.get(gem).cloned().unwrap_or_default();
+    let needs_railties = |gem: &str| {
+        let mut seen: crate::det::HashSet<String> = Default::default();
+        let mut stack = vec![gem.to_string()];
+        while let Some(g) = stack.pop() {
+            if g == "railties" {
+                return true;
+            }
+            if seen.insert(g.clone()) {
+                stack.extend(deps(&g));
+            }
+        }
+        false
+    };
+    let mut kept: crate::det::HashSet<String> = app.auto_source_gems.iter().filter(|g| needs_railties(g)).cloned().collect();
+    loop {
+        let more: Vec<String> = app
+            .auto_source_gems
+            .iter()
+            .filter(|g| !kept.contains(*g) && kept.iter().any(|k| deps(k).iter().any(|d| d == *g)))
+            .cloned()
+            .collect();
+        if more.is_empty() {
+            return kept;
+        }
+        kept.extend(more);
     }
 }

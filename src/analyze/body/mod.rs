@@ -142,6 +142,15 @@ pub struct Ctx {
     /// sites pass, so a `p ||= v` over one typed never nil nor false never assigns (`expr::DEAD_OR_ASSIGN`).
     /// Not any local's: a destructured `before, after = row` types an element it may not hold.
     pub call_site_params: crate::det::HashSet<Symbol>,
+    /// The parameters a `p ||= v` in the body assigns whose call sites
+    /// have not been read yet: in the typing pass before the first
+    /// unification, which has no parameter rows, or in a production round
+    /// whose row still has the slot pending. Such a `||=` leaves `p`
+    /// unbound instead of binding it to `v`'s type: whether `v` ever runs
+    /// is the callers' to say, and a `v` bound now and written through a
+    /// hash the callers read back (`_kinds[label] = kind`, `add(label,
+    /// _kinds[label])`) would return with them in every later round.
+    pub unseen_params: crate::det::HashSet<Symbol>,
     /// Module/class-level typed constants such as
     /// `STATUS_CODES = { ok: 200, ... }.freeze`. Rubydex IDs resolve
     /// source-backed reads; this scope types generated expressions.
@@ -900,6 +909,28 @@ impl<'a> BodyTyper<'a> {
     /// raise-equivalent without re-classifying.
     pub fn analyze_expr(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
         self.analyze_expr_role(expr, ctx, false)
+    }
+
+    /// [`Self::analyze_expr`] for a method's whole body. A body that is
+    /// one `p ||= v` is typed as the one statement of a sequence, as any
+    /// longer body's `||=` is: the call-site deferral
+    /// (`Ctx::unseen_params`) and the dead default (`expr::DEAD_OR_ASSIGN`)
+    /// are decided per statement, and `def pick(kind = nil) = kind ||=
+    /// Class.new(Base)` is the same `||=` as one with a statement before it.
+    pub fn analyze_method_body(&self, body: &mut Expr, ctx: &Ctx) -> Ty {
+        if !matches!(&*body.node, ExprNode::OpAssign { target: LValue::Var { .. }, op: crate::expr::OpAssignOp::OrOr, .. }) {
+            return self.analyze_expr(body, ctx);
+        }
+        let span = body.span;
+        let stmt = std::mem::replace(body, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+        let mut seq = Expr::new(span, ExprNode::Seq { exprs: vec![stmt] });
+        let ty = self.analyze_expr(&mut seq, ctx);
+        if let ExprNode::Seq { exprs } = &mut *seq.node {
+            if let Some(stmt) = exprs.pop() {
+                *body = stmt;
+            }
+        }
+        ty
     }
 
     fn analyze_receiver(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
@@ -3563,6 +3594,11 @@ impl<'a> BodyTyper<'a> {
                     let tail = i + 1 == exprs.len();
                     // What the statement was typed against, for the retype below.
                     let entry_ctx = (!nil_seed.is_empty()).then(|| local_ctx.clone());
+                    // `Ctx::unseen_params`: the statement's type stays
+                    // unknown after each typing of it below, the retypes
+                    // included, so `p` is never bound and never returned.
+                    let unseen_or_assign = matches!(&*exprs[i].node, ExprNode::OpAssign { target: LValue::Var { name, .. }, op: crate::expr::OpAssignOp::OrOr, .. }
+                        if local_ctx.unseen_params.contains(name) && !local_ctx.local_bindings.contains_key(name));
                     {
                         let e = &mut exprs[i];
                         if !tail {
@@ -3575,6 +3611,10 @@ impl<'a> BodyTyper<'a> {
                             if local_ctx.call_site_params.contains(name) && local_ctx.local_bindings.get(name).is_some_and(never_falsy));
                         if dead_or_assign { e.decisions |= crate::expr::DEAD_OR_ASSIGN } else { e.decisions &= !crate::expr::DEAD_OR_ASSIGN }
                         last = self.analyze_expr(e, &local_ctx);
+                        if unseen_or_assign {
+                            e.ty = Some(unknown());
+                            last = unknown();
+                        }
                         if let (true, ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }) = (dead_or_assign, &*e.node)
                             && let Some(kept) = local_ctx.local_bindings.get(name)
                         {
@@ -3653,6 +3693,10 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                     self.refine_lambda_locals(exprs, i, &mut local_ctx, &mut lambda_locals, &mut last);
+                    if unseen_or_assign {
+                        exprs[i].ty = Some(unknown());
+                        last = unknown();
+                    }
                     let e = &mut exprs[i];
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
@@ -4032,6 +4076,10 @@ impl<'a> BodyTyper<'a> {
                                     _ => None,
                                 };
                                 last = self.analyze_expr(&mut exprs[i], &retype);
+                                if unseen_or_assign {
+                                    exprs[i].ty = Some(unknown());
+                                    last = unknown();
+                                }
                                 // Not the binding the first typing exported: `values = xs.map { … prev … }` now answers the widened element.
                                 // Not over a refinement either: an accumulator scan may already have narrowed the binding past the first typing.
                                 if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*exprs[i].node {
@@ -7759,6 +7807,19 @@ pub(crate) fn rebound_locals(body: &Expr) -> crate::det::HashSet<Symbol> {
                 out.extend(extra_params.iter().map(|p| p.name.clone()));
             }
             _ => {}
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = crate::det::HashSet::default();
+    walk(body, &mut out);
+    out
+}
+
+/// The locals a `x ||= v` anywhere in `body` assigns.
+pub(crate) fn or_assigned_locals(body: &Expr) -> crate::det::HashSet<Symbol> {
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        if let ExprNode::OpAssign { target: LValue::Var { name, .. }, op: crate::expr::OpAssignOp::OrOr, .. } = &*e.node {
+            out.insert(name.clone());
         }
         e.node.for_each_child(&mut |c| walk(c, out));
     }

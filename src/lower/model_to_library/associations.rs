@@ -582,58 +582,85 @@ pub(super) fn push_association_methods(
 }
 
 /// `def self._association_names; [:room, :creator, …]; end` — the name
-/// table `ActiveRecord::Base.reflect_on_association` consults. Values
-/// are association names only; `counter_cache:` is unmodeled, so the
-/// reflection always answers `counter_cache_column == nil` (campfire's
-/// `Message.reflect_on_association(:room)` assertion).
+/// table `ActiveRecord::Base.reflect_on_association` consults — and, in
+/// its order, each association's macro, foreign key and `polymorphic:`
+/// (orm_adapter's `belongs_to?` / `foreign_key`). `counter_cache:` is
+/// unmodeled, so the reflection always answers `counter_cache_column ==
+/// nil` (campfire's `Message.reflect_on_association(:room)` assertion).
 fn push_association_names(methods: &mut Vec<MethodDef>, model: &Model) {
-    let name = Symbol::from("_association_names");
-    if model.methods().any(|m| m.name == name && m.receiver == MethodReceiver::Class)
-        || methods
-            .iter()
-            .any(|m| m.name == name && m.receiver == MethodReceiver::Class)
-    {
+    let defines = |methods: &Vec<MethodDef>, name: &Symbol| {
+        model.methods().any(|m| m.name == *name && m.receiver == MethodReceiver::Class)
+            || methods.iter().any(|m| m.name == *name && m.receiver == MethodReceiver::Class)
+    };
+    if defines(methods, &Symbol::from("_association_names")) || model.associations().next().is_none() {
         return;
     }
-    let elements: Vec<Expr> = model
+    // In `_association_names`' order: `reflect_on_association` reads each by the name's index.
+    let names: Vec<Expr> = model.associations().map(|a| lit_sym(a.name().clone())).collect();
+    let macros: Vec<Expr> = model
         .associations()
-        .map(|a| lit_sym(a.name().clone()))
+        .map(|a| {
+            lit_sym(Symbol::from(match a {
+                Association::BelongsTo { .. } => "belongs_to",
+                Association::HasMany { .. } => "has_many",
+                Association::HasOne { .. } => "has_one",
+                Association::HasAndBelongsToMany { .. } => "has_and_belongs_to_many",
+            }))
+        })
         .collect();
-    if elements.is_empty() {
-        return;
+    let foreign_keys: Vec<Expr> = model
+        .associations()
+        .map(|a| {
+            let key = match a {
+                Association::BelongsTo { foreign_key, .. }
+                | Association::HasMany { foreign_key, .. }
+                | Association::HasOne { foreign_key, .. } => foreign_key.as_str().to_string(),
+                Association::HasAndBelongsToMany { .. } => String::new(),
+            };
+            let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: key } });
+            e.ty = Some(Ty::Str);
+            e
+        })
+        .collect();
+    let polymorphic: Vec<Expr> = model
+        .associations()
+        .map(|a| {
+            let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: matches!(a, Association::BelongsTo { polymorphic: true, .. }) } });
+            e.ty = Some(Ty::Bool);
+            e
+        })
+        .collect();
+    for (name, elements, elem) in [
+        ("_association_names", names, Ty::Sym),
+        ("_association_macros", macros, Ty::Sym),
+        ("_association_foreign_keys", foreign_keys, Ty::Str),
+        ("_association_polymorphic", polymorphic, Ty::Bool),
+    ] {
+        let name = Symbol::from(name);
+        if defines(methods, &name) {
+            continue;
+        }
+        let array = Ty::Array { elem: std::sync::Arc::new(elem) };
+        let mut body = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets });
+        body.ty = Some(array.clone());
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name,
+            receiver: MethodReceiver::Class,
+            params: Vec::new(),
+            body,
+            signature: Some(fn_sig(vec![], array)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
     }
-    let mut body = Expr::new(
-        Span::synthetic(),
-        ExprNode::Array {
-            elements,
-            style: crate::expr::ArrayStyle::Brackets,
-        },
-    );
-    body.ty = Some(Ty::Array {
-        elem: std::sync::Arc::new(Ty::Sym),
-    });
-    methods.push(MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: Span::synthetic(),
-        name,
-        receiver: MethodReceiver::Class,
-        params: Vec::new(),
-        body,
-        signature: Some(fn_sig(
-            vec![],
-            Ty::Array {
-                elem: std::sync::Arc::new(Ty::Sym),
-            },
-        )),
-        effects: EffectSet::default(),
-        enclosing_class: Some(model.name.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-        mutates_self: false,
-        block_param: None,
-    });
 }
 
 /// `return <value> if new_record? && <owner key absent>`: Rails'

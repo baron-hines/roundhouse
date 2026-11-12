@@ -160,6 +160,10 @@ impl Sti {
 
 pub fn apply_sti_scope_lowering(app: &mut App) {
     let bases = sti_bases(app);
+    // Not the STI subclasses alone: Rails' base_class is the base model whatever the table's type column.
+    let mut every_base = bases.clone();
+    every_base.extend(plain_subclass_bases(app));
+    push_base_class(app, &every_base);
     if bases.is_empty() {
         return;
     }
@@ -205,6 +209,71 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
     }
     push_becomes_from(app, &bases, &recast);
     stamp_sti_subclasses(app, &bases);
+}
+
+/// Rails' `base_class` of a model's subclass, STI or plain: its base model (the runtime's answers the class itself).
+fn push_base_class(app: &mut App, bases: &HashMap<ClassId, ClassId>) {
+    let defines_base_class: HashSet<ClassId> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "base_class"))
+        .map(|lc| lc.name.clone())
+        .collect();
+    let parents: HashMap<ClassId, ClassId> = app.library_classes.iter().filter_map(|lc| Some((lc.name.clone(), lc.parent.clone()?))).collect();
+    // Not under a superclass short of the base that answers `base_class` itself: Ruby finds that one first.
+    let inherits_override = |mut at: ClassId, base: &ClassId| {
+        for _ in 0..64 {
+            if defines_base_class.contains(&at) {
+                return true;
+            }
+            match parents.get(&at) {
+                Some(p) if p != base => at = p.clone(),
+                _ => return false,
+            }
+        }
+        false
+    };
+    let names: HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.to_string()).chain(app.models.iter().map(|m| m.name.0.to_string())).collect();
+    for lc in &mut app.library_classes {
+        let Some(base) = bases.get(&lc.name) else { continue };
+        if inherits_override(lc.name.clone(), base) {
+            continue;
+        }
+        let ty = Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![Ty::Class { id: base.clone(), args: vec![].into() }].into() };
+        // Rooted where a namespace around the subclass holds the base's first name (`User` inside `Admin::User` is that class itself).
+        let head = base.0.as_str().split("::").next().unwrap_or_default();
+        let mut scope = lc.name.0.as_str();
+        let mut shadowed = false;
+        loop {
+            shadowed |= names.contains(format!("{scope}::{head}").as_str());
+            match scope.rsplit_once("::") {
+                Some((outer, _)) => scope = outer,
+                None => break,
+            }
+        }
+        let rooted = shadowed.then(|| Symbol::from(""));
+        let path = rooted.into_iter().chain(base.0.as_str().split("::").map(Symbol::from)).collect();
+        let mut body = Expr::new(crate::span::Span::synthetic(), ExprNode::Const { path });
+        body.decisions |= crate::expr::GENERATED_CONST_REF;
+        body.ty = Some(ty.clone());
+        lc.methods.push(crate::dialect::MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("base_class"),
+            receiver: MethodReceiver::Class,
+            params: Vec::new(),
+            body,
+            signature: Some(Ty::Fn { params: vec![].into(), block: None, ret: std::sync::Arc::new(ty), effects: crate::effect::EffectSet::default() }),
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: Some(lc.name.0.clone()),
+            kind: crate::dialect::AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
 }
 
 /// Record each base model's STI subclasses on the model itself

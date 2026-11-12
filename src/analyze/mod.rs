@@ -135,9 +135,22 @@ pub struct Analyzer {
     /// they pass, not its default too: Warden's `add(label, strategy =
     /// nil)` is never called without the class. Grows only.
     defaulted_param_slots: std::sync::Mutex<BTreeSet<(ParamKey, usize)>>,
-    /// The classes compiled from a gem's source. Only their slots drop a default no caller leaves:
-    /// an app method's callers include its tests and the console, which no site here records.
-    source_gem_classes: crate::det::HashSet<ClassId>,
+    /// Set for the typing pass before the first unification only: no
+    /// method has a parameter row yet, so a parameter no default types is
+    /// one its call sites have not been read for, not one nobody passes
+    /// (`Ctx::unseen_params`).
+    seeding_unseen_params: bool,
+    /// Set for the production rounds' typing passes: a `p ||= v` over a
+    /// parameter whose row slot is still pending is left untyped too. The
+    /// passes after that loop retype every production body without it.
+    deferring_pending_slots: bool,
+    /// The classes that pass left a `p ||= v` untyped in: the first
+    /// fixpoint round retypes them whatever else moved.
+    unseen_or_assign_classes: std::sync::Mutex<crate::det::HashSet<ClassId>>,
+    /// Per method name, what the calls by that name in the app's tests
+    /// pass. Those calls are callers too, and the unification reads only
+    /// the ones that reach a test helper, so `defaulted` reads them here.
+    test_call_arities: HashMap<Symbol, TestCalls>,
     /// (class, method) pairs an author wrote a signature for, as opposed
     /// to a `Fn` the registry stamped from the def itself. Only in the
     /// first is an `untyped` slot a statement rather than an inference
@@ -1388,7 +1401,10 @@ impl Analyzer {
             open_param_slots: BTreeSet::new(),
             pinned_param_slots: BTreeSet::new(),
             defaulted_param_slots: Default::default(),
-            source_gem_classes: source_gem_classes(app),
+            seeding_unseen_params: false,
+            deferring_pending_slots: false,
+            unseen_or_assign_classes: Default::default(),
+            test_call_arities: test_call_arities(app),
             declared_signatures: app
                 .rbs_signatures
                 .iter()
@@ -1614,6 +1630,11 @@ impl Analyzer {
             .map(|c| (c.name.clone(), c.parent.clone()))
             .collect();
 
+        // No parameter row exists yet: a `p ||= v` over a parameter the
+        // call sites will type is left untyped rather than bound to `v`
+        // (`Ctx::unseen_params`).
+        self.seeding_unseen_params = true;
+        self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         crate::timings::phase("typing passes (initial)", || {
             self.run_typing_passes(
                 app,
@@ -1625,6 +1646,11 @@ impl Analyzer {
                 TypingMode::Production { dirty: None },
             )
         });
+        self.seeding_unseen_params = false;
+        self.deferring_pending_slots = true;
+        // Those bodies were typed against no rows, so the first round
+        // retypes them even where no row or return moved.
+        let mut unseen = std::mem::take(&mut *self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()));
 
         let mut rounds = FixpointRounds {
             production: LoopEnd::RanToCap,
@@ -1657,7 +1683,8 @@ impl Analyzer {
             // verdicts (`DirtyHints`); both must be quiet before the
             // loop stops, or a newly block-valued method leaves its
             // callers on the registered return instead of the block.
-            if self.inference_matches(&prev_hints.sig)
+            if unseen.is_empty()
+                && self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
                 rounds.production = LoopEnd::Settled(round);
@@ -1673,7 +1700,11 @@ impl Analyzer {
             // so the later rounds retype the whole app for a handful of
             // returns. `dirty_classes_for_retype` is that handful plus
             // everything that reads it.
-            let dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            let mut dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            if let Some(dirty) = dirty.as_mut() {
+                dirty.extend(unseen.drain());
+            }
+            unseen.clear();
             crate::timings::note(match &dirty {
                 Some(dirty) => format!("round {round}: retype frontier {} classes", dirty.len()),
                 None => format!("round {round}: retype frontier everything"),
@@ -1691,6 +1722,7 @@ impl Analyzer {
                 )
             });
         }
+        self.deferring_pending_slots = false;
         let round_inputs = fixpoint_check::RoundInputs {
             dynamic_render_ivars: &dynamic_render_ivars,
             existing_view_names: &existing_view_names,
@@ -2156,6 +2188,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
                 in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -2283,7 +2316,7 @@ impl Analyzer {
                         let ty = if p.rest {
                             rest_element(inferred.map(|v| v.get(i..).unwrap_or_default()).unwrap_or_default())
                         } else {
-                            param_ty_with_default(inferred.and_then(|v| v.get(i)).cloned(), p, self.defaulted(&key, i))
+                            param_ty_with_default(inferred.and_then(|v| v.get(i)).cloned(), p.default.as_ref(), self.defaulted(&key, i, param_keyword(p)))
                                 .unwrap_or(Ty::Untyped)
                                 .subst_self(&owner_ty)
                         };
@@ -2521,6 +2554,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: shared.clone(),
                     annotate_self_dispatch: false,
                     in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -2818,6 +2852,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -2837,6 +2872,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: class_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -2859,7 +2895,7 @@ impl Analyzer {
                     }
                 }
                 let mctx = self.seed_method_params(&class_ctx, &model_name, method, true);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
+                self.body_typer().analyze_method_body(&mut method.body, &mctx);
             }
 
             // Pass B: gather every ivar assignment across the model's
@@ -2908,6 +2944,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: class_constants.clone(),
                     annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                 };
@@ -2935,7 +2972,7 @@ impl Analyzer {
                 for method in model.methods_mut() {
                     let side = if method.receiver == MethodReceiver::Class { &class_side_ctx } else { &reseeded_ctx };
                     let mctx = self.seed_method_params(side, &model_name, method, true);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
             self.harvest_one_model(model);
@@ -2978,6 +3015,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -3001,6 +3039,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: class_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
             };
@@ -3034,7 +3073,7 @@ impl Analyzer {
                     // (`fold_concern_param_sites`), whichever includer the
                     // sites were in.
                     let origin = spliced_from.as_ref().and_then(|m| m.get(&action.name));
-                    let mctx = self.seed_action_params(
+                    let mut mctx = self.seed_action_params(
                         &ctx,
                         &ctrl_id,
                         origin,
@@ -3044,8 +3083,8 @@ impl Analyzer {
                         action.block_param.as_ref(),
                         action.rest_param.as_ref(),
                     );
-                    self.analyze_action_defaults(action, &mctx, &ctrl_id, origin);
-                    self.body_typer().analyze_expr(&mut action.body, &mctx);
+                    self.analyze_action_defaults(action, &mut mctx, &ctrl_id, origin);
+                    self.body_typer().analyze_method_body(&mut action.body, &mctx);
                 }
             }
 
@@ -3066,7 +3105,7 @@ impl Analyzer {
                         }
                     }
                     let mctx = self.seed_method_params(&ctx, &ctrl_id, method, false);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
 
@@ -3607,6 +3646,7 @@ impl Analyzer {
                             class_objects: Default::default(),
                             query_class_objects: Default::default(),
                             call_site_params: Default::default(),
+                            unseen_params: Default::default(),
                             constants: meta.class_constants.clone(),
                             annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                         };
@@ -3617,7 +3657,7 @@ impl Analyzer {
                             .concern_spliced_actions
                             .get(&ctrl_name)
                             .and_then(|m| m.get(&action.name));
-                        let inner_ctx = self.seed_action_params(
+                        let mut inner_ctx = self.seed_action_params(
                             &base_ctx,
                             &ctrl_name,
                             origin,
@@ -3627,8 +3667,8 @@ impl Analyzer {
                             action.block_param.as_ref(),
                             action.rest_param.as_ref(),
                         );
-                        self.analyze_action_defaults(action, &inner_ctx, &ctrl_name, origin);
-                        self.body_typer().analyze_expr(&mut action.body, &inner_ctx);
+                        self.analyze_action_defaults(action, &mut inner_ctx, &ctrl_name, origin);
+                        self.body_typer().analyze_method_body(&mut action.body, &inner_ctx);
                     }
                 }
 
@@ -4093,6 +4133,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         call_site_params: Default::default(),
+                        unseen_params: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
                         in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
@@ -4102,7 +4143,7 @@ impl Analyzer {
                         .concern_spliced_actions
                         .get(&ctrl_name)
                         .and_then(|m| m.get(&action.name));
-                    let inner_ctx = self.seed_action_params(
+                    let mut inner_ctx = self.seed_action_params(
                         &base_ctx,
                         &ctrl_name,
                         origin,
@@ -4112,8 +4153,8 @@ impl Analyzer {
                         action.block_param.as_ref(),
                         action.rest_param.as_ref(),
                     );
-                    self.analyze_action_defaults(action, &inner_ctx, &ctrl_name, origin);
-                    self.body_typer().analyze_expr(&mut action.body, &inner_ctx);
+                    self.analyze_action_defaults(action, &mut inner_ctx, &ctrl_name, origin);
+                    self.body_typer().analyze_method_body(&mut action.body, &inner_ctx);
                 }
             });
         }
@@ -4166,12 +4207,13 @@ impl Analyzer {
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         call_site_params: Default::default(),
+                        unseen_params: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
                         in_view: false, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: false,
                         view_name: None,
                     };
-                    let inner_ctx = self.seed_action_params(
+                    let mut inner_ctx = self.seed_action_params(
                         &base_ctx,
                         &ctrl_name,
                         None,
@@ -4181,8 +4223,8 @@ impl Analyzer {
                         action.block_param.as_ref(),
                         action.rest_param.as_ref(),
                     );
-                    self.analyze_action_defaults(action, &inner_ctx, &ctrl_name, None);
-                    self.body_typer().analyze_expr(&mut action.body, &inner_ctx);
+                    self.analyze_action_defaults(action, &mut inner_ctx, &ctrl_name, None);
+                    self.body_typer().analyze_method_body(&mut action.body, &inner_ctx);
                 }
             });
         }
@@ -4402,6 +4444,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 call_site_params: Default::default(),
+                unseen_params: Default::default(),
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: self.helper_modules.contains(&lc.name),
             };
 
@@ -4430,7 +4473,7 @@ impl Analyzer {
                             self.body_typer().analyze_expr(default, &mctx);
                         }
                     }
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
 
@@ -4580,11 +4623,12 @@ impl Analyzer {
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     call_site_params: Default::default(),
+                    unseen_params: Default::default(),
                     constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(), super_method: None, helper_body: class_ctx.helper_body,
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
             views
@@ -5081,7 +5125,7 @@ impl Analyzer {
         fn writes(e: &Expr, out: &mut HashMap<Symbol, Ty>) {
             if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node
                 && let Some(cvar) = name.as_str().strip_prefix("@@")
-                && let Some(ty) = value.ty.clone().filter(|t| !t.is_open() && !matches!(t, Ty::Untyped))
+                && let Some(ty) = value.ty.clone().filter(|t| !t.is_open() && !matches!(t, Ty::Untyped)).map(|t| class_object_arg_ty(value, t))
             {
                 let key = Symbol::from(cvar);
                 let joined = match out.remove(&key) {
@@ -5207,7 +5251,7 @@ impl Analyzer {
                 let elem = rest_element(observed.map(|v| v.get(i..).unwrap_or_default()).unwrap_or_default());
                 Some(Ty::Array { elem: std::sync::Arc::new(elem) })
             } else {
-                param_ty_with_default(observed.and_then(|v| v.get(i)).cloned(), param, self.defaulted(&key, i))
+                param_ty_with_default(observed.and_then(|v| v.get(i)).cloned(), param.default.as_ref(), self.defaulted(&key, i, param_keyword(param)))
             };
             let ty = prefer_declared(
                 self.declared_param_ty(class_id, &method.name, positional, &param.name),
@@ -5259,6 +5303,25 @@ impl Analyzer {
             .filter(|p| !p.rest && !rebound.contains(&p.name) && observed.is_some())
             .map(|p| p.name.clone())
             .collect();
+        // Before the first unification no row exists; in the production
+        // rounds after it, a row whose slot is still pending (`Var`) names
+        // callers whose argument is not typed yet. A method no call site
+        // reaches has no row then, and keeps its default from round one.
+        let unseen_slot = |i: usize| match observed {
+            None => self.seeding_unseen_params,
+            Some(row) => self.deferring_pending_slots && row.get(i).is_none_or(|t| matches!(t, Ty::Var { .. })),
+        };
+        if self.seeding_unseen_params || (self.deferring_pending_slots && observed.is_some()) {
+            let or_assigned = body::or_assigned_locals(&method.body);
+            ctx.unseen_params = method.params.iter().enumerate()
+                .filter(|(i, p)| !p.rest && !rebound.contains(&p.name) && or_assigned.contains(&p.name) && unseen_slot(*i))
+                .filter(|(_, p)| !ctx.local_bindings.contains_key(&p.name))
+                .map(|(_, p)| p.name.clone())
+                .collect();
+            if self.seeding_unseen_params && !ctx.unseen_params.is_empty() {
+                self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).insert(class_id.clone());
+            }
+        }
         ctx
     }
 
@@ -5334,39 +5397,71 @@ impl Analyzer {
         ctx
     }
 
-    fn analyze_action_defaults(&self, action: &mut crate::dialect::Action, ctx: &Ctx, class_id: &ClassId, origin: Option<&ClassId>) {
+    /// Types an action's defaults, and binds its optional positional
+    /// parameters in `ctx`, the body's, as `seed_method_params` binds a
+    /// method's: what the call sites pass, joined with the default only
+    /// where a call may leave the slot to it. A `p ||= v` over a slot no
+    /// call site has typed yet is left untyped (`Ctx::unseen_params`).
+    fn analyze_action_defaults(&self, action: &mut crate::dialect::Action, ctx: &mut Ctx, class_id: &ClassId, origin: Option<&ClassId>) {
+        // A concern method spliced in keeps its sites under the module's key.
+        let keys: Vec<ParamKey> = [Some(class_id), origin]
+            .into_iter()
+            .flatten()
+            .map(|c| (c.clone(), action.name.clone(), MethodReceiver::Instance))
+            .collect();
+        let rows: Vec<&Vec<Ty>> = keys.iter().filter_map(|k| self.inferred_params.get(k)).collect();
         let observed = |slot: usize| {
-            [Some(class_id), origin]
-                .into_iter()
-                .flatten()
-                .filter_map(|c| self.inferred_params.get(&(c.clone(), action.name.clone(), MethodReceiver::Instance)))
+            rows.iter()
                 .filter_map(|v| v.get(slot).cloned())
                 .filter(|t| !matches!(t, Ty::Var { .. }))
                 .reduce(unify_param_ty)
         };
         let required = action.params.fields.len();
-        let observed: Vec<Option<Ty>> = (0..action.opt_params.len()).map(|j| observed(required + j)).collect();
-        let mut ctx = ctx.clone();
-        for ((name, default), seen) in action.opt_params.iter_mut().zip(observed) {
-            self.body_typer().analyze_expr(default, &ctx);
-            if !ctx.local_bindings.contains_key(name) {
-                let own = default.ty.clone().filter(|t| !matches!(t, Ty::Var { .. }));
-                let ty = match (seen, own) {
-                    (Some(seen), Some(own)) => Some(unify_param_ty(seen, own)),
-                    (seen, own) => seen.or(own),
-                };
-                if let Some(ty) = ty {
-                    ctx.local_bindings.insert(name.clone(), ty);
-                }
+        for (j, (name, default)) in action.opt_params.iter_mut().enumerate() {
+            self.body_typer().analyze_expr(default, ctx);
+            // Not the default alone: a helper no typed site calls keeps
+            // the parameter unbound, as it was before any row existed.
+            if rows.is_empty() || ctx.local_bindings.contains_key(name) {
+                continue;
+            }
+            let slot = required + j;
+            let defaulted = keys.iter().any(|k| self.defaulted(k, slot, None));
+            if let Some(ty) = param_ty_with_default(observed(slot), Some(&*default), defaulted) {
+                ctx.local_bindings.insert(name.clone(), ty);
             }
         }
+        let rebound = body::rebound_locals(&action.body);
+        let positional: Vec<&Symbol> = action.params.fields.keys().chain(action.opt_params.iter().map(|(n, _)| n)).collect();
+        if !rows.is_empty() {
+            ctx.call_site_params = positional.iter().filter(|n| !rebound.contains(**n)).map(|n| (*n).clone()).collect();
+        }
+        if self.seeding_unseen_params || (self.deferring_pending_slots && !rows.is_empty()) {
+            let unseen_slot = |i: usize| {
+                if rows.is_empty() {
+                    self.seeding_unseen_params
+                } else {
+                    rows.iter().all(|row| row.get(i).is_none_or(|t| matches!(t, Ty::Var { .. })))
+                }
+            };
+            let or_assigned = body::or_assigned_locals(&action.body);
+            ctx.unseen_params = positional.iter().enumerate()
+                .filter(|(i, n)| !rebound.contains(**n) && or_assigned.contains(**n) && unseen_slot(*i))
+                .filter(|(_, n)| !ctx.local_bindings.contains_key(**n))
+                .map(|(_, n)| (*n).clone())
+                .collect();
+            if self.seeding_unseen_params && !ctx.unseen_params.is_empty() {
+                self.unseen_or_assign_classes.lock().unwrap_or_else(|e| e.into_inner()).insert(class_id.clone());
+            }
+        }
+        // Not bound in the body: no call-site row reaches a keyword.
+        let mut kw_ctx = ctx.clone();
         for (name, default) in action.kw_params.iter_mut() {
             let Some(default) = default else { continue };
-            self.body_typer().analyze_expr(default, &ctx);
-            if !ctx.local_bindings.contains_key(name)
+            self.body_typer().analyze_expr(default, &kw_ctx);
+            if !kw_ctx.local_bindings.contains_key(name)
                 && let Some(ty) = default.ty.clone().filter(|t| !matches!(t, Ty::Var { .. }))
             {
-                ctx.local_bindings.insert(name.clone(), ty);
+                kw_ctx.local_bindings.insert(name.clone(), ty);
             }
         }
     }
@@ -7856,6 +7951,9 @@ pub(crate) struct ClassIvarWrites {
     modules: BTreeSet<Symbol>,
     /// The modules with a computed `instance_variable_set`.
     dynamic_modules: BTreeSet<ClassId>,
+    /// Each indexed class's direct subclasses among `classes`, so a lookup walks down from one class instead of up
+    /// from every class.
+    children: HashMap<ClassId, Vec<ClassId>>,
 }
 
 impl ClassIvarWrites {
@@ -7879,11 +7977,33 @@ impl ClassIvarWrites {
         if !class_side && own.last().and_then(|c| self.classes.get(c)).and_then(|e| e.parent.as_ref()).is_some_and(|p| !self.classes.contains_key(p) && p.0.as_str() != "Object") {
             return true;
         }
-        self.classes.iter().any(|(c, e)| {
-            (own.contains(c) || ancestors(c).contains(class))
-                && (e.any
-                    || e.mixins.iter().any(|m| self.dynamic_modules.contains(m))
-                    || if class_side { e.class.contains(name) } else { e.instance.contains(name) })
+        // The classes whose chain reaches `class` within the 64 links `ancestors` follows: its subclasses, walked down.
+        let mut related: Vec<&ClassId> = own.iter().filter(|c| self.classes.contains_key(*c)).collect();
+        let mut seen: HashSet<&ClassId> = HashSet::default();
+        let mut frontier: Vec<&ClassId> = vec![class];
+        seen.insert(class);
+        for _ in 0..=64 {
+            let mut next = Vec::new();
+            for c in frontier {
+                if self.classes.contains_key(c) && !own.contains(c) {
+                    related.push(c);
+                }
+                for child in self.children.get(c).into_iter().flatten() {
+                    if seen.insert(child) {
+                        next.push(child);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        related.into_iter().any(|c| {
+            let e = &self.classes[c];
+            e.any
+                || e.mixins.iter().any(|m| self.dynamic_modules.contains(m))
+                || if class_side { e.class.contains(name) } else { e.instance.contains(name) }
         })
     }
 }
@@ -7977,7 +8097,13 @@ fn class_ivar_writes(app: &App) -> Option<ClassIvarWrites> {
     for (model, m) in &app.macro_includes {
         classes.entry(model.clone()).or_default().mixins.push(m.clone());
     }
-    Some(ClassIvarWrites { classes, modules, dynamic_modules })
+    let mut children: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for (c, e) in &classes {
+        if let Some(p) = &e.parent {
+            children.entry(p.clone()).or_default().push(c.clone());
+        }
+    }
+    Some(ClassIvarWrites { classes, modules, dynamic_modules, children })
 }
 
 fn collect_ivar_reads(e: &Expr, out: &mut BTreeSet<Symbol>) {
@@ -8841,8 +8967,13 @@ pub(crate) fn fold_param_observations(
 
 impl Analyzer {
     /// Whether some call site may leave `key`'s slot `i` to its default.
-    fn defaulted(&self, key: &ParamKey, i: usize) -> bool {
-        if !self.source_gem_classes.contains(&key.0) {
+    /// A call in a test counts by its method's name alone: the
+    /// production rounds decide this before any test is typed, and a
+    /// test receiver left untyped would otherwise hide the call.
+    /// `keyword` names the slot when a call fills it by name: a test call
+    /// leaves it out by not naming it, not by its positional count.
+    fn defaulted(&self, key: &ParamKey, i: usize, keyword: Option<&Symbol>) -> bool {
+        if self.test_call_arities.get(&key.1).is_some_and(|calls| calls.leave(i, keyword)) {
             return true;
         }
         let defaulted = self.defaulted_param_slots.lock().unwrap_or_else(|e| e.into_inner());
@@ -9255,6 +9386,15 @@ fn class_object_union(answers: &[Option<&Ty>]) -> Option<Ty> {
 
 // Recorded flat, a class object argument would type its parameter as an instance of that class.
 fn class_object_arg_ty(arg: &Expr, ty: Ty) -> Ty {
+    // `x.class` is typed as x's own class (so `self.class.find` dispatches), which as a parameter declared an instance.
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*arg.node
+        && method.as_str() == "class"
+        && args.is_empty()
+        && r.decisions & crate::expr::CLASS_OBJECT_VALUE == 0
+        && matches!(&ty, Ty::Class { id, args } if args.is_empty() && !matches!(id.0.as_str(), "Class" | "Module"))
+    {
+        return Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![ty].into() };
+    }
     match ty {
         Ty::Class { ref args, .. }
             if arg.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 && args.is_empty() =>
@@ -10031,28 +10171,123 @@ fn prefer_declared(declared: Option<Ty>, observed: Option<Ty>) -> Option<Ty> {
     }
 }
 
-fn source_gem_classes(app: &App) -> crate::det::HashSet<ClassId> {
-    let Some(lock) = app.gem_lock.as_ref() else { return Default::default() };
-    let in_gem = |file: crate::span::FileId| {
-        app.source_path(file).is_some_and(|path| {
-            lock.source.iter().any(|gem| lock.version_of(gem).is_some_and(|v| crate::ingest::source_gems::file_of(path, gem, v)))
-        })
-    };
-    app.library_classes
-        .iter()
-        .filter(|c| c.methods.iter().any(|m| !m.body.span.is_synthetic() && in_gem(m.body.span.file)))
-        .map(|c| c.name.clone())
-        .collect()
+/// What the calls by one method name in the app's tests pass: the
+/// fewest positional arguments, and the keywords every one of them
+/// names. By name alone: a call whose receiver is another class only
+/// keeps a default that could have been dropped.
+#[derive(Debug)]
+struct TestCalls {
+    positional: usize,
+    keywords: crate::det::HashSet<Symbol>,
 }
 
-fn param_ty_with_default(observed: Option<Ty>, param: &crate::dialect::Param, defaulted: bool) -> Option<Ty> {
+impl TestCalls {
+    /// Whether some call may leave slot `i` (named `keyword`, if a call
+    /// fills it by name) to its default.
+    fn leave(&self, i: usize, keyword: Option<&Symbol>) -> bool {
+        match keyword {
+            Some(name) => !self.keywords.contains(name),
+            None => i >= self.positional,
+        }
+    }
+}
+
+/// The name a call fills `param` by, if it is a keyword, or one ingest
+/// flattened into a positional (`Param::from_keyword`).
+fn param_keyword(param: &crate::dialect::Param) -> Option<&Symbol> {
+    (param.keyword || param.from_keyword).then_some(&param.name)
+}
+
+/// [`TestCalls`] per method name, from every test body. A splat, `...`,
+/// `**`, or the name written as a symbol (`send(:add, …)`,
+/// `method(:add)`) counts as passing no positional argument and naming
+/// no keyword.
+fn test_call_arities(app: &App) -> HashMap<Symbol, TestCalls> {
+    fn note(out: &mut HashMap<Symbol, TestCalls>, name: &Symbol, positional: usize, keywords: crate::det::HashSet<Symbol>) {
+        match out.get_mut(name) {
+            Some(calls) => {
+                calls.positional = calls.positional.min(positional);
+                calls.keywords.retain(|k| keywords.contains(k));
+            }
+            None => {
+                out.insert(name.clone(), TestCalls { positional, keywords });
+            }
+        }
+    }
+    fn walk(e: &Expr, out: &mut HashMap<Symbol, TestCalls>) {
+        match &*e.node {
+            ExprNode::Send { recv, method, args, block, .. } => {
+                let opaque = args.iter().any(|a| matches!(&*a.node,
+                    ExprNode::Splat { .. } | ExprNode::ForwardArgs | ExprNode::ForwardKeywords
+                        | ExprNode::ForwardKeywordsWithPairs { .. } | ExprNode::KeywordSplat { .. }));
+                let mut positional = 0;
+                let mut keywords = crate::det::HashSet::default();
+                let mut named = true;
+                for arg in args {
+                    match &*arg.node {
+                        ExprNode::Hash { entries, kwargs: true } => {
+                            for (key, value) in entries {
+                                match &*key.node {
+                                    // The keyword, not a mention of a method.
+                                    ExprNode::Lit { value: Literal::Sym { value: k } } => {
+                                        keywords.insert(k.clone());
+                                    }
+                                    // A computed key is an expression like any
+                                    // other: `keyed(record.add => 1)` calls `add`.
+                                    _ => {
+                                        named = false;
+                                        walk(key, out);
+                                    }
+                                }
+                                walk(value, out);
+                            }
+                        }
+                        ExprNode::KeywordSplat { .. } | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. } => walk(arg, out),
+                        _ => {
+                            positional += 1;
+                            walk(arg, out);
+                        }
+                    }
+                }
+                if opaque || !named {
+                    positional = if opaque { 0 } else { positional };
+                    keywords.clear();
+                }
+                note(out, method, positional, keywords);
+                if let Some(recv) = recv {
+                    walk(recv, out);
+                }
+                if let Some(block) = block {
+                    walk(block, out);
+                }
+                return;
+            }
+            ExprNode::Lit { value: Literal::Sym { value } } | ExprNode::MethodRef { name: value, .. } => {
+                note(out, value, 0, Default::default());
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = HashMap::default();
+    for module in &app.test_modules {
+        let methods = module.helpers.iter().chain(module.inner_classes.iter().flat_map(|c| c.methods.iter()));
+        let bodies = module.setup.iter()
+            .chain(module.tests.iter().map(|t| &t.body))
+            .chain(methods.flat_map(|m| m.params.iter().filter_map(|p| p.default.as_ref()).chain(std::iter::once(&m.body))));
+        for body in bodies {
+            walk(body, &mut out);
+        }
+    }
+    out
+}
+
+fn param_ty_with_default(observed: Option<Ty>, default: Option<&Expr>, defaulted: bool) -> Option<Ty> {
     let observed = observed.filter(|t| !matches!(t, Ty::Var { .. }));
     if let Some(o) = observed.as_ref().filter(|_| !defaulted) {
         return Some(o.clone());
     }
-    let default = param
-        .default
-        .as_ref()
+    let default = default
         .and_then(|d| d.ty.clone().map(|t| class_object_arg_ty(d, t)))
         .filter(|t| !matches!(t, Ty::Var { .. }));
     match (observed, default) {
@@ -10780,7 +11015,8 @@ fn walk_ivar_assignments(
             let empty_indifferent = matches!(&*value.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
                 if method.as_str() == "new" && args.is_empty() && matches!(&*r.node, ExprNode::Const { path }
                     if matches!(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().as_slice(), ["HashWithIndifferentAccess"] | ["ActiveSupport", "HashWithIndifferentAccess"])));
-            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { value.ty.clone() };
+            // A class object stored is the class (`@responder = Devise::Controllers::Responder`), as a method answering it is.
+            let ty = if empty_indifferent { Some(crate::analyze::indifferent::of(crate::analyze::body::unknown())) } else { value.ty.clone().map(|t| class_object_arg_ty(value, t)) };
             if let Some(ty) = ty {
                 // Union with existing entry so repeated assignments to
                 // the same ivar accumulate (rather than the last write
@@ -12313,7 +12549,7 @@ impl Analyzer {
     /// is measured on a copy. Destructured without `..`, so a new field has
     /// to be listed here; `Copy` fields own no heap.
     pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
-        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, source_gem_classes, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
+        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("module_self_types", crate::memory_census::freed_by(|| drop(module_self_types))),
@@ -12323,7 +12559,8 @@ impl Analyzer {
             ("open_param_slots", crate::memory_census::freed_by(|| drop(open_param_slots))),
             ("pinned_param_slots", crate::memory_census::freed_by(|| drop(pinned_param_slots))),
             ("defaulted_param_slots", crate::memory_census::freed_by(|| drop(defaulted_param_slots))),
-            ("source_gem_classes", crate::memory_census::freed_by(|| drop(source_gem_classes))),
+            ("unseen_or_assign_classes", crate::memory_census::freed_by(|| drop(unseen_or_assign_classes))),
+            ("test_call_arities", crate::memory_census::freed_by(|| drop(test_call_arities))),
             ("declared_signatures", crate::memory_census::freed_by(|| drop(declared_signatures))),
             ("adapter", crate::memory_census::freed_by(|| drop(adapter))),
             ("concern_folded", crate::memory_census::freed_by(|| drop(concern_folded))),

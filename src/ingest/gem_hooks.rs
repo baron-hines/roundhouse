@@ -280,6 +280,181 @@ pub(super) fn devise_mapping_types(app: &mut App) {
     }
 }
 
+/// Devise's `configure_warden!` hands Warden a block per mapping, which `Warden::Manager.serialize_into_session`
+/// makes a `SessionSerializer` method with `define_method(name, &block)`: a body known only when it runs, which
+/// Spinel cannot compile. The mappings are known here, so each is written as the method that block makes
+/// (`user_serialize`, `user_deserialize`), and `configure_warden!` no longer hands the blocks over.
+pub(super) fn unroll_warden_serializers(app: &mut App, mappings: &[(String, String)]) {
+    if mappings.is_empty() || !app.library_classes.iter().any(|c| c.name.0.as_str() == "Warden::SessionSerializer") {
+        return;
+    }
+    let mut src = String::from("class Warden::SessionSerializer\n");
+    // `mapping.to` is the model class `class_name` names (`Devise.ref(class_name).get`).
+    for (name, class) in mappings {
+        src.push_str(&format!(
+            "  def {name}_serialize(record)\n    {class}.serialize_into_session(record)\n  end\n\n  def {name}_deserialize(args)\n    {class}.serialize_from_session(*args)\n  end\n\n"
+        ));
+    }
+    src.push_str("end\n");
+    let parsed = super::prism::scope(|| super::ingest_library_classes(src.as_bytes(), "<warden serializers>")).0;
+    let Ok(classes) = parsed else { return };
+    let methods: Vec<_> = classes.into_iter().flat_map(|c| c.methods).collect();
+    let mut removed = false;
+    for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str() == "Devise") {
+        for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "configure_warden!") {
+            removed |= drop_serializer_calls(&mut m.body);
+        }
+    }
+    if !removed {
+        return;
+    }
+    if let Some(serializer) = app.library_classes.iter_mut().find(|c| c.name.0.as_str() == "Warden::SessionSerializer") {
+        serializer.methods.extend(methods);
+    }
+}
+
+/// `warden_config.serialize_into_session(…) { … }` and `serialize_from_session` dropped from a body, as statements.
+/// A Devise view's `resource_name` (and `scope_name`) is `devise_mapping.name`, the mapping the request's route set:
+/// where the app has one mapping, every request a Devise controller serves has that one, so the view's form spells
+/// its name (`form_for(resource, as: resource_name, …)`, whose field prefix is lowered from a literal).
+pub(super) fn fold_devise_view_scope(app: &mut App, mappings: &[(String, String)]) {
+    let [(name, _)] = mappings else { return };
+    let app_defines = |m: &str, span: crate::span::Span| {
+        matches!(m, "resource_name" | "scope_name") && !super::sources::path_of(span.file).is_some_and(|p| super::absence_guards::is_source_gem_path(&p))
+    };
+    // Not where the app answers it too (a helper that renders Devise's forms on its own pages): that answer is the app's.
+    if app.library_classes.iter().any(|c| c.methods.iter().any(|m| app_defines(m.name.as_str(), m.name_span)))
+        || app.controllers.iter().any(|c| c.actions().any(|a| app_defines(a.name.as_str(), a.name_span)))
+    {
+        return;
+    }
+    for view in app.views.iter_mut() {
+        fold_scope_reads(&mut view.body, name);
+    }
+}
+
+/// Devise's FailureApp names the route it sends a visitor to as `route(scope)`, `:"new_#{scope}_session_url"`, and
+/// asks the router for it with `respond_to?` and `send`; an emitted program sends no name it learns at run time. With
+/// one mapping the scope is that mapping's (another raises in `Devise.mappings[scope]` before), so the name is a literal.
+///
+/// The router it asks is `send(router_name)`, `Devise.available_router_name` (`router_name || :main_app`) where the
+/// mapping names none: `main_app` while the app sets no `config.router_name`.
+pub(super) fn fold_devise_failure_route(app: &mut App, mappings: &[(String, String)]) {
+    let [(name, _)] = mappings else { return };
+    let literal = format!("new_{name}_session_url");
+    let router_named = app.boot_program.iter().any(|e| sends(e, "router_name="));
+    for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str() == "Devise::FailureApp") {
+        if !lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "route") {
+            continue;
+        }
+        for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() != "route") {
+            fold_route_local(&mut m.body, &literal);
+            if !router_named {
+                fold_router_send(&mut m.body);
+            }
+        }
+    }
+}
+
+fn sends(e: &Expr, name: &str) -> bool {
+    let mut found = matches!(&*e.node, ExprNode::Send { method, .. } if method.as_str() == name);
+    e.node.for_each_child(&mut |c| found |= sends(c, name));
+    found
+}
+
+// Not any `send(x)`: only the one naming the router (`router_name = Devise.mappings[scope].router_name || …`).
+fn fold_router_send(e: &mut Expr) {
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && method.as_str() == "send"
+        && let [arg] = args.as_slice()
+        && matches!(&*arg.node, ExprNode::Var { name, .. } if name.as_str() == "router_name")
+    {
+        *e.node = ExprNode::Send { recv: None, method: crate::ident::Symbol::from("main_app"), args: Vec::new(), block: None, parenthesized: false };
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| fold_router_send(c));
+}
+
+fn is_route_call(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "route" && args.len() == 1)
+}
+
+// Not where the local is written twice: the read after the second write is not the route's name.
+fn fold_route_local(body: &mut Expr, literal: &str) {
+    let mut locals: Vec<crate::ident::Symbol> = Vec::new();
+    let mut writes: Vec<crate::ident::Symbol> = Vec::new();
+    collect_route_locals(body, &mut locals, &mut writes);
+    locals.retain(|l| writes.iter().filter(|w| *w == l).count() == 1);
+    replace_route_reads(body, &locals, literal);
+}
+
+fn collect_route_locals(e: &Expr, locals: &mut Vec<crate::ident::Symbol>, writes: &mut Vec<crate::ident::Symbol>) {
+    if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node {
+        writes.push(name.clone());
+        if is_route_call(value) {
+            locals.push(name.clone());
+        }
+    }
+    e.node.for_each_child(&mut |c| collect_route_locals(c, locals, writes));
+}
+
+fn replace_route_reads(e: &mut Expr, locals: &[crate::ident::Symbol], literal: &str) {
+    let sym = || ExprNode::Lit { value: Literal::Sym { value: crate::ident::Symbol::from(literal) } };
+    if is_route_call(e) {
+        *e.node = sym();
+        return;
+    }
+    if let ExprNode::Var { name, .. } = &*e.node
+        && locals.contains(name)
+    {
+        *e.node = sym();
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| replace_route_reads(c, locals, literal));
+}
+
+/// Devise's `rails/warden_compat.rb` reopens `Warden::Mixins::Common` after Warden has loaded (`devise.rb` requires
+/// warden first and `devise/rails` last), so its `request` (an `ActionDispatch::Request` over the env, whose params
+/// are Rails') and `reset_session!` are the ones Ruby keeps. The reopens are not held in load order, so Warden's own
+/// definitions of those names are left out.
+pub(super) fn devise_warden_compat(app: &mut App) {
+    let compat = |m: &crate::dialect::MethodDef| super::sources::path_of(m.name_span.file).is_some_and(|p| p.ends_with("lib/devise/rails/warden_compat.rb"));
+    let overridden: Vec<(crate::ident::Symbol, crate::dialect::MethodReceiver)> = app
+        .library_classes
+        .iter()
+        .filter(|c| c.name.0.as_str() == "Warden::Mixins::Common")
+        .flat_map(|c| c.methods.iter().filter(|m| compat(m)).map(|m| (m.name.clone(), m.receiver)))
+        .collect();
+    if overridden.is_empty() {
+        return;
+    }
+    for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str() == "Warden::Mixins::Common") {
+        lc.methods.retain(|m| compat(m) || !overridden.iter().any(|(n, r)| *n == m.name && *r == m.receiver));
+    }
+}
+
+fn fold_scope_reads(e: &mut Expr, name: &str) {
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && args.is_empty()
+        && matches!(method.as_str(), "resource_name" | "scope_name")
+    {
+        *e.node = ExprNode::Lit { value: Literal::Sym { value: crate::ident::Symbol::from(name) } };
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| fold_scope_reads(c, name));
+}
+
+fn drop_serializer_calls(e: &mut Expr) -> bool {
+    let mut removed = false;
+    if let ExprNode::Seq { exprs } = &mut *e.node {
+        let before = exprs.len();
+        exprs.retain(|x| !matches!(&*x.node, ExprNode::Send { method, block: Some(_), .. } if matches!(method.as_str(), "serialize_into_session" | "serialize_from_session")));
+        removed |= exprs.len() != before;
+    }
+    e.node.for_each_child_mut(&mut |c| removed |= drop_serializer_calls(c));
+    removed
+}
+
 /// `:x` of a `self.modules.include?(:x)` body.
 fn includes_module(body: &Expr) -> Option<String> {
     let body = match &*body.node {
@@ -636,6 +811,18 @@ pub(super) fn devise_url_helpers_source(facts: &DeviseUrlFacts, routes: &HashMap
     out.push_str(&format!(
         "def self.devise_path_with(path, params)\n  return path if params.nil?\n  raise ArgumentError, \"a positional argument to a Devise url helper is not supported\" unless params.is_a?(Hash)\n  params.each_key {{ |key| raise ArgumentError, \"`#{{key}}:` on a Devise url helper is not supported\" if %w[{DEVISE_URL_RESERVED}].include?(key.to_s) }}\n  path + RouteHelpers.query_suffix(params)\nend\n\n"
     ));
+    // Devise's FailureApp answers Warden with `main_app.send(route(scope), opts)` (`fold_devise_failure_route`), and
+    // Rails' `main_app` answers each `_url` helper; the nil options it passes Rails' url_for skips, and a `script_name:`
+    // (`RAILS_RELATIVE_URL_ROOT`) leads the path.
+    for m in &facts.mappings {
+        let path = format!("new_{}_session_path", m.name);
+        if routes.get(&path) == Some(&0) {
+            out.push_str(&format!(
+                "def self.new_{name}_session_url(options = nil)\n  given = options.nil? ? nil : options.reject {{ |_, value| value.nil? }}\n  script = given.nil? ? nil : given.delete(:script_name)\n  Rails.application.protocol + Rails.application.domain + script.to_s.chomp(\"/\") + RouteHelpers.devise_path_with(RouteHelpers.{path}, given)\nend\n\n",
+                name = m.name
+            ));
+        }
+    }
     for (module, actions) in &facts.modules {
         for action in actions {
             let prefix = action.as_ref().map_or(String::new(), |a| format!("{a}_"));

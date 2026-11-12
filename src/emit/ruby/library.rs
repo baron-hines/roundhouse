@@ -6366,7 +6366,16 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             // `to_s`. campfire's own test writes `user_sidebar_url(:me)`
             // against a `scope defaults: { user_id: "me" }` segment,
             // and that segment is declared `String` after its default.
-            if wants_str_here {
+            // An optional segment (`/media_proxy/:id/(*any)`, `String |
+            // nil`) the same: a Symbol is never nil.
+            let wants_str_or_nil_here = matches!(
+                declared.as_ref().and_then(|tys| tys.get(idx)),
+                Some(crate::ty::Ty::Union { variants })
+                    if variants.len() == 2
+                        && variants.contains(&crate::ty::Ty::Str)
+                        && variants.contains(&crate::ty::Ty::Nil)
+            );
+            if wants_str_here || wants_str_or_nil_here {
                 if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
                     let mut lit = Expr::new(
                         arg.span,
@@ -6392,30 +6401,44 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             // whatever the schema says (a new record's key, a reader the
             // model overrides), so the argument is bound once and only a
             // value that isn't nil is converted.
-            let wants_opt_str_here = matches!(
-                declared.as_ref().and_then(|tys| tys.get(idx)),
-                Some(crate::ty::Ty::Union { variants })
-                    if variants.len() == 2
-                        && variants.contains(&crate::ty::Ty::Str)
-                        && variants.contains(&crate::ty::Ty::Nil)
-            );
             // `Integer | nil` too (`flag ? n : nil`): the binding keeps the nil.
             let int_or_nil = matches!(&arg.ty, Some(crate::ty::Ty::Union { variants })
                 if variants.len() == 2
                     && variants.contains(&crate::ty::Ty::Int)
                     && variants.contains(&crate::ty::Ty::Nil));
-            if wants_opt_str_here
-                && (matches!(arg.ty, Some(crate::ty::Ty::Int)) || int_or_nil || is_integer_column_read(arg, sig))
+            // `Symbol | nil` (`flag ? :thumb : nil`) the same way: the
+            // Symbol is its String, the nil drops the segment (CodeRabbit
+            // on #2071). `Symbol | String | nil` and `Symbol | Integer | nil`
+            // too: a String's `to_s` is itself, an Integer's is its
+            // `to_param`.
+            let sym_union = |nil: bool| {
+                matches!(&arg.ty, Some(crate::ty::Ty::Union { variants })
+                    if variants.contains(&crate::ty::Ty::Sym)
+                        && variants.contains(&crate::ty::Ty::Nil) == nil
+                        && variants.iter().all(|v| matches!(v, crate::ty::Ty::Sym | crate::ty::Ty::Str | crate::ty::Ty::Int | crate::ty::Ty::Nil)))
+            };
+            let sym_or_nil = sym_union(true);
+            if wants_str_or_nil_here
+                && (matches!(arg.ty, Some(crate::ty::Ty::Int))
+                    || int_or_nil
+                    || sym_or_nil
+                    || is_integer_column_read(arg, sig))
             {
                 let value = std::mem::replace(arg, Expr::new(arg.span, ExprNode::Seq { exprs: vec![] }));
                 *arg = to_s_keeping_nil(value, sig);
                 continue;
             }
-            if wants_str_here
+            // A Symbol-typed value in an optional segment (`style =
+            // :thumb; media_proxy_path(id, style)`) is never nil, so it
+            // is its `to_s` there as well (CodeRabbit on #2071), as is a
+            // `Symbol | String` or `Symbol | Integer` one (`flag ? :thumb :
+            // "small"`).
+            if (wants_str_here
                 && (is_bare_id_read(arg)
                     || is_symbol_arg(arg)
                     || matches!(arg.ty, Some(crate::ty::Ty::Int))
-                    || is_integer_column_read(arg, sig))
+                    || is_integer_column_read(arg, sig)))
+                || (wants_str_or_nil_here && (is_symbol_arg(arg) || sym_union(false)))
             {
                 let span = arg.span;
                 let inner =
@@ -7795,8 +7818,14 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
+        // A parameter's default is evaluated in the method's lexical
+        // scope, as its body is: `def tag(value = Util.tag)` in a
+        // compact `class Gadget::Thing` reads `::Util`.
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, name, &shadowing, &prefixes, &known);
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                root_shadowed_constants(default, name, &shadowing, &prefixes, &known);
+            }
         }
     }
 }
@@ -8535,7 +8564,7 @@ fn emit_library_class_decl_inner(
         && (lc.has_source_ivar_initializers() || !replayed_in_place.is_empty())
         && !app.controllers.iter().any(|controller| controller.name == lc.name);
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
-    let load_time_bodies = initializers_call_self || !deferred.is_empty();
+    let load_time_bodies = !deferred.is_empty();
     if ordered_body {
         eager = (0..lc.constants.len()).collect();
         deferred.clear();
@@ -8793,6 +8822,14 @@ fn emit_library_class_decl_inner(
     for &i in &deferred {
         body_requires.extend(resolve_all(&lc.constants[i].1, true));
     }
+    // Not every method body at load: only what an initializer reaches, or a body-only edge closes a cycle (devise.rb, url_helpers.rb).
+    if initializers_call_self {
+        for init in &lc.class_ivar_initializers {
+            let mut paths = BTreeSet::new();
+            walk_load_time_paths(init, lc, &mut BTreeSet::new(), &mut paths);
+            body_requires.extend(paths.iter().filter_map(|p| resolve(p, true)));
+        }
+    }
     // Not only the interleaved ones, which the split plan places: an ordered body writes the rest after its methods, where they read their constants as the body loads (devise's `@@helpers << Devise::Controllers::Helpers`).
     if ordered_body {
         for init in lc.class_ivar_initializers.iter().filter(|init| {
@@ -8803,6 +8840,31 @@ fn emit_library_class_decl_inner(
             body_requires.extend(paths.iter().filter_map(|p| resolve(p, true)));
         }
     }
+    // A subclass's file requires this one as it loads (its superclass): a method body naming the subclass
+    // (ApplicationController's `devise_controller?`, `is_a?(::DeviseController)`) requires it after the class, where
+    // the cycle finds this class defined.
+    let parents: HashMap<&str, &str> = classes
+        .iter()
+        .filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str(), p.0.as_str().trim_start_matches("::"))))
+        .chain(app.controllers.iter().filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str(), p.0.as_str().trim_start_matches("::")))))
+        .collect();
+    let descends = |class: &str| {
+        let mut cur = parents.get(class).copied();
+        for _ in 0..32 {
+            match cur {
+                Some(p) if p == name => return true,
+                Some(p) => cur = parents.get(p).copied(),
+                None => return false,
+            }
+        }
+        false
+    };
+    let subclass_requires: BTreeSet<String> = parents
+        .keys()
+        .filter(|class| **class != name && descends(class))
+        .filter_map(|class| resolve(&class.split("::").map(str::to_string).collect(), false))
+        .collect();
+    let mut tail_requires: BTreeSet<String> = BTreeSet::new();
     let factory_methods: Vec<&MethodDef> = lc
         .constants
         .iter()
@@ -8821,7 +8883,13 @@ fn emit_library_class_decl_inner(
             walk_load_time_paths_on(&m.body, lc, m.receiver, &mut BTreeSet::new(), &mut paths);
             body_requires.extend(paths.iter().filter_map(|p| resolve(p, true)));
         } else {
-            body_requires.extend(resolve_all(&m.body, false));
+            for r in resolve_all(&m.body, false) {
+                if subclass_requires.contains(&r) {
+                    tail_requires.insert(r);
+                } else {
+                    body_requires.insert(r);
+                }
+            }
         }
     }
     for m in factory_methods {
@@ -8891,6 +8959,7 @@ fn emit_library_class_decl_inner(
     }
     body_requires.retain(|r| !requires.contains(r));
     requires.extend(body_requires);
+    tail_requires.retain(|r| !requires.contains(r));
     for r in &requires {
         writeln!(s, "require_relative {r:?}").unwrap();
     }
@@ -9405,6 +9474,12 @@ fn emit_library_class_decl_inner(
     for i in (0..depth).rev() {
         writeln!(s, "{}end", "  ".repeat(i)).unwrap();
     }
+    if !tail_requires.is_empty() {
+        writeln!(s).unwrap();
+        for r in &tail_requires {
+            writeln!(s, "require_relative {r:?}").unwrap();
+        }
+    }
 
     EmittedFile { path: out_path, content: s }
 }
@@ -9755,6 +9830,9 @@ struct NameIndex {
     first_modules_bare: std::cell::OnceCell<HashMap<String, usize>>,
     constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
     file_constant_owners: std::cell::OnceCell<HashMap<String, String>>,
+    /// How each declared signature spelled its class names
+    /// (`app.rbs_spellings`), by `Owner#method`, for `rbs::type_name`.
+    written: HashMap<String, crate::rbs::Spellings>,
     source_ptr: usize,
     source_len: usize,
 }
@@ -9798,6 +9876,7 @@ impl NameIndex {
             first_modules_bare: std::cell::OnceCell::new(),
             constant_paths: std::cell::OnceCell::new(),
             file_constant_owners: std::cell::OnceCell::new(),
+            written: declared_spellings(app),
             source_ptr: classes.as_ptr() as usize,
             source_len: classes.len(),
         };
@@ -10408,6 +10487,31 @@ fn app_constant_paths(app: &App, classes: &[LibraryClass]) -> std::rc::Rc<crate:
         Some(index) => index.constant_paths.get_or_init(build).clone(),
         None => build(),
     }
+}
+
+/// How each declared method (`app.rbs_signatures`) spelled its class
+/// names, by `Owner#method`; empty where its reader recorded none.
+fn declared_spellings(app: &App) -> HashMap<String, crate::rbs::Spellings> {
+    let methods = app.rbs_signatures.iter().flat_map(|(owner, methods)| methods.keys().map(move |m| (owner, m)));
+    methods.map(|(owner, m)| {
+        let spelled = app.rbs_spellings.get(owner).and_then(|s| s.get(m)).cloned().unwrap_or_default();
+        (format!("{}#{}", owner.0.as_str(), m.as_str()), spelled)
+    }).collect()
+}
+
+/// For an RBS sidecar: how `owner`'s declared signature of `method`
+/// spelled its class names, from the installed index.
+pub(super) fn written_names(owner: &str, method: &str) -> Option<crate::rbs::Spellings> {
+    NAME_INDEX.with(|slot| slot.borrow().as_ref().and_then(|(_, index)| index.written.get(&format!("{owner}#{method}")).cloned()))
+}
+
+/// For an RBS sidecar: whether `path` is a model, controller or library
+/// class or module, the classes analysis resolves a written name against
+/// (`analyze::body::lexical_class`). False with no index installed.
+pub(super) fn registers(path: &str) -> bool {
+    NAME_INDEX.with(|slot| slot.borrow().as_ref().is_some_and(|(_, index)| {
+        index.models.contains(path) || index.controllers.contains(path) || index.library_classes.contains_key(path)
+    }))
 }
 
 /// Does the app declare the constant `path`, or a namespace enclosing a
@@ -11122,6 +11226,8 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
 /// alone, as is the primary key's.
 pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &App) {
     apply_enum_raw_input_lowering(lcs, app);
+    apply_string_keyed_attrs_lowering(lcs, app);
+    apply_dynamic_human_attribute_name(lcs, app);
     for model in &app.models {
         let table = app.schema.tables.get(&model.table.0);
         let mut casts: HashMap<Symbol, &'static str> = table
@@ -11240,6 +11346,85 @@ pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &A
 /// `<enum>_before_type_cast` answers what was assigned until the record
 /// saves or loads, and the stored value after (activerecord 8.1.4). Only
 /// for the enum columns the app reads it on.
+/// Ruby-family pre-emit pass: `Model.new(attrs)` reads `attrs[:col]`, and Rails' `new` takes a String-keyed Hash as
+/// well (`assign_attributes` stringifies the keys): Devise's `resource_class.new(sign_in_params)` hands one. Strict
+/// targets type the parameter as Symbol-keyed and are not rewritten.
+fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
+    let var = |name: &str| sp_expr(ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) });
+    let send = |recv: Expr, method: &str, args: Vec<Expr>, block: Option<Expr>| {
+        sp_expr(ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block, parenthesized: true })
+    };
+    let block = |params: &[&str], body: Expr| {
+        sp_expr(ExprNode::Lambda {
+            params: params.iter().map(|p| Symbol::from(*p)).collect(),
+            rest_param: None,
+            extra_params: Vec::new(),
+            block_param: None,
+            body,
+            block_style: crate::expr::BlockStyle::Brace,
+        })
+    };
+    for model in &app.models {
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        let Some(init) = lc.methods.iter_mut().find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize") else { continue };
+        if init.params.first().is_none_or(|p| p.name.as_str() != "attrs") {
+            continue;
+        }
+        // Not a runtime helper: a tree that loads its models without the boot (a framework test) has none, and this
+        // reads nothing of a typed params object, nor allocates for the empty Hash a bare record is built from.
+        // `attrs = attrs.to_h { |k, v| [k.to_s.to_sym, v] } if attrs.is_a?(Hash) && attrs.any? { |k, _| k.is_a?(String) }`
+        let string_key = send(var("k"), "is_a?", vec![sp_expr(ExprNode::Const { path: vec![Symbol::from("String")] })], None);
+        let cond = sp_expr(ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::And,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left: send(var("attrs"), "is_a?", vec![sp_expr(ExprNode::Const { path: vec![Symbol::from("Hash")] })], None),
+            right: send(var("attrs"), "any?", Vec::new(), Some(block(&["k", "_"], string_key))),
+        });
+        let pair = sp_expr(ExprNode::Array {
+            elements: vec![send(send(var("k"), "to_s", Vec::new(), None), "to_sym", Vec::new(), None), var("v")],
+            style: Default::default(),
+        });
+        let symbolized = send(var("attrs"), "to_h", Vec::new(), Some(block(&["k", "v"], pair)));
+        let assign = sp_expr(ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from("attrs") }, value: symbolized });
+        let guarded = sp_expr(ExprNode::If { cond, then_branch: assign, else_branch: sp_expr(ExprNode::Lit { value: Literal::Nil }) });
+        let body = std::mem::replace(&mut init.body, sp_expr(ExprNode::Lit { value: Literal::Nil }));
+        init.body = match *body.node {
+            ExprNode::Seq { mut exprs } => {
+                exprs.insert(0, guarded);
+                sp_expr(ExprNode::Seq { exprs })
+            }
+            other => sp_expr(ExprNode::Seq { exprs: vec![guarded, Expr::new(body.span, other)] }),
+        };
+    }
+}
+
+/// Ruby-family pre-emit pass: `Model.human_attribute_name(attr)` of an attribute only known when it runs (Devise's
+/// `scope_class.human_attribute_name(key)`) answers the locale's name for it, as Rails does. `lower::
+/// human_attribute_name` folds a literal attribute; the runtime's ActiveRecord::Base answer humanizes, which is
+/// Rails' too where the locale names no attribute, so only a model whose locale names one gets its own.
+fn apply_dynamic_human_attribute_name(lcs: &mut [LibraryClass], app: &App) {
+    for model in &app.models {
+        let names = model.i18n.translated_attribute_names();
+        if names.is_empty() {
+            continue;
+        }
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "human_attribute_name") {
+            continue;
+        }
+        let arms: String = names.iter().map(|(attr, name)| format!("    when {attr:?} then {name:?}\n")).collect();
+        let src = format!(
+            "def self.human_attribute_name(attr, options = {{}})\n  case attr.to_s\n{arms}  else ActiveSupport.humanize(attr.to_s.tr(\".\", \"_\"))\n  end\nend\n"
+        );
+        let Ok(mut methods) = crate::runtime_src::parse_methods(&src) else { continue };
+        for m in &mut methods {
+            m.receiver = MethodReceiver::Class;
+            m.enclosing_class = Some(model.name.0.clone());
+        }
+        lc.methods.extend(methods);
+    }
+}
+
 fn apply_enum_raw_input_lowering(lcs: &mut [LibraryClass], app: &App) {
     let demanded = crate::analyze::raw_input_columns(app);
     if demanded.is_empty() {

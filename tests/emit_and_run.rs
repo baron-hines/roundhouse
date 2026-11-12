@@ -14,6 +14,9 @@ mod data_record_siblings;
 mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/native_http.rs"]
+#[allow(dead_code)]
+mod native_http;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
 #[path = "emit_and_run/controller_content_type_writer.rs"]
@@ -22,6 +25,8 @@ mod controller_content_type_writer;
 mod time_change_usec_contract;
 #[path = "emit_and_run/time_change_usec.rs"]
 mod time_change_usec;
+#[path = "emit_and_run/controller_constant_rooting.rs"]
+mod controller_constant_rooting;
 #[path = "emit_and_run/rate_limits.rs"]
 mod rate_limits;
 #[path = "emit_and_run/config_for.rs"]
@@ -152,6 +157,10 @@ mod constant_branches;
 mod defined_method_query;
 #[path = "emit_and_run/metal_subclass.rs"]
 mod metal_subclass;
+#[path = "emit_and_run/association_reflection.rs"]
+mod association_reflection;
+#[path = "emit_and_run/human_attribute_name_dynamic.rs"]
+mod human_attribute_name_dynamic;
 #[path = "emit_and_run/boot_with_options.rs"]
 mod boot_with_options;
 #[path = "support/class_param_or_assign.rs"]
@@ -415,6 +424,10 @@ mod class_side_default;
 mod hash_write_through_reader_contract;
 #[path = "emit_and_run/hash_write_through_reader.rs"]
 mod hash_write_through_reader;
+#[path = "support/app_class_registry.rs"]
+mod app_class_registry_contract;
+#[path = "emit_and_run/app_class_registry.rs"]
+mod app_class_registry;
 #[path = "emit_and_run/helper_anonymous_rest.rs"]
 mod helper_anonymous_rest;
 #[path = "emit_and_run/controller_response_body.rs"]
@@ -22143,3 +22156,15 @@ mod array_grep_extract_options;
 mod load_time_string_definer;
 #[path = "emit_and_run/mime_extension_lookup.rs"]
 mod mime_extension_lookup;
+#[path = "emit_and_run/self_class_argument.rs"]
+mod self_class_argument;
+#[path = "emit_and_run/form_for_record.rs"]
+mod form_for_record;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "emit_and_run/library_concern_included_include.rs"]
+mod library_concern_included_include;
+#[path = "emit_and_run/param_default_constant_rooting.rs"]
+mod param_default_constant_rooting;
+#[path = "emit_and_run/serializable_resource_as_json.rs"]
+mod serializable_resource_as_json;

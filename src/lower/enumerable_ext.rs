@@ -162,6 +162,19 @@ pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
         *parenthesized = true;
         return true;
     }
+    // ActiveSupport's `Hash#assert_valid_keys(*keys)`: the keys as one list.
+    if method.as_str() == "assert_valid_keys" && block.is_none() && args.iter().all(|a| !matches!(&*a.node, ExprNode::Splat { .. })) {
+        let Some(receiver) = recv.as_ref() else { return false };
+        if !matches!(receiver.ty.as_ref(), Some(Ty::Hash { .. })) {
+            return false;
+        }
+        let receiver = recv.take().expect("checked above");
+        let keys = Expr::new(span, ExprNode::Array { elements: std::mem::take(args), style: Default::default() });
+        *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+        *args = vec![receiver, keys];
+        *parenthesized = true;
+        return true;
+    }
     if method.as_str() == "pluck" && block.is_none() {
         if ground_indexed_pluck(expr) {
             return true;
