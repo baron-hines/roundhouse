@@ -182,6 +182,9 @@ fn super_and_an_override_of_the_gems_api_are_refused() {
     for (serializer, needle) in [
         ("class ArticleSerializer < ActiveModel::Serializer\n  attributes :id, :title\n\n  def title\n    super.upcase\n  end\nend\n", "`super` reaches the gem's class"),
         ("class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n\n  def attributes(*args)\n    super.merge(extra: 1)\n  end\nend\n", "`def attributes` overrides the gem's"),
+        // The gem's `initialize` assigns the scope through `scope=`: a serializer's own setter runs there
+        // (`{"scoped":"BOB"}` for `scope: "bob"`), and the synthesized one would replace it.
+        ("class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\n\n  def scope=(value)\n    @scope = value.upcase\n  end\nend\n", "`def scope=` overrides the gem's"),
         ("class ArticleSerializer < ActiveModel::Serializer\n  attribute(:x) { defined?(super) ? 1 : 2 }\nend\n", "`super` reaches the gem's class"),
     ] {
         survey::activate();
