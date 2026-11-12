@@ -112,6 +112,11 @@ class SafeString < String
   def to_s
     self
   end
+
+  # Rails' `SafeBuffer#+`: still safe, the other side escaped unless it is safe too (a builder's `label + text_field`).
+  def +(other)
+    SafeString.new(String.new(self) + ActionView::ViewHelpers.html_escape(other))
+  end
 end
 
 class String

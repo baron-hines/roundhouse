@@ -535,6 +535,8 @@ fn transpile(
             roundhouse::diagnostic::DiagnosticKind::Unsupported {
                 construct, detail, ..
             } if construct.as_str() == "constant" => !external_roots.names_any(detail),
+            // Not this tree's: its overlay carries Rails' FormBuilder, which runs a builder class's own methods.
+            roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "custom form builder method" => false,
             // Not this tree's: it runs the gem file's statements in the file's program (`ingest::gem_load_program`).
             roundhouse::diagnostic::DiagnosticKind::Unsupported {
                 target: Some(only), construct, ..

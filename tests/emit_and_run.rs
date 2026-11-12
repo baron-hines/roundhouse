@@ -22156,6 +22156,8 @@ mod loaded_begin;
 mod class_eval_definer_call;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
 mod classvar_block_initializers;
+#[path = "emit_and_run/custom_form_builder.rs"]
+mod custom_form_builder;
 #[path = "emit_and_run/model_mixin_macro.rs"]
 mod model_mixin_macro;
 #[path = "emit_and_run/controller_append_callbacks.rs"]
