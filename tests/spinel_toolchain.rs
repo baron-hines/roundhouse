@@ -206,6 +206,10 @@ mod class_side_default;
 mod hash_write_through_reader_contract;
 #[path = "spinel_toolchain/hash_write_through_reader.rs"]
 mod hash_write_through_reader;
+#[path = "support/app_class_registry.rs"]
+mod app_class_registry_contract;
+#[path = "spinel_toolchain/app_class_registry.rs"]
+mod app_class_registry;
 #[path = "spinel_toolchain/action_text_sanitize.rs"]
 mod action_text_sanitize;
 #[path = "support/campfire_caches.rs"]
@@ -324,6 +328,10 @@ mod file_level_struct;
 mod concern_class_side_contract;
 #[path = "spinel_toolchain/concern_class_side.rs"]
 mod concern_class_side;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "spinel_toolchain/library_concern_included_include.rs"]
+mod library_concern_included_include;
 #[path = "support/concern_define_loop.rs"]
 mod concern_define_loop_contract;
 #[path = "spinel_toolchain/concern_define_loop.rs"]

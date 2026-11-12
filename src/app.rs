@@ -434,6 +434,10 @@ pub struct App {
     /// their instance methods are class-method macros on every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_extended_macros: Vec<ClassId>,
+    /// Constants written on ActiveRecord::Base inside `ActiveSupport.on_load(:active_record)` (`self::X = Const`,
+    /// orm_adapter's `self::OrmAdapter = ::OrmAdapter::ActiveRecord`): the name and the constant path it holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_constants: Vec<(Symbol, Vec<Symbol>)>,
     /// Class methods a model took from a module only it extends
     /// (`ingest::extend_splice`), by name.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
@@ -1353,6 +1357,7 @@ impl App {
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             load_hook_extended_macros: Vec::new(),
+            load_hook_constants: Vec::new(),
             macro_includes: Vec::new(),
             expanded_macro_calls: Vec::new(),
             spliced_class_methods: Default::default(),

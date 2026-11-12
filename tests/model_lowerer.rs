@@ -183,6 +183,9 @@ fn article_lowers_with_schema_methods() {
         "_hydrate_all",
         // #818: class-side name table for `reflect_on_association`.
         "_association_names",
+        "_association_macros",
+        "_association_foreign_keys",
+        "_association_polymorphic",
         "schema_column_types",
     ];
     for m in &lc.methods {

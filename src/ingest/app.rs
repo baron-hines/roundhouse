@@ -3231,6 +3231,7 @@ end
     super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops);
     super::gem_routes::expand(vfs, dir, &path_gems, &mut app);
     super::class_macros::drop_expanded_hook_macros(&mut app, &hook_macros_called, &mentions);
+    super::extend_splice::splice_load_hook_extended_calls(&mut app);
     super::model_callbacks::expand_model_callbacks(&mut app);
     // After the macros: an expanded `has_ancestry` is what writes the `extend`.
     super::extend_splice::splice_sole_extended_modules(&mut app);
@@ -3539,7 +3540,7 @@ fn report_unmodelled_records(app: &App) {
     }
 }
 
-const APP_REQUIRABLE_STDLIB: &[&str] = &[
+pub(crate) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "base64", "benchmark", "bigdecimal", "cgi", "csv", "date", "delegate", "digest",
     "digest/md5", "digest/sha1", "digest/sha2", "English", "erb", "etc", "fileutils", "find",
     "forwardable", "io/console", "io/nonblock", "io/wait", "ipaddr", "json", "logger",

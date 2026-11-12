@@ -1240,6 +1240,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         if name == "primary_abstract_class" {
             continue;
         }
+        // `self.abstract_class = true|false` — the older spelling of the
+        // same marker, read in order by `markers::is_abstract_class`.
+        if name == "abstract_class=" && self::markers::is_literal_abstract_class_write(expr) {
+            continue;
+        }
         // `include Notifications` — a model concern, spliced by the
         // analyzer (`model_includes` + `concern_model_items`) into the
         // includer's registry and lowered with its methods; nothing is
@@ -3272,7 +3277,10 @@ fn type_method_body(
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
     }
-    if let Some(enclosing) = &method.enclosing_class {
+    // Not the module a method was written in when it runs in the model: an included or extended module's method
+    // (Devise's `serialize_from_session`) has the model as `self`, and the module answers none of the model's methods.
+    let enclosing = method.enclosing_class.as_ref().filter(|e| model.is_none_or(|m| m.name.0 == **e));
+    if let Some(enclosing) = enclosing {
         ctx.self_ty = Some(Ty::Class {
             id: ClassId(enclosing.clone()),
             args: vec![].into(),
