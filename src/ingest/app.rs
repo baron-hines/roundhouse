@@ -5173,6 +5173,10 @@ fn splice_concerns_into_controllers(app: &mut App) {
                     }) else {
                         continue;
                     };
+                    // Not a winner that forwards anonymously (`def f(...)`, `def f(**)`): its `super` passes what no name holds.
+                    if winner.anonymous_formal.is_some() {
+                        continue;
+                    }
                     // A distinct name per level, so each shadowed definition keeps its own `super`.
                     let Some(target) = (1..64)
                         .map(|depth| crate::ident::Symbol::from(format!("__super{}_{}", if depth == 1 { String::new() } else { depth.to_string() }, method.name.as_str())))
