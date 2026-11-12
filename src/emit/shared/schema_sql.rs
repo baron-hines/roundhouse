@@ -283,7 +283,7 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
         writeln!(s, "CREATE TABLE IF NOT EXISTS {} (", dialect.ident(table.name.as_str())).unwrap();
         let mut lines: Vec<String> = Vec::new();
         for col in &table.columns {
-            if col.primary_key {
+            if col.primary_key && table.primary_key_columns.is_empty() {
                 lines.push(dialect.key_column(col));
                 continue;
             }
@@ -313,22 +313,35 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
             }
             lines.push(line);
         }
+        if !table.primary_key_columns.is_empty() {
+            let keys = table.primary_key_columns.iter().map(|c| dialect.ident(c.as_str())).collect::<Vec<_>>().join(", ");
+            lines.push(format!("  PRIMARY KEY ({keys})"));
+        }
         // Not on PostgreSQL yet: Rails adds its constraints with ALTER TABLE, and the fixture loader there must disable triggers to load out of order.
         if dialect == Dialect::Sqlite {
             for fk in &table.foreign_keys {
                 if !schema.tables.contains_key(&fk.to_table.0) {
                     continue;
                 }
+                if fk.from_columns.is_empty() || fk.from_columns.len() != fk.to_columns.len() {
+                    return Err(format!("foreign key on {} requires equally sized nonempty column lists", table.name));
+                }
                 let mut line = format!(
                     "  FOREIGN KEY ({}) REFERENCES {} ({})",
-                    dialect.ident(fk.from_column.as_str()),
+                    fk.from_columns.iter().map(|c| dialect.ident(c.as_str())).collect::<Vec<_>>().join(", "),
                     dialect.ident(fk.to_table.0.as_str()),
-                    dialect.ident(fk.to_column.as_str())
+                    fk.to_columns.iter().map(|c| dialect.ident(c.as_str())).collect::<Vec<_>>().join(", ")
                 );
                 for (verb, action) in [("DELETE", &fk.on_delete), ("UPDATE", &fk.on_update)] {
                     if let Some(sql) = referential_action_sql(action) {
                         line.push_str(&format!(" ON {verb} {sql}"));
                     }
+                }
+                if let Some(timing) = fk.deferrable {
+                    line.push_str(match timing {
+                        crate::schema::Deferrable::Immediate => " DEFERRABLE INITIALLY IMMEDIATE",
+                        crate::schema::Deferrable::Deferred => " DEFERRABLE INITIALLY DEFERRED",
+                    });
                 }
                 lines.push(line);
             }

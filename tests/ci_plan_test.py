@@ -1148,6 +1148,25 @@ class Routing(unittest.TestCase):
                 self.assertIn("schema_default_expressions", plan["spinel_tests"])
                 self.assertIn("spinel-framework", plan["jobs"])
 
+    def test_schema_keys_owns_declarations_and_consumers(self):
+        for path in [
+            "tests/schema_keys.rs", "tests/support/schema_keys_schema.rb", "tests/support/schema_keys_contract.rb",
+            "tests/support/schema_keys_implicit.rb", "tests/support/schema_keys_implicit_contract.rb",
+            "src/schema.rs", "src/ingest/schema.rs", "src/emit/shared/schema_sql.rs", "src/emit/roda.rs",
+            "src/ingest/sequel_model.rs", "src/analyze/graphql.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("schema_keys", plan["spinel_tests"])
+                self.assertIn("spinel-framework", plan["jobs"])
+
+    def test_schema_key_readers_select_the_native_contract(self):
+        for path in ["src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs", "src/ingest/roda_app.rs"]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("schema_keys", plan["spinel_tests"])
+                self.assertIn("spinel-framework", plan["jobs"])
+
     def test_jdbc_probes_select_the_existing_comparison_without_archives(self):
         for path, native_jobs, suites in [
             ("tests/support/jdbc_cleanup_failures.rb", set(), []),

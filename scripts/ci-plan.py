@@ -109,6 +109,7 @@ SPINEL_TESTS = [
     "spinel_db_contract",
     "generated_columns_spinel",
     "schema_constraints",
+    "schema_keys",
     "schema_default_expressions",
     "postgres_json_types_spinel",
     "array_column_storage_spinel",
@@ -653,6 +654,12 @@ def native_coverage(path):
         "src/lower/model_to_library/schema.rs", "src/session.rs", "src/project.rs",
     } or path.startswith("tests/support/schema_defaults_"):
         suites.add("schema_default_expressions")
+    if path in {
+        "tests/schema_keys.rs", "src/schema.rs", "src/ingest/schema.rs", "src/emit/shared/schema_sql.rs",
+        "src/emit/roda.rs", "src/ingest/sequel_model.rs", "src/analyze/graphql.rs",
+        "src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs", "src/ingest/roda_app.rs",
+    } or path.startswith("tests/support/schema_keys_"):
+        suites.add("schema_keys")
     if path in JSON_TYPES_SPINEL_INPUTS:
         suites.add("postgres_json_types_spinel")
     if path in APP_REOPENS_INPUTS:
