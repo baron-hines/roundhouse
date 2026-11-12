@@ -1315,9 +1315,16 @@ impl<'a> BodyTyper<'a> {
                 _ => self.constant_predicate_parts(right, ctx, evaluated),
             };
         }
-        let answer = self.constant_predicate_leaf(cond, ctx)?;
+        // `if unlockable?(resource)`: a predicate of the class's own whose body is a condition over what it is passed.
+        self.constant_predicates?;
+        let mut body_runs = false;
+        let answer = match self.inlined_predicate(cond, ctx, &mut body_runs) {
+            Some(answer) => answer,
+            None => self.constant_predicate_leaf(cond, ctx)?,
+        };
         let plain = |e: &Expr| matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef | ExprNode::Lit { .. } | ExprNode::Const { .. });
-        if !matches!(&*cond.node, ExprNode::Send { recv, args, .. } if recv.as_ref().is_none_or(|r| plain(r)) && args.iter().all(plain)) {
+        // Nor a predicate whose own body runs code (`fetch_resource.respond_to?(:missing)`): the call is what runs it.
+        if body_runs || !matches!(&*cond.node, ExprNode::Send { recv, args, .. } if recv.as_ref().is_none_or(|r| plain(r)) && args.iter().all(plain)) {
             evaluated.push(cond.clone());
         }
         Some(answer)
@@ -1325,10 +1332,6 @@ impl<'a> BodyTyper<'a> {
 
     fn constant_predicate_leaf(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
         let predicates = self.constant_predicates?;
-        // `if unlockable?(resource)`: a predicate of the class's own whose body is a condition over what it is passed.
-        if let Some(answer) = self.inlined_predicate(cond, ctx) {
-            return Some(answer);
-        }
         let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *cond.node else { return None };
         // `resource.respond_to?(:unlock_access!)` on a model that is not `:lockable`: nothing in its chain answers it.
         if method.as_str() == "respond_to?"
@@ -1421,7 +1424,7 @@ impl<'a> BodyTyper<'a> {
 
     /// `m(a, b)`, receiverless, where `m` is the one definition of the name in the class's chain, takes exactly those
     /// positional parameters and is one condition over them: that condition, with what is passed written in.
-    fn inlined_predicate(&self, cond: &Expr, ctx: &Ctx) -> Option<bool> {
+    fn inlined_predicate(&self, cond: &Expr, ctx: &Ctx, body_runs: &mut bool) -> Option<bool> {
         thread_local! { static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*cond.node else { return None };
         if args.is_empty() || ctx.class_side || DEPTH.with(|d| d.get()) > 4 {
@@ -1445,8 +1448,10 @@ impl<'a> BodyTyper<'a> {
             _ => None,
         });
         DEPTH.with(|d| d.set(d.get() + 1));
-        let answer = self.constant_predicate(&mut written, ctx);
+        let mut inner = Vec::new();
+        let answer = self.constant_predicate_parts(&mut written, ctx, &mut inner);
         DEPTH.with(|d| d.set(d.get() - 1));
+        *body_runs = !inner.is_empty();
         answer
     }
 
