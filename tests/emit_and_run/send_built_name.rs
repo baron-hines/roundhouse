@@ -56,10 +56,10 @@ fn a_send_of_a_built_name_calls_the_classs_method_of_that_shape_on_spinel() {
     assert!(run.stdout.contains("bells passed"), "{}", run.stdout);
 }
 
-/// A module a model includes is not rewritten: the model may add a method of that shape (`_extra`),
-/// which the module's `send` reaches and an arm list read from the module alone would miss.
+/// A module only models include answers its `send` over its includers' methods too: the model adds a method of
+/// that shape (`_extra`), which the module's `send` reaches and an arm list read from the module alone would miss.
 #[test]
-fn a_module_a_model_includes_keeps_its_send() {
+fn a_module_a_model_includes_sends_over_its_includers_methods() {
     let (tree, errors) = emit_and_run::real_blog()
         .write("app/models/chimes.rb", "module Chimes\n  def chime(kind)\n    send(\"_#{kind}\")\n  end\n\n  def _soft\n    \"soft\"\n  end\nend\n")
         .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  include Chimes\n\n  def _extra\n    \"extra\"\n  end\n")
@@ -71,7 +71,8 @@ fn a_module_a_model_includes_keeps_its_send() {
             found = text;
         }
     }
-    assert!(found.contains("send(\"_#{kind}\")"), "{found}\n{errors:#?}");
+    assert!(found.contains("when \"extra\"") && found.contains("_extra"), "{found}\n{errors:#?}");
+    assert!(found.contains("when \"soft\"") && found.contains("_soft"), "{found}\n{errors:#?}");
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
