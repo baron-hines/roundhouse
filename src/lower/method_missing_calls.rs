@@ -83,6 +83,17 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
             rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers);
         }
     }
+    // A block a class-body call hands over (`uid do request.params[options.uid_field] end`, replayed and instance_eval'd
+    // on an instance): its receiverless reads are the instance's methods, typed by what the class answers for them.
+    for lc in &mut app.library_classes {
+        let owner = lc.name.clone();
+        let Some(info) = registry.get(&owner) else { continue };
+        for call in &mut lc.unknown_calls {
+            let ExprNode::Send { block: Some(block), .. } = &mut *call.node else { continue };
+            let ExprNode::Lambda { body, .. } = &mut *block.node else { continue };
+            body_reads(body, info, &answers_missing, &core_of, &module_answers, registry);
+        }
+    }
     // Every other body reaches such a class through a receiver (`auth.provider` on OmniAuth's AuthHash in a model).
     let nobody = ClassId(Symbol::from(""));
     crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], true, registry, &answers_missing, &core_of, &module_answers));
@@ -140,5 +151,37 @@ fn rewrite(
     args.insert(0, name);
     *method = Symbol::from("method_missing");
     // Not the source's bare `auth.provider`: an argument written without parens does not parse inside another call's.
+    *parenthesized = true;
+}
+
+fn body_reads(
+    e: &mut Expr,
+    info: &crate::analyze::ClassInfo,
+    answers_missing: &dyn Fn(&ClassId) -> bool,
+    core_of: &dyn Fn(&ClassId) -> &'static [&'static str],
+    module_answers: &dyn Fn(&ClassId, &str) -> bool,
+    registry: &HashMap<ClassId, crate::analyze::ClassInfo>,
+) {
+    e.node.for_each_child_mut(&mut |c| body_reads(c, info, answers_missing, core_of, module_answers, registry));
+    let ExprNode::Send { recv: Some(r), method, args, parenthesized, .. } = &mut *e.node else { return };
+    let ExprNode::Send { recv: None, method: reader, args: reader_args, block: None, .. } = &*r.node else { return };
+    if !reader_args.is_empty() || method.as_str() == "method_missing" || method.as_str() == "new" {
+        return;
+    }
+    let held = match info.instance_methods.get(reader) {
+        Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+        Some(t) => t.clone(),
+        None => return,
+    };
+    let Ty::Class { id, .. } = held.peel_nilable() else { return };
+    if !answers_missing(id) || core_of(id).contains(&method.as_str()) || module_answers(id, method.as_str()) {
+        return;
+    }
+    if crate::analyze::diagnostics::method_registered_on(registry, Some(&Ty::Class { id: id.clone(), args: vec![].into() }), method) {
+        return;
+    }
+    let name = Expr::new(e.span, ExprNode::Lit { value: Literal::Sym { value: method.clone() } });
+    args.insert(0, name);
+    *method = Symbol::from("method_missing");
     *parenthesized = true;
 }
