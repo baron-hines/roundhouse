@@ -550,7 +550,7 @@ def native_coverage(path):
         suites.add("framework_tests_spinel")
     if path in {"runtime/ruby/active_support_ext.rb", "src/lower/blank.rs", "src/lower/mod.rs", "src/lower/jbuilder_to_library/mod.rs"}:
         suites.add("object_blank")
-    if path in {"runtime/ruby/active_support_ext.rb", "src/lower/symbolize_keys.rs"}:
+    if path in {"runtime/ruby/active_support_ext.rb", "src/lower/symbolize_keys.rs", "src/lower/config_reader.rs", "src/lower/mod.rs"}:
         suites.add("untyped_key_conversion")
     # `Model.transaction` (rollback, nesting, savepoints) lives here; its
     # gate compiles it with the real_blog fixture.

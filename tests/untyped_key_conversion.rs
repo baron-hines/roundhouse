@@ -38,10 +38,30 @@ const KEY_SOURCE: &str = r#"class KeySource
     { "name" => "custom" }
   end
 end
+
+class BareKeySource < BasicObject
+  def symbolize_keys
+    { name: "bare" }
+  end
+
+  def stringify_keys
+    { "name" => "bare" }
+  end
+end
+"#;
+
+/// A class whose own `Hash` names something else: the guard's `Hash` is the top-level one.
+const SHADOWED: &str = r#"class ShadowedOptions
+  Hash = String
+
+  def self.symbolized(saved)
+    { note: nil }.merge(saved.symbolize_keys)
+  end
+end
 "#;
 
 const CASES: &str = r##"
-[{ "name" => "first" }, { name: "second" }, {}, KeySource.new, nil].each do |value|
+[{ "name" => "first" }, { name: "second" }, {}, KeySource.new, BareKeySource.new, nil].each do |value|
   begin
     fields = SavedOptions.symbolized(value)
     puts "#{fields.keys.map(&:inspect).join(",")}=#{fields[:name]}"
@@ -57,6 +77,7 @@ const CASES: &str = r##"
 end
 puts SavedOptions.new({ "name" => "first" }).symbolized.keys.map(&:inspect).join(",")
 puts SavedOptions.new(KeySource.new).symbolized[:name]
+puts ShadowedOptions.symbolized({ "name" => "first" }).keys.map(&:inspect).join(",")
 "##;
 
 const EXPECTED: &str = ":note,:name=first
@@ -67,16 +88,20 @@ note,name=second
 note=
 :note,:name=custom
 note,name=custom
+:note,:name=bare
+note,name=bare
 undefined method 'symbolize_keys' for nil
 undefined method 'stringify_keys' for nil
 :name
 custom
+:note,:name
 ";
 
 fn overlay() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("app/models/saved_options.rb", OPTIONS)
         .write("app/models/key_source.rb", KEY_SOURCE)
+        .write("app/models/shadowed_options.rb", SHADOWED)
 }
 
 #[test]
@@ -89,7 +114,7 @@ fn rails_key_conversion_oracle() {
            exit 77\n\
          end\n\
          RailsOracle.activate(\"activesupport\")\n\
-         require 'active_support/core_ext/hash/keys'\n{OPTIONS}\n{KEY_SOURCE}\n{CASES}"
+         require 'active_support/core_ext/hash/keys'\n{OPTIONS}\n{KEY_SOURCE}\n{SHADOWED}\n{CASES}"
     );
     let output = std::process::Command::new("ruby").args(["-e", &script]).output().expect("Rails oracle");
     if output.status.code() == Some(77) {
@@ -108,9 +133,9 @@ fn emitted_conversions_match_rails() {
     let source = std::fs::read_to_string(run.emitted.join("app/models/saved_options.rb")).unwrap();
     let source = source.split_whitespace().collect::<Vec<_>>().join(" ");
     for guarded in [
-        "merge(if saved.instance_of?(Hash) ActiveSupport.symbolize_keys(saved) else saved.symbolize_keys end)",
-        "merge(if saved.instance_of?(Hash) ActiveSupport.stringify_keys(saved) else saved.stringify_keys end)",
-        "if @saved.instance_of?(Hash) ActiveSupport.symbolize_keys(@saved) else @saved.symbolize_keys end",
+        "merge(if ::Hash === saved && saved.instance_of?(::Hash) ActiveSupport.symbolize_keys(saved) else saved.symbolize_keys end)",
+        "merge(if ::Hash === saved && saved.instance_of?(::Hash) ActiveSupport.stringify_keys(saved) else saved.stringify_keys end)",
+        "if ::Hash === @saved && @saved.instance_of?(::Hash) ActiveSupport.symbolize_keys(@saved) else @saved.symbolize_keys end",
     ] {
         assert!(source.contains(guarded), "{guarded}\n{source}");
     }
@@ -152,6 +177,16 @@ end
     }
 }
 
+/// The guard calls helpers only the Ruby family and Spinel ship, so a
+/// target without them keeps the call as written.
+#[test]
+fn targets_without_the_helpers_keep_the_call() {
+    let (tree, _) = overlay().emit(BuildTarget::Typescript);
+    let emitted = std::fs::read_to_string(tree.join("app/models/saved_options.ts")).unwrap();
+    assert!(!emitted.contains("instance_of") && !emitted.contains("==="), "{emitted}");
+    assert!(emitted.contains("saved.symbolize_keys"), "{emitted}");
+}
+
 /// Only the probe and the runtime file it calls, built with the
 /// generated signatures as emitted.
 #[test]
@@ -161,13 +196,16 @@ fn native_conversions_match_rails_with_generated_signatures() {
     assert!(errors.is_empty(), "{errors:?}");
     let signatures = std::fs::read_to_string(tree.join("app/models/saved_options.rbs")).unwrap();
     assert!(signatures.contains("def self.symbolized: (untyped saved)"), "{signatures}");
-    std::fs::write(
-        tree.join("contract.rb"),
-        format!(
-            "require_relative \"runtime/active_support_ext\"\nrequire_relative \"app/models/key_source\"\nrequire_relative \"app/models/saved_options\"\n{CASES}"
-        ),
-    )
-    .unwrap();
+    // The emitter writes one file per class.
+    let mut models: Vec<String> = std::fs::read_dir(tree.join("app/models"))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".rb").map(str::to_string))
+        .collect();
+    models.sort();
+    let requires: String = models.iter().map(|m| format!("require_relative \"app/models/{m}\"\n")).collect();
+    std::fs::write(tree.join("contract.rb"), format!("require_relative \"runtime/active_support_ext\"\n{requires}{CASES}"))
+        .unwrap();
     let spinel = std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into());
     // The app's signatures alone, then every emitted sidecar, as the shipped Makefile builds.
     for signatures in ["app/models", "."] {
