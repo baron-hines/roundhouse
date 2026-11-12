@@ -420,9 +420,9 @@ fn parameters_on_hash(expr: &mut Expr) -> bool {
             expr.ty = ty;
             true
         }
-        ("fetch" | "key?" | "has_key?", [key, ..])
-            if matches!(&*r.node, ExprNode::Var { .. })
-                && let ExprNode::Lit { value: Literal::Sym { value } } = &*key.node =>
+        // Any other receiver of Parameters (Warden's `params_auth_hash[:remember_me]`) holds the request's String keys.
+        ("[]" | "delete" | "fetch" | "key?" | "has_key?", [key, ..])
+            if let ExprNode::Lit { value: Literal::Sym { value } } = &*key.node =>
         {
             let mut text = Expr::new(key.span, ExprNode::Lit { value: Literal::Str { value: value.as_str().to_string() } });
             text.ty = Some(Ty::Str);
