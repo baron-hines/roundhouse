@@ -1457,6 +1457,7 @@ def main():
     parser.add_argument("--units")
     parser.add_argument("--kind", choices=SPINEL_TIMING_KINDS)
     parser.add_argument("--name")
+    parser.add_argument("--charged", type=float, default=0)
     parser.add_argument("--parallel", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--previous")
     parser.add_argument("--records")
@@ -1473,7 +1474,7 @@ def main():
         return False
     if args.command == "timed":
         # The command's own status: the framework loop tells timeout(1)'s 124 from a failure.
-        return run_timed(args.kind, args.name, command)
+        return run_timed(args.kind, args.name, command, args.charged)
     if args.command == "run-tests":
         tests = [line.strip() for line in sys.stdin if line.strip()]
         return run_tests(args.kind, tests, args.parallel, command)
