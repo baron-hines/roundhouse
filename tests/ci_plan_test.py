@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -1825,6 +1826,26 @@ class Results(unittest.TestCase):
                     )
                     records = [json.loads(line) for line in out.read_text().splitlines()]
                     self.assertEqual({r["name"]: r["seconds"] for r in records}, expected)
+
+    def test_run_tests_stops_at_the_deadline_with_the_tests_children_and_records_a_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "records.jsonl"
+            child = Path(tmp) / "child.pid"
+            env = {**os.environ, "CI_SPINEL_TIMINGS_OUT": str(out), "CI_SPINEL_DEADLINE": str(int(time.time()) + 2)}
+            start = time.monotonic()
+            run = subprocess.run(
+                ["python3", spec.origin, "run-tests", "--kind", "toolchain", "--parallel", "1",
+                 "--", "sh", "-c", f'sleep 60 & echo $! > {child}; wait', "sh"],
+                input="slow\nlate\n", capture_output=True, text=True, env=env,
+            )
+            self.assertLess(time.monotonic() - start, 30, run)
+            self.assertEqual(run.returncode, 1, run)
+            self.assertIn("::error::slow stopped at this shard's deadline", run.stdout)
+            self.assertIn("::error::late not started: past this shard's deadline", run.stdout)
+            records = [json.loads(line) for line in out.read_text().splitlines()]
+            self.assertEqual([(r["name"], r.get("timed_out")) for r in records], [("slow", True)])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(child.read_text()), 0)
 
     def test_merge_averages_passing_records_into_the_last_seconds(self):
         merged = ci.merge_timings(

@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -1155,9 +1156,29 @@ def record_timing(kind, name, seconds, ok, timed_out=False):
             f.write(json.dumps(record) + "\n")
 
 
+def deadline_left():
+    """Seconds until CI_SPINEL_DEADLINE (epoch seconds), or None when no deadline is set."""
+    try:
+        return int(os.environ["CI_SPINEL_DEADLINE"]) - time.time()
+    except (KeyError, ValueError):
+        return None
+
+
 def run_timed(kind, name, command, charged=0):
     start = time.monotonic()
-    status = subprocess.run(command).returncode
+    left = deadline_left()
+    if left is not None and left <= 0:
+        print(f"::error::{name} not started: past this shard's deadline")
+        return 124
+    # Its own process group: killing the test alone would leave its spinel and cc children on the CPUs.
+    proc = subprocess.Popen(command, start_new_session=left is not None)
+    try:
+        status = proc.wait(timeout=left)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        print(f"::error::{name} stopped at this shard's deadline")
+        status = 124
     # 124 is timeout(1) stopping the command: its seconds are still worth recording.
     record_timing(kind, name, time.monotonic() - start + charged, status == 0, status == 124)
     return status
