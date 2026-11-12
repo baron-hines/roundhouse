@@ -506,6 +506,18 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                 {
                     return emit_expr_as_value(ctx, left);
                 }
+                // A nullable column's pointer field: nil takes the fallback,
+                // any stored value (0 included) is itself, as in Ruby.
+                if let Some(ptr) = nullable_field_go_ty(left)
+                    && let Some(scalar) = ptr.strip_prefix('*')
+                    && primitive_kind(&right.ty)
+                {
+                    return format!(
+                        "func() {scalar} {{ if p := {}; p != nil {{ return *p }}; return {} }}()",
+                        emit_expr_as_value(ctx, left),
+                        emit_expr_as_value(ctx, right)
+                    );
+                }
                 if primitive_kind(&left.ty) || primitive_kind(&right.ty) {
                     return format!(
                         "cmp.Or({}, {})",
@@ -3241,6 +3253,13 @@ fn emit_assign(ctx: &EmitCtx, target: &crate::expr::LValue, value: &Expr) -> Str
                 format!("{} = {v}", name.as_str())
             } else {
                 let pascal = go_field_name(name.as_str());
+                // A plain scalar into a nullable column's pointer field (a
+                // column held unset: `@<col>_raw = value`, the column's own type).
+                if matches!(value.ty, Some(Ty::Int | Ty::Float | Ty::Str | Ty::Bool))
+                    && let Some(conv) = nullable_column_converter(name.as_str(), value)
+                {
+                    return format!("self.{pascal} = {conv}({v})");
+                }
                 format!("self.{pascal} = {v}")
             }
         }

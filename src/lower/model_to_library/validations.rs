@@ -27,9 +27,14 @@ pub(super) fn push_validate_method(
     errors_readers: ErrorsReaders,
     runtime_relation: super::RuntimeRelation,
     primary_key: &Symbol,
+    table: Option<&crate::schema::Table>,
+    schema: &crate::schema::Schema,
 ) {
     let model_msgs = Messages(Some(model), None);
     let mut stmts: Vec<Expr> = Vec::new();
+    // The strict targets' uniqueness probes (`adapter_emit::uniqueness`),
+    // added beside `validate`, which calls them.
+    let mut probes: Vec<MethodDef> = Vec::new();
     let store_attrs: crate::det::HashSet<Symbol> = crate::lower::typed_store::typed_store_decls(&model.body)
         .into_iter()
         .flat_map(|(_, attrs)| attrs.into_iter().map(|a| a.name))
@@ -132,9 +137,27 @@ pub(super) fn push_validate_method(
                             super::RuntimeRelation::Present => vec![inline_uniqueness_check(
                                 msgs, model, primary_key, &v.attribute, scope, *case_sensitive, *allow_nil, *allow_blank,
                             )],
-                            // Reported per target by
-                            // `relation_residue::uniqueness_gaps_for_target`.
-                            super::RuntimeRelation::Absent => Vec::new(),
+                            super::RuntimeRelation::Absent => {
+                                match table.and_then(|table| {
+                                    crate::lower::validations::strict_uniqueness_columns(model, table, &v.attribute, scope)
+                                        .map(|columns| (table, columns))
+                                }) {
+                                    Some((table, (column, scoped))) => {
+                                        let name = super::adapter_emit::uniqueness::probe_name(&v.attribute, probes.len());
+                                        probes.push(super::adapter_emit::uniqueness::synth_uniqueness_probe(
+                                            &model.name, table, schema, name.clone(), &column, &scoped, primary_key, *case_sensitive,
+                                        ));
+                                        let nilable = super::adapter_emit::uniqueness::nilable(table, &column);
+                                        let slot_ty = super::adapter_emit::uniqueness::slot_ty(table, &column);
+                                        vec![strict_uniqueness_check(
+                                            msgs, &v.attribute, &column, name, nilable, slot_ty.as_ref(), *allow_nil, *allow_blank,
+                                        )]
+                                    }
+                                    // Reported per target by
+                                    // `relation_residue::uniqueness_gaps_for_target`.
+                                    None => Vec::new(),
+                                }
+                            }
                         }
                     } else {
                         validation_rule_to_calls(msgs, &v.attribute, rule, attr_ty, runtime_relation)
@@ -147,6 +170,16 @@ pub(super) fn push_validate_method(
                     if store_attrs.contains(&v.attribute) || defaulted_attrs.contains(&v.attribute) || virtual_attr || own_reader {
                         for check in &mut produced {
                             read_through_reader(check, &v.attribute);
+                        }
+                    }
+                    // A column held unset for its presence check is validated
+                    // in its nilable slot, as Rails validates the nil an
+                    // unassigned attribute holds (its reader answers 0) —
+                    // the validated attribute's, and a `scope:` column's.
+                    for col in table.iter().flat_map(|t| t.columns.iter()).filter(|c| c.unset_until_assigned) {
+                        let storage = super::schema::col_storage_name(col);
+                        for check in &mut produced {
+                            rename_ivar(check, &col.name, &storage);
                         }
                     }
                     // Rails reads the confirmation through its reader (`public_send("#{attr}_confirmation")`).
@@ -229,6 +262,7 @@ pub(super) fn push_validate_method(
             block_param: None,
         });
     }
+    methods.extend(probes);
 
     // A validating model OUTSIDE the ActiveRecord hierarchy (`class
     // Search` + `include ActiveModel::Validations`, no superclass)
@@ -794,6 +828,48 @@ fn validation_rule_to_calls(
 /// itself when it names a non-polymorphic `belongs_to` (`validates
 /// :reblog, uniqueness:` queries `reblog_of_id`; the error stays on
 /// `reblog`).
+/// The strict targets' uniqueness check: `validate` asks the probe
+/// (`adapter_emit::uniqueness`), skipping a nil value under `allow_nil:`
+/// and a blank one under `allow_blank:`, as `inline_uniqueness_check`
+/// does on the runtime Relation.
+fn strict_uniqueness_check(
+    msgs: Messages,
+    attr: &Symbol,
+    column: &Symbol,
+    probe: Symbol,
+    nilable: bool,
+    slot_ty: Option<&Ty>,
+    allow_nil: bool,
+    allow_blank: bool,
+) -> Expr {
+    let mut taken = with_bool(Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: None, method: probe, args: vec![], block: None, parenthesized: false },
+    ));
+    let value = ivar(column);
+    let not = |e: Expr| {
+        with_bool(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(e), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        ))
+    };
+    let is_nil = || with_bool(send(value.clone(), "nil?", vec![]));
+    if allow_blank {
+        // Narrowed past its `nil?` (Swift reads an optional String's
+        // `strip` no other way); a number is blank only when nil.
+        let blank = with_bool(allow_blank_cond(column, slot_ty, super::RuntimeRelation::Absent));
+        taken = with_bool(bool_op(BoolOpKind::And, not(blank), taken));
+    } else if allow_nil && nilable {
+        taken = with_bool(bool_op(BoolOpKind::And, not(is_nil()), taken));
+    }
+    let push_err = errors_push(attr.as_str(), msgs.error(attr.as_str(), "taken", &Default::default()));
+    if_with_nil_else(taken, push_err)
+}
+
+fn with_bool(e: Expr) -> Expr {
+    crate::lower::typing::with_ty(e, Ty::Bool)
+}
+
 fn inline_uniqueness_check(
     msgs: Messages,
     model: &Model,
@@ -1035,6 +1111,15 @@ fn read_through_reader(expr: &mut Expr, attr: &Symbol) {
     expr.node.for_each_child_mut(&mut |c| read_through_reader(c, attr));
     if matches!(&*expr.node, ExprNode::Ivar { name } if name == attr) {
         *expr.node = ExprNode::Send { recv: None, method: attr.clone(), args: vec![], block: None, parenthesized: false };
+    }
+}
+
+fn rename_ivar(expr: &mut Expr, from: &Symbol, to: &Symbol) {
+    expr.node.for_each_child_mut(&mut |c| rename_ivar(c, from, to));
+    if let ExprNode::Ivar { name } = &mut *expr.node
+        && name == from
+    {
+        *name = to.clone();
     }
 }
 

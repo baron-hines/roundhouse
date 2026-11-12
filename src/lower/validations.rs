@@ -281,20 +281,18 @@ fn lit_to_inclusion_value(lit: &crate::expr::Literal) -> Option<InclusionValue> 
 
 /// `validates :attr, presence:` on a NOT NULL number column with no
 /// default. Rails reads such an attribute as nil until it is assigned,
-/// so the check rejects a record that never set it. A strict target
-/// holds the column as a plain number that `new` starts at 0, which is
-/// never blank, so the check cannot fire and the record saves a 0 Rails
-/// would have refused. Reported once per validation, as
-/// `uniqueness_gaps_for_target` does, so the emit does not claim it.
+/// so the check rejects a record that never set it. Every target holds
+/// an integer one unset until assigned (`hold_unset_presence_columns`);
+/// any other (`presence_reads_unset` but not `unset_presence_column`) it
+/// holds as a plain number that `new` starts at 0, which is never blank,
+/// so the check cannot fire and the record saves a 0 Rails would have
+/// refused. Those are reported once per validation, as
+/// `uniqueness_gaps_for_target` does, so the emit does not claim them.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn presence_gaps_for_target(
     app: &crate::App,
     target: crate::build_target::BuildTarget,
 ) -> Vec<crate::diagnostic::Diagnostic> {
-    use crate::schema::ColumnType;
-    if target.has_runtime_relation() {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for model in &app.models {
         let Some(table) = app.schema.tables.get(&model.table.0) else { continue };
@@ -304,28 +302,14 @@ pub fn presence_gaps_for_target(
                 continue;
             }
             let Some(column) = table.columns.iter().find(|c| c.name == validation.attribute) else { continue };
-            let numeric = matches!(
-                column.col_type,
-                ColumnType::Integer
-                    | ColumnType::BigInt
-                    | ColumnType::Float
-                    | ColumnType::Decimal { .. }
-                    | ColumnType::Reference { .. }
-            );
-            if !numeric
-                || column.nullable
-                || column.primary_key
-                || column.default.is_some()
-                || column.default_expression.is_some()
-                || column.generated.is_some()
-            {
+            if !presence_reads_unset(model, column) || unset_presence_column(model, column) {
                 continue;
             }
             let mut d = crate::diagnostic::Diagnostic::unsupported(
                 item.span(),
                 Some(Symbol::from(target.as_str())),
                 format!("validates :{}, presence:", validation.attribute.as_str()),
-                "this target holds the NOT NULL column as a number that starts at 0, which is never blank, so a record that never assigned it passes the check and saves 0 where Rails rejects it",
+                "this target holds the NOT NULL column as a number that starts at 0, which is never blank, so a record that never assigned it passes the check and saves 0 where Rails rejects it; only an integer column without a writer of the model's own starts unset",
             );
             d.severity = crate::diagnostic::Severity::Warning;
             out.push(d);
@@ -368,4 +352,119 @@ pub fn acceptance_gaps_for_target(
         }
     }
     out
+}
+
+/// `validates :attr, presence:` on a NOT NULL number column with no
+/// default. Rails reads such an attribute as nil until it is assigned,
+/// so the check rejects a record that never set it, where a strict
+/// target's number field starts at 0.
+fn presence_reads_unset(model: &crate::dialect::Model, column: &crate::schema::Column) -> bool {
+    use crate::schema::ColumnType;
+    let numeric = matches!(
+        column.col_type,
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Float | ColumnType::Decimal { .. } | ColumnType::Reference { .. }
+    );
+    numeric
+        && !column.nullable
+        && !column.primary_key
+        && column.default.is_none()
+        && column.default_expression.is_none()
+        && column.generated.is_none()
+        && model.validations().any(|v| v.attribute == column.name && v.rules.iter().any(|r| matches!(r, ValidationRule::Presence)))
+}
+
+/// The `presence_reads_unset` columns a strict target holds unset until
+/// assigned: the integer ones (a float, a decimal or a `belongs_to`
+/// foreign key stays the reported gap), on a model without its own
+/// writer for the column, since Rails' `new(attrs)` runs that writer,
+/// which takes the column's type.
+fn unset_presence_column(model: &crate::dialect::Model, column: &crate::schema::Column) -> bool {
+    use crate::schema::ColumnType;
+    matches!(column.col_type, ColumnType::Integer | ColumnType::BigInt)
+        && presence_reads_unset(model, column)
+        && !crate::lower::model_to_library::model_defines_writer(model, &column.name)
+}
+
+/// Each target's lowering holds each `unset_presence_column` nilable,
+/// on its own copy of the schema: the record starts with nil there, as
+/// Rails' does, the presence check sees it, and every storage path
+/// (INSERT, hydration, `attributes`, `[]`) is the nullable column's. The
+/// column keeps NOT NULL in the database, and its public reader keeps
+/// the column's type (`unset_until_assigned`).
+pub fn hold_unset_presence_columns(models: &[crate::dialect::Model], schema: &crate::schema::Schema) -> crate::schema::Schema {
+    let mut out = schema.clone();
+    for model in models {
+        let Some(table) = out.tables.get_mut(&model.table.0) else { continue };
+        for column in table.columns.iter_mut() {
+            if unset_presence_column(model, column) {
+                column.nullable = true;
+                column.unset_until_assigned = true;
+            }
+        }
+    }
+    out
+}
+
+/// `(model, column)` for each column `hold_unset_presence_columns` holds,
+/// on every model its table backs. An emitter that writes a column's
+/// field by name (Go's struct literals and fixture loaders) writes these
+/// through their nilable `<col>_raw` slot.
+pub fn held_unset_columns(models: &[crate::dialect::Model], schema: &crate::schema::Schema) -> Vec<(crate::ident::ClassId, crate::ident::Symbol)> {
+    let held = hold_unset_presence_columns(models, schema);
+    let mut out = Vec::new();
+    for model in models {
+        let Some(table) = held.tables.get(&model.table.0) else { continue };
+        for column in table.columns.iter().filter(|c| c.unset_until_assigned) {
+            out.push((model.name.clone(), column.name.clone()));
+        }
+    }
+    out
+}
+
+/// The columns a strict target's `uniqueness:` query compares: the
+/// validated attribute's (a non-polymorphic `belongs_to` reads its
+/// foreign key, as Rails' `bind_attribute` resolves it), then each
+/// `scope:` entry's (a `belongs_to` its foreign key, and its type column
+/// when polymorphic). `None` where a column is not a plain scalar slot
+/// the query can compare as stored: absent from the table, temporal,
+/// JSON, an enum or an array, or a polymorphic attribute. Those stay
+/// the reported gap (`relation_residue::uniqueness_gaps_for_target`),
+/// which asks this same question.
+pub fn strict_uniqueness_columns(
+    model: &crate::dialect::Model,
+    table: &crate::schema::Table,
+    attr: &Symbol,
+    scope: &[Symbol],
+) -> Option<(Symbol, Vec<Symbol>)> {
+    use crate::dialect::Association;
+    let belongs_to = |name: &Symbol| {
+        model.associations().find_map(|a| match a {
+            Association::BelongsTo { name: n, foreign_key, polymorphic, .. } if n == name => Some((foreign_key.clone(), *polymorphic)),
+            _ => None,
+        })
+    };
+    let column = match belongs_to(attr) {
+        Some((_, true)) => return None,
+        Some((foreign_key, false)) => foreign_key,
+        None => attr.clone(),
+    };
+    let mut scoped = Vec::new();
+    for name in scope {
+        match belongs_to(name) {
+            Some((foreign_key, polymorphic)) => {
+                scoped.push(foreign_key);
+                if polymorphic {
+                    scoped.push(Symbol::from(format!("{}_type", name.as_str()).as_str()));
+                }
+            }
+            None => scoped.push(name.clone()),
+        }
+    }
+    let plain = |name: &Symbol| {
+        table.columns.iter().find(|c| c.name == *name).is_some_and(|c| {
+            let slot = crate::lower::column_slot::ColumnSlot::classify(c, model);
+            !slot.is_temporal() && !slot.is_json() && !c.array && !model.enums.contains_key(&c.name)
+        })
+    };
+    (plain(&column) && scoped.iter().all(plain)).then_some((column, scoped))
 }

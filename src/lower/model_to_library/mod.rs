@@ -422,6 +422,10 @@ pub(crate) fn lower_models_inner_with_ruby_values(
     runtime_relation: RuntimeRelation,
     partial_stems: &crate::lower::view_to_library::PartialStems,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    // Every target's lowering holds a NOT NULL integer that `presence:`
+    // checks unset until assigned, as Rails reads it nil until then.
+    let unset_schema = crate::lower::validations::hold_unset_presence_columns(models, schema);
+    let schema = &unset_schema;
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
     let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
     let _body_names = schema::share_model_body_names(models, &Default::default());
@@ -1732,7 +1736,7 @@ fn build_methods_with_finder_inputs(
             })
         })
         .unwrap_or_else(|| Symbol::from("id"));
-    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key);
+    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key, schema.tables.get(&model.table.0), schema);
     push_association_methods(&mut methods, model, models, &through_joins, runtime_relation);
     push_dependent_destroy(&mut methods, model, &through_joins);
     push_unknown_marker_methods(&mut methods, model);
@@ -3598,13 +3602,15 @@ pub(super) fn is_id_column(name: &Symbol) -> bool {
 
 /// The schema columns a class stores that the DB declares nullable —
 /// the `LibraryClass::nullable_columns` payload. Same rule as
-/// `ty_of_column_slot`: nullable, primary key excluded.
+/// `ty_of_column_slot`: nullable, primary key excluded. A column held
+/// unset for its presence check is named by its `<col>_raw` slot, the
+/// nilable field; its reader answers the column's own type.
 pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
     let Some(t) = table else { return Vec::new() };
     t.columns
         .iter()
         .filter(|c| c.nullable && !c.primary_key)
-        .map(|c| c.name.clone())
+        .map(|c| if c.unset_until_assigned { schema::col_storage_name(c) } else { c.name.clone() })
         .collect()
 }
 

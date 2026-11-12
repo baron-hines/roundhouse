@@ -600,7 +600,7 @@ fn emit_node(n: &ExprNode) -> String {
             // simple-Symbol literals. Hand-written calls that
             // already pass a typed Hash variable, or non-Hash args,
             // fall through to the standard emit.
-            if (method.as_str() == "new" || method.as_str() == "create")
+            if matches!(method.as_str(), "new" | "create" | "create!")
                 && args.len() == 1
             {
                 if let Some(r) = recv {
@@ -998,7 +998,7 @@ fn emit_array(elements: &[Expr], _style: &crate::expr::ArrayStyle) -> String {
 ///
 /// `.new` produces: `(__inst = Cls.new(hash); __inst.k1 = v1; …; __inst)`
 /// `.create` adds an explicit `.save` after the assigns and still
-/// returns the instance.
+/// returns the instance; `.create!` raises `RecordInvalid` when it fails.
 ///
 /// The hash is passed through to `.new` (in addition to the per-
 /// field assigns) so classes with a user-defined `initialize(attrs)`
@@ -1078,6 +1078,8 @@ fn try_emit_new_or_create_per_field(
     }
     if method == "create" {
         body.push_str("__inst.save\n");
+    } else if method == "create!" {
+        body.push_str("raise ActiveRecord::RecordInvalid.new(__inst) unless __inst.save\n");
     }
     body.push_str("__inst");
     Some(format!("begin\n{}\nend", indent_lines(&body, 1)))

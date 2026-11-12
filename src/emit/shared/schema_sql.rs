@@ -73,6 +73,15 @@ impl Dialect {
 
     /// A literal boolean: SQLite stores 1/0; PostgreSQL's boolean takes
     /// no integer.
+    /// Equality that also holds between two NULLs, one SQL shape for a
+    /// value that may be nil (`"col" IS ?` in SQLite).
+    pub fn null_safe_eq(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "IS",
+            Dialect::Postgres => "IS NOT DISTINCT FROM",
+        }
+    }
+
     pub fn boolean(self, value: bool) -> &'static str {
         match (self, value) {
             (Dialect::Sqlite, true) => "1",
@@ -748,6 +757,7 @@ mod tests {
             generated_int4_compatible: None,
             array: false,
             array_stored: false,
+            unset_until_assigned: false,
         }
     }
 
