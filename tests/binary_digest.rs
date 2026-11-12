@@ -180,3 +180,39 @@ fn rust_cargo_test_passes_the_digest_tests() {
         assert!(stdout.contains(&format!("tests::{name} ... ok")), "{name}:\n{stdout}");
     }
 }
+
+/// A controller's action visibility, as `respond_to?` folding reads it.
+/// A bare `private` makes what follows private. Any other visibility
+/// call (`private :pong`) leaves every action of that controller
+/// undecided (in both sets), across every declaration of the controller:
+/// here a second declaration defines `pang`.
+#[test]
+fn controller_action_visibility_is_positional_or_undecided() {
+    use roundhouse::ident::{ClassId, Symbol};
+    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+        ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+        ("app/controllers/pings_controller.rb", "class PingsController < ApplicationController\n  def index\n  end\n\n  private\n\n  def secret\n  end\nend\n"),
+        ("app/controllers/pongs_controller.rb", "class PongsController < ApplicationController\n  def pong\n  end\n  private :pong\nend\n"),
+        ("app/controllers/pongs_controller_more.rb", "class PongsController < ApplicationController\n  def pang\n  end\nend\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, s)| (std::path::PathBuf::from(p), s.as_bytes().to_vec()))
+    .collect();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let analyzer = roundhouse::analyze::Analyzer::new(&app);
+    let info = |name: &str| &analyzer.class_registry()[&ClassId(Symbol::from(name))];
+    let sym = Symbol::from;
+    let pings = info("PingsController");
+    assert!(pings.public_instance_methods.contains(&sym("index")) && !pings.nonpublic_instance_methods.contains(&sym("index")));
+    assert!(pings.nonpublic_instance_methods.contains(&sym("secret")) && !pings.public_instance_methods.contains(&sym("secret")));
+    let pongs = info("PongsController");
+    for action in ["pong", "pang"] {
+        assert!(
+            pongs.public_instance_methods.contains(&sym(action)) && pongs.nonpublic_instance_methods.contains(&sym(action)),
+            "{action}: {:?} / {:?}",
+            pongs.public_instance_methods,
+            pongs.nonpublic_instance_methods
+        );
+    }
+}

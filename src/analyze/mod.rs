@@ -1321,18 +1321,27 @@ impl Analyzer {
                 classes.entry(id.clone()).or_default().constructor_calls_super = expr_calls_super(&method.body);
             }
         }
+        use crate::dialect::ControllerBodyItem;
+        // Visibility is positional: a bare `private` makes what follows
+        // private. Any other visibility call (`protected`, `public`,
+        // `private :name`, `private def …`) is not modeled, so every
+        // action then counts as both, which `lower::respond_to` leaves
+        // unanswered. Per controller NAME: such a call in one reopening
+        // (`private :ping`) can name an action another one defines.
+        let unmodeled_visibility: crate::det::HashSet<&ClassId> = app
+            .controllers
+            .iter()
+            .filter(|controller| {
+                controller.body.iter().any(|item| {
+                    matches!(item, ControllerBodyItem::Unknown { expr, .. }
+                        if matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, .. }
+                            if matches!(method.as_str(), "private" | "protected" | "public" | "module_function")))
+                })
+            })
+            .map(|controller| &controller.name)
+            .collect();
         for controller in &app.controllers {
-            use crate::dialect::ControllerBodyItem;
-            // Visibility is positional: a bare `private` makes what follows
-            // private. Any other visibility call (`protected`, `public`,
-            // `private :name`, `private def …`) is not modeled, so every
-            // action then counts as both, which `lower::respond_to` leaves
-            // unanswered.
-            let unmodeled = controller.body.iter().any(|item| {
-                matches!(item, ControllerBodyItem::Unknown { expr, .. }
-                    if matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, .. }
-                        if matches!(method.as_str(), "private" | "protected" | "public" | "module_function")))
-            });
+            let unmodeled = unmodeled_visibility.contains(&controller.name);
             let entry = classes.entry(controller.name.clone()).or_default();
             let mut private = false;
             for item in &controller.body {
