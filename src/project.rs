@@ -10610,6 +10610,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         "action_view_number_helper_mixin",
         "active_support_ext",
         "active_model_validator",
+        "active_model_name",
         // `Rails.event` / `Rails.error`: the reporters, ParameterFilter and
         // ExecutionContext. rails.rb requires it, so it ships beside rails.
         "active_support_reporters",

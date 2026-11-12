@@ -3349,6 +3349,9 @@ end
     // (`refuse_numericality_allow_on_untyped`, `session::analyze_and_lower_for`).
     gap_acceptance_on_undeclared(&mut app);
     define_confirmation_accessors(&mut app);
+    crate::lower::for_each_hook_body(&mut app, &mut drop_discarded_permits);
+    super::built_send::devirtualize(&mut app);
+    super::built_send::devirtualize_param_sends(&mut app);
     record_mixin_sends(&mut app);
     // Not at model ingest: the `select` naming a model's aliases can sit in another model, class, controller or view.
     super::select_aliases::stamp(&mut app);
@@ -3867,6 +3870,26 @@ fn define_confirmation_accessors(app: &mut App) {
             model.body.insert(i, ModelBodyItem::Unknown { expr: accessor, leading_comments: Vec::new(), leading_blank_line: false });
         }
     }
+}
+
+/// `attributes.try(:permit!)` as a statement (Devise's `find_or_initialize_with_errors`): it only marks Parameters
+/// permitted, and a request's params reach the emitted program as plain Hashes whose permits are already identities
+/// (`lower::params_permit`), so on every value it can hold it does nothing the program reads.
+fn drop_discarded_permits(body: &mut crate::expr::Expr) {
+    use crate::expr::{ExprNode, Literal};
+    body.node.for_each_child_mut(&mut drop_discarded_permits);
+    let ExprNode::Seq { exprs } = &mut *body.node else { return };
+    let last = exprs.len().saturating_sub(1);
+    let mut i = 0;
+    exprs.retain(|e| {
+        let keep = i == last
+            || !matches!(&*e.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                if method.as_str() == "try"
+                    && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "permit!"))
+                    && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. }));
+        i += 1;
+        keep
+    });
 }
 
 /// Each model's [`crate::dialect::Model::mixin_sends`]: the Dirty spellings the instance methods of the modules it

@@ -16,6 +16,7 @@
 //! cross-cutting Prism AST helpers live in [`util`].
 
 mod alba;
+mod built_send;
 mod conditional_permit;
 pub(crate) mod unreachable_views;
 mod view_paths;

@@ -582,6 +582,8 @@ mod format_value_to_s;
 mod validates_acceptance;
 #[path = "emit_and_run/validates_of_confirmation.rs"]
 mod validates_of_confirmation;
+#[path = "emit_and_run/respond_to_fold.rs"]
+mod respond_to_fold;
 #[path = "emit_and_run/attribute_api_boolean_cast.rs"]
 mod attribute_api_boolean_cast;
 #[path = "emit_and_run/hash_fetch_one_arg.rs"]
