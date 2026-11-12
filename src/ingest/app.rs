@@ -756,6 +756,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let stack = super::railtie_middleware::read(vfs, dir, &gem_libs);
     let stacked_application_uses = stack.application_taken;
     let middleware_loops = stack.loops;
+    let env_writes_by_class = stack.env_writes_by_class;
     (app.gem_middlewares, app.gem_middleware_blocks, app.rack_env_writes, app.gem_middleware_refusals) =
         (stack.classes, stack.blocks, stack.env_writes, stack.diags);
     // `enum` columns declared inside a concern's `included do`, keyed by
@@ -3242,7 +3243,7 @@ end
     // After the macros: a configured object's readers and its builder's writers are methods by now.
     super::configured_superclass::fold(vfs, dir, &mut app);
     super::configured_superclass::fold_class_names(vfs, dir, &mut app);
-    super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops);
+    super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops, &env_writes_by_class);
     super::gem_routes::expand(vfs, dir, &path_gems, &mut app);
     super::class_macros::drop_expanded_hook_macros(&mut app, &hook_macros_called, &mentions);
     super::extend_splice::splice_load_hook_extended_calls(&mut app);
@@ -3292,9 +3293,7 @@ end
     drop_modelled_included_hooks(&mut app);
     splice_concerns_into_controllers(&mut app);
     // After the splice: a concern's filter reads the key as the controller's own body does.
-    if every_primary_key_is_id(&app) {
-        crate::lower::for_each_hook_body(&mut app, &mut read_primary_key_sends);
-    }
+    crate::lower::primary_key_send::rewrite_guarded(&mut app);
     // After the splice: an action a concern provides is not implicit.
     synthesize_template_only_actions(&mut app);
     // After the splice: a macro has to resolve against the concern's
@@ -4202,6 +4201,7 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         .collect();
 
     let dependencies = concern_dependencies(app, carriers);
+    let facts = super::gem_hooks::Facts::of(app);
 
     for model in &mut app.models {
         if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
@@ -4262,7 +4262,12 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                     for i in 0..=plain.len() {
                         for g in guarded {
                             let here = if i == plain.len() { g.at >= i } else { g.at == i };
-                            if here && g.guard.admits(includer) {
+                            // Not admitted where the module's question goes unanswered: neither branch is known to run.
+                            let admitted = match &g.guard.asked {
+                                Some((module, method)) => super::gem_hooks::includer_answer(&facts, module, method, includer).is_some_and(|answer| answer != g.guard.negate),
+                                None => g.guard.admits(includer),
+                            };
+                            if here && admitted {
                                 ordered.push(&g.item);
                             }
                         }
@@ -5152,9 +5157,56 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
             for method in module_methods.get(module).into_iter().flatten() {
-                if !defined.insert(method.name.clone()) {
-                    continue;
-                }
+                let renamed;
+                let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
+                    method
+                } else {
+                    // Not dropped where the winning copy calls `super` (Devise's `Helpers#expire_data_after_sign_out!`
+                    // over `SignInOut`'s): Ruby runs this one there, which the flattened controller keeps under its own name.
+                    // The chain's end: the definition of the name, or a shadowed one kept under its own, that still calls `super`.
+                    let chained = |name: &crate::ident::Symbol| {
+                        *name == method.name || name.as_str().strip_prefix("__super").is_some_and(|rest| rest.ends_with(&format!("_{}", method.name.as_str())))
+                    };
+                    let Some(winner) = methods.iter_mut().chain(actions.iter_mut()).find_map(|item| match item {
+                        ControllerBodyItem::Action { action, .. } if chained(&action.name) && calls_super(&action.body) => Some(action),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    // Not a winner that forwards anonymously (`def f(...)`, `def f(**)`): its `super` passes what no name holds.
+                    if winner.anonymous_formal.is_some() {
+                        continue;
+                    }
+                    // A distinct name per level, so each shadowed definition keeps its own `super`.
+                    let Some(target) = (1..64)
+                        .map(|depth| crate::ident::Symbol::from(format!("__super{}_{}", if depth == 1 { String::new() } else { depth.to_string() }, method.name.as_str())))
+                        .find(|t| !defined.contains(t))
+                    else {
+                        continue;
+                    };
+                    defined.insert(target.clone());
+                    let var = |n: &crate::ident::Symbol| crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Var { id: crate::ident::VarId(0), name: n.clone() });
+                    // Every channel a bare `super` passes on, as Ruby's does: positional, rest, keywords and keyword rest.
+                    let mut forwarded: Vec<crate::expr::Expr> = winner.params.fields.keys().chain(winner.opt_params.iter().map(|(n, _)| n)).map(var).collect();
+                    if let Some(rest) = &winner.rest_param {
+                        forwarded.push(crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Splat { value: var(rest) }));
+                    }
+                    let mut keywords: Vec<(crate::expr::Expr, crate::expr::Expr)> = winner
+                        .kw_params
+                        .iter()
+                        .map(|(n, _)| (crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: n.clone() } }), var(n)))
+                        .collect();
+                    if let Some(kwrest) = &winner.kwrest_param {
+                        keywords.push((crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::KeywordSplat { value: var(kwrest) }), crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })));
+                    }
+                    if !keywords.is_empty() {
+                        forwarded.push(crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Hash { entries: keywords, kwargs: true }));
+                    }
+                    let block = winner.block_param.as_ref().map(var);
+                    redirect_super(&mut winner.body, &target, &forwarded, block.as_ref());
+                    renamed = crate::dialect::MethodDef { name: target, ..(*method).clone() };
+                    &renamed
+                };
                 let mut body = method.body.clone();
                 if let Some(consts) = module_constants.get(module) {
                     qualify_lexical_consts(&mut body, module, consts);
@@ -5522,46 +5574,22 @@ fn answers_callback_macro(app: &App, name: &crate::ident::ClassId) -> bool {
     false
 }
 
-/// `record.send(record.class.primary_key)` (orm_adapter's `conditions_to_fields`) where every model's key is `id`:
-/// `record.id`, the same method the send names, an override of `id` included.
-// Not `record[key]`: that reads the column past a reader the model overrides.
-fn read_primary_key_sends(body: &mut crate::expr::Expr) {
-    use crate::expr::ExprNode;
-    body.node.for_each_child_mut(&mut read_primary_key_sends);
-    if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *body.node
-        && matches!(method.as_str(), "send" | "public_send" | "__send__")
-        && matches!(&*recv.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
-        && let [name] = args.as_slice()
-        && let ExprNode::Send { recv: Some(class), method: key, args: key_args, block: None, .. } = &*name.node
-        && key.as_str() == "primary_key"
-        && key_args.is_empty()
-        // Only the record's own class's key: another class's (`KeySource.primary_key`) names any column.
-        && matches!(&*class.node, ExprNode::Send { recv: Some(of), method, args, block: None, .. }
-            if method.as_str() == "class" && args.is_empty() && same_read(of, recv))
-    {
-        *method = crate::ident::Symbol::from("id");
-        args.clear();
-    }
+fn calls_super(e: &crate::expr::Expr) -> bool {
+    let mut found = matches!(&*e.node, crate::expr::ExprNode::Super { .. });
+    e.node.for_each_child(&mut |c| found |= calls_super(c));
+    found
 }
 
-fn same_read(a: &crate::expr::Expr, b: &crate::expr::Expr) -> bool {
-    use crate::expr::ExprNode;
-    match (&*a.node, &*b.node) {
-        (ExprNode::Var { name: x, .. }, ExprNode::Var { name: y, .. }) | (ExprNode::Ivar { name: x }, ExprNode::Ivar { name: y }) => x == y,
-        (ExprNode::SelfRef, ExprNode::SelfRef) => true,
-        _ => false,
+/// Each `super` of a spliced method, as the call to the shadowed definition kept under `target`; a bare one passes
+/// the method's own arguments, as Ruby's does.
+fn redirect_super(e: &mut crate::expr::Expr, target: &crate::ident::Symbol, forwarded: &[crate::expr::Expr], block: Option<&crate::expr::Expr>) {
+    if let crate::expr::ExprNode::Super { args } = &*e.node {
+        let args = args.clone().unwrap_or_else(|| forwarded.to_vec());
+        // The method's own block, which `super` hands on as Ruby's does.
+        *e.node = crate::expr::ExprNode::Send { recv: None, method: target.clone(), args, block: block.cloned(), parenthesized: true };
+        return;
     }
-}
-
-fn every_primary_key_is_id(app: &App) -> bool {
-    // Nor where a class of the app answers `primary_key` itself: the send then names whatever that method answers.
-    let own_primary_key = app.library_classes.iter().flat_map(|c| c.methods.iter()).any(|m| m.name.as_str() == "primary_key")
-        || app.models.iter().any(|m| m.methods().any(|d| d.name.as_str() == "primary_key"));
-    !own_primary_key
-        && app.models.iter().all(|m| m.primary_key.as_ref().is_none_or(|k| k.as_str() == "id"))
-        && app.schema.tables.values().all(|t| {
-            t.primary_key_columns.is_empty() && t.columns.iter().filter(|c| c.primary_key).all(|c| c.name.as_str() == "id")
-        })
+    e.node.for_each_child_mut(&mut |c| redirect_super(c, target, forwarded, block));
 }
 
 /// A modelled hook has nothing left to do at load, and the emitted

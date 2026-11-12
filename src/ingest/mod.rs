@@ -102,6 +102,9 @@ pub mod jbuilder;
 pub mod library_class;
 mod file_program;
 pub(crate) use file_program::{normalize_source, resolve_gem_require};
+pub(crate) fn source_gems_mount() -> &'static str {
+    source_gems::MOUNT
+}
 mod glob_autoload;
 pub mod channel_callbacks;
 mod active_model_attributes;
@@ -124,6 +127,7 @@ pub(crate) mod inherited_alias;
 mod class_macros;
 mod configured_superclass;
 mod gem_hooks;
+pub(crate) use gem_hooks::method_missing_readers;
 mod gem_routes;
 mod column_accessors;
 mod model_macros;

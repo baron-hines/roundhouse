@@ -5535,7 +5535,7 @@ fn ruby_family_runtime_files(
     )?;
     // The middleware the app's gems' Railties `use`, outermost first, as Rails stacks them.
     if !app.gem_middlewares.is_empty() {
-        let stacked = stack_middlewares(&app.gem_middlewares, &app.gem_middleware_blocks, "app");
+        let stacked = stack_middlewares(&app.gem_middlewares, &app.gem_middleware_blocks, &app.gem_middleware_args, "app");
         let body = format!(
             "# frozen_string_literal: true\n# The Rack middleware the app's gems put on Rails' stack from their\n# Railties (`App::gem_middlewares`), outermost first.\nmodule GemMiddleware\n  def self.wrap(app)\n    stack = {stacked}\n    # Rails finalizes the routes once the stack is built (a gem's `RouteSet#finalize!`).\n    ActionDispatch::Routing::RouteSet.finalize_app!\n    stack\n  end\n\n  # The test harness's request through the stack (Rails' integration tests run it), the block at its bottom.\n  def self.around(env, &inner)\n    wrap(inner).call(env)\n  end\n\n  # `Controller.action(name)`'s endpoint (runtime/action_controller_endpoint.rb), over the env it is called with.\n  def self.endpoint(controller, action, env)\n    Main.run_endpoint(controller, action, env)\n  end\nend\n"
         );
@@ -5701,6 +5701,52 @@ fn apply_conditional_declarations(files: &mut Vec<(String, String)>, app: &App) 
 /// loads (`App::boot_gem_entries`). A program nothing reaches from those is
 /// listed in `UNREACHED_PROGRAMS` and not loaded, as Ruby loads no gem
 /// file that nothing requires.
+/// A `require` a gem's method runs (OmniAuth's `KeyStore.override_logging` requires `hashie/version`), of a file the tree
+/// carries: its program, as a carried file's top-level require loads it (`program` answers its anchor where the tree
+/// writes programs), or `false` for a file of declarations alone, which the tree has loaded, as Ruby answers a feature
+/// already loaded.
+// Not left as written: the tree has no load path where the gem's files are, and Spinel resolves the feature as it builds.
+fn rewrite_carried_requires(files: &mut [(String, String)], app: &App, program: impl Fn(&str) -> Option<String>) {
+    let known: crate::det::HashSet<String> = app.sources.iter().map(|f| normalize_source(&f.path)).collect();
+    // Not a program that only declares and opens namespaces: loading it again is loading its declarations.
+    let with_program: crate::det::HashSet<String> = app
+        .file_programs
+        .iter()
+        .filter(|p| p.items.iter().any(|item| !matches!(item, crate::app::ProgramItem::Declared(_) | crate::app::ProgramItem::Opened(_))))
+        .map(|p| normalize_source(&p.source))
+        .collect();
+    for (path, content) in files.iter_mut() {
+        if !path.starts_with("app/models/") || path.starts_with("app/models/roundhouse_files/") || !path.ends_with(".rb") || !content.contains("require \"") {
+            continue;
+        }
+        let mut changed = false;
+        let lines: Vec<String> = content
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                let Some(feature) = trimmed.strip_prefix("require \"").and_then(|rest| rest.strip_suffix('"')).filter(|f| !f.contains('"') && !f.contains('#')) else {
+                    return line.to_string();
+                };
+                let indent = &line[..line.len() - trimmed.len()];
+                let Some(target) = resolve_gem_require(&known, "", feature, false).filter(|t| known.contains(t)) else { return line.to_string() };
+                let replaced = if with_program.contains(&target) {
+                    match program(&target) {
+                        Some(anchor) => format!("{indent}RoundhouseAutoload.require_gem_file({anchor:?})"),
+                        None => return line.to_string(),
+                    }
+                } else {
+                    format!("{indent}false")
+                };
+                changed = true;
+                replaced
+            })
+            .collect();
+        if changed {
+            *content = lines.join("\n") + "\n";
+        }
+    }
+}
+
 fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
     use std::fmt::Write;
     if app.file_programs.is_empty() {
@@ -5723,6 +5769,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         .filter_map(|(p, _)| p.strip_prefix("app/").and_then(|p| p.strip_suffix(".rb")).map(str::to_string))
         .collect();
     let resolve = |from: &str, feature: &str, relative: bool| resolve_gem_require(&known, from, feature, relative);
+    rewrite_carried_requires(files, app, |target| programs.get(target).map(|_| anchor_of(target)));
     let site = |span: crate::span::Span| -> String {
         let Some(source) = (span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else {
             return "(unknown)".to_string();
@@ -5765,6 +5812,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         // Ruby's autoload when the file raises.
         let header = std::mem::take(&mut out);
         let mut loaded: crate::det::HashSet<String> = Default::default();
+        let mut opened: crate::det::HashSet<String> = Default::default();
         let mut steps = Vec::new();
         program_steps(&program.items, 0, &mut steps);
         for (depth, step) in steps {
@@ -5785,6 +5833,24 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                     for name in names {
                         let anchor = crate::emit::ruby::library_file_anchor(name.0.as_str(), app);
                         if emitted.contains(&anchor) && loaded.insert(anchor.clone()) {
+                            // A module in a namespace the file opens, defined ahead of its declaration file: an autoload
+                            // registered on the namespace at run time (Devise's `add_module`) loads this program while that
+                            // file is loading, and the circular require would leave the constant undefined.
+                            if let Some((owner, leaf)) = name.0.as_str().rsplit_once("::")
+                                && opened.contains(owner)
+                                && app.library_classes.iter().any(|c| c.name == *name && c.is_module)
+                            {
+                                let segments: Vec<&str> = owner.split("::").collect();
+                                let mut open: Vec<String> = (0..segments.len())
+                                    .map(|i| {
+                                        let path = segments[..=i].join("::");
+                                        let class = app.library_classes.iter().any(|c| c.name.0.as_str() == path && !c.is_module);
+                                        format!("{} {}", if class { "class" } else { "module" }, segments[i])
+                                    })
+                                    .collect();
+                                open.push(format!("module {leaf}"));
+                                writeln!(out, "{}; {}", open.join("; "), vec!["end"; open.len()].join("; ")).unwrap();
+                            }
                             writeln!(out, "require RoundhouseAutoload.path({anchor:?})").unwrap();
                         }
                     }
@@ -5832,6 +5898,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                 }
                 crate::app::ProgramItem::Opened(chains) => {
                     for chain in chains {
+                        opened.insert(chain.iter().map(|(segment, _)| segment.as_str()).collect::<Vec<_>>().join("::"));
                         let open: Vec<String> =
                             chain.iter().map(|(segment, is_class)| format!("{} {segment}", if *is_class { "class" } else { "module" })).collect();
                         writeln!(out, "{}; {}", open.join("; "), vec!["end"; chain.len()].join("; ")).unwrap();
@@ -10089,16 +10156,19 @@ fn drop_solid_queue_standin(app: &App, files: &mut Vec<(String, String)>) {
 /// `use` middleware (`App::gem_middlewares`): the request as a Rack env,
 /// through the stack, with the routes at the bottom.
 /// `A.new(B.new(app) { |config| … })`: outermost first, each with the block its `use` passed.
-fn stack_middlewares(classes: &[String], blocks: &crate::det::HashMap<String, String>, app: &str) -> String {
-    classes.iter().rev().fold(app.to_string(), |inner, class| match blocks.get(class) {
-        Some(block) => format!("{class}.new({inner}) {block}"),
-        None => format!("{class}.new({inner})"),
+fn stack_middlewares(classes: &[String], blocks: &crate::det::HashMap<String, String>, args: &crate::det::HashMap<String, String>, app: &str) -> String {
+    classes.iter().rev().fold(app.to_string(), |inner, class| {
+        let given = args.get(class).map_or(String::new(), |a| format!(", {a}"));
+        match blocks.get(class) {
+            Some(block) => format!("{class}.new({inner}{given}) {block}"),
+            None => format!("{class}.new({inner}{given})"),
+        }
     })
 }
 
-fn spinel_gem_middleware(classes: &[String], blocks: &crate::det::HashMap<String, String>) -> String {
-    let stacked = stack_middlewares(classes, blocks, "App.new");
-    let around = stack_middlewares(classes, blocks, "Inner.new(inner)");
+fn spinel_gem_middleware(classes: &[String], blocks: &crate::det::HashMap<String, String>, args: &crate::det::HashMap<String, String>) -> String {
+    let stacked = stack_middlewares(classes, blocks, args, "App.new");
+    let around = stack_middlewares(classes, blocks, args, "Inner.new(inner)");
     format!(
         r#"# frozen_string_literal: true
 # The Rack middleware the app's gems put on Rails' stack from their
@@ -10300,7 +10370,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
 
     crate::runtime_files::walk_flat("runtime/spinel", &["rb"], "runtime/", &mut files)?;
     if !app.gem_middlewares.is_empty() {
-        let body = spinel_gem_middleware(&app.gem_middlewares, &app.gem_middleware_blocks);
+        let body = spinel_gem_middleware(&app.gem_middlewares, &app.gem_middleware_blocks, &app.gem_middleware_args);
         for (path, content) in files.iter_mut() {
             if path == "runtime/gem_middleware.rb" {
                 *content = body.clone();
@@ -10946,6 +11016,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     }
     // A PATH gem's own data, beside its compiled code.
     carry_path_gem_data(fixture, &mut files)?;
+    carry_source_gem_data(app, fixture, &mut files)?;
     // `test/fixtures/files` — `file_fixture_path`, which `file_fixture`,
     // `fixture_file_upload` and an `ActiveStorage::FixtureSet.blob`
     // fixture row read. The same blind spot again: the binary files
@@ -11028,6 +11099,8 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     apply_pagination_demand(&mut files)?;
     apply_pagy_demand(&mut files, app)?;
     apply_pay_demand(&mut files, app)?;
+    // Not a program's anchor: this tree writes no gem file programs.
+    rewrite_carried_requires(&mut files, app, |_| None);
     drop_solid_queue_standin(app, &mut files);
     Ok((files, test_stems))
 }
@@ -14221,6 +14294,46 @@ fn carry_path_gem_data(fixture: &Path, out: &mut Vec<(String, String)>) -> Resul
                 }
             }
         }
+        out.extend(found);
+    }
+    Ok(())
+}
+
+/// The text files under the `lib/` of each gem compiled from source, other than its Ruby, at the gem's mount
+/// (`ingest::source_gems::MOUNT`): a gem reads them by a path from its own file (omniauth's
+/// `File.read(File.expand_path('../form.css', __FILE__))`), which the emitted `__FILE__` names under that mount.
+// Not the ruby family's: CRuby loads the installed gem, which reads its own copy.
+fn carry_source_gem_data(app: &App, fixture: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    let Some(lock) = app.gem_lock.as_ref() else { return Ok(()) };
+    let vfs = crate::vfs::FsVfs;
+    let roots = crate::i18n::gems::gem_roots(&vfs, fixture);
+    let secret = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        ["secret", "credential", "password", "token"].iter().any(|w| lower.contains(w))
+            || [".key", ".pem", ".p12", ".env"].iter().any(|ext| lower.ends_with(ext))
+    };
+    for name in &lock.source {
+        let Some(version) = lock.version_of(name) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem(&vfs, &roots, name, version) else { continue };
+        let lib = installed.join("lib");
+        if !lib.is_dir() {
+            continue;
+        }
+        let prefix = format!("{}/{name}-{version}/lib/", crate::ingest::source_gems_mount());
+        let mut found = Vec::new();
+        walk_dir_into_skipping(&lib, &prefix, &["node_modules", "tmp", "log", "coverage"], &mut found)?;
+        found.retain(|(rel, _)| {
+            let file = rel.rsplit('/').next().unwrap_or(rel);
+            // Not a file reached through a symlink: its target may lie outside the gem.
+            let linked = {
+                let mut at = lib.clone();
+                rel.strip_prefix(&prefix).unwrap_or(rel).split('/').any(|part| {
+                    at.push(part);
+                    fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink())
+                })
+            };
+            !linked && !rel.ends_with(".rb") && !rel.ends_with(".rbs") && !secret(file)
+        });
         out.extend(found);
     }
     Ok(())

@@ -309,6 +309,8 @@ module Main
     controller.request.flash = flash
     # The env's own request, which a gem's `ActionDispatch::Request.new(env)` is (`Request.for_env`).
     env["roundhouse.request"] = controller.request
+    # Rails' `request.cookie_jar` is the controller's `cookies`: Warden's `cookies` (Devise's remember-me) reads and writes it.
+    controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
     controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
@@ -384,7 +386,7 @@ module Main
     httponly_cookies = {}
     expires_cookies = {}
     jar.pending.each do |k, v|
-      out_cookies[k] = v
+      out_cookies[k] = jar.deleted?(k) ? nil : v
       secure_cookies[k] = true if jar.flag_secure?(k)
       httponly_cookies[k] = jar.flag_httponly?(k)
       ss = jar.flag_samesite(k).to_s

@@ -601,6 +601,10 @@ jobs:
           gem install --no-document --ignore-dependencies warden -v 1.2.9
           gem install --no-document --ignore-dependencies orm_adapter -v 0.5.0
           gem install --no-document --ignore-dependencies responders -v 3.1.1
+          # OmniAuth for devise's :omniauthable, installed as the Ruby family loads it (tests/emit_and_run/devise.rs).
+          gem install --no-document --ignore-dependencies omniauth -v 2.1.4
+          gem install --no-document --ignore-dependencies hashie -v 5.1.0
+          gem install --no-document --ignore-dependencies rack-protection -v 4.2.1
           # Gem extensions whose finders the native controls run (tests/finder_ownership_and_form_keys.rs).
           gem install --no-document friendly_id -v 5.5.1
           gem install --no-document sorbet-runtime -v 0.5.11934

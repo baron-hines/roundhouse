@@ -21148,6 +21148,8 @@ mod devise;
 mod warden;
 #[path = "emit_and_run/class_eval_string_macro.rs"]
 mod class_eval_string_macro;
+#[path = "emit_and_run/primary_key_send.rs"]
+mod primary_key_send;
 #[path = "emit_and_run/send_built_name.rs"]
 mod send_built_name;
 #[path = "emit_and_run/app_middleware.rs"]
