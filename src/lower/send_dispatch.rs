@@ -708,7 +708,9 @@ fn residue(expr: &Expr, reason: &str) -> Diagnostic {
 ///    (`each`, `each_with_index`, `map`, `flat_map`) with a block;
 /// 3. what `push`, `<<`, `each` and `each_with_index` return, the list
 ///    itself, is dropped, or is what the method returns while no block
-///    reads the list: nothing else can reach the list to change it;
+///    reads the list and, with a String element, no block inside a walk
+///    reads the element (`@run = -> { "#{status}" }` keeps it, and the
+///    caller can change it): nothing else can reach the list to change it;
 /// 4. with a String element, every walk reads its element parameter only
 ///    as an interpolated piece: no code can reach an element to change it
 ///    in place. A Symbol element cannot change.
@@ -718,6 +720,7 @@ fn collect_var_element_sets(body: &Expr) -> HashMap<Symbol, Vec<Expr>> {
         ExprNode::Seq { exprs } => exprs.as_slice(),
         _ => std::slice::from_ref(body),
     };
+    let mut handed_back = None;
     for (i, statement) in statements.iter().enumerate() {
         if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*statement.node
             && let ExprNode::Array { elements, .. } = &*value.node
@@ -729,13 +732,14 @@ fn collect_var_element_sets(body: &Expr) -> HashMap<Symbol, Vec<Expr>> {
         // The last statement's value is the method's. The caller can then
         // change a list handed back, but only a block can walk it again.
         let last = i + 1 == statements.len();
-        let returned = last && list_returned(statement).is_some_and(|name| !read_in_block(body, name));
-        walk_var_uses(statement, last && !returned, &mut uses);
+        handed_back = list_returned(statement).filter(|name| last && !read_in_block(body, name));
+        walk_var_uses(statement, last && handed_back.is_none(), &mut uses);
     }
-    let ListUses { mut sets, poisoned, exposed } = uses;
+    let ListUses { mut sets, poisoned, exposed, kept } = uses;
     sets.retain(|name, elems| {
         let strings = elems.iter().any(|el| matches!(&*el.node, ExprNode::Lit { value: Literal::Str { .. } }));
-        !poisoned.contains(name) && bindings(body, name, true) == 1 && !(strings && exposed.contains(name))
+        let changeable = exposed.contains(name) || (kept.contains(name) && handed_back == Some(name));
+        !poisoned.contains(name) && bindings(body, name, true) == 1 && !(strings && changeable)
     });
     sets
 }
@@ -746,6 +750,8 @@ struct ListUses {
     poisoned: BTreeSet<Symbol>,
     /// Lists a walk hands an element to other than as an interpolated piece.
     exposed: BTreeSet<Symbol>,
+    /// Lists a block inside a walk keeps an element of after the walk.
+    kept: BTreeSet<Symbol>,
 }
 
 /// `used`: the value of `e` is read, not dropped as a statement's.
@@ -772,6 +778,9 @@ fn walk_var_uses(e: &Expr, used: bool, uses: &mut ListUses) {
                 "each" | "map" | "flat_map" | "each_with_index" if uses.sets.contains_key(name) => {
                     let exposes = match block.as_ref().map(|b| &*b.node) {
                         Some(ExprNode::Lambda { params, extra_params, rest_param, body, .. }) => {
+                            if params.first().is_some_and(|p| read_in_block(body, p)) {
+                                uses.kept.insert(name.clone());
+                            }
                             !extra_params.is_empty()
                                 || rest_param.is_some()
                                 || params.first().is_some_and(|p| read_besides_interpolation(body, p))
@@ -832,7 +841,7 @@ fn list_returned(statement: &Expr) -> Option<&Symbol> {
 }
 
 /// True when a block in `body` reads the local `name`: a block may run
-/// after the method returns.
+/// after the method returns, or after the walk whose body this is.
 fn read_in_block(body: &Expr, name: &Symbol) -> bool {
     fn walk(e: &Expr, name: &Symbol, in_block: bool) -> bool {
         if let ExprNode::Var { name: n, .. } = &*e.node {
@@ -895,6 +904,7 @@ fn rewrite(
             _ => None,
         };
         if let Some(index) = element {
+            let literal_each = method.as_str() == "each" && matches!(&*r.node, ExprNode::Array { .. });
             let elems: Option<Vec<Expr>> = match &*r.node {
                 ExprNode::Array { elements, .. } => Some(elements.clone()),
                 ExprNode::Var { name, .. } => var_sets.get(name).cloned(),
@@ -914,7 +924,10 @@ fn rewrite(
                     // Not a parameter the block binds again: it may hold another value when it is read.
                     if !rebinds(body, &param) {
                         let strings = elems.iter().any(|el| matches!(&*el.node, ExprNode::Lit { value: Literal::Str { .. } }));
-                        let in_place = strings && read_besides_interpolation(body, &param);
+                        // A literal's `each` hands the literal back, so a String element a block inside keeps
+                        // (`@run = -> { "#{status}" }`) can change after the walk. A list local's check is its own.
+                        let kept = literal_each && read_in_block(body, &param);
+                        let in_place = strings && (kept || read_besides_interpolation(body, &param));
                         inner.push(IterBinding { name: &param, elems: &elems, in_place });
                     }
                     rewrite(body, var_sets, providers, origins, &inner, registry, diags);
