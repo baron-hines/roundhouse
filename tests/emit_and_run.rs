@@ -339,6 +339,8 @@ mod representable;
 mod active_model_serializer_app;
 #[path = "emit_and_run/active_model_serializer.rs"]
 mod active_model_serializer;
+#[path = "emit_and_run/serializer_scope.rs"]
+mod serializer_scope;
 #[path = "emit_and_run/instance_extend.rs"]
 mod instance_extend;
 
