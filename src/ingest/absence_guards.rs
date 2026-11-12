@@ -125,8 +125,11 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
             Some(full[..depth].join("::"))
         })
     };
-    // A required path is the absent gem's own when its namespace is (tzinfo-data's `tzinfo/data`).
-    let unloadable = |path: &str| absent_namespaces.owner(&path.split('/').collect::<Vec<_>>().join("::")).is_some();
+    // A required path is the absent gem's own when its namespace is (tzinfo-data's `tzinfo/data`), unless a locked,
+    // installed gem ships the file: Ruby's `require` then loads that one.
+    let unloadable = |path: &str| {
+        absent_namespaces.owner(&path.split('/').collect::<Vec<_>>().join("::")).is_some() && !shipped(feature_of(path))
+    };
     // Not a feature any locked gem (by name, constant or file), Ruby (by exact path) or Rails provides: a gem's optional feature's library the app doesn't bundle
     // (`require "method_source"` in a loader that rescues LoadError). Ruby raises LoadError where the method runs; Spinel
     // resolves a require statically, and `spin build` refuses one it cannot satisfy.
