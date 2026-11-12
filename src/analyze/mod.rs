@@ -213,6 +213,8 @@ pub struct Analyzer {
     class_factories: HashMap<crate::span::Span, Ty>,
     /// [`constant_predicates`] of the app.
     constant_predicates: HashMap<(ClassId, Symbol), bool>,
+    /// [`predicate_bodies`] of the app.
+    predicate_bodies: HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>,
     /// Registered Data factories that use the generated initializer, so
     /// `.new` call-site types do not manufacture a source `initialize`.
     data_factories_without_custom_initialize: HashSet<ClassId>,
@@ -1425,6 +1427,7 @@ impl Analyzer {
             data_factories,
             class_factories: HashMap::default(),
             constant_predicates: constant_predicates(app),
+            predicate_bodies: predicate_bodies(app),
             data_factories_without_custom_initialize,
             view_seeds: None,
             callers_by_target: HashMap::default(),
@@ -1455,7 +1458,7 @@ impl Analyzer {
             .with_open_classes(&self.open_classes)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories);
-        let typer = typer.with_class_factories(&self.class_factories).with_constant_predicates(&self.constant_predicates);
+        let typer = typer.with_class_factories(&self.class_factories).with_constant_predicates(&self.constant_predicates).with_predicate_bodies(&self.predicate_bodies);
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
@@ -7929,6 +7932,64 @@ fn constant_predicates(app: &App) -> HashMap<(ClassId, Symbol), bool> {
                 && !crate::emit::audit::OBJECT_METHODS.contains(&m.name.as_str())
             {
                 out.insert((c.name.clone(), m.name.clone()), *value);
+            }
+        }
+    }
+    out
+}
+
+/// Each instance method, of a name no other method of the app defines, that takes only positional parameters and
+/// whose body is one condition (`resource.respond_to?(:m) && …`): its parameters and that condition.
+fn predicate_bodies(app: &App) -> HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)> {
+    let mut defs: HashMap<Symbol, usize> = HashMap::default();
+    for m in app.library_classes.iter().flat_map(|c| c.methods.iter()).chain(app.models.iter().flat_map(|m| m.methods())) {
+        *defs.entry(m.name.clone()).or_default() += 1;
+    }
+    let mut out = HashMap::default();
+    for c in &app.library_classes {
+        for m in c.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && !m.params.is_empty()) {
+            if defs.get(&m.name) != Some(&1)
+                || m.block_param.is_some()
+                || m.params.iter().any(|p| p.keyword || p.default.is_some() || p.rest || p.forwarding || p.name.as_str().is_empty())
+            {
+                continue;
+            }
+            let body = match &*m.body.node {
+                ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+                ExprNode::Seq { .. } => continue,
+                _ => &m.body,
+            };
+            if matches!(&*body.node, ExprNode::BoolOp { .. } | ExprNode::Send { .. }) {
+                out.insert((c.name.clone(), m.name.clone()), (m.params.iter().map(|p| p.name.clone()).collect(), body.clone()));
+            }
+        }
+    }
+    // A controller's own helpers too (Devise's PasswordsController#unlockable?).
+    let mut actions: HashMap<Symbol, usize> = HashMap::default();
+    for a in app.controllers.iter().flat_map(|c| c.actions()) {
+        *actions.entry(a.name.clone()).or_default() += 1;
+    }
+    for c in &app.controllers {
+        for a in c.actions() {
+            if actions.get(&a.name) != Some(&1)
+                || defs.contains_key(&a.name)
+                || a.params.fields.is_empty()
+                || !a.opt_params.is_empty()
+                || !a.kw_params.is_empty()
+                || a.kwrest_param.is_some()
+                || a.block_param.is_some()
+                || a.rest_param.is_some()
+                || a.anonymous_formal.is_some()
+            {
+                continue;
+            }
+            let body = match &*a.body.node {
+                ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+                ExprNode::Seq { .. } => continue,
+                _ => &a.body,
+            };
+            if matches!(&*body.node, ExprNode::BoolOp { .. } | ExprNode::Send { .. }) {
+                out.insert((c.name.clone(), a.name.clone()), (a.params.fields.keys().cloned().collect(), body.clone()));
             }
         }
     }
