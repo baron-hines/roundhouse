@@ -299,3 +299,56 @@ fn r2_configuring_a_job_does_not_enqueue_it() {
 fn r2_foreign_adapter_setter_preserves_durable_storage_natively() {
     foreign_adapter_app().run_spinel_with_db(FOREIGN_STORED).assert_passes();
 }
+
+/// A bare `NotifyJob` in a setter resolves the way Ruby looks it up from
+/// that class body. Inside `module Admin; class NotifyJob` the lexical
+/// scope `Admin` holds it, so it names the job itself, even when a
+/// top-level `NotifyJob` exists.
+const TOP_NOTIFY_JOB: &str = "class NotifyJob < ApplicationJob\n  def perform(value)\n    ProbeSink.record(\"top\")\n  end\nend\n";
+fn admin_notify_job(open: &str, close: &str, adapter: &str) -> String {
+    format!("{open}  NotifyJob.queue_adapter = :{adapter}\n  def perform(value)\n    ProbeSink.record(\"ran\")\n  end\n{close}")
+}
+const NESTED: (&str, &str) = ("module Admin\nclass NotifyJob < ApplicationJob\n", "end\nend\n");
+const COMPACT: (&str, &str) = ("class Admin::NotifyJob < ApplicationJob\n", "end\n");
+
+#[test]
+fn a_nested_jobs_bare_setter_exempts_the_job_itself() {
+    for top in [false, true] {
+        for (adapter, ran, held) in [("inline", 1, 0), ("test", 0, 1)] {
+            let mut overlay = tracked("Admin::NotifyJob.perform_later({ value: 1 })")
+                .write("app/jobs/admin/notify_job.rb", &admin_notify_job(NESTED.0, NESTED.1, adapter));
+            if top {
+                overlay = overlay.write("app/jobs/notify_job.rb", TOP_NOTIFY_JOB);
+            }
+            overlay.run_ruby(&format!("ActiveJob.register_drain\nEnqueues.submit(nil)\nraise 'SQL write' unless SolidQueue::Job.count == 0\nraise 'local Proc' unless ActiveJob::PENDING.empty?\nraise 'execution' unless ProbeSink::VALUES == {:?}\nraise 'test hold' unless ActiveJob::HELD.length == {held}\n", vec!["ran"; ran])).assert_passes();
+        }
+    }
+}
+
+/// The nested setter configures `Admin::NotifyJob` only: a top-level
+/// `NotifyJob` keeps the app's durable adapter and its refusal.
+#[test]
+fn a_nested_jobs_bare_setter_leaves_a_top_level_namesake_durable() {
+    let (_, _, errors) = tracked("Admin::NotifyJob.perform_later({ value: 1 })\n    NotifyJob.perform_later({ value: 1 })")
+        .write("app/jobs/admin/notify_job.rb", &admin_notify_job(NESTED.0, NESTED.1, "inline"))
+        .write("app/jobs/notify_job.rb", TOP_NOTIFY_JOB)
+        .emit_with_app(BuildTarget::Ruby);
+    assert!(errors.iter().any(|d| d.message.contains("`NotifyJob`") && d.message.contains("payload")), "{errors:#?}");
+    assert!(!errors.iter().any(|d| d.message.contains("Admin::NotifyJob") && d.message.contains("payload")), "{errors:#?}");
+}
+
+/// `class Admin::NotifyJob` makes only itself a lexical scope, so a bare
+/// `NotifyJob` there is the top-level class (CRuby: a NameError when none
+/// exists), never the job. Its payload keeps the durable refusal.
+#[test]
+fn a_compact_jobs_bare_setter_does_not_exempt_the_job() {
+    for top in [false, true] {
+        let mut overlay = tracked("Admin::NotifyJob.perform_later({ value: 1 })")
+            .write("app/jobs/admin/notify_job.rb", &admin_notify_job(COMPACT.0, COMPACT.1, "inline"));
+        if top {
+            overlay = overlay.write("app/jobs/notify_job.rb", TOP_NOTIFY_JOB);
+        }
+        let (_, _, errors) = overlay.emit_with_app(BuildTarget::Ruby);
+        assert!(errors.iter().any(|d| d.message.contains("`Admin::NotifyJob`") && d.message.contains("payload")), "top={top}: {errors:#?}");
+    }
+}

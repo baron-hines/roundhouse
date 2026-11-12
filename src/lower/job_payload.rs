@@ -1132,6 +1132,7 @@ pub(super) fn job_adapter(app: &App, name: &str) -> Option<String> {
                 && method.as_str() == "queue_adapter=" && args.len() == 1 {
                 let own = match &*recv.node {
                     ExprNode::SelfRef => true,
+                    // The class Ruby looks it up to from this body (`ingest::written_names`).
                     ExprNode::Const { path } => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == name,
                     _ => false,
                 };
