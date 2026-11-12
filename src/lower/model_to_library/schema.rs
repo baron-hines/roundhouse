@@ -2442,6 +2442,15 @@ fn synth_column_prev_was(owner: &ClassId, col: &Column) -> MethodDef {
 /// question in Rails, as the two saved-change predicates are. Shared
 /// by the synthesis and `shakeable_synthesized_names`, so the two lists
 /// cannot drift.
+/// Whether `name` is spelled as one of [`pending_change_methods`]' names for some column.
+pub(crate) fn is_pending_change_spelling(name: &str) -> bool {
+    name.ends_with("_changed?")
+        || name.starts_with("will_save_change_to_")
+        || name.ends_with("_was")
+        || (name.starts_with("clear_") && name.ends_with("_change"))
+        || (name.starts_with("restore_") && name.ends_with('!'))
+}
+
 fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
     let n = col.name.as_str();
     vec![
@@ -2545,6 +2554,7 @@ fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
     for model in models {
         #[cfg(test)]
         lookup_test_support::MODEL_VISITS.with(|n| n.set(n.get() + 1));
+        out.extend(model.mixin_sends.iter().cloned());
         for item in &model.body {
             match item {
                 ModelBodyItem::Method { method, .. } => walk(&method.body, &mut out),

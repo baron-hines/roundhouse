@@ -616,3 +616,59 @@ fn a_devise_user_signs_in_over_http_natively() {
     let (again, _) = server.request_with_set_cookies("GET", "/users/sign_in", &[("Cookie", cookie.as_str())], "");
     assert_eq!(again.status, 302, "{}", server.log());
 }
+
+/// `:validatable`: Devise's `included` hook `class_eval`s its `validates_*_of` calls onto the model, with
+/// `email_regexp` and `password_length` read as the hook runs. Each case's errors are Rails 8.1.4's with Devise 4.9.4.
+const CHECKS: &str = "class AccountsController < ApplicationController\n  def create\n    User.create!(email: \"a@example.com\", password: \"secret123\")\n    head :ok\n  end\n\n  def check\n    user = User.new(email: params[:email], password: params[:password])\n    user.password_confirmation = params[:confirmation] if params[:confirmation]\n    user.valid?\n    render plain: user.errors.full_messages.join(\"|\")\n  end\nend\n";
+
+const VALIDATABLE_ROUTES: &str = "  devise_for :users\n  get \"/account/new\", to: \"accounts#create\"\n  get \"/account/check\", to: \"accounts#check\"\n";
+
+/// The query of each case, and the errors Rails answers for it.
+const VALIDATABLE_CASES: [(&str, &str); 6] = [
+    ("email=bad&password=123", "Email is invalid|Password is too short (minimum is 6 characters)"),
+    ("email=&password=", "Email can't be blank|Password can't be blank"),
+    ("email=b%40example.com&password=secret123&confirmation=other", "Password confirmation doesn't match Password"),
+    ("email=b%40example.com&password=secret123&confirmation=secret123", ""),
+    ("email=b%40example.com&password=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "Password is too long (maximum is 128 characters)"),
+    ("email=a%40example.com&password=secret123", "Email has already been taken"),
+];
+
+#[test]
+fn devise_validatable_answers_rails_errors_on_the_ruby_family() {
+    let cases = VALIDATABLE_CASES.iter().map(|(query, want)| format!("[{query:?}, {want:?}]")).collect::<Vec<_>>().join(",\n  ");
+    let script = format!(
+        r##"def get(path, query)
+  env = {{ "REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => query, "SERVER_NAME" => "localhost",
+          "SERVER_PORT" => "80", "HTTP_HOST" => "localhost", "rack.url_scheme" => "http", "rack.input" => StringIO.new("") }}
+  status, _headers, chunks = Main.run_rack(env)
+  [status, chunks.join]
+end
+status, = get("/account/new", "")
+raise "account #{{status}}" unless status == 200
+[
+  {cases}
+].each do |query, want|
+  status, body = get("/account/check", query)
+  raise "#{{query}}: #{{status}} #{{body.inspect}}" unless status == 200 && body == want
+end
+puts "devise validatable passed"
+"##
+    );
+    let run = app(":database_authenticatable, :validatable", VALIDATABLE_ROUTES).write("app/controllers/accounts_controller.rb", CHECKS).run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("devise validatable passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn devise_validatable_answers_rails_errors_natively() {
+    let tree = app(":database_authenticatable, :validatable", VALIDATABLE_ROUTES)
+        .write("app/controllers/accounts_controller.rb", CHECKS)
+        .native_http_tree();
+    let server = super::native_http::Server::start(&tree);
+    assert_eq!(server.get("/account/new").status, 200, "{}", server.log());
+    for (query, want) in VALIDATABLE_CASES {
+        let answer = server.get(&format!("/account/check?{query}"));
+        assert_eq!((answer.status, answer.body.as_str()), (200, want), "{query}\n{}", server.log());
+    }
+}
