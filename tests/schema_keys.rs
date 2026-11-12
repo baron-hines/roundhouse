@@ -544,15 +544,26 @@ fn removing_a_composite_primary_key_column_is_refused() {
     assert!(error.contains("db/migrate/1_remove.rb") && error.contains("composite primary key"), "{error}");
 }
 
+/// Rails 8.1.4 on SQLite fails to rebuild `identities` when the removed
+/// `b_id` is in its primary key, but removes a separate `b_id` from a
+/// `(a, b)` key and keeps the key.
 fn refuse_reference_key_removal(verb: &str) {
     use roundhouse::ingest::ingest_migration;
-    let source = SCHEMA.replace("t.string \"label\"", "t.string \"label\"\n    t.integer :b_id");
+    let source = SCHEMA.replace("primary_key: [:a, :b] do |t|\n    t.integer \"a\", null: false\n    t.integer \"b\", null: false", "primary_key: [:a, :b_id] do |t|\n    t.integer \"a\", null: false\n    t.integer \"b_id\", null: false");
+    assert_ne!(source, SCHEMA);
     let mut schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
     let migration = format!("class RemoveReference < ActiveRecord::Migration[8.1]\n def change\n {verb} :identities, :b\n end\nend");
     let error = ingest_migration(migration.as_bytes(), "db/migrate/1_reference.rb", &mut schema)
         .expect_err("reference removal must not invalidate the composite key").to_string();
     assert!(error.contains("db/migrate/1_reference.rb") && error.contains("composite primary key"), "{error}");
-    assert!(schema.tables[&roundhouse::Symbol::from("identities")].columns.iter().any(|c| c.name.as_str() == "b"));
+    assert!(schema.tables[&roundhouse::Symbol::from("identities")].columns.iter().any(|c| c.name.as_str() == "b_id"));
+
+    let source = SCHEMA.replace("t.string \"label\"", "t.string \"label\"\n    t.integer :b_id");
+    let mut schema = ingest_schema(source.as_bytes(), "db/schema.rb").unwrap();
+    ingest_migration(migration.as_bytes(), "db/migrate/1_reference.rb", &mut schema).expect("a separate `b_id` is removable");
+    let identities = &schema.tables[&roundhouse::Symbol::from("identities")];
+    assert_eq!(identities.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a", "b", "label"]);
+    assert_eq!(identities.primary_key_columns, [roundhouse::Symbol::from("a"), roundhouse::Symbol::from("b")]);
 }
 
 #[test]

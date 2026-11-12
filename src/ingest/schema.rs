@@ -663,9 +663,12 @@ fn apply_table_verb(
                 let removed = |column: &Column| column.name.as_str() == physical
                     || (column.name.as_str() == name && matches!(column.col_type, ColumnType::Reference { .. }));
                 if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
-                    refuse_composite_primary_key_mutation(verb, table, &name, file)?;
+                    let no_id = !table.columns.iter().any(|column| column.name.as_str() == physical);
+                    for column in table.columns.iter().filter(|column| removed(column)) {
+                        refuse_composite_primary_key_mutation(verb, table, column.name.as_str(), file)?;
+                    }
                     refuse_composite_foreign_key_mutation(verb, table, &[physical.as_str()], file)?;
-                    if table.columns.iter().any(|column| {
+                    if no_id && table.columns.iter().any(|column| {
                         column.name.as_str() == name && column.generated.is_some()
                     }) {
                         return Err(IngestError::Unsupported {
@@ -679,7 +682,6 @@ fn apply_table_verb(
                     if table.columns.iter().any(|column| column.generated.is_some()) {
                         // Without a `<name>_id`, PostgreSQL fails the removal (SQLite skips
                         // it), so a generated column reading an ordinary `<name>` still refuses.
-                        let no_id = !table.columns.iter().any(|column| column.name.as_str() == physical);
                         let mut candidate = table.clone();
                         candidate.columns.retain(|column| !removed(column) && !(no_id && column.name.as_str() == name));
                         validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
@@ -980,7 +982,7 @@ fn refuse_composite_foreign_key_mutation(verb: &str, table: &Table, columns: &[&
 }
 
 fn refuse_composite_primary_key_mutation(verb: &str, table: &Table, column: &str, file: &str) -> IngestResult<()> {
-    if table.primary_key_columns.iter().any(|key| key.as_str() == column || (matches!(verb, "remove_reference" | "remove_belongs_to") && key.as_str() == format!("{column}_id"))) {
+    if table.primary_key_columns.iter().any(|key| key.as_str() == column) {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: format!("migration `{verb}` on {}.{column} changes a composite primary key; run `rails db:migrate` to materialize db/schema.rb", table.name),
