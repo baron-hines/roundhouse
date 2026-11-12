@@ -3287,6 +3287,8 @@ end
     refuse_unread_concern_filters(&app)?;
     drop_modelled_included_hooks(&mut app);
     splice_concerns_into_controllers(&mut app);
+    // After the splice: a concern's filter reads the key as the controller's own body does.
+    crate::lower::primary_key_send::rewrite_guarded(&mut app);
     // After the splice: an action a concern provides is not implicit.
     synthesize_template_only_actions(&mut app);
     // After the splice: a macro has to resolve against the concern's
