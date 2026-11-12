@@ -223,6 +223,16 @@ impl std::fmt::Display for IngestError {
 
 impl std::error::Error for IngestError {}
 
+/// Render the current failure before another ingest replaces its noted source site.
+pub fn render_error(err: &IngestError) -> String {
+    if let IngestError::Unsupported { file, message } = err
+        && let Some((start, _)) = error_site::of(err)
+        && let Some(line) = sources::line_at(file, start) {
+        return format!("unsupported construct in {file}:{line}: {message}");
+    }
+    err.to_string()
+}
+
 impl From<std::io::Error> for IngestError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)

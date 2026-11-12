@@ -148,23 +148,20 @@ module ActiveRecord
   # stays unmodeled.
   module Reflection
     class AssociationReflection
-      # Not `macro` for the slot: Rust reserves the word, and the field and parameter take its name.
-      def initialize(name, counter_cache_column, kind, foreign_key, polymorphic)
+      def initialize(name, counter_cache_column, macro, foreign_key, polymorphic)
         @name = name
         @counter_cache_column = counter_cache_column
-        @kind = kind
+        @macro = macro
         @foreign_key = foreign_key
         @polymorphic = polymorphic
-        @options = {}
-        @options[:polymorphic] = true if polymorphic
       end
 
       def macro
-        @kind
+        @macro
       end
 
       def belongs_to?
-        @kind == :belongs_to
+        @macro == :belongs_to
       end
 
       def foreign_key
@@ -176,15 +173,13 @@ module ActiveRecord
       end
 
       # Not every option the association was declared with: only `polymorphic:` is kept, as Rails holds it (present only when given).
-      # Not a Hash literal built here: a strict target types a local literal apart from the declared return, the slot carries the type.
       def options
-        @options
+        @polymorphic ? { polymorphic: true } : {}
       end
 
       # Rails' `"#{name}_type"`, of a polymorphic belongs_to only.
       def foreign_type
-        return nil unless @polymorphic
-        "#{@name}_type"
+        @polymorphic ? "#{@name}_type" : nil
       end
 
       def name

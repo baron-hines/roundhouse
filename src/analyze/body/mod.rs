@@ -960,12 +960,21 @@ impl<'a> BodyTyper<'a> {
         }
         // `if devise_mapping.validatable?` over a predicate that answers one constant: Ruby takes one branch, and the
         // other, typed, would report what never runs.
+        let mut evaluated = Vec::new();
         if let ExprNode::If { cond, .. } = &mut *expr.node
-            && let Some(answer) = self.constant_predicate(cond, ctx)
+            && let Some(answer) = self.constant_predicate_parts(cond, ctx, &mut evaluated)
             && let ExprNode::If { then_branch, else_branch, .. } = &*expr.node
         {
             let (kept, dropped) = if answer { (then_branch.clone(), else_branch.clone()) } else { (else_branch.clone(), then_branch.clone()) };
-            *expr = declare_dropped_locals(kept, &dropped, ctx);
+            let branch = declare_dropped_locals(kept, &dropped, ctx);
+            // Not the branch alone where the condition runs code (`fetch_resource.respond_to?(:m)`): Ruby still runs it.
+            *expr = if evaluated.is_empty() {
+                branch
+            } else {
+                let span = expr.span;
+                evaluated.push(branch);
+                Expr::new(span, ExprNode::Seq { exprs: evaluated })
+            };
         }
         // `a && b` whose left answers false (`resource.respond_to?(:m) && resource.m`): Ruby answers the left and never
         // evaluates the right, which, typed, would report what never runs.
@@ -1297,19 +1306,36 @@ impl<'a> BodyTyper<'a> {
     }
 
     fn constant_predicate(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
+        self.constant_predicate_parts(cond, ctx, &mut Vec::new())
+    }
+
+    /// [`Self::constant_predicate`], with each operand Ruby evaluates that may run code pushed to `evaluated`, in order.
+    fn constant_predicate_parts(&self, cond: &mut Expr, ctx: &Ctx, evaluated: &mut Vec<Expr>) -> Option<bool> {
         // `devise_mapping.lockable? && resource_class.unlock_strategy_enabled?(:email)`: Ruby never evaluates the right.
         if let ExprNode::BoolOp { left, op, right, .. } = &mut *cond.node {
             let short = matches!(op, crate::expr::BoolOpKind::Or);
-            return match self.constant_predicate(left, ctx)? {
+            return match self.constant_predicate_parts(left, ctx, evaluated)? {
                 answer if answer == short => Some(short),
-                _ => self.constant_predicate(right, ctx),
+                _ => self.constant_predicate_parts(right, ctx, evaluated),
             };
         }
-        let predicates = self.constant_predicates?;
         // `if unlockable?(resource)`: a predicate of the class's own whose body is a condition over what it is passed.
-        if let Some(answer) = self.inlined_predicate(cond, ctx) {
-            return Some(answer);
+        self.constant_predicates?;
+        let mut body_runs = false;
+        let answer = match self.inlined_predicate(cond, ctx, &mut body_runs) {
+            Some(answer) => answer,
+            None => self.constant_predicate_leaf(cond, ctx)?,
+        };
+        let plain = |e: &Expr| matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef | ExprNode::Lit { .. } | ExprNode::Const { .. });
+        // Nor a predicate whose own body runs code (`fetch_resource.respond_to?(:missing)`): the call is what runs it.
+        if body_runs || !matches!(&*cond.node, ExprNode::Send { recv, args, .. } if recv.as_ref().is_none_or(|r| plain(r)) && args.iter().all(plain)) {
+            evaluated.push(cond.clone());
         }
+        Some(answer)
+    }
+
+    fn constant_predicate_leaf(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
+        let predicates = self.constant_predicates?;
         // `respond_to?(:disable_warnings)` in a class method (OmniAuth's `KeyStore.override_logging`): true where the
         // class side's chain defines it, which every class below answers too.
         // Not false where nothing defines it: a subclass the call runs on may.
@@ -1338,6 +1364,7 @@ impl<'a> BodyTyper<'a> {
                     if self.is_instance(r, ctx)
                         && self.never_responds(t, &asked)
                         && !self.chain_defines(id, &Symbol::from("respond_to?"))
+                        && !self.chain_defines(id, &Symbol::from("respond_to_missing?"))
                         && self.reaches_object(id) =>
                 {
                     Some(false)
@@ -1357,7 +1384,14 @@ impl<'a> BodyTyper<'a> {
             let try_name = Symbol::from("try");
             return match r.ty.as_ref().map(Ty::peel_nilable) {
                 // Not a class with a `try` of the program's in its chain: Object's is the one that answers nil.
-                Some(t @ Ty::Class { id, .. }) if self.never_responds(t, &asked) && !self.chain_defines(id, &try_name) => Some(false),
+                Some(t @ Ty::Class { id, .. })
+                    if self.never_responds(t, &asked)
+                        && !self.chain_defines(id, &try_name)
+                        && !self.chain_defines(id, &Symbol::from("respond_to_missing?"))
+                        && self.descendants_never_answer(id, &asked) =>
+                {
+                    Some(false)
+                }
                 // Nor a union of such classes (Devise's mailer views over two mappings' models): nil's `try` answers nil too.
                 // Not past a receiver that may run code (`(flag ? A.new : B.new).try(:m)`): the fold would drop it with the condition.
                 Some(Ty::Union { variants })
@@ -1370,8 +1404,10 @@ impl<'a> BodyTyper<'a> {
                             matches!(v, Ty::Class { id, .. } if !self.chain_defines(id, &try_name)
                                 && !self.defines_short_of_object(id, &try_name)
                                 && !self.chain_defines(id, &Symbol::from("respond_to?"))
+                                && !self.chain_defines(id, &Symbol::from("respond_to_missing?"))
                                 && self.reaches_object(id))
                                 && self.never_responds(v, &asked)
+                                && matches!(v, Ty::Class { id, .. } if self.descendants_never_answer(id, &asked))
                         })
                         // Nor past a nil whose `try` the program overrides: NilClass's own answers nil.
                         && (!variants.iter().any(|v| matches!(v, Ty::Nil))
@@ -1406,7 +1442,7 @@ impl<'a> BodyTyper<'a> {
 
     /// `m(a, b)`, receiverless, where `m` is the one definition of the name in the class's chain, takes exactly those
     /// positional parameters and is one condition over them: that condition, with what is passed written in.
-    fn inlined_predicate(&self, cond: &Expr, ctx: &Ctx) -> Option<bool> {
+    fn inlined_predicate(&self, cond: &Expr, ctx: &Ctx, body_runs: &mut bool) -> Option<bool> {
         thread_local! { static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*cond.node else { return None };
         if args.is_empty() || ctx.class_side || DEPTH.with(|d| d.get()) > 4 {
@@ -1420,7 +1456,8 @@ impl<'a> BodyTyper<'a> {
         }
         let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return None };
         let ((owner, _), (params, body)) = self.predicate_bodies?.iter().find(|((_, m), _)| m == method)?;
-        if params.len() != args.len() || !self.in_chain(id, owner) {
+        // Not a module's body the class or a later include overrides: the nearest definition is the one Ruby calls.
+        if params.len() != args.len() || self.nearest_definer(id, method).as_ref() != Some(owner) {
             return None;
         }
         let bound: HashMap<Symbol, Expr> = params.iter().cloned().zip(args.iter().cloned()).collect();
@@ -1429,32 +1466,34 @@ impl<'a> BodyTyper<'a> {
             _ => None,
         });
         DEPTH.with(|d| d.set(d.get() + 1));
-        let answer = self.constant_predicate(&mut written, ctx);
+        let mut inner = Vec::new();
+        let answer = self.constant_predicate_parts(&mut written, ctx, &mut inner);
         DEPTH.with(|d| d.set(d.get() - 1));
+        *body_runs = !inner.is_empty();
         answer
     }
 
-    /// Whether `owner` is `class`, one of its parents, or a module they include.
-    fn in_chain(&self, class: &ClassId, owner: &ClassId) -> bool {
+    /// The class or module whose own `method` an instance of `class` calls: the class, its includes from the latest,
+    /// then its parent's.
+    fn nearest_definer(&self, class: &ClassId, method: &Symbol) -> Option<ClassId> {
         let classes = self.classes();
-        let mut seen: Vec<ClassId> = Vec::new();
-        let mut pending = vec![class.clone()];
-        while let Some(c) = pending.pop() {
-            if c == *owner {
-                return true;
+        fn walk(classes: &HashMap<ClassId, ClassInfo>, c: &ClassId, method: &Symbol, depth: usize) -> Option<ClassId> {
+            if depth > 64 {
+                return None;
             }
-            if seen.contains(&c) || seen.len() > 64 {
-                continue;
+            let info = classes.get(c)?;
+            if info.source_instance_methods.contains(method) {
+                return Some(c.clone());
             }
-            seen.push(c.clone());
-            if let Some(info) = classes.get(&c) {
-                pending.extend(info.parent.iter().cloned());
-                pending.extend(info.includes.iter().cloned());
+            for m in info.includes.iter().rev() {
+                if let Some(found) = walk(classes, m, method, depth + 1) {
+                    return Some(found);
+                }
             }
+            info.parent.as_ref().and_then(|p| walk(classes, p, method, depth + 1))
         }
-        false
+        walk(classes, class, method, 0)
     }
-
 
     /// Whether a class or module in `class`'s chain short of `Object` registers `method`, source or not: a gem's
     /// `try` there answers before Active Support's.
@@ -1618,6 +1657,30 @@ impl<'a> BodyTyper<'a> {
             current = self.classes().get(&id).and_then(|c| c.parent.clone());
         }
         false
+    }
+
+    // A value typed `A` may be an instance of a subclass of A, whose own `try`, `respond_to?` or method answers.
+    fn descendants_never_answer(&self, of: &ClassId, asked: &Symbol) -> bool {
+        let classes = self.classes();
+        let below = |id: &ClassId| {
+            let mut seen = crate::det::HashSet::default();
+            let mut current = classes.get(id).and_then(|c| c.parent.clone());
+            while let Some(p) = current {
+                if &p == of {
+                    return true;
+                }
+                if !seen.insert(p.clone()) {
+                    break;
+                }
+                current = classes.get(&p).and_then(|c| c.parent.clone());
+            }
+            false
+        };
+        classes.keys().filter(|id| below(id)).all(|id| {
+            self.never_responds(&Ty::Class { id: id.clone(), args: Vec::new().into() }, asked)
+                && !self.chain_defines(id, &Symbol::from("try"))
+                && !self.chain_defines(id, &Symbol::from("respond_to?"))
+        })
     }
 
     // An app class over Hash/Array/String/Set answers `include?` as membership, not Module#include?.

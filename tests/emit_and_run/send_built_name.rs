@@ -60,30 +60,10 @@ fn a_send_of_a_built_name_calls_the_classs_method_of_that_shape_on_spinel() {
 /// that shape (`_extra`), which the module's `send` reaches and an arm list read from the module alone would miss.
 #[test]
 fn a_module_a_model_includes_sends_over_its_includers_methods() {
-    let (tree, errors) = emit_and_run::real_blog()
+    let run = emit_and_run::real_blog()
         .write("app/models/chimes.rb", "module Chimes\n  def chime(kind)\n    send(\"_#{kind}\")\n  end\n\n  def _soft\n    \"soft\"\n  end\nend\n")
         .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  include Chimes\n\n  def _extra\n    \"extra\"\n  end\n")
-        .emit(roundhouse::build_target::BuildTarget::Ruby);
-    let mut found = String::new();
-    for entry in walk(&tree) {
-        let text = std::fs::read_to_string(&entry).unwrap_or_default();
-        if text.contains("def chime") {
-            found = text;
-        }
-    }
-    assert!(found.contains("when \"extra\"") && found.contains("_extra"), "{found}\n{errors:#?}");
-    assert!(found.contains("when \"soft\"") && found.contains("_soft"), "{found}\n{errors:#?}");
-}
-
-fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(walk(&path));
-        } else if path.extension().is_some_and(|e| e == "rb") {
-            out.push(path);
-        }
-    }
-    out
+        .run_ruby("a = Article.new\ngot = [a.chime(\"extra\"), a.chime(\"soft\")]\nraise \"chimes: #{got.inspect}\" unless got == [\"extra\", \"soft\"]\nputs \"chimes passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("chimes passed"), "{}", run.stdout);
 }
