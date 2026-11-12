@@ -290,6 +290,20 @@ fn data_reopening_parameters_use_the_last_definition() {
     }
 }
 
+/// A load-time statement between two definitions sees the first, which ingest does not keep.
+#[test]
+fn a_statement_between_two_definitions_of_a_data_method_is_refused() {
+    for (receiver, call) in [("self.", "capture"), ("", "new(digest: 1).capture")] {
+        let source = format!("Artifact = Data.define(:digest) do\n  def {receiver}capture = \"old\"\n  CAPTURED = {call}\n  def {receiver}capture = 1\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "between two definitions", source.find("CAPTURED"));
+        }
+    }
+    let source = "Artifact = Data.define(:digest) do\n  CAPTURED = 1\n  def capture = \"old\"\n  def capture = 1\nend\n";
+    let mut app = review_record(source, "lib/artifact.rb", None);
+    assert!(errors(&mut app).is_empty());
+}
+
 /// A replaced definition never runs, so neither its block use nor its calls reach analysis.
 #[test]
 fn a_replaced_data_definition_reaches_no_caller_or_callee() {

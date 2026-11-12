@@ -603,14 +603,26 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
     let owner = ClassId(Symbol::from(name));
     let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
     if let Some(body) = body() {
-        if flatten_statements(body)
-            .iter()
-            .any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some())
-        {
+        let statements = flatten_statements(body);
+        if statements.iter().any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: "class or module inside a Data.define block".into(),
             });
+        }
+        // Ruby runs a load-time statement while the earlier definition is active,
+        // but only the last definition is kept and emitted.
+        let mut first: HashMap<(&str, bool), usize> = HashMap::default();
+        for (index, stmt) in statements.iter().enumerate() {
+            let Some(def) = visibility::definition(stmt) else { continue };
+            let key = (constant_id_str(&def.name()), def.receiver().is_some());
+            let start = *first.entry(key).or_insert(index);
+            if let Some(work) = statements[start..index].iter().skip(1).find(|stmt| !data_method_statement(stmt)) {
+                return Err(super::error_site::at(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "Data.define block with a load-time statement between two definitions of a method is not modeled".into(),
+                }, work));
+            }
         }
     }
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
