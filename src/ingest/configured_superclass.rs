@@ -3468,6 +3468,7 @@ pub(super) fn expand_model_mixin_macros<V: Vfs + ?Sized>(vfs: &V, dir: &Path, ge
             Some((mi, bi, includes, declared, hooked))
         })
         .collect();
+    let eligible: Vec<(usize, usize, Vec<String>)> = rewrites.iter().map(|r| (r.0, r.1, r.4.clone())).collect();
     // Not a model whose hooked module another class includes as it is: the hook stays for that one, and would run again on this one's `include`.
     // Per module: a model whose own rewrite ran some other hook still includes this one as written.
     loop {
@@ -3496,6 +3497,42 @@ pub(super) fn expand_model_mixin_macros<V: Vfs + ?Sized>(vfs: &V, dir: &Path, ge
     });
     if unexpanded {
         rewrites.clear();
+    }
+    // Not left to run at load: the hook's declarations are only what this expansion compiles, so a call it cannot
+    // rewrite, and a written `include` of the same module, run a hook the emitted model does not answer.
+    let kept: HashSet<(usize, usize)> = rewrites.iter().map(|r| (r.0, r.1)).collect();
+    let mut stranded: HashSet<String> = HashSet::default();
+    for (mi, bi, hooked) in &eligible {
+        if kept.contains(&(*mi, *bi)) {
+            continue;
+        }
+        stranded.extend(hooked.iter().cloned());
+        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+            app.models[*mi].body[*bi].span(),
+            None,
+            "class macro",
+            format!("its modules' `included` hook ({}) declares what only its expansion compiles, which another model's use of them leaves unexpanded", hooked.join(", ")),
+        ));
+    }
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
+                && let ExprNode::Send { recv: None, method, args, .. } = &*expr.node
+                && method.as_str() == "include"
+                && let [arg] = args.as_slice()
+                && let ExprNode::Const { path } = &*arg.node
+            {
+                let written = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                if stranded.contains(&written) {
+                    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                        expr.span,
+                        None,
+                        "included hook",
+                        format!("`{written}.included` declares on the model at load, which the emitted model does not answer"),
+                    ));
+                }
+            }
+        }
     }
     let mut hooked_by: HashMap<String, Vec<ClassId>> = HashMap::default();
     for (mi, bi, includes, declared, hooked) in rewrites {
