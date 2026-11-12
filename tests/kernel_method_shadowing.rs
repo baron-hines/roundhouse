@@ -250,6 +250,33 @@ end
 }
 
 #[test]
+fn a_conditional_class_receiver_dispatches_on_the_class_side() {
+    let source = r#"class Loader
+  def self.load(value) = 17
+  def load(value) = "instance"
+end
+class Formatter
+  def self.load(value) = 18
+  def load(value) = "instance"
+end
+class Probe
+  def self.reference(flag) = [nil].map(&(flag ? Loader : Formatter).method(:load))
+  def self.direct(flag) = (flag ? Loader : Formatter).load(nil)
+end
+"#;
+    let signatures = rbs(source, "probe");
+    for expected in [
+        "def self.reference: (untyped flag) -> Array[Integer]",
+        "def self.direct: (untyped flag) -> Integer",
+    ] {
+        assert!(signatures.contains(expected), "{signatures}");
+    }
+    let run = app(source).run_ruby("p [Probe.reference(true), Probe.reference(false), Probe.direct(true), Probe.direct(false)]\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "[[17], [18], 17, 18]\n");
+}
+
+#[test]
 fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls
   def load(value) = "instance"

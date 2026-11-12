@@ -1494,6 +1494,8 @@ impl<'a> BodyTyper<'a> {
     // `x.class` is not a class reference to `is_class_object`, yet types as the same flat `Ty::Class` as an instance.
     fn is_instance(&self, expr: &Expr, ctx: &Ctx) -> bool {
         !self.is_class_object(expr, ctx)
+            // `flag ? A : B` with a class object in every branch.
+            && !(matches!(&*expr.node, ExprNode::If { .. }) && self.each_branch_is_class_object(expr, ctx))
             && !matches!(&*expr.node, ExprNode::Var { name, .. } if ctx.query_class_objects.contains(name))
             && !matches!(&*expr.node, ExprNode::Send { method, args, .. } if method.as_str() == "class" && args.is_empty())
     }
