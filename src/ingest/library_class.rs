@@ -2281,7 +2281,22 @@ impl DeclBody {
             _ => false,
         });
         // Not `include`: an ancestor's `@@x` is shared with this body's. An extended module's methods read their own (rolify's `extend Configure` beside `@@resource_types = []`).
+        let autoload_only = |e: &Expr| {
+            let statements: Vec<&Expr> = match &*e.node {
+                ExprNode::Seq { exprs } => exprs.iter().collect(),
+                _ => vec![e],
+            };
+            statements.iter().all(|s| matches!(&*s.node, ExprNode::Send { recv: None, method, block: None, .. } if method.as_str() == "autoload"))
+        };
+        // A call of the body's own class method (simple_form's `wrappers … do |b| … end` at its module's end) is replayed
+        // where it stands, and the emitter then writes the body in source order around it.
+        let own_class_method = |name: &Symbol| self.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name == *name);
         let mixins_only = self.unknown_calls.iter().all(|call| match &*call.node {
+            ExprNode::Send { recv: None, method, .. } if own_class_method(method) => true,
+            // `eager_autoload do autoload :X end` (ActiveSupport::Autoload): the names it registers read no class variable.
+            ExprNode::Send { recv: None, method, args, block: Some(block), .. } if method.as_str() == "eager_autoload" && args.is_empty() => {
+                matches!(&*block.node, ExprNode::Lambda { params, body, .. } if params.is_empty() && autoload_only(body))
+            }
             ExprNode::Send { recv: None, method, args, block: None, .. } => {
                 (method.as_str() == "extend"
                     && !args.is_empty()
@@ -2289,6 +2304,8 @@ impl DeclBody {
                     // A visibility declaration over names reads no class variable.
                     || (method.as_str() == "autoload"
                         && matches!(args.as_slice(), [name, path] if matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { .. } }) && matches!(&*path.node, ExprNode::Lit { value: Literal::Str { .. } })))
+                    // ActiveSupport::Autoload's `autoload :Helpers`, whose path is the name's underscored file.
+                    || (method.as_str() == "autoload" && matches!(args.as_slice(), [name] if matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { .. } })))
                     || (matches!(method.as_str(), "private_constant" | "public_constant" | "private_class_method" | "public_class_method")
                         && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } })))
             }
