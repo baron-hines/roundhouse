@@ -646,7 +646,7 @@ def native_coverage(path):
     if path in {
         "tests/schema_keys.rs", "src/schema.rs", "src/ingest/schema.rs", "src/emit/shared/schema_sql.rs",
         "src/emit/roda.rs", "src/ingest/sequel_model.rs", "src/analyze/graphql.rs",
-        "src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs",
+        "src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs", "src/ingest/roda_app.rs",
     } or path.startswith("tests/support/schema_keys_"):
         suites.add("schema_keys")
     if path in JSON_TYPES_SPINEL_INPUTS:

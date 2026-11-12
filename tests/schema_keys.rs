@@ -288,14 +288,49 @@ fn unsupported_key_options_do_not_silently_become_id() {
 }
 
 #[test]
-fn a_foreign_key_to_an_absent_or_renamed_table_is_still_skipped() {
+fn foreign_keys_follow_a_renamed_table_and_skip_a_dropped_one() {
     use roundhouse::ingest::ingest_migration;
     let mut schema = ingest_schema(SCHEMA.as_bytes(), "db/schema.rb").unwrap();
     let migration = "class RenameParent < ActiveRecord::Migration[8.1]\n def change\n rename_table :parents, :renamed_parents\n end\nend";
     ingest_migration(migration.as_bytes(), "db/migrate/1_rename.rb", &mut schema).unwrap();
     let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
     assert!(!ddl.contains("REFERENCES parents"), "{ddl}");
+    // Rails 8.1.4 on SQLite points both child keys at the new name.
+    assert_eq!(ddl.matches("FOREIGN KEY (parent_id) REFERENCES renamed_parents (id)").count(), 2, "{ddl}");
     assert!(ddl.contains("FOREIGN KEY (tenant_id, item_id) REFERENCES scopes"), "{ddl}");
+    let migration = "class DropParent < ActiveRecord::Migration[8.1]\n def change\n drop_table :renamed_parents\n end\nend";
+    ingest_migration(migration.as_bytes(), "db/migrate/2_drop.rb", &mut schema).unwrap();
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+    assert!(!ddl.contains("REFERENCES renamed_parents"), "{ddl}");
+    assert!(ddl.contains("FOREIGN KEY (tenant_id, item_id) REFERENCES scopes"), "{ddl}");
+}
+
+#[test]
+fn rails_points_foreign_keys_at_a_renamed_table() {
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let script = format!(r##"
+require {helper:?}
+unless RailsOracle.available?("activerecord", sqlite3: ">= 2.9")
+  puts "skip: Rails oracle and sqlite3 are unavailable"
+  exit
+end
+RailsOracle.activate("activerecord", sqlite3: ">= 2.9")
+require "active_record"
+ActiveRecord::Schema.verbose = false
+ActiveRecord::Migration.verbose = false
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+{SCHEMA}
+ActiveRecord::Base.connection.rename_table :parents, :renamed_parents
+db = ActiveRecord::Base.connection
+%w[children immediate_children].each do |table|
+  raise "#{{table}} key target" unless db.foreign_keys(table).map(&:to_table) == ["renamed_parents"]
+end
+puts "rename verified with Rails"
+"##);
+    let out = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("rename verified with Rails") || stdout.contains("skip:"), "{stdout}");
 }
 
 /// Each removes a reference that carries a foreign key; Rails drops the
@@ -308,6 +343,12 @@ const REFERENCE_REMOVALS: &[(&str, &str, &[&str], &[&str])] = &[
     ("posts", "change_table(:posts) { |t| t.references :author, foreign_key: true }\n change_table(:posts) { |t| t.remove_references :author }", &["id", "title"], &[]),
     ("posts", "add_column :posts, :author_id, :integer\n add_foreign_key :posts, :authors\n remove_column :posts, :author_id", &["id", "title"], &[]),
     ("posts", "add_reference :posts, :author, foreign_key: true\n add_reference :posts, :editor, foreign_key: {to_table: :authors}\n remove_reference :posts, :author", &["id", "title", "editor_id"], &["editor_id"]),
+];
+
+/// Indexes over a removed reference's column go with it; others stay.
+const REFERENCE_INDEX_REMOVALS: &[(&str, &str, &[&[&str]])] = &[
+    ("posts", "add_belongs_to :posts, :author, foreign_key: true, index: false\n add_index :posts, :author_id\n add_index :posts, :title\n remove_belongs_to :posts, :author", &[&["title"]]),
+    ("notes", "create_table(:notes) { |t| t.references :author, foreign_key: true, index: false; t.string :label; t.index :author_id; t.index :label }\n remove_reference :notes, :author", &[&["label"]]),
 ];
 
 fn reference_removal_migration(body: &str) -> String {
@@ -325,6 +366,25 @@ fn removing_a_reference_drops_its_column_and_foreign_key() {
         assert_eq!(from, keys, "{body}");
         render_schema_statements_for(&schema, Dialect::Sqlite).unwrap_or_else(|e| panic!("{body}: {e}"));
     }
+}
+
+#[test]
+fn removing_a_reference_drops_indexes_over_its_column() {
+    let indexes = |schema: &roundhouse::schema::Schema, table: &str| schema.tables[&roundhouse::Symbol::from(table)].indexes.iter()
+        .map(|i| i.columns.iter().map(|c| c.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>();
+    for &(table, body, expected) in REFERENCE_INDEX_REMOVALS {
+        let mut schema = roundhouse::schema::Schema::default();
+        roundhouse::ingest::ingest_migration(reference_removal_migration(body).as_bytes(), "db/migrate/1_author.rb", &mut schema).unwrap();
+        assert_eq!(indexes(&schema, table), expected, "{body}");
+    }
+    // A composite index goes whole, as `remove_column` already drops it and
+    // PostgreSQL drops it; Rails' SQLite adapter instead keeps `[created_at]`.
+    let body = "create_table(:notes) { |t| t.references :author, foreign_key: true; t.datetime :created_at; t.index [:author_id, :created_at] }\n remove_reference :notes, :author";
+    let mut schema = roundhouse::schema::Schema::default();
+    roundhouse::ingest::ingest_migration(reference_removal_migration(body).as_bytes(), "db/migrate/1_author.rb", &mut schema).unwrap();
+    assert!(indexes(&schema, "notes").is_empty());
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap().join(";\n");
+    assert!(!ddl.contains("author_id"), "{ddl}");
 }
 
 #[test]
@@ -349,6 +409,15 @@ RemoveAuthor.migrate(:up)
 db = ActiveRecord::Base.connection
 raise "columns after {table}" unless db.columns({table:?}).map(&:name) == {columns:?}
 raise "keys after {table}" unless db.foreign_keys({table:?}).map(&:column) == {keys:?}
+"#));
+    }
+    for &(table, body, indexes) in REFERENCE_INDEX_REMOVALS {
+        let migration = reference_removal_migration(body);
+        script.push_str(&format!(r#"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+eval({migration:?})
+RemoveAuthor.migrate(:up)
+raise "indexes after {table}" unless ActiveRecord::Base.connection.indexes({table:?}).map(&:columns) == {indexes:?}
 "#));
     }
     script.push_str("puts 'reference removals verified with Rails'\n");

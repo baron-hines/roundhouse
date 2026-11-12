@@ -1139,7 +1139,7 @@ class Routing(unittest.TestCase):
                 self.assertIn("spinel-framework", plan["jobs"])
 
     def test_schema_key_readers_select_the_native_contract(self):
-        for path in ["src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs"]:
+        for path in ["src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs", "src/ingest/roda_app.rs"]:
             with self.subTest(path=path):
                 plan = ci.select([path])
                 self.assertIn("schema_keys", plan["spinel_tests"])

@@ -518,9 +518,13 @@ fn apply_table_verb(
         }
         "rename_table" => {
             if let (Some(old), Some(new)) = (arg_name(0), arg_name(1)) {
-                if let Some(mut table) = schema.tables.shift_remove(&Symbol::from(old)) {
+                if let Some(mut table) = schema.tables.shift_remove(&Symbol::from(old.as_str())) {
                     table.name = Symbol::from(new.clone());
-                    schema.tables.insert(Symbol::from(new), table);
+                    schema.tables.insert(Symbol::from(new.clone()), table);
+                    // Foreign keys follow the table: SQLite and PostgreSQL both retarget them.
+                    for fk in schema.tables.values_mut().flat_map(|t| t.foreign_keys.iter_mut()).filter(|fk| fk.to_table.0.as_str() == old) {
+                        fk.to_table = TableRef(Symbol::from(new.as_str()));
+                    }
                 }
             }
         }
@@ -679,6 +683,9 @@ fn apply_table_verb(
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     table.columns.retain(|x| !removed(x));
                     table.foreign_keys.retain(|fk| !matches!(fk.from_columns.as_slice(), [key] if key.as_str() == physical));
+                    // Indexes over the removed column go too, as `remove_named_column` drops them.
+                    let columns = &table.columns;
+                    table.indexes.retain(|idx| idx.columns.iter().all(|name| columns.iter().any(|col| col.name == *name)));
                 }
             }
         }
