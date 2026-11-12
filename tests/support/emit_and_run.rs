@@ -748,7 +748,7 @@ pub mod bundle {
         let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
         let (group, _) = shared_case(&dir, &key(overlay, "", &[HTTP])?)?;
         let emitted = scratch_dir().join("emitted");
-        copy_tree(&dir.join(group), &emitted);
+        copy_tree(&dir.join(&group), &emitted);
         Some(emitted)
     }
 
@@ -983,7 +983,7 @@ pub mod bundle {
         let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
         let (group, case) = shared_case(&dir, &key(overlay, script, flags)?)?;
         let emitted = scratch_dir().join("emitted");
-        copy_tree(&dir.join(group), &emitted);
+        copy_tree(&dir.join(&group), &emitted);
         // Not one spawn: another test thread's fork can still hold the copied binary open for writing, and Linux refuses to run it then.
         let output = (0..100)
             .find_map(|_| match Command::new(emitted.join("contract")).arg(case.to_string()).current_dir(&emitted).output() {
