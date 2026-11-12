@@ -512,3 +512,53 @@ fn a_serializable_resource_of_a_current_user_reader_is_refused() {
         "{gaps:?}"
     );
 }
+
+const SCOPE_ONLY: &str = "class ArticleSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { scope }\nend\n";
+
+const SHOW: &str = "  def show\n    render json: Article.find(params[:id]), serializer: ArticleSerializer\n  end\n";
+
+/// A parent controller the app reads only as a library class (one
+/// defined outside app/controllers, `lib/quiet_base.rb` here) may declare
+/// its own `serialization_scope`, which the controller chain doesn't see:
+/// the scope is unknown, so the render is left as written, and reported.
+/// active_model_serializers 0.10.16 (Rails 8.1.4) answers `{"scoped":"none"}`
+/// under such a parent's `serialization_scope nil`.
+#[test]
+fn a_scope_render_under_a_library_class_parent_stays_reported() {
+    let base = "class QuietBase < ActionController::Base\n  serialization_scope nil\n\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n";
+    let controller = format!("class ArticlesController < QuietBase\n{SHOW}end\n");
+    let (_, rendered, messages) = emitted_with(SCOPE_ONLY, &controller, &[("lib/quiet_base.rb", base)]);
+    assert!(!rendered.contains("serializable_hash") && !rendered.contains("as_json_str"), "{rendered}");
+    assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
+}
+
+/// `self.serialization_scope nil` declares the same class attribute as
+/// `serialization_scope nil`: the render passes no scope.
+#[test]
+fn a_self_serialization_scope_is_the_controllers() {
+    let controller = format!("class ArticlesController < ApplicationController\n  self.serialization_scope nil\n\n{SHOW}\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n");
+    let (_, rendered, _) = emitted(SCOPE_ONLY, &controller);
+    assert!(rendered.contains("ArticleSerializer.new(Article.find(@params[\"id\"])).serializable_hash"), "{rendered}");
+}
+
+/// A descendant that overrides the action and calls `super` runs the
+/// parent's render under its own `serialization_scope`: active_model_serializers
+/// 0.10.16 answers the descendant's scope (`{"scoped":"bob"}`), so the
+/// parent's render, whose plan differs, is left as written, and reported.
+#[test]
+fn an_overriding_render_that_calls_super_under_another_scope_stays_reported() {
+    let controller = format!("class ArticlesController < ApplicationController\n{SHOW}\n  private\n\n  def current_user\n    \"ann\"\n  end\nend\n");
+    let heir = "class ReaderArticlesController < ArticlesController\n  serialization_scope :reader\n\n  def show\n    super\n  end\n\n  private\n\n  def reader\n    \"bob\"\n  end\nend\n";
+    let (_, rendered, messages) = emitted_with(SCOPE_ONLY, &controller, &[("app/controllers/reader_articles_controller.rb", heir)]);
+    assert!(!rendered.contains("serializable_hash") && !rendered.contains("as_json_str"), "{rendered}");
+    assert!(messages.iter().any(|m| m.contains("rendering through an active_model_serializers")), "{messages:#?}");
+}
+
+/// `attr_reader :current_user` is the controller's `current_user`: the
+/// render passes it as the scope.
+#[test]
+fn an_attr_reader_current_user_is_the_scope() {
+    let controller = format!("class ArticlesController < ApplicationController\n  attr_reader :current_user\n\n{SHOW}end\n");
+    let (_, rendered, _) = emitted(SCOPE_ONLY, &controller);
+    assert!(rendered.contains("{ scope: self.current_user }"), "{rendered}");
+}

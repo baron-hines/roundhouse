@@ -382,3 +382,114 @@ puts "locals OK"
     run.assert_passes();
     assert!(run.stdout.contains("locals OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
 }
+
+/// The scope a serializer holds, and the controller declarations that
+/// set it, as active_model_serializers 0.10.16 answers them on Rails
+/// 8.1.4: the gem keeps the scope in its own accessor from construction,
+/// so a later write to `instance_options[:scope]` leaves it
+/// (`{"scoped":"ann"}`), and `self.scope = "other"` changes it, for
+/// `current_user` too (`{"scoped":"other"}`, `{"viewer":"other"}`).
+/// `self.serialization_scope nil` is `serialization_scope nil`
+/// (`{"scoped":"none"}`), and `attr_reader :current_user` is the
+/// controller's `current_user` (`{"scoped":"cat"}`).
+fn holds_app() -> emit_and_run::Overlay {
+    app()
+        .write(
+            "app/serializers/options_write_serializer.rb",
+            "class OptionsWriteSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { instance_options[:scope] = \"other\"; scope }\nend\n",
+        )
+        .write(
+            "app/serializers/scope_write_serializer.rb",
+            "class ScopeWriteSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:scoped) { self.scope = \"other\"; scope }\nend\n",
+        )
+        .write(
+            "app/serializers/scope_write_viewer_serializer.rb",
+            "class ScopeWriteViewerSerializer < ActiveModel::Serializer\n  attributes :id\n  attribute(:viewer) { self.scope = \"other\"; current_user }\nend\n",
+        )
+        .write(
+            "app/controllers/writes_json_controller.rb",
+            r#"class WritesJsonController < ApplicationController
+  def options_write
+    render json: Article.find(params[:id]), serializer: OptionsWriteSerializer
+  end
+
+  def scope_write
+    render json: Article.find(params[:id]), serializer: ScopeWriteSerializer
+  end
+
+  def scope_write_viewer
+    render json: Article.find(params[:id]), serializer: ScopeWriteViewerSerializer
+  end
+
+  private
+
+  def current_user
+    "ann"
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/self_quiet_json_controller.rb",
+            r#"class SelfQuietJsonController < ApplicationController
+  self.serialization_scope nil
+
+  def show
+    render json: Article.find(params[:id]), serializer: ScopeOnlySerializer
+  end
+
+  private
+
+  def current_user
+    "ann"
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/attr_user_json_controller.rb",
+            r#"class AttrUserJsonController < ApplicationController
+  attr_reader :current_user
+  before_action :set_user
+
+  def show
+    render json: Article.find(params[:id]), serializer: ScopeOnlySerializer
+  end
+
+  private
+
+  def set_user
+    @current_user = "cat"
+  end
+end
+"#,
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"writes/:id/options_write\" => \"writes_json#options_write\"\n  get \"writes/:id/scope_write\" => \"writes_json#scope_write\"\n  get \"writes/:id/scope_write_viewer\" => \"writes_json#scope_write_viewer\"\n  get \"self_quiet/:id\" => \"self_quiet_json#show\"\n  get \"attr_user/:id\" => \"attr_user_json#show\"\n  resources :articles do",
+        )
+}
+
+const HOLDS_SCRIPT: &str = r##"
+%w[writes_json self_quiet_json attr_user_json].each { |c| require_relative "app/controllers/#{c}_controller" }
+a = Article.create!(title: "Hello", body: "A long body")
+run = ->(controller, action, params) { c = controller.new; c.params = params; c.process_action(action); c.body }
+failures = []
+check = ->(label, got, want) { failures << "#{label}: #{got.inspect}, want #{want.inspect}" unless got == want }
+id = a.id.to_s
+check.("instance_options[:scope] write", (run.(WritesJsonController, :options_write, { "id" => id }) rescue $!.class.name), '{"id":' + id + ',"scoped":"ann"}')
+check.("self.scope write, scope", (run.(WritesJsonController, :scope_write, { "id" => id }) rescue $!.class.name), '{"id":' + id + ',"scoped":"other"}')
+check.("self.scope write, current_user", (run.(WritesJsonController, :scope_write_viewer, { "id" => id }) rescue $!.class.name), '{"id":' + id + ',"viewer":"other"}')
+check.("self.serialization_scope nil", (run.(SelfQuietJsonController, :show, { "id" => id }) rescue $!.class.name), '{"id":' + id + ',"scoped":"none"}')
+check.("attr_reader :current_user", (run.(AttrUserJsonController, :show, { "id" => id }) rescue $!.class.name), '{"id":' + id + ',"scoped":"cat"}')
+raise failures.join("\n") unless failures.empty?
+puts "scope holds OK"
+"##;
+
+#[test]
+fn a_serializer_holds_its_scope_as_the_gem_does() {
+    let run = holds_app().run_ruby(HOLDS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("scope holds OK"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+}
