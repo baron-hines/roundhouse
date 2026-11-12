@@ -365,7 +365,7 @@ fn roda_sqlite_migrations_enforce_the_same_predicates() {
         roundhouse::emit::roda::emit(&roundhouse::ingest::ingest_app_from_tree(tree).unwrap())
     };
     let source: String = PREDICATES.iter().map(|p| schema(p).replace("predicate_items", &format!("predicate_{}", p.name))).collect();
-    let dir = std::env::temp_dir().join(format!("roundhouse-roda-predicates-{}", std::process::id()));
+    let dir = scratch::dir("roundhouse-roda-predicates");
     for emitted in roda(&source, Some(SQLITE)).iter().filter(|f| f.path.starts_with("db") || f.path.ends_with("db.rb")) {
         let path = dir.join(&emitted.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -404,6 +404,18 @@ def scalar(sql) = DB.fetch(sql).first.values.first
     for database in [None, Some(POSTGRES)] {
         assert_eq!(connection(roda(&shared, database)), default, "{database:?}");
     }
+}
+
+#[test]
+fn a_refused_expression_index_keeps_the_check_with_its_text() {
+    roundhouse::ingest::survey::activate();
+    let source = schema_with(predicate("concat"), "t.check_constraint \"code GLOB 'a*'\"\n    t.index \"code GLOB 'a*'\", name: 'code_glob'");
+    let schema = app_schema(&source, Some(SQLITE)).unwrap();
+    let recorded = roundhouse::ingest::survey::recorded();
+    let table = &schema.tables[&roundhouse::Symbol::from("predicate_items")];
+    assert_eq!(table.check_constraints.iter().map(|c| c.expression.as_str()).collect::<Vec<_>>(), ["code GLOB 'a*'"]);
+    assert!(table.indexes.is_empty(), "{:?}", table.indexes);
+    assert!(recorded.iter().any(|gap| gap.contains("unsupported schema expression")), "{recorded:#?}");
 }
 
 #[test]

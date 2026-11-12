@@ -1786,8 +1786,12 @@ fn table_from_create_table(
         {
             let line = super::sources::line_at(file, offset).unwrap_or(1);
             gaps.push(IngestError::Unsupported { file: file.into(), message: format!("line {line}: unsupported schema expression on {table_name}: {expression}") });
-            table.check_constraints.retain(|c| c.expression != expression);
-            table.indexes.retain(|i| i.expression.as_deref() != Some(expression.as_str()));
+            // Only the rejected kind goes: SQLite may accept a CHECK whose text an index can't use.
+            if check {
+                table.check_constraints.retain(|c| c.expression != expression);
+            } else {
+                table.indexes.retain(|i| i.expression.as_deref() != Some(expression.as_str()));
+            }
         }
     }
     Some((Symbol::from(table_name), table))

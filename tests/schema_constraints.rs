@@ -10,6 +10,8 @@ const SCHEMA: &str = include_str!("support/schema_constraints_schema.rb");
 const CONTRACT: &str = include_str!("support/schema_constraints_contract.rb");
 const EXPECTED: &str = "CHECK and lower(email) enforce writes; NULL is accepted";
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/schema_constraints_predicates.rs"]
 mod sqlite_predicates;
 
