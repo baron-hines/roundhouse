@@ -3811,13 +3811,15 @@ impl<'a> BodyTyper<'a> {
                     {
                         local_ctx.ivar_bindings.insert(name, ty);
                     }
-                    if let ExprNode::OpAssign { target, .. } = &*e.node
+                    if let ExprNode::OpAssign { target, value, .. } = &*e.node
                         && e.decisions & crate::expr::DEAD_OR_ASSIGN == 0
                     {
                         if let Some(ty) = e.ty.clone() {
                             if !matches!(ty, Ty::Var { .. }) {
                                 match target {
                                     LValue::Ivar { name } => {
+                                        // `@x &&= Klass` stores the class, as `walk_ivar_assignments` records it.
+                                        let ty = super::class_object_arg_ty(value, ty);
                                         let merged = match local_ctx
                                             .ivar_bindings
                                             .remove(name)

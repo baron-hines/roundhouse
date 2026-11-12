@@ -11034,7 +11034,7 @@ fn walk_ivar_assignments(
         // a plain assignment so a controller's `@story ||= Story.find(..)`
         // still flows its type to before_action seeds and views.
         ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
-            if let Some(ty) = value.ty.clone() {
+            if let Some(ty) = value.ty.clone().map(|t| class_object_arg_ty(value, t)) {
                 let merged = match out.remove(name) {
                     Some(prev) => crate::analyze::body::join_ivar_slot(prev, ty),
                     None => ty,
