@@ -17,10 +17,53 @@
 # overlay CookieJar; one typed implementation now serves all three ruby-family
 # targets.
 require_relative "../active_support_ext"
-require_relative "../rack_utils"
 
 module ActionController
   class CookieJar
+    # rack's `parse_cookies_header`: each `name=value` of a `Cookie:` header, `+` and `%XX` unescaped, the first of a
+    # repeated name kept; a bare name, which rack keeps as nil, is left out and reads nil from the jar alike.
+    # Not `Rack::Utils.parse_cookies`: a tree without the rack gem (JRuby's run outside Bundler) loads this file, and
+    # the ruby family's `rack_utils` is that gem.
+    def self.parse_header(header)
+      out = {}
+      return out if header.empty?
+      header.split(";").each do |pair|
+        pair = pair.strip
+        eq = pair.index("=")
+        next if eq.nil?
+        name = unescape_component(pair[0, eq].strip)
+        value = unescape_component(pair[eq + 1, pair.length - eq - 1].strip)
+        out[name] = value unless name.empty? || out.key?(name)
+      end
+      out
+    end
+
+    def self.unescape_component(s)
+      out = +""
+      i = 0
+      n = s.bytesize
+      while i < n
+        b = s.getbyte(i)
+        hi = i + 2 < n ? hex_value(s.getbyte(i + 1)) : -1
+        lo = i + 2 < n ? hex_value(s.getbyte(i + 2)) : -1
+        if b == 37 && hi >= 0 && lo >= 0
+          out << (hi * 16 + lo).chr
+          i += 3
+        else
+          out << (b == 43 ? " " : b.chr)
+          i += 1
+        end
+      end
+      out.force_encoding("UTF-8")
+    end
+
+    def self.hex_value(b)
+      return b - 48 if b >= 48 && b <= 57
+      return b - 55 if b >= 65 && b <= 70
+      return b - 87 if b >= 97 && b <= 102
+      -1
+    end
+
     def initialize(inbound = {})
       @inbound = {}
       @out = {}
@@ -468,7 +511,7 @@ module ActionDispatch
     def cookie_jar
       found = @env["action_dispatch.cookies"]
       return found if found.is_a?(ActionController::CookieJar)
-      jar = ActionController::CookieJar.new(Rack::Utils.parse_cookies(@env["HTTP_COOKIE"].to_s))
+      jar = ActionController::CookieJar.new(ActionController::CookieJar.parse_header(@env["HTTP_COOKIE"].to_s))
       @env["action_dispatch.cookies"] = jar
       jar
     end

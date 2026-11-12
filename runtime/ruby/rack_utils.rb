@@ -181,22 +181,6 @@ module Rack
 
     # Rack's `escape`, `URI.encode_www_form_component`: ASCII letters, digits and `*-._` as written, a space as `+`,
     # every other byte as `%XX` (OmniAuth's failure redirect's `message=`).
-    # rack's `parse_cookies_header`: each `name=value` of a `Cookie:` header, unescaped, the first of a repeated
-    # name kept.
-    def self.parse_cookies(header)
-      out = {}
-      return out if header.empty?
-      header.split(";").each do |pair|
-        pair = pair.strip
-        eq = pair.index("=")
-        next if eq.nil?
-        name = unescape_path(pair[0, eq].strip.tr("+", " "))
-        value = unescape_path(pair[eq + 1, pair.length - eq - 1].strip.tr("+", " "))
-        out[name] = value unless name.empty? || out.key?(name)
-      end
-      out
-    end
-
     def self.escape(s)
       out = +""
       text = s.to_s

@@ -25,6 +25,9 @@ module ActionController
     @flag_expires: Hash[String, String]
     @deleted: Hash[String, String]
 
+    def self.parse_header: (String header) -> Hash[String, String]
+    def self.unescape_component: (String s) -> String
+    def self.hex_value: (Integer b) -> Integer
     def initialize: (?Hash[String, String] inbound) -> void
     def []: (String | Symbol key) -> String
     # The written value is untyped and the STORE is String: `raw_set`
