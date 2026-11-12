@@ -598,8 +598,10 @@ fn sqlite_expression(predicate: &str, table: Option<&Table>) -> bool {
 /// A word is an operator or a name by where it stands, as in SQLite's
 /// parser: after an operand it is an operator (`code LIKE 'a%'`), and
 /// anywhere else a column or a call (`like IS NULL`). A column of the
-/// same name never stands in for the operator. Comments, `ESCAPE`,
-/// `REGEXP`, casts and every unlisted call stay refused.
+/// same name never stands in for the operator. `TRUE` and `FALSE` are
+/// the literals only where no column has the name, as SQLite resolves
+/// them; `NULL` is always the keyword. Comments, `ESCAPE`, `REGEXP`,
+/// casts and every unlisted call stay refused.
 ///
 /// "As the application read it" also needs the column stored as there.
 /// [`sqlite_type`] declares `decimal` REAL and `json`, dates, times and
@@ -616,6 +618,7 @@ pub(crate) fn sqlite_check_expression(sql: &str, table: &Table, source: crate::s
     let tokens = regex::Regex::new(r#"\A(?:'(?:''|[^'])*'|[0-9]+(?:\.[0-9]+)?|"((?:""|[^"])*)"|([a-zA-Z_][a-zA-Z0-9_]*)|<>|!=|<=|>=|==|\|\||[-+=<>*/%(),])"#).unwrap();
     let stored_as_rails = |ct: &ColumnType| matches!(ct, ColumnType::String { .. } | ColumnType::Text | ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. } | ColumnType::Float | ColumnType::Boolean | ColumnType::Binary);
     let column = |name: &str, quoted: bool| table.columns.iter().any(|c| stored_as_rails(&c.col_type) && c.generated_text_compatible != Some(false) && if quoted { c.name.as_str() == name } else { c.name.as_str().eq_ignore_ascii_case(name) });
+    let named = |name: &str| table.columns.iter().any(|c| c.name.as_str().eq_ignore_ascii_case(name));
     // SQLite's whitespace; any other character outside a literal is refused.
     let space = |c: char| matches!(c, ' ' | '\t'..='\r');
     // `operand`: the last token ended an operand, so an operator comes next.
@@ -639,7 +642,9 @@ pub(crate) fn sqlite_check_expression(sql: &str, table: &Table, source: crate::s
                     false
                 }
                 ("WHEN", false) if was_case => false,
-                ("NULL" | "TRUE" | "FALSE", false) => true,
+                ("NULL", false) => true,
+                // A column of the name is read as any column is, just below.
+                (literal @ ("TRUE" | "FALSE"), false) if !named(literal) => true,
                 (name, false) if rest.starts_with('(') && FUNCTIONS.contains(&name) => false,
                 (name, false) if !rest.starts_with('(') && column(name, false) => true,
                 _ => return false,

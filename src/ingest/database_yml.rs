@@ -73,6 +73,12 @@ pub(crate) struct Configurations {
     /// Some `url:` is computed. Its configuration is still read from the
     /// keys beside it, but Rails takes its adapter from the URL at boot.
     pub computed_url: bool,
+    /// Some configuration's `pragmas:` may set `case_sensitive_like`: a key
+    /// names it (to any value, as a string or a symbol) or is computed, or
+    /// `pragmas:` itself is computed or not a mapping. Rails runs a
+    /// configuration's pragmas on each connection it opens, and this one
+    /// changes what `LIKE` matches.
+    pub case_sensitive_like: bool,
 }
 
 /// `config/database.yml`'s configurations, resolved at build time; empty
@@ -139,6 +145,12 @@ pub(crate) fn database_configurations(text: &str, file: FileId) -> Configuration
             };
             let label = format!("`{env}.{name}`");
             let scalar = |key: &str| hash.get(key).cloned();
+            let other_pragma = |key: &Value| matches!(key, Value::String(key) if !key.contains(ERB_VALUE) && !key.trim_start_matches(':').eq_ignore_ascii_case("case_sensitive_like"));
+            out.case_sensitive_like |= match scalar("pragmas").or_else(|| scalar(":pragmas")) {
+                None => false,
+                Some(Value::Mapping(pragmas)) => !pragmas.keys().all(other_pragma),
+                Some(_) => true,
+            };
             let computed = |value: &Value| match value {
                 Value::String(text) => text.contains(ERB_VALUE),
                 Value::Sequence(items) => items.iter().any(|item| matches!(item, Value::String(text) if text.contains(ERB_VALUE))),

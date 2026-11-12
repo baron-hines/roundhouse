@@ -44,6 +44,14 @@ const PREDICATES: &[Predicate] = &[
         valid: &["'Abc',NULL,NULL,NULL,0", "'Abc','a',NULL,NULL,0"],
         invalid: &["'b','a',NULL,NULL,0", "'zeta','z',NULL,NULL,0"],
     },
+    // The second column is named `true` (see `schema`): SQLite reads the
+    // word as that column, and `false`, which no column has, as the literal.
+    Predicate {
+        name: "true_column",
+        sql: "true GLOB 'a*' OR false",
+        valid: &["'x','abc',NULL,NULL,0", "'x',NULL,NULL,NULL,0"],
+        invalid: &["'x','xyz',NULL,NULL,0", "'x','Abc',NULL,NULL,0"],
+    },
     Predicate {
         name: "json_type",
         sql: "\"payload\" IS NULL OR json_valid(\"payload\") AND json_type(\"payload\") = 'array'",
@@ -121,11 +129,19 @@ fn predicate(name: &str) -> &'static Predicate {
 }
 
 fn columns(predicate: &Predicate) -> &'static str {
-    if predicate.name == "like_column" { "code,\"like\",mode,parent_id,amount" } else { "code,payload,mode,parent_id,amount" }
+    match predicate.name {
+        "like_column" => "code,\"like\",mode,parent_id,amount",
+        "true_column" => "code,\"true\",mode,parent_id,amount",
+        _ => "code,payload,mode,parent_id,amount",
+    }
 }
 
 fn schema_with(predicate: &Predicate, declaration: &str) -> String {
-    let second = if predicate.name == "like_column" { "like" } else { "payload" };
+    let second = match predicate.name {
+        "like_column" => "like",
+        "true_column" => "true",
+        _ => "payload",
+    };
     format!(
         r#"ActiveRecord::Schema[8.1].define(version: 1) do
   create_table :predicate_items do |t|
@@ -239,7 +255,7 @@ macro_rules! predicate_tests {
     ($($name:ident),* $(,)?) => {$(#[test] fn $name() { sqlite_case(stringify!($name)); })*};
 }
 predicate_tests!(
-    glob, not_glob, like, not_like, like_column, json_type, simple_case, searched_case, between, not_between,
+    glob, not_glob, like, not_like, like_column, true_column, json_type, simple_case, searched_case, between, not_between,
     concat, char, substr, precedence, combinations, nested_case
 );
 
@@ -350,20 +366,31 @@ fn every_sqlite_target_carries_the_checks_as_sql() {
     }
 }
 
+/// The Roda application emitted for this schema beside this `config/database.yml`.
+fn roda(source: &str, database: Option<&str>) -> Vec<roundhouse::emit::EmittedFile> {
+    let mut tree = std::collections::HashMap::new();
+    tree.insert(std::path::PathBuf::from("db/schema.rb"), source.as_bytes().to_vec());
+    if let Some(database) = database {
+        tree.insert(std::path::PathBuf::from("config/database.yml"), database.as_bytes().to_vec());
+    }
+    roundhouse::emit::roda::emit(&roundhouse::ingest::ingest_app_from_tree(tree).unwrap())
+}
+
+/// The line of an emitted Roda `db.rb` that opens the database.
+fn connection(files: Vec<roundhouse::emit::EmittedFile>) -> String {
+    let db = files.into_iter().find(|f| f.path.ends_with("db.rb")).unwrap().content;
+    db.lines().find(|line| line.starts_with("DB = ")).unwrap().to_string()
+}
+
+/// The connection main's `db.rb` opens: Sequel's default, case-sensitive `LIKE`.
+const MAIN_CONNECTION: &str = r#"DB = Sequel.sqlite(ENV.fetch("DATABASE", File.expand_path("db/blog.db", __dir__)))"#;
+
 /// The emitted Roda application, booted the way it boots itself: its own
 /// `db.rb` opens the database and runs its migrations. Sequel's SQLite
 /// connection makes `LIKE` case-sensitive unless told otherwise and Rails'
 /// does not, so the emitted connection has to say so for the same rows to pass.
 #[test]
 fn roda_sqlite_migrations_enforce_the_same_predicates() {
-    let roda = |source: &str, database: Option<&str>| {
-        let mut tree = std::collections::HashMap::new();
-        tree.insert(std::path::PathBuf::from("db/schema.rb"), source.as_bytes().to_vec());
-        if let Some(database) = database {
-            tree.insert(std::path::PathBuf::from("config/database.yml"), database.as_bytes().to_vec());
-        }
-        roundhouse::emit::roda::emit(&roundhouse::ingest::ingest_app_from_tree(tree).unwrap())
-    };
     let source: String = PREDICATES.iter().map(|p| schema(p).replace("predicate_items", &format!("predicate_{}", p.name))).collect();
     let dir = scratch::dir("roundhouse-roda-predicates");
     for emitted in roda(&source, Some(SQLITE)).iter().filter(|f| f.path.starts_with("db") || f.path.ends_with("db.rb")) {
@@ -394,15 +421,67 @@ def scalar(sql) = DB.fetch(sql).first.values.first
     let _ = std::fs::remove_dir_all(&dir);
 
     // Only a SQLite application's connection changes: any other keeps the one main writes.
-    let connection = |files: Vec<roundhouse::emit::EmittedFile>| {
-        let db = files.into_iter().find(|f| f.path.ends_with("db.rb")).unwrap().content;
-        db.lines().find(|line| line.starts_with("DB = ")).unwrap().to_string()
-    };
     let shared = schema(predicate("between"));
-    let default = r#"DB = Sequel.sqlite(ENV.fetch("DATABASE", File.expand_path("db/blog.db", __dir__)))"#;
-    assert_eq!(connection(roda(&shared, Some(SQLITE))), default.replace("__dir__)))", "__dir__)), case_sensitive_like: false)"));
+    assert_eq!(connection(roda(&shared, Some(SQLITE))), MAIN_CONNECTION.replace("__dir__)))", "__dir__)), case_sensitive_like: false)"));
     for database in [None, Some(POSTGRES)] {
-        assert_eq!(connection(roda(&shared, database)), default, "{database:?}");
+        assert_eq!(connection(roda(&shared, database)), MAIN_CONNECTION, "{database:?}");
+    }
+}
+
+/// Rails runs each configuration's `pragmas:` on every connection it opens,
+/// and `case_sensitive_like` changes what `LIKE` matches there, in a CHECK
+/// too. A file that sets it in any configuration, to either value, or that
+/// computes its pragmas, keeps the portable grammar, and the Roda connection
+/// keeps main's.
+#[test]
+fn a_case_sensitive_like_pragma_keeps_the_portable_grammar() {
+    let test = "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
+    for (why, database) in [
+        ("on in the test primary", format!("{test}  pragmas:\n    case_sensitive_like: true\n")),
+        ("off", format!("{test}  pragmas:\n    journal_mode: wal\n    case_sensitive_like: false\n")),
+        ("a symbol key", format!("{test}  pragmas:\n    :case_sensitive_like: 1\n")),
+        ("a computed value", format!("{test}  pragmas:\n    case_sensitive_like: <%= ENV[\"LIKE\"] %>\n")),
+        ("computed pragmas", format!("{test}  pragmas: <%= ENV[\"PRAGMAS\"] %>\n")),
+        ("an anchor", "default: &default\n  adapter: sqlite3\n  pragmas:\n    case_sensitive_like: true\ntest:\n  <<: *default\n  database: storage/test.sqlite3\n".to_string()),
+        ("production's cache", format!("{test}production:\n  primary:\n    adapter: sqlite3\n    database: storage/production.sqlite3\n  cache:\n    adapter: sqlite3\n    database: storage/production_cache.sqlite3\n    pragmas:\n      case_sensitive_like: true\n")),
+    ] {
+        for predicate in PREDICATES.iter().filter(|p| p.name != "like_column") {
+            let read = app_schema(&schema(predicate), Some(&database));
+            assert_eq!(read.is_ok(), SHARED.contains(&predicate.name), "{} with {why}", predicate.name);
+        }
+        assert_eq!(connection(roda(&schema(predicate("between")), Some(&database))), MAIN_CONNECTION, "{why}");
+    }
+    // Other pragmas, literal or computed, leave SQLite's grammar and connection as they were.
+    let other = format!("{test}  pragmas:\n    journal_mode: wal\n    foreign_keys: true\n    mmap_size: <%= 1 %>\n");
+    assert!(app_schema(&schema(predicate("like")), Some(&other)).is_ok());
+    assert_eq!(connection(roda(&schema(predicate("between")), Some(&other))), connection(roda(&schema(predicate("between")), Some(SQLITE))));
+}
+
+/// SQLite reads `true` and `false` as the table's column of that name when
+/// it has one, and as the literal only otherwise. So does the reader, so a
+/// column stored differently from Rails' is refused there as anywhere.
+#[test]
+fn true_and_false_are_columns_before_literals() {
+    let table = |column: &str, sql: &str| format!("ActiveRecord::Schema[8.1].define do\n  create_table :items do |t|\n    t.text :code\n    {column}\n    t.check_constraint {sql:?}, name: 'items_check'\n  end\nend\n");
+    for (column, sql) in [
+        // Rails stores `10` as 10 and rejects it; the emitted REAL column stores 10.0 and would accept it.
+        ("t.decimal :true", "true GLOB '*.*'"),
+        ("t.decimal :TRUE", "code GLOB 'a*' OR True"),
+        ("t.json :false", "CASE WHEN code GLOB 'a*' THEN true ELSE false END"),
+        ("t.date :false", "false IS NULL OR code LIKE 'a%'"),
+    ] {
+        let error = app_schema(&table(column, sql), Some(SQLITE)).map(|_| ()).unwrap_err();
+        assert!(error.contains("line 5: unsupported schema expression on items"), "{column}, {sql}: {error}");
+    }
+    // A column of the name stored as Rails stores it is read as the column. Where no column
+    // has the name, the word is the literal, beside a column stored differently or not.
+    for (column, sql) in [
+        ("t.decimal :price", "CASE WHEN code GLOB 'a*' THEN true ELSE false END"),
+        ("t.text :true", "true GLOB 'a*' OR code GLOB 'a*' AND false"),
+        ("t.integer :false", "false > 0 OR code LIKE 'a%' OR TRUE"),
+    ] {
+        let ddl = sqlite_ddl(&app_schema(&table(column, sql), Some(SQLITE)).unwrap_or_else(|error| panic!("{sql}: {error}")));
+        assert!(ddl.contains(&format!("CHECK ({sql})")), "{ddl}");
     }
 }
 

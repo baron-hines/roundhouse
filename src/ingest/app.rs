@@ -13332,13 +13332,16 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
 /// test environment has a primary, every configuration names sqlite3, and
 /// none was left out as unresolved or takes a computed `url:`. A file that
 /// says less, or no file, keeps the portable grammar, since some database
-/// of the app may not be SQLite.
+/// of the app may not be SQLite. So does a file whose pragmas may set
+/// `case_sensitive_like`, to either value: Rails runs it on connect, and
+/// it decides what `LIKE` matches.
 fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
     use crate::schema::generated::GeneratedExpressionDialect::{Portable, Sqlite};
     let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Portable };
     let read = super::database_yml::database_configurations(&text, crate::span::FileId(0));
     let sqlite = read.refusals.is_empty()
         && !read.computed_url
+        && !read.case_sensitive_like
         && read.databases.iter().any(|d| d.env == "test" && d.primary)
         && read.databases.iter().all(|d| d.adapter == crate::database::DatabaseAdapter::Sqlite3);
     if sqlite { Sqlite } else { Portable }
