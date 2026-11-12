@@ -8,7 +8,7 @@ use super::RuntimeRelation;
 
 const KEEP: &str = "_keep_selected_aliases";
 
-pub(crate) fn base_instance_methods() -> &'static crate::det::HashSet<Symbol> {
+fn base_instance_methods() -> &'static crate::det::HashSet<Symbol> {
     static NAMES: std::sync::OnceLock<crate::det::HashSet<Symbol>> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         let mut names = crate::det::HashSet::default();

@@ -247,14 +247,18 @@ pub(crate) fn responds(surface: &Surface, class: &ClassId, name: &Symbol) -> Opt
         // and may define the name itself.
         let Some(cid) = step else { return None };
         let cls = &registry[cid];
-        if defines(cls, name) {
-            // Defined public in one reopening and private in another:
-            // which wins is load order, which is not modeled here.
+        if cls.source_instance_methods.contains(name) {
+            // Public in one reopening and private in another (which wins
+            // is load order, not modeled here), or a source method whose
+            // visibility analysis did not record: neither way.
             let private = cls.nonpublic_instance_methods.contains(name);
-            if private && cls.public_instance_methods.contains(name) {
-                return None;
-            }
-            return Some(!private);
+            let public = cls.public_instance_methods.contains(name);
+            return if private == public { None } else { Some(public) };
+        }
+        // A signed member (a column, an association, a declared
+        // accessor), which is public.
+        if cls.instance_methods.contains_key(name) {
+            return Some(true);
         }
         if column_method(cls, name) {
             return Some(true);
@@ -271,7 +275,7 @@ pub(crate) fn responds(surface: &Surface, class: &ClassId, name: &Symbol) -> Opt
         && (crate::catalog::AR_CATALOG
             .iter()
             .any(|e| e.receiver == crate::catalog::ReceiverContext::Instance && e.name == name.as_str())
-            || crate::lower::model_to_library::select_aliases::base_instance_methods().contains(name))
+            || record_base_methods().contains(name))
     {
         return Some(true);
     }
@@ -287,6 +291,37 @@ pub(crate) fn responds(surface: &Surface, class: &ClassId, name: &Symbol) -> Opt
         return None;
     }
     Some(false)
+}
+
+/// The public instance methods the runtime defines on
+/// `ActiveRecord::Base` itself (base.rb and connection.rb's reopening),
+/// owner-qualified: those files also define `Connection`, `Relation` and
+/// others, whose methods a record does not have. `Base` includes no
+/// module there, so this is its whole runtime surface.
+fn record_base_methods() -> &'static crate::det::HashSet<Symbol> {
+    static NAMES: std::sync::OnceLock<crate::det::HashSet<Symbol>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = crate::det::HashSet::default();
+        for (file, source) in [
+            ("runtime/ruby/active_record/base.rb", include_str!("../../runtime/ruby/active_record/base.rb")),
+            ("runtime/ruby/active_record/connection.rb", include_str!("../../runtime/ruby/active_record/connection.rb")),
+        ] {
+            let classes = crate::ingest::ingest_library_classes(source.as_bytes(), file).expect("framework Base ingests");
+            for class in classes.iter().filter(|c| c.name.0.as_str() == "ActiveRecord::Base") {
+                names.extend(
+                    class
+                        .methods
+                        .iter()
+                        .filter(|m| {
+                            m.receiver == crate::dialect::MethodReceiver::Instance
+                                && m.visibility == crate::dialect::MethodVisibility::Public
+                        })
+                        .map(|m| m.name.clone()),
+                );
+            }
+        }
+        names
+    })
 }
 
 fn defines(cls: &ClassInfo, name: &Symbol) -> bool {
@@ -384,6 +419,7 @@ mod tests {
         model.instance_methods.insert(Symbol::from("salt"), Ty::Str);
         model.source_instance_methods.extend(["digest", "salt", "rehash"].map(Symbol::from));
         model.nonpublic_instance_methods.insert(Symbol::from("salt"));
+        model.public_instance_methods.extend(["digest", "rehash"].map(Symbol::from));
         registry.insert(id("Snapshot"), model);
         registry
     }
@@ -403,6 +439,7 @@ mod tests {
         assert_eq!(ask(&registry, "Snapshot", "checksum="), Some(true));
         assert_eq!(ask(&registry, "Snapshot", "save"), Some(true), "the AR catalog");
         assert_eq!(ask(&registry, "Snapshot", "to_key"), Some(true), "the runtime's own Base");
+        assert_eq!(ask(&registry, "Snapshot", "exec_delete"), Some(false), "a runtime Connection method, not Base's");
         assert_eq!(ask(&registry, "Snapshot", "shop_id"), Some(false));
         assert_eq!(ask(&registry, "Snapshot", "checksum=="), Some(false), "only the generated suffixes");
         assert_eq!(ask(&registry, "Snapshot", "checksum?="), Some(false));
@@ -440,6 +477,9 @@ mod tests {
         let model = registry.get_mut(&id("Snapshot")).unwrap();
         model.public_instance_methods.insert(Symbol::from("salt"));
         assert_eq!(ask(&registry, "Snapshot", "salt"), None);
+        // A source method whose visibility analysis did not record.
+        registry.get_mut(&id("Snapshot")).unwrap().source_instance_methods.insert(Symbol::from("mystery"));
+        assert_eq!(ask(&registry, "Snapshot", "mystery"), None);
     }
 
     #[test]

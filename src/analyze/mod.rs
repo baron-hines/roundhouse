@@ -1322,8 +1322,33 @@ impl Analyzer {
             }
         }
         for controller in &app.controllers {
-            for action in controller.actions() {
-                classes.entry(controller.name.clone()).or_default().source_instance_methods.insert(action.name.clone());
+            use crate::dialect::ControllerBodyItem;
+            // Visibility is positional: a bare `private` makes what follows
+            // private. Any other visibility call (`protected`, `public`,
+            // `private :name`, `private def …`) is not modeled, so every
+            // action then counts as both, which `lower::respond_to` leaves
+            // unanswered.
+            let unmodeled = controller.body.iter().any(|item| {
+                matches!(item, ControllerBodyItem::Unknown { expr, .. }
+                    if matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, .. }
+                        if matches!(method.as_str(), "private" | "protected" | "public" | "module_function")))
+            });
+            let entry = classes.entry(controller.name.clone()).or_default();
+            let mut private = false;
+            for item in &controller.body {
+                match item {
+                    ControllerBodyItem::PrivateMarker { .. } => private = true,
+                    ControllerBodyItem::Action { action, .. } => {
+                        entry.source_instance_methods.insert(action.name.clone());
+                        if unmodeled || !private {
+                            entry.public_instance_methods.insert(action.name.clone());
+                        }
+                        if unmodeled || private {
+                            entry.nonpublic_instance_methods.insert(action.name.clone());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 

@@ -11905,7 +11905,7 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> Res
 /// file is the app's (app/, lib/, config/ with the initializers the boot
 /// program writes, test/, boot.rb) except the framework runtime and the
 /// emitted test helper.
-fn apply_digest_gem(files: &mut [(String, String)]) {
+fn apply_digest_gem(files: &mut Vec<(String, String)>) {
     const DECLARATION: &str = "gem \"digest\", \">= 3.3.0\"";
     let demanded = files.iter().any(|(p, c)| {
         !p.starts_with("runtime/")
@@ -11916,9 +11916,14 @@ fn apply_digest_gem(files: &mut [(String, String)]) {
     if !demanded {
         return;
     }
-    if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile") {
-        ensure_runtime_gem_declaration(gemfile, "digest", DECLARATION);
+    let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile") else { return };
+    if gemfile.contains(DECLARATION) {
+        return;
     }
+    ensure_runtime_gem_declaration(gemfile, "digest", DECLARATION);
+    // The scaffold lock may pin an older digest; `bundle install`
+    // resolves the edited Gemfile fresh.
+    files.retain(|(p, _)| p != "Gemfile.lock");
 }
 
 /// Activate the locked Git checkouts before any guarded native requires.
