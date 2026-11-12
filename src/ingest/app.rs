@@ -5158,24 +5158,43 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 } else {
                     // Not dropped where the winning copy calls `super` (Devise's `Helpers#expire_data_after_sign_out!`
                     // over `SignInOut`'s): Ruby runs this one there, which the flattened controller keeps under its own name.
+                    // The chain's end: the definition of the name, or a shadowed one kept under its own, that still calls `super`.
+                    let chained = |name: &crate::ident::Symbol| {
+                        *name == method.name || name.as_str().strip_prefix("__super").is_some_and(|rest| rest.ends_with(&format!("_{}", method.name.as_str())))
+                    };
                     let Some(winner) = methods.iter_mut().chain(actions.iter_mut()).find_map(|item| match item {
-                        ControllerBodyItem::Action { action, .. } if action.name == method.name && calls_super(&action.body) => Some(action),
+                        ControllerBodyItem::Action { action, .. } if chained(&action.name) && calls_super(&action.body) => Some(action),
                         _ => None,
                     }) else {
                         continue;
                     };
-                    let target = crate::ident::Symbol::from(format!("__super_{}", method.name.as_str()));
-                    if !defined.insert(target.clone()) {
+                    // A distinct name per level, so each shadowed definition keeps its own `super`.
+                    let Some(target) = (1..64)
+                        .map(|depth| crate::ident::Symbol::from(format!("__super{}_{}", if depth == 1 { String::new() } else { depth.to_string() }, method.name.as_str())))
+                        .find(|t| !defined.contains(t))
+                    else {
                         continue;
+                    };
+                    defined.insert(target.clone());
+                    let var = |n: &crate::ident::Symbol| crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Var { id: crate::ident::VarId(0), name: n.clone() });
+                    // Every channel a bare `super` passes on, as Ruby's does: positional, rest, keywords and keyword rest.
+                    let mut forwarded: Vec<crate::expr::Expr> = winner.params.fields.keys().chain(winner.opt_params.iter().map(|(n, _)| n)).map(var).collect();
+                    if let Some(rest) = &winner.rest_param {
+                        forwarded.push(crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Splat { value: var(rest) }));
                     }
-                    let forwarded: Vec<crate::expr::Expr> = winner
-                        .params
-                        .fields
-                        .keys()
-                        .chain(winner.opt_params.iter().map(|(n, _)| n))
-                        .map(|n| crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Var { id: crate::ident::VarId(0), name: n.clone() }))
+                    let mut keywords: Vec<(crate::expr::Expr, crate::expr::Expr)> = winner
+                        .kw_params
+                        .iter()
+                        .map(|(n, _)| (crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: n.clone() } }), var(n)))
                         .collect();
-                    redirect_super(&mut winner.body, &target, &forwarded);
+                    if let Some(kwrest) = &winner.kwrest_param {
+                        keywords.push((crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::KeywordSplat { value: var(kwrest) }), crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })));
+                    }
+                    if !keywords.is_empty() {
+                        forwarded.push(crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Hash { entries: keywords, kwargs: true }));
+                    }
+                    let block = winner.block_param.as_ref().map(var);
+                    redirect_super(&mut winner.body, &target, &forwarded, block.as_ref());
                     renamed = crate::dialect::MethodDef { name: target, ..(*method).clone() };
                     &renamed
                 };
@@ -5554,13 +5573,14 @@ fn calls_super(e: &crate::expr::Expr) -> bool {
 
 /// Each `super` of a spliced method, as the call to the shadowed definition kept under `target`; a bare one passes
 /// the method's own arguments, as Ruby's does.
-fn redirect_super(e: &mut crate::expr::Expr, target: &crate::ident::Symbol, forwarded: &[crate::expr::Expr]) {
+fn redirect_super(e: &mut crate::expr::Expr, target: &crate::ident::Symbol, forwarded: &[crate::expr::Expr], block: Option<&crate::expr::Expr>) {
     if let crate::expr::ExprNode::Super { args } = &*e.node {
         let args = args.clone().unwrap_or_else(|| forwarded.to_vec());
-        *e.node = crate::expr::ExprNode::Send { recv: None, method: target.clone(), args, block: None, parenthesized: true };
+        // The method's own block, which `super` hands on as Ruby's does.
+        *e.node = crate::expr::ExprNode::Send { recv: None, method: target.clone(), args, block: block.cloned(), parenthesized: true };
         return;
     }
-    e.node.for_each_child_mut(&mut |c| redirect_super(c, target, forwarded));
+    e.node.for_each_child_mut(&mut |c| redirect_super(c, target, forwarded, block));
 }
 
 /// A modelled hook has nothing left to do at load, and the emitted

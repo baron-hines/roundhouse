@@ -3324,6 +3324,12 @@ fn substitute_var(e: &mut Expr, name: &Symbol, with: &Expr) {
         *e = with.clone();
         return;
     }
+    // Not inside a block that binds the name itself: there it is the block's own.
+    if let ExprNode::Lambda { params, rest_param, block_param, extra_params, .. } = &*e.node
+        && (params.contains(name) || rest_param.as_ref() == Some(name) || block_param.as_ref() == Some(name) || extra_params.iter().any(|p| &p.name == name))
+    {
+        return;
+    }
     e.node.for_each_child_mut(&mut |c| substitute_var(c, name, with));
 }
 

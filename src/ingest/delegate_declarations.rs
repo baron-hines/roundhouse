@@ -29,6 +29,8 @@ pub(super) struct Delegation {
 pub(super) struct CallShapes {
     pub(super) positional_arities: HashSet<usize>,
     pub(super) has_block: bool,
+    /// A call passed keywords, which a positional forwarder would hand on as a Hash.
+    pub(super) keywords: bool,
 }
 
 pub(super) type CallsWithArguments = HashMap<String, CallShapes>;
@@ -185,7 +187,7 @@ impl<'a> DelegateEligibility<'a> {
                                     .iter()
                                     .all(|call_arity| *call_arity == arity)
                         });
-                    let fixed = (!calls.has_block && super::operator_forwarder("", method.as_str()).is_none() && calls.positional_arities.len() == 1)
+                    let fixed = (!calls.has_block && !calls.keywords && super::operator_forwarder("", method.as_str()).is_none() && calls.positional_arities.len() == 1)
                         .then(|| calls.positional_arities.iter().copied().next())
                         .flatten();
                     if block_only {
@@ -535,5 +537,9 @@ fn collect_calls_with_args(expr: &Expr, out: &mut CallsWithArguments) {
         let calls = out.entry(method.as_str().to_string()).or_default();
         calls.positional_arities.insert(args.len());
         calls.has_block |= block.is_some();
+        calls.keywords |= args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }));
+    } else if instance_call {
+        // A call without arguments too, so one name called both ways is no fixed arity.
+        out.entry(method.as_str().to_string()).or_default().positional_arities.insert(0);
     }
 }

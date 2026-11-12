@@ -245,7 +245,10 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
             }
             let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_none()) else { continue };
             let Some(body) = def.body() else { continue };
-            let param = def.parameters().and_then(|p| p.requireds().iter().next()).and_then(|p| p.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()));
+            // Only `call(env)`'s parameter is Rack's env; another method's first parameter is whatever it is passed.
+            let param = matches!(constant_id_str(&def.name()), "call" | "_call")
+                .then(|| def.parameters().and_then(|p| p.requireds().iter().next()).and_then(|p| p.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string())))
+                .flatten();
             let statements = flatten_statements(body);
             if let Some(class) = statements.last().and_then(|last| built(last, lexical)) {
                 owner.answers.insert(constant_id_str(&def.name()).to_string(), class);
@@ -339,7 +342,8 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
     by_class
 }
 
-/// The env keys the stacked classes write, a key two of them write with different classes left out.
+/// The env keys the stacked classes write, a key two of them write with different classes marked by an empty class.
+// Not removed here: a later fold over another class would write the key again as if no conflict had been seen.
 pub(super) fn stacked_env_writes(by_class: &crate::det::HashMap<String, crate::det::HashMap<String, String>>, stacked: &[String], into: &mut crate::det::HashMap<String, String>) {
     for class in stacked {
         for (key, value) in by_class.get(class).into_iter().flatten() {
@@ -353,7 +357,6 @@ pub(super) fn stacked_env_writes(by_class: &crate::det::HashMap<String, crate::d
             }
         }
     }
-    into.retain(|_, v| !v.is_empty());
 }
 
 /// The app's own `config.middleware.use K` (with or without a block) in its `Rails::Application` body.

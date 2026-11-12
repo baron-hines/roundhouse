@@ -148,6 +148,7 @@ fn rewrite(e: &mut Expr, names: &[String]) {
         return;
     }
     let asks = method.as_str() == "respond_to?";
+    let public = method.as_str() == "public_send";
     if !asks && !matches!(method.as_str(), "send" | "public_send" | "__send__") {
         return;
     }
@@ -189,6 +190,11 @@ fn rewrite(e: &mut Expr, names: &[String]) {
             let infix = &n[prefix.len()..n.len() - suffix.len()];
             let body = if asks {
                 Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: true } })
+            } else if public {
+                // Not the plain call: `public_send` still refuses a private method of the name.
+                let mut sent = vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n.as_str()) } })];
+                sent.extend(rest.iter().cloned());
+                Expr::new(span, ExprNode::Send { recv: Some(Expr::new(span, ExprNode::SelfRef)), method: Symbol::from("public_send"), args: sent, block: None, parenthesized: true })
             } else {
                 // A writer on `self` explicitly: a bare `email=(v)` is a local's assignment to Ruby.
                 let recv = n.ends_with('=').then(|| Expr::new(span, ExprNode::SelfRef));
