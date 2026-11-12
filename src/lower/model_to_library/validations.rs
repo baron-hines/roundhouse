@@ -49,7 +49,9 @@ pub(super) fn push_validate_method(
                 // for fields the schema declares as `Str` — tsc narrows
                 // `Array.isArray(stringField)` to `never` and rejects the
                 // subsequent `.length` access.
-                let attr_ty = model.attributes.fields.get(&v.attribute);
+                // Not the column's type where the model writes its own reader over it: that reader answers what Rails validates, of any type.
+                let own_reader = model.methods().any(|d| d.receiver == MethodReceiver::Instance && d.name == v.attribute);
+                let attr_ty = model.attributes.fields.get(&v.attribute).filter(|_| !own_reader);
                 // `validates :user, presence: true` on a `belongs_to :user` (or
                 // `has_one`) names the ASSOCIATION, and Rails asks its reader —
                 // `user.blank?`, nil for a record. There is no `@user` slot: the
@@ -142,7 +144,6 @@ pub(super) fn push_validate_method(
                     // Nor for an attribute no column holds (Devise's `password`): Rails validates what its reader answers.
                     let virtual_attr = attr_ty.is_none() && !is_assoc && attachment.is_none() && !is_collection && !own_ivar_accessor(model, &v.attribute);
                     // Nor where the model writes its own reader over the column's or the accessor's: Rails validates what that answers.
-                    let own_reader = model.methods().any(|d| d.receiver == MethodReceiver::Instance && d.name == v.attribute);
                     if store_attrs.contains(&v.attribute) || defaulted_attrs.contains(&v.attribute) || virtual_attr || own_reader {
                         for check in &mut produced {
                             read_through_reader(check, &v.attribute);

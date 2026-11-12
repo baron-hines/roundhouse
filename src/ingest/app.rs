@@ -3797,7 +3797,27 @@ fn model_declares_side(model: &crate::dialect::Model, attr: &crate::ident::Symbo
 fn define_confirmation_accessors(app: &mut App) {
     use crate::dialect::{ModelBodyItem, ValidationRule};
     use crate::expr::{ExprNode, Literal};
-    for model in &mut app.models {
+    // What the modules each model includes define, which Ruby's `method_defined?` counts as the model's.
+    let mixed_in: Vec<crate::det::HashSet<crate::ident::Symbol>> = app
+        .models
+        .iter()
+        .map(|model| {
+            let mut out = crate::det::HashSet::default();
+            let mut pending = crate::analyze::model_includes(model);
+            let mut seen = crate::det::HashSet::default();
+            while let Some(id) = pending.pop() {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                for lc in app.library_classes.iter().filter(|c| c.name == id) {
+                    out.extend(lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.clone()));
+                    pending.extend(lc.includes.iter().cloned());
+                }
+            }
+            out
+        })
+        .collect();
+    for (model, mixed_in) in app.models.iter_mut().zip(mixed_in) {
         let mut wanted: Vec<(usize, crate::ident::Symbol, crate::span::Span, &'static str)> = Vec::new();
         for (i, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Validation { validation, .. } = item else { continue };
@@ -3809,7 +3829,10 @@ fn define_confirmation_accessors(app: &mut App) {
                 continue;
             }
             // Each side on its own, as `setup!` asks `method_defined?` of the reader and of the writer.
-            let macro_name = match (model_declares_side(model, &name, true), model_declares_side(model, &name, false)) {
+            let writer = crate::ident::Symbol::from(format!("{}=", name.as_str()));
+            let reader_declared = model_declares_side(model, &name, true) || mixed_in.contains(&name);
+            let writer_declared = model_declares_side(model, &name, false) || mixed_in.contains(&writer);
+            let macro_name = match (reader_declared, writer_declared) {
                 (true, true) => continue,
                 (true, false) => "attr_writer",
                 (false, true) => "attr_reader",
