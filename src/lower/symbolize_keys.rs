@@ -25,6 +25,17 @@
 //! Receiver effects are not a concern the way they are in
 //! `lower::blank`: the receiver is used exactly once, in the same
 //! position, so evaluation order and count are unchanged.
+//!
+//! A receiver with no static type (`def self.read(saved) = { note:
+//! nil }.merge(saved.symbolize_keys)`) may be a Hash or a value with
+//! its own `symbolize_keys`, so its call is guarded rather than
+//! replaced: `saved.instance_of?(Hash) ? ActiveSupport
+//! .symbolize_keys(saved) : saved.symbolize_keys`. A plain Hash takes
+//! the shared helper; any other value keeps the call as written, so a
+//! class's own method still answers and nil still raises
+//! NoMethodError. Only a local or instance variable qualifies, since
+//! the guard reads the receiver twice. `stringify_keys` follows the
+//! same rule.
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
@@ -106,7 +117,69 @@ fn is_escape_false(e: &Expr) -> bool {
     }
 }
 
+/// No static type answers for the value: unknown, or unknown or nil (an
+/// instance variable read before any write is nil).
+fn is_open(ty: Option<&Ty>) -> bool {
+    match ty {
+        None | Some(Ty::Untyped | Ty::Var { .. }) => true,
+        Some(Ty::Union { variants }) => {
+            variants.iter().all(|v| matches!(v, Ty::Untyped | Ty::Var { .. } | Ty::Nil))
+                && variants.iter().any(|v| *v != Ty::Nil)
+        }
+        _ => false,
+    }
+}
+
+/// `r.symbolize_keys` / `r.stringify_keys` on a variable no static type
+/// answers for: `r.instance_of?(Hash) ? ActiveSupport.<method>(r) :
+/// <the call as written>`. `instance_of?`, not `is_a?`: a Hash subclass
+/// (such as an indifferent hash) defines its own conversion, so only a
+/// plain Hash is known to answer with ActiveSupport's.
+fn guard_untyped_conversion(expr: &Expr) -> Option<Expr> {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
+        return None;
+    };
+    let key = match method.as_str() {
+        "symbolize_keys" => Ty::Sym,
+        "stringify_keys" => Ty::Str,
+        _ => return None,
+    };
+    if !args.is_empty()
+        || !is_open(r.ty.as_ref())
+        || !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. })
+    {
+        return None;
+    }
+    let span = expr.span;
+    let mut is_hash = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(r.clone()),
+            method: crate::ident::Symbol::from("instance_of?"),
+            args: vec![Expr::new(span, ExprNode::Const { path: vec![crate::ident::Symbol::from("Hash")] })],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    is_hash.ty = Some(Ty::Bool);
+    let mut converted = active_support_call(span, method.as_str(), r.clone());
+    converted.ty = Some(Ty::Hash { key: std::sync::Arc::new(key), value: std::sync::Arc::new(Ty::Untyped) });
+    let mut original = expr.clone();
+    original.leading_blank_line = false;
+    let mut guarded = Expr::new(
+        span,
+        ExprNode::If { cond: is_hash, then_branch: converted, else_branch: original },
+    );
+    guarded.ty = expr.ty.clone();
+    guarded.leading_blank_line = expr.leading_blank_line;
+    Some(guarded)
+}
+
 pub(crate) fn rewrite_node(expr: &mut Expr) {
+    if let Some(guarded) = guard_untyped_conversion(expr) {
+        *expr = guarded;
+        return;
+    }
     let replacement = match &mut *expr.node {
         // Rails' `ActiveSupport::JSON.encode(value, escape: false)`: the
         // document without the HTML-entity escaping, for text that is
