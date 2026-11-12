@@ -208,3 +208,95 @@ fn a_class_object_written_by_compound_or_reflective_assignment_runs_natively_wit
     run.assert_passes();
     assert!(run.stdout.contains("class object writes passed"), "{}", run.stdout);
 }
+
+// A before_action that reaches the write through a call of its own: the action starts from what the
+// callee stored, so `@loader.load` must resolve `Loader.load`. `Tally` receives the action's values,
+// and its sidecar declares their types.
+
+const TALLY: &str = r#"class Tally
+  def self.or_load(value)
+    value.to_s
+  end
+
+  def self.or_loader(loader)
+    loader.load.to_s
+  end
+
+  def self.eq_load(value)
+    value.to_s
+  end
+
+  def self.eq_loader(loader)
+    loader.load.to_s
+  end
+end
+"#;
+
+/// The filter calls the method that stores the class by `||=` or by `=`.
+fn loads_controller(class: &str, tally: &str, write: &str) -> String {
+    format!(
+        "class {class} < ApplicationController\n  before_action :prepare\n\n  def show\n    render plain: \"#{{Tally.{tally}_load(@loader.load)}} #{{Tally.{tally}_loader(@loader)}}\"\n  end\n\n  private\n\n  def prepare\n    remember_loader\n  end\n\n  def remember_loader\n    {write}\n  end\nend\n"
+    )
+}
+
+fn filter_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\nend\n")
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  get \"/or_loads\", to: \"or_loads#show\"\n  get \"/eq_loads\", to: \"eq_loads#show\"\nend\n",
+        )
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("app/models/loader.rb", LOADER)
+        .write("app/models/tally.rb", TALLY)
+        .write("app/controllers/or_loads_controller.rb", &loads_controller("OrLoadsController", "or", "@loader ||= Loader"))
+        .write("app/controllers/eq_loads_controller.rb", &loads_controller("EqLoadsController", "eq", "@loader = Loader"))
+}
+
+#[test]
+fn a_class_stored_by_a_before_actions_callee_is_the_class_in_the_action() {
+    let (tree, errors) = filter_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let rbs = std::fs::read_to_string(tree.join("sig/app/models/tally.rbs")).unwrap();
+    for line in [
+        "def self.or_load: (String value) -> String",
+        "def self.or_loader: (singleton(Loader) loader) -> String",
+        "def self.eq_load: (String value) -> String",
+        "def self.eq_loader: (singleton(Loader) loader) -> String",
+    ] {
+        assert!(rbs.lines().any(|l| l.trim() == line), "expected `{line}` in\n{rbs}");
+    }
+}
+
+const FILTER_SCRIPT: &str = r##"bodies = ["/or_loads", "/eq_loads"].map do |path|
+  status, _, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => "",
+    "HTTP_HOST" => "localhost", "rack.input" => StringIO.new(""))
+  "#{status} #{body.join}"
+end
+raise "bodies #{bodies.inspect}" unless bodies == ["200 class class"] * 2
+puts "a before_action's callee stored the class"
+"##;
+
+#[test]
+fn a_class_stored_by_a_before_actions_callee_runs_as_emitted_ruby() {
+    let run = filter_app().run_ruby(FILTER_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("a before_action's callee stored the class"), "{}", run.stdout);
+}
+
+const FILTER_NATIVE_SCRIPT: &str = r##"bodies = [OrLoadsController.new, EqLoadsController.new].map do |controller|
+  controller.params = {}
+  controller.process_action(:show)
+  "#{controller.status} #{controller.body}"
+end
+raise "bodies #{bodies.inspect}" unless bodies == ["200 class class"] * 2
+puts "a before_action's callee stored the class"
+"##;
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_class_stored_by_a_before_actions_callee_runs_natively_with_its_rbs() {
+    let run = filter_app().run_spinel_with_rbs(FILTER_NATIVE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("a before_action's callee stored the class"), "{}", run.stdout);
+}

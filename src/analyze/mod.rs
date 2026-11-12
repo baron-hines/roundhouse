@@ -8534,7 +8534,8 @@ fn collect_transitive_filter_ivars(
         | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
             let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
             if !own {
-                if let Some(ty) = value.ty.clone() {
+                // A class object stored is the class, as `walk_ivar_assignments` records the same write.
+                if let Some(ty) = value.ty.clone().map(|t| class_object_arg_ty(value, t)) {
                     union_ivar_maps(&mut out, HashMap::from_iter([(name.clone(), ty)]));
                 }
             }
