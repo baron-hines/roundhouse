@@ -25,8 +25,11 @@ impl SourceGemCode {
     /// Whether the gem alone wrote this method: one the app also defines
     /// under that name is left as the app's.
     fn wrote(&self, class: &str, m: &crate::dialect::MethodDef) -> bool {
-        let key = method_key(class, m);
-        self.gem_methods.contains(&key) && !self.app_methods.contains(&key)
+        self.wrote_key(&method_key(class, m))
+    }
+
+    fn wrote_key(&self, key: &MethodKey) -> bool {
+        self.gem_methods.contains(key) && !self.app_methods.contains(key)
     }
 }
 
@@ -128,7 +131,8 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
     // (`require "method_source"` in a loader that rescues LoadError). Ruby raises LoadError where the method runs; Spinel
     // resolves a require statically, and `spin build` refuses one it cannot satisfy.
     let provided_by_nothing = |path: &str| {
-        let feature = path.trim_end_matches(".rb");
+        // Looked up without its suffix: `io/wait.so` is Ruby's `io/wait` (the raise keeps the name as written).
+        let feature = feature_of(path);
         let root = feature.split('/').next().unwrap_or(feature);
         let under_ruby_root = feature.contains('/') && RUBY_FEATURE_ROOTS.contains(&root);
         let as_constant: Vec<String> = feature.split('/').map(|s| s.split(['_', '-']).map(capitalized).collect::<String>()).collect();
@@ -157,11 +161,23 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
         }
     }
     let gone = |written: &[&Symbol]| gone_in("", written);
+    // A mixin's method spliced into a controller is a copy of the module's: one a source gem alone wrote decides its
+    // `require`s as the original does. The walk below then finds nothing left to rewrite in it.
+    for controller in app.controllers.iter_mut() {
+        let Some(origins) = app.concern_spliced_actions.get(&controller.name) else { continue };
+        for item in controller.body.iter_mut() {
+            let crate::dialect::ControllerBodyItem::Action { action, .. } = item else { continue };
+            let Some(module) = origins.get(&action.name) else { continue };
+            let key = (module.0.as_str().to_string(), action.name.as_str().to_string(), false);
+            if source_gem.wrote_key(&key) {
+                let unloadable = |path: &str| unloadable(path) || provided_by_nothing(path);
+                walk(&mut action.body, &[], &absent, &gone, &unloadable);
+            }
+        }
+    }
     crate::lower::for_each_hook_body(app, &mut |e| walk(e, &[], &absent, &gone, &unloadable));
 }
 
-/// The first segment of a feature Ruby itself provides, as a default or bundled gem or part of the standard
-/// library, beyond `APP_REQUIRABLE_STDLIB` (`net/smtp`, `rbconfig`, `prism`).
 /// Ruby ships this exact feature: a root such as `json`, or a path under one that Ruby's own library or a default gem
 /// has (`net/http`, not net-http-persistent's `net/http/persistent`).
 fn ships_with_ruby(feature: &str) -> bool {
@@ -173,6 +189,13 @@ fn ships_with_ruby(feature: &str) -> bool {
     }
 }
 
+/// A required path as a feature: without `.rb` or a native extension's suffix.
+fn feature_of(path: &str) -> &str {
+    [".rb", ".so", ".bundle", ".dll"].iter().find_map(|ext| path.strip_suffix(ext)).unwrap_or(path)
+}
+
+/// The first segment of a feature Ruby itself provides, as a default or bundled gem or part of the standard
+/// library, beyond `APP_REQUIRABLE_STDLIB` (`net/smtp`, `rbconfig`, `prism`).
 const RUBY_FEATURE_ROOTS: &[&str] = &[
     "abbrev", "base64", "benchmark", "bigdecimal", "bundler", "cgi", "continuation", "coverage", "csv", "date", "debug",
     "delegate", "did_you_mean", "digest", "drb", "English", "erb", "error_highlight", "etc", "expect", "fcntl", "fiber",
