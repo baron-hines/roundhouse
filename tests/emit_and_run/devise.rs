@@ -575,7 +575,7 @@ fn a_serializer_scope_is_devises_current_user_only_under_devise_for_users() {
         (std::fs::read_to_string(tree.join("app/controllers/cards_controller.rb")).expect("cards_controller.rb"), errors)
     };
     let (cards, errors) = rendered("  devise_for :users\n");
-    assert!(cards.contains("CardSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).as_json_str"), "{cards}\n{errors:#?}");
+    assert!(cards.contains("CardSerializer.new(Article.find(@params[\"id\"]), { scope: current_user }).serializable_hash"), "{cards}\n{errors:#?}");
     for routes in [
         "  devise_for :users, class_name: \"User\"\n",
         "  devise_for :users, as: :member\n",
