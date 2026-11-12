@@ -2342,6 +2342,11 @@ fn runs_own_writer(expr: &Expr, methods: &[crate::dialect::MethodDef]) -> bool {
 /// local or method of the body's own.
 fn is_order_safe_value(e: &Expr) -> bool {
     match &*e.node {
+        // A block's body runs when it is called, not at the write: only a local it closes over is read here.
+        ExprNode::Lambda { .. } => closes_over_nothing(e),
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. } if matches!(method.as_str(), "proc" | "lambda") && args.is_empty() => {
+            closes_over_nothing(block)
+        }
         ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef => false,
         ExprNode::Send { recv: None, .. } => false,
         ExprNode::Send { block: Some(_), .. } => false,
@@ -2351,6 +2356,35 @@ fn is_order_safe_value(e: &Expr) -> bool {
             ok
         }
     }
+}
+
+/// Whether a block reads no local but its own parameters (and its nested blocks' own).
+fn closes_over_nothing(e: &Expr) -> bool {
+    fn free(e: &Expr, bound: &mut Vec<Symbol>) -> bool {
+        match &*e.node {
+            ExprNode::Var { name, .. } => return bound.contains(name),
+            ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
+                let ok = free(value, bound);
+                bound.push(name.clone());
+                return ok;
+            }
+            ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
+                let depth = bound.len();
+                bound.extend(params.iter().cloned());
+                bound.extend(rest_param.iter().cloned());
+                bound.extend(extra_params.iter().map(|p| p.name.clone()));
+                bound.extend(block_param.iter().cloned());
+                let ok = free(body, bound);
+                bound.truncate(depth);
+                return ok;
+            }
+            _ => {}
+        }
+        let mut ok = true;
+        e.node.for_each_child(&mut |c| ok = ok && free(c, bound));
+        ok
+    }
+    free(e, &mut Vec::new())
 }
 
 /// A literal (or an array/hash of literals): a value that reads no other
