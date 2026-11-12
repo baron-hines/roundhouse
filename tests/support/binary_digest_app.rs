@@ -4,7 +4,8 @@
 //! content, and model tests that build every record themselves (no
 //! `test/fixtures/`), read the digest back byte for byte, call
 //! `hexdigest` / `base64digest`, and say what the model does and does
-//! not answer with `assert_respond_to` / `refute_respond_to`.
+//! not answer with `assert_respond_to` / `refute_respond_to` (a private
+//! method is one it does not: `respond_to?` is public-only).
 //!
 //! `"content 9"` is chosen for its digest, which holds a NUL byte
 //! (`…44b2 0089…`): the one byte no quoted SQL literal can carry.
@@ -21,6 +22,13 @@ end
   #: (String content) -> Snapshot?
   def self.for_content(content)
     find_by(checksum: Digest::BLAKE3.digest(content))
+  end
+
+  private
+
+  #: () -> String
+  def salt
+    "pepper"
   end
 end
 "#)
@@ -89,6 +97,7 @@ class SnapshotTest < ActiveSupport::TestCase
     assert_respond_to snapshot, :checksum
     assert_respond_to snapshot, :label
     refute_respond_to snapshot, :shop_id
+    refute_respond_to snapshot, :salt
   end
 end
 "#;

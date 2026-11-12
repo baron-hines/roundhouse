@@ -48,7 +48,9 @@ fn rust_writes_binary_columns_as_bytes_and_hashes_with_blake3() {
     let test = read("src/tests/snapshot.rs");
     assert!(test.contains("blake3::hash("), "{test}");
     assert!(!test.contains("respond_to("), "{test}");
-    assert!(test.contains(r#"if false { panic!("{}", "refute_respond_to failed") };"#), "{test}");
+    // checksum and label answer, shop_id and the private salt do not.
+    assert!(test.contains(r#"if !(true) { panic!("{}", "assertion failed") };"#), "{test}");
+    assert_eq!(test.matches(r#"if false { panic!("{}", "refute failed") };"#).count(), 2, "{test}");
 }
 
 /// No `Digest::BLAKE3`, no `blake3` crate: the dependency is the call's.
@@ -104,6 +106,15 @@ fn an_unknown_constant_in_a_test_is_refused_on_strict_targets() {
     );
     let (_emitted, errors) = declared.emit(BuildTarget::Rust);
     assert!(!errors.iter().any(|e| e.contains("Probe")), "{errors:?}");
+
+    // Declaring `Probe` does not declare what is under it.
+    let beneath = binary_digest_app::app().edit(
+        "test/models/snapshot_test.rb",
+        "  test \"hexdigest\" do\n",
+        "  class Probe\n    def self.answer = 42\n  end\n\n  test \"beneath\" do\n    assert_nil Probe::Missing.digest(\"a\")\n  end\n\n  test \"hexdigest\" do\n",
+    );
+    let (_emitted, errors) = beneath.emit(BuildTarget::Rust);
+    assert!(errors.iter().any(|e| e.contains("Probe::Missing")), "{errors:?}");
 }
 
 /// The CRuby tree declares the digest gem that has BLAKE3 and its
@@ -125,6 +136,20 @@ fn cruby_runs_the_digest_tests() {
     assert!(gemfile.contains("gem \"digest\", \">= 3.3.0\""), "{gemfile}");
 }
 
+/// An initializer is the app's code too: a BLAKE3 call only there still
+/// declares the gem.
+#[test]
+fn an_initializer_alone_declares_the_digest_gem() {
+    let (emitted, errors) = binary_digest_app::app()
+        .write("app/models/snapshot.rb", "class Snapshot < ApplicationRecord\nend\n")
+        .write("test/models/snapshot_test.rb", "require \"test_helper\"\n\nclass SnapshotTest < ActiveSupport::TestCase\n  test \"nothing\" do\n    assert_nil Snapshot.first\n  end\nend\n")
+        .write("config/initializers/fingerprint.rb", "FINGERPRINT = Digest::BLAKE3.hexdigest(\"build\")\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    let gemfile = std::fs::read_to_string(emitted.join("Gemfile")).expect("Gemfile");
+    assert!(gemfile.contains("gem \"digest\", \">= 3.3.0\""), "{gemfile}");
+}
+
 /// The emitted Rust project's `cargo test`: every test passes.
 #[test]
 #[ignore]
@@ -138,6 +163,7 @@ fn rust_cargo_test_passes_the_digest_tests() {
         .expect("run cargo test");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("test result:"), "the emitted project did not build:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "cargo test failed:\n{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     for name in binary_digest_app::PASSING {
         assert!(stdout.contains(&format!("tests::{name} ... ok")), "{name}:\n{stdout}");
     }

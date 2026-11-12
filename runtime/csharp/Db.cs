@@ -224,10 +224,17 @@ public static class Db
     public static string EscapeBoolOpt(bool? value) =>
         value is null ? "NULL" : (value.Value ? "1" : "0");
 
-    // `t.binary` columns: the text methods. No value here reaches the
-    // column as bytes (`Digest::BLAKE3` is not emitted for this target).
-    public static string EscapeBinary(string? value) => EscapeString(value);
-    public static string EscapeBinaryOpt(string? value) => EscapeStringOpt(value);
+    // `t.binary` columns: a value is its UTF-8 bytes (`Digest::BLAKE3` is
+    // not emitted for this target). One holding a NUL is written as an
+    // `X'…'` blob literal, since a NUL inside a quoted literal ends the
+    // SQL text; anything else is the text literal. GetString decodes a
+    // BLOB cell as UTF-8, so the read side is the text method.
+    public static string EscapeBinary(string? value) =>
+        value is not null && value.Contains('\0')
+            ? "X'" + Convert.ToHexString(System.Text.Encoding.UTF8.GetBytes(value)) + "'"
+            : EscapeString(value);
+    public static string EscapeBinaryOpt(string? value) =>
+        value is null ? "NULL" : EscapeBinary(value);
     public static string ColumnBinary(long stmt, long index) => ColumnText(stmt, index);
     public static string? ColumnBinaryOpt(long stmt, long index) => ColumnTextOpt(stmt, index);
 

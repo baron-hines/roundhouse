@@ -1296,6 +1296,9 @@ impl Analyzer {
                 }
             } else {
                 classes.entry(id.clone()).or_default().source_instance_methods.insert(method.name.clone());
+                if method.visibility != crate::dialect::MethodVisibility::Public {
+                    classes.entry(id.clone()).or_default().nonpublic_instance_methods.insert(method.name.clone());
+                }
                 if method.name.as_str() == "each" && forwards_block_to_each(method) {
                     classes.entry(id.clone()).or_default().each_forwards_block = true;
                 }

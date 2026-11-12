@@ -487,16 +487,35 @@ type its values `ValueType::Binary`. A digest such as
 NUL byte, which no quoted SQL literal carries.
 
 **Why a pair of its own.** In the Ruby family a String carries its
-encoding, so `escape_string` already writes an `X'…'` literal for a value
-that holds a NUL or is non-ASCII BINARY. Those shims, and every target
-without a byte type in its String, alias the binary pair to the text
-pair. Rust's `String` is UTF-8 with no encoding tag. There the pair is
-real: a binary value is held one char per byte (U+0000–U+00FF),
-`escape_binary` writes `X'…'` for any NUL or high byte, and
-`column_binary` reads a BLOB back the same way. `find_by` on a binary
-column escapes through the same method, so a lookup by digest matches
-the bytes the INSERT stored. Spinel binds parameters, so `Binary` binds
-through `bind_text`.
+encoding, so the SQLite shims' `escape_string` already writes an `X'…'`
+literal for a value that holds a NUL or is non-ASCII BINARY, and they
+alias the binary pair to the text pair. Rust's `String` is UTF-8 with no
+encoding tag. There the pair is real: a binary value is held one char
+per byte (U+0000–U+00FF), `escape_binary` writes `X'…'` for any NUL or
+high byte, and `column_binary` reads a BLOB back the same way. `find_by`
+on a binary column escapes through the same method, so a lookup by
+digest matches the bytes the INSERT stored. Spinel binds parameters, so
+`Binary` binds through `bind_text`.
+
+The other shims treat a value as its UTF-8 bytes (none of them emits
+`Digest::BLAKE3`). Crystal, C#, Elixir, Go, Kotlin and Python write
+`X'…'` when the value holds a NUL, since a NUL inside a quoted literal
+ends the SQL text (Python's sqlite3 refuses it outright), and the text
+literal otherwise. Crystal and Python decode a BLOB cell, which their
+drivers hand back as bytes, as UTF-8. On PostgreSQL (`db_pg.rb`) the
+column is `bytea`: `escape_binary` writes bytea's hex input format,
+`'\x…'`, and `column_binary` decodes the `\x` hex that the text result
+format returns into an ASCII-8BIT string, as Rails reads it.
+
+**Known gaps.**
+- **JRuby** reads a binary column through JDBC `getString`, which
+  decodes the BLOB as UTF-8, so bytes that are not valid UTF-8 (most
+  digests) do not round-trip. Writes are correct (`X'…'`).
+- **Rust `Digest::BLAKE3`** hashes its argument's UTF-8 bytes. A value
+  read back from a binary column is one char per byte, so one holding a
+  byte at or above 0x80 hashes differently from CRuby, which hashes the
+  raw bytes. Hashing text, the usual case and what the pinned test
+  exercises, agrees.
 
 **`Digest::BLAKE3`** is typed in the stdlib registry next to MD5/SHA1/
 SHA256, and it exists only where a runtime has it: CRuby, from the digest

@@ -2798,9 +2798,16 @@ fn report_test_unknown_constants(app: &App, target: BuildTarget) {
         .iter()
         .flat_map(|m| m.inner_classes.iter())
         .flat_map(|c| {
+            // The class by its full name and its last segment (as the
+            // test reads it), and each constant it defines under either.
             let full = c.name.0.as_str().to_string();
             let last = full.rsplit("::").next().unwrap_or_default().to_string();
-            [full, last]
+            let constants: Vec<String> = c
+                .constants
+                .iter()
+                .flat_map(|(name, _)| [format!("{full}::{}", name.as_str()), format!("{last}::{}", name.as_str())])
+                .collect();
+            [full, last].into_iter().chain(constants)
         })
         .collect();
     let walk = |expr: &Expr| {
@@ -2810,9 +2817,9 @@ fn report_test_unknown_constants(app: &App, target: BuildTarget) {
                 && let ExprNode::Const { path } = &*expr.node
             {
                 let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
-                let full = segments.join("::");
-                let root = segments.first().copied().unwrap_or_default();
-                if !declared.contains(&full) && !declared.contains(root) {
+                // The exact path only: a declared `Known` does not
+                // declare `Known::Missing`.
+                if !declared.contains(&segments.join("::")) {
                     emit::diagnostics::report_unsupported(expr.span, target.as_str(), "constant", detail.clone());
                 }
             }
@@ -5580,7 +5587,6 @@ fn ruby_family_runtime_files(
     // above explicitly select native gems for both Ruby-family targets.
     if flavor == RubyFlavor::CRuby {
         apply_locked_external_gem_wiring(&mut files, app);
-        apply_digest_gem(&mut files);
     }
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
@@ -5591,6 +5597,10 @@ fn ruby_family_runtime_files(
     // the ruby family is the one that can run the lines.
     apply_module_mixins(&mut files, app, MixinForm::ExplicitReceiver);
     apply_boot_program(&mut files, app, RequireTarget::RubyFamily);
+    // After the boot program, whose initializers may be the only caller.
+    if flavor == RubyFlavor::CRuby {
+        apply_digest_gem(&mut files);
+    }
     // Overlay boot replaced the spinel boot, so the flags written into
     // that file in `spinel_files` are gone. Write them again here.
     apply_environment_flags(&mut files, app);
@@ -11887,14 +11897,17 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> Res
 }
 
 /// `Digest::BLAKE3` is the digest gem's from 3.3.0; the digest Ruby 4.0
-/// bundles is 3.2.1, which has no BLAKE3. A tree whose app or tests
-/// name it declares the version that does (`report_digest_blake3` keeps
-/// the constant off the targets with no BLAKE3 at all). Not the
-/// emitted helper: `test/test_helper.rb` is ours, not a demand.
+/// bundles is 3.2.1, which has no BLAKE3. A tree whose own code names
+/// it declares the version that does (`report_digest_blake3` keeps the
+/// constant off the targets with no BLAKE3 at all). Every emitted Ruby
+/// file is the app's (app/, lib/, config/ with the initializers the boot
+/// program writes, test/, boot.rb) except the framework runtime and the
+/// emitted test helper.
 fn apply_digest_gem(files: &mut [(String, String)]) {
     const DECLARATION: &str = "gem \"digest\", \">= 3.3.0\"";
     let demanded = files.iter().any(|(p, c)| {
-        (p.starts_with("app/") || (p.starts_with("test/") && p != "test/test_helper.rb"))
+        !p.starts_with("runtime/")
+            && p != "test/test_helper.rb"
             && p.ends_with(".rb")
             && c.contains("Digest::BLAKE3")
     });

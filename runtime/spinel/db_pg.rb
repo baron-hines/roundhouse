@@ -1467,23 +1467,45 @@ module Db
     s.nil? ? "NULL" : escape_string(s)
   end
 
-  # `t.binary` columns (the lowerer's `ValueType::Binary`). This shim
-  # tells bytes from text by the value's encoding, so they are its text
-  # methods; the separate names are for a target that cannot (Rust).
+  # `t.binary` columns (the lowerer's `ValueType::Binary`), which are
+  # `bytea` here. A value is written in bytea's hex input format,
+  # `'\x…'` (standard_conforming_strings, on since PostgreSQL 9.1, keeps
+  # the backslash literal), so a NUL or a byte that is not UTF-8 reaches
+  # the column intact. The text result format renders bytea the same
+  # way, so a read decodes the `\x` hex back to the bytes.
   def self.escape_binary(s)
-    escape_string(s)
+    "'\\x" + s.to_s.unpack1("H*") + "'"
   end
 
   def self.escape_binary_opt(s)
-    escape_string_opt(s)
+    s.nil? ? "NULL" : escape_binary(s)
   end
 
   def self.column_binary(stmt, i)
-    column_text(stmt, i)
+    v = column_binary_opt(stmt, i)
+    return "" if v.nil?
+    v
   end
 
   def self.column_binary_opt(stmt, i)
-    column_text_opt(stmt, i)
+    v = Db.cell(stmt, i)
+    return nil if v.nil?
+    Db.bytea_decode(v)
+  end
+
+  # `\x` + hex pairs to the bytes they spell, as an ASCII-8BIT string
+  # (what Rails reads a bytea as); anything else (a value stored before
+  # the column was bytea) as it is.
+  def self.bytea_decode(s)
+    return s if !s.start_with?("\\x")
+    out = "".dup
+    i = 2
+    n = s.bytesize
+    while i + 1 < n
+      out = out + (PgUrl.hex(s.getbyte(i)) * 16 + PgUrl.hex(s.getbyte(i + 1))).chr
+      i += 2
+    end
+    out.force_encoding("ASCII-8BIT")
   end
 
   def self.escape_int_opt(n)
