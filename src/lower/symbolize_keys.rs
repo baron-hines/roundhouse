@@ -205,6 +205,9 @@ fn guard_untyped_conversion(expr: &Expr) -> Option<Expr> {
     converted.ty = Some(Ty::Hash { key: std::sync::Arc::new(key), value: std::sync::Arc::new(Ty::Untyped) });
     let mut original = expr.clone();
     original.leading_blank_line = false;
+    // The splat belongs to the argument position the guard takes over
+    // (`rewrite_node`), not to the fallback call inside it.
+    original.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
     let mut guarded = Expr::new(
         span,
         ExprNode::If { cond: is_plain_hash, then_branch: converted, else_branch: original },
@@ -215,7 +218,15 @@ fn guard_untyped_conversion(expr: &Expr) -> Option<Expr> {
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr, untyped_guard: bool) {
-    if untyped_guard && let Some(guarded) = guard_untyped_conversion(expr) {
+    // A `**h.symbolize_keys` argument that `lower::forwarding` made
+    // positional is marked on the node in argument position, and the
+    // Ruby emitter writes the `**` back from that mark. Whatever replaces
+    // the call takes the position, so it takes the mark: a keyword-only
+    // callee reached through `public_send` or an untyped receiver
+    // otherwise gets one positional Hash.
+    let splat = expr.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
+    if untyped_guard && let Some(mut guarded) = guard_untyped_conversion(expr) {
+        guarded.decisions |= splat;
         *expr = guarded;
         return;
     }
@@ -462,7 +473,8 @@ pub(crate) fn rewrite_node(expr: &mut Expr, untyped_guard: bool) {
         }
         _ => None,
     };
-    if let Some(r) = replacement {
+    if let Some(mut r) = replacement {
+        r.decisions |= splat;
         *expr = r;
     }
 }

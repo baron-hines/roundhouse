@@ -220,3 +220,89 @@ fn native_conversions_match_rails_with_generated_signatures() {
         assert_eq!(String::from_utf8_lossy(&run.stdout), EXPECTED, "--rbs {signatures}");
     }
 }
+
+/// `**saved.symbolize_keys` into keyword-only methods the lowering can't
+/// resolve: through an untyped receiver, and through `public_send`. The
+/// converted value must stay a keyword splat.
+const KEYWORDS: &str = r##"class KeywordReceiver
+  def call(name:, note: nil)
+    "#{name}/#{note.inspect}"
+  end
+end
+
+class KeywordCalls
+  def self.direct(receiver, saved)
+    receiver.call(**saved.symbolize_keys)
+  end
+
+  def self.reflected(receiver, saved)
+    receiver.public_send(:call, **saved.symbolize_keys)
+  end
+
+  def self.typed_reflected(receiver)
+    receiver.public_send(:call, **{ "name" => "typed" }.symbolize_keys)
+  end
+end
+"##;
+
+const KEYWORD_CASES: &str = r#"
+puts KeywordCalls.direct(KeywordReceiver.new, { "name" => "first" })
+puts KeywordCalls.reflected(KeywordReceiver.new, { "name" => "second", "note" => "n" })
+puts KeywordCalls.typed_reflected(KeywordReceiver.new)
+"#;
+
+const KEYWORD_EXPECTED: &str = "first/nil\nsecond/\"n\"\ntyped/nil\n";
+
+fn keywords() -> emit_and_run::Overlay {
+    emit_and_run::empty_app().write("app/models/keyword_calls.rb", KEYWORDS)
+}
+
+#[test]
+fn keyword_splats_match_rails() {
+    let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let script = format!(
+        "require {oracle:?}\n\
+         unless RailsOracle.available?(\"activesupport\")\n\
+           warn \"skipping: #{{RailsOracle.label}} activesupport is not installed\"\n\
+           exit 77\n\
+         end\n\
+         RailsOracle.activate(\"activesupport\")\n\
+         require 'active_support/core_ext/hash/keys'\n{KEYWORDS}\n{KEYWORD_CASES}"
+    );
+    let output = std::process::Command::new("ruby").args(["-e", &script]).output().expect("Rails oracle");
+    if output.status.code() == Some(77) {
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
+        return;
+    }
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), KEYWORD_EXPECTED);
+    let run = keywords().run_ruby(KEYWORD_CASES);
+    run.assert_passes();
+    assert_eq!(run.stdout, KEYWORD_EXPECTED);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn native_keyword_splats_match_rails() {
+    let (tree, errors) = keywords().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    let mut models: Vec<String> = std::fs::read_dir(tree.join("app/models"))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".rb").map(str::to_string))
+        .collect();
+    models.sort();
+    let requires: String = models.iter().map(|m| format!("require_relative \"app/models/{m}\"\n")).collect();
+    std::fs::write(tree.join("contract.rb"), format!("require_relative \"runtime/active_support_ext\"\n{requires}{KEYWORD_CASES}"))
+        .unwrap();
+    let spinel = std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into());
+    let built = std::process::Command::new(&spinel)
+        .args(["--strict-require", "--rbs", "app/models", "contract.rb", "-o", "contract"])
+        .current_dir(&tree)
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let run = std::process::Command::new(tree.join("contract")).current_dir(&tree).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), KEYWORD_EXPECTED);
+}
