@@ -428,3 +428,39 @@ pub(super) fn raise_undefined_capitalized_calls(app: &mut App) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOX: &str = "module Shelf\n  class Box\n    def self.pretty!\n      require \"fancy_printer\"\n    end\n\n    def self.local_tag\n      require \"local_formatter\"\n    end\n  end\nend\n";
+
+    /// A gem class the app reopens holds the gem's methods and the app's. Only the gem's own `require` of a library
+    /// nothing provides becomes the `LoadError` Ruby raises; the app's `require` of its own lib file is the app's.
+    #[test]
+    fn an_apps_own_method_on_a_reopened_gem_class_keeps_its_require() {
+        let tree: crate::vfs::FileTree = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            ("lib/shelf/box.rb", BOX),
+            ("lib/local_formatter.rb", "class LocalFormatter\nend\n"),
+        ]
+        .into_iter()
+        .map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec()))
+        .collect();
+        let mut app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+        // The class as ingest sees it when the gem is compiled from source and an app file reopens it.
+        let gem_file = super::super::sources::register(".roundhouse/source_gems/shelf-1.0.0/lib/shelf.rb", BOX);
+        let app_file = super::super::sources::register("lib/shelf/box.rb", BOX);
+        let class = app.library_classes.iter_mut().find(|c| c.name.0.as_str() == "Shelf::Box").expect("Shelf::Box");
+        for m in &mut class.methods {
+            m.name_span.file = if m.name.as_str() == "pretty!" { gem_file } else { app_file };
+        }
+        app.gem_lock = Some(crate::gems::Lockfile::default());
+        let classes = source_gem_classes(&app);
+        mark(&mut app, &classes);
+        let class = app.library_classes.iter().find(|c| c.name.0.as_str() == "Shelf::Box").expect("Shelf::Box");
+        let body = |name: &str| format!("{:?}", class.methods.iter().find(|m| m.name.as_str() == name).expect(name).body);
+        assert!(body("pretty!").contains("cannot load such file -- fancy_printer"), "{}", body("pretty!"));
+        assert!(body("local_tag").contains("local_formatter") && !body("local_tag").contains("cannot load such file"), "{}", body("local_tag"));
+    }
+}

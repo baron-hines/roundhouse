@@ -17,3 +17,14 @@ fn the_spinel_emit_raises_load_error_for_a_gems_method_body_require_of_an_absent
     assert!(!pretty.contains("require \"fancy_printer\""), "{pretty}");
     assert!(pretty.contains("raise LoadError.new(\"cannot load such file -- fancy_printer\")"), "{pretty}");
 }
+
+/// A library another locked, installed gem ships as `lib/optional_backend.rb` loads on Ruby, whatever that gem's
+/// name or namespace: its `require` stays.
+#[test]
+fn the_spinel_emit_keeps_a_require_another_locked_gem_ships() {
+    let (emitted, errors) = contract::app_with_backend().emit(BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("optional_backend")), "{errors:#?}");
+    let backend = std::fs::read_to_string(emitted.join("app/models/shelf/backend.rb")).expect("backend.rb");
+    assert!(!backend.contains("cannot load such file -- optional_backend"), "{backend}");
+    assert!(backend.contains("require \"optional_backend\""), "{backend}");
+}

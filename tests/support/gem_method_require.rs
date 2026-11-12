@@ -41,17 +41,52 @@ raise "pretty_kind #{got.inspect}" unless got == "nil box"
 puts "gem method require passed"
 "#;
 
-#[allow(dead_code)]
-pub fn app() -> emit_and_run::Overlay {
+/// A second locked gem, installed, whose `lib` ships `optional_backend.rb` under a name and namespace of its own.
+const BACKENDS: &str = "vendor/bundle/ruby/3.4.0/gems/backends-1.0.0/lib/optional_backend.rb";
+
+pub const OPTIONAL_BACKEND: &str = "module OptionalBackend\n  def self.tag\n    \"optional\"\n  end\nend\n";
+
+/// The gem's loader of a library another locked gem ships: Ruby loads it.
+pub const SHELF_BACKEND: &str = r#"module Shelf
+  module Backend
+    def self.load!
+      require "optional_backend"
+      true
+    rescue LoadError
+      nil
+    end
+  end
+end
+"#;
+
+pub const ARTICLE_BACKEND: &str = "class ArticleBackend\n  def self.loaded\n    Shelf::Backend.load!.inspect\n  end\nend\n";
+
+/// real-blog with the `gems` locked and installed under `vendor/bundle`.
+fn with_gems(gems: &[&str]) -> emit_and_run::Overlay {
     let fixture = roundhouse::fixtures::real_blog();
     let lock = std::fs::read_to_string(fixture.join("Gemfile.lock")).unwrap();
     assert!(lock.contains("\n    rack (") && lock.contains("DEPENDENCIES\n"), "the fixture's Gemfile.lock changed shape");
-    let lock = lock.replacen("\n    rack (", "\n    shelf (1.0.0)\n    rack (", 1).replacen("DEPENDENCIES\n", "DEPENDENCIES\n  shelf\n", 1);
-    let gemfile = std::fs::read_to_string(fixture.join("Gemfile")).unwrap() + "gem \"shelf\"\n";
+    let specs: String = gems.iter().map(|g| format!("\n    {g} (1.0.0)")).collect();
+    let deps: String = gems.iter().map(|g| format!("  {g}\n")).collect();
+    let lock = lock.replacen("\n    rack (", &format!("{specs}\n    rack ("), 1).replacen("DEPENDENCIES\n", &format!("DEPENDENCIES\n{deps}"), 1);
+    let gemfile = std::fs::read_to_string(fixture.join("Gemfile")).unwrap() + &gems.iter().map(|g| format!("gem \"{g}\"\n")).collect::<String>();
     emit_and_run::real_blog()
         .write("Gemfile", &gemfile)
         .write("Gemfile.lock", &lock)
         .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
-        .write(GEM, SHELF)
+}
+
+#[allow(dead_code)]
+pub fn app() -> emit_and_run::Overlay {
+    with_gems(&["shelf"]).write(GEM, SHELF).write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// [`app`] with `Shelf::Backend` in the gem and the `backends` gem beside it.
+#[allow(dead_code)]
+pub fn app_with_backend() -> emit_and_run::Overlay {
+    with_gems(&["backends", "shelf"])
+        .write(GEM, &format!("{SHELF}{SHELF_BACKEND}"))
+        .write(BACKENDS, OPTIONAL_BACKEND)
         .write("app/models/article_box.rb", ARTICLE_BOX)
+        .write("app/models/article_backend.rb", ARTICLE_BACKEND)
 }
