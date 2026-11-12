@@ -157,6 +157,9 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
     // in the source is a use.
     let mut reached: HashMap<String, usize> = HashMap::default();
     for_each_rewritten_body(app, &mut |body| count_resources(body, &mut reached));
+    // Where each serializer is first read through a resource the rewrite
+    // takes: such a site passes no scope (below).
+    let resource_at: HashMap<ClassId, String> = resource_sites.iter().map(|(id, (_, at))| (id.clone(), at.clone())).collect();
     for (id, (count, at)) in resource_sites {
         if reached.get(id.0.as_str()).copied().unwrap_or(0) < count {
             used.entry(id).or_insert(at);
@@ -187,6 +190,18 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
                 continue;
             }
             match collect_fields(&class, source) {
+                // A resource passes its serializer no scope unless it's
+                // given `scope:` (active_model_serializers 0.10.16), and
+                // defines no scope name, so a serializer that reads
+                // `current_user` raises NameError there: that use is the
+                // gem's.
+                Ok((_, reads)) if reads.current_user && resource_at.contains_key(&id) => {
+                    let at = &resource_at[&id];
+                    refused.insert(
+                        id,
+                        refuse(source, offset, &format!("used at {at} other than through `render json:`, which needs the gem's class")),
+                    );
+                }
                 Ok((fields, reads)) => {
                     let span =
                         Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
@@ -257,7 +272,12 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
             rewrite_renders(&mut action.body, &lowered);
         }
     }
-    for_each_rewritten_body(app, &mut |body| rewrite_resources(body, &lowered));
+    // A resource passes no scope, so a serializer that reads only `scope`
+    // reads nil there, as `S.new(x)` does; one reading `current_user` was
+    // refused above.
+    let unscoped: HashSet<String> =
+        decls.iter().filter(|(_, d)| !d.reads.current_user).map(|(id, _)| id.0.as_str().to_string()).collect();
+    for_each_rewritten_body(app, &mut |body| rewrite_resources(body, &unscoped));
     Ok(())
 }
 
