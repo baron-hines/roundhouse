@@ -667,6 +667,7 @@ fn value_type_for(col_type: &ColumnType) -> ValueType {
         | ColumnType::BigInt
         | ColumnType::Reference { .. } => ValueType::Int,
         ColumnType::Boolean => ValueType::Bool,
+        ColumnType::Binary => ValueType::Binary,
         _ => ValueType::Str,
     }
 }
@@ -742,7 +743,7 @@ mod tests {
                 primary_key_columns: Vec::new(),
             },
         );
-        let schema = Schema { tables };
+        let schema = Schema { tables, ..Default::default() };
 
         let mut registry = HashMap::default();
         let mut comment_info = ClassInfo::default();

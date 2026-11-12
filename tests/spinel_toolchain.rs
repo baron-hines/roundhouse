@@ -316,6 +316,10 @@ mod auto_source_gem;
 mod gem_method_require_contract;
 #[path = "spinel_toolchain/gem_method_require.rs"]
 mod gem_method_require;
+#[path = "support/block_arg_conditional.rs"]
+mod block_arg_conditional_contract;
+#[path = "spinel_toolchain/block_arg_conditional.rs"]
+mod block_arg_conditional;
 #[path = "support/untyped_calendar.rs"]
 mod untyped_calendar_contract;
 #[path = "spinel_toolchain/untyped_calendar.rs"]
