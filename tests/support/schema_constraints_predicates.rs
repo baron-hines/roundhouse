@@ -442,6 +442,7 @@ fn a_case_sensitive_like_pragma_keeps_the_portable_grammar() {
         ("a symbol key", format!("{test}  pragmas:\n    :case_sensitive_like: 1\n")),
         ("a computed value", format!("{test}  pragmas:\n    case_sensitive_like: <%= ENV[\"LIKE\"] %>\n")),
         ("computed pragmas", format!("{test}  pragmas: <%= ENV[\"PRAGMAS\"] %>\n")),
+        ("a computed key", format!("{test}  <%= \"pragmas\" %>:\n    case_sensitive_like: true\n")),
         ("an anchor", "default: &default\n  adapter: sqlite3\n  pragmas:\n    case_sensitive_like: true\ntest:\n  <<: *default\n  database: storage/test.sqlite3\n".to_string()),
         ("production's cache", format!("{test}production:\n  primary:\n    adapter: sqlite3\n    database: storage/production.sqlite3\n  cache:\n    adapter: sqlite3\n    database: storage/production_cache.sqlite3\n    pragmas:\n      case_sensitive_like: true\n")),
     ] {

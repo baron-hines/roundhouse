@@ -146,7 +146,9 @@ pub(crate) fn database_configurations(text: &str, file: FileId) -> Configuration
             let label = format!("`{env}.{name}`");
             let scalar = |key: &str| hash.get(key).cloned();
             let other_pragma = |key: &Value| matches!(key, Value::String(key) if !key.contains(ERB_VALUE) && !key.trim_start_matches(':').eq_ignore_ascii_case("case_sensitive_like"));
-            out.case_sensitive_like |= match scalar("pragmas").or_else(|| scalar(":pragmas")) {
+            // ERB runs before YAML is parsed, so a computed key may be `pragmas`.
+            let computed_key = hash.keys().any(|key| matches!(key, Value::String(key) if key.contains(ERB_VALUE)));
+            out.case_sensitive_like |= computed_key || match scalar("pragmas").or_else(|| scalar(":pragmas")) {
                 None => false,
                 Some(Value::Mapping(pragmas)) => !pragmas.keys().all(other_pragma),
                 Some(_) => true,
