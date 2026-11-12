@@ -1990,6 +1990,20 @@ impl<'a> BodyTyper<'a> {
                         elem: std::sync::Arc::new(Ty::Class { id: id.clone(), args: vec![].into() }),
                     };
                 }
+                // TLS writers belong to an HTTP instance, unless the app owns a class-side override.
+                if !instance_receiver && matches!(method.as_str(), "verify_mode=" | "verify_hostname=" | "cert_store=")
+                {
+                    let mut owner = Some(id);
+                    for _ in 0..32 {
+                        let Some(current) = owner else { break };
+                        let Some(info) = self.classes().get(current) else { break };
+                        if info.class_methods.contains_key(method)
+                            || info.class_method_extensions.iter().any(|m| self.declares_instance_method(m, method))
+                        { break; }
+                        if current.0.as_str() == "Net::HTTP" { return unknown(); }
+                        owner = info.parent.as_ref();
+                    }
+                }
                 // A model's class-side relation builder that no class in
                 // the chain defines (`Widget.includes(:gadget)`,
                 // `Widget.order(:id)`). The analyzer's registry seeds the

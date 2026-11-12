@@ -3773,21 +3773,21 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
 
 /// A column, an `attr_*` or an instance method of the model names `attr` (or its writer).
 fn model_declares_attr(model: &crate::dialect::Model, attr: &crate::ident::Symbol) -> bool {
+    model_declares_side(model, attr, true) || model_declares_side(model, attr, false)
+}
+
+/// The model answers `attr` (`reader`) or `attr=` itself: a column, its own `def`, or the `attr_*` that defines that side.
+fn model_declares_side(model: &crate::dialect::Model, attr: &crate::ident::Symbol, reader: bool) -> bool {
     use crate::dialect::{MethodReceiver, ModelBodyItem};
     use crate::expr::{ExprNode, Literal};
-let setter = crate::ident::Symbol::from(format!("{}=", attr.as_str()));
+    let name = if reader { attr.clone() } else { crate::ident::Symbol::from(format!("{}=", attr.as_str())) };
+    let macros: &[&str] = if reader { &["attr_accessor", "attr_reader"] } else { &["attr_accessor", "attr_writer"] };
     model.attributes.fields.contains_key(attr)
         || model.body.iter().any(|item| match item {
-            ModelBodyItem::Method { method, .. } => {
-                method.receiver == MethodReceiver::Instance && (method.name == *attr || method.name == setter)
-            }
+            ModelBodyItem::Method { method, .. } => method.receiver == MethodReceiver::Instance && method.name == name,
             ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
-                ExprNode::Send { recv: None, method, args, .. }
-                    if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") =>
-                {
-                    args.iter().any(|arg| {
-                        matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)
-                    })
+                ExprNode::Send { recv: None, method, args, .. } if macros.contains(&method.as_str()) => {
+                    args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr))
                 }
                 _ => false,
             },
@@ -3795,29 +3795,78 @@ let setter = crate::ident::Symbol::from(format!("{}=", attr.as_str()));
         })
 }
 
+/// The module `written` names in `from`'s body: looked up from `from`'s namespace outward, then as written.
+fn lexical_module(app: &App, from: &crate::ident::ClassId, written: &crate::ident::ClassId) -> crate::ident::ClassId {
+    let name = written.0.as_str();
+    if let Some(top) = name.strip_prefix("::") {
+        return crate::ident::ClassId(crate::ident::Symbol::from(top));
+    }
+    let mut scope = Some(from.0.as_str());
+    while let Some(prefix) = scope {
+        let candidate = format!("{prefix}::{name}");
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == candidate) {
+            return crate::ident::ClassId(crate::ident::Symbol::from(candidate.as_str()));
+        }
+        scope = prefix.rsplit_once("::").map(|(p, _)| p);
+    }
+    written.clone()
+}
+
 /// `confirmation:` on `attr`: Rails' `ConfirmationValidator#setup!` defines a plain `<attr>_confirmation` reader and
 /// writer where the model has none, so the model gains that `attr_accessor`, ahead of the validation.
 fn define_confirmation_accessors(app: &mut App) {
     use crate::dialect::{ModelBodyItem, ValidationRule};
     use crate::expr::{ExprNode, Literal};
-    for model in &mut app.models {
-        let mut wanted: Vec<(usize, crate::ident::Symbol, crate::span::Span)> = Vec::new();
+    // What the modules each model includes define, which Ruby's `method_defined?` counts as the model's.
+    let mixed_in: Vec<crate::det::HashSet<crate::ident::Symbol>> = app
+        .models
+        .iter()
+        .map(|model| {
+            let mut out = crate::det::HashSet::default();
+            let mut pending = crate::analyze::model_includes(model);
+            let mut seen = crate::det::HashSet::default();
+            while let Some(id) = pending.pop() {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                for lc in app.library_classes.iter().filter(|c| c.name == id) {
+                    out.extend(lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.clone()));
+                    // Not as written: a module includes a sibling by its short name, which names it from its own namespace outward.
+                    pending.extend(lc.includes.iter().map(|written| lexical_module(app, &lc.name, written)));
+                }
+            }
+            out
+        })
+        .collect();
+    for (model, mixed_in) in app.models.iter_mut().zip(mixed_in) {
+        let mut wanted: Vec<(usize, crate::ident::Symbol, crate::span::Span, &'static str)> = Vec::new();
         for (i, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Validation { validation, .. } = item else { continue };
             if !validation.rules.iter().any(|rule| matches!(rule, ValidationRule::Confirmation { .. })) {
                 continue;
             }
             let name = crate::ident::Symbol::from(format!("{}_confirmation", validation.attribute.as_str()));
-            if !model_declares_attr(model, &name) && !wanted.iter().any(|(_, n, _)| *n == name) {
-                wanted.push((i, name, item.span()));
+            if wanted.iter().any(|(_, n, _, _)| *n == name) {
+                continue;
             }
+            // Each side on its own, as `setup!` asks `method_defined?` of the reader and of the writer.
+            let writer = crate::ident::Symbol::from(format!("{}=", name.as_str()));
+            let reader_declared = model_declares_side(model, &name, true) || mixed_in.contains(&name);
+            let writer_declared = model_declares_side(model, &name, false) || mixed_in.contains(&writer);
+            let macro_name = match (reader_declared, writer_declared) {
+                (true, true) => continue,
+                (true, false) => "attr_writer",
+                (false, true) => "attr_reader",
+                (false, false) => "attr_accessor",
+            };
+            wanted.push((i, name, item.span(), macro_name));
         }
-        for (i, name, span) in wanted.into_iter().rev() {
+        for (i, name, span, macro_name) in wanted.into_iter().rev() {
             let accessor = crate::expr::Expr::new(
                 span,
                 ExprNode::Send {
                     recv: None,
-                    method: crate::ident::Symbol::from("attr_accessor"),
+                    method: crate::ident::Symbol::from(macro_name),
                     args: vec![crate::expr::Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: name } })],
                     block: None,
                     parenthesized: false,
@@ -3854,8 +3903,15 @@ fn record_mixin_sends(app: &mut App) {
     use crate::dialect::MethodReceiver;
     use crate::expr::{Expr, ExprNode};
     fn walk(e: &Expr, out: &mut crate::det::HashSet<crate::ident::Symbol>) {
-        if let ExprNode::Send { method, .. } = &*e.node {
-            out.insert(method.clone());
+        match &*e.node {
+            ExprNode::Send { method, .. } => {
+                out.insert(method.clone());
+            }
+            // A name sent by its Symbol (`public_send(:email_changed?)`) demands the method as a spelled call does.
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => {
+                out.insert(value.clone());
+            }
+            _ => {}
         }
         e.node.for_each_child(&mut |c| walk(c, out));
     }
