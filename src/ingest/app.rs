@@ -607,6 +607,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         let mut app = match ingest_rails_app(vfs, dir, &auto) {
             Ok(app) => app,
             Err(err) => {
+                let site = super::error_site::of(&err);
+                let source = match &err {
+                    IngestError::Unsupported { file, .. } => super::sources::text_of(file), _ => None,
+                };
                 let strict = super::prism::mark();
                 // Not the strict pass's first refusal as the answer: it can be a gem's DSL (`devise_for`) that only the gem's source, which this pass has not read yet, defines.
                 let more: Vec<String> = super::concern_accessors::not_deferring(|| super::survey::surveying(|| {
@@ -617,6 +621,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 .collect();
                 if more.is_empty() || auto.len() >= 32 {
                     super::prism::rewind(strict);
+                    if let (Some(source), IngestError::Unsupported { file, .. }) = (source, &err) {
+                        super::sources::register(file, &source);
+                    }
+                    if let Some((start, end)) = site { super::error_site::note(&err, start, end); }
                     return Err(err);
                 }
                 super::prism::rewind(marks.1);
@@ -3556,8 +3564,8 @@ pub(crate) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "strscan", "tempfile", "time", "timeout", "tmpdir", "uri", "weakref", "yaml", "zlib",
 ];
 
-/// [`App::app_requires`]: every literal top-level `require "lib"` of a
-/// standard library in the ingested Ruby sources under the app and
+/// [`App::app_requires`]: every literal `require "lib"` at file level or
+/// in a class or module body for a standard library under the app and
 /// support roots, including files loaded by the boot chain. A terminal
 /// channel that requires `pty` and `io/console` needs the second for `IO#winsize=`,
 /// which io/console adds and no constant names, so the bundled requires
@@ -3571,21 +3579,8 @@ fn collect_app_requires(sources: &[crate::span::SourceFile], roots: &[PathBuf]) 
         {
             continue;
         }
-        for line in source.text.lines() {
-            let Some(rest) = line.strip_prefix("require ") else { continue };
-            // `require "io/console" # why`: the literal, then nothing but
-            // a comment
-            let rest = rest.trim_start();
-            let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
-            let Some(end) = rest[1..].find(q) else { continue };
-            let after = rest[end + 2..].trim_start();
-            let quoted = (after.is_empty() || after.starts_with('#')).then(|| &rest[1..end + 1]);
-            if let Some(lib) = quoted {
-                if APP_REQUIRABLE_STDLIB.contains(&lib) {
-                    out.insert(lib.to_string());
-                }
-            }
-        }
+        out.extend(super::file_program::literal_requires(source.text.as_bytes(), &source.path)
+            .into_iter().filter(|lib| APP_REQUIRABLE_STDLIB.contains(&lib.as_str())));
     }
     out.into_iter().collect()
 }

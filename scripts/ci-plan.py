@@ -77,6 +77,7 @@ JRUBY_BIND_INPUTS = {
 }
 PARAM_BIND_TESTS = ["param_binds", "param_binds_values", "param_binds_planner", "param_binds_cleanup"]
 SPINEL_TESTS = [
+    "data_record_composition",
     "spinel_chunked_body",
     "spinel_stream_error",
     "did_you_mean",
@@ -858,14 +859,23 @@ def select(
 
         if path in {
             "src/analyze/data.rs",
+            "src/analyze/mod.rs",
             "src/ingest/library_class.rs",
+            "src/ingest/app.rs",
+            "src/ingest/file_program.rs",
+            "src/ingest/mod.rs",
+            "src/ingest/visibility.rs",
+            "src/emit/ruby/library.rs",
+            "src/emit/ruby/rbs.rs",
             "tests/data_factory_constants.rs",
             "tests/emit_and_run/data_record_siblings.rs",
+            "tests/spinel_toolchain/data_record_siblings.rs",
             "tests/support/data_record_siblings.rs",
         }:
             reasons.append(f"{path}: unit and spinel-toolchain (file-level Data records)")
             spinel = True
             jobs_selected.update(CORE)
+            spinel_tests.add("data_record_composition")
         if path in {"tests/emit_and_run/class_body_calls.rs", "tests/support/class_body_calls.rs"}:
             reasons.append(f"{path}: unit (emit_and_run), spinel-toolchain (ordinary class-body calls)")
             spinel = True
