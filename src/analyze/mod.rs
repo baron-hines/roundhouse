@@ -6989,7 +6989,13 @@ impl Analyzer {
             }
         }
         for lc in &app.library_classes {
-            for m in &lc.methods {
+            for (index, m) in lc.methods.iter().enumerate() {
+                // A Data reopening replaces the earlier definition, parameters included.
+                if lc.data_define().is_some()
+                    && lc.methods[index + 1..].iter().any(|later| later.name == m.name && later.receiver == m.receiver)
+                {
+                    continue;
+                }
                 record(&lc.name, m);
             }
         }

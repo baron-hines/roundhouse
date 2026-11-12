@@ -268,6 +268,29 @@ fn data_reopening_return_uses_the_last_definition_on_each_receiver() {
 }
 
 #[test]
+fn an_untyped_override_of_a_generated_data_method_is_untyped() {
+    for (head, tail) in [(" do\n  def with = digest\nend\n", ""), ("\n", "class Artifact\n  def with = digest\nend\n"),
+                         (" do\n  def self.new(digest:) = digest\nend\n", ""), ("\n", "class Artifact\n  def self.new(digest:) = digest\nend\n")] {
+        let source = format!("Artifact = Data.define(:digest){head}{tail}");
+        let receiver = if source.contains("self.new") { "self.new" } else { "with" };
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            let rbs = review_record_signature(&source, path);
+            let line = rbs.lines().find(|line| line.contains(&format!("def {receiver}:"))).unwrap_or_else(|| panic!("{rbs}"));
+            assert!(line.ends_with("-> untyped"), "{source}\n{rbs}");
+        }
+    }
+}
+
+#[test]
+fn data_reopening_parameters_use_the_last_definition() {
+    let source = "Artifact = Data.define(:digest) do\n  def label(name) = name\nend\nclass Artifact\n  def label(name:) = name\nend\nmodule Builder; def self.make = Artifact.new(digest: \"a\").label(name: \"abc\"); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let rbs = review_record_signature(source, path);
+        assert!(rbs.contains("def label: (name: String) -> String"), "{rbs}");
+    }
+}
+
+#[test]
 fn data_reopening_keeps_a_declared_return_signature() {
     let source = "Artifact = Data.define(:digest) do\n  def label = 'old'\nend\nclass Artifact\n  def label = digest\nend\n";
     for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
