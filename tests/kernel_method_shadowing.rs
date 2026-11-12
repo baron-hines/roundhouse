@@ -298,6 +298,33 @@ end
     }
 }
 
+/// An instance binding puts `self` back on the instance side, after a
+/// class-object binding or in a class method's body, so the instance
+/// method answers, not the class method of the same name.
+#[test]
+fn an_instance_self_binding_finds_instance_methods_before_kernel() {
+    let source = r#"class Widget
+  def self.load(value) = "class"
+  def load(value) = 17
+end
+class Config
+  def rebound
+    T.bind(self, T.class_of(Widget))
+    #: self as Widget
+    load(nil)
+  end
+  def self.from_class_side
+    #: self as Widget
+    load(nil)
+  end
+end
+"#;
+    let signatures = rbs(source, "config");
+    for expected in ["def rebound: () -> Integer", "def self.from_class_side: () -> Integer"] {
+        assert!(signatures.contains(expected), "{expected}\n{signatures}");
+    }
+}
+
 #[test]
 fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls

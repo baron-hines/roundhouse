@@ -3705,16 +3705,16 @@ impl<'a> BodyTyper<'a> {
                         // inside included. It changes only how `self` types:
                         // which class a method defined below belongs to is
                         // settled at ingest, lexically. A class-object binding
-                        // puts `self` on the class side, as in a `def self.x`.
+                        // puts `self` on the class side, as in a `def self.x`,
+                        // and an instance binding puts it back on the instance
+                        // side, as on entry to a method body.
                         if crate::expr::is_self_binding(e) {
                             if local_ctx.lexical_self.is_none() {
                                 local_ctx.lexical_self = local_ctx.self_ty.clone();
                             }
                             local_ctx.self_ty = e.ty.clone();
                             local_ctx.class_side = e.decisions & crate::expr::SELF_BINDING_CLASS_OBJECT != 0;
-                            if local_ctx.class_side {
-                                local_ctx.instance_body = false;
-                            }
+                            local_ctx.instance_body = !local_ctx.class_side;
                         }
                         if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
                             let proven = self.is_class_object(value, &local_ctx);
