@@ -1889,11 +1889,26 @@ evaluate, at run time) gets no wrapper, and each call to its
   envelope (`runtime/spinel/sidekiq_push.rb`, `sidekiq_redis.rb`):
   `SADD queues` and `LPUSH queue:<name>`, or `ZADD schedule` for a
   literal `set(wait:)` or `set(wait_until:)` that lands in the future.
-  Redis comes from `Sidekiq.configure_client`'s `url:` and `password:`
-  only: an app on `:sidekiq` without a `url:` there is an error, with
-  no fallback to `REDIS_PROVIDER`, `REDIS_URL` or localhost. The connection is one per
-  process, with 1-second connect and read timeouts, and a refused or
-  dropped connection, the first one included, is retried once. A job
+  Redis comes from `Sidekiq.configure_client`'s `config.redis = { … }`:
+  an app on `:sidekiq` without a `url:` there is an error, with no
+  fallback to `REDIS_PROVIDER`, `REDIS_URL` or localhost. `password:`,
+  `username:` and `db:` override the URL's (each a String literal,
+  `ENV["NAME"]` or `ENV.fetch("NAME"[, "default"])`, `db:` an Integer
+  literal too). `timeout:` (or `network_timeout:`), `connect_timeout:`
+  and `read_timeout:` are literal seconds, 3 when the app gives none, as
+  Sidekiq passes it. `reconnect_attempts:` is an Integer or an Array of
+  delays, as redis-client reads it: a refused or dropped connection, the
+  first one included, is retried that many times, once without a wait
+  when the app gives none (or `false`, which Sidekiq's `||= 1` keeps).
+  On ruby and jruby redis-rb also retries once inside a command. The
+  connection is one per process. A key that would connect somewhere, or
+  some way, the app didn't ask for is an error on `:sidekiq`: TLS
+  (`ssl:`, `ssl_params:`), Sentinel (`sentinels:`, `role:`, `name:`),
+  `id:` (spinel-redis sends no `CLIENT SETNAME`; `id: nil` is fine),
+  `path:`, `host:`, `port:`, `namespace:`, `nodes:`, `protocol: 2`, and
+  a value of an honored key in a form ingest doesn't read. The pool's
+  `size:`, `pool_timeout:` and `pool_name:`, `driver:`, `write_timeout:`
+  and `logger:` change nothing here and are warnings. A job
   held for COMMIT is dropped when an `after_commit` callback raises, as
   Rails drops it, and the caller sees the callback's error. A non-literal `set(...)` is an error
   under `:sidekiq`, and `set(priority:)` is dropped with a warning.

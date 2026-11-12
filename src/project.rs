@@ -4189,6 +4189,9 @@ fn with_sidekiq_readme(mut files: Vec<(String, String)>, target: BuildTarget, ap
         "### Jobs on Sidekiq\n\
          The app is on `queue_adapter :sidekiq`, so `perform_later` pushes each job \
          to the Redis its `Sidekiq.configure_client` names, in Sidekiq 8's format. \
+         Its `url:`, `password:`, `username:`, `db:`, timeouts (3 seconds unless it \
+         sets them) and `reconnect_attempts:` are honored; TLS and Sentinel are not \
+         supported. \
          Run them with the same build in a second process (or with a Ruby Sidekiq \
          process on the Rails app):\n\
          ```sh\n\
@@ -5136,7 +5139,7 @@ fn ruby_family_runtime_files(
     let sidekiq_client = if sidekiq {
         let client = crate::runtime_files::read_to_string(SIDEKIQ_REDIS_CLIENT)?;
         const AT_LOAD: &str = "require \"redis\"\n";
-        const OPEN: &str = "    conn = password == \"\" ? Redis.new(url: url, connect_timeout: CONNECT_TIMEOUT, read_timeout: READ_TIMEOUT) : Redis.new(url: url, password: password, connect_timeout: CONNECT_TIMEOUT, read_timeout: READ_TIMEOUT)\n";
+        const OPEN: &str = "    conn = client(url, user, pass, db, connect_timeout, read_timeout)\n";
         if !client.contains(AT_LOAD) || !client.contains(OPEN) {
             return Err(format!("{SIDEKIQ_REDIS_CLIENT}: the require or the connect line moved"));
         }
@@ -7422,6 +7425,37 @@ fn redis_setting_source(setting: Option<&crate::app::RedisSetting>) -> String {
     }
 }
 
+/// A Float as a Ruby literal: `3.0`, `0.25`.
+fn ruby_float(v: f64) -> String {
+    if v.fract() == 0.0 { format!("{v:.1}") } else { format!("{v}") }
+}
+
+/// `JobRegistry`'s connection settings past the URL and password: the
+/// `configure_client` `username:` (`""` for none) and `db:` (-1 for none,
+/// so the URL's database stands; a variable is checked by
+/// `SidekiqPush.db_setting` when the push first connects), the connect and
+/// read timeouts with Sidekiq's defaults filled in, and the reconnect
+/// delays as one String of seconds, `""` for no retry.
+fn redis_connection_source(config: &crate::app::SidekiqRedisConfig) -> String {
+    use crate::app::RedisSetting;
+    use crate::emit::ruby::expr::ruby_str_literal;
+    let db = match &config.db {
+        None => "-1".to_string(),
+        Some(RedisSetting::Literal(digits)) => digits.clone(),
+        Some(setting) => format!("SidekiqPush.db_setting({})", redis_setting_source(Some(setting))),
+    };
+    let delays: Vec<String> = config.effective_reconnect_delays().into_iter().map(ruby_float).collect();
+    let method = |name: &str, body: String| format!("\n  def self.{name}\n    {body}\n  end\n");
+    [
+        method("sidekiq_redis_username", redis_setting_source(config.username.as_ref())),
+        method("sidekiq_redis_db", db),
+        method("sidekiq_redis_connect_timeout", ruby_float(config.effective_connect_timeout())),
+        method("sidekiq_redis_read_timeout", ruby_float(config.effective_read_timeout())),
+        method("sidekiq_redis_reconnect_delays", ruby_str_literal(&delays.join(" "))),
+    ]
+    .concat()
+}
+
 /// `JobRegistry`'s `config/sidekiq.yml` defaults for the worker:
 /// concurrency 0 and timeout -1 when the file gives none, and the queues
 /// as one String of `name` or `name,weight` words, `""` for none. The
@@ -7490,9 +7524,10 @@ fn apply_job_registry(files: &mut [(String, String)], app: &App) {
         "  def self.sidekiq?\n    false\n  end\n".to_string()
     };
     let redis = format!(
-        "\n  def self.sidekiq_redis_url\n    {}\n  end\n\n  def self.sidekiq_redis_password\n    {}\n  end\n{}",
+        "\n  def self.sidekiq_redis_url\n    {}\n  end\n\n  def self.sidekiq_redis_password\n    {}\n  end\n{}{}",
         redis_setting_source(app.sidekiq_redis.url.as_ref()),
         redis_setting_source(app.sidekiq_redis.password.as_ref()),
+        redis_connection_source(&app.sidekiq_redis),
         worker_defaults_source(&app.sidekiq_worker),
     );
     let redis = format!("{redis}{}", cable_redis_source(app));

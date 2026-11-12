@@ -1515,7 +1515,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // The ActiveJob queue adapter (see `App::queue_adapter`).
     app.queue_adapter = read_queue_adapter(vfs, dir);
     // Where Sidekiq pushes (see `App::sidekiq_redis`).
-    app.sidekiq_redis = read_sidekiq_redis(vfs, dir);
+    let (sidekiq_redis, sidekiq_redis_refused) = read_sidekiq_redis(vfs, dir);
+    app.sidekiq_redis = sidekiq_redis;
     // The worker's defaults (see `App::sidekiq_worker`).
     let (worker_defaults, worker_warnings) = super::sidekiq_yml::read(vfs, dir);
     app.sidekiq_worker = worker_defaults;
@@ -2996,7 +2997,12 @@ end
     let (rate_limit_stores, rate_limit_store_values) = super::rate_limit::install_boot_stores(&mut app, rate_limit_stores, &const_resolver.for_sources(&sources));
     if app.queue_adapter.as_deref() == Some("sidekiq") {
         sidekiq_warnings.into_iter().for_each(warn_sidekiq);
+        sidekiq_redis_refused.into_iter().for_each(refuse_sidekiq);
         require_sidekiq_redis_url(&app);
+    } else {
+        // Off :sidekiq the settings reach no client, so these stay
+        // warnings, as the ignored keys are.
+        sidekiq_redis_refused.into_iter().for_each(warn_sidekiq);
     }
     if app.queue_adapter.as_deref() == Some("sidekiq") && app.cable_redis.is_none() {
         warn_sidekiq(format!(
@@ -13716,8 +13722,12 @@ fn job_queue_adapter(call: &crate::expr::Expr) -> Option<Option<String>> {
 /// `App::sidekiq_redis`: the `Sidekiq.configure_client` Redis settings
 /// in `config/initializers`, the last block that sets them winning, as it
 /// does when Rails runs the initializers in order.
-fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::app::SidekiqRedisConfig {
-    let mut config = crate::app::SidekiqRedisConfig::default();
+///
+/// Also the settings that block gives that can't be honored, each a
+/// message: errors on a tree that ends up on `:sidekiq`, warnings on any
+/// other.
+fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> (crate::app::SidekiqRedisConfig, Vec<String>) {
+    let mut config = (crate::app::SidekiqRedisConfig::default(), Vec::new());
     let init = dir.join("config/initializers");
     if !vfs.is_dir(&init) {
         return config;
@@ -13731,15 +13741,16 @@ fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::app::Sidek
     config
 }
 
-/// The `url:` and `password:` a file's `Sidekiq.configure_client do
-/// |config| config.redis = { … } end` gives, `None` when the file has no
-/// such assignment. Only those two keys are read, each as a String
-/// literal, `ENV["NAME"]` or `ENV.fetch("NAME"[, "default"])`. Any other
-/// key, a value in another form, or a `config.redis =` that isn't a Hash
-/// literal is a warning, and the setting is not read. A tree on
-/// `:sidekiq` whose blocks leave it no `url:` is an error
-/// (`require_sidekiq_redis_url`): there is no environment fallback.
-pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::app::SidekiqRedisConfig> {
+/// The Redis settings a file's `Sidekiq.configure_client do |config|
+/// config.redis = { … } end` gives, `None` when the file has no such
+/// assignment, with the messages for the keys that can't be honored
+/// (`sidekiq_redis_key` says which key does what). A key that changes
+/// nothing here, an unknown key, a `url:` or `password:` in a form
+/// ingest doesn't read, or a `config.redis =` that isn't a Hash literal
+/// is a warning. A tree on `:sidekiq` whose blocks leave it no `url:` is
+/// an error (`require_sidekiq_redis_url`): there is no environment
+/// fallback.
+pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<(crate::app::SidekiqRedisConfig, Vec<String>)> {
     let src = String::from_utf8_lossy(source);
     // Cheap skip before parsing, as `kaminari_default_per_page` does.
     if !src.contains("configure_client") {
@@ -13790,14 +13801,18 @@ pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::a
             let args: Vec<_> = args.arguments().iter().collect();
             let [value] = args.as_slice() else { continue };
             let mut config = crate::app::SidekiqRedisConfig::default();
+            let mut refused = Vec::new();
             let Some(hash) = value.as_hash_node() else {
                 warn_sidekiq(format!(
                     "`{param}.redis = {}` in {file} is not a Hash literal, so it is not read",
                     text(value)
                 ));
-                found = Some(config);
+                found = Some((config, refused));
                 continue;
             };
+            // Sidekiq maps `network_timeout:` onto `timeout:` after its
+            // own `timeout ||= 3`, so it wins wherever it is written.
+            let mut network_timeout = None;
             for element in hash.elements().iter() {
                 let Some(pair) = element.as_assoc_node() else {
                     warn_sidekiq(format!("`{}` in {file}'s Sidekiq Redis settings is not read", text(&element)));
@@ -13807,33 +13822,186 @@ pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::a
                     warn_sidekiq(format!("`{}` in {file}'s Sidekiq Redis settings is not read", text(&element)));
                     continue;
                 };
-                if key != "url" && key != "password" {
-                    warn_sidekiq(format!(
-                        "Sidekiq Redis setting `{key}:` in {file} is not supported yet (only url: and password: are read); it is ignored"
-                    ));
-                    continue;
-                }
                 let value = pair.value();
-                let Some(setting) = redis_setting(&value, &src) else {
-                    warn_sidekiq(format!(
-                        "Sidekiq Redis `{key}: {}` in {file} is not a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"); it is ignored",
-                        text(&value)
-                    ));
-                    continue;
-                };
-                if key == "url" {
-                    config.url = Some(setting);
-                } else {
-                    config.password = Some(setting);
+                let shown = format!("`{key}: {}` in {file}", text(&value));
+                match sidekiq_redis_key(&key, &value, &src) {
+                    RedisKey::Url(setting) => config.url = Some(setting),
+                    RedisKey::Password(setting) => config.password = Some(setting),
+                    RedisKey::Username(setting) => config.username = Some(setting),
+                    RedisKey::Db(setting) => config.db = Some(setting),
+                    RedisKey::Timeout(seconds) => config.timeout = Some(seconds),
+                    RedisKey::NetworkTimeout(seconds) => network_timeout = Some(seconds),
+                    RedisKey::ConnectTimeout(seconds) => config.connect_timeout = Some(seconds),
+                    RedisKey::ReadTimeout(seconds) => config.read_timeout = Some(seconds),
+                    RedisKey::ReconnectAttempts(delays) => config.reconnect_attempts = delays,
+                    RedisKey::AsHere => {}
+                    RedisKey::Unread(why) => {
+                        warn_sidekiq(format!("Sidekiq Redis {shown} is not read: {why}; it is ignored"));
+                    }
+                    RedisKey::Ignored(why) => {
+                        warn_sidekiq(format!("Sidekiq Redis setting `{key}:` in {file} is ignored: {why}"));
+                    }
+                    RedisKey::Refused(why) => {
+                        refused.push(format!("Sidekiq Redis setting `{key}:` in {file} can't be honored: {why}"));
+                    }
+                    RedisKey::Unknown => warn_sidekiq(format!(
+                        "Sidekiq Redis setting `{key}:` in {file} is not supported; it is ignored"
+                    )),
                 }
             }
-            found = Some(config);
+            if network_timeout.is_some() {
+                config.timeout = network_timeout;
+            }
+            found = Some((config, refused));
         }
     }
     found
 }
 
+/// What one key of a `configure_client` `config.redis = { … }` Hash
+/// does here, keyed as Sidekiq 8.1.7 hands it to redis-client.
+enum RedisKey {
+    /// `url:` and `password:`, each a String literal or a variable.
+    Url(crate::app::RedisSetting),
+    Password(crate::app::RedisSetting),
+    Username(crate::app::RedisSetting),
+    Db(crate::app::RedisSetting),
+    Timeout(f64),
+    NetworkTimeout(f64),
+    ConnectTimeout(f64),
+    ReadTimeout(f64),
+    /// `None` keeps Sidekiq's default of one retry.
+    ReconnectAttempts(Option<Vec<f64>>),
+    /// A value that asks for what the push already does (`id: nil`,
+    /// `ssl: false`, `protocol: 3`).
+    AsHere,
+    /// A key that is read but changes nothing here, with the reason.
+    Ignored(&'static str),
+    /// A key this pipeline can't honor: an error on `:sidekiq`, where
+    /// ignoring it would connect somewhere, or some way, the app didn't
+    /// ask for.
+    Refused(String),
+    /// A `url:` or `password:` in a form ingest doesn't read.
+    Unread(&'static str),
+    Unknown,
+}
+
+fn sidekiq_redis_key(key: &str, value: &Node<'_>, src: &str) -> RedisKey {
+    const STRING_FORMS: &str = "it is not a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])";
+    const TLS: &str = "TLS is not supported, since Spinel's sp_net has no TLS yet (matz/spinel#1054); \
+                       use a redis:// URL, through a local TLS proxy such as stunnel if the server needs TLS";
+    const SENTINEL: &str = "Redis Sentinel is not supported: the client connects to the one host in url:";
+    let seconds = |key: &str| match number_value(value) {
+        Some(n) if n > 0.0 => Ok(n),
+        _ => Err(RedisKey::Refused(format!(
+            "`{key}:` must be a positive Integer or Float literal, or a Duration literal such as 5.seconds"
+        ))),
+    };
+    let nil_or_false = value.as_nil_node().is_some() || value.as_false_node().is_some();
+    match key {
+        "url" | "password" => {
+            let Some(setting) = redis_setting(value, src) else { return RedisKey::Unread(STRING_FORMS) };
+            if key == "url" { RedisKey::Url(setting) } else { RedisKey::Password(setting) }
+        }
+        "username" => match redis_setting(value, src) {
+            Some(setting) => RedisKey::Username(setting),
+            None => RedisKey::Refused(
+                "`username:` must be a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])".to_string(),
+            ),
+        },
+        "db" => match super::util::integer_value(value) {
+            Some(n) if n >= 0 => RedisKey::Db(crate::app::RedisSetting::Literal(n.to_string())),
+            Some(_) => RedisKey::Refused("`db:` must not be negative".to_string()),
+            None => match redis_setting(value, src) {
+                // A String literal is emitted as an Integer literal, so it
+                // must read as one in plain decimal: `"08"` would emit `08`,
+                // which Ruby refuses, and `"010"` would be octal.
+                Some(crate::app::RedisSetting::Literal(text)) => match decimal_db(&text) {
+                    Some(n) => RedisKey::Db(crate::app::RedisSetting::Literal(n.to_string())),
+                    None => RedisKey::Refused(
+                        "`db:` must be an Integer, written in decimal without leading zeros".to_string(),
+                    ),
+                },
+                Some(setting) => RedisKey::Db(setting),
+                None => RedisKey::Refused(
+                    "`db:` is read only as an Integer literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])".to_string(),
+                ),
+            },
+        },
+        "timeout" => seconds(key).map_or_else(|e| e, RedisKey::Timeout),
+        "network_timeout" => seconds(key).map_or_else(|e| e, RedisKey::NetworkTimeout),
+        "connect_timeout" => seconds(key).map_or_else(|e| e, RedisKey::ConnectTimeout),
+        "read_timeout" => seconds(key).map_or_else(|e| e, RedisKey::ReadTimeout),
+        // Sidekiq's `reconnect_attempts ||= 1` turns `nil` and `false`
+        // into one retry; only 0 (or `[]`) turns retrying off.
+        "reconnect_attempts" => {
+            if nil_or_false {
+                return RedisKey::ReconnectAttempts(None);
+            }
+            if let Some(n) = super::util::integer_value(value).filter(|n| (0..=100).contains(n)) {
+                return RedisKey::ReconnectAttempts(Some(vec![0.0; n as usize]));
+            }
+            let delays: Option<Vec<f64>> = value
+                .as_array_node()
+                .and_then(|array| array.elements().iter().map(|e| number_value(&e).filter(|n| *n >= 0.0)).collect());
+            match delays {
+                Some(delays) => RedisKey::ReconnectAttempts(Some(delays)),
+                None => RedisKey::Refused(
+                    "`reconnect_attempts:` must be an Integer literal from 0 to 100 or an Array of literal delays in seconds".to_string(),
+                ),
+            }
+        }
+        // redis-client names the connection with `CLIENT SETNAME`, which
+        // the push doesn't send. `id: nil` (the old way to turn Sidekiq 6's
+        // naming off) asks for exactly that.
+        "id" if value.as_nil_node().is_some() => RedisKey::AsHere,
+        "id" => RedisKey::Refused(
+            "naming the connection needs CLIENT SETNAME, which spinel-redis does not send yet; leave `id:` out or set it to nil".to_string(),
+        ),
+        "ssl" if nil_or_false => RedisKey::AsHere,
+        "ssl" | "ssl_params" => RedisKey::Refused(TLS.to_string()),
+        "sentinels" | "role" | "name" | "master_name" | "sentinel_username" | "sentinel_password" => {
+            RedisKey::Refused(SENTINEL.to_string())
+        }
+        "path" => RedisKey::Refused("unix sockets are not supported; use a redis://host:port URL".to_string()),
+        // redis-client lets an explicit `host:` or `port:` win over the
+        // URL's, so ignoring one would connect to another server.
+        "host" | "port" => RedisKey::Refused(format!("`{key}:` overrides url:'s, and is not read; put it in url:")),
+        "namespace" => RedisKey::Refused("Sidekiq 7 and later raise for a namespace; drop it".to_string()),
+        "nodes" => RedisKey::Refused("Redis Cluster is not supported, as Sidekiq itself refuses it".to_string()),
+        "protocol" if super::util::integer_value(value) == Some(3) => RedisKey::AsHere,
+        "protocol" => RedisKey::Refused("Sidekiq 7 and later speak only RESP3 (`protocol: 3`)".to_string()),
+        "size" | "pool_timeout" | "pool_name" => RedisKey::Ignored(
+            "there is no connection pool: pushes share one connection per process, and the worker opens one per thread",
+        ),
+        "driver" => RedisKey::Ignored("the client is spinel-redis on spinel and redis-rb on ruby and jruby"),
+        "write_timeout" => RedisKey::Ignored("spinel-redis has no write timeout, so a write waits until the socket takes it"),
+        "logger" => RedisKey::Ignored("the boot line is the only connection log"),
+        _ => RedisKey::Unknown,
+    }
+}
+
+/// A number literal: an Integer, a Float, or a Duration literal's seconds.
+fn number_value(node: &Node<'_>) -> Option<f64> {
+    if let Some(n) = super::util::integer_value(node) {
+        return Some(n as f64);
+    }
+    if let Some(n) = node.as_float_node().map(|f| f.value()).filter(|n| n.is_finite()) {
+        return Some(n);
+    }
+    super::util::duration_seconds(node).map(|n| n as f64)
+}
+
 /// A Redis setting's value as `RedisSetting` reads it.
+/// A `db:` given as a String literal, read as the Integer it names: plain
+/// decimal digits, `"0"` or no leading zero, and small enough for an i64.
+fn decimal_db(text: &str) -> Option<i64> {
+    let decimal = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if decimal { text.parse().ok() } else { None }
+}
+
 fn redis_setting(node: &Node<'_>, src: &str) -> Option<crate::app::RedisSetting> {
     use crate::app::RedisSetting;
     if let Some(literal) = string_literal_value(node) {
@@ -13882,6 +14050,12 @@ fn require_sidekiq_redis_url(app: &App) {
         "Sidekiq",
         detail,
     ));
+}
+
+/// An error for a Sidekiq setting, on a tree on `:sidekiq`, that can't
+/// be honored.
+fn refuse_sidekiq(detail: String) {
+    super::prism::push(crate::diagnostic::Diagnostic::unsupported(crate::span::Span::synthetic(), None, "Sidekiq", detail));
 }
 
 /// A warning about what ingest reads from the app's Sidekiq settings.
