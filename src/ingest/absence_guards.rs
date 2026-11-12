@@ -3,21 +3,57 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
 
-/// The classes whose code a source gem wrote: what reads a constant no
-/// locked gem could define there is a gem written for apps without it.
-pub(super) fn source_gem_classes(app: &App) -> crate::det::HashSet<String> {
-    app.library_classes
-        .iter()
-        .filter(|lc| lc.methods.iter().any(|m| super::sources::path_of(m.name_span.file).is_some_and(|p| is_source_gem_path(&p))))
-        .map(|lc| lc.name.0.as_str().to_string())
-        .collect()
+/// A method by its class, name and side: `(class, name, class-side)`.
+type MethodKey = (String, String, bool);
+
+fn method_key(class: &str, m: &crate::dialect::MethodDef) -> MethodKey {
+    (class.to_string(), m.name.as_str().to_string(), matches!(m.receiver, crate::dialect::MethodReceiver::Class))
+}
+
+/// What a source gem wrote, read while each method still resolves its
+/// file: the classes it wrote code in, and its methods. A class the app
+/// reopens holds the app's methods too.
+pub(super) struct SourceGemCode {
+    /// What reads a constant no locked gem could define there is a gem
+    /// written for apps without it.
+    pub(super) classes: crate::det::HashSet<String>,
+    gem_methods: crate::det::HashSet<MethodKey>,
+    app_methods: crate::det::HashSet<MethodKey>,
+}
+
+impl SourceGemCode {
+    /// Whether the gem alone wrote this method: one the app also defines
+    /// under that name is left as the app's.
+    fn wrote(&self, class: &str, m: &crate::dialect::MethodDef) -> bool {
+        let key = method_key(class, m);
+        self.gem_methods.contains(&key) && !self.app_methods.contains(&key)
+    }
+}
+
+pub(super) fn source_gem_code(app: &App) -> SourceGemCode {
+    let mut code = SourceGemCode { classes: Default::default(), gem_methods: Default::default(), app_methods: Default::default() };
+    for lc in &app.library_classes {
+        let class = lc.name.0.as_str();
+        for m in &lc.methods {
+            if super::sources::path_of(m.name_span.file).is_some_and(|p| is_source_gem_path(&p)) {
+                code.classes.insert(class.to_string());
+                code.gem_methods.insert(method_key(class, m));
+            } else {
+                code.app_methods.insert(method_key(class, m));
+            }
+        }
+    }
+    code
 }
 
 pub(crate) fn is_source_gem_path(p: &str) -> bool {
     p.contains("/.roundhouse/source_gems/") || p.starts_with(".roundhouse/source_gems/")
 }
 
-pub(super) fn mark(app: &mut App, source_gem_classes: &crate::det::HashSet<String>) {
+/// `shipped`: whether an installed locked gem (or a path gem) has the
+/// feature's file under its `lib`.
+pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&str) -> bool) {
+    let source_gem_classes = &source_gem.classes;
     let Some(lock) = app.gem_lock.clone() else { return };
     let index = crate::gems::LockGemIndex::new(&lock);
     let absent_namespaces = crate::gems::AbsentGemNamespaces::new(&lock);
@@ -88,7 +124,7 @@ pub(super) fn mark(app: &mut App, source_gem_classes: &crate::det::HashSet<Strin
     };
     // A required path is the absent gem's own when its namespace is (tzinfo-data's `tzinfo/data`).
     let unloadable = |path: &str| absent_namespaces.owner(&path.split('/').collect::<Vec<_>>().join("::")).is_some();
-    // Not a feature any locked gem, Ruby or Rails provides: a gem's optional feature's library the app doesn't bundle
+    // Not a feature any locked gem (by name, constant or file), Ruby or Rails provides: a gem's optional feature's library the app doesn't bundle
     // (`require "method_source"` in a loader that rescues LoadError). Ruby raises LoadError where the method runs; Spinel
     // resolves a require statically, and `spin build` refuses one it cannot satisfy.
     let provided_by_nothing = |path: &str| {
@@ -102,6 +138,7 @@ pub(super) fn mark(app: &mut App, source_gem_classes: &crate::det::HashSet<Strin
             && !super::app::APP_REQUIRABLE_STDLIB.iter().any(|s| s.split('/').next() == Some(root))
             && ![root.to_string(), root.replace('_', "-"), feature.replace('/', "-")].iter().any(|n| lock.version_of(n).is_some())
             && index.owners(&as_constant.join("::")).is_empty()
+            && !shipped(feature)
     };
     unreached_gated_classes(app, source_gem_classes, &absent);
     for lc in app.library_classes.iter_mut() {
@@ -109,10 +146,11 @@ pub(super) fn mark(app: &mut App, source_gem_classes: &crate::det::HashSet<Strin
         let gone = |written: &[&Symbol]| gone_in(&owner, written);
         // A gem's own read of a constant nothing locked defines is Ruby's NameError where it runs (rack-attack's `Redis::VERSION`).
         let everywhere: Vec<Vec<Symbol>> = if source_gem_classes.contains(&owner) { vec![Vec::new()] } else { Vec::new() };
-        // Only in a source gem's own methods: its `require` runs when the method does (an app's own is the app's to bundle).
-        let from_gem = source_gem_classes.contains(&owner);
-        let unloadable = |path: &str| unloadable(path) || (from_gem && provided_by_nothing(path));
         for m in lc.methods.iter_mut() {
+            // Only in a source gem's own methods: its `require` runs when the method does. An app's own, in a
+            // class it reopens or not, is the app's to bundle.
+            let from_gem = source_gem.wrote(&owner, m);
+            let unloadable = |path: &str| unloadable(path) || (from_gem && provided_by_nothing(path));
             walk(&mut m.body, &everywhere, &absent, &gone, &unloadable);
         }
     }
@@ -456,8 +494,8 @@ mod tests {
             m.name_span.file = if m.name.as_str() == "pretty!" { gem_file } else { app_file };
         }
         app.gem_lock = Some(crate::gems::Lockfile::default());
-        let classes = source_gem_classes(&app);
-        mark(&mut app, &classes);
+        let code = source_gem_code(&app);
+        mark(&mut app, &code, &|_| false);
         let class = app.library_classes.iter().find(|c| c.name.0.as_str() == "Shelf::Box").expect("Shelf::Box");
         let body = |name: &str| format!("{:?}", class.methods.iter().find(|m| m.name.as_str() == name).expect(name).body);
         assert!(body("pretty!").contains("cannot load such file -- fancy_printer"), "{}", body("pretty!"));
