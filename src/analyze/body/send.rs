@@ -1251,13 +1251,37 @@ impl<'a> BodyTyper<'a> {
                     && !EXCEPTION_METHODS.contains(&method.as_str());
             };
             // Not settled past a module the program does not define, or a `method_missing`: either may answer it.
-            if cls.instance_methods.contains_key(method)
+            // Nor an open class: a gem the program does not model may define the method on it.
+            // Nor one the source defines whose signature is not harvested yet.
+            if cls.open
+                || cls.instance_methods.contains_key(method)
+                || cls.source_instance_methods.contains(method)
                 || cls.instance_methods.contains_key(&Symbol::from("method_missing"))
                 || cls.instance_methods.contains_key(&Symbol::from("respond_to_missing?"))
-                || cls.includes.iter().any(|m| self.classes().get(m).is_none() || self.lookup_in_module(m, method).is_some())
+                || cls.includes.iter().any(|m| {
+                    self.classes().get(m).is_none()
+                        || self.lookup_in_module(m, method).is_some()
+                        // A module's `method_missing` answers for its includer too.
+                        || self.lookup_in_module(m, &Symbol::from("method_missing")).is_some()
+                        || self.lookup_in_module(m, &Symbol::from("respond_to_missing?")).is_some()
+                })
             {
                 return false;
             }
+            current = cls.parent.clone();
+        }
+        false
+    }
+
+    /// Whether `of`'s chain ends at `Object`, whose `try` (Active Support's) answers nil for a method it lacks.
+    pub(super) fn reaches_object(&self, of: &ClassId) -> bool {
+        let mut current = Some(of.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { return true };
+            if id.0.as_str().trim_start_matches("::") == "BasicObject" {
+                return false;
+            }
+            let Some(cls) = self.classes().get(&id) else { return id.0.as_str().trim_start_matches("::") == "Object" };
             current = cls.parent.clone();
         }
         false
@@ -1575,6 +1599,14 @@ impl<'a> BodyTyper<'a> {
                     id: id.clone(),
                     args: args.clone(),
                 },
+                // Not the bare Class for a union of classes: each is its own class's (Devise's `resource.class.model_name` over two mappings' models).
+                // Nor a union of class objects (`flag ? User : Admin`), whose `.class` is `Class` itself.
+                Some(Ty::Union { variants })
+                    if !variants.is_empty()
+                        && variants.iter().all(|v| matches!(v, Ty::Class { id, .. } if id.0.as_str() != "Class" && !self.defines_instance_method(id, &Symbol::from("class")))) =>
+                {
+                    Ty::Union { variants: variants.clone() }
+                }
                 _ => Ty::Class {
                     id: ClassId(Symbol::from("Class")),
                     args: vec![].into(),
@@ -1958,6 +1990,20 @@ impl<'a> BodyTyper<'a> {
                         elem: std::sync::Arc::new(Ty::Class { id: id.clone(), args: vec![].into() }),
                     };
                 }
+                // TLS writers belong to an HTTP instance, unless the app owns a class-side override.
+                if !instance_receiver && matches!(method.as_str(), "verify_mode=" | "verify_hostname=" | "cert_store=")
+                {
+                    let mut owner = Some(id);
+                    for _ in 0..32 {
+                        let Some(current) = owner else { break };
+                        let Some(info) = self.classes().get(current) else { break };
+                        if info.class_methods.contains_key(method)
+                            || info.class_method_extensions.iter().any(|m| self.declares_instance_method(m, method))
+                        { break; }
+                        if current.0.as_str() == "Net::HTTP" { return unknown(); }
+                        owner = info.parent.as_ref();
+                    }
+                }
                 // A model's class-side relation builder that no class in
                 // the chain defines (`Widget.includes(:gadget)`,
                 // `Widget.order(:id)`). The analyzer's registry seeds the
@@ -1983,6 +2029,12 @@ impl<'a> BodyTyper<'a> {
                 }
                 // Class-side defs stay a fallback: a value typed as an instance may still be a class object (`@klass = Post`).
                 let instance_side = instance_receiver && self.defines_instance_method(id, method);
+                // A Kernel-named singleton in an ancestor precedes the instance
+                // fallback too; a class object cannot call the child's instance method.
+                let kernel_class_side = !instance_receiver
+                    && matches!(method.as_str(), "require" | "require_relative" | "load" | "autoload"
+                        | "puts" | "print" | "warn" | "format" | "sprintf" | "`")
+                    && self.class_side_defines(id, method);
                 let mut current_id: Option<&ClassId> = Some(id);
                 let mut depth = 0usize;
                 // Set when the chain reaches a *named* superclass we don't
@@ -2191,7 +2243,7 @@ impl<'a> BodyTyper<'a> {
                         }
                         return unwrap_fn_ret(&subst(ty));
                     }
-                    if !class_dynamic_finder && let Some(ty) = cls.instance_methods.get(method) {
+                    if !kernel_class_side && !class_dynamic_finder && let Some(ty) = cls.instance_methods.get(method) {
                         if !controller_writer || instance_receiver {
                             return unwrap_fn_ret(&subst(ty));
                         }
@@ -2202,7 +2254,7 @@ impl<'a> BodyTyper<'a> {
                     // Checked after the class's own methods, before the
                     // parent — Ruby's ancestor order puts an included
                     // module between the class and its superclass.
-                    for module_id in cls.includes.iter().filter(|_| !class_dynamic_finder) {
+                    for module_id in cls.includes.iter().filter(|_| !kernel_class_side && !class_dynamic_finder) {
                         if controller_writer && !instance_receiver {
                             continue;
                         }
@@ -2876,7 +2928,8 @@ impl<'a> BodyTyper<'a> {
                     if matches!(v, Ty::Nil | Ty::Var { .. }) {
                         continue;
                     }
-                    let r = self.dispatch_on(Some(v), method, block_ret, args, instance_receiver);
+                    let r = self.dispatch_on(Some(v), method, block_ret, args,
+                        instance_receiver && super::instance_shaped(v));
                     if !matches!(r, Ty::Var { .. }) {
                         resolved.push(r);
                     }

@@ -77,6 +77,7 @@ JRUBY_BIND_INPUTS = {
 }
 PARAM_BIND_TESTS = ["param_binds", "param_binds_values", "param_binds_planner", "param_binds_cleanup"]
 SPINEL_TESTS = [
+    "data_record_composition",
     "spinel_chunked_body",
     "spinel_stream_error",
     "did_you_mean",
@@ -89,6 +90,7 @@ SPINEL_TESTS = [
     "temporal_initialize_spinel",
     "framework_tests_spinel",
     "object_blank",
+    "untyped_key_conversion",
     "spinel_web_push_crypto",
     "openssl_random",
     "openssl_registrations",
@@ -99,6 +101,7 @@ SPINEL_TESTS = [
     "db_sqlite_concurrency",
     "spinel_param_builder",
     "spinel_net_http_start",
+    "net_http_tls",
     "rails_compat_vectors_spinel",
     "spinel_pg_db",
     "spinel_db_contract",
@@ -125,8 +128,10 @@ SPINEL_TESTS = [
     "plain_class_optional_keywords_spinel",
     "conditional_expression_parens",
     "class_object_return_rbs",
+    "qualified_constant_rbs",
     "class_object_container_rbs",
     "module_self_argument_rbs",
+    "kernel_method_shadowing",
     "jbuilder_array_value_spinel",
     "active_job_payload",
     "render_json_encoder_spinel",
@@ -531,6 +536,9 @@ def native_coverage(path):
     if path in {"src/analyze/mod.rs", "src/analyze/body/mod.rs"}:
         suites.add("module_self_argument_rbs")
         suites.add("class_object_container_rbs")
+        suites.add("kernel_method_shadowing")
+    if path == "src/analyze/body/send.rs":
+        suites.add("kernel_method_shadowing")
     if path in {
         "src/dialect.rs",
         "src/ingest/model.rs",
@@ -548,6 +556,8 @@ def native_coverage(path):
         suites.add("framework_tests_spinel")
     if path in {"runtime/ruby/active_support_ext.rb", "src/lower/blank.rs", "src/lower/mod.rs", "src/lower/jbuilder_to_library/mod.rs"}:
         suites.add("object_blank")
+    if path in {"runtime/ruby/active_support_ext.rb", "src/lower/symbolize_keys.rs", "src/lower/config_reader.rs", "src/lower/mod.rs"}:
+        suites.add("untyped_key_conversion")
     # `Model.transaction` (rollback, nesting, savepoints) lives here; its
     # gate compiles it with the real_blog fixture.
     if path in {
@@ -558,6 +568,8 @@ def native_coverage(path):
     focused = re.fullmatch(r"tests/([^/]+)\.(?:rs|rb)", path)
     if focused and focused[1] in SPINEL_TESTS:
         suites.add(focused[1])
+    if path in {"src/emit/ruby/rbs.rs", "src/emit/ruby/library.rs", "src/rbs.rs", "src/ingest/sorbet_sig.rs", "src/app.rs", "src/ingest/app.rs"}:
+        suites.add("qualified_constant_rbs")
     if path in {
         "src/ingest/settled_conditionals.rs",
         "src/lower/defined_const_fold.rs",
@@ -593,6 +605,8 @@ def native_coverage(path):
         "runtime/spinel/tep/server_scheduled.rb",
     }:
         suites.add("spinel_chunked_body")
+    if path in {"runtime/spinel/net_http.rb", "src/analyze/registry/stdlib.rs", "src/analyze/body/send.rs"} or path.startswith("tests/net_http_tls/"):
+        suites.add("net_http_tls")
     if path.startswith("tests/spinel_faye_websocket/") or path == "runtime/spinel/faye_websocket.rb":
         suites.add("spinel_faye_websocket")
     if path.startswith(("tests/spinel_websocket_lifecycle", "runtime/spinel/tep/websocket")) or path in {
@@ -614,8 +628,8 @@ def native_coverage(path):
     ):
         suites.add("generated_columns_spinel")
     if path in {
-        "tests/schema_constraints.rs", "src/schema.rs", "src/ingest/schema.rs",
-        "src/schema/generated.rs", "tests/support/emit_and_run.rs",
+        "tests/schema_constraints.rs", "src/schema.rs", "src/ingest/schema.rs", "src/ingest/app.rs",
+        "src/ingest/database_yml.rs", "src/schema/generated.rs", "tests/support/emit_and_run.rs",
         "src/emit/shared/schema_sql.rs", "src/lower/model_to_library/schema.rs", "src/lower/scope_chain.rs",
         "src/emit/roda.rs", "src/emit/ruby/library.rs",
         "src/lower/model_to_library/mod.rs",
@@ -859,14 +873,23 @@ def select(
 
         if path in {
             "src/analyze/data.rs",
+            "src/analyze/mod.rs",
             "src/ingest/library_class.rs",
+            "src/ingest/app.rs",
+            "src/ingest/file_program.rs",
+            "src/ingest/mod.rs",
+            "src/ingest/visibility.rs",
+            "src/emit/ruby/library.rs",
+            "src/emit/ruby/rbs.rs",
             "tests/data_factory_constants.rs",
             "tests/emit_and_run/data_record_siblings.rs",
+            "tests/spinel_toolchain/data_record_siblings.rs",
             "tests/support/data_record_siblings.rs",
         }:
             reasons.append(f"{path}: unit and spinel-toolchain (file-level Data records)")
             spinel = True
             jobs_selected.update(CORE)
+            spinel_tests.add("data_record_composition")
         if path in {"tests/emit_and_run/class_body_calls.rs", "tests/support/class_body_calls.rs"}:
             reasons.append(f"{path}: unit (emit_and_run), spinel-toolchain (ordinary class-body calls)")
             spinel = True
@@ -1458,6 +1481,7 @@ def main():
     parser.add_argument("--units")
     parser.add_argument("--kind", choices=SPINEL_TIMING_KINDS)
     parser.add_argument("--name")
+    parser.add_argument("--charged", type=float, default=0)
     parser.add_argument("--parallel", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--previous")
     parser.add_argument("--records")
@@ -1474,7 +1498,7 @@ def main():
         return False
     if args.command == "timed":
         # The command's own status: the framework loop tells timeout(1)'s 124 from a failure.
-        return run_timed(args.kind, args.name, command)
+        return run_timed(args.kind, args.name, command, args.charged)
     if args.command == "run-tests":
         tests = [line.strip() for line in sys.stdin if line.strip()]
         return run_tests(args.kind, tests, args.parallel, command)

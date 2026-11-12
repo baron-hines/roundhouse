@@ -435,7 +435,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Digest::MD5.file(path)` is `new.file(path)`: an instance of the
     // digest class holding the file's bytes, read back with the same
     // three readers (spinel's packages/digest answers an object with them).
-    for digest in ["Digest::MD5", "Digest::SHA1", "Digest::SHA256"] {
+    // `Digest::BLAKE3` is the digest gem's from 3.3.0 (Ruby 4.0 bundles
+    // 3.2.1); `project.rs::report_digest_blake3` keeps it to the targets
+    // that carry it.
+    for digest in ["Digest::MD5", "Digest::SHA1", "Digest::SHA256", "Digest::BLAKE3"] {
         let instance = Ty::Class { id: ClassId(Symbol::from(digest)), args: vec![].into() };
         register_stdlib_class(classes, digest, &[
             ("hexdigest", Ty::Str), ("digest", Ty::Str),
@@ -907,6 +910,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // hands them — campfire assigns an ActiveSupport::Duration — so
         // asserting Int there would be a narrower answer than the truth.
         ("use_ssl=", Ty::Bool),
+        // TLS writers answer the supplied value, which can also be nil.
+        ("verify_mode=", Ty::Untyped),
+        ("verify_hostname=", Ty::Untyped),
+        ("cert_store=", Ty::Untyped),
         ("open_timeout=", Ty::Untyped),
         ("read_timeout=", Ty::Untyped),
         ("use_ssl?", Ty::Bool), ("started?", Ty::Bool),
@@ -1161,6 +1168,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     for module in ["ActionController::UrlFor", "ActionController::Redirecting", "AbstractController::Callbacks", "ActionView::Rendering"] {
         register_stdlib_class(classes, module, &[], &[]);
     }
+    // `runtime/ruby/action_dispatch/route_set.rb`: `main_app` is the app's routes.
+    let route_helpers = Ty::Class {
+        id: ClassId(Symbol::from("Class")),
+        args: vec![Ty::Class { id: ClassId(Symbol::from("RouteHelpers")), args: vec![].into() }].into(),
+    };
+    register_stdlib_class(classes, "ActionDispatch::Routing::MountedHelpers", &[], &[("main_app", route_helpers)]);
+    register_stdlib_class(classes, "ActionDispatch::Routing::RouteSet", &[("finalize_app!", Ty::Nil)], &[("finalize!", Ty::Nil)]);
     register_stdlib_class(classes, crate::analyze::indifferent::CLASS, &[], &[]);
     // Not answered here beyond `new`: the dispatch arm for `ActiveSupport::StringInquirer` types its predicates and String surface.
     register_stdlib_class(classes, "ActiveSupport::StringInquirer", &[("new", Ty::Str)], &[]);

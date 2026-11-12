@@ -677,7 +677,7 @@ module Rails
     # unset, drops the meta tag — the same page Rails renders without
     # credentials configured.
     def credentials
-      {}
+      Credentials.new
     end
 
     # The Rack env defaults every request starts from
@@ -798,6 +798,85 @@ module Rails
     end
   end
 
+  # `Rails.application.credentials` with nothing configured: Rails' `EncryptedConfiguration`, whose every key reads
+  # nil (`credentials.secret_key_base`, `credentials[:vapid]`, `credentials.dig(:vapid, :public_key)`), and whose
+  # `fetch` of a key it does not hold answers its block, else its default, else raises, as a Hash's does.
+  class Credentials
+    def secret_key_base
+      nil
+    end
+
+    def [](key)
+      nil
+    end
+
+    def dig(*keys)
+      nil
+    end
+
+    def fetch(key, *default, &block)
+      return block.call(key) unless block.nil?
+      raise KeyError, "key not found: #{key.inspect}" if default.empty?
+      default[0]
+    end
+
+    def key?(key)
+      false
+    end
+
+    def has_key?(key)
+      false
+    end
+
+    def include?(key)
+      false
+    end
+
+    def keys
+      []
+    end
+
+    def values
+      []
+    end
+
+    def to_h
+      {}
+    end
+
+    def config
+      {}
+    end
+
+    def merge(other)
+      other
+    end
+
+    def each
+      self
+    end
+
+    def empty?
+      true
+    end
+
+    def any?
+      false
+    end
+
+    def present?
+      false
+    end
+
+    def blank?
+      true
+    end
+
+    def nil?
+      false
+    end
+  end
+
   class AssetConfig
     def prefix
       "/assets"
@@ -807,16 +886,32 @@ module Rails
   class FrameworkConfig
     def initialize
       @assets = AssetConfig.new
+      @action_controller = ActionControllerOptions.new
     end
 
     def assets
       @assets
     end
 
+    def relative_url_root
+      ENV["RAILS_RELATIVE_URL_ROOT"]
+    end
+
+    def action_controller
+      @action_controller
+    end
+
     # `Rails.application.config.filter_parameters` read at run time. The
     # list is the one ingest lifts from the app's `config.filter_parameters`.
     def filter_parameters
       Rails.application.config_filter_parameters
+    end
+  end
+
+  # Not ActionController::ControllerConfig: that one is the Ruby family's alone, and this config is every target's.
+  class ActionControllerOptions
+    def relative_url_root
+      Rails.application.config.relative_url_root
     end
   end
 

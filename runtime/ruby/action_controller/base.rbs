@@ -18,6 +18,7 @@ module ActionController
   def self.url_host_without_port: (String hostport) -> String
   def self.url_port_of: (String hostport) -> String
   def self.find_last: (String hay, String needle) -> Integer
+  def self.symbol_status_code: (Symbol status) -> Integer?
   def self.forgery_flag: () -> bool
   def self.set_forgery_flag: (bool value) -> void
   def self.forgery_switched_off: () -> bool

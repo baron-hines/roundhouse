@@ -151,6 +151,11 @@ module ActiveSupport
   # anything that answers `duplicable?` with false is itself; anything
   # else is its `dup` (an Integer's, nil's or a Symbol's is itself).
   # `lower::symbolize_keys` routes a typed Hash or Array receiver here.
+  # Not a table of hooks to run: an `on_load` block is carried into its class when the app is read, or reported.
+  def self.run_load_hooks(name, base = nil)
+    nil
+  end
+
   def self.deep_dup(value)
     case value
     when Array then value.map { |item| ActiveSupport.deep_dup(item) }
@@ -552,6 +557,42 @@ module ActiveSupport
     end
   end
 
+  # Rails' PBKDF2 key derivation (`ActiveSupport::KeyGenerator`): `secret` stretched with each salt it is asked for,
+  # 2**16 iterations by default, by the SHA256 digest a `load_defaults 7.0` app sets as its `hash_digest_class`.
+  # Not SHA1, an older app's: the digest primitives this runtime carries derive by SHA256 only.
+  class KeyGenerator
+    def initialize(secret, options = {})
+      digest = options[:hash_digest_class]
+      # Not a SHA256 key under another digest's name: it would never match the keys that digest derived.
+      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256" unless digest.nil? || digest.to_s.end_with?("SHA256")
+      @secret = secret
+      iterations = options[:iterations]
+      @iterations = iterations.nil? ? 65536 : iterations.to_i
+    end
+
+    def generate_key(salt, key_size = 64)
+      MessageDigest.pbkdf2_sha256(@secret, salt, @iterations, key_size)
+    end
+  end
+
+  # `ActiveSupport::CachingKeyGenerator`: each salt and size derived once, as the stretch is the slow part.
+  class CachingKeyGenerator
+    def initialize(key_generator)
+      @key_generator = key_generator
+      @cache_keys = {}
+    end
+
+    def generate_key(salt, key_size = 64)
+      cache_key = "#{salt}|#{key_size}"
+      key = @cache_keys[cache_key]
+      if key.nil?
+        key = @key_generator.generate_key(salt, key_size)
+        @cache_keys[cache_key] = key
+      end
+      key
+    end
+  end
+
   # `list.index_by { |x| key }` — the collection as a Hash keyed by the
   # block's value, last write winning on duplicates (Rails' contract).
   #
@@ -584,6 +625,18 @@ module ActiveSupport
   # Hash, removed from the Array it was called on, or a new empty one.
   # Only a plain Hash, as Rails' `Hash#extractable_options?` answers
   # (`instance_of?(Hash)`): a subclass stays in the Array.
+  # AS `Hash#assert_valid_keys`: the first key outside the list raises, naming the list.
+  def self.assert_valid_keys(hash, valid_keys)
+    # Not the list as given: Rails flattens it, so `assert_valid_keys(KEYS)` and `(:a, [:b])` name the same keys.
+    keys = valid_keys.flatten
+    hash.keys.each do |key|
+      unless keys.include?(key)
+        raise ArgumentError, "Unknown key: #{key.inspect}. Valid keys are: #{keys.map { |valid| valid.inspect }.join(", ")}"
+      end
+    end
+    hash
+  end
+
   def self.extract_options!(list)
     last = list.last
     return list.pop if last.instance_of?(Hash)

@@ -62,7 +62,7 @@ fn tiny_blog_round_trips() {
             primary_key_columns: Vec::new(),
         },
     );
-    let schema = Schema { tables };
+    let schema = Schema { tables, ..Default::default() };
 
     let mut attrs = IndexMap::new();
     attrs.insert(Symbol::from("id"), Ty::Int);
@@ -81,6 +81,7 @@ fn tiny_blog_round_trips() {
         class_attr_defaults: Default::default(),
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
         select_aliases: Vec::new(),
         i18n: Default::default(),
         span: Span::synthetic(),
@@ -179,6 +180,7 @@ fn tiny_blog_round_trips() {
         ingest_drops: Vec::new(),
         library_class_files: Vec::new(),
         rbs_includes: Default::default(),
+        rbs_spellings: Default::default(),
         controllers: vec![posts_controller],
         routes,
         views: vec![],
@@ -225,6 +227,7 @@ fn tiny_blog_round_trips() {
         pending_attachment_on_load: Vec::new(),
         load_hook_class_macros: Vec::new(),
         load_hook_extended_macros: Vec::new(),
+        load_hook_constants: Vec::new(),
         macro_includes: Vec::new(),
         expanded_macro_calls: Vec::new(),
         spliced_class_methods: Default::default(),

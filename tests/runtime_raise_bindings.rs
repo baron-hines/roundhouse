@@ -203,10 +203,6 @@ fn swift_bare_nil_bodies_return_nil() {
             "func klass() -> Any? {",
         ),
         (
-            "Sources/App/ActiveRecordBase.swift",
-            "func macro() -> Any? {",
-        ),
-        (
             "Sources/App/ActionControllerBase.swift",
             "func requestForCsrf() -> Any? {",
         ),

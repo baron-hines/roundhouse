@@ -71,11 +71,19 @@ module ActiveRecord
 
   module Reflection
     class AssociationReflection
-      def initialize: (Symbol name, untyped counter_cache_column) -> void
+      @macro: Symbol
+      @foreign_key: String
+      @polymorphic: bool
+      def initialize: (Symbol name, untyped counter_cache_column, Symbol macro, String foreign_key, bool polymorphic) -> void
       def name: () -> Symbol
       def counter_cache_column: () -> untyped
       def klass: () -> untyped
-      def macro: () -> untyped
+      def macro: () -> Symbol
+      def belongs_to?: () -> bool
+      def foreign_key: () -> String
+      def polymorphic?: () -> bool
+      def options: () -> Hash[Symbol, bool]
+      def foreign_type: () -> String?
     end
   end
 
@@ -123,6 +131,7 @@ module ActiveRecord
     def id=: (Integer) -> Integer
     def _primary_key_value: () -> Integer
     def to_param: () -> String
+    def to_key: () -> Array[Integer]?
 
     # Error message accumulator populated by the lowerer-emitted
     # `validate` body. Phase 2.5(a) inlines every `validates :x, …`
@@ -158,6 +167,9 @@ module ActiveRecord
     def self._sti_type_names: () -> Array[String]
     def self.primary_key: () -> String
     def self._association_names: () -> Array[Symbol]
+    def self._association_macros: () -> Array[Symbol]
+    def self._association_foreign_keys: () -> Array[String]
+    def self._association_polymorphic: () -> Array[bool]
     def self.reflect_on_association: (Symbol | String name) -> ActiveRecord::Reflection::AssociationReflection?
     def self.reflect_on_association_at: (String needle, Integer i) -> ActiveRecord::Reflection::AssociationReflection?
     def self._cast_primary_key: (Integer | String id) -> (Integer | String | nil)

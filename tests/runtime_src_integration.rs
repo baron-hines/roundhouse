@@ -1325,7 +1325,13 @@ fn every_runtime_method_body_concretely_typed() {
     // ActiveSupport.extract_options! takes any Array, so its untyped list
     // argument adds 8 sites in active_support_ext.rb; other files are
     // unchanged. Raise to 958, preserving the two-site headroom.
-    const CEILING: usize = 958;
+    // MEASURED 959 on devise-boot (main eed6a083f: 956): Params.indifferent_read
+    // reads a value that is Rails' Parameters or a Symbol-keyed Hash, which only
+    // the run time tells apart. Raise to 961, preserving the two-site headroom.
+    // MEASURED 963 on devise-recoverable (devise-boot: 959 + 2): KeyGenerator reads
+    // `hash_digest_class` out of its open options Hash, and Credentials#fetch answers
+    // what its block gives. Raise to 965, preserving the two-site headroom.
+    const CEILING: usize = 965;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

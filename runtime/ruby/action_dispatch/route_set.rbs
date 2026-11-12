@@ -1,0 +1,12 @@
+module ActionDispatch
+  module Routing
+    module MountedHelpers
+      def main_app: () -> singleton(RouteHelpers)
+    end
+
+    class RouteSet
+      def finalize!: () -> nil
+      def self.finalize_app!: () -> nil
+    end
+  end
+end

@@ -80,6 +80,7 @@ require_relative "runtime/active_support_duration"
 require_relative "runtime/active_support_ext"
 require_relative "runtime/active_support_calendar"
 require_relative "runtime/active_model_validator"
+require_relative "runtime/active_model_name"
 require_relative "runtime/rails"
 # Not part of runtime/rails: the instrumented Notifications paths keep per-thread state the strict targets' typing gate does not follow.
 require_relative "runtime/active_support_instrumentation"
@@ -311,6 +312,10 @@ require_relative "runtime/integration_session"
 # Rails 8.1.4's full ActionController::Head options hash is a Ruby-family
 # feature; strict non-Ruby targets keep the bounded shared implementation.
 require_relative "runtime/action_controller_head"
+# `Controller.action(name)`, which a gem's middleware calls (Warden's failure app).
+require_relative "runtime/action_controller_endpoint"
+require_relative "runtime/active_record_attribute_keys"
+require_relative "runtime/route_helpers_routes"
 require_relative "runtime/action_controller_render"
 # Rails' FlashHash keeps any key; the shared Flash keeps notice/alert, which every target can type.
 require_relative "runtime/flash_any_key"
