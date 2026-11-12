@@ -124,7 +124,7 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
     };
     // A required path is the absent gem's own when its namespace is (tzinfo-data's `tzinfo/data`).
     let unloadable = |path: &str| absent_namespaces.owner(&path.split('/').collect::<Vec<_>>().join("::")).is_some();
-    // Not a feature any locked gem (by name, constant or file), Ruby or Rails provides: a gem's optional feature's library the app doesn't bundle
+    // Not a feature any locked gem (by name, constant or file), Ruby (by exact path) or Rails provides: a gem's optional feature's library the app doesn't bundle
     // (`require "method_source"` in a loader that rescues LoadError). Ruby raises LoadError where the method runs; Spinel
     // resolves a require statically, and `spin build` refuses one it cannot satisfy.
     let provided_by_nothing = |path: &str| {
@@ -134,8 +134,7 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
         !root.is_empty()
             && !feature.starts_with('.')
             && !crate::gems::is_framework_feature(feature)
-            && !RUBY_FEATURE_ROOTS.contains(&root)
-            && !super::app::APP_REQUIRABLE_STDLIB.iter().any(|s| s.split('/').next() == Some(root))
+            && !ships_with_ruby(feature)
             && ![root.to_string(), root.replace('_', "-"), feature.replace('/', "-")].iter().any(|n| lock.version_of(n).is_some())
             && index.owners(&as_constant.join("::")).is_empty()
             && !shipped(feature)
@@ -160,6 +159,17 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
 
 /// The first segment of a feature Ruby itself provides, as a default or bundled gem or part of the standard
 /// library, beyond `APP_REQUIRABLE_STDLIB` (`net/smtp`, `rbconfig`, `prism`).
+/// Ruby ships this exact feature: a root such as `json`, or a path under one that Ruby's own library or a default gem
+/// has (`net/http`, not net-http-persistent's `net/http/persistent`).
+fn ships_with_ruby(feature: &str) -> bool {
+    if feature.contains('/') {
+        super::stdlib_features::STDLIB_SUBFEATURES.binary_search(&feature).is_ok()
+            || super::app::APP_REQUIRABLE_STDLIB.contains(&feature)
+    } else {
+        RUBY_FEATURE_ROOTS.contains(&feature)
+    }
+}
+
 const RUBY_FEATURE_ROOTS: &[&str] = &[
     "abbrev", "base64", "benchmark", "bigdecimal", "bundler", "cgi", "continuation", "coverage", "csv", "date", "debug",
     "delegate", "did_you_mean", "digest", "drb", "English", "erb", "error_highlight", "etc", "expect", "fcntl", "fiber",
