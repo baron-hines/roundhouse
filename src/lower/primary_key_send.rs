@@ -90,7 +90,7 @@ fn guarded(e: &mut Expr, records: &crate::det::HashSet<String>, proven: &[Symbol
         let mut inner = proven.to_vec();
         record_tests(cond, records, &mut inner);
         // Not a local the branch binds again (an assignment, a block parameter): the test no longer speaks for it.
-        inner.retain(|name| !rebinds(then_branch, name));
+        inner.retain(|name| !rebinds(then_branch, name) && !rebinds(cond, name));
         guarded(then_branch, records, &inner);
         guarded(else_branch, records, proven);
         return;

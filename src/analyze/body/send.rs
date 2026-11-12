@@ -2267,8 +2267,9 @@ impl<'a> BodyTyper<'a> {
                             // An instance send that no method answers goes to the instance-side `method_missing` (hashie's
                             // Mash, which OmniAuth's AuthHash answers `provider` with).
                             // The latest include first, as Ruby looks it up; `self` the receiving class.
+                            // Not a module's singleton `method_missing`, which answers calls on the module, not on its includers.
                             cls.instance_methods.get(&missing).cloned().or_else(|| {
-                                cls.includes.iter().rev().find_map(|m| self.lookup_in_module(m, &missing))
+                                cls.includes.iter().rev().find_map(|m| self.instance_method_in_module(m, &missing))
                             }).map(|ty| subst(&ty))
                         } else {
                             cls.class_methods.get(&missing).cloned()
@@ -3069,6 +3070,23 @@ impl<'a> BodyTyper<'a> {
                 return Some(unwrap_fn_ret(ty));
             }
             stack.extend(m.includes.iter().cloned());
+        }
+        None
+    }
+
+    /// [`Self::lookup_in_module`] on the instance side alone.
+    pub(super) fn instance_method_in_module(&self, module_id: &ClassId, method: &Symbol) -> Option<Ty> {
+        let mut stack = vec![module_id.clone()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(m) = self.classes().get(&id) else { continue };
+            if let Some(ty) = m.instance_methods.get(method) {
+                return Some(unwrap_fn_ret(ty));
+            }
+            stack.extend(m.includes.iter().rev().cloned());
         }
         None
     }

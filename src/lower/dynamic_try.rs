@@ -37,7 +37,8 @@ fn rewrite(e: &mut Expr) {
     let mut binds = Vec::new();
     let mut sent = vec![name.clone()];
     for (i, arg) in rest.iter().enumerate() {
-        if matches!(&*arg.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Lit { .. } | ExprNode::SelfRef) {
+        // Not a variable either: a later argument may assign it before the send reads it.
+        if matches!(&*arg.node, ExprNode::Lit { .. } | ExprNode::SelfRef) {
             sent.push(arg.clone());
             continue;
         }

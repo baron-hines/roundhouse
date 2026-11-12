@@ -537,7 +537,8 @@ fn collect_calls_with_args(expr: &Expr, out: &mut CallsWithArguments) {
         let calls = out.entry(method.as_str().to_string()).or_default();
         calls.positional_arities.insert(args.len());
         calls.has_block |= block.is_some();
-        calls.keywords |= args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }));
+        // Nor a splat of either kind, whose count the call does not show.
+        calls.keywords |= args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. } | ExprNode::KeywordSplat { .. } | ExprNode::Splat { .. }));
     } else if instance_call {
         // A call without arguments too, so one name called both ways is no fixed arity.
         out.entry(method.as_str().to_string()).or_default().positional_arities.insert(0);

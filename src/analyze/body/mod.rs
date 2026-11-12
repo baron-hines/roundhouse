@@ -8456,10 +8456,18 @@ fn builtin_never_answers(ty: &Ty, method: &Symbol) -> bool {
 /// assignment names wherever the parser meets it, a branch that never runs included (`x = y if false` leaves `x` nil).
 fn declare_dropped_locals(kept: Expr, dropped: &Expr, cond: &Expr, ctx: &Ctx) -> Expr {
     fn assigned(e: &Expr, out: &mut Vec<(crate::ident::VarId, Symbol)>) {
-        if let ExprNode::Assign { target: crate::expr::LValue::Var { id, name }, .. } = &*e.node
-            && !out.iter().any(|(_, n)| n == name)
-        {
-            out.push((*id, name.clone()));
+        // Every form that makes a local: `x = `, `x ||= `, and each target of `a, b = `.
+        let mut push = |target: &crate::expr::LValue| {
+            if let crate::expr::LValue::Var { id, name } = target
+                && !out.iter().any(|(_, n)| n == name)
+            {
+                out.push((*id, name.clone()));
+            }
+        };
+        match &*e.node {
+            ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => push(target),
+            ExprNode::MultiAssign { targets, .. } => targets.iter().for_each(&mut push),
+            _ => {}
         }
         // Not a block's own: its locals are its body's.
         if matches!(&*e.node, ExprNode::Lambda { .. }) {

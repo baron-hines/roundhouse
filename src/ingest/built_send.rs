@@ -169,6 +169,12 @@ fn rewrite(e: &mut Expr, names: &[String]) {
     {
         let exact = format!("{prefix}{infix}{suffix}");
         let span = e.span;
+        if public {
+            let mut sent = vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(exact.as_str()) } })];
+            sent.extend(rest.iter().cloned());
+            *e.node = ExprNode::Send { recv: Some(Expr::new(span, ExprNode::SelfRef)), method: Symbol::from("public_send"), args: sent, block: None, parenthesized: true };
+            return;
+        }
         let recv = exact.ends_with('=').then(|| Expr::new(span, ExprNode::SelfRef));
         *e.node = ExprNode::Send { recv, method: Symbol::from(exact.as_str()), args: rest.to_vec(), block: None, parenthesized: !rest.is_empty() };
         return;
