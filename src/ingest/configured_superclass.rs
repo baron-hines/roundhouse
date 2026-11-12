@@ -2255,7 +2255,7 @@ impl<'a> Eval<'a> {
             && c == subject
         {
             for (_, _, module) in self.mixed_in.iter().rev().filter(|(owner, kind, _)| owner == c && *kind == "include") {
-                for decl in self.classes.iter().filter(|lc| lc.name.0.as_str() == module) {
+                for decl in self.classes.iter().rev().filter(|lc| lc.name.0.as_str() == module) {
                     if let Some(m) = decl.methods.iter().rev().find(|m| {
                         m.receiver == MethodReceiver::Class && m.name.as_str() == name && self.class_side_spans.contains(&m.name_span)
                     }) {
@@ -3444,11 +3444,47 @@ pub(super) fn expand_model_mixin_macros<V: Vfs + ?Sized>(vfs: &V, dir: &Path, ge
         }
     }
     rewrites.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    // Not rewritten where its hook's declarations do not read back as the model's: the call stays, and so does the hook.
+    let mut rewrites: Vec<_> = rewrites
+        .into_iter()
+        .filter_map(|(mi, bi, includes, class_body, hooked)| {
+            // Not a statement reading a constant by its name in the hook's module: read back in the model it names nothing there, and a format's `with:` drops.
+            let lexical = class_body.iter().any(|statement| {
+                let mut hit = false;
+                visit(statement, &mut |e| {
+                    if let ExprNode::Const { path } = &*e.node
+                        && path.first().is_some_and(|p| !p.as_str().is_empty())
+                    {
+                        let name = path.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("::");
+                        hit |= !app.library_classes.iter().any(|c| c.name.0.as_str() == name) && !app.models.iter().any(|m| m.name.0.as_str() == name);
+                    }
+                });
+                hit
+            });
+            if lexical {
+                return None;
+            }
+            let declared = class_body_items(&class_body, &app.models[mi].name)?;
+            Some((mi, bi, includes, declared, hooked))
+        })
+        .collect();
+    // Not a model whose hooked module another class includes as it is: the hook stays for that one, and would run again on this one's `include`.
+    loop {
+        let rewritten: HashSet<ClassId> = rewrites.iter().map(|r| app.models[r.0].name.clone()).collect();
+        let shared = |module: &String| {
+            let id = ClassId(Symbol::from(module.as_str()));
+            app.library_classes.iter().any(|c| c.includes.contains(&id))
+                || app.models.iter().any(|m| !rewritten.contains(&m.name) && crate::analyze::model_includes(m).contains(&id))
+        };
+        let before = rewrites.len();
+        rewrites.retain(|r| !r.4.iter().any(&shared));
+        if rewrites.len() == before {
+            break;
+        }
+    }
     let mut hooked_by: HashMap<String, Vec<ClassId>> = HashMap::default();
-    for (mi, bi, includes, class_body, hooked) in rewrites {
+    for (mi, bi, includes, declared, hooked) in rewrites {
         let owner = app.models[mi].name.clone();
-        // Not rewritten where its hook's declarations do not read back as the model's: the call stays, and so does the hook.
-        let Some(declared) = class_body_items(&class_body, &owner) else { continue };
         for m in hooked {
             hooked_by.entry(m).or_default().push(owner.clone());
         }
@@ -3740,6 +3776,14 @@ fn class_body_items(statements: &[Expr], owner: &ClassId) -> Option<Vec<crate::d
             let mut ingested = super::model::ingest_model_body_items(&stmt, owner, "<included hook>", Vec::new(), None, &super::model::ClassConsts::default()).ok()?;
             for item in &mut ingested {
                 super::class_macros::mark_constants(item);
+                // Not the span of the text read back: each statement is parsed on its own, so two calls of one length would share it, and a rule refused by span would take the other along.
+                match item {
+                    crate::dialect::ModelBodyItem::Association { span, .. }
+                    | crate::dialect::ModelBodyItem::Validation { span, .. }
+                    | crate::dialect::ModelBodyItem::Callback { span, .. } => *span = statement.span,
+                    crate::dialect::ModelBodyItem::Unknown { expr, .. } => expr.span = statement.span,
+                    _ => {}
+                }
             }
             items.extend(ingested);
         }

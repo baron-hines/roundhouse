@@ -3,7 +3,8 @@ use super::emit_and_run;
 /// `validates_<kind>_of` is the `validates` call Rails makes of it (`validates_with <Kind>Validator,
 /// _merge_attributes(attr_names)`), and `confirmation:` is Rails' `ConfirmationValidator`: an error on
 /// `<attr>_confirmation` when one was given and differs, and a reader and writer for it where the model has none.
-/// The answers are Rails 8.1.4's for the same model and records.
+/// The model's own `attr_writer` leaves Rails to define only the reader, and a nil value is compared by `==` where
+/// the confirmation is not case-sensitive. The answers are Rails 8.1.4's for the same model and records.
 fn categories() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
@@ -19,6 +20,7 @@ fn categories() -> emit_and_run::Overlay {
   validates_uniqueness_of :name, allow_blank: true, case_sensitive: true, if: :need?
   validates_length_of :name, within: 2..5, allow_blank: true
   validates_size_of :kind, maximum: 20
+  attr_writer :name_confirmation
   validates_confirmation_of :name
   validates :kind, confirmation: { case_sensitive: false }
 
@@ -42,7 +44,7 @@ const SCRIPT: &str = r##"def errs(name, kind = nil, name_confirmation = nil, kin
 end
 got = [errs(""), errs("abcdefg"), errs("abc", "x" * 21)]
 Category.create!(name: "abc")
-got += [errs("abc"), errs("ABC"), errs("ab", nil, "ac"), errs("ab", nil, "ab"), errs("ab", "Abc", nil, "aBC"), errs("ab", "Abc", nil, "x")]
+got += [errs("abc"), errs("ABC"), errs("ab", nil, "ac"), errs("ab", nil, "ab"), errs("ab", "Abc", nil, "aBC"), errs("ab", "Abc", nil, "x"), errs("ab", nil, nil, "x")]
 want = [
   ["Name can't be blank"],
   ["Name is too long (maximum is 5 characters)"],
@@ -52,6 +54,7 @@ want = [
   ["Name confirmation doesn't match Name"],
   [],
   [],
+  ["Kind confirmation doesn't match Kind"],
   ["Kind confirmation doesn't match Kind"],
 ]
 raise "category errors: #{got.inspect}" unless got == want
