@@ -1845,7 +1845,7 @@ fn unloadable_classes(app: &App, names: &HashSet<String>) -> HashSet<String> {
             let gem = gem.as_str();
             gem == root || gem.replace('-', "_") == root || gem.replace('-', "") == root || gem.starts_with(&format!("{root}-")) || gem.starts_with(&format!("{root}_"))
         });
-        is_framework_feature(feature)
+        crate::gems::is_framework_feature(feature)
             || gem_named
             || stdlib(root)
             || stdlib(feature)
@@ -1916,19 +1916,4 @@ pub(crate) fn compiled_on_the_ruby_family(app: &App) -> crate::det::HashSet<Stri
         }
         kept.extend(more);
     }
-}
-
-/// A feature of the Rails frameworks (`active_support/core_ext/…`,
-/// `rails`): the runtime ports are the framework in an emitted tree, and
-/// no such file is on its load path.
-pub(crate) fn is_framework_feature(feature: &str) -> bool {
-    let root = feature.split('/').next().unwrap_or(feature);
-    matches!(
-        root,
-        "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
-            | "active_model" | "activemodel" | "active_job" | "activejob" | "action_pack" | "actionpack"
-            | "action_controller" | "action_dispatch" | "abstract_controller" | "action_view" | "actionview"
-            | "action_mailer" | "actionmailer" | "action_cable" | "actioncable" | "action_text" | "actiontext"
-            | "active_storage" | "activestorage" | "action_mailbox" | "actionmailbox"
-    )
 }

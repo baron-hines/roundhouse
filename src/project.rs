@@ -3554,6 +3554,11 @@ fn target_files_inner(
     for d in crate::lower::validations::acceptance_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
+    // `presence:` on a NOT NULL number with no default, which a strict
+    // target's zero-started field cannot see as unset.
+    for d in crate::lower::validations::presence_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
     for d in crate::lower::relation_residue::default_scope_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
@@ -5703,7 +5708,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                             report_program_error(*span, "file_require_not_carried", &message);
                             writeln!(out, "$stderr.puts {message:?}").unwrap();
                         }
-                        _ if is_framework_feature(feature) => {
+                        _ if crate::gems::is_framework_feature(feature) => {
                             writeln!(out, "# {}: `require {feature:?}` is a Rails feature this tree's runtime ports answer; not required", site(*span)).unwrap();
                         }
                         _ => {
@@ -5737,7 +5742,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                         }
                         writeln!(out, "{owner}.autoload(:{name}, RoundhouseAutoload.path({:?}))", anchor_of(&target)).unwrap();
                     }
-                    _ if is_framework_feature(feature) => {
+                    _ if crate::gems::is_framework_feature(feature) => {
                         writeln!(out, "# {}: `autoload :{name}, {feature:?}` is a Rails feature this tree's runtime ports answer", site(*span)).unwrap();
                     }
                     _ => {
@@ -6095,11 +6100,6 @@ fn all_program_items(items: &[crate::app::ProgramItem]) -> Vec<&crate::app::Prog
     }
     out
 }
-
-/// A path with `.` and `..` segments folded, as a require resolves it.
-
-pub(crate) use crate::source_gem_shake::is_framework_feature;
-
 
 /// An error diagnostic for a program item the tree does not carry.
 fn report_program_error(span: crate::span::Span, construct: &str, message: &str) {
