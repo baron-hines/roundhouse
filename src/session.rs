@@ -52,7 +52,7 @@ fn analyze_and_lower_with_target(app: &mut App, target: crate::build_target::Bui
     analyzer.analyze(app);
     // Typed again without the gem code the program does not reach: its calls are no evidence for what the reached code is
     // passed, as Warden's `update(label, &block)`, which nothing calls, would type `add`'s strategy `untyped`.
-    if crate::project::shakes_source_gems(app, target)
+    if crate::source_gem_shake::shakes_source_gems(app, target)
         && let Some(trimmed) = crate::source_gem_shake::shake(app)
     {
         *app = trimmed;

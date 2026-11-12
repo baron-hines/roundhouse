@@ -3375,46 +3375,7 @@ fn without_auto_source_gems(app: &App, target: BuildTarget) -> Option<App> {
     Some(trimmed)
 }
 
-/// Does `target`'s tree carry only the part of a gem compiled from source the program reaches? Spinel's does, and the
-/// ruby family's where it compiles a gem too (`compiled_on_the_ruby_family`).
-pub(crate) fn shakes_source_gems(app: &App, target: BuildTarget) -> bool {
-    target == BuildTarget::Spinel
-        || (matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) && !compiled_on_the_ruby_family(app).is_empty())
-}
-
-/// The automatically sourced gems the ruby family compiles too: a gem that needs Rails' railties cannot load as
-/// the real gem over the runtime, which is not Rails (Devise, responders), and a sourced gem one of them depends on
-/// (Warden) comes with it, since the compiled gem calls its compiled classes.
-pub(crate) fn compiled_on_the_ruby_family(app: &App) -> crate::det::HashSet<String> {
-    let Some(lock) = app.gem_lock.as_ref() else { return Default::default() };
-    let deps = |gem: &str| lock.spec_deps.get(gem).cloned().unwrap_or_default();
-    let needs_railties = |gem: &str| {
-        let mut seen: crate::det::HashSet<String> = Default::default();
-        let mut stack = vec![gem.to_string()];
-        while let Some(g) = stack.pop() {
-            if g == "railties" {
-                return true;
-            }
-            if seen.insert(g.clone()) {
-                stack.extend(deps(&g));
-            }
-        }
-        false
-    };
-    let mut kept: crate::det::HashSet<String> = app.auto_source_gems.iter().filter(|g| needs_railties(g)).cloned().collect();
-    loop {
-        let more: Vec<String> = app
-            .auto_source_gems
-            .iter()
-            .filter(|g| !kept.contains(*g) && kept.iter().any(|k| deps(k).iter().any(|d| d == *g)))
-            .cloned()
-            .collect();
-        if more.is_empty() {
-            return kept;
-        }
-        kept.extend(more);
-    }
-}
+pub(crate) use crate::source_gem_shake::{compiled_on_the_ruby_family, shakes_source_gems};
 
 fn target_files_inner(
     app: &App,
@@ -3429,6 +3390,9 @@ fn target_files_inner(
                 expr.decisions &= !(crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_CLASS_BODY);
             }
         });
+        // On this copy, before any later pass or emitter reads a constant,
+        // so no target without a `::` to print sees a rooted one.
+        crate::lower::rooted_constants::unroot_for_target(&mut trimmed, target);
         without_inherited_replay = trimmed;
         &without_inherited_replay
     } else { app };
@@ -3591,6 +3555,11 @@ fn target_files_inner(
     // `acceptance:` on an `attribute :x, :boolean`, left out where the
     // writer cannot keep Rails' nil.
     for d in crate::lower::validations::acceptance_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
+    // `presence:` on a NOT NULL number with no default, which a strict
+    // target's zero-started field cannot see as unset.
+    for d in crate::lower::validations::presence_gaps_for_target(app, target) {
         emit::diagnostics::push(d);
     }
     for d in crate::lower::relation_residue::default_scope_gaps_for_target(app, target) {
@@ -5742,7 +5711,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                             report_program_error(*span, "file_require_not_carried", &message);
                             writeln!(out, "$stderr.puts {message:?}").unwrap();
                         }
-                        _ if is_framework_feature(feature) => {
+                        _ if crate::gems::is_framework_feature(feature) => {
                             writeln!(out, "# {}: `require {feature:?}` is a Rails feature this tree's runtime ports answer; not required", site(*span)).unwrap();
                         }
                         _ => {
@@ -5776,7 +5745,7 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
                         }
                         writeln!(out, "{owner}.autoload(:{name}, RoundhouseAutoload.path({:?}))", anchor_of(&target)).unwrap();
                     }
-                    _ if is_framework_feature(feature) => {
+                    _ if crate::gems::is_framework_feature(feature) => {
                         writeln!(out, "# {}: `autoload :{name}, {feature:?}` is a Rails feature this tree's runtime ports answer", site(*span)).unwrap();
                     }
                     _ => {
@@ -6133,23 +6102,6 @@ fn all_program_items(items: &[crate::app::ProgramItem]) -> Vec<&crate::app::Prog
         }
     }
     out
-}
-
-/// A path with `.` and `..` segments folded, as a require resolves it.
-
-/// A feature of the Rails frameworks (`active_support/core_ext/…`,
-/// `rails`): the runtime ports are the framework in an emitted tree, and
-/// no such file is on its load path.
-fn is_framework_feature(feature: &str) -> bool {
-    let root = feature.split('/').next().unwrap_or(feature);
-    matches!(
-        root,
-        "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
-            | "active_model" | "activemodel" | "active_job" | "activejob" | "action_pack" | "actionpack"
-            | "action_controller" | "action_dispatch" | "abstract_controller" | "action_view" | "actionview"
-            | "action_mailer" | "actionmailer" | "action_cable" | "actioncable" | "action_text" | "actiontext"
-            | "active_storage" | "activestorage" | "action_mailbox" | "actionmailbox"
-    )
 }
 
 /// An error diagnostic for a program item the tree does not carry.

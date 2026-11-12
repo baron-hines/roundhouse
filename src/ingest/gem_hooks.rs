@@ -316,9 +316,12 @@ pub(super) fn unroll_warden_serializers(app: &mut App, mappings: &[(String, Stri
 /// `warden_config.serialize_into_session(…) { … }` and `serialize_from_session` dropped from a body, as statements.
 /// A Devise view's `resource_name` (and `scope_name`) is `devise_mapping.name`, the mapping the request's route set:
 /// where the app has one mapping, every request a Devise controller serves has that one, so the view's form spells
-/// its name (`form_for(resource, as: resource_name, …)`, whose field prefix is lowered from a literal).
+/// its name (`form_for(resource, as: resource_name, …)`, whose field prefix is lowered from a literal). With more,
+/// the view is a `case resource_name` over the mappings, each arm the view with that mapping's name spelled.
 pub(super) fn fold_devise_view_scope(app: &mut App, mappings: &[(String, String)]) {
-    let [(name, _)] = mappings else { return };
+    if mappings.is_empty() {
+        return;
+    }
     let app_defines = |m: &str, span: crate::span::Span| {
         matches!(m, "resource_name" | "scope_name") && !super::sources::path_of(span.file).is_some_and(|p| super::absence_guards::is_source_gem_path(&p))
     };
@@ -329,8 +332,60 @@ pub(super) fn fold_devise_view_scope(app: &mut App, mappings: &[(String, String)
         return;
     }
     for view in app.views.iter_mut() {
-        fold_scope_reads(&mut view.body, name);
+        if let [(name, _)] = mappings {
+            fold_scope_reads(&mut view.body, name);
+            continue;
+        }
+        // Not an app's own view, which may read the name only in a branch a request without a mapping never takes: the case would read it first.
+        if !devise_rendered(view.name.as_str(), mappings) || !reads_scope(&view.body) {
+            continue;
+        }
+        let span = view.body.span;
+        let mut arms: Vec<crate::expr::Arm> = mappings
+            .iter()
+            .map(|(name, _)| {
+                let mut body = view.body.clone();
+                fold_scope_reads(&mut body, name);
+                crate::expr::Arm {
+                    pattern: crate::expr::Pattern::Lit { value: Literal::Sym { value: crate::ident::Symbol::from(name.as_str()) } },
+                    guard: None,
+                    body,
+                }
+            })
+            .collect();
+        // Not a raise for a name no mapping has: every request a Devise controller serves carries one of them.
+        if let Some(last) = arms.last_mut() {
+            last.pattern = crate::expr::Pattern::Wildcard;
+        }
+        let scrutinee = Expr::new(span, ExprNode::Send { recv: None, method: crate::ident::Symbol::from("resource_name"), args: Vec::new(), block: None, parenthesized: false });
+        view.body = Expr::new(span, ExprNode::Case { scrutinee, arms });
     }
+}
+
+/// A view only Devise's controllers render: its own `devise/…`, or a scoped one (`config.scoped_views`) under a
+/// mapping's plural, in one of Devise's controllers' directories (`users/sessions/new`).
+fn devise_rendered(view: &str, mappings: &[(String, String)]) -> bool {
+    const CONTROLLERS: &[&str] = &["sessions", "registrations", "passwords", "confirmations", "unlocks", "omniauth_callbacks", "shared", "mailer"];
+    // Not a mailer's view: a mailer has no request mapping for the case to read.
+    if view.split('/').any(|dir| dir == "mailer") {
+        return false;
+    }
+    if view.starts_with("devise/") {
+        return true;
+    }
+    mappings.iter().any(|(name, _)| {
+        let plural = crate::naming::pluralize(name);
+        view.strip_prefix(&format!("{plural}/"))
+            .and_then(|rest| rest.split('/').next())
+            .is_some_and(|dir| CONTROLLERS.contains(&dir))
+    })
+}
+
+fn reads_scope(e: &Expr) -> bool {
+    let mut found = matches!(&*e.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+        if args.is_empty() && matches!(method.as_str(), "resource_name" | "scope_name"));
+    e.node.for_each_child(&mut |c| found |= reads_scope(c));
+    found
 }
 
 /// Devise's FailureApp names the route it sends a visitor to as `route(scope)`, `:"new_#{scope}_session_url"`, and
@@ -340,15 +395,19 @@ pub(super) fn fold_devise_view_scope(app: &mut App, mappings: &[(String, String)
 /// The router it asks is `send(router_name)`, `Devise.available_router_name` (`router_name || :main_app`) where the
 /// mapping names none: `main_app` while the app sets no `config.router_name`.
 pub(super) fn fold_devise_failure_route(app: &mut App, mappings: &[(String, String)]) {
-    let [(name, _)] = mappings else { return };
-    let literal = format!("new_{name}_session_url");
+    if mappings.is_empty() {
+        return;
+    }
     let router_named = app.boot_program.iter().any(|e| sends(e, "router_name="));
     for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str() == "Devise::FailureApp") {
         if !lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "route") {
             continue;
         }
         for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() != "route") {
-            fold_route_local(&mut m.body, &literal);
+            match mappings {
+                [(name, _)] => fold_route_local(&mut m.body, &format!("new_{name}_session_url")),
+                _ => spread_route_local(&mut m.body, mappings),
+            }
             if !router_named {
                 fold_router_send(&mut m.body);
             }
@@ -386,6 +445,47 @@ fn fold_route_local(body: &mut Expr, literal: &str) {
     collect_route_locals(body, &mut locals, &mut writes);
     locals.retain(|l| writes.iter().filter(|w| *w == l).count() == 1);
     replace_route_reads(body, &locals, literal);
+}
+
+// With more mappings, each call handed the route local (`context.respond_to?(route)`, `context.send(route, opts)`) is a
+// `case scope` over them, the name each arm's: the scope is one of the mappings', as `Devise.mappings[scope]` holds.
+fn spread_route_local(body: &mut Expr, mappings: &[(String, String)]) {
+    let mut locals: Vec<crate::ident::Symbol> = Vec::new();
+    let mut writes: Vec<crate::ident::Symbol> = Vec::new();
+    collect_route_locals(body, &mut locals, &mut writes);
+    locals.retain(|l| writes.iter().filter(|w| *w == l).count() == 1);
+    if locals.is_empty() {
+        return;
+    }
+    spread_calls(body, &locals, mappings);
+}
+
+fn spread_calls(e: &mut Expr, locals: &[crate::ident::Symbol], mappings: &[(String, String)]) {
+    let hands_route = matches!(&*e.node, ExprNode::Send { args, .. }
+        if args.iter().any(|a| matches!(&*a.node, ExprNode::Var { name, .. } if locals.contains(name))));
+    if hands_route {
+        let span = e.span;
+        let mut arms: Vec<crate::expr::Arm> = mappings
+            .iter()
+            .map(|(name, _)| {
+                let mut call = e.clone();
+                replace_route_reads(&mut call, locals, &format!("new_{name}_session_url"));
+                crate::expr::Arm {
+                    pattern: crate::expr::Pattern::Lit { value: Literal::Sym { value: crate::ident::Symbol::from(name.as_str()) } },
+                    guard: None,
+                    body: call,
+                }
+            })
+            .collect();
+        // Not a raise for another scope: `Devise.mappings[scope]` has already raised for one no mapping has.
+        if let Some(last) = arms.last_mut() {
+            last.pattern = crate::expr::Pattern::Wildcard;
+        }
+        let scrutinee = Expr::new(span, ExprNode::Send { recv: None, method: crate::ident::Symbol::from("scope"), args: Vec::new(), block: None, parenthesized: false });
+        *e = Expr::new(span, ExprNode::Case { scrutinee, arms });
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| spread_calls(c, locals, mappings));
 }
 
 fn collect_route_locals(e: &Expr, locals: &mut Vec<crate::ident::Symbol>, writes: &mut Vec<crate::ident::Symbol>) {
@@ -431,63 +531,6 @@ pub(super) fn devise_warden_compat(app: &mut App) {
     for lc in app.library_classes.iter_mut().filter(|c| c.name.0.as_str() == "Warden::Mixins::Common") {
         lc.methods.retain(|m| compat(m) || !overridden.iter().any(|(n, r)| *n == m.name && *r == m.receiver));
     }
-}
-
-/// orm_adapter's ActiveRecord adapter, which Devise's models reach through `to_adapter` (`extend ::OrmAdapter::ToAdapter`
-/// in an `on_load(:active_record)` block that is not carried, and a `self::OrmAdapter` constant it reads): `find_first`
-/// with plain conditions is `where(conditions).first`, and `get(id)` is the row of that primary key
-/// (`OrmAdapter::ActiveRecord#find_first` / `#get`, orm_adapter 0.5.0).
-pub(super) fn devise_orm_adapter(app: &mut App) {
-    if !app.library_classes.iter().any(|c| c.name.0.as_str() == "Devise::Mapping") {
-        return;
-    }
-    let src = "class OrmAdapterProbe\n  def find_first(klass, conditions)\n    klass.where(conditions).first\n  end\n\n  def get(klass, id)\n    klass.where(klass.primary_key => (id.is_a?(Array) ? id.first : id)).first\n  end\nend\n";
-    let Ok(probe) = super::prism::scope(|| super::ingest_library_classes(src.as_bytes(), "<orm_adapter active_record>")).0 else { return };
-    let body = |name: &str| probe.iter().flat_map(|c| c.methods.iter()).find(|m| m.name.as_str() == name).map(|m| m.body.clone());
-    let (Some(find_first), Some(get)) = (body("find_first"), body("get")) else { return };
-    let devise = |m: &crate::dialect::MethodDef| super::sources::path_of(m.name_span.file).is_some_and(|p| p.contains("/devise-") && super::absence_guards::is_source_gem_path(&p));
-    for lc in app.library_classes.iter_mut() {
-        for m in lc.methods.iter_mut().filter(|m| devise(m)) {
-            rewrite_to_adapter(&mut m.body, &find_first, &get);
-        }
-    }
-    // A model's `devise` call splices the modules' methods into it.
-    for model in app.models.iter_mut() {
-        for m in model.methods_mut().filter(|m| devise(m)) {
-            rewrite_to_adapter(&mut m.body, &find_first, &get);
-        }
-    }
-}
-
-fn rewrite_to_adapter(e: &mut Expr, find_first: &Expr, get: &Expr) {
-    e.node.for_each_child_mut(&mut |c| rewrite_to_adapter(c, find_first, get));
-    let ExprNode::Send { recv: Some(adapter), method, args, block: None, .. } = &*e.node else { return };
-    let ExprNode::Send { recv: klass, method: to_adapter, args: none, block: None, .. } = &*adapter.node else { return };
-    if to_adapter.as_str() != "to_adapter" || !none.is_empty() {
-        return;
-    }
-    let template = match (method.as_str(), args.as_slice()) {
-        ("find_first", [_]) => find_first,
-        ("get", [_]) => get,
-        _ => return,
-    };
-    let klass = klass.clone().unwrap_or_else(|| Expr::new(e.span, ExprNode::SelfRef));
-    let arg = args[0].clone();
-    let mut out = template.clone();
-    substitute_vars(&mut out, &klass, &arg);
-    *e = out;
-}
-
-fn substitute_vars(e: &mut Expr, klass: &Expr, arg: &Expr) {
-    if let ExprNode::Var { name, .. } = &*e.node {
-        match name.as_str() {
-            "klass" => *e = klass.clone(),
-            "conditions" | "id" => *e = arg.clone(),
-            _ => {}
-        }
-        return;
-    }
-    e.node.for_each_child_mut(&mut |c| substitute_vars(c, klass, arg));
 }
 
 fn fold_scope_reads(e: &mut Expr, name: &str) {
