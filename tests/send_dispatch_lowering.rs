@@ -15,6 +15,9 @@
 //! Unprovable name sets must leave the `send` untouched and go on the
 //! residue ledger.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+
 use roundhouse::App;
 use roundhouse::analyze::Analyzer;
 use roundhouse::diagnostic::Diagnostic;
@@ -374,10 +377,15 @@ end
 end
 "##;
 
-fn cruby(source: &str) -> String {
-    let out = std::process::Command::new("ruby").args(["-e", source]).output().expect("spawn ruby");
+/// The program's output on CRuby, or None (reported as a missing
+/// prerequisite) when no `ruby` is on PATH. A run that fails still fails.
+fn cruby(source: &str) -> Option<String> {
+    let Ok(out) = std::process::Command::new("ruby").args(["-e", source]).output() else {
+        prerequisite::missing("ruby is not on PATH");
+        return None;
+    };
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[test]
@@ -398,9 +406,10 @@ fn a_name_built_from_a_reduce_blocks_literal_list_rewrites_to_case_dispatch() {
         assert!(!out.contains("public_send(\"#{") && !out.contains("public_send(:\"#{"), "{iterator}: the built name survived:\n{out}");
         assert!(diags.is_empty(), "{iterator}: grounded sites must not ledger residue: {diags:?}");
         // The emitted module answers as the source does, in the same order, stopping at the first reader that answers.
-        let want = cruby(&format!("{source}{REDUCE_HOST}"));
+        let Some(want) = cruby(&format!("{source}{REDUCE_HOST}")) else { return };
         assert_eq!(want, ":r [:ready]\n:c [:ready, :claimed]\nNoMethodError failed_execution [:ready, :claimed]\n");
-        assert_eq!(cruby(&format!("{out}\n{REDUCE_HOST}")), want, "{iterator}:\n{out}");
+        let Some(got) = cruby(&format!("{out}\n{REDUCE_HOST}")) else { return };
+        assert_eq!(got, want, "{iterator}:\n{out}");
     }
 }
 
@@ -435,8 +444,9 @@ end
 }
 
 /// Without a finite proof the name stays built, and the site joins the
-/// residue ledger: a list that is not a literal, or an element parameter
-/// the block rebinds or changes in place.
+/// residue ledger: a list that is not a literal, an element parameter
+/// the block rebinds or changes in place, or one an inner block's own
+/// parameter shadows.
 #[test]
 fn a_built_name_without_a_finite_proof_stays_dynamic() {
     for (label, body, call) in [
@@ -458,6 +468,16 @@ fn a_built_name_without_a_finite_proof_stays_dynamic() {
         (
             "an element String changed in place",
             "def execution\n    %w[ ready claimed ].reduce(nil) do |acc, status|\n      status << \"x\"\n      acc || public_send(\"#{status}_execution\")\n    end\n  end",
+            "public_send(\"#{status}_execution\")",
+        ),
+        (
+            "a rest parameter of the same name in an inner element block",
+            "def execution\n    %w[ ready claimed ].each do |status|\n      [[1]].each { |value, *status| public_send(\"#{status}_execution\") }\n    end\n  end",
+            "public_send(\"#{status}_execution\")",
+        ),
+        (
+            "a rest parameter of the same name in an inner block that binds no element",
+            "def execution\n    %w[ ready claimed ].each do |status|\n      tap { |value, *status| public_send(\"#{status}_execution\") }\n    end\n  end",
             "public_send(\"#{status}_execution\")",
         ),
         (

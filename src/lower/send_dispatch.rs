@@ -783,6 +783,22 @@ struct IterBinding<'a> {
     in_place: bool,
 }
 
+/// A block parameter of any kind named `name` (positional, optional,
+/// keyword, `*rest` or `&block`) shadows an outer binding of it: inside
+/// the block the name holds the block's own value.
+fn block_binds(
+    params: &[Symbol],
+    extra_params: &[crate::dialect::Param],
+    rest_param: &Option<Symbol>,
+    block_param: &Option<Symbol>,
+    name: &Symbol,
+) -> bool {
+    params.contains(name)
+        || extra_params.iter().any(|p| &p.name == name)
+        || rest_param.as_ref() == Some(name)
+        || block_param.as_ref() == Some(name)
+}
+
 fn rewrite(
     e: &mut Expr,
     var_sets: &HashMap<Symbol, Vec<Expr>>,
@@ -810,14 +826,14 @@ fn rewrite(
                 ExprNode::Var { name, .. } => var_sets.get(name).cloned(),
                 _ => None,
             };
-            if let (Some(elems), ExprNode::Lambda { params, extra_params, body, .. }) =
+            if let (Some(elems), ExprNode::Lambda { params, extra_params, rest_param, block_param, body, .. }) =
                 (elems, &mut *block.node)
             {
                 if params.len() == index + 1 && extra_params.is_empty() {
                     let param = params[index].clone();
                     let mut inner: Vec<IterBinding<'_>> = Vec::new();
                     for b in bindings {
-                        if !params.contains(b.name) {
+                        if !block_binds(params, extra_params, rest_param, block_param, b.name) {
                             inner.push(IterBinding { name: b.name, elems: b.elems, in_place: b.in_place });
                         }
                     }
@@ -837,10 +853,10 @@ fn rewrite(
             }
         }
     }
-    if let ExprNode::Lambda { extra_params, params, body, .. } = &mut *e.node {
+    if let ExprNode::Lambda { extra_params, params, rest_param, block_param, body, .. } = &mut *e.node {
         let survivors: Vec<IterBinding<'_>> = bindings
             .iter()
-            .filter(|b| !params.contains(b.name) && !extra_params.iter().any(|p| &p.name == b.name))
+            .filter(|b| !block_binds(params, extra_params, rest_param, block_param, b.name))
             .map(|b| IterBinding { name: b.name, elems: b.elems, in_place: b.in_place })
             .collect();
         rewrite(body, var_sets, providers, origins, &survivors, registry, diags);
