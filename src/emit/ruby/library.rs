@@ -6368,7 +6368,16 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             // `to_s`. campfire's own test writes `user_sidebar_url(:me)`
             // against a `scope defaults: { user_id: "me" }` segment,
             // and that segment is declared `String` after its default.
-            if wants_str_here {
+            // An optional segment (`/media_proxy/:id/(*any)`, `String |
+            // nil`) the same: a Symbol is never nil.
+            let wants_str_or_nil_here = matches!(
+                declared.as_ref().and_then(|tys| tys.get(idx)),
+                Some(crate::ty::Ty::Union { variants })
+                    if variants.len() == 2
+                        && variants.contains(&crate::ty::Ty::Str)
+                        && variants.contains(&crate::ty::Ty::Nil)
+            );
+            if wants_str_here || wants_str_or_nil_here {
                 if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
                     let mut lit = Expr::new(
                         arg.span,
@@ -6394,30 +6403,44 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             // whatever the schema says (a new record's key, a reader the
             // model overrides), so the argument is bound once and only a
             // value that isn't nil is converted.
-            let wants_opt_str_here = matches!(
-                declared.as_ref().and_then(|tys| tys.get(idx)),
-                Some(crate::ty::Ty::Union { variants })
-                    if variants.len() == 2
-                        && variants.contains(&crate::ty::Ty::Str)
-                        && variants.contains(&crate::ty::Ty::Nil)
-            );
             // `Integer | nil` too (`flag ? n : nil`): the binding keeps the nil.
             let int_or_nil = matches!(&arg.ty, Some(crate::ty::Ty::Union { variants })
                 if variants.len() == 2
                     && variants.contains(&crate::ty::Ty::Int)
                     && variants.contains(&crate::ty::Ty::Nil));
-            if wants_opt_str_here
-                && (matches!(arg.ty, Some(crate::ty::Ty::Int)) || int_or_nil || is_integer_column_read(arg, sig))
+            // `Symbol | nil` (`flag ? :thumb : nil`) the same way: the
+            // Symbol is its String, the nil drops the segment (CodeRabbit
+            // on #2071). `Symbol | String | nil` and `Symbol | Integer | nil`
+            // too: a String's `to_s` is itself, an Integer's is its
+            // `to_param`.
+            let sym_union = |nil: bool| {
+                matches!(&arg.ty, Some(crate::ty::Ty::Union { variants })
+                    if variants.contains(&crate::ty::Ty::Sym)
+                        && variants.contains(&crate::ty::Ty::Nil) == nil
+                        && variants.iter().all(|v| matches!(v, crate::ty::Ty::Sym | crate::ty::Ty::Str | crate::ty::Ty::Int | crate::ty::Ty::Nil)))
+            };
+            let sym_or_nil = sym_union(true);
+            if wants_str_or_nil_here
+                && (matches!(arg.ty, Some(crate::ty::Ty::Int))
+                    || int_or_nil
+                    || sym_or_nil
+                    || is_integer_column_read(arg, sig))
             {
                 let value = std::mem::replace(arg, Expr::new(arg.span, ExprNode::Seq { exprs: vec![] }));
                 *arg = to_s_keeping_nil(value, sig);
                 continue;
             }
-            if wants_str_here
+            // A Symbol-typed value in an optional segment (`style =
+            // :thumb; media_proxy_path(id, style)`) is never nil, so it
+            // is its `to_s` there as well (CodeRabbit on #2071), as is a
+            // `Symbol | String` or `Symbol | Integer` one (`flag ? :thumb :
+            // "small"`).
+            if (wants_str_here
                 && (is_bare_id_read(arg)
                     || is_symbol_arg(arg)
                     || matches!(arg.ty, Some(crate::ty::Ty::Int))
-                    || is_integer_column_read(arg, sig))
+                    || is_integer_column_read(arg, sig)))
+                || (wants_str_or_nil_here && (is_symbol_arg(arg) || sym_union(false)))
             {
                 let span = arg.span;
                 let inner =
@@ -8603,6 +8626,19 @@ fn emit_library_class_decl_inner(
         if !requires.contains(&rel) {
             requires.push(rel);
         }
+        // So is every segment between the runtime's and this one (rack-protection's `Rack::Protection` around
+        // `class Rack::Protection::Base`): the compound header looks it up too.
+        for end in 2..outer_segments.len() {
+            let path: Vec<String> = outer_segments[..end].iter().map(|s| s.to_string()).collect();
+            let Some(inner) = require_path_for_body_const(&path, app, classes, "") else { continue };
+            if inner == self_anchor || inner.starts_with("runtime/") || inner.starts_with(&format!("{self_anchor}/")) {
+                continue;
+            }
+            let rel = relpath(&out_dir, &inner);
+            if !requires.contains(&rel) {
+                requires.push(rel);
+            }
+        }
     }
     // `include`d modules must be LOADED before the `include` executes at
     // class-definition time — unlike body const-refs (request-time), so we
@@ -9233,7 +9269,7 @@ fn emit_library_class_decl_inner(
         if render_conditional(s, m) {
             return;
         }
-        if data_block {
+        if lc.data_define().is_some_and(|(_, span)| m.name_span.file == span.file && m.name_span.start >= span.start && m.name_span.end <= span.end) {
             let mut m = m.clone();
             m.body = top_level(&m.body);
             for param in m.params.iter_mut().chain(m.block_param.iter_mut()) {
@@ -11345,7 +11381,9 @@ fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
     };
     for model in &app.models {
         let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
-        let Some(init) = lc.methods.iter_mut().find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize") else { continue };
+        // Not `initialize` alone: `update(attrs)` reads the same Symbol keys (Devise's `update_with_password(params)`).
+        // Only the generated `update`: one the model writes takes its arguments as it reads them.
+        for init in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance && (m.name.as_str() == "initialize" || (m.name.as_str() == "update" && m.name_span.is_synthetic()))) {
         if init.params.first().is_none_or(|p| p.name.as_str() != "attrs") {
             continue;
         }
@@ -11374,6 +11412,7 @@ fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
             }
             other => sp_expr(ExprNode::Seq { exprs: vec![guarded, Expr::new(body.span, other)] }),
         };
+        }
     }
 }
 
