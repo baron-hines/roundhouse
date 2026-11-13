@@ -270,13 +270,20 @@ pub(super) const FRAMEWORK_ROOTS: &[&str] = &[
 /// Bundler loads the gem before Rails runs the initializer, so the class
 /// holds both, and a method both define is the initializer's. The emit
 /// writes the openings into one file, the gem's first.
+///
+/// A `Const.class_eval do … end` of `def`s on such a name
+/// (`library_class::class_eval_openings`) is the same opening and is kept
+/// the same way, as a module when the gem declares one. Its statement is
+/// returned, so the initializer ledger stops reporting it as having no
+/// effect; one on any other name is left on the ledger.
 fn keep_initializer_defined(
     app: &mut App,
     dir: &Path,
     sources: &[crate::span::SourceFile],
     gem_mounts: &[PathBuf],
     candidates: Vec<LibraryClass>,
-) {
+    class_evals: Vec<((String, u32), LibraryClass)>,
+) -> Vec<(String, u32)> {
     const CORE: &[&str] = &[
         "Object", "BasicObject", "Kernel", "Module", "Class", "Comparable",
         "Enumerable", "Integer", "Float", "Numeric", "String", "Symbol",
@@ -313,11 +320,19 @@ fn keep_initializer_defined(
     let from_gem = |lc: &LibraryClass| {
         opening_file(lc, sources).is_some_and(|file| gem_mounts.iter().any(|mount| Path::new(file).starts_with(mount)))
     };
-    let gem_declared: HashSet<String> =
-        app.library_classes.iter().filter(|c| from_gem(c)).map(|c| c.name.0.as_str().to_string()).collect();
+    let gem_declared: HashMap<String, bool> =
+        app.library_classes.iter().filter(|c| from_gem(c)).map(|c| (c.name.0.as_str().to_string(), c.is_module)).collect();
+    let mut taken = Vec::new();
+    for (statement, mut lc) in class_evals {
+        if let Some(&is_module) = gem_declared.get(lc.name.0.as_str()) {
+            lc.is_module = is_module;
+            app.library_classes.push(lc);
+            taken.push(statement);
+        }
+    }
     for lc in candidates {
         let name = lc.name.0.as_str().to_string();
-        if gem_declared.contains(&name) {
+        if gem_declared.contains_key(&name) {
             app.library_classes.push(lc);
             continue;
         }
@@ -333,6 +348,7 @@ fn keep_initializer_defined(
         }
         app.library_classes.push(lc);
     }
+    taken
 }
 
 /// The file an opening was read from: the first of its spans that points
@@ -2098,6 +2114,10 @@ end
     // kept or dropped after every app file is read (see
     // `keep_initializer_defined`).
     let mut initializer_defined: Vec<LibraryClass> = Vec::new();
+    // An initializer's top-level `Const.class_eval do … end` of `def`s,
+    // by the statement it is (path, start): kept or left on the ledger
+    // with `initializer_defined` (see `keep_initializer_defined`).
+    let mut class_eval_openings: Vec<((String, u32), LibraryClass)> = Vec::new();
     let mut rate_limit_stores = Vec::new();
     // `ActionController::Base.prepend_view_path …`, applied with the class
     // bodies' own once every class is read (see `view_paths`).
@@ -2154,6 +2174,10 @@ end
                             initializer_defined.push(lc);
                         }
                     }
+                }
+                if let Ok(openings) = super::library_class::class_eval_openings(&bytes, &path_str) {
+                    let relative = super::sources::relative_path(&path_str);
+                    class_eval_openings.extend(openings.into_iter().map(|(start, lc)| ((relative.clone(), start), lc)));
                 }
                 rate_limit_stores.extend(super::rate_limit::initializer_stores(&bytes, &path_str));
                 app.module_mixins.extend(mixins);
@@ -3025,7 +3049,7 @@ end
         enum_input_files.iter().chain(boot_files.iter()).cloned().collect();
     enum_constants.validate_consumed_sources(&app, &sources, &observed)?;
     let gem_mounts: Vec<PathBuf> = source_gems.iter().map(|gem| gem.mount.clone()).collect();
-    keep_initializer_defined(&mut app, dir, &sources, &gem_mounts, initializer_defined);
+    let class_evals_taken = keep_initializer_defined(&mut app, dir, &sources, &gem_mounts, initializer_defined, class_eval_openings);
     // `self.queue_adapter =` on ApplicationJob (see `App::queue_adapter`).
     apply_application_job_queue_adapter(&mut app);
     let const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
@@ -3059,6 +3083,7 @@ end
     let gem_lock = app.gem_lock.clone();
     let mut boot_taken = super::boot_program::build(vfs, dir, &path_gems, &mut app, gem_lock.as_ref(), &app_namespaces, &rate_limit_store_values)?;
     boot_taken.extend(super::engine_config::carry(&mut app, dir));
+    boot_taken.extend(class_evals_taken);
     boot_taken.extend(stacked_application_uses.iter().map(|start| ("config/application.rb".to_string(), *start)));
     super::boot_program::apply_call_sites(&mut app);
     super::initializer_ledger::record(

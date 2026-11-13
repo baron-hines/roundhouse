@@ -169,6 +169,65 @@ pub fn ingest_library_classes(
     ingest_library_classes_impl(source, file, Walk::All)
 }
 
+/// The top-level `Const.class_eval do … end` (or `module_eval`) blocks of
+/// a file that hold nothing but `def`s, each as an opening of `Const` with
+/// the statement's start offset. In the block `self` is `Const`, so a `def`
+/// there defines what the same `def` in a `class Const` body would. A
+/// block with parameters, arguments or any other statement is not taken:
+/// a constant written there belongs to the block's lexical scope, not to
+/// `Const`, and a local it reads is the enclosing scope's. The opening is
+/// read as a class's (`is_module: false`); whoever keeps it gives it the
+/// kind of the declaration it reopens.
+pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<(u32, LibraryClass)>> {
+    let result = super::prism::parse_silent(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for node in program.statements().body().iter() {
+        let Some(call) = node.as_call_node() else { continue };
+        if !matches!(call.name().as_slice(), b"class_eval" | b"module_eval") || call.arguments().is_some() {
+            continue;
+        }
+        let Some(path) = call.receiver().and_then(|receiver| constant_path_of(&receiver)) else { continue };
+        let Some(block) = call.block().and_then(|block| block.as_block_node()) else { continue };
+        if block.parameters().is_some() {
+            continue;
+        }
+        let Some(statements) = block.body().and_then(|body| body.as_statements_node()) else { continue };
+        if !statements.body().iter().all(|statement| statement.as_def_node().is_some()) {
+            continue;
+        }
+        let owner = ClassId(Symbol::from(path.join("::")));
+        let DeclBody {
+            includes,
+            include_spans,
+            methods,
+            constants,
+            unknown_calls,
+            class_initializers,
+            class_attributes: _,
+            conditional_definitions,
+        } = walk_decl_body(block.body(), &owner, file, DeclBodyMode::Instance)
+            .map_err(|err| super::error_site::at(err, &node))?;
+        out.push((node.location().start_offset() as u32, LibraryClass {
+            name: owner,
+            is_module: false,
+            parent: None,
+            parent_span: Span::synthetic(),
+            includes,
+            include_spans,
+            methods,
+            nullable_columns: Vec::new(),
+            origin: None,
+            constants,
+            conditional_definitions,
+            unknown_calls,
+            class_ivar_initializers: class_initializers,
+        }));
+    }
+    Ok(out)
+}
+
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads
 /// (`app/models`, the autoloaded support dirs): a file that declares no
 /// class or module but writes file-level constants still defines them,
