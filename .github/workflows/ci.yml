@@ -1826,7 +1826,7 @@ jobs:
     # hardens the CORE lane (spinel-advisory=false).
     needs: [generate-fixture, spinel-build, spinel-toolchain-build, spinel-toolchain-plan, plan]
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-toolchain') && needs.generate-fixture.result == 'success' && needs.spinel-build.outputs.artifact-id != '' && needs.spinel-toolchain-build.outputs.artifact-id != '' && needs.spinel-toolchain-plan.outputs.artifact-id != '' }}
-    # Four shards, balanced by `ci-plan.py toolchain-shard` on recorded
+    # Five shards, balanced by `ci-plan.py toolchain-shard` on recorded
     # seconds: a new test lands on the lightest shard instead of growing a
     # hand-kept catch-all one (two such shards reached 25 of 25 minutes).
     # Not every-third-by-name: three tests take two to three times the rest,
