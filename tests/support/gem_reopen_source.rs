@@ -48,6 +48,31 @@ pub const LOCAL_COMPACT: &str = r##"class Shelf::Box
 end
 "##;
 
+/// [`LOCAL`] as a `class_eval` block in an initializer: `self` in the
+/// block is the class, so `def self.…` defines its class methods.
+pub const CLASS_EVAL: &str = r##"Shelf::Box.class_eval do
+  def self.local_tag
+    "local"
+  end
+
+  def self.label
+    "app box"
+  end
+end
+"##;
+
+/// A `class_eval` block that also writes a constant. Ruby puts `LIMIT` in
+/// the block's lexical scope (the top level), not in `Shelf::Box`, so the
+/// block is not the same as a reopen and is left as it is.
+pub const CLASS_EVAL_LIMIT: &str = r##"Shelf::Box.class_eval do
+  LIMIT = 3
+
+  def self.local_tag
+    "local"
+  end
+end
+"##;
+
 /// Adds only a constant and an `include`, no method.
 pub const EXTRAS: &str = r##"module Shelf
   class Box
@@ -145,5 +170,21 @@ pub fn initializer_app() -> emit_and_run::Overlay {
 pub fn compact_initializer_app() -> emit_and_run::Overlay {
     with_gem()
         .write("config/initializers/shelf_box.rb", LOCAL_COMPACT)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// The reopen as a `class_eval` block in an initializer (#2093's second form).
+#[allow(dead_code)]
+pub fn class_eval_app() -> emit_and_run::Overlay {
+    with_gem()
+        .write("config/initializers/shelf_box.rb", CLASS_EVAL)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// [`class_eval_app`] with a block that also writes a constant.
+#[allow(dead_code)]
+pub fn class_eval_limit_app() -> emit_and_run::Overlay {
+    with_gem()
+        .write("config/initializers/shelf_box.rb", CLASS_EVAL_LIMIT)
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }

@@ -492,6 +492,13 @@ impl Overlay {
         diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
     }
 
+    /// Every diagnostic ingest reports for the overlaid tree, warnings included.
+    #[allow(dead_code)]
+    pub fn ingest_diagnostics(self) -> Vec<Diagnostic> {
+        let (_scratch, source) = self.materialize();
+        roundhouse::ingest::prism::scope(|| ingest_app(&source)).1
+    }
+
     fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         self.emit_app_tree_with_lowering(target, true)
     }

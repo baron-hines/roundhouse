@@ -73,3 +73,46 @@ fn the_spinel_emit_keeps_a_gem_class_reopened_in_an_initializer() {
         assert!(kind < local && gem_label < app_label, "{source}");
     }
 }
+
+/// The `class_eval` form, run on the Ruby family with the gem listed.
+#[test]
+fn a_gem_class_class_evaled_in_an_initializer_answers_the_gems_methods_and_the_apps() {
+    contract::listed(contract::class_eval_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// On Spinel a `class_eval` block of `def`s on a gem's class is one more
+/// opening of it, after the gem's, and the initializer statement is no
+/// longer reported as having no effect.
+#[test]
+fn the_spinel_emit_keeps_a_gem_class_class_evaled_in_an_initializer() {
+    let unconsumed = |app: super::emit_and_run::Overlay| -> Vec<String> {
+        app.ingest_diagnostics()
+            .into_iter()
+            .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+            .map(|d| d.message)
+            .collect()
+    };
+    let source = shelf_box(contract::class_eval_app());
+    let at = |needle: &str| source.find(needle).unwrap_or_else(|| panic!("{needle:?} in\n{source}"));
+    let (kind, local) = (at("def self.kind"), at("def self.local_tag"));
+    let gem_label = at("\"shelf box\"");
+    let app_label = at("\"app box\"");
+    assert!(kind < local && gem_label < app_label, "{source}");
+    let warned = unconsumed(contract::class_eval_app());
+    assert!(!warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block with any statement besides `def`s is not taken: it stays
+/// reported, and the emitted class is the gem's alone.
+#[test]
+fn a_class_eval_block_that_writes_a_constant_is_left_reported() {
+    let source = shelf_box(contract::class_eval_limit_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_limit_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
