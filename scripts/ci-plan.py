@@ -239,7 +239,7 @@ SPINEL_TOOLCHAIN_SECONDS = {
     "finite_concern_class_configuration_runs_natively": 133,
 }
 SPINEL_TOOLCHAIN_DEFAULT_SECONDS = 80
-SPINEL_TOOLCHAIN_SHARDS = 4
+SPINEL_TOOLCHAIN_SHARDS = 5
 SPINEL_TOOLCHAIN_THREADS = 4
 # tiny_api's gate runs alone after the suite on the last shard, so its seconds count once per test thread.
 SPINEL_TOOLCHAIN_TAIL = "tiny_api"

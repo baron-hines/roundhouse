@@ -1773,7 +1773,7 @@ jobs:
   # closes. Running it (vs `if: false`) keeps the model-suite progress
   # visible and catches regressions in the compile path.
   #
-  # Compile once (this producer), then four shards only restore binaries
+  # Compile once (this producer), then the shards only restore binaries
   # and run — same path contract as unit-build (CARGO_BIN_EXE_roundhouse
   # and the test binary path are compile-time absolute).
   spinel-toolchain-build:
@@ -1826,17 +1826,18 @@ jobs:
     # hand-kept catch-all one (two such shards reached 25 of 25 minutes).
     # Not every-third-by-name: three tests take two to three times the rest,
     # and two of them shared the slowest shard. Each shard reports its own
-    # output key (ci-plan.py requires all four), since a matrix's shared
+    # output key (ci-plan.py requires all five), since a matrix's shared
     # output would let one shard's success hide another's failure.
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4]
     outputs:
       shard-0: ${{ steps.result.outputs.shard-0 }}
       shard-1: ${{ steps.result.outputs.shard-1 }}
       shard-2: ${{ steps.result.outputs.shard-2 }}
       shard-3: ${{ steps.result.outputs.shard-3 }}
+      shard-4: ${{ steps.result.outputs.shard-4 }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
