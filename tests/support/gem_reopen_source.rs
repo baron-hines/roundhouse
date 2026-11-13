@@ -120,12 +120,17 @@ puts "extras passed"
 /// locked, but not listed in `source_gems`: the app's naming of
 /// `Shelf::Box` is what brings it in.
 fn with_gem() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF)
+}
+
+/// [`with_gem`] with `lib/shelf.rb` holding `lib`.
+fn with_gem_lib(lib: &str) -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .edit("Gemfile.lock", "    debug (1.11.1)\n", "    debug (1.11.1)\n    shelf (1.0.0)\n")
         .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  shelf\n")
         .edit("Gemfile", "gem \"rails\", \"~> 8.1.4\"\n", "gem \"rails\", \"~> 8.1.4\"\ngem \"shelf\"\n")
         .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
-        .write(&format!("{GEM_DIR}/lib/shelf.rb"), SHELF)
+        .write(&format!("{GEM_DIR}/lib/shelf.rb"), lib)
 }
 
 /// The same app with the gem listed in `source_gems`, which compiles it
@@ -187,4 +192,92 @@ pub fn class_eval_limit_app() -> emit_and_run::Overlay {
     with_gem()
         .write("config/initializers/shelf_box.rb", CLASS_EVAL_LIMIT)
         .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A gem module a controller includes.
+pub const SHELF_TAGGING: &str = r##"module Shelf
+  module Tagging
+    def original
+      "gem"
+    end
+
+    def label
+      "gem label"
+    end
+  end
+end
+"##;
+
+/// An initializer's reopen of it: a method of its own, and `label` redefined.
+pub const TAGGING_REOPEN: &str = r##"module Shelf
+  module Tagging
+    def local
+      "local"
+    end
+
+    def label
+      "app label"
+    end
+  end
+end
+"##;
+
+pub const SHELVES_CONTROLLER: &str = r##"class ShelvesController < ApplicationController
+  include Shelf::Tagging
+
+  def show
+    render plain: [original, local, label].join(" / ")
+  end
+end
+"##;
+
+/// The controller including the gem module the initializer reopens.
+/// Ruby answers `"gem / local / app label"` for `show`.
+#[allow(dead_code)]
+pub fn included_module_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_TAGGING)
+        .write("config/initializers/shelf_tagging.rb", TAGGING_REOPEN)
+        .write("app/controllers/shelves_controller.rb", SHELVES_CONTROLLER)
+}
+
+/// [`included_module_app`] with the reopen in `lib/`, required by an
+/// initializer (#2122's form). Ruby answers the same.
+#[allow(dead_code)]
+pub fn included_module_lib_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_TAGGING)
+        .write("lib/shelf_tagging.rb", TAGGING_REOPEN)
+        .write("config/initializers/shelf_tagging.rb", "require Rails.root.join(\"lib/shelf_tagging\").to_s\n")
+        .write("app/controllers/shelves_controller.rb", SHELVES_CONTROLLER)
+}
+
+/// A gem module with an empty body.
+pub const SHELF_HOOKS: &str = r##"module Shelf
+  module Hooks
+  end
+end
+"##;
+
+pub const HOOKS_REOPEN: &str = r##"module Shelf
+  module Hooks
+    def self.hook
+      "hooked"
+    end
+  end
+end
+"##;
+
+pub const HOOK_PROBE: &str = r##"class HookProbe
+  def self.describe
+    Shelf::Hooks.hook
+  end
+end
+"##;
+
+/// An initializer adding a method to a module the gem declares empty.
+/// Ruby answers `"hooked"` for `HookProbe.describe`.
+#[allow(dead_code)]
+pub fn empty_module_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_HOOKS)
+        .write("config/initializers/shelf_hooks.rb", HOOKS_REOPEN)
+        .write("app/models/hook_probe.rb", HOOK_PROBE)
 }

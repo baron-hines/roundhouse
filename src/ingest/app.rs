@@ -351,15 +351,19 @@ fn keep_initializer_defined(
     taken
 }
 
-/// The file an opening was read from: the first of its spans that points
-/// at a source.
-fn opening_file<'s>(lc: &LibraryClass, sources: &'s [crate::span::SourceFile]) -> Option<&'s str> {
-    let span = std::iter::once(lc.parent_span)
+/// The first of an opening's spans that points at a source.
+fn opening_span(lc: &LibraryClass) -> Option<crate::span::Span> {
+    std::iter::once(lc.parent_span)
         .chain(lc.include_spans.iter().copied())
         .chain(lc.constants.iter().map(|(_, v)| v.span))
         .chain(lc.methods.iter().map(|m| m.body.span))
         .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())?;
+        .find(|s| !s.is_synthetic())
+}
+
+/// The file an opening was read from.
+fn opening_file<'s>(lc: &LibraryClass, sources: &'s [crate::span::SourceFile]) -> Option<&'s str> {
+    let span = opening_span(lc)?;
     sources.get((span.file.0 as usize).checked_sub(1)?).map(|f| f.path.as_str())
 }
 
@@ -5114,16 +5118,26 @@ fn splice_concerns_into_controllers(app: &mut App) {
         })
         .filter(|(_, calls)| !calls.is_empty())
         .collect();
-    for lc in &app.library_classes {
-        module_methods.insert(
-            lc.name.clone(),
-            lc.methods
-                .iter()
-                .filter(|m| matches!(m.receiver, MethodReceiver::Instance))
-                .collect(),
-        );
-        module_constants
-            .insert(lc.name.clone(), lc.constants.iter().map(|(n, _)| n.clone()).collect());
+    // A module opened more than once (a source gem's, reopened by the
+    // app in `lib/` or an initializer) has every opening's methods, read
+    // in load order: Bundler loads the gem before the app's code runs, so
+    // a gem's opening comes first. A method a later opening defines again
+    // replaces the earlier one, as a reopen does in Ruby; the splice below
+    // takes the first of a name.
+    let from_source_gem = |lc: &LibraryClass| {
+        opening_span(lc)
+            .and_then(|span| super::sources::path_of(span.file))
+            .is_some_and(|path| super::absence_guards::is_source_gem_path(&path))
+    };
+    let mut openings: Vec<&LibraryClass> = app.library_classes.iter().collect();
+    openings.sort_by_key(|lc| !from_source_gem(lc));
+    for lc in openings {
+        let opened: Vec<&crate::dialect::MethodDef> =
+            lc.methods.iter().filter(|m| matches!(m.receiver, MethodReceiver::Instance)).collect();
+        let methods = module_methods.entry(lc.name.clone()).or_default();
+        methods.retain(|m| !opened.iter().any(|o| o.name == m.name));
+        methods.extend(opened);
+        module_constants.entry(lc.name.clone()).or_default().extend(lc.constants.iter().map(|(n, _)| n.clone()));
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
     }
     let filter_edges = filter_dependency_edges(app, &module_includes);

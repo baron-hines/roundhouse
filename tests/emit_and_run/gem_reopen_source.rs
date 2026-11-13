@@ -116,3 +116,28 @@ fn a_class_eval_block_that_writes_a_constant_is_left_reported() {
         .collect();
     assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
 }
+
+/// A controller including a gem module the initializer reopens gets both
+/// openings' methods, and the reopen's `label`, as in Ruby
+/// (`"gem / local / app label"`): with the reopen written in the
+/// initializer, and in `lib/` (#2122's form).
+#[test]
+fn a_controller_including_a_reopened_gem_module_gets_both_openings() {
+    for app in [contract::included_module_app(), contract::included_module_lib_app()] {
+        let (emitted, _errors) = app.emit(BuildTarget::Spinel);
+        let source = std::fs::read_to_string(emitted.join("app/controllers/shelves_controller.rb")).expect("shelves_controller.rb");
+        for needle in ["def original", "def local", "\"app label\""] {
+            assert!(source.contains(needle), "{needle:?} in\n{source}");
+        }
+        assert!(!source.contains("\"gem label\""), "{source}");
+    }
+}
+
+/// A gem module whose own opening is empty is still the gem's, so the
+/// initializer's opening is kept.
+#[test]
+fn a_gem_module_declared_empty_keeps_the_initializers_methods() {
+    let source = std::fs::read_to_string(contract::empty_module_app().emit(BuildTarget::Spinel).0.join("app/models/shelf/hooks.rb"))
+        .expect("app/models/shelf/hooks.rb");
+    assert!(source.contains("def self.hook"), "{source}");
+}
