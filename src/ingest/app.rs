@@ -1514,6 +1514,11 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     app.active_job_retry_jitter = read_active_job_retry_jitter(vfs, dir);
     // The ActiveJob queue adapter (see `App::queue_adapter`).
     app.queue_adapter = read_queue_adapter(vfs, dir);
+    // Retain recurring declarations for payload refusal locations.
+    let recurring = dir.join("config/recurring.yml");
+    if let Ok(text) = vfs.read_to_string(&recurring) {
+        super::sources::register(&recurring.display().to_string(), &text);
+    }
     // Where Sidekiq pushes (see `App::sidekiq_redis`).
     let (sidekiq_redis, sidekiq_redis_refused) = read_sidekiq_redis(vfs, dir);
     app.sidekiq_redis = sidekiq_redis;
@@ -3260,7 +3265,7 @@ end
     super::metal_actions::synthesize(&mut app);
     super::absence_guards::raise_undefined_capitalized_calls(&mut app);
     // Not asked at `absence_guards::mark`: by then a source gem's methods no longer resolve their file.
-    let source_gem_classes = super::absence_guards::source_gem_classes(&app);
+    let source_gem_code = super::absence_guards::source_gem_code(&app);
     super::column_accessors::rewrite_super(&mut app);
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
@@ -3445,7 +3450,19 @@ end
     splice_concern_to_param_into_includers(&mut app);
     super::job_class_lookup::rewrite(&mut app);
     super::uncalled_definers::mark(&mut app);
-    super::absence_guards::mark(&mut app, &source_gem_classes);
+    // A feature an installed locked gem ships as `lib/<feature>.rb`, whatever the gem's name or namespace.
+    let locked_gem_libs: Vec<PathBuf> = {
+        let roots = crate::i18n::gems::gem_roots(vfs, dir);
+        app.gem_lock
+            .iter()
+            .flat_map(|lock| lock.specs.iter())
+            .filter_map(|(name, version)| crate::i18n::gems::installed_gem(vfs, &roots, name, version))
+            .chain(path_gems.iter().cloned())
+            .map(|gem| gem.join("lib"))
+            .collect()
+    };
+    let shipped = |feature: &str| locked_gem_libs.iter().any(|lib| vfs.exists(&lib.join(format!("{feature}.rb"))));
+    super::absence_guards::mark(&mut app, &source_gem_code, &shipped);
     // After every pass that changes a controller's methods, the concern
     // splice and the class-body macros above all: the lowering clones
     // from the controller they leave.
@@ -13681,8 +13698,8 @@ fn effective_queue_adapter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<Strin
 /// job that inherits it, so it overrides the config files' setting, the
 /// last assignment winning, and a value that isn't a literal leaves the
 /// adapter unknown, as in `read_queue_adapter`. Another job class's own
-/// setting is not honored yet: its jobs follow the app's adapter, with a
-/// warning.
+/// durable setting is not honored yet: its jobs follow the app's adapter,
+/// with a warning. The class-side lowering honors literal inline/test adapters.
 fn apply_application_job_queue_adapter(app: &mut App) {
     let mut set: Option<Option<String>> = None;
     for lc in &app.library_classes {
@@ -13691,9 +13708,22 @@ fn apply_application_job_queue_adapter(app: &mut App) {
             let Some(value) = job_queue_adapter(call) else { continue };
             if name == "ApplicationJob" {
                 set = Some(value);
-            } else {
+            } else if !matches!(value.as_deref(), Some("inline" | "test")) {
                 warn_sidekiq(format!(
                     "`self.queue_adapter =` in {name} is not honored yet (only ApplicationJob's is read); its jobs use the app's adapter"
+                ));
+            } else if let Some(heir) = app.library_classes.iter().find(|other| {
+                other.parent.as_ref().is_some_and(|p| p.0.as_str().trim_start_matches("::") == name)
+                    && !app.library_classes.iter().any(|same| {
+                        same.name == other.name && same.unknown_calls.iter().any(|c| job_queue_adapter(c).is_some())
+                    })
+            }) {
+                // The class-side lowering honors a literal inline/test
+                // adapter on the job that sets it, not on a subclass that
+                // inherits it: that subclass's jobs still use the app's.
+                warn_sidekiq(format!(
+                    "`self.queue_adapter =` in {name} is honored for {name} only; {} inherits it and its jobs use the app's adapter",
+                    heir.name.0.as_str()
                 ));
             }
         }

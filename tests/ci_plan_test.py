@@ -370,6 +370,21 @@ class Routing(unittest.TestCase):
             any("campfire" in job for job in plan["jobs"] if job not in ci.BASE)
         )
 
+    def test_solid_queue_durability_inputs_select_the_native_contract(self):
+        for path in [
+            "src/ingest/app.rs",
+            "src/lower/job_payload.rs",
+            "src/lower/job_class_side.rs",
+            "runtime/spinel/solid_queue_runner.rb",
+            "tests/support/solid_queue_worker.rs",
+            "tests/solid_queue_durability.rs",
+            "tests/solid_queue_durability/oracle.rb",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("solid_queue_durability", plan["spinel_tests"])
+                self.assertIn("unit", plan["jobs"])
+
     def test_solid_queue_schema_selection_keeps_its_ruby_execution_coverage(self):
         for path in [
             "src/ingest/app.rs",
@@ -1146,6 +1161,25 @@ class Routing(unittest.TestCase):
             with self.subTest(path=path):
                 plan = ci.select([path])
                 self.assertIn("schema_default_expressions", plan["spinel_tests"])
+                self.assertIn("spinel-framework", plan["jobs"])
+
+    def test_schema_keys_owns_declarations_and_consumers(self):
+        for path in [
+            "tests/schema_keys.rs", "tests/support/schema_keys_schema.rb", "tests/support/schema_keys_contract.rb",
+            "tests/support/schema_keys_implicit.rb", "tests/support/schema_keys_implicit_contract.rb",
+            "src/schema.rs", "src/ingest/schema.rs", "src/emit/shared/schema_sql.rs", "src/emit/roda.rs",
+            "src/ingest/sequel_model.rs", "src/analyze/graphql.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("schema_keys", plan["spinel_tests"])
+                self.assertIn("spinel-framework", plan["jobs"])
+
+    def test_schema_key_readers_select_the_native_contract(self):
+        for path in ["src/ingest/sequel_migration.rs", "src/ingest/structure_sql.rs", "src/ingest/roda_app.rs"]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("schema_keys", plan["spinel_tests"])
                 self.assertIn("spinel-framework", plan["jobs"])
 
     def test_jdbc_probes_select_the_existing_comparison_without_archives(self):

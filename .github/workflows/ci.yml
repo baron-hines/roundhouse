@@ -601,6 +601,8 @@ jobs:
           gem install --no-document --ignore-dependencies warden -v 1.2.9
           gem install --no-document --ignore-dependencies orm_adapter -v 0.5.0
           gem install --no-document --ignore-dependencies responders -v 3.1.1
+          # simple_form, compiled from source (tests/emit_and_run/simple_form.rs).
+          gem install --no-document --ignore-dependencies simple_form -v 5.4.1
           # OmniAuth for devise's :omniauthable, installed as the Ruby family loads it (tests/emit_and_run/devise.rs).
           gem install --no-document --ignore-dependencies omniauth -v 2.1.4
           gem install --no-document --ignore-dependencies hashie -v 5.1.0
@@ -1037,6 +1039,9 @@ jobs:
           name: real-blog-fixture
       - name: Extract fixture
         run: tar -xzf real-blog.tar.gz
+      - name: Install Solid Queue model sources for its durable-job contract
+        if: ${{ contains(matrix.tests, 'solid_queue_durability') }}
+        run: gem install --no-document --ignore-dependencies solid_queue -v "$(sed -n 's/^    solid_queue (\(.*\))$/\1/p' fixtures/real-blog/Gemfile.lock)"
       - uses: actions/download-artifact@v8
         with:
           name: spinel-dist
@@ -1849,9 +1854,9 @@ jobs:
       # Full validation compiles each inside the whole blog's boot instead.
       ROUNDHOUSE_SPINEL_SLIM: ${{ inputs.full && '0' || '1' }}
     steps:
-      # Not left to timeout-minutes: a job stopped there uploads no seconds, so the planner kept the shard as it was.
+      # Not left to timeout-minutes: a job stopped there uploads no seconds, so the planner kept the shard as it was. Not earlier than a minute before it: shards that used to pass near 24 minutes would fail.
       - name: Set this shard's deadline
-        run: echo "CI_SPINEL_DEADLINE=$(( $(date +%s) + 1380 ))" >> "$GITHUB_ENV"
+        run: echo "CI_SPINEL_DEADLINE=$(( $(date +%s) + 1440 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       # No setup-rust: the producer archive restores the test binaries.
       - uses: actions/download-artifact@v8

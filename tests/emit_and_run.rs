@@ -205,6 +205,10 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "emit_and_run/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_method_require.rs"]
+mod gem_method_require_contract;
+#[path = "emit_and_run/gem_method_require.rs"]
+mod gem_method_require;
 #[path = "support/block_arg_conditional.rs"]
 mod block_arg_conditional_contract;
 #[path = "emit_and_run/block_arg_conditional.rs"]
@@ -22154,6 +22158,10 @@ mod deprecation;
 mod loaded_begin;
 #[path = "emit_and_run/class_eval_definer_call.rs"]
 mod class_eval_definer_call;
+#[path = "emit_and_run/custom_form_builder.rs"]
+mod custom_form_builder;
+#[path = "emit_and_run/simple_form.rs"]
+mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
 mod classvar_block_initializers;
 #[path = "emit_and_run/model_mixin_macro.rs"]
