@@ -233,7 +233,7 @@ SPINEL_TEST_SECONDS = {
     ),
 }
 SPINEL_TEST_DEFAULT_SECONDS = 40
-SPINEL_FRAMEWORK_SHARDS = 4
+SPINEL_FRAMEWORK_SHARDS = 5
 # Not balanced by count: these three take two to three times a typical test (local run, 2026-10-17).
 SPINEL_TOOLCHAIN_SECONDS = {
     "real_blog_spinel_tests_pass": 265,
@@ -241,7 +241,7 @@ SPINEL_TOOLCHAIN_SECONDS = {
     "finite_concern_class_configuration_runs_natively": 133,
 }
 SPINEL_TOOLCHAIN_DEFAULT_SECONDS = 80
-SPINEL_TOOLCHAIN_SHARDS = 4
+SPINEL_TOOLCHAIN_SHARDS = 5
 SPINEL_TOOLCHAIN_THREADS = 4
 # tiny_api's gate runs alone after the suite on the last shard, so its seconds count once per test thread.
 SPINEL_TOOLCHAIN_TAIL = "tiny_api"
@@ -1190,6 +1190,7 @@ def run_timed(kind, name, command, charged=0):
         proc.wait()
         print(f"::error::{name} stopped at this shard's deadline")
         status = 124
+    charged = charged() if callable(charged) else charged
     # 124 is timeout(1) stopping the command: its seconds are still worth recording.
     record_timing(kind, name, time.monotonic() - start + charged, status == 0, status == 124)
     return status
@@ -1209,6 +1210,21 @@ def bundle_seconds():
     if not isinstance(data, dict):
         return {}
     return {name: seconds for name, seconds in data.items() if positive_seconds(seconds)}
+
+
+def suite_bundle_seconds(cases):
+    """The bundle seconds charged to the tests whose cases a suite left in `cases` (RH_SPINEL_BUNDLE_COLLECT).
+
+    Read once the suite has ended, not when it starts: it starts while the bundle still builds.
+    """
+    charged = bundle_seconds()
+    tests = set()
+    for path in Path(cases).glob("*.json"):
+        try:
+            tests.add(json.loads(path.read_text()).get("test"))
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            continue
+    return sum(charged.get(t, 0) for t in tests if isinstance(t, str))
 
 
 def run_tests(kind, tests, parallel, command):
@@ -1517,6 +1533,7 @@ def main():
     parser.add_argument("--kind", choices=SPINEL_TIMING_KINDS)
     parser.add_argument("--name")
     parser.add_argument("--charged", type=float, default=0)
+    parser.add_argument("--charge-cases")
     parser.add_argument("--parallel", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--previous")
     parser.add_argument("--records")
@@ -1533,7 +1550,8 @@ def main():
         return False
     if args.command == "timed":
         # The command's own status: the framework loop tells timeout(1)'s 124 from a failure.
-        return run_timed(args.kind, args.name, command, args.charged)
+        charged = (lambda: args.charged + suite_bundle_seconds(args.charge_cases)) if args.charge_cases else args.charged
+        return run_timed(args.kind, args.name, command, charged)
     if args.command == "run-tests":
         tests = [line.strip() for line in sys.stdin if line.strip()]
         return run_tests(args.kind, tests, args.parallel, command)

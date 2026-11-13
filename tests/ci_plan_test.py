@@ -1619,6 +1619,7 @@ class Results(unittest.TestCase):
                         "shard-1": "success",
                         "shard-2": "success",
                         "shard-3": "success",
+                        "shard-4": "success",
                     },
                 }
                 for j in plan["jobs"]
@@ -1726,11 +1727,11 @@ class Results(unittest.TestCase):
                     self.assertEqual(ci.check_results(plan, needs), ([], False))
 
     def test_each_spinel_toolchain_shard_must_actually_pass_for_completion(self):
-        # The suite is a four-shard matrix; each shard writes its own output
+        # The suite is a five-shard matrix; each shard writes its own output
         # key, so one shard's success cannot stand in for the other's.
         plan = ci.select([], spinel_lane=True)
         self.assertIn("spinel-toolchain", plan["jobs"])
-        for shard in ["shard-0", "shard-1", "shard-2", "shard-3"]:
+        for shard in ["shard-0", "shard-1", "shard-2", "shard-3", "shard-4"]:
             for status in ["failure", "cancelled", "", None]:
                 with self.subTest(shard=shard, status=status):
                     needs = self.needs(plan)
@@ -1743,8 +1744,8 @@ class Results(unittest.TestCase):
 
     def test_each_spinel_framework_shard_must_actually_pass_for_completion(self):
         plan = ci.select([], spinel_lane=True)
-        self.assertEqual(len(plan["spinel_framework_shards"]), 4)
-        for shard in ["shard-0", "shard-1", "shard-2", "shard-3"]:
+        self.assertEqual(len(plan["spinel_framework_shards"]), 5)
+        for shard in ["shard-0", "shard-1", "shard-2", "shard-3", "shard-4"]:
             for status in ["failure", "cancelled", "", None]:
                 with self.subTest(shard=shard, status=status):
                     needs = self.needs(plan)
@@ -1799,7 +1800,7 @@ class Results(unittest.TestCase):
             ci.SPINEL_TOOLCHAIN_SECONDS["real_blog_spinel_tests_pass"],
         )
         tests = [f"t{i:02}" for i in range(12)]
-        shards = [ci.spinel_toolchain_shard(tests, k, timings=timings) for k in range(4)]
+        shards = [ci.spinel_toolchain_shard(tests, k, timings=timings) for k in range(ci.SPINEL_TOOLCHAIN_SHARDS)]
         self.assertEqual(sorted(t for s in shards for t in s), tests)
         self.assertIn(["t00"], shards)
         alone = [s for s in ci.spinel_framework_shards(ci.SPINEL_TESTS, timings=timings) if "spinel_pg_db" in s["tests"]]
@@ -1823,7 +1824,8 @@ class Results(unittest.TestCase):
 
         def plan(recorded):
             timings = {"toolchain": {**heavy, **{t: recorded for t in bundled}}}
-            shards = [ci.spinel_toolchain_shard(tests, k, timings=timings) for k in range(4)]
+            # Not the live shard count: the half-of-bundled bound below is drawn for four shards beside these three heavy tests.
+            shards = [ci.spinel_toolchain_shard(tests, k, count=4, timings=timings) for k in range(4)]
             self.assertEqual(sorted(t for s in shards for t in s), tests)
             loads = [sum(true_cost[t] for t in s) for s in shards]
             loads[-1] += ci.SPINEL_TOOLCHAIN_TAIL_SECONDS * ci.SPINEL_TOOLCHAIN_THREADS
@@ -1878,6 +1880,23 @@ class Results(unittest.TestCase):
             self.assertIn("::error::late not started: past this shard's deadline", run.stdout)
             records = [json.loads(line) for line in out.read_text().splitlines()]
             self.assertEqual([(r["name"], r.get("timed_out")) for r in records], [("slow", True)])
+
+    def test_timed_charges_a_suite_the_bundle_seconds_written_while_it_ran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, bundle, cases = Path(tmp) / "records.jsonl", Path(tmp) / "bundle", Path(tmp) / "cases"
+            bundle.mkdir()
+            cases.mkdir()
+            (cases / "k1.json").write_text('{"test": "suite::a"}')
+            (cases / "k2.json").write_text('{"test": "suite::a"}')
+            (cases / "k3.json").write_text("not json")
+            env = {**os.environ, "CI_SPINEL_TIMINGS_OUT": str(out), "RH_SPINEL_BUNDLE": str(bundle)}
+            seconds = '{"suite::a": 40, "other::b": 99}'
+            subprocess.run(
+                ["python3", spec.origin, "timed", "--kind", "framework", "--name", "suite", "--charge-cases", str(cases),
+                 "--", "sh", "-c", f"echo '{seconds}' > {bundle}/seconds.json"],
+                env=env, check=True,
+            )
+            self.assertEqual([json.loads(line)["seconds"] for line in out.read_text().splitlines()], [40])
 
     def test_merge_averages_passing_records_into_the_last_seconds(self):
         merged = ci.merge_timings(
@@ -1956,7 +1975,7 @@ class Results(unittest.TestCase):
 
     def test_spinel_framework_shards_cover_each_selected_suite_once(self):
         shards = ci.spinel_framework_shards(ci.SPINEL_TESTS)
-        self.assertEqual([s["shard"] for s in shards], [0, 1, 2, 3])
+        self.assertEqual([s["shard"] for s in shards], [0, 1, 2, 3, 4])
         self.assertEqual(
             sorted(t for s in shards for t in s["tests"]), sorted(ci.SPINEL_TESTS)
         )
