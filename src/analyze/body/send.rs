@@ -60,6 +60,10 @@ impl<'a> BodyTyper<'a> {
     /// twins) are schema-indexed APIs.  The generic ActiveRecord catalog
     /// can only describe their fallback shape, but a literal key and a
     /// concrete model receiver make the exact column type available.
+    ///
+    /// Only an ActiveRecord record's: another class's `[]` is its own
+    /// method, whatever a method of the key's name answers. A gem's
+    /// `self[:dn].first`, with `[]` answering an Array, read `dn`'s String.
     pub(super) fn column_attribute_access_ty(
         &self,
         recv_ty: Option<&Ty>,
@@ -75,7 +79,11 @@ impl<'a> BodyTyper<'a> {
             "[]=" | "write_attribute" if args.len() == 2 => &args[0],
             _ => return None,
         };
-        let methods = &self.classes().get(model)?.instance_methods;
+        let info = self.classes().get(model)?;
+        if !info.active_record_model {
+            return None;
+        }
+        let methods = &info.instance_methods;
         let entry = match &*key_arg.node {
             ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => methods.get(value),
             ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
