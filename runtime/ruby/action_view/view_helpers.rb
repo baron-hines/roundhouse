@@ -1319,7 +1319,10 @@ module ActionView
       attrs = opts.to_h.dup
       attrs.delete(:method)
       attrs.delete(:form_class)
-      "<form action=\"#{html_escape(url.to_s)}\" method=\"post\" class=\"#{html_escape(form_class)}\">#{method_override_input(method)}<button type=\"submit\"#{render_attrs(attrs)}>#{html}</button>#{csrf_token_hidden_input}</form>"
+      # Rails' GET form carries neither a method override nor the token.
+      form_method = method == "get" ? "get" : "post"
+      token = method == "get" ? "" : csrf_token_hidden_input
+      "<form action=\"#{html_escape(url.to_s)}\" method=\"#{form_method}\" class=\"#{html_escape(form_class)}\">#{method_override_input(method)}<button type=\"submit\"#{render_attrs(attrs)}>#{html}</button>#{token}</form>"
     end
 
     # Rails' `ensure_valid_html5_tag_name` (`/\A[a-zA-Z][^\s\/>]*\z/`):

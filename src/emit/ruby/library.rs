@@ -3994,7 +3994,8 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                         .filter(|c| &c.name == **class)
                         .any(|c| c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == *name))
                 });
-                if first.is_some_and(|class| !app.helper_modules.contains(*class)) {
+                // The same test that turns a helper module's methods into its functions (`is_helper_module`).
+                if first.is_some_and(|class| !helper_modules.contains(*class) || controller_names.contains(*class)) {
                     inherited_instance.insert(name.clone());
                 }
             }

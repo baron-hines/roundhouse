@@ -9,8 +9,8 @@ module ActiveSupport
       Zlib.gunzip(source)
     end
 
-    def self.compress(source, level = Zlib::DEFAULT_COMPRESSION)
-      Zlib.gzip(source, level: level)
+    def self.compress(source, level = Zlib::DEFAULT_COMPRESSION, strategy = nil)
+      Zlib.gzip(source, level: level, strategy: strategy)
     end
   end
 end

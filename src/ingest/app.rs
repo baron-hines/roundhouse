@@ -3687,14 +3687,15 @@ fn collect_source_gem_data<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gem
         let Ok(entries) = vfs.read_dir(&installed) else { continue };
         for entry in entries {
             let Some(top) = entry.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-            if !vfs.is_dir(&entry) || top.starts_with('.') || CODE_OR_DEVELOPMENT.contains(&top.as_str()) {
+            // Not through a link: its target may lie outside the gem.
+            if vfs.is_symlink(&entry) || !vfs.is_dir(&entry) || top.starts_with('.') || CODE_OR_DEVELOPMENT.contains(&top.as_str()) {
                 continue;
             }
             let mut stack = vec![entry];
             while let Some(at) = stack.pop() {
                 let Ok(children) = vfs.read_dir(&at) else { continue };
                 for child in children {
-                    if child.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                    if vfs.is_symlink(&child) || child.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
                         continue;
                     }
                     if vfs.is_dir(&child) {
