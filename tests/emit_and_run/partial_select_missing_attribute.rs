@@ -2,7 +2,10 @@
 //! `ActiveModel::MissingAttributeError` when it is read, as Rails'
 //! generated attribute reader raises, also through a module the model
 //! includes whose reader answers `super`. A column the model's own method
-//! answers without reading it still answers.
+//! answers without reading it still answers. Serializing the record
+//! (`as_json` / `serializable_hash` / `to_json`) writes only its
+//! `attribute_names`, as Rails' `serializable_hash` does: the loaded
+//! columns and the primary key, never a left-out column.
 //! The probe's expected values are ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
@@ -46,6 +49,15 @@ end
     check("own method", read { partial.byline }, "\"staff\"")
     check("has_attribute?", partial.has_attribute?(:status), false)
     check("whole row", read { Article.find(article.id).status }, "\"draft\"")
+    whole = Article.find(article.id)
+    check("partial as_json", partial.as_json.keys.sort, ["author_id", "id", "title"])
+    check("partial serializable_hash", partial.serializable_hash.slice("author_id", "title"), { "author_id" => 3, "title" => "Hello" })
+    check("partial serializable_hash keys", partial.serializable_hash.keys.sort, ["author_id", "id", "title"])
+    check("partial to_json", [partial.to_json.include?("\"title\":\"Hello\""), partial.to_json.include?("status")], [true, false])
+    check("partial to_json only", partial.to_json(only: [:title, :status]), "{\"title\":\"Hello\"}")
+    check("whole to_json", whole.to_json.include?("\"status\":\"draft\""), true)
+    check("whole as_json", whole.as_json.keys.sort, ["author_id", "byline", "id", "status", "title"])
+    check("whole serializable_hash", whole.serializable_hash, { "id" => article.id, "author_id" => 3, "title" => "Hello", "status" => "draft", "byline" => "staff" })
   end
 end
 "##)

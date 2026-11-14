@@ -1507,12 +1507,16 @@ module ActiveRecord
     # renders as ISO8601 with three fractional digits in the app's zone.
     # `schema_time_columns` is the emitted fact that says which those
     # are.
+    # A column a partial `select` left out is no attribute of the record,
+    # so it is not written either (Rails' `attribute_names`).
     def _as_json_only(only)
       h = {}
       columns = self.class.schema_columns
       time_columns = self.class.schema_time_columns
+      unloaded = @__unloaded_columns
       only.each do |k|
         next unless columns.include?(k)
+        next if !unloaded.nil? && unloaded.include?(k)
         h[k.to_s] = if time_columns.include?(k)
           ActiveSupport.json_time(self[k])
         else
@@ -2501,9 +2505,12 @@ module ActiveRecord
     # a `User.select(*attrs)` without `token` must not mint one. Nothing
     # is recorded when the row carries every column, so the common path
     # allocates nothing.
+    # The primary key is never noted: Rails keeps it among a partial row's
+    # attributes (`has_attribute?(:id)` true, `id` in `as_json`), reading nil.
     def _note_unloaded(row)
       missing = []
-      self.class.schema_columns.each { |c| missing << c unless row.key?(c.to_s) }
+      primary_key = self.class.primary_key
+      self.class.schema_columns.each { |c| missing << c unless row.key?(c.to_s) || c.to_s == primary_key }
       @__unloaded_columns = missing unless missing.empty?
       nil
     end
