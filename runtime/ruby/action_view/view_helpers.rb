@@ -1313,10 +1313,12 @@ module ActionView
     # button that holds the block's captured markup, `method:` and `form_class:` read out of the options as the
     # compile-time spelling reads them (`view_to_library::helpers::button_to_wrapper_markup`).
     def self.button_to_html(url, html, opts = EMPTY_HTML_OPTS)
-      options = opts.to_h
-      attrs = options.reject { |k, _| k == :method || k == :form_class }
-      method = options.fetch(:method, "post").to_s
-      form_class = options.fetch(:form_class, "button_to").to_s
+      # Not a `reject` block: the strict targets emit none for a runtime Hash. `button_to`'s portable spelling.
+      method = opts.fetch(:method, "post").to_s
+      form_class = opts.fetch(:form_class, "button_to").to_s
+      attrs = opts.to_h.dup
+      attrs.delete(:method)
+      attrs.delete(:form_class)
       "<form action=\"#{html_escape(url.to_s)}\" method=\"post\" class=\"#{html_escape(form_class)}\">#{method_override_input(method)}<button type=\"submit\"#{render_attrs(attrs)}>#{html}</button>#{csrf_token_hidden_input}</form>"
     end
 

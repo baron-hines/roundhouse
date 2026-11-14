@@ -3999,6 +3999,18 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 }
             }
         }
+        if is_helper_module {
+            // Not flipped too: `module_function`'s private instance copy would become a second, private `def self.x`.
+            let class_side: Vec<(Symbol, crate::span::Span)> = lc
+                .methods
+                .iter()
+                .filter(|m| m.receiver == MethodReceiver::Class)
+                .map(|m| (m.name.clone(), m.body.span))
+                .collect();
+            lc.methods.retain(|m| {
+                m.receiver == MethodReceiver::Class || !class_side.iter().any(|(n, span)| *n == m.name && *span == m.body.span)
+            });
+        }
         for m in &mut lc.methods {
             // A helper module's own methods become module-functions so the
             // rewritten `Module.method` call has a real target — Rails mixed
