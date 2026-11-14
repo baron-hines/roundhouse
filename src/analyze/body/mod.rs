@@ -3088,6 +3088,16 @@ impl<'a> BodyTyper<'a> {
                 ) {
                     return t;
                 }
+                // `async_count` answers a Promise of that same count.
+                if let Some(t) = self.async_count_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                ) {
+                    return t;
+                }
                 if let Some(t) = recv.as_ref().and_then(|recv| send::literal_array_extreme_ty(recv, method, args, block.is_some())) {
                     return t;
                 }

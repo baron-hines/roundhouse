@@ -127,6 +127,33 @@ module ActiveRecord
     end
   end
 
+  # Rails' `ActiveRecord::Promise` (promise.rb), what an `async_*` query
+  # answers: `value` is the query's result, `then` chains a block onto it
+  # and answers a Promise of the block's value. With no async executor
+  # configured Rails runs the query at once and answers a
+  # `Promise::Complete`; this runtime has no executor, so every Promise
+  # is complete.
+  class Promise
+    def initialize(value)
+      @value = value
+    end
+
+    def value
+      @value
+    end
+
+    def pending?
+      false
+    end
+
+    def then
+      Complete.new(yield(@value))
+    end
+
+    class Complete < Promise
+    end
+  end
+
   class Relation
     # `scoped` false is `Model.unscoped`: no default scope. Otherwise the
     # model's `default_scope { where(…) }` is added here, when the
@@ -2577,6 +2604,19 @@ module ActiveRecord
       value
     end
     private :cast_schema_date
+
+    # `async_count(column_name = nil)` — Rails' `count` as an
+    # `ActiveRecord::Promise`, run at once as Rails runs it with no async
+    # executor. A grouped relation's value is the Hash its grouped count
+    # is. `:all` and the primary key count every row (a key is never
+    # NULL); counting another column's non-NULL values is Rails'
+    # `COUNT(column)`, which `count` here does not take yet.
+    def async_count(column = nil)
+      unless column.nil? || column.to_s == "all" || column.to_s == primary_key
+        raise NotImplementedError, "async_count(#{column.inspect}): only :all and the primary key are counted here"
+      end
+      Promise::Complete.new(@groups.empty? ? count : group_count)
+    end
 
     # `group(:col).count` — Rails hands back a Hash of group-key =>
     # COUNT. The group_count lowering renames the grouped chain's

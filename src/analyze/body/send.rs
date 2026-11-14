@@ -279,22 +279,55 @@ impl<'a> BodyTyper<'a> {
         if method.as_str() != "count" || !args.is_empty() || block.is_some() {
             return None;
         }
-        let group_args = Self::group_args_in_count_chain(recv?)?;
+        self.grouped_count_hash(recv?, recv_ty?)
+    }
+
+    /// The Hash a grouped count answers when `recv` is a grouped
+    /// relation chain; `None` when it is not grouped.
+    fn grouped_count_hash(&self, recv: &Expr, recv_ty: &Ty) -> Option<Ty> {
+        let group_args = Self::group_args_in_count_chain(recv)?;
         // The receiver of `count` is the `group(...)` result, so its
         // type names the model whose schema owns the grouped column.
-        // Both relation representations reach here: an inline
-        // `Model.where(...).group(...)` chain carries the Array shape,
-        // a scope or association read carries `Ty::Relation`.
-        let model = match recv_ty? {
-            Ty::Relation { of } => of,
-            Ty::Array { elem } => match &**elem {
-                Ty::Class { id, .. } => id,
-                _ => return None,
-            },
-            _ => return None,
-        };
+        let model = Self::relation_model(recv_ty)?;
         let key = self.grouped_key_ty(model, group_args).unwrap_or(Ty::Untyped);
         Some(Ty::Hash { key: std::sync::Arc::new(key), value: std::sync::Arc::new(Ty::Int) })
+    }
+
+    /// The model a relation-typed value is over. Both relation
+    /// representations reach here: an inline `Model.where(...)` chain
+    /// carries the Array shape, a scope or association read carries
+    /// `Ty::Relation`.
+    fn relation_model(ty: &Ty) -> Option<&ClassId> {
+        match ty {
+            Ty::Relation { of } => Some(of),
+            Ty::Array { elem } => match &**elem {
+                Ty::Class { id, .. } => Some(id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `relation.async_count(column)` — Rails' `count` as an
+    /// `ActiveRecord::Promise` of the count: an Integer, or the Hash a
+    /// grouped relation counts into, read as `grouped_count_ty` reads
+    /// it. The runtime's `Relation#async_count` picks the same two by
+    /// the relation's groups.
+    pub(super) fn async_count_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+        block: Option<&Expr>,
+    ) -> Option<Ty> {
+        if method.as_str() != "async_count" || args.len() > 1 || block.is_some() {
+            return None;
+        }
+        let recv_ty = recv_ty?;
+        Self::relation_model(recv_ty)?;
+        let count = self.grouped_count_hash(recv?, recv_ty).unwrap_or(Ty::Int);
+        Some(crate::analyze::promise::of(count))
     }
 
     fn group_args_in_count_chain(expr: &Expr) -> Option<&[Expr]> {
@@ -642,6 +675,10 @@ impl<'a> BodyTyper<'a> {
         let recv_ty = recv_ty?;
         if !class_object_receiver && let Some(view) = self.enumerable_view(Some(recv_ty), method) {
             return self.block_params_for(Some(&view), method, false);
+        }
+        // A Promise's `then` yields its value, not the Promise (Kernel's).
+        if method.as_str() == "then" && let Some(value) = crate::analyze::promise::value_of(recv_ty) {
+            return Some(vec![value.clone()]);
         }
         if matches!(recv_ty, Ty::Class { id, .. } if id.0.as_str() == PARAM_VALUE) {
             return match method.as_str() {
@@ -1437,6 +1474,15 @@ impl<'a> BodyTyper<'a> {
         {
             if ClassInfo::class_method_ownership_unknown(self.classes(), id, method) { return Ty::Untyped; }
             if let Some(ty) = ClassInfo::source_class_method_type(self.classes(), id, method) { return unwrap_fn_ret(ty); }
+        }
+        // A typed Promise answers its value, and `then` a Promise of the
+        // block's value (`analyze::promise`).
+        if let Some(value) = recv_ty.and_then(crate::analyze::promise::value_of) {
+            match method.as_str() {
+                "value" if args.is_empty() => return value.clone(),
+                "then" => return crate::analyze::promise::of(block_ret.cloned().unwrap_or(Ty::Untyped)),
+                _ => {}
+            }
         }
         let controller_writer = method.as_str() == "content_type="
             && recv_ty.is_some_and(|ty| self.controller_writer_receiver(ty));

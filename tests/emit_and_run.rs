@@ -22277,3 +22277,5 @@ mod model_delete_by_id;
 mod querying_delegation;
 #[path = "emit_and_run/bulk_write_window.rs"]
 mod bulk_write_window;
+#[path = "emit_and_run/relation_async_count.rs"]
+mod relation_async_count;

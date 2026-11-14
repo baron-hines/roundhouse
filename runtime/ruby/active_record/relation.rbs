@@ -18,6 +18,19 @@ module ActiveRecord
     def orders: () -> Array[Hash[Symbol, untyped]]
   end
 
+  # The value is a count, a grouped count's Hash or a `then` block's
+  # value; the analyzer types each Promise's value at its call site
+  # (`ActiveRecord::Promise[T]`), which RBS here cannot spell.
+  class Promise
+    def initialize: (untyped value) -> void
+    def value: () -> untyped
+    def pending?: () -> bool
+    def then: () { (untyped) -> untyped } -> Promise
+  end
+
+  class Promise::Complete < Promise
+  end
+
   class Relation
     # Model handle is `Base` (class object collapsed onto `Ty::Class{Base}`
     # in send.rs). Do not spell `Class` — that leaves `@model` as Ty::Var
@@ -344,6 +357,7 @@ module ActiveRecord
     private def cast_schema_value: (untyped value, Symbol column) -> untyped
     private def cast_schema_date: (untyped value) -> untyped
     def group_count: () -> Hash[untyped, Integer]
+    def async_count: (?(Symbol | String)? column) -> Promise
     def empty?: () -> bool
     def any?: () -> bool
     def blank?: () -> bool

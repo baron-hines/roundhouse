@@ -1340,7 +1340,12 @@ fn every_runtime_method_body_concretely_typed() {
     // integer_list_predicate reads the elements of a hash condition's
     // untyped Array (+4 in active_record/relation.rb); its typed helpers
     // add none. Within the ceiling, which is unchanged.
-    const CEILING: usize = 986;
+    // MEASURED 989 on relation async_count (main ca6fe1626: 986): Rails'
+    // `ActiveRecord::Promise` holds a count, a grouped count's Hash or a
+    // `then` block's value, a type parameter RBS here cannot declare, so
+    // its `value` and `then` read an untyped value (+3 in
+    // active_record/relation.rb; `analyze::promise` types the call sites).
+    const CEILING: usize = 989;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"
