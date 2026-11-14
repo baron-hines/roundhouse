@@ -52,6 +52,7 @@ pub mod schema_to_library;
 pub mod seeds_to_library;
 pub mod test_module_to_library;
 pub mod create_block;
+pub mod create_rows;
 pub mod as_json_poro;
 mod as_json_record;
 pub use as_json_writer::WRITER_METHOD as JSON_WRITER_METHOD;
@@ -651,6 +652,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("errors_index", &["errors_add"]),
     ("human_attribute_name", &[]),
     ("i18n_translate", &[]),
+    // `create!(rows)` of an Array → one `create!` per row. Its blockless
+    // calls are none of `create_block`'s; `params_merge` then sees the
+    // per-row call.
+    ("create_rows", &[]),
     ("create_block", &["secure_password_super"]),
     // `<params>.merge(k: v)` written a method away from the permit
     // chain → `Model.from_params(p)` + per-key setters, hoisted above
@@ -1086,6 +1091,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("human_attribute_name");
     i18n_translate::apply_i18n_translate_lowering(app);
     ran!("i18n_translate");
+    create_rows::apply_create_rows_lowering(app);
+    ran!("create_rows");
     diags.extend(create_block::apply_create_block_inline(app));
     ran!("create_block");
     diags.extend(params_merge::apply_params_merge_lowering(app));

@@ -72,7 +72,7 @@ mod send;
 mod active_storage;
 mod buffered_stdlib;
 pub(crate) use send::{ENUMERABLE_METHODS, PARAM_VALUE};
-pub(crate) use send::{indexed_pluck, string_answers};
+pub(crate) use send::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use send::counted_first_last;
 

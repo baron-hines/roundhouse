@@ -33,7 +33,7 @@ mod class_configuration;
 mod data;
 mod database_identity;
 mod class_new;
-pub(crate) use body::{indexed_pluck, string_answers};
+pub(crate) use body::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
 pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};

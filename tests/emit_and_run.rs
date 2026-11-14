@@ -22283,3 +22283,5 @@ mod relation_async_count;
 mod order_values;
 #[path = "emit_and_run/scoping_all_is_scope.rs"]
 mod scoping_all_is_scope;
+#[path = "emit_and_run/create_array.rs"]
+mod create_array;

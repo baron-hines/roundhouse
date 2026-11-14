@@ -1484,6 +1484,15 @@ impl<'a> BodyTyper<'a> {
                 _ => {}
             }
         }
+        // A model class's own `create` / `create!` of an Array of attribute Hashes, unless the app defines it.
+        if !instance_receiver
+            && creates_rows(method, args)
+            && let Some(Ty::Class { id, .. }) = recv_ty
+            && self.is_model_class(recv_ty)
+            && !self.source_class_side(id, method)
+        {
+            return Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: id.clone(), args: vec![].into() }) };
+        }
         let controller_writer = method.as_str() == "content_type="
             && recv_ty.is_some_and(|ty| self.controller_writer_receiver(ty));
         // Not the stdlib's String form too: the port reads `other.octets`, which a String lacks.
@@ -2852,7 +2861,7 @@ impl<'a> BodyTyper<'a> {
                 if let Some(t) = self.column_projection(of, method, args) {
                     return t;
                 }
-                if counted_first_last(method, args) || array_find(method, args, block_ret) {
+                if counted_first_last(method, args) || array_find(method, args, block_ret) || creates_rows(method, args) {
                     return Ty::Array {
                         elem: std::sync::Arc::new(Ty::Class { id: of.clone(), args: vec![].into() }),
                     };
@@ -3551,6 +3560,16 @@ fn sub_array_slice(method: &Symbol, args: &[crate::expr::Expr], elem: &Ty) -> Op
     (range_index || args.len() == 2).then(|| Ty::Union {
         variants: vec![Ty::Array { elem: std::sync::Arc::new(elem.clone()) }, Ty::Nil].into(),
     })
+}
+
+/// `create` / `create!` given one Array (of attribute Hashes): Rails creates
+/// one record per Hash and answers the Array of them, on the class and on a
+/// relation alike (Persistence::ClassMethods#create!, Relation#create!:
+/// `attributes.collect { |attr| create!(attr, &block) }`).
+/// `lower::create_rows` rewrites the call to that `map`.
+pub(crate) fn creates_rows(method: &Symbol, args: &[crate::expr::Expr]) -> bool {
+    matches!(method.as_str(), "create" | "create!")
+        && matches!(args, [rows] if matches!(rows.ty, Some(Ty::Array { .. })))
 }
 
 /// `first(n)` / `last(n)` — the counted form. Ruby's `Array#first(n)`,

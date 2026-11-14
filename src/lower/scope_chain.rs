@@ -641,7 +641,12 @@ fn assoc_scope_shape(
                     || (args.len() == 1
                         && match &*args[0].node {
                             ExprNode::Hash { .. } => true,
-                            ExprNode::Var { name, .. } => hash_params.contains(name),
+                            // Or a local the analyzer typed as a Hash: the row
+                            // `lower::create_rows` hands each `create!` of an Array.
+                            ExprNode::Var { name, .. } => {
+                                hash_params.contains(name)
+                                    || matches!(args[0].ty, Some(crate::ty::Ty::Hash { .. }))
+                            }
                             _ => false,
                         });
                 if !mergeable && blocked.is_none() {
