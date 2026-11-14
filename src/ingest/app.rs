@@ -3683,7 +3683,7 @@ fn collect_source_gem_data<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gem
     let mut found = Vec::new();
     for name in names {
         let Some(version) = lock.version_of(name) else { continue };
-        let Some(installed) = crate::i18n::gems::installed_gem(vfs, &roots, name, version) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem_locked(vfs, &roots, &lock, name, version) else { continue };
         let Ok(entries) = vfs.read_dir(&installed) else { continue };
         for entry in entries {
             let Some(top) = entry.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };

@@ -14803,7 +14803,7 @@ fn carry_source_gem_data(app: &App, fixture: &Path, out: &mut Vec<(String, Strin
     };
     for name in &lock.source {
         let Some(version) = lock.version_of(name) else { continue };
-        let Some(installed) = crate::i18n::gems::installed_gem(&vfs, &roots, name, version) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem_locked(&vfs, &roots, lock, name, version) else { continue };
         let lib = installed.join("lib");
         if !lib.is_dir() {
             continue;

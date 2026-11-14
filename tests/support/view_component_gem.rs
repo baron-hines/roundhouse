@@ -58,12 +58,7 @@ puts "view_component passed"
 /// Not an app of nothing else: a Spinel tree with no model leaves the runtime record's schema untyped.
 #[allow(dead_code)]
 pub fn native_app() -> Option<emit_and_run::Overlay> {
-    let fixture = roundhouse::fixtures::real_blog();
-    let (gemfile, lock) = gemfiles(fixture);
-    let mut overlay = emit_and_run::real_blog()
-        .write("Gemfile", &gemfile)
-        .write("Gemfile.lock", &lock)
-        .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
+    let mut overlay = with_ui(emit_and_run::real_blog())
         .write("app/components/greeting_component.rb", COMPONENT)
         .write("app/components/greeting_component.html.erb", TEMPLATE)
         .write("app/components/card_component.rb", CARD)
@@ -80,7 +75,7 @@ pub fn native_app() -> Option<emit_and_run::Overlay> {
 
 /// What view_component 3.23.2 renders for `ComponentReport.lines` on Rails 7.2.2.1 (the gem run on a stub of Rails).
 #[allow(dead_code)]
-pub const NATIVE_SCRIPT: &str = "ComponentReport.lines.each { |line| puts line }\n";
+pub const NATIVE_SCRIPT: &str = "ComponentReport.lines.each { |line| puts line }\nUiReport.lines.each { |line| puts line }\n";
 #[allow(dead_code)]
 pub const NATIVE_EXPECTED: &str = "<p class=\"greeting\">Hello, BLOG! (0 articles)</p>\n<div class=\"card card-warm\">\n  <h2>Title &lt;b&gt;</h2>\n  <ul><li>one</li><li>two</li></ul>\n  <div class=\"body\">\n  Body text\n</div>\n  <small>fine <print></small>\n</div>\n";
 
@@ -161,13 +156,21 @@ pub const KNOWN_GAPS: [&str; 12] = [
 /// helper into the view from a Railtie initializer and reads its gzipped glyphs from a directory beside its `lib/`.
 #[allow(dead_code)]
 pub fn ui_app() -> Option<emit_and_run::Overlay> {
+    let mut overlay = with_ui(emit_and_run::real_blog());
+    for (name, version) in GEMS {
+        overlay = with_gem(overlay, name, version)?;
+    }
+    Some(overlay)
+}
+
+fn with_ui(overlay: emit_and_run::Overlay) -> emit_and_run::Overlay {
     let fixture = roundhouse::fixtures::real_blog();
     let (gemfile, lock) = gemfiles(fixture);
     let lock = lock
         .replacen("\n    method_source (1.1.0)\n", "\n    glyphs (0.1.0)\n      railties (>= 4.1.0)\n    method_source (1.1.0)\n", 1)
         .replacen("DEPENDENCIES\n", "DEPENDENCIES\n  glyphs\n", 1);
     let gem = "vendor/bundle/ruby/3.4.0/gems/glyphs-0.1.0";
-    let mut overlay = emit_and_run::real_blog()
+    overlay
         .write("Gemfile", &(gemfile + "gem \"glyphs\"\n"))
         .write("Gemfile.lock", &lock)
         .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
@@ -185,14 +188,10 @@ pub fn ui_app() -> Option<emit_and_run::Overlay> {
         .write("app/components/ui/button.html.erb", UI_BUTTON_TEMPLATE)
         .write("app/components/ui/link.rb", "class Ui::Link < Ui::BaseButton\nend\n")
         .write("app/components/ui/link.html.erb", UI_LINK_TEMPLATE)
-        .write("app/lib/component_report.rb", UI_REPORT);
-    for (name, version) in GEMS {
-        overlay = with_gem(overlay, name, version)?;
-    }
-    Some(overlay)
+        .write("app/lib/ui_report.rb", UI_REPORT)
 }
 
-/// What Rails 7.2.2.1 and view_component 3.23.2 render for `ComponentReport.lines` with the `glyphs` gem loaded, but
+/// What Rails 7.2.2.1 and view_component 3.23.2 render for `UiReport.lines` with the `glyphs` gem loaded, but
 /// for the last line's form: that is the form a view's `button_to … do` renders here (`view_to_library::helpers::
 /// button_to_wrapper_markup`), whose attribute order, void tags and empty token input outside a request are its own.
 #[allow(dead_code)]
@@ -221,4 +220,4 @@ const UI_BUTTON_TEMPLATE: &str = "<%= container do %>\n  <% if icon %><%= helper
 
 const UI_LINK_TEMPLATE: &str = "<%= link_to href, class: classes, **opts do %>\n  <% if icon %><%= helpers.icon(icon) %><% end %>\n  <%= text %>\n<% end %>\n";
 
-const UI_REPORT: &str = "class ComponentReport\n  def self.lines\n    view = ActionView::Base.new\n    [\n      Ui::Button.new(text: \"Save <now>\", tone: :quiet).render_in(view),\n      Ui::Button.new(text: \"Add\", icon: \"plus\", confirm: \"Sure?\", class: \"btn\").render_in(view),\n      Ui::Link.new(text: \"Home\", href: \"/home\", icon: \"minus\").render_in(view),\n      Ui::Button.new(text: \"Drop\", href: \"/items/1\", method: :delete, confirm: \"Gone?\").render_in(view)\n    ].map(&:to_s)\n  end\nend\n";
+const UI_REPORT: &str = "class UiReport\n  def self.lines\n    view = ActionView::Base.new\n    [\n      Ui::Button.new(text: \"Save <now>\", tone: :quiet).render_in(view),\n      Ui::Button.new(text: \"Add\", icon: \"plus\", confirm: \"Sure?\", class: \"btn\").render_in(view),\n      Ui::Link.new(text: \"Home\", href: \"/home\", icon: \"minus\").render_in(view),\n      Ui::Button.new(text: \"Drop\", href: \"/items/1\", method: :delete, confirm: \"Gone?\").render_in(view)\n    ].map(&:to_s)\n  end\nend\n";
