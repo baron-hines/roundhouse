@@ -1051,6 +1051,7 @@ fn parse_validator(key: &str, value: &Node<'_>, file: &str, class_consts: &super
         "exclusion" => parse_set(value, file, true, class_consts),
         "uniqueness" => parse_uniqueness(value, file, class_consts),
         "format" => parse_format(value, file, class_consts),
+        "comparison" => parse_comparison(value, file),
         other => RuleParse::Gap(vec![other.to_string()]),
     };
     // Scheduling is shared by every validator, independently of its own options.
@@ -1455,6 +1456,73 @@ fn parse_set(value: &Node<'_>, file: &str, exclusion: bool, class_consts: &super
         }
         None => built.gap(vec![format!("{label}: in")]),
     }
+}
+
+/// `comparison:` — Rails' `ComparisonValidator` options, each bound a literal, a Symbol (the record's method) or a
+/// lambda (`-> { min_supported_date }`, its body run on the record), with the guards and flags `inclusion:` takes.
+fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
+    use crate::dialect::ValidationRule;
+    let Some(elements) = hash_elements(value) else {
+        return RuleParse::Gap(vec!["comparison".to_string()]);
+    };
+    let mut checks: Vec<(Symbol, crate::expr::Expr)> = Vec::new();
+    let mut built = BuiltRule::bare(ValidationRule::Comparison { checks: Vec::new() });
+    let mut gaps = Vec::new();
+    for el in elements.iter() {
+        let Some(assoc) = el.as_assoc_node() else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let Some(key) = symbol_value(&assoc.key()) else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let child = assoc.value();
+        match key.as_str() {
+            "greater_than" | "greater_than_or_equal_to" | "equal_to" | "less_than" | "less_than_or_equal_to" | "other_than" => {
+                let bound = match inclusion_call(&child, file) {
+                    Some(InclusionSpec::Call(bound)) => Some(bound),
+                    _ => super::super::expr::ingest_expr(&child, file)
+                        .ok()
+                        .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
+                };
+                match bound {
+                    Some(bound) => checks.push((Symbol::from(key.as_str()), bound)),
+                    None => gaps.push(format!("comparison: {key}")),
+                }
+            }
+            "prepend" => {}
+            "on" => match context_guard(&child) {
+                Some(guard) => built.on_guard = Some(guard),
+                None => gaps.push("on".to_string()),
+            },
+            "if" => push_condition(&child, file, &mut built.if_cond, "if", &mut gaps),
+            "unless" => push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps),
+            "allow_nil" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.nil_skip = flag;
+                    built.own_allow_nil = true;
+                }
+                None => gaps.push("allow_nil".to_string()),
+            },
+            "allow_blank" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.blank_skip = flag;
+                    built.own_allow_blank = true;
+                }
+                None => gaps.push("allow_blank".to_string()),
+            },
+            other => gaps.push(format!("comparison: {other}")),
+        }
+    }
+    if checks.is_empty() {
+        gaps.push("comparison".to_string());
+    }
+    if !gaps.is_empty() {
+        return built.gap(gaps);
+    }
+    built.rule = ValidationRule::Comparison { checks };
+    RuleParse::Rule(built)
 }
 
 fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts) -> RuleParse {
@@ -1893,8 +1961,12 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
             block.clone()
         }
         // A set computed from constants (`in: DATE_FORMATS.map(&:last)`, `I18n.available_locales.map(&:to_s)`): Rails
-        // evaluates it once as the class loads; with no read of self it is the same set at validation time.
-        ExprNode::Send { recv: Some(_), .. } if !reads_implicit_self(&expr) => return Some(InclusionSpec::Call(expr)),
+        // evaluates it once as the class loads; with no read of self it is the same set at validation time. Not one
+        // rooted at a class (`PtySession.drivers.keys`): an enum recipient's stored values may not be the labels Rails
+        // validates, which the enum fold decides.
+        ExprNode::Send { recv: Some(_), .. } if !reads_implicit_self(&expr) && rooted_at_a_value_constant(&expr) => {
+            return Some(InclusionSpec::Call(expr));
+        }
         _ => return None,
     };
     let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else {
@@ -1919,6 +1991,21 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
         replace_var_with_self(&mut body, param);
     }
     Some(InclusionSpec::Call(body))
+}
+
+/// The receiver chain under `e` starts at a constant holding a value (`DATE_FORMATS`, `Period::PERIODS`) or at
+/// `I18n`, not at a class.
+fn rooted_at_a_value_constant(e: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        ExprNode::Send { recv: Some(r), .. } => rooted_at_a_value_constant(r),
+        ExprNode::Const { path } => {
+            let names: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+            names == ["I18n"]
+                || names.last().is_some_and(|n| n.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        }
+        _ => false,
+    }
 }
 
 /// The highest numbered parameter (`_1`, `_2`, …) a lambda literal or a

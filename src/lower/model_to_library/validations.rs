@@ -763,6 +763,7 @@ fn validation_rule_to_calls(
             vec![inline_exclusion_check(msgs, attr, values, range.as_ref())]
         }
         ValidationRule::InclusionCall { set } => vec![inline_set_call_check(msgs, attr, set, false, attr_ty)],
+        ValidationRule::Comparison { checks } => vec![inline_comparison_check(msgs, attr, checks)],
         ValidationRule::ExclusionCall { set } => vec![inline_set_call_check(msgs, attr, set, true, attr_ty)],
         // `validate :validate_url` — a method the model defines, which
         // adds to `errors` itself. The synthesized `validate` just
@@ -1481,6 +1482,93 @@ fn inline_set_call_check(msgs: Messages, attr: &Symbol, set: &Expr, exclusion: b
     let kind = if exclusion { "exclusion" } else { "inclusion" };
     let push_err = errors_push(attr.as_str(), msgs.error(attr.as_str(), kind, &Default::default()));
     if_with_nil_else(cond, push_err)
+}
+
+/// Rails' `ComparisonValidator#validate_each`: a nil or blank value is `:blank` (once, as its loop returns there);
+/// otherwise each bound is read on the record and the value compared with it, an error of the option's kind whose
+/// `%{count}` is the bound as I18n interpolates it (`to_s`).
+fn inline_comparison_check(msgs: Messages, attr: &Symbol, checks: &[(Symbol, Expr)]) -> Expr {
+    const COUNT: &str = "\u{1}comparison-count\u{1}";
+    // The reader, not the ivar: a date or time column keeps its raw text there.
+    let attr_ivar = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: None, method: attr.clone(), args: vec![], block: None, parenthesized: false },
+    );
+    // `ActiveSupport.blank?`, not `blank?` on the value: Spinel's Date answers no `blank?`.
+    let support = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
+    let blank = bool_op(BoolOpKind::Or, send(attr_ivar.clone(), "nil?", vec![]), send(support, "blank?", vec![attr_ivar.clone()]));
+    let blank_err = errors_push(attr.as_str(), msgs.error(attr.as_str(), "blank", &Default::default()));
+    let mut stmts = Vec::new();
+    for (i, (option, bound)) in checks.iter().enumerate() {
+        let name = Symbol::from(format!("__comparison_bound_{i}").as_str());
+        let local = || Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+        stmts.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() }, value: bound.clone() },
+        ));
+        let op = match option.as_str() {
+            "greater_than" => ">",
+            "greater_than_or_equal_to" => ">=",
+            "equal_to" => "==",
+            "less_than" => "<",
+            "less_than_or_equal_to" => "<=",
+            _ => "!=",
+        };
+        let holds = send(attr_ivar.clone(), op, vec![local()]);
+        let fails = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(holds), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        );
+        let mut msg = msgs.error(attr.as_str(), option.as_str(), &ErrorOpts::count(COUNT));
+        let count = send(local(), "to_s", vec![]);
+        fill_count(&mut msg.full, COUNT, &count);
+        fill_count(&mut msg.bare, COUNT, &count);
+        stmts.push(if_with_nil_else(fails, errors_push(attr.as_str(), msg)));
+    }
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::If { cond: blank, then_branch: blank_err, else_branch: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: stmts }) },
+    )
+}
+
+/// A message built with `marker` for its `%{count}`, the marker read as `count` where it stands.
+fn fill_count(e: &mut Expr, marker: &str, count: &Expr) {
+    let split = |text: &str| -> Option<Vec<crate::expr::InterpPart>> {
+        if !text.contains(marker) {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for (i, piece) in text.split(marker).enumerate() {
+            if i > 0 {
+                parts.push(crate::expr::InterpPart::Expr { expr: count.clone() });
+            }
+            if !piece.is_empty() {
+                parts.push(crate::expr::InterpPart::Text { value: piece.to_string() });
+            }
+        }
+        Some(parts)
+    };
+    match &mut *e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            if let Some(parts) = split(value) {
+                *e = Expr::new(e.span, ExprNode::StringInterp { parts });
+            }
+        }
+        ExprNode::StringInterp { parts } => {
+            let mut out = Vec::new();
+            for part in std::mem::take(parts) {
+                match part {
+                    crate::expr::InterpPart::Text { value } => match split(&value) {
+                        Some(pieces) => out.extend(pieces),
+                        None => out.push(crate::expr::InterpPart::Text { value }),
+                    },
+                    other => out.push(other),
+                }
+            }
+            *parts = out;
+        }
+        _ => e.node.for_each_child_mut(&mut |c| fill_count(c, marker, count)),
+    }
 }
 
 /// An Array slot, nullable or not (`ty_of_column_slot`'s stored array

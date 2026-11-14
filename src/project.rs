@@ -10355,6 +10355,11 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 if let crate::dialect::ValidationRule::InclusionCall { set } | crate::dialect::ValidationRule::ExclusionCall { set } = rule {
                     visit(set);
                 }
+                if let crate::dialect::ValidationRule::Comparison { checks } = rule {
+                    for (_, bound) in checks {
+                        visit(bound);
+                    }
+                }
             }
         }
     }
