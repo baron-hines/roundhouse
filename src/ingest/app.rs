@@ -693,9 +693,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // The queue's records: on solid_queue the compiler runs the jobs, but the records Rails keeps of them are
     // solid_queue's own models, read from its installed source over a separate or primary queue schema.
     // Not every app on solid_queue: only one whose code (or a gem it carries) names solid_queue's classes reads its records.
+    // The file the test environment's primary names with `schema_dump:`, resolved once for the
+    // queue check below and the schema read; a form that isn't read is refused.
+    let named_schema = super::database_yml::named_schema(vfs, dir);
     let solid_queue_models = (effective_queue_adapter(vfs, dir).as_deref() == Some("solid_queue")
         && names_solid_queue(vfs, dir, &source_gems)
-        && (vfs.exists(&dir.join("db/queue_schema.rb")) || primary_schema_has_queue(vfs, dir)))
+        && (vfs.exists(&dir.join("db/queue_schema.rb")) || primary_schema_has_queue(vfs, dir, named_schema.primary.as_ref())))
         .then(|| super::source_gems::framework_models(vfs, dir, lock.as_ref(), "solid_queue"))
         .flatten();
     let solid_queue_root = solid_queue_models.as_ref().and_then(|gem| gem.mount.strip_prefix(dir).ok().map(|m| m.join("app")));
@@ -805,7 +808,22 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     let expression_dialect = schema_expression_dialect(vfs, dir);
-    if vfs.exists(&schema_path) {
+    // A refused `schema_dump:` leaves the schema empty.
+    if let Some(named) = &named_schema.primary {
+        if let Ok((path, sql)) = named
+            && let Some(source) = read_or_ledger(vfs, path)?
+        {
+            let file = path.display().to_string();
+            let schema = if *sql {
+                ingest_structure_sql(&source, &file)
+            } else {
+                ingest_schema_with_generated_expression_dialect(&source, &file, expression_dialect)
+            };
+            if let Some(schema) = unwrap_or_record(schema)? {
+                app.schema = schema;
+            }
+        }
+    } else if vfs.exists(&schema_path) {
         if let Some(source) = read_or_ledger(vfs, &schema_path)? {
             if let Some(schema) =
                 unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &schema_path.display().to_string(), expression_dialect))?
@@ -2155,6 +2173,8 @@ end
         let configurations = super::database_yml::database_configurations(&text, file);
         app.databases = configurations.databases;
         app.database_refusals.extend(configurations.refusals);
+        let joined = solid_queue_root.is_some().then_some("db/queue_schema.rb");
+        app.database_refusals.extend(named_schema.refusals(file, joined));
     }
 
     for root in &roots {
@@ -13705,9 +13725,16 @@ fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::sch
 
 /// Use the ordinary schema readers for selection too. The normal primary schema
 /// pass remains the owner of its facts and diagnostics, including survey gaps.
-fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
-    let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
-        .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
+fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path, named: Option<&Result<(PathBuf, bool), ()>>) -> bool {
+    let path = match named {
+        Some(Ok((path, _))) => path.clone(),
+        Some(Err(())) => return false,
+        None => {
+            let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
+                .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
+            path
+        }
+    };
     let Ok(source) = vfs.read(&path) else { return false };
     let marks = (super::survey::mark(), super::prism::mark());
     let file = path.display().to_string();

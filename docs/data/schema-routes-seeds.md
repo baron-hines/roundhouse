@@ -295,6 +295,25 @@ leaves that configuration out with a warning, and a control tag leaves
 them all out. `DATABASE_URL` is not read. The primary's SQLite
 `pragmas:` are read from the same file (`App::database_pragmas`).
 
+The test environment's primary may name its schema file with
+`schema_dump:` (`database_yml::named_schema`). One form is read: a plain
+or quoted YAML string, written directly in that configuration, naming a
+relative `.rb` file under `db/`, read in place of `db/schema.rb`, or a
+`.sql` file when the configuration says `schema_format: sql` itself. The
+guards are conservative: a `.rb` name is refused when a `schema_format`
+other than a direct literal `ruby` is written there, or when any Ruby file
+under `config/` mentions `schema_format`. A name is also refused when any
+of those files mentions `.paths`, `paths[` or `paths.add` (comments
+included; `assets.paths` aside), or when the configuration's `url:` is
+computed, not a string, written under more than one spelling (`:url`,
+quoted, any case), or names `schema_dump` or `schema_format` in its
+query, or when the file runs any ERB control flow (`<% ... %>`). `false`, null or an unquoted YAML 1.1
+boolean names no file, and the schema is found as before. Any other
+`schema_dump:` there (ERB, an anchor, alias, merge or flow value, the
+`:schema_dump:` key, another name, a missing file) is an error naming
+the configuration and the setting. Another test database whose schema
+file exists is a warning.
+
 Which database a model runs on is read from source, never from the
 file: a literal `connects_to database: { writing:, reading: }` in an
 abstract class, inherited by its subclasses (`App::model_databases`).
