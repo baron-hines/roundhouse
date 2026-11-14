@@ -138,6 +138,9 @@ module ActiveRecord
       @wheres = []
       @joins = []
       @orders = []
+      # Rails' `reordering_value`: set by `reorder`, so a merge of this
+      # relation replaces the receiver's ordering instead of extending it.
+      @reordering = false
       @groups = []
       @havings = []
       @select_sql = nil
@@ -813,7 +816,13 @@ module ActiveRecord
     def reorder_sql(fragment)
       rel = spawn
       rel.clear_ordering
+      rel.reordered!
       rel.order_sql!(fragment)
+    end
+
+    def reordered!
+      @reordering = true
+      self
     end
 
     # Rails requires at least one argument to the public `reorder` API.
@@ -842,6 +851,7 @@ module ActiveRecord
     def reorder_parts!(parts)
       own_lists
       @orders = []
+      @reordering = true
       order_parts!(parts)
     end
 
@@ -1335,8 +1345,8 @@ module ActiveRecord
       unloaded_spawn
     end
 
-    # `merge(other)` — fold another relation's WHEREs in. v1 handles the
-    # common case (merging a same-table scope's conditions).
+    # `merge(other)` — fold another relation's WHEREs and ORDER BY in.
+    # v1 handles the common case (merging a same-table scope's conditions).
     def merge(other)
       spawn.merge!(other)
     end
@@ -1348,13 +1358,47 @@ module ActiveRecord
         push_where(w)
         @opaque_wheres = true
       end
+      merge_orders!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
       self
     end
 
+    # Rails' `Merger#merge_multi_values`: the other relation's orderings
+    # follow this one's, each term once (`order!`), so a query can order
+    # rows ahead of a scope's own ordering and merge the scope's back
+    # after; a reordered other replaces this one's (`reorder!`). A column term here is unqualified (it reads the
+    # receiver's output alias), so another table's would sort this
+    # relation by the wrong column: that merge raises rather than order
+    # the rows wrongly.
+    def merge_orders!(other)
+      theirs = other.order_clauses
+      if other.reordering?
+        @orders = []
+        @reordering = true
+      end
+      return nil if theirs.empty?
+      unless other.table_sql == @table
+        raise NotImplementedError, "merge: the ordering of a relation on #{other.table_sql} cannot be applied to one on #{@table}"
+      end
+      theirs.each { |o| @orders << o unless @orders.include?(o) }
+      nil
+    end
+
     def where_clauses
       @wheres
+    end
+
+    def order_clauses
+      @orders
+    end
+
+    def reordering?
+      @reordering
+    end
+
+    def table_sql
+      @table
     end
 
     def having_clauses
