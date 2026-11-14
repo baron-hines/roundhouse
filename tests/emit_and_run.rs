@@ -22281,3 +22281,5 @@ mod bulk_write_window;
 mod relation_async_count;
 #[path = "emit_and_run/order_values.rs"]
 mod order_values;
+#[path = "emit_and_run/scoping_all_is_scope.rs"]
+mod scoping_all_is_scope;

@@ -629,7 +629,7 @@ module ActiveRecord
     # zero/empty-string key.
     def self.find(id)
       raise RecordNotFound.new("Couldn't find #{name} without an ID", name, primary_key, id) if id.nil?
-      result = _default_scope_where.empty? ? _find_primary_key_input(id) : _find_in_scope(id)
+      result = _read_through_relation? ? _find_in_scope(id) : _find_primary_key_input(id)
       raise RecordNotFound.new("Couldn't find #{name} with '#{primary_key}'=#{id.inspect}", name, primary_key, id) if result.nil?
       result
     end
@@ -653,7 +653,7 @@ module ActiveRecord
       _adapter_find_by_id(key)
     end
 
-    # `find` on a default-scoped model: the row only when the scope keeps it.
+    # `find` on a scoped model: the row only when the scope keeps it.
     def self._find_in_scope(id)
       key = _cast_primary_key(id)
       return nil if key.nil?
@@ -683,7 +683,7 @@ module ActiveRecord
       # Conditions, not a key (Rails' `exists?(name: "x")`): the Relation
       # answers them, through the default scope when the model has one.
       return all.exists?(id) if id.is_a?(Hash)
-      unless _default_scope_where.empty?
+      if _read_through_relation?
         key = _cast_primary_key(id)
         return false if key.nil?
         return all.where({ primary_key => key }).exists?
@@ -1134,7 +1134,7 @@ module ActiveRecord
     # rather than counted beforehand. Ruby-family-only because
     # `changes` is — see base.rb's default.
     def self.delete_all
-      return all.delete_all unless _default_scope_where.empty?
+      return all.delete_all if _read_through_relation?
       ActiveRecord.adapter.delete_all(table_name)
       ActiveRecord.adapter.changes
     end
@@ -1605,13 +1605,16 @@ module ActiveRecord
     # what Rails' UniquenessValidator queries (`finder_class.unscoped`).
     # With a block, Rails runs it with the model's default scope removed
     # from every relation built inside, and returns the block's value.
+    # Rails runs that block as `relation.scoping { … }`, so the bare
+    # relation is also the model's current scope: an outer `scoping` of
+    # the model does not reach in.
     def self.unscoped
       if block_given?
         tables = ActiveRecord::Relation.unscoped_tables
         tables << _table_sql
         value = nil
         begin
-          value = yield
+          value = ActiveRecord::Relation.new(self, false).scoping { yield }
         ensure
           tables.pop
         end
@@ -1626,22 +1629,29 @@ module ActiveRecord
       {}
     end
 
-    # A default-scoped model is read only through its Relation, which
-    # applies the scope (or not, inside `unscoped { }`): these class
+    # Whether a class-level read has to go through the Relation, the one
+    # place that applies a default scope (or not, inside `unscoped { }`)
+    # and a current scope (`rel.scoping { … }` of this model), as every
+    # Rails class-level query starts from `all`.
+    def self._read_through_relation?
+      !_default_scope_where.empty? || !ActiveRecord::Relation.current_scope_for(self).nil?
+    end
+
+    # A scoped model is read only through its Relation: these class
     # forms answer from it rather than from the model's whole-table
     # adapter primitives, which base.rb's defaults use.
     def self.count
-      return all.count unless _default_scope_where.empty?
+      return all.count if _read_through_relation?
       _adapter_count
     end
 
     def self.last
-      return all.last unless _default_scope_where.empty?
+      return all.last if _read_through_relation?
       _adapter_last
     end
 
     def self.destroy_all
-      return all.destroy_all unless _default_scope_where.empty?
+      return all.destroy_all if _read_through_relation?
       records = _adapter_all
       records.each { |r| r.destroy() }
       records

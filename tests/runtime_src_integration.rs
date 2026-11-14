@@ -1345,7 +1345,10 @@ fn every_runtime_method_body_concretely_typed() {
     // `then` block's value, a type parameter RBS here cannot declare, so
     // its `value` and `then` read an untyped value (+3 in
     // active_record/relation.rb; `analyze::promise` types the call sites).
-    const CEILING: usize = 989;
+    // MEASURED 990 on scoping: `Relation#scoping` answers what its block
+    // gives (+3 in active_record/relation.rb), and `Model.unscoped { }`
+    // now runs its block through it (-2 in active_record/connection.rb).
+    const CEILING: usize = 990;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

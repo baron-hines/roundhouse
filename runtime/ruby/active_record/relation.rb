@@ -159,6 +159,21 @@ module ActiveRecord
     # model's `default_scope { where(…) }` is added here, when the
     # relation is built, as Rails evaluates it — every query root on a
     # model is a `Relation.new`, so this is the one place it applies.
+    #
+    # Inside `rel.scoping { … }` of the same model the root starts from
+    # that relation instead, as Rails' `all` answers `scope.clone`
+    # (scoping/named.rb): its conditions, order, limit, offset, select
+    # and preloads, in place of the default scope. `Model.unscoped`
+    # (`scoped` false) is Rails' bare `relation`, which never reads it.
+    #
+    # Known gap: Rails builds an association's relation from
+    # `scope_for_association`, which ignores the current scope. The
+    # compiler's association seeds are `Relation.new(Target)` too; the
+    # `where_scope` seed (a class method reached through an association)
+    # drops what it copied, but the `where` seeds (an association chain
+    # such as `owner.items.where(…)`, a through reader, a preload batch)
+    # cannot be told from a class-level `Target.where`, so under a
+    # `scoping` of their target model they keep that scope.
     def initialize(model, scoped = true)
       @model = model
       @table = model._table_sql
@@ -205,7 +220,104 @@ module ActiveRecord
       @friendly = false
       names = @model._sti_type_names
       where!(type: names) unless names.empty?
-      apply_default_scope! if scoped
+      @inherited_scope = false
+      scope = scoped ? Relation.current_scope_for(@model) : nil
+      if scope.nil?
+        apply_default_scope! if scoped
+      else
+        scope.copy_query_state_to(self)
+        @inherited_scope = true
+      end
+    end
+
+    # The innermost `scoping { … }` relation of exactly this model on
+    # this thread, or nil. A scope of an STI relative is not taken: Rails
+    # merges an ancestor's scope (`relation.merge!(scope)`) rather than
+    # cloning it, which this runtime does not model.
+    def self.current_scope_for(model)
+      scopes = Db._current_scopes
+      return nil if scopes.nil?
+      # Innermost last: the last match wins.
+      found = nil
+      scopes.each { |scope| found = scope if scope.model.name == model.name }
+      found
+    end
+
+    # Rails' `Relation#scoping`: for the block, this relation is the
+    # current scope of its model, so `Model.all`, `Model.where` and every
+    # other class-level query start from it. Per thread, as Rails' scope
+    # registry is, and restored after the block, also when it raises.
+    # Answers the block's value.
+    def scoping
+      scopes = Db._push_current_scope(self)
+      begin
+        yield
+      ensure
+        scopes.pop
+      end
+    end
+
+    # Copy this relation's query state onto `target`, as Rails' `clone`
+    # copies a relation's values: not its loaded rows or memos.
+    def copy_query_state_to(target)
+      target.take_query_lists(
+        @wheres,
+        @where_cols,
+        @where_null,
+        @joins,
+        @orders,
+        @groups,
+        @havings,
+        @ctes,
+        @includes,
+        @scope_attributes
+      )
+      target.take_query_scalars(
+        @select_sql,
+        @distinct,
+        @optimizer_hints,
+        @limit,
+        @offset,
+        @skip_preloading,
+        @null,
+        @none,
+        @opaque_wheres,
+        @from,
+        @readonly,
+        @lock_clause,
+        @friendly
+      )
+    end
+
+    def take_query_scalars(select_sql, distinct, hints, limit, offset, skip_preloading, null, none, opaque, from, readonly, lock_clause, friendly)
+      @select_sql = select_sql
+      @distinct = distinct
+      @optimizer_hints = hints
+      @limit = limit
+      @offset = offset
+      @skip_preloading = skip_preloading
+      @null = null
+      @none = none
+      @opaque_wheres = opaque
+      @from = from
+      @readonly = readonly
+      @lock_clause = lock_clause
+      @friendly = friendly
+      unload_records
+      self
+    end
+
+    # An association's relation ignores the current scope, as Rails'
+    # `scope_for_association` does: put back what a root built outside
+    # any `scoping` holds (the bare relation, then the default scope).
+    # Only the compiler's association seed reaches it, `where_scope`
+    # straight on a `Relation.new`, so nothing else is lost.
+    def drop_inherited_scope!
+      return self unless @inherited_scope
+      @inherited_scope = false
+      Relation.new(@model, false).copy_query_state_to(self)
+      apply_default_scope!
+      self
     end
 
     # Rails' `default_scope`: the model's conditions (`{}` for a model
@@ -434,6 +546,7 @@ module ActiveRecord
     end
 
     def where_scope!(condition)
+      drop_inherited_scope!
       own_lists
       @scope_attributes = condition
       add_condition(condition, [], false)

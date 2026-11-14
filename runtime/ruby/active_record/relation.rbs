@@ -41,6 +41,28 @@ module ActiveRecord
     def initialize: (Base model, ?bool scoped) -> void
     def apply_default_scope!: () -> nil
     def self.unscoped_tables: () -> Array[String]
+    # Rails' current scope (`Relation#scoping`): the innermost scoping
+    # relation of the model on this thread; see `relation.rb`.
+    @inherited_scope: bool
+    def self.current_scope_for: (Base model) -> Relation?
+    def scoping: () { () -> untyped } -> untyped
+    def copy_query_state_to: (Relation target) -> Relation
+    def take_query_scalars: (
+        String? select_sql,
+        bool distinct,
+        String hints,
+        Integer? limit,
+        Integer? offset,
+        bool skip_preloading,
+        bool null,
+        bool none,
+        bool opaque,
+        String? from,
+        bool readonly,
+        String lock_clause,
+        bool friendly
+      ) -> Relation
+    def drop_inherited_scope!: () -> Relation
 
     # Rails' Relation#spawn — copy query state onto a fresh Relation so
     # a scope fork cannot mutate its caller's accumulators.

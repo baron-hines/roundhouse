@@ -247,6 +247,7 @@ module ActiveRecord
     def self.all: () -> Relation
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def self._default_scope_where: () -> Hash[Symbol, untyped]
+    def self._read_through_relation?: () -> bool
     def self._find_in_scope: (Integer | Float | String | nil id) -> Base?
     def self.count: () -> Integer
     def self.last: () -> Base?
