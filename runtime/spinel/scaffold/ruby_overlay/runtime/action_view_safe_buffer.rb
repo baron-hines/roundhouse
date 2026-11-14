@@ -46,8 +46,8 @@ module ActionView
       SafeString.new(value.to_s)
     end
 
-    # Rails' `safe_join`: each part and the separator escaped unless html_safe, the joined markup marked safe. The
-    # shared default joins as written, having no mark to read.
+    # Rails' `safe_join`: each part and the separator escaped unless html_safe, the joined markup a SafeBuffer, so an
+    # `h(...)` of it leaves the markup alone. Not the shared body's join as written, which has no mark to read.
     def self.safe_join(parts, separator = "")
       SafeString.new(Array(parts).flatten.map { |part| html_escape(part) }.join(html_escape(separator)))
     end
