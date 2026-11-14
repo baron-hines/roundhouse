@@ -22271,3 +22271,5 @@ mod safe_join_safe;
 mod relation_merge_order;
 #[path = "emit_and_run/relation_except_only.rs"]
 mod relation_except_only;
+#[path = "emit_and_run/model_delete_by_id.rs"]
+mod model_delete_by_id;

@@ -2676,6 +2676,18 @@ module ActiveRecord
       where(conditions).delete_all
     end
 
+    # Rails' `Relation#delete(id_or_array)` (relation.rb), which Querying
+    # hands `Model.delete(id)` to: `where(primary_key => id_or_array)
+    # .delete_all`, so one DELETE of the rows of those keys under this
+    # relation's own conditions, no callbacks, and the count deleted. Nil
+    # or `[]` deletes nothing. Rails wraps a single key on a composite
+    # primary key; every model here keys on one column
+    # (`composite_primary_key?` is false), so there is nothing to wrap.
+    def delete(id_or_array)
+      return 0 if id_or_array.nil? || (id_or_array.is_a?(Array) && id_or_array.empty?)
+      where(@model.primary_key => id_or_array).delete_all
+    end
+
     # `update_all(...)` — bulk UPDATE scoped by the accumulated WHEREs.
     # Hash form (`update_all(user_id: 3)`) escapes values; String form
     # (`update_all("hits = hits + 1")`) is trusted verbatim, same as

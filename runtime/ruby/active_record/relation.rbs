@@ -340,6 +340,7 @@ module ActiveRecord
     def destroy_all: () -> Array[Base]
     def destroy_by: (Hash[Symbol, untyped] | String conditions) -> Array[Base]
     def delete_by: (Hash[Symbol, untyped] | String conditions) -> Integer
+    def delete: ((Integer | String | Array[Integer | String])? id_or_array) -> Integer
     def update_all: (Hash[Symbol, untyped] | String updates) -> Integer
     def touch_all: (?Symbol? name) -> Integer
     # The WHERE a bulk write takes — a plain clause, or an

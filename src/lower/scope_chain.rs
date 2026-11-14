@@ -3300,8 +3300,14 @@ fn thread_rel(mut args: Vec<Expr>, rel: Expr, leading: Option<&Vec<Param>>, span
 ///
 /// `maximum` / `minimum` likewise: `Base` defines neither, and the arel
 /// pass leaves them to `Relation`'s SQL extrema.
+///
+/// `delete(id_or_array)` too: Querying delegates it to `all`, and
+/// Relation#delete is one DELETE of those keys. It cannot be a
+/// `def self.delete` on Base, because the runtime's signature checks key
+/// a class's methods by name and Base's instance `delete` (the record's
+/// own row, no arguments) already holds it.
 const CLASS_ROOT_TERMINALS: &[&str] = &[
-    "pluck", "pick", "ids", "destroy_by", "delete_by", "maximum", "minimum",
+    "pluck", "pick", "ids", "destroy_by", "delete_by", "delete", "maximum", "minimum",
 ];
 
 /// Relation TERMINALS our runtime implements — a seeded association
