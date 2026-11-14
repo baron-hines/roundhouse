@@ -326,6 +326,24 @@ fn drop_block_given(e: &mut Expr) {
     }
 }
 
+/// `ruby2_keywords(:set_slot)` and its kin lose the names trim left out, and go when none is left: Ruby raises
+/// NameError on a name its class does not define. Not a name the class never defined (`private_class_method :new`
+/// names an inherited method).
+fn keeps_a_named_method(call: &mut Expr, dropped: &HashSet<(bool, String)>) -> bool {
+    let ExprNode::Send { recv: None, method, args, .. } = &mut *call.node else { return true };
+    let class_side = match method.as_str() {
+        "ruby2_keywords" | "private" | "protected" | "public" | "module_function" => false,
+        "private_class_method" | "public_class_method" => true,
+        _ => return true,
+    };
+    let gone = |a: &Expr| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if dropped.contains(&(class_side, value.to_string())));
+    if args.is_empty() || !args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { .. } })) {
+        return true;
+    }
+    args.retain(|a| !gone(a));
+    !args.is_empty()
+}
+
 fn mounted(app: &App, file: FileId) -> bool {
     let Some(lock) = app.gem_lock.as_ref() else { return false };
     app.source_path(file).is_some_and(|path| {
@@ -848,6 +866,8 @@ impl<'a> Gems<'a> {
                 drop_block_given(&mut m.body);
                 blocks_dropped += usize::from(m.body != before);
             }
+            let before: HashSet<(bool, String)> =
+                c.methods.iter().map(|m| (m.receiver == MethodReceiver::Class, m.name.to_string())).collect();
             let owner = c.name.0.to_string();
             c.methods.retain(|m| {
                 // Not one ingest proved never runs (`absence_guards`' gated classes), `initialize` included: no instance is made.
@@ -858,6 +878,10 @@ impl<'a> Gems<'a> {
                     || IMPLICIT.contains(&m.name.as_str())
                     || reached.methods.contains(&(owner.clone(), m.receiver == MethodReceiver::Class, m.name.to_string()))
             });
+            let kept: HashSet<(bool, String)> =
+                c.methods.iter().map(|m| (m.receiver == MethodReceiver::Class, m.name.to_string())).collect();
+            let dropped: HashSet<(bool, String)> = before.difference(&kept).cloned().collect();
+            c.unknown_calls.retain_mut(|call| keeps_a_named_method(call, &dropped));
         }
         // A model's copy of a gem module's method (Devise's `Models.config` writers, copied onto `User`) goes with the
         // original: a call on the model reaches the original through the model's ancestors, so an unreached original

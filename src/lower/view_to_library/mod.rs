@@ -6767,14 +6767,29 @@ pub(crate) fn lexxy_uses_editor_adapter(lock: &crate::gems::Lockfile) -> bool {
 }
 
 /// The instance methods of the modules a gem's load hook mixes into `ActionView::Base`.
-fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<String> {
-    app.library_classes
+pub(crate) fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<String> {
+    // Not only the modules the hook names: what those include is in the view too.
+    let mut pending: Vec<&crate::ident::ClassId> = app
+        .library_classes
         .iter()
         .filter(|c| c.name.0.as_str() == "ActionView::Base")
         .flat_map(|c| c.includes.iter())
-        .flat_map(|m| app.library_classes.iter().filter(move |c| c.name == *m))
-        .flat_map(|c| c.methods.iter())
-        .filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public)
-        .map(|m| m.name.as_str().to_string())
-        .collect()
+        .collect();
+    let mut seen = crate::det::HashSet::default();
+    let mut out = crate::det::HashSet::default();
+    while let Some(module) = pending.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        for c in app.library_classes.iter().filter(|c| c.name == *module) {
+            out.extend(
+                c.methods
+                    .iter()
+                    .filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public)
+                    .map(|m| m.name.as_str().to_string()),
+            );
+            pending.extend(c.includes.iter());
+        }
+    }
+    out
 }

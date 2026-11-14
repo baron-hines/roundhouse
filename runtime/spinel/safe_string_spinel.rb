@@ -80,6 +80,16 @@ module ActionView
     def self.raw(value)
       SafeString.new(value.to_s)
     end
+
+    # Rails' `safe_join`: each part and the separator escaped unless html_safe, the joined markup marked safe.
+    def self.safe_join(parts, separator = "")
+      out = +""
+      parts.flatten.each_with_index do |part, i|
+        out << html_escape(separator) if i > 0
+        out << html_escape(part)
+      end
+      SafeString.new(out)
+    end
   end
 
   class Base
@@ -90,6 +100,12 @@ module ActionView
       return SafeString.new(value.to_s) if value.is_a?(ActionView::OutputBuffer)
       return nil unless value.is_a?(String)
       ActionView::ViewHelpers.html_escape(value)
+    end
+
+    # Rails' `render(renderable)` from a view: the object renders itself on this view (a component's `render_in`).
+    # Not a partial or a template by name, which no view context here looks up.
+    def render(options = {}, args = {}, &block)
+      options.render_in(self, &block)
     end
   end
 end
