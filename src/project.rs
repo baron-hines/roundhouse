@@ -2008,6 +2008,21 @@ fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app:
     Ok(())
 }
 
+/// The ruby overlay's `ActiveSupport::Gzip` only where a file of the tree names it, as Spinel's
+/// (`inject_spinel_active_support_requires`).
+fn drop_unnamed_gzip(files: &mut Vec<(String, String)>) {
+    let named = files
+        .iter()
+        .any(|(p, text)| p.ends_with(".rb") && !p.starts_with("runtime/") && (text.contains("Gzip.decompress") || text.contains("Gzip.compress")));
+    if named {
+        return;
+    }
+    files.retain(|(p, _)| p != "runtime/active_support_gzip.rb");
+    if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
+        *boot = boot.replace("require_relative \"runtime/active_support_gzip\"\n", "");
+    }
+}
+
 /// `boot.rb` requires `runtime/array_column` after the JSON-column seam,
 /// only for an app with a stored array column (`lower::array_columns`).
 /// The ruby overlay's boot replaces Spinel's, so both trees call this.
@@ -5773,6 +5788,7 @@ fn ruby_family_runtime_files(
         inject_cruby_date_calendar_boot_requires(&mut files)?;
     }
     inject_array_column_require(&mut files, app)?;
+    drop_unnamed_gzip(&mut files);
     // Re-apply after the gem_facades rewrite above: the CRuby/JRuby
     // content replaces the spinel-tree file that `apply_pay_demand`
     // already annotated in `spinel_files`.

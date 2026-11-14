@@ -133,7 +133,7 @@ pub fn app() -> Option<emit_and_run::Overlay> {
 /// tree replaces (`ActionView::Template`, its `class_eval`s), translations (`I18n` internals, keyword splats through
 /// `super`), collections (`ActionView::PartialIteration`), and method_source's computed requires.
 #[allow(dead_code)]
-pub const KNOWN_GAPS: [&str; 12] = [
+pub const KNOWN_GAPS: [&str; 11] = [
     "@render_args has no known type",
     "@example_name has no known type",
     "@preview has no known type",
@@ -142,7 +142,6 @@ pub const KNOWN_GAPS: [&str; 12] = [
     "conditional or dynamic visibility declarations are not modeled",
     "railtie middleware not supported (all targets)",
     "constant not supported (all targets): Rails::Engine",
-    "Module protocol not supported (all targets): method_defined? requires",
     "constant not supported (all targets): I18n::RESERVED_KEYS",
     "constant not supported (all targets): ActionView::PartialIteration",
     "file_statement_unsupported not supported (ruby)",

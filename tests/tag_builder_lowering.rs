@@ -243,16 +243,16 @@ fn button_to_without_a_block_is_left_to_the_runtime() {
 }
 
 #[test]
-fn button_to_with_computed_options_declines() {
+fn button_to_with_computed_options_reads_them_at_run_time() {
     // A `merge` chain has nothing to split `method:`/`form_class:` out
     // of at compile time, and those two decide the FORM rather than the
-    // button. Leave the site loud instead of rendering a POST form for
-    // what the caller meant as a PUT.
+    // button: the runtime's `button_to_html` reads them out as it runs,
+    // so a PUT the caller meant stays a PUT.
     let (out, _) = helper(r#"button_to "/rooms/1", opts.merge(class: "btn") do
       "x"
     end"#);
-    assert!(out.contains("button_to \""), "computed options should decline:\n{out}");
-    assert!(!out.contains("<form action="), "declined site must not expand:\n{out}");
+    assert!(out.contains("button_to_html(\"/rooms/1\""), "computed options go to the runtime:\n{out}");
+    assert!(!out.contains("button_to \""), "no bare button_to is left:\n{out}");
 }
 
 #[test]
