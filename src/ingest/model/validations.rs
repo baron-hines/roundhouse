@@ -1892,6 +1892,9 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
         {
             block.clone()
         }
+        // A set computed from constants (`in: DATE_FORMATS.map(&:last)`, `I18n.available_locales.map(&:to_s)`): Rails
+        // evaluates it once as the class loads; with no read of self it is the same set at validation time.
+        ExprNode::Send { recv: Some(_), .. } if !reads_implicit_self(&expr) => return Some(InclusionSpec::Call(expr)),
         _ => return None,
     };
     let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else {
