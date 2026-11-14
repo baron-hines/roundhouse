@@ -1273,7 +1273,7 @@ module ActiveRecord
       now = _database_now_sql
       stamps = _bulk_stamps(cols, record_timestamps)
       tuples = keyed.map do |row|
-        values = cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }
+        values = cols.map { |c| _written_sql(c, row[c]) }
         "(" + (values + stamps.map { |_c| now }).join(", ") + ")"
       end
 
@@ -1349,7 +1349,7 @@ module ActiveRecord
       now = _database_now_sql
       stamps = _bulk_stamps(cols, record_timestamps)
       tuples = keyed.map do |row|
-        values = cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }
+        values = cols.map { |c| _written_sql(c, row[c]) }
         "(" + (values + stamps.map { |_c| now }).join(", ") + ")"
       end
 
@@ -1906,6 +1906,23 @@ module ActiveRecord
     # is what the row held.
     def self.decode_plucked(column, value)
       value
+    end
+
+    # The value a bulk write (`update_all`, `insert_all`, `upsert_all`)
+    # gives a column, as a record's save would store it. A model with a
+    # stored PostgreSQL array column overrides this to encode that
+    # column's Array (`ArrayColumn.dump`: JSON on SQLite, the array
+    # literal on PostgreSQL); every other value, an Array into a json
+    # column included, is written as given.
+    def self.encode_written(column, value)
+      value
+    end
+
+    # One value of a bulk write as SQL: an Array through `encode_written`
+    # first, every value through the adapter's quoting.
+    def self._written_sql(column, value)
+      value = encode_written(column, value) if value.is_a?(Array)
+      ActiveRecord.adapter.escape_value(value)
     end
 
     # Not in base.rb: a block here would put one on every strict target's runtime.
