@@ -7140,9 +7140,10 @@ fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef
     if !param.rest || param.keyword || method.block_param.is_some() || method.has_anonymous_block {
         return None;
     }
-    let first = match &*method.body.node {
-        ExprNode::Seq { exprs } => exprs.first()?,
-        _ => &method.body,
+    // The store and, after it, at most the reader's `@x ||= default`: anything else is an effect the init would drop.
+    let (first, rest): (&Expr, &[Expr]) = match &*method.body.node {
+        ExprNode::Seq { exprs } => (exprs.first()?, &exprs[1..]),
+        _ => (&method.body, &[]),
     };
     let reads_rest = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name == &param.name);
     let store = match &*first.node {
@@ -7156,6 +7157,18 @@ fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef
     };
     let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*store.node else { return None };
     if !reads_rest(value) {
+        return None;
+    }
+    let reads_slot = |e: &Expr| matches!(&*e.node, ExprNode::Ivar { name: n } if n == name);
+    let only_its_reader = match rest {
+        [] => true,
+        [read] => match &*read.node {
+            ExprNode::OpAssign { target: LValue::Ivar { name: n }, .. } => n == name,
+            _ => reads_slot(read),
+        },
+        _ => false,
+    };
+    if !only_its_reader {
         return None;
     }
     let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };

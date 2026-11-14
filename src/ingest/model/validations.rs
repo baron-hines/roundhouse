@@ -1486,8 +1486,12 @@ fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
                         .ok()
                         .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
                 };
+                // A repeated option is the last one written, as a Ruby Hash keeps it.
                 match bound {
-                    Some(bound) => checks.push((Symbol::from(key.as_str()), bound)),
+                    Some(bound) => {
+                        checks.retain(|(option, _)| option.as_str() != key.as_str());
+                        checks.push((Symbol::from(key.as_str()), bound));
+                    }
                     None => gaps.push(format!("comparison: {key}")),
                 }
             }
@@ -1994,15 +1998,20 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
 }
 
 /// The receiver chain under `e` starts at a constant holding a value (`DATE_FORMATS`, `Period::PERIODS`) or at
-/// `I18n`, not at a class.
+/// `I18n.available_locales`, not at a class.
 fn rooted_at_a_value_constant(e: &crate::expr::Expr) -> bool {
     use crate::expr::ExprNode;
     match &*e.node {
+        // Not `I18n.t(…)`, whose value is the request's locale's: only the locale list is the same set however late.
+        ExprNode::Send { recv: Some(r), method, .. }
+            if method.as_str() == "available_locales" && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["I18n"])) =>
+        {
+            true
+        }
         ExprNode::Send { recv: Some(r), .. } => rooted_at_a_value_constant(r),
         ExprNode::Const { path } => {
             let names: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
-            names == ["I18n"]
-                || names.last().is_some_and(|n| n.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            names.last().is_some_and(|n| n.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
         }
         _ => false,
     }

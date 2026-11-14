@@ -1,18 +1,24 @@
 //! `validates :attr, comparison: { … }` (Rails' `ComparisonValidator`, activemodel 8.1): each option's bound is read
 //! on the record as it validates (a lambda's body run on it, maybe's `greater_than: -> { min_supported_date }`; a
 //! Symbol's method; a literal), a nil or blank value is "can't be blank", and the message's `%{count}` is the bound
-//! (`must be greater than 2020-01-01`). Ingest refused the validator ("comparison").
+//! (`must be greater than 2020-01-01`); the last of a repeated option is checked, and an `ArgumentError` a check raises
+//! is its error (`comparison of Integer with nil failed`). Ingest refused the validator ("comparison").
 
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
 
-const COLUMNS: &str = "create_table \"articles\", force: :cascade do |t|\n    t.date \"published_on\"\n    t.integer \"rank\"";
+const COLUMNS: &str = "create_table \"articles\", force: :cascade do |t|\n    t.date \"published_on\"\n    t.integer \"rank\"\n    t.integer \"score\"";
 
 const MODEL: &str = r#"class Article < ApplicationRecord
   has_many :comments, dependent: :destroy
   validates :published_on, comparison: { greater_than: -> { min_date } }, allow_nil: true
   validates :rank, comparison: { less_than_or_equal_to: 10, other_than: :banned_rank }, allow_nil: true
+  validates :score, comparison: { greater_than: 10, greater_than: :no_floor }, allow_nil: true
+
+  def no_floor
+    nil
+  end
 
   def min_date
     Date.new(2020, 1, 1)
@@ -45,6 +51,10 @@ check("literal message", high.errors.to_a, ["Rank must be less than or equal to 
 banned = Article.new(**valid, rank: 7)
 check("the symbol's value", banned.valid?, false)
 check("symbol message", banned.errors.to_a, ["Rank must be other than 7"])
+# The last of a repeated option is the one checked; an ArgumentError of a check is its error, as Rails rescues it.
+scored = Article.new(**valid, score: 5)
+check("repeated option, nil bound", scored.valid?, false)
+check("rescued message", scored.errors.to_a, ["Score comparison of Integer with nil failed"])
 puts "comparison passed"
 "##;
 
