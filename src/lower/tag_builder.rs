@@ -533,8 +533,14 @@ fn rewrite(
     // 200 and a green suite, because no gate reads the attributes of a tag.
     // `computed_attrs` did not catch it: it required `args.len() > 1`, and
     // a call whose arguments are entirely keywords has exactly one.
+    // With a block, Rails reads a lone argument as the options (`tag.dialog class: "x", **opts do`, whose merge chain
+    // starts at the literal rather than at the splat); only a written String is content there.
+    let block_options = block.is_some()
+        && args.len() == 1
+        && opts.is_none()
+        && !matches!(&*args[0].node, ExprNode::StringInterp { .. } | ExprNode::Lit { value: Literal::Str { .. } });
     let lone_computed_attrs =
-        args.len() == 1 && opts.is_none() && is_kwsplat_merge_chain(&args[0]);
+        args.len() == 1 && opts.is_none() && (is_kwsplat_merge_chain(&args[0]) || block_options);
     if lone_computed_attrs {
         content = None;
     }
@@ -1039,10 +1045,13 @@ fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     // `&block` turns out nil (maybe's `content_tag(:button, label, id:, &block)`), which Rails' `block_given?` reads.
     let (content, opts) = match block {
         Some(_) if args.len() > 2 => (args.get(1).cloned(), args.get(2).cloned()),
-        // `content_tag(:span, "Save", &block)`: not options unless a Hash, so the content a nil block leaves.
+        // `content_tag(:span, "Save", &block)`: not options unless a Hash, so the content a nil block leaves. Only a
+        // literal: a lone `**opts` reads here as the bare value, which is the options.
         Some(b)
             if matches!(&*b.node, ExprNode::Var { .. })
-                && args.get(1).is_some_and(|a| !matches!(&*a.node, ExprNode::Hash { .. }) && !is_kwsplat_merge_chain(a)) =>
+                && args.get(1).is_some_and(|a| {
+                    matches!(&*a.node, ExprNode::StringInterp { .. } | ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
+                }) =>
         {
             (args.get(1).cloned(), None)
         }
