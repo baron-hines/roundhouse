@@ -3963,8 +3963,29 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 .map(|n| Symbol::from(n.as_str()))
                 .collect()
         };
-        let inherited_instance = inherited(false);
+        let mut inherited_instance = inherited(false);
         let inherited_class = inherited(true);
+        // An app helper's name a parent answers (maybe's `DS::Buttonish#icon` beside `ApplicationHelper#icon`): the bare
+        // call is that method. Not through a helper module the chain includes, whose methods turn into module functions.
+        if !is_helper_module && !is_template {
+            let mut pending: Vec<&ClassId> = lc.parent.iter().collect();
+            let mut seen = crate::det::HashSet::default();
+            while let Some(class) = pending.pop() {
+                if !seen.insert(class.clone()) || app.helper_modules.contains(class) {
+                    continue;
+                }
+                for part in app.library_classes.iter().filter(|c| &c.name == class) {
+                    inherited_instance.extend(
+                        part.methods
+                            .iter()
+                            .filter(|m| m.receiver == MethodReceiver::Instance && app.helper_method_index.contains_key(&m.name))
+                            .map(|m| m.name.clone()),
+                    );
+                    pending.extend(part.parent.iter());
+                    pending.extend(part.includes.iter());
+                }
+            }
+        }
         if is_helper_module {
             // Not flipped too: `module_function`'s private instance copy would become a second, private `def self.x`.
             let class_side: Vec<(Symbol, crate::span::Span)> = lc
