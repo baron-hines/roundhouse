@@ -167,27 +167,46 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
             let (module, stem) = super::partial_name_to_key(partial, &ctx.resource_dir, &ctx.partial_stems);
             let record = match ctx.strict_locals.get(&(module.clone(), stem.clone())) {
                 Some(decl) => decl[0].name.as_str().to_string(),
-                None => singularize(&snake_case(last_segment(&module))),
+                None => ctx
+                    .partial_record_locals
+                    .get(&(module.clone(), stem.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| singularize(&snake_case(last_segment(&module)))),
             };
+            // An `object:` beside `locals:` where either runs code: every
+            // value but a literal binds to a temp in the order the options
+            // hash writes them, as Ruby evaluates it. A plain read is bound
+            // too, since a local after it may assign what it reads.
+            if let Some(o) = object.filter(|_| !entries.is_empty()) {
+                if reads_without_effect(o, ctx) && entries.iter().all(|(_, v)| reads_without_effect(v, ctx)) {
+                    let call = named_partial_object_call(partial, *arg, *locals, Some(o), ctx)?;
+                    return Some(accumulator_append_call(call, ctx));
+                }
+                let mut binds = Vec::new();
+                let mut bind_object = |binds: &mut Vec<Expr>| {
+                    if matches!(&*o.node, ExprNode::Lit { .. }) {
+                        return o.clone();
+                    }
+                    let name = Symbol::from(format!("__object_{}", o.span.start));
+                    binds.push(bind_temp(&name, o.clone()));
+                    Expr { span: o.span, ..var_ref(name) }
+                };
+                let object_first = o.span.start < entries[0].0.span.start;
+                let early = object_first.then(|| bind_object(&mut binds));
+                let bound = bind_local_values(entries, entries[0].1.span, &mut binds);
+                let object = early.unwrap_or_else(|| bind_object(&mut binds));
+                binds.push(accumulator_append_call(named_partial_object_call(partial, *arg, Some(&bound), Some(&object), ctx)?, ctx));
+                return Some(seq(binds));
+            }
             if !evaluated_out_of_order(entries, call_position(&module, &stem, Some(&record), ctx), ctx) {
                 let call = named_partial_object_call(partial, *arg, *locals, *object, ctx)?;
                 return Some(accumulator_append_call(call, ctx));
             }
             // The temps are named after the first local's value, as a
             // collection's are after the collection.
-            // An `object:` that runs code, written before the `locals:`,
-            // runs before them, as Ruby evaluates the options hash.
             let mut binds = Vec::new();
-            let object = object.map(|o| {
-                if reads_without_effect(o, ctx) || o.span.start > entries[0].0.span.start {
-                    return o.clone();
-                }
-                let name = Symbol::from(format!("__object_{}", o.span.start));
-                binds.push(bind_temp(&name, o.clone()));
-                Expr { span: o.span, ..var_ref(name) }
-            });
             let bound = bind_effectful_locals(entries, entries[0].1.span, ctx, &mut binds);
-            binds.push(accumulator_append_call(named_partial_object_call(partial, *arg, Some(&bound), object.as_ref(), ctx)?, ctx));
+            binds.push(accumulator_append_call(named_partial_object_call(partial, *arg, Some(&bound), *object, ctx)?, ctx));
             Some(seq(binds))
         }
         // `render layout: "x" do … end` needs MULTIPLE statements (the
@@ -435,6 +454,26 @@ fn bind_effectful_locals(
         .enumerate()
         .map(|(i, (k, v))| {
             if reads_without_effect(v, ctx) {
+                return (k.clone(), v.clone());
+            }
+            let key = local_key_name(k)
+                .filter(|n| n.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()))
+                .unwrap_or_else(|| i.to_string());
+            let name = Symbol::from(format!("__local_{}_{key}", site.start));
+            binds.push(bind_temp(&name, v.clone()));
+            (k.clone(), Expr { span: v.span, ..var_ref(name) })
+        })
+        .collect()
+}
+
+/// Every `locals:` value but a literal, bound to a temp in order (see
+/// `bind_effectful_locals`, which binds only the ones that run code).
+fn bind_local_values(entries: &[(Expr, Expr)], site: Span, binds: &mut Vec<Expr>) -> Vec<(Expr, Expr)> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| {
+            if matches!(&*v.node, ExprNode::Lit { .. }) {
                 return (k.clone(), v.clone());
             }
             let key = local_key_name(k)

@@ -4,7 +4,7 @@
 //! the local is the partial's own name (`shared/_person` reads `person`).
 //! The partial took the object under its directory's name (`shared`) and
 //! read `someone` bare: `wrong number of arguments (given 0, expected
-//! 1..3)`, the partial's own module function. An `object:` with `locals:` beside it is still the `as:` local, and a partial rendered `as: :class` takes `locals: { class: }` under that name. A partial reading the caller's `@article` still reads it when an `object:` render with `locals:` names its own local `article`, which the partial doesn't read. A partial that yields, rendered with `object:` and `locals:` and no block, yields nothing. An `object:` is evaluated before the `locals:` written after it.
+//! 1..3)`, the partial's own module function. An `object:` with `locals:` beside it is still the `as:` local, and a partial rendered `as: :class` takes `locals: { class: }` under that name. A partial reading the caller's `@article` still reads it when an `object:` render with `locals:` names its own local `article`, which the partial doesn't read. A partial that yields, rendered with `object:` and `locals:` and no block, yields nothing. An `object:` is evaluated before the `locals:` written after it, and after the ones written before it, and a plain read in `object:` is the value before a later local reassigns it.
 
 use super::emit_and_run;
 
@@ -46,6 +46,8 @@ end
         .write("app/views/probes/person.html.erb", r##"<p id="r">[<%= render partial: "shared/badge", object: @article, as: "someone" %>|<%= render partial: "shared/badge", object: @article, as: :someone %>|<%= render partial: "shared/person", object: @article %>|<%= render partial: "shared/badge", locals: { someone: @article } %>|<%= render partial: "shared/card", collection: [@article], as: :article %>|<%= render partial: "shared/card", object: @article, locals: { article: @article } %>|<%= render partial: "shared/badge", object: @article, as: :someone, locals: { label: "x" } %>|<%= render partial: "shared/klass", collection: [@article], as: :class %>|<%= render partial: "shared/klass", locals: { class: @article } %>]</p>
 <p id="y"><%= render layout: "shared/box" do %>in<% end %>|<%= render partial: "shared/box", object: @article, locals: { caption: "x" } %></p>
 <p id="o"><%= render partial: "probes/ticked", object: tick_record("o"), locals: { zeta: tick("z"), alpha: tick("a") } %>[<%= TickLog.log %>]</p>
+<p id="o2"><%= render partial: "probes/ticked", locals: { alpha: tick("l"), zeta: "z" }, object: tick_record("p") %>|<%= render partial: "shared/badge", locals: { label: tick("q"), someone: tick_record("s") } %>[<%= TickLog.log %>]</p>
+<p id="o3"><% @pick = Article.first %><%= render partial: "probes/ticked", object: @pick, locals: { zeta: (@pick = Article.last).title, alpha: tick("r") } %></p>
 <p id="t"><%= render partial: "articles/teaser", object: @other, as: :article, locals: { caption: "x" } %></p>
 "##)
         .write("app/views/shared/_badge.html.erb", r##"<b><%= someone.title %></b>
@@ -77,6 +79,8 @@ class ProbesControllerTest < ActionDispatch::IntegrationTest
     assert_includes response.body, "[<b>#{t}</b>\n|<b>#{t}</b>\n|<span>#{t}</span>\n|<b>#{t}</b>\n|<i>#{t}</i>\n|<i>#{t}</i>\n|<b>#{t}</b>\n|<u>#{t}</u>\n|<u>#{t}</u>\n]"
     assert_includes response.body, "<p id=\"y\"><q>in</q>\n|<q></q>\n</p>"
     assert_includes response.body, "<p id=\"o\">#{t}:az\n[oza]</p>"
+    assert_includes response.body, "<p id=\"o2\">#{t}:lz\n|<b>#{t}</b>\n[ozalpqs]</p>"
+    assert_includes response.body, "<p id=\"o3\">#{t}:r#{Article.last.title}\n</p>"
     assert_not_equal t, Article.last.title
     assert_includes response.body, "<p id=\"t\"><s>#{t}</s>\n</p>"
   end
@@ -106,6 +110,8 @@ raise body unless body.include?("[<b>Title</b>\n|<b>Title</b>\n|<span>Title</spa
 raise body unless body.include?("<p id=\"t\"><s>Title</s>\n</p>")
 raise body unless body.include?("<p id=\"y\"><q>in</q>\n|<q></q>\n</p>")
 raise body unless body.include?("<p id=\"o\">Title:az\n[oza]</p>")
+raise body unless body.include?("<p id=\"o2\">Title:lz\n|<b>Title</b>\n[ozalpqs]</p>")
+raise body unless body.include?("<p id=\"o3\">Title:rOther\n</p>")
 puts "probe passed"
 "##;
 
