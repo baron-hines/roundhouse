@@ -267,6 +267,13 @@ pub struct ClassInfo {
     /// what `respond_to?` (public only, by default) answers `false` for
     /// although the class defines it (`lower::respond_to`).
     pub nonpublic_instance_methods: crate::det::HashSet<Symbol>,
+    /// Names whose only `instance_methods` entry is a sidecar signature
+    /// (`app.rbs_signatures`), which names class methods too: nothing
+    /// generated (a column, association, `attr_accessor`, ...) had
+    /// registered the name before it. `lower::respond_to` does not take
+    /// such an entry for an instance method when the source defines it
+    /// class-side.
+    pub sidecar_only_instance_methods: crate::det::HashSet<Symbol>,
     /// The public ones. A name in both sets has a public and a non-public
     /// definition across reopenings, and which one Ruby keeps is load
     /// order, so `lower::respond_to` answers it neither way.
