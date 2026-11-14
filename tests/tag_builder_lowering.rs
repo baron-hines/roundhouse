@@ -265,3 +265,18 @@ fn an_underscored_name_builds_its_custom_element() {
     assert!(out.contains("></lexxy-prompt>"), "{out}");
     assert_eq!(diags, 0, "{out}");
 }
+
+#[test]
+fn content_tag_keeps_its_content_where_a_forwarded_block_is_nil() {
+    // Rails reads a non-Hash after the name as options only when a block is given; a nil `&block` leaves it content.
+    let out = lower("module H\n  def h(&block)\n    content_tag(:span, \"Save\", &block)\n  end\nend\n").0;
+    assert!(out.contains("block.nil?"), "{out}");
+    assert!(out.contains("\"Save\""), "{out}");
+    assert!(out.contains("</span>"), "{out}");
+}
+
+#[test]
+fn a_textarea_content_tag_keeps_rails_leading_newline() {
+    let (out, _) = helper(r#"content_tag(:textarea, "x", class: "a")"#);
+    assert!(out.contains(">\\n"), "{out}");
+}

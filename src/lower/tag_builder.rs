@@ -1039,6 +1039,13 @@ fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     // `&block` turns out nil (maybe's `content_tag(:button, label, id:, &block)`), which Rails' `block_given?` reads.
     let (content, opts) = match block {
         Some(_) if args.len() > 2 => (args.get(1).cloned(), args.get(2).cloned()),
+        // `content_tag(:span, "Save", &block)`: not options unless a Hash, so the content a nil block leaves.
+        Some(b)
+            if matches!(&*b.node, ExprNode::Var { .. })
+                && args.get(1).is_some_and(|a| !matches!(&*a.node, ExprNode::Hash { .. }) && !is_kwsplat_merge_chain(a)) =>
+        {
+            (args.get(1).cloned(), None)
+        }
         Some(_) => (None, args.get(1).cloned()),
         None => (args.get(1).cloned(), args.get(2).cloned()),
     };
@@ -1057,6 +1064,10 @@ fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("<{name}") }];
     append_attr_parts(&mut parts, &entries);
     parts.push(InterpPart::Text { value: ">".to_string() });
+    // Rails' `PRE_CONTENT_STRINGS`: the newline the parser drops, so a textarea's own leading one survives.
+    if name == "textarea" {
+        parts.push(InterpPart::Text { value: "\n".to_string() });
+    }
     match (block, content) {
         (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
             let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });

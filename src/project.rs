@@ -1960,7 +1960,7 @@ fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app:
         requires.push_str("require_relative \"runtime/ordered_options_spinel\"\n");
         sigs.push("ordered_options_spinel");
     }
-    if own(&|text| text.contains("Gzip.decompress") || text.contains("Gzip.compress")) {
+    if own(&|text| text.contains("Gzip.decompress") || text.contains("Gzip.compress") || text.contains("ActiveSupport::Gzip")) {
         requires.push_str("require_relative \"runtime/active_support_gzip_spinel\"\n");
         sigs.push("active_support_gzip_spinel");
     }
@@ -2013,7 +2013,11 @@ fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app:
 fn drop_unnamed_gzip(files: &mut Vec<(String, String)>) {
     let named = files
         .iter()
-        .any(|(p, text)| p.ends_with(".rb") && !p.starts_with("runtime/") && (text.contains("Gzip.decompress") || text.contains("Gzip.compress")));
+        .any(|(p, text)| {
+            p.ends_with(".rb")
+                && !p.starts_with("runtime/")
+                && (text.contains("Gzip.decompress") || text.contains("Gzip.compress") || text.contains("ActiveSupport::Gzip"))
+        });
     if named {
         return;
     }
@@ -5788,7 +5792,6 @@ fn ruby_family_runtime_files(
         inject_cruby_date_calendar_boot_requires(&mut files)?;
     }
     inject_array_column_require(&mut files, app)?;
-    drop_unnamed_gzip(&mut files);
     // Re-apply after the gem_facades rewrite above: the CRuby/JRuby
     // content replaces the spinel-tree file that `apply_pay_demand`
     // already annotated in `spinel_files`.
@@ -5798,6 +5801,8 @@ fn ruby_family_runtime_files(
     }
     apply_conditional_declarations(&mut files, app);
     apply_file_programs(&mut files, app);
+    // After the file programs: a gem's top-level file may be the only code that calls it.
+    drop_unnamed_gzip(&mut files);
     // After every pass that writes app code into a file: the boot
     // program (an initializer may be the only caller) and the file
     // programs (a top-level statement may be).

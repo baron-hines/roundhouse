@@ -30,7 +30,7 @@ pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfil
         if lock.is_in_repo(name) {
             continue;
         }
-        match installed_gem(vfs, &roots, name, version) {
+        match installed_gem_locked(vfs, &roots, lock, name, version) {
             Some(dir) => dirs.push((name.clone(), dir)),
             None if NON_ENGINE_LOCALES.iter().any(|(gem, _)| gem == name) => missing.push(format!("{name} {version}")),
             None => {}

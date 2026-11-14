@@ -73,7 +73,7 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
     let Some(prog) = root.as_program_node() else { return };
     for (stmt, scope) in load_time_statements(&prog) {
         let Some(call) = stmt.as_call_node() else { continue };
-        if carry_framework_include(&call, file, app) {
+        if carry_framework_include(&call, &scope, file, app) {
             continue;
         }
         if constant_id_str(&call.name()) != "on_load" {
@@ -460,7 +460,7 @@ fn carry_hook_includes(body: Node<'_>, hook: &str, file: &str, app: &mut App) {
 /// `ActionView::Base.include(M)` written as a statement that runs when the file loads, or in a Railtie's
 /// `initializer` (lucide-rails' `ActionView::Base.include LucideRails::RailsHelper`): the same mixin as the hook's
 /// `include M` and carried the same way, for the classes a hook names.
-fn carry_framework_include(call: &ruby_prism::CallNode<'_>, file: &str, app: &mut App) -> bool {
+fn carry_framework_include(call: &ruby_prism::CallNode<'_>, scope: &[String], file: &str, app: &mut App) -> bool {
     if constant_id_str(&call.name()) != "include" {
         return false;
     }
@@ -470,8 +470,27 @@ fn carry_framework_include(call: &ruby_prism::CallNode<'_>, file: &str, app: &mu
     if !hook_classes().contains(&class.as_str()) {
         return false;
     }
-    let mixins: Option<Vec<String>> =
-        call.arguments().map(|args| args.arguments().iter().map(|a| constant_path_of(&a).map(|p| p.join("::"))).collect()).flatten();
+    // As Ruby resolves the module from where the statement is written (`include RailsHelper` inside `module Vendor`).
+    let mixins: Option<Vec<String>> = call
+        .arguments()
+        .map(|args| {
+            args.arguments()
+                .iter()
+                .map(|a| {
+                    let written = constant_path_of(&a)?;
+                    let rooted = a.as_constant_path_node().is_some_and(|p| super::util::constant_path_is_rooted(&p));
+                    let path = resolve_lexically(&written, rooted, scope, app).unwrap_or_else(|| {
+                        let bare: Vec<String> = written.iter().filter(|s| !s.is_empty()).cloned().collect();
+                        match scope.last() {
+                            Some(outer) if !rooted && bare.len() == 1 => outer.split("::").map(String::from).chain(bare).collect(),
+                            _ => bare,
+                        }
+                    });
+                    Some(path.join("::"))
+                })
+                .collect()
+        })
+        .flatten();
     let Some(mixins) = mixins.filter(|m| !m.is_empty()) else { return false };
     let source = format!("class {class}\n  include {}\nend\n", mixins.join(", "));
     match super::library_class::ingest_library_classes(source.as_bytes(), file) {

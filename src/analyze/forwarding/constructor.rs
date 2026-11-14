@@ -193,32 +193,39 @@ fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
                 && (target == full || full.ends_with(&format!("::{target}")) || target.ends_with(&format!("::{full}")))
         })
     };
+    let mut parts_of: HashMap<&ClassId, Vec<&LibraryClass>> = HashMap::default();
+    for class in super::classes(app) {
+        parts_of.entry(&class.name).or_default().push(class);
+    }
     let mut out = HashSet::default();
-    for class in super::classes(app).filter(|class| !class.is_module) {
-        let defs: Vec<&MethodDef> = class
-            .methods
+    // Every reopening's together: one's plain `initialize` does not answer for another's `super`.
+    for (name, parts) in &parts_of {
+        if parts.iter().any(|class| class.is_module) {
+            continue;
+        }
+        let defs: Vec<&MethodDef> = parts
             .iter()
+            .flat_map(|class| class.methods.iter())
             .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
             .collect();
         if !defs.is_empty()
-            && defs.iter().all(|m| plain(&class.name, m))
-            && !class.unknown_calls.iter().any(prepends)
-            && !prepended_elsewhere(&class.name)
+            && defs.iter().all(|m| plain(name, m))
+            && !parts.iter().any(|class| class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
         {
-            out.insert(class.name.clone());
+            out.insert((*name).clone());
         }
     }
     // A `super`, or no `initialize` at all, lands on the parent's: when that one never passes the call on and no mixin of
     // the owner's own sits between them with an `initialize`, the call stops there too (maybe's `DS::Button` and
     // `DS::Link` under `DS::Buttonish`).
-    let mut parts_of: HashMap<&ClassId, Vec<&LibraryClass>> = HashMap::default();
-    for class in super::classes(app) {
-        parts_of.entry(&class.name).or_default().push(class);
-    }
     let brings_initialize = |module: &ClassId| match parts_of.get(module) {
         None => !catalog_leaves(module.0.as_str(), Question::NewOrInitialize),
         Some(known) => known.iter().any(|c| {
-            !c.is_module || !c.includes.is_empty() || c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+            !c.is_module
+                || !c.includes.is_empty()
+                || c.unknown_calls.iter().any(prepends)
+                || c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
         }),
     };
     let stops_at_parent = |name: &ClassId, parts: &[&LibraryClass], out: &HashSet<ClassId>| {
