@@ -582,7 +582,16 @@ fn untyped_subexpressions_baseline() {
     // branch's 1276): the two notes above add up, +4 and +38.
     // MEASURED 1284 on 2026-11-13 (doorkeeper, on main's 1280): `Base.columns` and `Column`'s `null` argument in
     // active_record/connection.rb (+4), vars on this RBS-less probe; connection.rbs types them for the RBS-paired gate.
-    const CEILING: usize = 1284;
+    // MEASURED 1341 on 2026-11-14 (relation queries, on main's 1268): the
+    // parameters and block values of the Relation methods this branch adds,
+    // vars on this RBS-less probe. `scoping` (+49: `take_query_scalars` 26,
+    // `current_scope_for` 10, `copy_query_state_to` 5, `scoping` 4,
+    // `initialize` 3, `drop_inherited_scope!` 1), `merge_orders!` and
+    // `merge!` (+16), `delete` (+5), `async_count` and `Promise` (+6),
+    // `_missing_attribute` and `_as_json_only` in active_record/connection.rb
+    // (+3), less `unscope_part!` and `order_sql!` (-5, -1). relation.rbs and
+    // connection.rbs type them for the RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1341;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
