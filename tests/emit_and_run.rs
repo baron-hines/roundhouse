@@ -22275,3 +22275,5 @@ mod relation_except_only;
 mod model_delete_by_id;
 #[path = "emit_and_run/querying_delegation.rs"]
 mod querying_delegation;
+#[path = "emit_and_run/bulk_write_window.rs"]
+mod bulk_write_window;

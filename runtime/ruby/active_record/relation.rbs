@@ -419,6 +419,7 @@ module ActiveRecord
     def to_subquery_sql: () -> String
     def select_sql_with: (String default_cols) -> String
     def sql_comment: (String comment) -> String
+    def append_window: (String sql) -> String
     def append_join_where: (String sql) -> String
     def append_group_having: (String sql) -> String
     def count_sql: () -> String

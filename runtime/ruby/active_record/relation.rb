@@ -2791,9 +2791,10 @@ module ActiveRecord
       rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
 
-    # `delete_all` — bulk DELETE scoped by the accumulated WHEREs.
+    # `delete_all` — bulk DELETE scoped by the accumulated WHEREs and
+    # the relation's ORDER BY / LIMIT / OFFSET (`scoped_write_where`).
     # Rails contract: no callbacks, no per-row loads, returns the
-    # affected-row count. ORDER/LIMIT don't apply to bulk ops.
+    # affected-row count.
     def delete_all
       return 0 if @null
       sql = "DELETE FROM #{@table}#{scoped_write_where}"
@@ -2896,17 +2897,28 @@ module ActiveRecord
     # form is what SQLite supports (it has no `DELETE … USING`), and it
     # is portable to every adapter this runtime might grow.
     #
+    # The relation's window goes the same way. Rails' `compile_update` /
+    # `compile_delete` carry its ORDER BY, LIMIT and OFFSET, and the
+    # SQLite and PostgreSQL visitors (`ToSql#prepare_update_statement`)
+    # move them into that key subquery, so `owner.items.limit(3)
+    # .update_all(...)` writes three rows, not every row the WHERE
+    # matches. The key keeps its own name as an alias: an ordering term
+    # here is unqualified (`order(:id)` is `ORDER BY id`) and reads
+    # resolve it against the aliases `_columns_sql` gives every column,
+    # so under a JOIN the subquery needs the same alias for it.
+    #
     # Returns "" for the unscoped case so an unconditional `delete_all`
     # still emits a bare `DELETE FROM <table>` — Rails' truncate-shaped
     # statement, not a subquery over every row.
     def scoped_write_where
-      return "" if @wheres.length == 0 && @joins.length == 0
-      if @joins.length == 0
+      windowed = @orders.length > 0 || !@limit.nil? || !@offset.nil?
+      return "" if @wheres.length == 0 && @joins.length == 0 && !windowed
+      if @joins.length == 0 && !windowed
         return " WHERE #{@wheres.join(" AND ")}"
       end
       key = "#{@table}.#{@model.primary_key}"
-      inner = "SELECT #{key} FROM #{@table} #{@joins.join(" ")}"
-      inner = "#{inner} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
+      key = "#{key} AS #{@model.primary_key}" if windowed
+      inner = append_window(append_join_where("SELECT #{key} FROM #{@table}"))
       " WHERE #{@model.primary_key} IN (#{inner})"
     end
 
@@ -3493,6 +3505,15 @@ module ActiveRecord
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} GROUP BY #{@groups.join(", ")}" if @groups.length > 0
       sql = "#{sql} HAVING #{@havings.join(" AND ")}" if @havings.length > 0
+      sql = append_window(sql)
+      sql = "#{sql} #{@lock_clause}" unless @lock_clause == ""
+      @annotations.each { |comment| sql = "#{sql} /* #{sql_comment(comment)} */" }
+      sql
+    end
+
+    # ORDER BY + LIMIT + OFFSET — shared by reads and the key subquery
+    # a windowed bulk write takes (`scoped_write_where`).
+    def append_window(sql)
       sql = "#{sql} ORDER BY #{@orders.join(", ")}" if @orders.length > 0
       if !@limit.nil?
         sql = "#{sql} LIMIT #{@limit}"
@@ -3503,8 +3524,6 @@ module ActiveRecord
         sql = "#{sql} LIMIT 9223372036854775807"
       end
       sql = "#{sql} OFFSET #{@offset}" unless @offset.nil?
-      sql = "#{sql} #{@lock_clause}" unless @lock_clause == ""
-      @annotations.each { |comment| sql = "#{sql} /* #{sql_comment(comment)} */" }
       sql
     end
 
