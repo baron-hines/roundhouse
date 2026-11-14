@@ -1309,6 +1309,17 @@ module ActionView
       "<#{n}#{render_attrs(opts.to_h)}>#{content_tag_pre(n)}#{html}</#{n}>"
     end
 
+    # `button_to url, opts do … end` whose options are computed (a `**opts` merge chain): Rails' form around a submit
+    # button that holds the block's captured markup, `method:` and `form_class:` read out of the options as the
+    # compile-time spelling reads them (`view_to_library::helpers::button_to_wrapper_markup`).
+    def self.button_to_html(url, html, opts = EMPTY_HTML_OPTS)
+      options = opts.to_h
+      attrs = options.reject { |k, _| k == :method || k == :form_class }
+      method = options.fetch(:method, "post").to_s
+      form_class = options.fetch(:form_class, "button_to").to_s
+      "<form action=\"#{html_escape(url.to_s)}\" method=\"post\" class=\"#{html_escape(form_class)}\">#{method_override_input(method)}<button type=\"submit\"#{render_attrs(attrs)}>#{html}</button>#{csrf_token_hidden_input}</form>"
+    end
+
     # Rails' `ensure_valid_html5_tag_name` (`/\A[a-zA-Z][^\s\/>]*\z/`):
     # a letter, then no whitespace, `/` or `>`, else ArgumentError, so a
     # dynamic name never writes past the tag. Bytes, not the Regexp (no

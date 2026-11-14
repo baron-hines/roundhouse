@@ -733,12 +733,21 @@ fn rewrite_button_to_block(expr: &mut Expr) -> bool {
         return false;
     }
     let Some(url) = args.first() else { return false };
+    let span = expr.span;
     let opts = match args.get(1).map(|a| &*a.node) {
         None => Vec::new(),
         Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+        // Computed options (maybe's `button_to(href, **merged_opts, &block)`): the runtime reads `method:` and
+        // `form_class:` out of them as this reads a literal Hash's.
+        Some(_) if args.len() == 2 => {
+            let call = view_helpers_call("button_to_html", vec![url.clone(), capture_call(block.clone(), span), args[1].clone()]);
+            let mut built = html_safe(call, span);
+            qualify_view_helpers(&mut built);
+            *expr = built;
+            return true;
+        }
         Some(_) => return false,
     };
-    let span = expr.span;
     let block = block.clone();
     let (mut parts, suffix) =
         crate::lower::view_to_library::helpers::button_to_wrapper_markup(url.clone(), opts);

@@ -153,3 +153,72 @@ pub const KNOWN_GAPS: [&str; 12] = [
     "file_statement_unsupported not supported (ruby)",
 ];
 
+
+/// A design system's components on the blog, shaped as maybe's are: a base component whose `attr_reader :icon` shares
+/// its name with an app helper, a subclass whose `initialize` passes its keywords to the base's, `content_tag(:button,
+/// **opts, &block)` and `link_to href, **opts do … end` wrapping a template block, and `helpers.icon` reaching an app
+/// helper that calls a helper gem's `glyph_tag`. The gem (`glyphs`, written here, shaped as lucide-rails is) mixes its
+/// helper into the view from a Railtie initializer and reads its gzipped glyphs from a directory beside its `lib/`.
+#[allow(dead_code)]
+pub fn ui_app() -> Option<emit_and_run::Overlay> {
+    let fixture = roundhouse::fixtures::real_blog();
+    let (gemfile, lock) = gemfiles(fixture);
+    let lock = lock
+        .replacen("\n    method_source (1.1.0)\n", "\n    glyphs (0.1.0)\n      railties (>= 4.1.0)\n    method_source (1.1.0)\n", 1)
+        .replacen("DEPENDENCIES\n", "DEPENDENCIES\n  glyphs\n", 1);
+    let gem = "vendor/bundle/ruby/3.4.0/gems/glyphs-0.1.0";
+    let mut overlay = emit_and_run::real_blog()
+        .write("Gemfile", &(gemfile + "gem \"glyphs\"\n"))
+        .write("Gemfile.lock", &lock)
+        .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
+        .write("roundhouse.yml", "extensions:\n  - config/roundhouse\n")
+        .write("config/roundhouse/gems.yml", "source_gems:\n  - {gem: \"glyphs\"}\n")
+        .write(&format!("{gem}/glyphs.gemspec"), GLYPHS_GEMSPEC)
+        .write(&format!("{gem}/lib/glyphs.rb"), GLYPHS_ENTRY)
+        .write(&format!("{gem}/lib/glyphs/store.rb"), GLYPHS_STORE)
+        .write(&format!("{gem}/lib/glyphs/helper.rb"), GLYPHS_HELPER)
+        .write(&format!("{gem}/lib/glyphs/railtie.rb"), GLYPHS_RAILTIE)
+        .write_bytes(&format!("{gem}/data/glyphs.bin.gz"), &GLYPHS_DATA)
+        .write("app/helpers/application_helper.rb", UI_HELPER)
+        .write("app/components/ui/base_button.rb", UI_BASE)
+        .write("app/components/ui/button.rb", UI_BUTTON)
+        .write("app/components/ui/button.html.erb", UI_BUTTON_TEMPLATE)
+        .write("app/components/ui/link.rb", "class Ui::Link < Ui::BaseButton\nend\n")
+        .write("app/components/ui/link.html.erb", UI_LINK_TEMPLATE)
+        .write("app/lib/component_report.rb", UI_REPORT);
+    for (name, version) in GEMS {
+        overlay = with_gem(overlay, name, version)?;
+    }
+    Some(overlay)
+}
+
+/// What Rails 7.2.2.1 and view_component 3.23.2 render for `ComponentReport.lines` with the `glyphs` gem loaded, but
+/// for the last line's form: that is the form a view's `button_to … do` renders here (`view_to_library::helpers::
+/// button_to_wrapper_markup`), whose attribute order, void tags and empty token input outside a request are its own.
+#[allow(dead_code)]
+pub const UI_EXPECTED: &str = "<button class=\"btn text-ink\">\n  \n  <span>Save &lt;now&gt;</span>\n</button>\n<button class=\"btn bg-ink text-paper btn-icon\" data-turbo-confirm=\"Sure?\">\n  <svg aria-hidden=\"true\" viewBox=\"0 0 24 24\" fill=\"none\" class=\"shrink-0 w-4 h-4 fg-ink\"><path d=\"M5 12h14\"></path><path d=\"M12 5v14\"></path></svg>\n  <span>Add</span>\n</button>\n<a class=\"btn bg-ink text-paper btn-icon\" href=\"/home\">\n  <svg aria-hidden=\"true\" viewBox=\"0 0 24 24\" fill=\"none\" class=\"shrink-0 w-5 h-5\"><path d=\"M5 12h14\"></path></svg>\n  Home\n</a>\n<form action=\"/items/1\" method=\"post\" class=\"button_to\"><input type=\"hidden\" name=\"_method\" value=\"delete\"><button type=\"submit\" class=\"btn bg-ink text-paper\" data-turbo-confirm=\"Gone?\">\n  \n  <span>Drop</span>\n</button><input type=\"hidden\" name=\"authenticity_token\" value=\"\"></form>\n";
+
+const GLYPHS_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"glyphs\"\n  s.version = \"0.1.0\"\n  s.summary = \"Inline SVG glyphs\"\n  s.authors = [\"roundhouse\"]\n  s.files = Dir[\"lib/**/*.rb\"] + Dir[\"data/*\"]\n  s.add_dependency \"railties\", \">= 4.1.0\"\nend\n";
+
+const GLYPHS_ENTRY: &str = "require \"active_support/gzip\"\nrequire_relative \"glyphs/store\"\nif defined?(Rails)\n  require_relative \"glyphs/helper\"\n  require_relative \"glyphs/railtie\"\nend\n\nmodule Glyphs\n  DEFAULT_OPTIONS = { \"aria-hidden\" => \"true\", \"viewBox\" => \"0 0 24 24\", \"fill\" => \"none\" }.freeze\n\n  module_function\n\n  def default_options\n    DEFAULT_OPTIONS\n  end\n\n  ROOT = Pathname.new(File.dirname(__FILE__)).join(\"..\")\nend\n";
+
+const GLYPHS_STORE: &str = "module Glyphs\n  module Store\n    module_function\n\n    def glyph(named)\n      named = named.to_s\n      raise ArgumentError, \"Unknown glyph #{named}\" unless all.key?(named)\n\n      all[named]\n    end\n\n    def all\n      return @all if @all\n\n      data = ActiveSupport::Gzip.decompress(File.read(Glyphs::ROOT.join(\"data/glyphs.bin.gz\")))\n      @all = data.split(\"\\x00\").to_h { |x| x.split(\",\", 2) }\n    end\n  end\nend\n";
+
+const GLYPHS_HELPER: &str = "module Glyphs\n  module Helper\n    def glyph_tag(named, **options)\n      content_tag(:svg, Store.glyph(named).html_safe, Glyphs.default_options.merge(**options))\n    end\n  end\nend\n";
+
+const GLYPHS_RAILTIE: &str = "module Glyphs\n  class Railtie < Rails::Railtie\n    initializer \"glyphs.helper\" do\n      ActionView::Base.include Glyphs::Helper\n    end\n  end\nend\n";
+
+/// `gzip -9 -n` of `plus,<path d="M5 12h14"></path><path d="M12 5v14"></path>\0minus,<path d="M5 12h14"></path>`.
+const GLYPHS_DATA: [u8; 64] = *include_bytes!("glyphs.bin.gz");
+
+const UI_HELPER: &str = "module ApplicationHelper\n  def icon(key, size: \"md\", **opts)\n    extra = opts.delete(:class)\n    sizes = { sm: \"w-4 h-4\", md: \"w-5 h-5\" }\n    glyph_tag(key, class: class_names(\"shrink-0\", sizes[size.to_sym], extra), **opts)\n  end\nend\n";
+
+const UI_BASE: &str = "class Ui::BaseButton < ViewComponent::Base\n  TONES = { solid: \"bg-ink text-paper\", quiet: \"text-ink\" }.freeze\n\n  attr_reader :tone, :href, :icon, :text, :extra_classes, :opts\n\n  def initialize(tone: :solid, href: nil, text: nil, icon: nil, **opts)\n    @tone = tone.to_sym\n    @href = href\n    @text = text\n    @icon = icon\n    @extra_classes = opts.delete(:class)\n    @opts = opts\n  end\n\n  def classes\n    class_names(\"btn\", TONES[tone], extra_classes, icon ? \"btn-icon\" : nil)\n  end\nend\n";
+
+const UI_BUTTON: &str = "class Ui::Button < Ui::BaseButton\n  attr_reader :confirm\n\n  def initialize(confirm: nil, **opts)\n    super(**opts)\n    @confirm = confirm\n  end\n\n  def container(&block)\n    data = confirm ? { turbo_confirm: confirm } : {}\n    if href\n      button_to(href, **opts.merge(class: classes, data: data), &block)\n    else\n      content_tag(:button, **opts.merge(class: classes, data: data), &block)\n    end\n  end\nend\n";
+
+const UI_BUTTON_TEMPLATE: &str = "<%= container do %>\n  <% if icon %><%= helpers.icon(icon, size: :sm, class: \"fg-ink\") %><% end %>\n  <span><%= text %></span>\n<% end %>\n";
+
+const UI_LINK_TEMPLATE: &str = "<%= link_to href, class: classes, **opts do %>\n  <% if icon %><%= helpers.icon(icon) %><% end %>\n  <%= text %>\n<% end %>\n";
+
+const UI_REPORT: &str = "class ComponentReport\n  def self.lines\n    view = ActionView::Base.new\n    [\n      Ui::Button.new(text: \"Save <now>\", tone: :quiet).render_in(view),\n      Ui::Button.new(text: \"Add\", icon: \"plus\", confirm: \"Sure?\", class: \"btn\").render_in(view),\n      Ui::Link.new(text: \"Home\", href: \"/home\", icon: \"minus\").render_in(view),\n      Ui::Button.new(text: \"Drop\", href: \"/items/1\", method: :delete, confirm: \"Gone?\").render_in(view)\n    ].map(&:to_s)\n  end\nend\n";

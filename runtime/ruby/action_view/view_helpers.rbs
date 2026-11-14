@@ -215,6 +215,7 @@ module ActionView
 
     def self.content_tag: (Symbol name, ?(String | Integer | nil) content, ?Hash[Symbol, untyped] opts) -> String
     def self.content_tag_html: (Symbol name, String html, ?Hash[Symbol, untyped] opts) -> String
+    def self.button_to_html: (String url, String html, ?Hash[Symbol, untyped] opts) -> String
     def self.content_tag_name: (String name) -> String
     def self.content_tag_pre: (String name) -> String
   

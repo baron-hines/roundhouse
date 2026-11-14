@@ -42,3 +42,14 @@ fn the_preview_pages_no_route_reaches_are_left_out_of_the_spinel_tree() {
     assert!(!emitted.join("app/views/view_components/previews.rb").exists());
     assert!(emitted.join("app/views/articles/index.rb").exists());
 }
+
+/// A design system's components, shaped as maybe's are, render on Ruby as Rails renders them (`ui_app`).
+#[test]
+fn design_system_components_render_as_rails_renders_them_on_ruby() {
+    let Some(app) = super::view_component_gem::ui_app() else { return };
+    let run = app.run_ruby("ComponentReport.lines.each { |line| puts line }\n");
+    let unknown: Vec<_> = run.errors.iter().filter(|e| !KNOWN_GAPS.iter().any(|gap| e.contains(gap))).collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, super::view_component_gem::UI_EXPECTED);
+}
