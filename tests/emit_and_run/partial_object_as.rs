@@ -4,7 +4,7 @@
 //! the local is the partial's own name (`shared/_person` reads `person`).
 //! The partial took the object under its directory's name (`shared`) and
 //! read `someone` bare: `wrong number of arguments (given 0, expected
-//! 1..3)`, the partial's own module function. An `object:` with `locals:` beside it is still the `as:` local, and a partial rendered `as: :class` takes `locals: { class: }` under that name. A partial reading the caller's `@article` still reads it when an `object:` render with `locals:` names its own local `article`, which the partial doesn't read. A partial that yields, rendered with `object:` and `locals:` and no block, yields nothing. An `object:` is evaluated before the `locals:` written after it, and after the ones written before it, and a plain read in `object:` is the value before a later local reassigns it.
+//! 1..3)`, the partial's own module function. An `object:` with `locals:` beside it is still the `as:` local, and a partial rendered `as: :class` takes `locals: { class: }` under that name. A partial reading the caller's `@article` still reads it when an `object:` render with `locals:` names its own local `article`, which the partial doesn't read. A partial that yields, rendered with `object:` and `locals:` and no block, yields nothing. An `object:` is evaluated before the `locals:` written after it, and after the ones written before it, and a template local read in `object:` is its value before a later `locals:` value reassigns it.
 
 use super::emit_and_run;
 
@@ -47,7 +47,7 @@ end
 <p id="y"><%= render layout: "shared/box" do %>in<% end %>|<%= render partial: "shared/box", object: @article, locals: { caption: "x" } %></p>
 <p id="o"><%= render partial: "probes/ticked", object: tick_record("o"), locals: { zeta: tick("z"), alpha: tick("a") } %>[<%= TickLog.log %>]</p>
 <p id="o2"><%= render partial: "probes/ticked", locals: { alpha: tick("l"), zeta: "z" }, object: tick_record("p") %>|<%= render partial: "shared/badge", locals: { label: tick("q"), someone: tick_record("s") } %>[<%= TickLog.log %>]</p>
-<p id="o3"><% @pick = Article.first %><%= render partial: "probes/ticked", object: @pick, locals: { zeta: (@pick = Article.last).title, alpha: tick("r") } %></p>
+<p id="o3"><% pick = Article.first %><%= render partial: "probes/ticked", object: pick, locals: { zeta: (pick = Article.last).title, alpha: tick("r") } %></p>
 <p id="t"><%= render partial: "articles/teaser", object: @other, as: :article, locals: { caption: "x" } %></p>
 "##)
         .write("app/views/shared/_badge.html.erb", r##"<b><%= someone.title %></b>
