@@ -279,6 +279,43 @@ fn array_columns_round_trip_on_postgresql() {
     assert_eq!(run.stdout, "array columns");
 }
 
+const FIXTURES: &str = "one:\n  name: one\n  tag_list: [\"a\", \"b,c\", \"it's\"]\n  scores: [1, 2]\n\ntwo:\n  name: two\n";
+
+const FIXTURE_TEST: &str = r#"require "test_helper"
+
+class WidgetFixtureTest < ActiveSupport::TestCase
+  test "a fixture's YAML sequence loads as the Array" do
+    assert_equal ["a", "b,c", "it's"], widgets(:one).tag_list
+    assert_equal [1, 2], widgets(:one).scores
+    assert_nil widgets(:one).notes
+    assert_equal [], widgets(:two).tag_list
+    assert_equal [0], widgets(:two).scores
+  end
+end
+"#;
+
+fn fixture_app(database_yml: &str) -> emit_and_run::Overlay {
+    widget_app(database_yml)
+        .write("test/test_helper.rb", "ENV[\"RAILS_ENV\"] ||= \"test\"\nrequire_relative \"../config/environment\"\nrequire \"rails/test_help\"\n\nmodule ActiveSupport\n  class TestCase\n    fixtures :all\n  end\nend\n")
+        .write("test/fixtures/widgets.yml", FIXTURES)
+        .write("test/models/widget_fixture_test.rb", FIXTURE_TEST)
+}
+
+/// A fixture's YAML sequence for an array column is the Array, written
+/// through the column's codec: on SQLite (JSON) and PostgreSQL alike.
+#[test]
+fn a_fixture_array_loads_on_sqlite() {
+    fixture_app(SQLITE_DATABASE_YML).run_test("test/models/widget_fixture_test.rb").assert_passes();
+}
+
+#[test]
+fn a_fixture_array_loads_on_postgresql() {
+    let Some(db) = pg_test_url::pg_test_db("postgresql_array_fixtures") else { return };
+    fixture_app(POSTGRESQL_DATABASE_YML)
+        .run_test_env("test/models/widget_fixture_test.rb", &[("DATABASE_URL", db.url.as_str())])
+        .assert_passes();
+}
+
 /// The bulk writes that skip the model (`update_all`, `insert_all`,
 /// `upsert_all`) write an Array into a stored array column as the
 /// column's codec does: the array literal on PostgreSQL, JSON on SQLite.
