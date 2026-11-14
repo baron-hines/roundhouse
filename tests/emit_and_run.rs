@@ -22285,3 +22285,5 @@ mod order_values;
 mod scoping_all_is_scope;
 #[path = "emit_and_run/create_array.rs"]
 mod create_array;
+#[path = "emit_and_run/partial_select_missing_attribute.rs"]
+mod partial_select_missing_attribute;

@@ -2343,6 +2343,14 @@ module ActiveRecord
       first
     end
 
+    # `take!` — `take`, raising `RecordNotFound` when there is no row, as
+    # Rails' FinderMethods#take! does (`take || raise_record_not_found_exception!`).
+    def take!
+      record = take
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
     # `first!` — like `first`, but raises `RecordNotFound` (→ 404 in the
     # dispatch layer) instead of returning nil when the relation is empty.
     def first!

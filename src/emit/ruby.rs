@@ -411,6 +411,9 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
+    // A partial `select`'s left-out column raises from its generated
+    // reader. After every pass that rewrites a reader body by its shape.
+    crate::lower::missing_attribute::apply(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated

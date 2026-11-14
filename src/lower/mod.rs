@@ -237,6 +237,7 @@ pub mod view_buffer_passing;
 pub mod view_instrumentation;
 pub mod tag_block_passing;
 pub mod lazy_model_state;
+pub mod missing_attribute;
 pub(crate) mod eager_load;
 pub mod view_to_library;
 

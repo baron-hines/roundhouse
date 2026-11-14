@@ -2514,6 +2514,15 @@ module ActiveRecord
       unloaded.nil? || !unloaded.include?(name)
     end
 
+    # Rails' generated reader raises for a column the row's `select` left
+    # out (attribute_methods/read.rb, `missing_attribute`); each generated
+    # reader calls this first when the row noted any (`lower::missing_attribute`).
+    def _missing_attribute(name)
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil? || !unloaded.include?(name)
+      raise ActiveModel::MissingAttributeError, "missing attribute '#{name}' for #{self.class.name}"
+    end
+
     # The pending diff: current attributes against the baseline the
     # last save (or hydration) left, in the same `[prev, value]` shape
     # as `saved_changes`. `save` runs validations and before_* hooks

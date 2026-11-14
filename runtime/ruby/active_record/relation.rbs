@@ -347,6 +347,7 @@ module ActiveRecord
     def each_with_object: (untyped memo) { (Base, untyped) -> untyped } -> untyped
     def first: () -> Base?
     def take: () -> Base?
+    def take!: () -> Base
     def first!: () -> Base
     def last: () -> Base?
     def second: () -> Base?
