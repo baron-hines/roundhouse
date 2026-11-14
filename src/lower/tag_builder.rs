@@ -150,6 +150,7 @@ pub fn apply_tag_builder_lowering(
     // `tag` column, `attr_reader :tag`, a `def tag` — calls ITS reader
     // (`tag.title`), and rewriting that compiled to `"<title></title>"`.
     let owns_tag = classes_owning(app, registry, "tag", false);
+    let owns_content_tag = classes_owning(app, registry, "content_tag", false);
     // An app's own `stylesheet_link_tag` (an app/helpers method or a
     // `helper_method`) is what Rails calls; it is left to the app. So is
     // a class's own, which its bare call reaches, found as `tag`'s is.
@@ -165,7 +166,8 @@ pub fn apply_tag_builder_lowering(
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let own_tag = owner.is_some_and(|c| owns_tag.contains(c));
         let own_stylesheet = app_stylesheet || owner.is_some_and(|c| owns_stylesheet.contains(c));
-        rewrite(body, own_tag, own_stylesheet, &models, &helpers, &sti_stems, &mut diags)
+        let own_content_tag = owner.is_some_and(|c| owns_content_tag.contains(c));
+        rewrite(body, own_tag, own_content_tag, own_stylesheet, &models, &helpers, &sti_stems, &mut diags)
     });
     diags
 }
@@ -435,9 +437,11 @@ fn is_tag_helper(recv: &Expr) -> bool {
 /// nor `tag(:x)` is the builder there (see [`classes_owning`]). The
 /// other helpers this pass expands have names of their own and still
 /// apply.
+#[allow(clippy::too_many_arguments)]
 fn rewrite(
     expr: &mut Expr,
     own_tag: bool,
+    own_content_tag: bool,
     own_stylesheet: bool,
     models: &crate::det::HashSet<String>,
     helpers: &crate::det::HashSet<String>,
@@ -445,7 +449,7 @@ fn rewrite(
     diags: &mut Vec<Diagnostic>,
 ) {
     expr.node.for_each_child_mut(&mut |child| {
-        rewrite(child, own_tag, own_stylesheet, models, helpers, sti_stems, diags)
+        rewrite(child, own_tag, own_content_tag, own_stylesheet, models, helpers, sti_stems, diags)
     });
 
     if rewrite_turbo_frame_tag(expr, models) {
@@ -464,6 +468,9 @@ fn rewrite(
         return;
     }
     if rewrite_link_to_block(expr, models, helpers, sti_stems, diags) {
+        return;
+    }
+    if !own_content_tag && rewrite_content_tag(expr, diags) {
         return;
     }
 
@@ -984,6 +991,55 @@ fn rewrite_link_to_block(
 /// Void-ness does not enter into it: the legacy form self-closes
 /// whatever it is handed, which is why it takes no block and no
 /// content argument here.
+/// `content_tag(name[, content][, opts]) [do … end]` written in a hook body (a helper, a component's method): the
+/// element `tag.<name>` builds, through the same attribute renderer. Rails reads the argument after the name as the
+/// OPTIONS when a block is given (maybe's `content_tag(:button, **merged_opts, &block)`), and closes even a void element.
+fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        return false;
+    };
+    if method.as_str() != "content_tag" || args.is_empty() || args.len() > 3 {
+        return false;
+    }
+    let name = match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return false,
+    };
+    if !is_html_element(&name) && !is_custom_element(&name) {
+        return false;
+    }
+    let (content, opts) = match block {
+        Some(_) if args.len() > 2 => return false,
+        Some(_) => (None, args.get(1).cloned()),
+        None => (args.get(1).cloned(), args.get(2).cloned()),
+    };
+    let block = block.clone();
+    let span = expr.span;
+    let entries = match opts.as_ref().map(|o| &*o.node) {
+        None => Vec::new(),
+        Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+        Some(_) => {
+            diags.push(residue(expr, "attributes are a computed expression, not a literal hash"));
+            *expr = content_tag_fallback(&name, content, opts, block, span);
+            return true;
+        }
+    };
+    let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("<{name}") }];
+    append_attr_parts(&mut parts, &entries);
+    parts.push(InterpPart::Text { value: ">".to_string() });
+    match (block, content) {
+        (Some(block), _) => parts.push(InterpPart::Expr { expr: capture_call(block, span) }),
+        (None, Some(content)) => parts.push(InterpPart::Expr { expr: escaped_content(content) }),
+        (None, None) => {}
+    }
+    parts.push(InterpPart::Text { value: format!("</{name}>") });
+    let mut built = string_interp(parts);
+    qualify_view_helpers(&mut built);
+    *expr = html_safe(built, span);
+    true
+}
+
 fn rewrite_legacy_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
         return false;

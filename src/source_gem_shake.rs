@@ -326,6 +326,23 @@ fn drop_block_given(e: &mut Expr) {
     }
 }
 
+/// `ruby2_keywords(:set_slot)` and its kin lose the names trim left out, and go when none is left: Ruby raises
+/// NameError on a name its class does not define.
+fn keeps_a_named_method(call: &mut Expr, kept: &HashSet<(bool, String)>) -> bool {
+    let ExprNode::Send { recv: None, method, args, .. } = &mut *call.node else { return true };
+    let class_side = match method.as_str() {
+        "ruby2_keywords" | "private" | "protected" | "public" | "module_function" => false,
+        "private_class_method" | "public_class_method" => true,
+        _ => return true,
+    };
+    let dropped = |a: &Expr| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if !kept.contains(&(class_side, value.to_string())));
+    if args.is_empty() || !args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { .. } })) {
+        return true;
+    }
+    args.retain(|a| !dropped(a));
+    !args.is_empty()
+}
+
 fn mounted(app: &App, file: FileId) -> bool {
     let Some(lock) = app.gem_lock.as_ref() else { return false };
     app.source_path(file).is_some_and(|path| {
@@ -858,6 +875,9 @@ impl<'a> Gems<'a> {
                     || IMPLICIT.contains(&m.name.as_str())
                     || reached.methods.contains(&(owner.clone(), m.receiver == MethodReceiver::Class, m.name.to_string()))
             });
+            let kept: HashSet<(bool, String)> =
+                c.methods.iter().map(|m| (m.receiver == MethodReceiver::Class, m.name.to_string())).collect();
+            c.unknown_calls.retain_mut(|call| keeps_a_named_method(call, &kept));
         }
         // A model's copy of a gem module's method (Devise's `Models.config` writers, copied onto `User`) goes with the
         // original: a call on the model reaches the original through the model's ancestors, so an unreached original

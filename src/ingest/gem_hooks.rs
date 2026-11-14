@@ -1356,9 +1356,16 @@ fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
         let file_leaf = file_stem.rsplit_once('/').map_or(file_stem, |(_, n)| n);
         for class in &names {
             if renders_as_component(app, class) {
-                // Base.inherited's `child.include Rails.application.routes.url_helpers`, which a tree's ancestry fixes as
-                // it builds (Spinel's): each component includes the route helpers as it is declared.
-                if let Some(lc) = app.library_classes.iter_mut().find(|c| &c.name == class)
+                // Base.inherited's `child.include Rails.application.routes.url_helpers unless child < url_helpers`, which a
+                // tree's ancestry fixes as it builds (Spinel's): a component under another already has them.
+                let inherits_them = app
+                    .library_classes
+                    .iter()
+                    .filter(|c| &c.name == class)
+                    .find_map(|c| c.parent.clone())
+                    .is_some_and(|parent| parent.0.as_str() != "ViewComponent::Base" && renders_as_component(app, &parent));
+                if !inherits_them
+                    && let Some(lc) = app.library_classes.iter_mut().find(|c| &c.name == class)
                     && !lc.includes.iter().any(|i| i.0.as_str() == "RouteHelpers")
                 {
                     lc.includes.insert(0, crate::ident::ClassId(crate::ident::Symbol::from("RouteHelpers")));
@@ -1676,6 +1683,67 @@ fn renders_as_component(app: &App, class: &crate::ident::ClassId) -> bool {
     false
 }
 
+/// `<%= helper do %>INNER<% end %>` as Rails' `capture` runs it: INNER writes a buffer of its own, which the block
+/// answers marked safe, not the template's `_buf`, which would take INNER ahead of the helper's own markup.
+fn capture_output_blocks(e: &mut Expr, depth: usize) {
+    // Under the escaping `html_escape((EXPR).to_s)` and the `.to_s` the compile closes the block with.
+    fn output_block_body(e: &mut Expr) -> Option<&mut Expr> {
+        let step = match &*e.node {
+            ExprNode::Send { method, args, block: None, .. } if method.as_str() == "html_escape" && args.len() == 1 => 1,
+            ExprNode::Send { recv: Some(_), method, args, block: None, .. } if method.as_str() == "to_s" && args.is_empty() => 2,
+            _ => 0,
+        };
+        match (&mut *e.node, step) {
+            (ExprNode::Send { args, .. }, 1) => output_block_body(&mut args[0]),
+            (ExprNode::Send { recv: Some(recv), .. }, 2) => output_block_body(recv),
+            (ExprNode::Send { block: Some(block), .. }, _) => match &mut *block.node {
+                ExprNode::Lambda { body, .. } => Some(body),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn writes_buf(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "_buf");
+        e.node.for_each_child(&mut |c| found = found || writes_buf(c));
+        found
+    }
+    fn rename(e: &mut Expr, to: &crate::ident::Symbol) {
+        match &mut *e.node {
+            ExprNode::Var { name, .. } | ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "_buf" => *name = to.clone(),
+            _ => {}
+        }
+        e.node.for_each_child_mut(&mut |c| rename(c, to));
+    }
+    if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &mut *e.node
+        && name.as_str() == "_buf"
+        && let ExprNode::Send { method, args, .. } = &mut *value.node
+        && method.as_str() == "+"
+        && let [arg] = args.as_mut_slice()
+    {
+        let inner = output_block_body(arg);
+        if let Some(body) = inner
+            && writes_buf(body)
+        {
+            capture_output_blocks(body, depth + 1);
+            let cap = crate::ident::Symbol::from(format!("_vc_cap{depth}").as_str());
+            rename(body, &cap);
+            let span = body.span;
+            let init = Expr::new(span, ExprNode::Assign {
+                target: LValue::Var { name: cap.clone(), id: crate::ident::VarId(0) },
+                value: Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Str { value: String::new() } }),
+            });
+            let helpers = Expr::new(crate::span::Span::synthetic(), ExprNode::Const { path: vec![crate::ident::Symbol::from("ActionView"), crate::ident::Symbol::from("ViewHelpers")] });
+            let read = Expr::new(span, ExprNode::Var { name: cap, id: crate::ident::VarId(0) });
+            let result = Expr::new(span, ExprNode::Send { recv: Some(helpers), method: crate::ident::Symbol::from("raw"), args: vec![read], block: None, parenthesized: true });
+            let old = std::mem::replace(body, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+            *body = Expr::new(span, ExprNode::Seq { exprs: vec![init, old, result] });
+            return;
+        }
+    }
+    e.node.for_each_child_mut(&mut |c| capture_output_blocks(c, depth));
+}
+
 /// A compiled template's `_buf = _buf + (EXPR).to_s` as Rails' `<%= %>` writes it: escaped unless html_safe; its text
 /// as written; and the buffer, at the end, marked safe as a template's output is. Not with `.html_safe`, which the
 /// emit drops from an app's code: `ActionView::ViewHelpers.raw`, which it keeps.
@@ -1703,6 +1771,7 @@ fn escape_template_output(body: &mut Expr) {
         e.node.for_each_child_mut(&mut |c| walk(c));
     }
     walk(body);
+    capture_output_blocks(body, 1);
     if let ExprNode::Seq { exprs } = &mut *body.node
         && let Some(last) = exprs.last_mut()
         && matches!(&*last.node, ExprNode::Var { name, .. } if name.as_str() == "_buf")
