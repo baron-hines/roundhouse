@@ -533,12 +533,13 @@ fn rewrite(
     // 200 and a green suite, because no gate reads the attributes of a tag.
     // `computed_attrs` did not catch it: it required `args.len() > 1`, and
     // a call whose arguments are entirely keywords has exactly one.
-    // With a block, Rails reads a lone argument as the options (`tag.dialog class: "x", **opts do`, whose merge chain
-    // starts at the literal rather than at the splat); only a written String is content there.
+    // With a block, Rails reads a lone Hash as the options (`tag.dialog class: "x", **opts do`, whose merge chain starts
+    // at the literal rather than at the splat). Not any other value: `tag.div(label) { … }` is content.
     let block_options = block.is_some()
         && args.len() == 1
         && opts.is_none()
-        && !matches!(&*args[0].node, ExprNode::StringInterp { .. } | ExprNode::Lit { value: Literal::Str { .. } });
+        && matches!(&*args[0].node, ExprNode::Send { recv: Some(head), method, .. }
+            if method.as_str() == "merge" && matches!(&*head.node, ExprNode::Hash { .. }));
     let lone_computed_attrs =
         args.len() == 1 && opts.is_none() && (is_kwsplat_merge_chain(&args[0]) || block_options);
     if lone_computed_attrs {

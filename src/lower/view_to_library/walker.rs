@@ -1550,7 +1550,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 };
                 // A helper a gem mixes into the view (`simple_form_for`): Rails' method, on a view context, whose block's
                 // capture is the template's markup, a safe buffer.
-                let on_view_context = recv.is_none() && ctx.view_context_helpers.contains(method.as_str());
+                let on_view_context = recv.is_none()
+                    && ctx.view_context_helpers.contains(method.as_str())
+                    && !ctx.app_helper_names.contains(method.as_str());
                 let mut cap_stmts = vec![assign_accumulator_string_new(cap)];
                 cap_stmts.extend(walk_body(body, &cap_ctx));
                 cap_stmts.push(if on_view_context {

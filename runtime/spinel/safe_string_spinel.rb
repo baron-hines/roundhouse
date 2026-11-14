@@ -84,7 +84,7 @@ module ActionView
     # Rails' `safe_join`: each part and the separator escaped unless html_safe, the joined markup marked safe.
     def self.safe_join(parts, separator = "")
       out = +""
-      parts.each_with_index do |part, i|
+      parts.flatten.each_with_index do |part, i|
         out << html_escape(separator) if i > 0
         out << html_escape(part)
       end

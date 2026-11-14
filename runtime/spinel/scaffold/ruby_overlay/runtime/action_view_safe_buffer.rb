@@ -46,10 +46,13 @@ module ActionView
       SafeString.new(value.to_s)
     end
 
-    # Rails' `safe_join`: each part and the separator escaped unless html_safe, the joined markup a SafeBuffer, so an
-    # `h(...)` of it leaves the markup alone. Not the shared body's join as written, which has no mark to read.
+    # `safe_join` answers a SafeBuffer in Rails, so an `h(...)` of what it
+    # joined (a helper's, or a value handed on) leaves the markup alone.
+    # The parts are joined as the shared body joins them.
+    # Not each part escaped unless html_safe, as Rails does: an app helper's markup reaches here unmarked (the emit
+    # drops its `.html_safe`), and would be escaped.
     def self.safe_join(parts, separator = "")
-      SafeString.new(Array(parts).flatten.map { |part| html_escape(part) }.join(html_escape(separator)))
+      SafeString.new(parts.join(separator))
     end
 
     # Rails' `content_for?` is `present?`-based: a slot holding only
