@@ -43,6 +43,7 @@ end
     check("where in a class method", Book.order(:id).offset(3).on_shelf, ["Ulysses"])
     check("scoping limit", Book.order(:id).limit(1).scoping { Book.all.map(&:title) }, ["Dune"])
     check("scoping offset", Book.order(:id).offset(3).scoping { Book.where.not(title: "Missing").map(&:title) }, ["Ulysses"])
+    check("scoping select", Book.select(:id, :title).scoping { Book.all.first.has_attribute?(:library_id) }, false)
     check("scoping preload", Library.preload(:books).scoping { Library.all.first.association(:books).loaded? }, true)
     check("scoping where", Book.where(title: "Emma").scoping { Book.all.map(&:title) }, ["Emma"])
     check("class-level count under scoping", Book.where(title: "Emma").scoping { Book.count }, 1)
