@@ -131,6 +131,46 @@ fn respond_to_assertions_fold_on_the_rust_target() {
     );
 }
 
+/// A concern's `def self.name` with a signature is the singleton's: an
+/// includer's instance, through one module or a nested one, does not
+/// respond to it. A module that also defines the instance method of that
+/// name does.
+#[test]
+fn a_concerns_signed_singleton_method_is_not_an_instance_method_of_its_includer() {
+    let (emitted, errors) = rust_record_tests_app::app()
+        .write(
+            "app/models/concerns/grouping.rb",
+            "module Grouping\n  #: (String name) -> Integer\n  def self.grouped(name)\n    name.size\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/nesting.rb",
+            "module Nesting\n  #: () -> String\n  def self.nested_label\n    \"n\"\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/ranking.rb",
+            "module Ranking\n  include Nesting\n\n  #: () -> Integer\n  def self.ranked\n    1\n  end\n\n  #: () -> Integer\n  def ranked\n    2\n  end\nend\n",
+        )
+        .write(
+            "app/models/item.rb",
+            "class Item < ApplicationRecord\n  include Grouping\n  include Ranking\n  belongs_to :shelf\n\n  validates :name, presence: true\n  validates :weight, presence: true\n  validates :name, uniqueness: { scope: :shelf_id }\nend\n",
+        )
+        .write(
+            "test/models/item_surface_test.rb",
+            "require \"test_helper\"\n\nclass ItemSurfaceTest < ActiveSupport::TestCase\n  test \"surface\" do\n    item = Item.new(name: \"a\", weight: 1)\n    refute_respond_to item, :grouped\n    refute_respond_to item, :nested_label\n    assert_respond_to item, :ranked\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = std::fs::read_to_string(emitted.join("src/tests/item_surface.rs")).expect("item surface test");
+    let body = test.split("fn test_surface").nth(1).expect("the surface test");
+    let answers: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("assertion failed") || line.contains("refute failed"))
+        .map(|line| line.split(" { panic!").next().unwrap())
+        .collect();
+    assert_eq!(answers, ["if false", "if false", "if !(true)"], "{body}");
+}
+
 /// What the test above expects, from Rails (the oracle the developer selected
 /// with `RH_RAILS_ORACLE`, else the pinned release; an instance's `respond_to?`
 /// for a column, association, persistence method or class method does not vary
