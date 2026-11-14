@@ -4889,10 +4889,21 @@ fn schema_default_literal(col: &Column) -> Option<Expr> {
     }
     let raw = col.stored_default()?;
     if col.array_stored {
-        // `default: []`, the only array default ingest keeps: a fresh
-        // empty Array of the column's element type.
+        // The array default ingest keeps (`[]`, `[0]`, `["a"]`, as JSON):
+        // a fresh Array of the column's element type, with its elements.
+        let elements = match serde_json::from_str::<serde_json::Value>(raw).ok()? {
+            serde_json::Value::Array(elements) => elements,
+            _ => return None,
+        };
+        let elements = elements
+            .iter()
+            .map(|e| match e {
+                serde_json::Value::String(s) => Some(lit_str(s.clone())),
+                _ => e.as_i64().map(lit_int),
+            })
+            .collect::<Option<Vec<_>>>()?;
         return Some(with_ty(
-            Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets }),
+            Expr::new(Span::synthetic(), ExprNode::Array { elements, style: ArrayStyle::Brackets }),
             super::ty_of_column_slot(col),
         ));
     }
