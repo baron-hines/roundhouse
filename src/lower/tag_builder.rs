@@ -1035,13 +1035,16 @@ fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     if !is_html_element(&name) && !is_custom_element(&name) {
         return false;
     }
+    // With a block, a Hash after the name is the options; anything else there is content only when a passed-through
+    // `&block` turns out nil (maybe's `content_tag(:button, label, id:, &block)`), which Rails' `block_given?` reads.
     let (content, opts) = match block {
-        Some(_) if args.len() > 2 => return false,
+        Some(_) if args.len() > 2 => (args.get(1).cloned(), args.get(2).cloned()),
         Some(_) => (None, args.get(1).cloned()),
         None => (args.get(1).cloned(), args.get(2).cloned()),
     };
     let block = block.clone();
     let span = expr.span;
+
     let entries = match opts.as_ref().map(|o| &*o.node) {
         None => Vec::new(),
         Some(ExprNode::Hash { entries, .. }) => entries.clone(),
@@ -1055,6 +1058,11 @@ fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     append_attr_parts(&mut parts, &entries);
     parts.push(InterpPart::Text { value: ">".to_string() });
     match (block, content) {
+        (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
+            let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });
+            let captured = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("capture"), args: vec![], block: Some(block), parenthesized: false });
+            parts.push(InterpPart::Expr { expr: Expr::new(span, ExprNode::If { cond: given, then_branch: escaped_content(content), else_branch: captured }) });
+        }
         (Some(block), _) => parts.push(InterpPart::Expr { expr: capture_call(block, span) }),
         (None, Some(content)) => parts.push(InterpPart::Expr { expr: escaped_content(content) }),
         (None, None) => {}
@@ -1256,9 +1264,14 @@ fn content_tag_fallback(
         ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } },
     );
     sym.ty = Some(crate::ty::Ty::Sym);
-    let body = match block {
-        Some(block) => capture_call(block, span),
-        None => content.unwrap_or_else(|| lit_str(String::new())),
+    let body = match (block, content) {
+        (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
+            let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });
+            let captured = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("capture"), args: vec![], block: Some(block), parenthesized: false });
+            Expr::new(span, ExprNode::If { cond: given, then_branch: content, else_branch: captured })
+        }
+        (Some(block), _) => capture_call(block, span),
+        (None, content) => content.unwrap_or_else(|| lit_str(String::new())),
     };
     let mut args = vec![sym, body];
     if let Some(opts) = opts {
