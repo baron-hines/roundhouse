@@ -1685,7 +1685,7 @@ fn renders_as_component(app: &App, class: &crate::ident::ClassId) -> bool {
 
 /// `<%= helper do %>INNER<% end %>` as Rails' `capture` runs it: INNER writes a buffer of its own, which the block
 /// answers marked safe, not the template's `_buf`, which would take INNER ahead of the helper's own markup.
-fn capture_output_blocks(e: &mut Expr, depth: usize) {
+fn capture_output_blocks(e: &mut Expr, depth: usize, prefix: &str) {
     // Under the escaping `html_escape((EXPR).to_s)` and the `.to_s` the compile closes the block with.
     fn output_block_body(e: &mut Expr) -> Option<&mut Expr> {
         let step = match &*e.node {
@@ -1725,8 +1725,8 @@ fn capture_output_blocks(e: &mut Expr, depth: usize) {
         if let Some(body) = inner
             && writes_buf(body)
         {
-            capture_output_blocks(body, depth + 1);
-            let cap = crate::ident::Symbol::from(format!("_vc_cap{depth}").as_str());
+            capture_output_blocks(body, depth + 1, prefix);
+            let cap = crate::ident::Symbol::from(format!("{prefix}{depth}").as_str());
             rename(body, &cap);
             let span = body.span;
             let init = Expr::new(span, ExprNode::Assign {
@@ -1741,7 +1741,7 @@ fn capture_output_blocks(e: &mut Expr, depth: usize) {
             return;
         }
     }
-    e.node.for_each_child_mut(&mut |c| capture_output_blocks(c, depth));
+    e.node.for_each_child_mut(&mut |c| capture_output_blocks(c, depth, prefix));
 }
 
 /// A compiled template's `_buf = _buf + (EXPR).to_s` as Rails' `<%= %>` writes it: escaped unless html_safe; its text
@@ -1771,7 +1771,21 @@ fn escape_template_output(body: &mut Expr) {
         e.node.for_each_child_mut(&mut |c| walk(c));
     }
     walk(body);
-    capture_output_blocks(body, 1);
+    // Not a name the template's own code holds: its locals live in the same method.
+    fn locals(e: &Expr, out: &mut Vec<String>) {
+        match &*e.node {
+            ExprNode::Var { name, .. } | ExprNode::Assign { target: LValue::Var { name, .. }, .. } => out.push(name.as_str().to_string()),
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| locals(c, out));
+    }
+    let mut held = Vec::new();
+    locals(body, &mut held);
+    let mut prefix = String::from("_vc_cap");
+    while held.iter().any(|n| n.starts_with(&prefix)) {
+        prefix.push('_');
+    }
+    capture_output_blocks(body, 1, &prefix);
     if let ExprNode::Seq { exprs } = &mut *body.node
         && let Some(last) = exprs.last_mut()
         && matches!(&*last.node, ExprNode::Var { name, .. } if name.as_str() == "_buf")

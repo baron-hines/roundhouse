@@ -3892,6 +3892,9 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         .filter(|n| is_framework_view_helper(n))
         .collect();
     let source_methods = crate::analyze::SourceMethodIndex::new(app);
+    let view_context_helpers: crate::det::HashSet<Symbol> =
+        crate::lower::view_to_library::view_context_helpers(app).into_iter().map(|n| Symbol::from(n.as_str())).collect();
+    let no_view_context = crate::det::HashSet::default();
     let controller_names: crate::det::HashSet<&ClassId> = app.controllers.iter().map(|c| &c.name).collect();
     for lc in lcs.iter_mut() {
         // CONTROLLERS in the index provide `helper_method`s to views:
@@ -3965,38 +3968,36 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         };
         let mut inherited_instance = inherited(false);
         let inherited_class = inherited(true);
-        // An app helper's name a parent answers (maybe's `DS::Buttonish#icon` beside `ApplicationHelper#icon`): the bare
-        // call is that method. Not through a helper module the chain includes, whose methods turn into module functions.
+        // An app helper's name an ancestor answers before any helper module does (maybe's `DS::Buttonish#icon` beside
+        // `ApplicationHelper#icon`): the bare call is that method. Ruby's order, an includer's modules (the last first)
+        // ahead of its parent; a helper module found first keeps the call its function's.
         if !is_helper_module && !is_template {
-            let mut pending: Vec<&ClassId> = lc.parent.iter().collect();
+            let mut order: Vec<&ClassId> = Vec::new();
+            let mut pending: Vec<&ClassId> = vec![&lc.name];
             let mut seen = crate::det::HashSet::default();
             while let Some(class) = pending.pop() {
-                if !seen.insert(class.clone()) || app.helper_modules.contains(class) {
+                if !seen.insert(class.clone()) {
                     continue;
                 }
-                for part in app.library_classes.iter().filter(|c| &c.name == class) {
-                    inherited_instance.extend(
-                        part.methods
-                            .iter()
-                            .filter(|m| m.receiver == MethodReceiver::Instance && app.helper_method_index.contains_key(&m.name))
-                            .map(|m| m.name.clone()),
-                    );
-                    pending.extend(part.parent.iter());
-                    pending.extend(part.includes.iter());
+                if class != &lc.name {
+                    order.push(class);
+                }
+                let parts: Vec<&crate::dialect::LibraryClass> = app.library_classes.iter().filter(|c| &c.name == class).collect();
+                // Popped last-in first: the parent goes on before the modules, which come off last included first.
+                pending.extend(parts.iter().filter_map(|p| p.parent.as_ref()));
+                pending.extend(parts.iter().flat_map(|p| p.includes.iter()));
+            }
+            for name in app.helper_method_index.keys() {
+                let first = order.iter().find(|class| {
+                    app.library_classes
+                        .iter()
+                        .filter(|c| &c.name == **class)
+                        .any(|c| c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == *name))
+                });
+                if first.is_some_and(|class| !app.helper_modules.contains(*class)) {
+                    inherited_instance.insert(name.clone());
                 }
             }
-        }
-        if is_helper_module {
-            // Not flipped too: `module_function`'s private instance copy would become a second, private `def self.x`.
-            let class_side: Vec<(Symbol, crate::span::Span)> = lc
-                .methods
-                .iter()
-                .filter(|m| m.receiver == MethodReceiver::Class)
-                .map(|m| (m.name.clone(), m.body.span))
-                .collect();
-            lc.methods.retain(|m| {
-                m.receiver == MethodReceiver::Class || !class_side.iter().any(|(n, span)| *n == m.name && *span == m.body.span)
-            });
         }
         for m in &mut lc.methods {
             // A helper module's own methods become module-functions so the
@@ -4045,6 +4046,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                     &own_methods,
                     &own_params,
                     &app.view_visible_controller_methods,
+                    if is_helper_module { &view_context_helpers } else { &no_view_context },
                 );
                 ground_string_pluralize(default, app_defines_pluralize);
                 if is_helper_module {
@@ -4060,6 +4062,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 &own_methods,
                 &own_params,
                 &app.view_visible_controller_methods,
+                if is_helper_module { &view_context_helpers } else { &no_view_context },
             );
             ground_string_pluralize(&mut m.body, app_defines_pluralize);
             // A CONTROLLER IVAR read in a helper body. Rails mixes
@@ -4905,6 +4908,7 @@ fn rewrite_helper_calls(
     own_methods: &crate::det::HashSet<Symbol>,
     own_params: &crate::det::HashSet<Symbol>,
     view_visible: &std::collections::BTreeSet<Symbol>,
+    view_context: &crate::det::HashSet<Symbol>,
 ) {
     expr.node.for_each_child_mut(&mut |c| {
         rewrite_helper_calls(
@@ -4916,8 +4920,29 @@ fn rewrite_helper_calls(
             own_methods,
             own_params,
             view_visible,
+            view_context,
         )
     });
+
+    // A helper a gem mixes into the view (lucide-rails' `lucide_icon`), called from a helper module's function: Rails'
+    // method, on a view context, as a template's call of it is (`view_to_library`'s `ActionView::Base.new`).
+    if let ExprNode::Send { recv: None, method, .. } = &*expr.node
+        && view_context.contains(method)
+        && !index.contains_key(method)
+        && !own_methods.contains(method)
+        && !own_params.contains(method)
+    {
+        let span = expr.span;
+        let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };
+        *recv = Some(Expr::new(span, ExprNode::Send {
+            recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })),
+            method: Symbol::from("new"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        }));
+        return;
+    }
 
     // Not left on `self` in a view or helper module: a helper reached as `self.x` is the bare `x` below, and the module function has no such method. A same-named param keeps `self`, which a bare call would read instead.
     if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node {

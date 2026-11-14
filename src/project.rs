@@ -1960,6 +1960,10 @@ fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app:
         requires.push_str("require_relative \"runtime/ordered_options_spinel\"\n");
         sigs.push("ordered_options_spinel");
     }
+    if own(&|text| text.contains("Gzip.decompress") || text.contains("Gzip.compress")) {
+        requires.push_str("require_relative \"runtime/active_support_gzip_spinel\"\n");
+        sigs.push("active_support_gzip_spinel");
+    }
     // Not only a dotted call: a class method calls them bare (`descendants.each`); not a word inside another name, nor
     // an assignment (`descendants = …`), though a comparison (`module_parent == Object`) still calls it.
     let names_bare = |text: &str, name: &str| {
@@ -9234,6 +9238,8 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "ActiveSupport::ConfigurationFile",
     // `config_for`'s Hash, which ships with ConfigurationFile.
     "ActiveSupport::OrderedOptions",
+    // A String gzipped and back (lucide-rails' icon bundle): the CRuby overlay's, and Spinel's on its zlib package.
+    "ActiveSupport::Gzip",
     // Exception classes and their newly exposed owners in
     // `runtime/ruby/active_storage.rb`. Registering a nested error also
     // resolves its enclosing namespace as a value, which needs the same

@@ -6682,7 +6682,7 @@ pub(crate) fn lexxy_uses_editor_adapter(lock: &crate::gems::Lockfile) -> bool {
 }
 
 /// The instance methods of the modules a gem's load hook mixes into `ActionView::Base`.
-fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<String> {
+pub(crate) fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<String> {
     app.library_classes
         .iter()
         .filter(|c| c.name.0.as_str() == "ActionView::Base")

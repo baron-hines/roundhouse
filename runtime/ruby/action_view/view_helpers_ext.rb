@@ -112,25 +112,23 @@ module ActionView
     # Rails `class_names` (alias of `token_list`): strings/arrays add
     # their tokens, hash entries contribute their key when the value is
     # truthy (`class_names("nav", current_page: cur == path)`), nested
-    # arrays recurse, and nil, false and blank tokens drop. Joined with
-    # single spaces.
+    # arrays recurse, and nil, false and blank tokens drop. Each value is
+    # split on whitespace and a token repeated is kept once, as Rails'
+    # `.split(/\s+/)` and `.uniq` do; joined with single spaces.
     def self.class_names(*args)
       tokens = []
       args.each do |arg|
         if arg.is_a?(Hash)
           arg.each do |k, v|
-            key = k.to_s
-            tokens << key if v && !key.strip.empty?
+            k.to_s.split(" ").each { |t| tokens << t } if v
           end
         elsif arg.is_a?(Array)
-          s = class_names(*arg)
-          tokens << s unless s.empty?
+          class_names(*arg).split(" ").each { |t| tokens << t }
         elsif arg
-          s = arg.to_s
-          tokens << s unless s.strip.empty?
+          arg.to_s.split(" ").each { |t| tokens << t }
         end
       end
-      tokens.join(" ")
+      tokens.uniq.join(" ")
     end
 
     def self.number_helper_for_template(method, value, options = {})

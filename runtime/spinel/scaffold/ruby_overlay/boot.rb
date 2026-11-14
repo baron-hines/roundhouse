@@ -111,6 +111,7 @@ require_relative "runtime/type_toolkit"
 # `config_for`'s answer: a Hash subclass with `method_missing`, so it cannot
 # live in the shared runtime that reads it (CRuby overlay only).
 require_relative "runtime/active_support_ordered_options"
+require_relative "runtime/active_support_gzip"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other

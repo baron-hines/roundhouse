@@ -151,6 +151,7 @@ pub fn apply_tag_builder_lowering(
     // (`tag.title`), and rewriting that compiled to `"<title></title>"`.
     let owns_tag = classes_owning(app, registry, "tag", false);
     let owns_content_tag = classes_owning(app, registry, "content_tag", false);
+    let app_content_tag = app.helper_method_index.contains_key(&Symbol::from("content_tag"));
     // An app's own `stylesheet_link_tag` (an app/helpers method or a
     // `helper_method`) is what Rails calls; it is left to the app. So is
     // a class's own, which its bare call reaches, found as `tag`'s is.
@@ -166,7 +167,8 @@ pub fn apply_tag_builder_lowering(
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let own_tag = owner.is_some_and(|c| owns_tag.contains(c));
         let own_stylesheet = app_stylesheet || owner.is_some_and(|c| owns_stylesheet.contains(c));
-        let own_content_tag = owner.is_some_and(|c| owns_content_tag.contains(c));
+        // Not where the app's helpers define it: a helper module's bare call reaches theirs through the helper index.
+        let own_content_tag = app_content_tag || owner.is_some_and(|c| owns_content_tag.contains(c));
         rewrite(body, own_tag, own_content_tag, own_stylesheet, &models, &helpers, &sti_stems, &mut diags)
     });
     diags
@@ -232,6 +234,9 @@ pub(crate) fn helpers_including(app: &App, method: &str) -> HashSet<ClassId> {
 /// `include ActionView::Helpers::TagHelper` is dropped by the analyzer
 /// as a view-helper marker, so a model that really uses the builder
 /// keeps the rewrite.
+const FRAMEWORK_REOPENS: &[&str] =
+    &["ActionView::Base", "ActionController::Base", "ActionMailer::Base", "ActiveRecord::Base", "ActiveJob::Base"];
+
 fn classes_owning(
     app: &App,
     registry: &HashMap<ClassId, ClassInfo>,
@@ -257,6 +262,18 @@ fn classes_owning(
                 continue;
             }
             let Some(info) = registry.get(c) else { continue };
+            // Not the framework's own `tag` on a framework class the app or a gem reopens (`class ActionView::Base;
+            // include M; end` from an `on_load` or a Railtie): the reopen's methods only, and what it mixes in.
+            if FRAMEWORK_REOPENS.contains(&c.0.as_str()) {
+                let parts = app.library_classes.iter().filter(|lc| lc.name == *c);
+                for lc in parts {
+                    if lc.methods.iter().any(|m| m.name == tag && (m.receiver == crate::dialect::MethodReceiver::Instance || (class_side && !included))) {
+                        return true;
+                    }
+                    stack.extend(lc.includes.iter().map(|m| (m, true)));
+                }
+                continue;
+            }
             if info.instance_methods.contains_key(&tag)
                 || (class_side && !included && info.class_methods.contains_key(&tag))
             {
