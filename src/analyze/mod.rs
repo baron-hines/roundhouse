@@ -1171,6 +1171,9 @@ impl Analyzer {
         for (class_id, methods) in &app.rbs_signatures {
             let cls = classes.entry(class_id.clone()).or_default();
             for (name, ty) in methods {
+                if !cls.instance_methods.contains_key(name) {
+                    cls.sidecar_only_instance_methods.insert(name.clone());
+                }
                 cls.instance_methods.insert(name.clone(), ty.clone());
             }
         }

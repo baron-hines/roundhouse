@@ -131,7 +131,10 @@ fn respond_to_assertions_fold_on_the_rust_target() {
     );
 }
 
-/// What the test above expects, from Rails 8.1.4: an instance answers to
+/// What the test above expects, from Rails (the oracle the developer selected
+/// with `RH_RAILS_ORACLE`, else the pinned release; an instance's `respond_to?`
+/// for a column, association, persistence method or class method does not vary
+/// across Rails releases): an instance answers to
 /// its column and its association, and not to the class's own method
 /// (`def self.labelled`) or to another table's column.
 #[test]
@@ -139,7 +142,6 @@ fn rails_answers_the_same_respond_to_questions() {
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
     let components = r#""activerecord", sqlite3: ">= 2.9""#;
     let probe = emit_and_run::ruby()
-        .env("RH_RAILS_ORACLE", "8.1.4")
         .args(["-e", &format!("require {oracle:?}; puts RailsOracle.available?({components})")])
         .output()
         .expect("oracle availability");
@@ -150,7 +152,7 @@ fn rails_answers_the_same_respond_to_questions() {
         String::from_utf8_lossy(&probe.stderr)
     );
     if available == "false" {
-        prerequisite::missing("native Rails 8.1.4 oracle: missing activerecord, sqlite3");
+        prerequisite::missing("native Rails oracle: missing activerecord, sqlite3");
         return;
     }
     let program = format!(
@@ -173,6 +175,6 @@ got = %i[aisle items save shelf_id weight labelled find].map {{ |name| shelf.res
 raise got.inspect unless got == [true, true, true, false, false, false, false]
 "#
     );
-    let result = emit_and_run::ruby().env("RH_RAILS_ORACLE", "8.1.4").args(["-e", &program]).output().expect("native Rails oracle");
-    assert!(result.status.success(), "native Rails 8.1.4: {}", String::from_utf8_lossy(&result.stderr));
+    let result = emit_and_run::ruby().args(["-e", &program]).output().expect("native Rails oracle");
+    assert!(result.status.success(), "native Rails: {}", String::from_utf8_lossy(&result.stderr));
 }

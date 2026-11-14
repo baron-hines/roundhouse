@@ -54,7 +54,6 @@ pub fn apply(
     let surface = Surface {
         registry,
         model_parents: app.models.iter().map(|m| (m.name.clone(), m.parent.clone())).collect(),
-        sidecar_signed: app.rbs_signatures.iter().map(|(c, ms)| (c.clone(), ms.keys().cloned().collect())).collect(),
     };
     // A test class (or a test class it inherits from) that defines an
     // assertion owns it: the call is its method, not Minitest's.
@@ -104,11 +103,6 @@ const ASSERTIONS: [&str; 3] = ["assert_respond_to", "refute_respond_to", "assert
 pub(crate) struct Surface<'a> {
     pub registry: &'a HashMap<ClassId, ClassInfo>,
     pub model_parents: HashMap<ClassId, Option<ClassId>>,
-    /// The names each class has a signature for in `app.rbs_signatures`
-    /// (a `#:` comment or `sig/` file). Analysis files all of them under
-    /// `instance_methods`, class methods' included, so a signed name is
-    /// an instance method only if something else says so.
-    pub sidecar_signed: HashMap<ClassId, crate::det::HashSet<Symbol>>,
 }
 
 /// A local or ivar the test module may bind to a class object rather
@@ -266,7 +260,7 @@ pub(crate) fn responds(surface: &Surface, class: &ClassId, name: &Symbol) -> Opt
         // a sidecar one for a `def self.name`: that signature describes
         // the class method, and an instance does not respond to it.
         let class_side_signature = cls.source_class_methods.contains(name)
-            && surface.sidecar_signed.get(cid).is_some_and(|names| names.contains(name));
+            && cls.sidecar_only_instance_methods.contains(name);
         if cls.instance_methods.contains_key(name) && !class_side_signature {
             return Some(true);
         }
@@ -435,7 +429,7 @@ mod tests {
     }
 
     fn ask(registry: &HashMap<ClassId, ClassInfo>, class: &str, name: &str) -> Option<bool> {
-        let surface = Surface { registry, model_parents: HashMap::default(), sidecar_signed: HashMap::default() };
+        let surface = Surface { registry, model_parents: HashMap::default() };
         responds(&surface, &id(class), &Symbol::from(name))
     }
 
@@ -464,17 +458,38 @@ mod tests {
         let model = registry.get_mut(&id("Snapshot")).unwrap();
         model.instance_methods.insert(Symbol::from("labelled"), Ty::Nil);
         model.source_class_methods.insert(Symbol::from("labelled"));
-        let signed: HashMap<ClassId, crate::det::HashSet<Symbol>> =
-            [(id("Snapshot"), [Symbol::from("labelled")].into_iter().collect())].into_iter().collect();
-        let surface = Surface { registry: &registry, model_parents: HashMap::default(), sidecar_signed: signed.clone() };
+        model.sidecar_only_instance_methods.insert(Symbol::from("labelled"));
+        let surface = Surface { registry: &registry, model_parents: HashMap::default() };
         assert_eq!(responds(&surface, &id("Snapshot"), &Symbol::from("labelled")), Some(false));
         assert_eq!(responds(&surface, &id("Snapshot"), &Symbol::from("digest")), Some(true));
         // The same name defined on the instance side as well answers.
         let mut registry = registry;
         registry.get_mut(&id("Snapshot")).unwrap().source_instance_methods.insert(Symbol::from("labelled"));
         registry.get_mut(&id("Snapshot")).unwrap().public_instance_methods.insert(Symbol::from("labelled"));
-        let surface = Surface { registry: &registry, model_parents: HashMap::default(), sidecar_signed: signed };
+        let surface = Surface { registry: &registry, model_parents: HashMap::default() };
         assert_eq!(responds(&surface, &id("Snapshot"), &Symbol::from("labelled")), Some(true));
+    }
+
+    #[test]
+    fn an_accessor_or_association_beside_a_class_method_still_answers() {
+        // `attr_accessor :labelled` and `has_many :tags` register their
+        // names before any sidecar signature, so a sidecar-signed
+        // `def self.labelled` / `def self.tags` does not hide them.
+        let mut registry = registry();
+        let model = registry.get_mut(&id("Snapshot")).unwrap();
+        for name in ["labelled", "labelled=", "tags"] {
+            model.instance_methods.insert(Symbol::from(name), Ty::Untyped);
+        }
+        model.source_class_methods.extend(["labelled", "tags"].map(Symbol::from));
+        // The sidecar loop saw them already registered: not sidecar-only.
+        assert_eq!(ask(&registry, "Snapshot", "labelled"), Some(true));
+        assert_eq!(ask(&registry, "Snapshot", "labelled="), Some(true));
+        assert_eq!(ask(&registry, "Snapshot", "tags"), Some(true));
+        // A class method with only a sidecar signature does not.
+        let model = registry.get_mut(&id("Snapshot")).unwrap();
+        model.sidecar_only_instance_methods.insert(Symbol::from("labelled"));
+        assert_eq!(ask(&registry, "Snapshot", "labelled"), Some(false));
+        assert_eq!(ask(&registry, "Snapshot", "tags"), Some(true));
     }
 
     #[test]
@@ -485,7 +500,6 @@ mod tests {
         registry.get_mut(&id("ApplicationRecord")).unwrap().parent = None;
         let with = |parent: &str| Surface {
             registry: &registry,
-            sidecar_signed: HashMap::default(),
             model_parents: [
                 (id("ApplicationRecord"), Some(id(parent))),
                 (id("Snapshot"), Some(id("ApplicationRecord"))),
