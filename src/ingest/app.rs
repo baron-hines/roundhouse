@@ -6791,6 +6791,28 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
                 };
                 other_method == method && stored_options_init(other_expr, macro_def).is_none() && !args.is_empty()
             });
+            if let Some(init) = stored_rest_init(expr, macro_def) {
+                // The setter is its reader too (`self.class.permitted_accountable_attributes`), which the controller
+                // answers as Rails' extend does; the class-method splice leaves a controller that called it alone.
+                if !expanded.iter().chain(controller.body.iter()).any(|i| matches!(i, ControllerBodyItem::ClassMethod { method: m, .. } if m.name == macro_def.name)) {
+                    let mut method = concern_class_method_copy(macro_def, &module, &Default::default());
+                    method.receiver = crate::dialect::MethodReceiver::Class;
+                    expanded.push(ControllerBodyItem::ClassMethod {
+                        method,
+                        configuration_slot: None,
+                        configuration_role: None,
+                        leading_comments: vec![],
+                        leading_blank_line: true,
+                    });
+                }
+                expanded.push(ControllerBodyItem::ClassIvarInit {
+                    expr: init,
+                    carrier: module,
+                    leading_comments: leading_comments.clone(),
+                    leading_blank_line: *leading_blank_line,
+                });
+                continue;
+            }
             if method_stores_keyword_rest(macro_def) && !another_unreadable {
                 if let Some(init) = stored_options_init(expr, macro_def) {
                     survey::record(&IngestError::Unsupported {
@@ -7109,6 +7131,41 @@ fn stored_options_init(
     ))
 }
 
+/// `permitted_accountable_attributes :a, :b` on a class method that keeps its `*rest` in an ivar (maybe's
+/// `@x = attrs if attrs.any?` then `@x ||= [:id]`): the call is the store, an `@x = [:a, :b]` as the class body runs.
+/// Only literal arguments, whose list is the stored value as written.
+fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode, LValue};
+    let [param] = method.params.as_slice() else { return None };
+    if !param.rest || param.keyword || method.block_param.is_some() || method.has_anonymous_block {
+        return None;
+    }
+    let first = match &*method.body.node {
+        ExprNode::Seq { exprs } => exprs.first()?,
+        _ => &method.body,
+    };
+    let reads_rest = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name == &param.name);
+    let store = match &*first.node {
+        ExprNode::If { cond, then_branch, else_branch }
+            if matches!(&*cond.node, ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "any?" && args.is_empty() && reads_rest(r))
+                && matches!(&*else_branch.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) =>
+        {
+            then_branch
+        }
+        _ => return None,
+    };
+    let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*store.node else { return None };
+    if !reads_rest(value) {
+        return None;
+    }
+    let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };
+    if args.is_empty() || !args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { .. } | ExprNode::Hash { .. } | ExprNode::Array { .. })) {
+        return None;
+    }
+    let list = Expr::new(expr.span, ExprNode::Array { elements: args.clone(), style: Default::default() });
+    Some(Expr::new(expr.span, ExprNode::Assign { target: LValue::Ivar { name: name.clone() }, value: list }))
+}
+
 fn method_stores_keyword_rest(method: &crate::dialect::MethodDef) -> bool {
     use crate::expr::{ExprNode, LValue};
     let [param] = method.params.as_slice() else { return false };
@@ -7275,8 +7332,25 @@ fn substitute_params(
         .collect();
     bindings.extend(extra);
     replace(&mut body, &bindings);
+    flatten_literal_keyword_splats(&mut body);
     fold_literal_hash_reads(&mut body);
     Some(body)
+}
+
+/// `before_action :guard, **{ unless: … }`, as a forwarded `**options` reads once bound to the call's literal
+/// keywords: the keywords themselves, which the filter reader takes (`guard_feature(**options)` in maybe).
+fn flatten_literal_keyword_splats(expr: &mut crate::expr::Expr) {
+    use crate::expr::ExprNode;
+    expr.node.for_each_child_mut(&mut |c| flatten_literal_keyword_splats(c));
+    let ExprNode::Send { args, .. } = &mut *expr.node else { return };
+    for arg in args.iter_mut() {
+        if let ExprNode::KeywordSplat { value } = &*arg.node
+            && let ExprNode::Hash { entries, .. } = &*value.node
+        {
+            let entries = entries.clone();
+            *arg = crate::expr::Expr::new(arg.span, ExprNode::Hash { entries, kwargs: true });
+        }
+    }
 }
 
 /// True for the call-site expression that supplies keyword arguments —
@@ -7587,6 +7661,7 @@ fn filter_from_send(
     let mut except: Vec<crate::ident::Symbol> = Vec::new();
     let mut only_present = false;
     let mut prepend = method.as_str() == "prepend_before_action";
+    let (mut if_cond, mut unless_cond, mut if_cond_expr, mut unless_cond_expr) = (None, None, None, None);
     for arg in args {
         if let Some(sym) = sym_of(arg) {
             targets.push((sym, arg.span));
@@ -7616,14 +7691,24 @@ fn filter_from_send(
                     ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => {}
                     _ => return None,
                 },
-                // if:/unless: guards on a macro-expanded filter would
-                // need the predicate to resolve in the INCLUDER; not
-                // modeled, and silently dropping a guard changes when a
-                // filter fires.
-                Some("if") | Some("unless")
-                    if !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) =>
-                {
-                    return None
+                // A guard Rails runs on the controller instance, as a hand-written filter's: a Symbol names the
+                // predicate, a parameterless lambda's body is it. Any other value is refused: dropping a guard
+                // changes when a filter fires.
+                Some(which @ ("if" | "unless")) if !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) => {
+                    let (sym, body) = match &*value.node {
+                        ExprNode::Lit { value: Literal::Sym { value } } => (Some(value.clone()), None),
+                        ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
+                            if params.is_empty() && extra_params.is_empty() =>
+                        {
+                            (None, Some(body.clone()))
+                        }
+                        _ => return None,
+                    };
+                    if which == "if" {
+                        (if_cond, if_cond_expr) = (sym, body);
+                    } else {
+                        (unless_cond, unless_cond_expr) = (sym, body);
+                    }
                 }
                 _ => {}
             }
@@ -7644,10 +7729,10 @@ fn filter_from_send(
                 except: except.clone(),
                 only_style: crate::expr::ArrayStyle::default(),
                 except_style: crate::expr::ArrayStyle::default(),
-                if_cond: None,
-                unless_cond: None,
-                if_cond_expr: None,
-                unless_cond_expr: None,
+                if_cond: if_cond.clone(),
+                unless_cond: unless_cond.clone(),
+                if_cond_expr: if_cond_expr.clone(),
+                unless_cond_expr: unless_cond_expr.clone(),
                 unread_guard: false,
                 unread_options: false,
                 only_present,
