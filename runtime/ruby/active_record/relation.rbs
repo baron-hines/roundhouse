@@ -189,10 +189,15 @@ module ActiveRecord
     # shape, so a strict target that needs it has a spelling.
     def select: (*(String | Symbol) specs) -> Relation
     def select_specs!: (Array[String | Symbol] specs) -> Relation
+    def reselect: (*(String | Symbol) specs) -> Relation
     def distinct: (?(bool | Symbol | String) value) -> Relation
     def distinct!: (?(bool | Symbol | String) value) -> Relation
     def optimizer_hints: (*String hints) -> Relation
     def optimizer_hints!: (*String hints) -> Relation
+    @annotations: Array[String]
+    def annotate: (*String comments) -> Relation
+    def annotate!: (*String comments) -> Relation
+    def annotate_values: () -> Array[String]
     def all: () -> Relation
     def includes: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
     def preload: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
@@ -309,6 +314,24 @@ module ActiveRecord
     def take: () -> Base?
     def first!: () -> Base
     def last: () -> Base?
+    def second: () -> Base?
+    def third: () -> Base?
+    def fourth: () -> Base?
+    def fifth: () -> Base?
+    def second_to_last: () -> Base?
+    def third_to_last: () -> Base?
+    def second!: () -> Base
+    def third!: () -> Base
+    def fourth!: () -> Base
+    def fifth!: () -> Base
+    def second_to_last!: () -> Base
+    def third_to_last!: () -> Base
+    def found_or_raise: (Base? record) -> Base
+    def find_nth: (Integer index) -> Base?
+    def find_nth_from_last: (Integer index) -> Base?
+    def ordered_spawn: () -> Relation
+    def row_at: (Array[Base] rows, Integer index) -> Base?
+    def row_from_end: (Array[Base] rows, Integer index) -> Base?
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
     def count: () -> Integer
@@ -395,6 +418,7 @@ module ActiveRecord
     def bound_sql: () -> String
     def to_subquery_sql: () -> String
     def select_sql_with: (String default_cols) -> String
+    def sql_comment: (String comment) -> String
     def append_join_where: (String sql) -> String
     def append_group_having: (String sql) -> String
     def count_sql: () -> String

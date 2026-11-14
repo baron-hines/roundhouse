@@ -1743,6 +1743,38 @@ module ActiveRecord
       all.first!
     end
 
+    def self.second!
+      all.second!
+    end
+
+    def self.third!
+      all.third!
+    end
+
+    def self.fourth!
+      all.fourth!
+    end
+
+    def self.fifth!
+      all.fifth!
+    end
+
+    def self.second_to_last!
+      all.second_to_last!
+    end
+
+    def self.third_to_last!
+      all.third_to_last!
+    end
+
+    def self.reselect(*specs)
+      all.reselect(*specs)
+    end
+
+    def self.annotate(*comments)
+      all.annotate(*comments)
+    end
+
     def self.from(source)
       all.from(source)
     end

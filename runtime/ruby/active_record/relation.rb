@@ -146,6 +146,8 @@ module ActiveRecord
       @select_sql = nil
       @distinct = false
       @optimizer_hints = ""
+      # `annotate`'s comments, as given (Rails' `annotate_values`).
+      @annotations = []
       @limit = nil
       @offset = nil
       @includes = []
@@ -1331,6 +1333,13 @@ module ActiveRecord
       self
     end
 
+    # Rails' `reselect(*args)`: the projection replaced by these columns
+    # (query_methods.rb `reselect!` assigns `select_values`).
+    def reselect(*specs)
+      raise ArgumentError, "The method .reselect() must contain arguments." if specs.empty?
+      spawn.select_specs!(specs)
+    end
+
     # Rails' `QueryMethods#distinct(value = true)`: any truthy value
     # turns DISTINCT on (`distinct(:name)` is not a column list; it is
     # `distinct(true)`), `false` turns it off.
@@ -1352,6 +1361,30 @@ module ActiveRecord
         @optimizer_hints = @optimizer_hints.empty? ? text : "#{@optimizer_hints} #{text}"
       end
       self
+    end
+
+    # Rails' `annotate(*comments)`: SQL comments written after the query
+    # (`SELECT … /* comment */`). `annotate!` takes the union with the
+    # comments already given (`annotate_values |= args`) and keeps them as
+    # given; they are sanitized only where the SQL is written, as arel's
+    # `visit_Arel_Nodes_Comment` does. The list is replaced, never
+    # mutated, so a spawned copy shares it safely.
+    def annotate(*comments)
+      raise ArgumentError, "The method .annotate() must contain arguments." if comments.empty?
+      spawn.annotate!(*comments)
+    end
+
+    def annotate!(*comments)
+      unload_records
+      merged = copy_string_list(@annotations)
+      comments.each { |comment| merged << comment unless merged.include?(comment) }
+      @annotations = merged
+      self
+    end
+
+    # Rails' `annotate_values`: the comments `annotate` was given.
+    def annotate_values
+      copy_string_list(@annotations)
     end
 
     def distinct!(value = true)
@@ -2181,6 +2214,125 @@ module ActiveRecord
     def last
       rows = last_n(1)
       rows.length == 0 ? nil : rows[0]
+    end
+
+    # Rails' ordinal finders (finder_methods.rb): `second` … `fifth` are
+    # `find_nth(index)`, `second_to_last` / `third_to_last` are
+    # `find_nth_from_last(index)`, and each bang form raises
+    # RecordNotFound where the plain one answers nil.
+    def second
+      find_nth(1)
+    end
+
+    def third
+      find_nth(2)
+    end
+
+    def fourth
+      find_nth(3)
+    end
+
+    def fifth
+      find_nth(4)
+    end
+
+    def second_to_last
+      find_nth_from_last(2)
+    end
+
+    def third_to_last
+      find_nth_from_last(3)
+    end
+
+    def second!
+      found_or_raise(second)
+    end
+
+    def third!
+      found_or_raise(third)
+    end
+
+    def fourth!
+      found_or_raise(fourth)
+    end
+
+    def fifth!
+      found_or_raise(fifth)
+    end
+
+    def second_to_last!
+      found_or_raise(second_to_last)
+    end
+
+    def third_to_last!
+      found_or_raise(third_to_last)
+    end
+
+    # Rails' `raise_record_not_found_exception!` with no ids, as `first!`.
+    def found_or_raise(record)
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
+    # Rails' `find_nth(index)`: the record at that position of the
+    # relation's own LIMIT/OFFSET window, in its order (the primary key
+    # when it has none, as `ordered_relation` imposes). A loaded
+    # relation answers from its rows.
+    def find_nth(index)
+      loaded = @records
+      return row_at(loaded, index) unless loaded.nil?
+      limit = 1
+      cap = @limit
+      unless cap.nil?
+        limit = cap - index if cap - index < limit
+      end
+      return nil if limit <= 0
+      start = @offset
+      rel = ordered_spawn
+      rel.offset!(start.nil? ? index : start + index)
+      rel.limit!(limit)
+      rows = rel.to_a
+      rows.length == 0 ? nil : rows[0]
+    end
+
+    # Rails' `find_nth_from_last(index)`: a loaded or LIMIT/OFFSET-windowed
+    # relation answers from its rows; otherwise the order reversed,
+    # OFFSET index - 1, and its first row.
+    def find_nth_from_last(index)
+      loaded = @records
+      return row_from_end(loaded, index) unless loaded.nil?
+      return row_from_end(ordered_spawn.to_a, index) unless @limit.nil? && @offset.nil?
+      reversed = []
+      if @orders.empty?
+        reversed << "#{@table}.#{@model.primary_key} DESC"
+      else
+        @orders.each { |term| reversed << reverse_order_term(term) }
+      end
+      rel = unloaded_spawn
+      rel.clear_ordering
+      reversed.each { |term| rel.order_sql!(term) }
+      rel.offset!(index - 1)
+      rel.first
+    end
+
+    # Rails' `ordered_relation`: this relation, ordered by its primary key
+    # when it has no order of its own.
+    def ordered_spawn
+      rel = unloaded_spawn
+      rel.order_sql!("#{@table}.#{@model.primary_key} ASC") if @orders.empty?
+      rel
+    end
+
+    # `rows[index]`. A helper, as `loaded_tail` is, so the loaded rows
+    # read as the narrowed `Array[Base]` rather than `@records`' own type.
+    def row_at(rows, index)
+      rows[index]
+    end
+
+    # `rows[-index]`, nil past the front.
+    def row_from_end(rows, index)
+      at = rows.length - index
+      at < 0 ? nil : rows[at]
     end
 
     # Rails' `first(n)` / `last(n)` — the COUNTED forms, which answer an
@@ -3352,7 +3504,16 @@ module ActiveRecord
       end
       sql = "#{sql} OFFSET #{@offset}" unless @offset.nil?
       sql = "#{sql} #{@lock_clause}" unless @lock_clause == ""
+      @annotations.each { |comment| sql = "#{sql} /* #{sql_comment(comment)} */" }
       sql
+    end
+
+    # Rails' `sanitize_as_sql_comment` (abstract/quoting.rb): the
+    # comment's own surrounding `/*`, `/*+` and `*/` are dropped and any
+    # inside it broken up, so it cannot end the comment early.
+    def sql_comment(comment)
+      text = comment.sub(/\A\s*\/\*\+?\s?/, "").sub(/\s?\*\/\s*\Z/, "")
+      text.gsub("*/", "* /").gsub("/*", "/ *")
     end
 
     # JOIN + WHERE only — shared by count_sql / exists_sql so DISTINCT

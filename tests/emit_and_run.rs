@@ -22273,3 +22273,5 @@ mod relation_merge_order;
 mod relation_except_only;
 #[path = "emit_and_run/model_delete_by_id.rs"]
 mod model_delete_by_id;
+#[path = "emit_and_run/querying_delegation.rs"]
+mod querying_delegation;

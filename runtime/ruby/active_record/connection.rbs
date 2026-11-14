@@ -207,6 +207,14 @@ module ActiveRecord
     def self.find_in_batches: () { (Array[Base]) -> void } -> Relation
     def self.first_or_initialize: () -> Base
     def self.first!: () -> Base
+    def self.second!: () -> Base
+    def self.third!: () -> Base
+    def self.fourth!: () -> Base
+    def self.fifth!: () -> Base
+    def self.second_to_last!: () -> Base
+    def self.third_to_last!: () -> Base
+    def self.reselect: (*(String | Symbol) specs) -> Relation
+    def self.annotate: (*String comments) -> Relation
     def self.from: (String source) -> Relation
     def self.group: (*(String | Symbol) parts) -> Relation
     def self.having: (String condition, *untyped args) -> Relation
