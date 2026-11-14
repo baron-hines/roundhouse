@@ -215,6 +215,12 @@ module ActiveRecord
     def unscope_parts: (Array[Symbol] parts) -> Relation
     def unscope_part!: (Symbol part) -> Relation
     def unscope_where!: () -> Relation
+    def except: (*Symbol skips) -> Relation
+    def only: (*Symbol onlies) -> Relation
+    def query_parts: () -> Array[Symbol]
+    def except_parts!: (Array[Symbol] skips) -> Relation
+    def split_parts!: (Array[Symbol] skips, Array[Symbol] group, bool held) -> nil
+    def except_part!: (Symbol part) -> Relation
     def arel: () -> Arel::SelectManager
     def none: () -> Relation
     def none!: () -> Relation

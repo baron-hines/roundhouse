@@ -656,6 +656,82 @@ module ActiveRecord
       self
     end
 
+    # Rails' `SpawnMethods#except(*skips)`: this relation without the
+    # named query values (`values.except(*skips)`), the rest kept.
+    # `scope.except(:order).order(...)` orders a scope afresh; a name
+    # this relation holds no value for drops nothing, as `Hash#except`.
+    def except(*skips)
+      unloaded_spawn.except_parts!(skips)
+    end
+
+    # Rails' `SpawnMethods#only(*onlies)`: the relation with just the
+    # named query values (`values.slice(*onlies)`), so `distinct` goes
+    # too unless named. `merge(scope.only(:order))` carries a scope's
+    # ordering onto another relation.
+    def only(*onlies)
+      skips = []
+      query_parts.each { |part| skips << part unless onlies.include?(part) }
+      unloaded_spawn.except_parts!(skips)
+    end
+
+    # The query values this relation holds, named as Rails'
+    # `Relation::VALUE_METHODS` key them. `:reordering` is its own value
+    # there, so `only(:order)` of a reordered relation merges as an
+    # ordering that extends, not replaces.
+    def query_parts
+      [:where, :order, :reordering, :limit, :offset, :select, :group, :having, :distinct, :joins, :left_outer_joins,
+       :includes, :preload, :eager_load, :from, :with, :lock, :readonly, :optimizer_hints]
+    end
+
+    def except_parts!(skips)
+      # Rails keeps `joins` and `left_outer_joins` apart, and `includes`,
+      # `preload` and `eager_load`; here each group is one list, so
+      # dropping one member and keeping another cannot be told apart.
+      split_parts!(skips, [:joins, :left_outer_joins], !@joins.empty?)
+      split_parts!(skips, [:includes, :preload, :eager_load], !@includes.empty?)
+      skips.each { |part| except_part!(part) }
+      self
+    end
+
+    def split_parts!(skips, group, held)
+      return nil unless held
+      named = 0
+      group.each { |part| named += 1 if skips.include?(part) }
+      return nil if named == 0 || named == group.length
+      raise NotImplementedError, "except/only: :#{group.join(", :")} are one list here, so they are dropped or kept together"
+    end
+
+    def except_part!(part)
+      if part == :where || part == :order || part == :limit || part == :offset
+        unscope_part!(part)
+      elsif part == :reordering
+        @reordering = false
+      elsif part == :select
+        @select_sql = nil
+      elsif part == :group
+        @groups = []
+      elsif part == :having
+        @havings = []
+      elsif part == :distinct
+        @distinct = false
+      elsif part == :joins || part == :left_outer_joins
+        @joins = []
+      elsif part == :includes || part == :preload || part == :eager_load
+        @includes = []
+      elsif part == :from
+        @from = nil
+      elsif part == :with
+        @ctes = []
+      elsif part == :lock
+        @lock_clause = ""
+      elsif part == :readonly
+        @readonly = false
+      elsif part == :optimizer_hints
+        @optimizer_hints = ""
+      end
+      self
+    end
+
     def unscope_where!
       own_lists
       @wheres = []
