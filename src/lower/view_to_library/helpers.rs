@@ -1262,7 +1262,14 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
         by_key.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
     };
     let controller = take("controller")?;
-    let action = take("action")?;
+    // Rails' route set normalizes a Hash that names a controller:
+    // `action ||= "index"`, so no action, or a nil one, is the index.
+    let index = || Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: "index".to_string() } });
+    let action = match take("action") {
+        None => index(),
+        Some(a) if matches!(&*a.node, ExprNode::Lit { value: Literal::Nil }) => index(),
+        Some(a) => a,
+    };
     let mut extras: Vec<(String, Expr)> = by_key
         .iter()
         .filter(|(k, _)| k != "controller" && k != "action")

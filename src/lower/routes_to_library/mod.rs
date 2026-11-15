@@ -984,8 +984,8 @@ fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute
 
 /// Every url-options hash in a view: a Hash literal in the URL argument
 /// of `link_to`, `link_to_if` or `button_to`, whose keys are all Symbols
-/// and include both `controller` and `action`. Yields the remaining
-/// keys, sorted.
+/// and include `controller` (no `action` is the index). Yields the
+/// keys other than those two, sorted.
 ///
 /// The view lowerer resolves a url-options hash only in that URL
 /// argument (`emit_url_options_hash`), so this looks only there. A Hash
@@ -1039,7 +1039,8 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
                 })
                 .collect();
             if let Some(keys) = keys {
-                if keys.iter().any(|k| k == "controller") && keys.iter().any(|k| k == "action") {
+                // No action is the controller's index (`emit_url_options_hash`).
+                if keys.iter().any(|k| k == "controller") {
                     let mut extras: Vec<String> = keys
                         .into_iter()
                         .filter(|k| k != "controller" && k != "action")

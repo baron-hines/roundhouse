@@ -22275,3 +22275,5 @@ mod assert_select_equality;
 mod request_headers_merge;
 #[path = "emit_and_run/prepend_around_action.rs"]
 mod prepend_around_action;
+#[path = "emit_and_run/url_for_controller_index.rs"]
+mod url_for_controller_index;
