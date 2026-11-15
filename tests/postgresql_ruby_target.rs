@@ -77,16 +77,17 @@ fn postgresql_fixtures_move_the_id_sequence_past_their_rows() {
     assert!(!comments.contains("setval"), "{comments}");
 }
 
-/// Fixtures keyed 0 and below load on PostgreSQL, and a create after
-/// them takes the sequence's first value. PostgreSQL 18 refuses
-/// `setval` below a sequence's minimum: "setval: value 0 is out of
-/// bounds for sequence "comments_id_seq" (1..9223372036854775807)".
+/// Fixtures keyed below zero load on PostgreSQL, and a create after them
+/// takes the sequence's first value. PostgreSQL 18 refuses `setval`
+/// below a sequence's minimum ("setval: value 0 is out of bounds for
+/// sequence ... (1..9223372036854775807)"). Not keyed 0: the insert
+/// takes a 0 key as unset and lets the database assign one.
 #[test]
-fn postgresql_fixtures_keyed_at_or_below_zero_load() {
+fn postgresql_fixtures_keyed_below_zero_load() {
     let Some(db) = pg_test_url::pg_test_db("postgresql_ruby_target_nonpositive_ids") else { return };
     postgresql_blog()
-        .edit("test/fixtures/comments.yml", "one:\n  article: one\n", "one:\n  id: 0\n  article: one\n")
-        .edit("test/fixtures/comments.yml", "two:\n  article: two\n", "two:\n  id: -1\n  article: two\n")
+        .edit("test/fixtures/comments.yml", "one:\n  article: one\n", "one:\n  id: -1\n  article: one\n")
+        .edit("test/fixtures/comments.yml", "two:\n  article: two\n", "two:\n  id: -2\n  article: two\n")
         .write("test/models/nonpositive_id_test.rb", NONPOSITIVE_ID_TEST)
         .run_test_env("test/models/nonpositive_id_test.rb", &[("DATABASE_URL", db.url.as_str())])
         .assert_passes();
@@ -95,9 +96,9 @@ fn postgresql_fixtures_keyed_at_or_below_zero_load() {
 const NONPOSITIVE_ID_TEST: &str = r#"require "test_helper"
 
 class NonpositiveIdTest < ActiveSupport::TestCase
-  test "fixtures keyed at or below zero, then a create" do
-    assert_equal 0, comments(:one).id
-    assert_equal(-1, comments(:two).id)
+  test "fixtures keyed below zero, then a create" do
+    assert_equal(-1, comments(:one).id)
+    assert_equal(-2, comments(:two).id)
     comment = Comment.create!(article: articles(:one), commenter: "Carol", body: "A new comment")
     assert_equal 1, comment.id
   end
