@@ -68,6 +68,28 @@ fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines
     let Some(Ty::Array { elem: row_ty }) = args[0].ty.clone() else { return };
     let record_ty = (**elem).clone();
     let span = expr.span;
+    // Rails reads the receiver once, before the rows, and for an empty
+    // Array too: a receiver that is more than a read (a `where` chain
+    // whose arguments call out) is bound first and the binding read per row.
+    let (bind_recv, recv) = match recv {
+        Some(r) if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Const { .. } | ExprNode::SelfRef) => {
+            let name = Symbol::from("__creator");
+            let recv_ty = r.ty.clone().unwrap_or(Ty::Untyped);
+            let assign = with_ty(
+                Expr::new(
+                    span,
+                    ExprNode::Assign {
+                        target: crate::expr::LValue::Var { id: VarId(0), name: name.clone() },
+                        value: r.clone(),
+                    },
+                ),
+                recv_ty.clone(),
+            );
+            let read = with_ty(Expr::new(span, ExprNode::Var { id: VarId(0), name }), recv_ty);
+            (Some(assign), Some(read))
+        }
+        other => (None, other.clone()),
+    };
     let attrs = Symbol::from("__attrs");
     let row = with_ty(
         Expr::new(span, ExprNode::Var { id: VarId(0), name: attrs.clone() }),
@@ -77,7 +99,7 @@ fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines
         Expr::new(
             span,
             ExprNode::Send {
-                recv: recv.clone(),
+                recv,
                 method: method.clone(),
                 args: vec![row],
                 block: block.clone(),
@@ -103,7 +125,7 @@ fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines
     );
     let rows = args[0].clone();
     let ty = expr.ty.clone();
-    *expr = Expr::new(
+    let map = Expr::new(
         span,
         ExprNode::Send {
             recv: Some(rows),
@@ -113,5 +135,9 @@ fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines
             parenthesized: false,
         },
     );
+    *expr = match bind_recv {
+        Some(assign) => Expr::new(span, ExprNode::Seq { exprs: vec![assign, with_ty(map, ty.clone().unwrap_or(Ty::Untyped))] }),
+        None => map,
+    };
     expr.ty = ty;
 }

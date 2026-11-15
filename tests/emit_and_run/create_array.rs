@@ -30,6 +30,13 @@ end
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
+  SOURCES = []
+
+  def self.next_source
+    SOURCES << "s#{SOURCES.size + 1}"
+    SOURCES.last
+  end
+
   def self.check(label, actual, expected)
     raise "#{label}: #{actual.inspect}, Rails answers #{expected.inspect}" unless actual == expected
   end
@@ -51,6 +58,10 @@ end
     tagged = Tagging.create!([{ post_id: 11, tag_name: "e" }, { post_id: 11, tag_name: "f" }]) { |t| t.source = "block" }
     check("a block runs per row", tagged.map { |t| row(t) }, [[11, "e", "block"], [11, "f", "block"]])
     check("an app factory's create!", TaggingFactory.create!([{ tag_name: "x" }, { tag_name: "y" }]).map(&:tag_name), ["built 2"])
+    scoped = Tagging.where(source: next_source).create([{ post_id: 12, tag_name: "g" }, { post_id: 12, tag_name: "h" }])
+    check("the receiver once", scoped.map { |t| row(t) }, [[12, "g", "s1"], [12, "h", "s1"]])
+    Tagging.where(source: next_source).create([])
+    check("the receiver of an empty Array", SOURCES, ["s1", "s2"])
   end
 end
 "##)
