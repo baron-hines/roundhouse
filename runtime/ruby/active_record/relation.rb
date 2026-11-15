@@ -250,11 +250,13 @@ module ActiveRecord
     # Answers the block's value.
     def scoping
       scopes = Db._push_current_scope(self)
+      value = nil
       begin
-        yield
+        value = yield
       ensure
         scopes.pop
       end
+      value
     end
 
     # Copy this relation's query state onto `target`, as Rails' `clone`

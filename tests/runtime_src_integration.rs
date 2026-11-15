@@ -1352,7 +1352,11 @@ fn every_runtime_method_body_concretely_typed() {
     // nil for a column a partial `select` left out before it reads the
     // untyped `self[name]`, so its body is a sequence ending in that read
     // (+1 in active_record/connection.rb).
-    const CEILING: usize = 991;
+    // MEASURED 993 on unscoped's block value (991): `Model.unscoped { }`
+    // pushes its bare relation and binds its own block's value rather than
+    // answering `scoping`'s, so the Spinel binary keeps it (+2 in
+    // active_record/connection.rb).
+    const CEILING: usize = 993;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

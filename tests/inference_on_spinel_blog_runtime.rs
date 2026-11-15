@@ -603,7 +603,11 @@ fn untyped_subexpressions_baseline() {
     // MEASURED 1347 on async_count(:id) of a select (1345): `async_count`
     // reads its `column` twice more to count the key of a relation with a
     // `select`, a var on this RBS-less probe (+2 in active_record/relation.rb).
-    const CEILING: usize = 1347;
+    // MEASURED 1351 on unscoped's block value (1347): `scoping` and
+    // `Model.unscoped { }` bind the block's value before their ensure, so
+    // the Spinel binary keeps it, a var on this RBS-less probe (+2 in
+    // active_record/relation.rb, +2 in active_record/connection.rb).
+    const CEILING: usize = 1351;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

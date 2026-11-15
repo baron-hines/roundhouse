@@ -1621,10 +1621,16 @@ module ActiveRecord
       if block_given?
         tables = ActiveRecord::Relation.unscoped_tables
         tables << _table_sql
+        # The bare relation is the block's current scope, as Rails'
+        # `relation.scoping { yield }` makes it, so an outer scope does
+        # not reach in. Pushed here rather than through `scoping`, so the
+        # block's value comes straight from this `yield`.
+        scopes = Db._push_current_scope(ActiveRecord::Relation.new(self, false))
         value = nil
         begin
-          value = ActiveRecord::Relation.new(self, false).scoping { yield }
+          value = yield
         ensure
+          scopes.pop
           tables.pop
         end
         return value
