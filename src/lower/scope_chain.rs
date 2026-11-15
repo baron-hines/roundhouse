@@ -3527,6 +3527,16 @@ pub(crate) fn owner_reads_once(owner: &Expr) -> bool {
     }
 }
 
+/// True when reading `owner` a second time answers the same value
+/// without running anything: a local, an ivar, or `self`. The hold wrap
+/// a constructor on a held has_many takes names the owner twice — as
+/// `__hold_<name>`'s receiver and inside the constructor's key (or
+/// inverse) argument — so an owner this does not admit (`Shelf.counted`,
+/// `Room.find(id)`) would be evaluated once per mention.
+fn owner_repeats_safely(owner: &Expr) -> bool {
+    matches!(&*owner.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
+}
+
 /// Association resolution for the seed arm: `(target, fk, <owner>.id)`,
 /// from the owner's stamped type, else the owner's NAME, else the assoc
 /// name when it is a unique has_many across models.
@@ -5416,8 +5426,21 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 // a later read merges the row into
                                 // (`_merge_target`). A built one is also
                                 // validated with the owner and saved after
-                                // it.
-                                if held && matches!(ctor_name, "new" | "create" | "create!") {
+                                // it. A created record is held only when its
+                                // owner reads the same value twice (a local,
+                                // an ivar or `self`): the wrap names the owner
+                                // again as the constructor's key, so a method
+                                // call would run once per mention. Otherwise
+                                // the create keeps its unheld shape, with the
+                                // owner read once. A built record is always
+                                // held: the owner saves it, so a memoized
+                                // owner reader (`current_shelf.books.build`)
+                                // must hold it (KNOWN GAP: that owner is read
+                                // twice).
+                                if held
+                                    && (ctor_name == "new"
+                                        || (matches!(ctor_name, "create" | "create!") && owner_repeats_safely(ir)))
+                                {
                                     let ty = expr.ty.clone();
                                     let built = std::mem::replace(expr, syn(span, ExprNode::Lit { value: Literal::Nil }));
                                     *expr = put(
@@ -7311,6 +7334,93 @@ mod tests {
             !mentions_assoc_lookup(&var_arg, &assocs),
             "a bare variable argument is not admitted"
         );
+    }
+
+    /// The hold wrap names the owner twice — `__hold_<name>`'s receiver
+    /// and the constructor's key — so it is only taken for an owner that
+    /// reads the same value twice (a local, an ivar, `self`). A
+    /// method-call owner keeps the unheld shape (and its one read) for
+    /// `create!`; `build` stays held, since its owner saves the record.
+    #[test]
+    fn a_constructor_on_a_method_call_owner_is_not_hold_wrapped() {
+        let shelf = ingest(
+            "class Shelf < ApplicationRecord\n  has_many :books\nend\n",
+            "app/models/shelf.rb",
+        );
+        let book = ingest(
+            "class Book < ApplicationRecord\n  belongs_to :shelf\nend\n",
+            "app/models/book.rb",
+        );
+        let models_v = vec![shelf.clone(), book];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let mut assocs = build_assoc_registry(&models_v);
+        assocs.has_many_held.insert((shelf.name.clone(), Symbol::from("books")));
+        let ctor = |owner: Expr, method: &str| {
+            let read = Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(owner),
+                    method: Symbol::from("books"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(read),
+                    method: Symbol::from(method),
+                    args: vec![hash_arg(vec![(sym_lit("title"), int_lit(1))])],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        };
+
+        // A bareword owner (the template-local form) whose name reads
+        // `Shelf` by convention: `Shelf` declares `books`.
+        let bare_shelf = || {
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("shelf"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            )
+        };
+        let mut create = ctor(bare_shelf(), "create!");
+        rewrite_call_site(&mut create, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, args, .. } = &*create.node else {
+            panic!("expected Send, got {:?}", create.node)
+        };
+        assert_eq!(method.as_str(), "create!", "an owner read twice is not held: {:?}", create.node);
+        let ExprNode::Hash { entries, .. } = &*args[0].node else {
+            panic!("expected a kwargs hash, got {:?}", args[0].node)
+        };
+        assert!(
+            entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "shelf_id")),
+            "the constructor still carries the association's key: {entries:?}"
+        );
+
+        let ivar = Expr::new(span(), ExprNode::Ivar { name: Symbol::from("shelf") });
+        let mut built = ctor(ivar, "build");
+        rewrite_call_site(&mut built, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, .. } = &*built.node else {
+            panic!("expected Send, got {:?}", built.node)
+        };
+        assert_eq!(method.as_str(), "__hold_books", "an ivar owner is held: {:?}", built.node);
+
+        let mut built_on_call = ctor(bare_shelf(), "build");
+        rewrite_call_site(&mut built_on_call, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, .. } = &*built_on_call.node else {
+            panic!("expected Send, got {:?}", built_on_call.node)
+        };
+        assert_eq!(method.as_str(), "__hold_books", "a built record is held whatever its owner: {:?}", built_on_call.node);
     }
 
     #[test]

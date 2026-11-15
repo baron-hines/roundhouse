@@ -18,6 +18,15 @@ end
   def retagged
     dogs.update(age: 7)
   end
+
+  # A class method as the OWNER of a create: reading it twice would run
+  # this body twice, so the counter is how the probe sees that.
+  def self.counted
+    k = Kennel.find_by(name: "counted")
+    k.reads = k.reads + 1
+    k.save!
+    k
+  end
 end
 "##)
         .write("app/models/dog.rb", r##"class Dog < ApplicationRecord
@@ -45,12 +54,18 @@ end
     retagged = m.retagged
     check("method body update", retagged.length == 1 && retagged.first.equal?(mdog) && mdog.age == 7)
     check("method body row", Dog.find(mdog.id).age == 7)
+    # Rails: `Kennel.counted.dogs.create!` evaluates the owner once
+    c = Kennel.create!(name: "counted")
+    cd = Kennel.counted.dogs.create!(name: "once", age: 1)
+    check("owner read once", Kennel.find_by(name: "counted").reads == 1)
+    check("owner of the created record", cd.kennel_id == c.id)
   end
 end
 "##)
         .write("db/schema.rb", r##"ActiveRecord::Schema.define do
   create_table "kennels", force: :cascade do |t|
     t.string "name"
+    t.integer "reads", default: 0
   end
   create_table "dogs", force: :cascade do |t|
     t.string "name"
