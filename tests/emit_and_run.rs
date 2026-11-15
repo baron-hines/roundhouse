@@ -22392,3 +22392,23 @@ mod safe_navigation_on_false;
 mod symbol_key_reads;
 #[path = "emit_and_run/unsaved_id_present.rs"]
 mod unsaved_id_present;
+
+// Fork specs: record queries.
+#[path = "emit_and_run/integer_sum.rs"]
+mod integer_sum;
+#[path = "emit_and_run/pluck_joined_columns.rs"]
+mod pluck_joined_columns;
+#[path = "emit_and_run/query_constraints_update.rs"]
+mod query_constraints_update;
+#[path = "emit_and_run/quoted_booleans.rs"]
+mod quoted_booleans;
+#[path = "emit_and_run/record_bracket_read.rs"]
+mod record_bracket_read;
+#[path = "emit_and_run/select_without_text_key.rs"]
+mod select_without_text_key;
+#[path = "emit_and_run/self_join_nested_hop.rs"]
+mod self_join_nested_hop;
+#[path = "emit_and_run/sti_custom_inheritance_column.rs"]
+mod sti_custom_inheritance_column;
+#[path = "emit_and_run/where_bound_sql_literal.rs"]
+mod where_bound_sql_literal;
