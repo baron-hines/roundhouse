@@ -6627,6 +6627,13 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App, target: R
         }
     }
     files.push(("runtime/db.rb".to_string(), db_pg));
+    // A stored array column is a real PostgreSQL array (`text[]`,
+    // `schema_sql`), so its codec is the array literal's, not SQLite's
+    // JSON text: the same `ArrayColumn` API, so the lowering is unchanged.
+    if let Some((_, codec)) = files.iter_mut().find(|(p, _)| p == "runtime/array_column.rb") {
+        *codec = crate::runtime_files::read_to_string("runtime/spinel/array_column_pg.rb")
+            .map_err(|e| format!("read runtime/spinel/array_column_pg.rb: {e}"))?;
+    }
 
     // The gem, and a fresh lock: the committed one is SQLite's.
     let gemfile = files.iter_mut().find(|(p, _)| p == "Gemfile").ok_or("PostgreSQL tree: Gemfile not found")?;
@@ -10945,6 +10952,9 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     } else {
         files.retain(|(p, _)| p != "runtime/array_column.rb" && p != "runtime/array_column.rbs");
     }
+    // PostgreSQL's codec, which `apply_postgresql_tree` swaps in; no tree
+    // ships it under its own name.
+    files.retain(|(p, _)| p != "runtime/array_column_pg.rb");
     inject_array_column_require(&mut files, app)?;
 
     // ActiveJob payload codecs. Same reason as the JSON-column sidecar:

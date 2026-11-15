@@ -63,6 +63,28 @@ fn push_schema_symbol_list(
 /// as read. Only a model with a stored array column overrides `Base`'s
 /// identity, so only its tree names `ArrayColumn`.
 fn push_decode_plucked(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Table) {
+    push_array_column_switch(methods, owner, table, "decode_plucked", |col| array_load_method(col), |col| super::ty_of_column_stored(col));
+}
+
+/// `def self.encode_written(column, value)`: an Array a bulk write
+/// (`update_all`, `insert_all`, `upsert_all`) gives a stored array column,
+/// encoded as a record's save encodes it (`ArrayColumn.dump`): JSON text
+/// on SQLite, the array literal on PostgreSQL. Every other column's value
+/// is written as given, so an Array into a json column stays JSON.
+fn push_encode_written(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Table) {
+    push_array_column_switch(methods, owner, table, "encode_written", |_| "dump", |_| Ty::Untyped);
+}
+
+/// `def self.<name>(column, value)`: `ArrayColumn.<call>(value)` for each
+/// stored array column, `value` for every other one.
+fn push_array_column_switch(
+    methods: &mut Vec<MethodDef>,
+    owner: &ClassId,
+    table: &Table,
+    name: &str,
+    call: impl Fn(&Column) -> &'static str,
+    arg_ty: impl Fn(&Column) -> Ty,
+) {
     let stored: Vec<&Column> = table.columns.iter().filter(|c| c.array_stored).collect();
     if stored.is_empty() {
         return;
@@ -98,8 +120,8 @@ fn push_decode_plucked(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Ta
             Span::synthetic(),
             ExprNode::Send {
                 recv: Some(class_const(&ClassId(Symbol::from("ArrayColumn")))),
-                method: Symbol::from(array_load_method(col)),
-                args: vec![with_ty(var_ref(value.clone()), super::ty_of_column_stored(col))],
+                method: Symbol::from(call(col)),
+                args: vec![with_ty(var_ref(value.clone()), arg_ty(col))],
                 block: None,
                 parenthesized: true,
             },
@@ -114,7 +136,7 @@ fn push_decode_plucked(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Ta
         unsupported_formals: None,
         has_anonymous_block: false,
         name_span: Span::synthetic(),
-        name: Symbol::from("decode_plucked"),
+        name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params: vec![Param::positional(column.clone()), Param::positional(value.clone())],
         body,
@@ -724,6 +746,7 @@ pub(super) fn push_schema_methods(
         push_schema_symbol_list(methods, owner, "schema_json_coder_columns", table, |c| json_coder.contains(&c.name));
     }
     push_decode_plucked(methods, owner, table);
+    push_encode_written(methods, owner, table);
     push_schema_symbol_list(methods, owner, "schema_time_columns", table, |c| {
         matches!(c.col_type, crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Time)
     });
@@ -4897,10 +4920,21 @@ fn schema_default_literal(col: &Column) -> Option<Expr> {
     }
     let raw = col.stored_default()?;
     if col.array_stored {
-        // `default: []`, the only array default ingest keeps: a fresh
-        // empty Array of the column's element type.
+        // The array default ingest keeps (`[]`, `[0]`, `["a"]`, as JSON):
+        // a fresh Array of the column's element type, with its elements.
+        let elements = match serde_json::from_str::<serde_json::Value>(raw).ok()? {
+            serde_json::Value::Array(elements) => elements,
+            _ => return None,
+        };
+        let elements = elements
+            .iter()
+            .map(|e| match e {
+                serde_json::Value::String(s) => Some(lit_str(s.clone())),
+                _ => e.as_i64().map(lit_int),
+            })
+            .collect::<Option<Vec<_>>>()?;
         return Some(with_ty(
-            Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets }),
+            Expr::new(Span::synthetic(), ExprNode::Array { elements, style: ArrayStyle::Brackets }),
             super::ty_of_column_slot(col),
         ));
     }

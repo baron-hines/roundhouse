@@ -273,6 +273,8 @@ module ActiveRecord
     def self._adapter_all: () -> Array[Base]
     def self._adapter_find_by_id: (Integer id) -> Base?
     def self.decode_plucked: (String | Symbol column, untyped value) -> untyped
+    def self.encode_written: (String | Symbol column, untyped value) -> untyped
+    def self._written_sql: (String | Symbol column, untyped value) -> String
     def save: () -> bool
     def error_full_messages_for: (String attribute) -> Array[String]
     def valid?: () -> bool

@@ -615,11 +615,17 @@ fn untyped_subexpressions_baseline() {
     // Symbol it normalizes to instead of the name as given, which types
     // both (-1). The names are vars on this RBS-less probe;
     // connection.rbs types them for the RBS-paired gate, which stays at 0.
-    // MEASURED 1353 on aasm (1352): `attribute_names` in active_record/connection.rb
+    // MEASURED 1354 on PostgreSQL array columns (1352): a bulk write passes
+    // each value through `Model._written_sql(column, value)`, which hands
+    // an Array to `encode_written(column, value)`; both take a column value
+    // of any type, as `escape_value` does, so their `value` reads are vars
+    // on this RBS-less probe (+2 in active_record/connection.rb).
+    // connection.rbs types them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1355 on aasm (1354): `attribute_names` in active_record/connection.rb
     // leaves out the row's unloaded columns, reading each column `name` in its
     // block, a var on this RBS-less probe (+1); connection.rbs types it for the
     // RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1353;
+    const CEILING: usize = 1355;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

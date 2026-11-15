@@ -2591,8 +2591,9 @@ struct ColumnOpts {
     unheld_decimal: Option<String>,
     /// A present array option is non-scalar unless explicitly false or nil.
     array: bool,
-    /// `default: []`, which `default_value` reads as no default.
-    empty_array_default: bool,
+    /// An array literal `default:` (`[]`, `[0]`, `["a"]`), as JSON, which
+    /// `default_value` reads as no default.
+    array_default: Option<String>,
     /// `collation:` with a value ([`Column::collated`]).
     collated: bool,
 }
@@ -2715,6 +2716,19 @@ fn json_literal(node: &Node<'_>) -> Option<String> {
     None
 }
 
+/// Whether an array column's JSON default holds only elements of the
+/// column's kind: integers for an integer column, strings for a string
+/// one (`lower::array_columns::stores_element`). Any other default is
+/// dropped, as one that ingest cannot read.
+fn array_default_matches(json: &str, col_type: &ColumnType) -> bool {
+    let Ok(serde_json::Value::Array(elements)) = serde_json::from_str::<serde_json::Value>(json) else { return false };
+    match col_type {
+        ColumnType::Integer | ColumnType::BigInt => elements.iter().all(|e| e.as_i64().is_some()),
+        ColumnType::String { .. } | ColumnType::Text => elements.iter().all(|e| e.is_string()),
+        _ => elements.is_empty(),
+    }
+}
+
 /// Collect column options while retaining array metadata omitted by the normalized column type.
 fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> ColumnOpts {
     let mut opts = ColumnOpts::default();
@@ -2734,7 +2748,7 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         opts.default_expression = Some((node_span(value), sql_default_expression(value)));
                     }
                     opts.json_default = json_default_value(value);
-                    opts.empty_array_default = value.as_array_node().is_some_and(|a| a.elements().iter().next().is_none());
+                    opts.array_default = value.as_array_node().and_then(|_| opts.json_default.clone());
                 }
                 "limit" => {
                     if let Some(n) = integer_value(value) {
@@ -3052,14 +3066,16 @@ fn column_with_type(
         None
     };
 
+    let array_default = opts.array_default.clone().filter(|json| array_default_matches(json, &col_type));
     Ok(Column {
         name: Symbol::from(col_name),
         col_type,
         nullable: opts.nullable.unwrap_or(true),
-        // An array column's `default: []` is kept as `[]`; a target that
+        // An array column's literal default (`[]`, `[0]`, `["a"]`) is kept
+        // as JSON when each element is of the column's kind; a target that
         // stores the Array reads it (`Column::stored_default`).
-        default: if opts.array && opts.empty_array_default {
-            Some("[]".into())
+        default: if opts.array {
+            array_default
         } else if !opts.array && matches!(type_name, "json" | "jsonb") {
             opts.json_default.clone()
         } else {
