@@ -26,6 +26,9 @@ class ShelfMarksControllerTest < ActionDispatch::IntegrationTest
     assert_equal "aisle-4", response.header["X-Shelf-Mark"]
     assert_equal "aisle-4", response.header["x-shelf-mark"]
     assert_equal "aisle-4", @response.header["X-Shelf-Mark"]
+    name = "X-Shelf-Mark"
+    assert_equal "aisle-4", response.header[name]
+    assert_equal "aisle-4", response.headers[name]
     assert_equal response.headers["Content-Type"], response.header["Content-Type"]
     assert_nil response.header["X-Never-Set"]
   end

@@ -1260,6 +1260,8 @@ fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
 
 /// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`,
 /// and the same through `response.header`, Rails' alias of `headers`.
+/// On the response, a key known only at run time reads as
+/// `key.to_s.downcase`.
 ///
 /// Rails' `response.headers` is case-insensitive (Rack 3's `Headers`);
 /// the harness's is a plain Hash keyed the way Rack normalizes —
@@ -1309,6 +1311,16 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
             *value = lower;
             return true;
         }
+        return changed;
+    }
+    // A key known only at run time, on the response: lowercased there.
+    let lowered = matches!(&*args[0].node, ExprNode::Send { method, .. } if method.as_str() == "downcase");
+    if on_response() && !lowered {
+        let key = args[0].clone();
+        let span = key.span;
+        let to_s = Expr::new(span, ExprNode::Send { recv: Some(key), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false });
+        args[0] = Expr::new(span, ExprNode::Send { recv: Some(to_s), method: Symbol::from("downcase"), args: vec![], block: None, parenthesized: false });
+        return true;
     }
     changed
 }
