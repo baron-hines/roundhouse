@@ -63,3 +63,15 @@ fn a_fixture_with_its_own_id_is_found_by_it_on_spinel() {
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+/// A target whose insert leaves an integer key to the database (all but
+/// the Ruby family, which writes a supplied key as Rails does) stores
+/// the row under the next rowid, not its `id:`. Its accessor keeps
+/// finding the row by position, where that rowid is.
+#[test]
+fn a_target_that_assigns_its_own_keys_finds_the_row_by_position() {
+    let (emitted, errors) = app().emit(BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let fixtures = std::fs::read_to_string(emitted.join("src/fixtures/comments.rs")).expect("src/fixtures/comments.rs");
+    assert!(fixtures.contains("Comment::find(1_i64)") && !fixtures.contains("Comment::find(1001_i64)"), "{fixtures}");
+}
