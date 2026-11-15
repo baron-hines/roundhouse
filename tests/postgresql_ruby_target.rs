@@ -58,15 +58,17 @@ fn a_postgresql_primary_ships_the_pg_tree() {
 /// does after it loads fixtures: a create in a test then takes a new id
 /// (#2164). SQLite's rowid needs nothing.
 /// The sequence is set to the largest id, marked called so the next
-/// value is past it (1, uncalled, for an empty table), rather than to
-/// `MAX(id) + 1`, which overflows a bigint key at its largest value.
+/// value is past it, rather than to `MAX(id) + 1`, which overflows a
+/// bigint key at its largest value. With no positive id (an empty table,
+/// or fixtures keyed 0 or below) it is set to 1, uncalled: the sequence's
+/// minimum, below which `setval` raises.
 #[test]
 fn postgresql_fixtures_move_the_id_sequence_past_their_rows() {
     let (emitted, errors) = postgresql_blog().emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let comments = read(&emitted, "test/fixtures/comments.rb");
     assert!(
-        comments.contains("setval(pg_get_serial_sequence('\\\"comments\\\"', 'id'), COALESCE(MAX(\\\"id\\\"), 1), MAX(\\\"id\\\") IS NOT NULL) FROM \\\"comments\\\""),
+        comments.contains("setval(pg_get_serial_sequence('\\\"comments\\\"', 'id'), GREATEST(COALESCE(MAX(\\\"id\\\"), 0), 1), COALESCE(MAX(\\\"id\\\"), 0) >= 1) FROM \\\"comments\\\""),
         "{comments}"
     );
     let (emitted, errors) = emit_and_run::real_blog().emit(BuildTarget::Ruby);
@@ -74,6 +76,33 @@ fn postgresql_fixtures_move_the_id_sequence_past_their_rows() {
     let comments = read(&emitted, "test/fixtures/comments.rb");
     assert!(!comments.contains("setval"), "{comments}");
 }
+
+/// Fixtures keyed 0 and below load on PostgreSQL, and a create after
+/// them takes the sequence's first value. PostgreSQL 18 refuses
+/// `setval` below a sequence's minimum: "setval: value 0 is out of
+/// bounds for sequence "comments_id_seq" (1..9223372036854775807)".
+#[test]
+fn postgresql_fixtures_keyed_at_or_below_zero_load() {
+    let Some(db) = pg_test_url::pg_test_db("postgresql_ruby_target_nonpositive_ids") else { return };
+    postgresql_blog()
+        .edit("test/fixtures/comments.yml", "one:\n  article: one\n", "one:\n  id: 0\n  article: one\n")
+        .edit("test/fixtures/comments.yml", "two:\n  article: two\n", "two:\n  id: -1\n  article: two\n")
+        .write("test/models/nonpositive_id_test.rb", NONPOSITIVE_ID_TEST)
+        .run_test_env("test/models/nonpositive_id_test.rb", &[("DATABASE_URL", db.url.as_str())])
+        .assert_passes();
+}
+
+const NONPOSITIVE_ID_TEST: &str = r#"require "test_helper"
+
+class NonpositiveIdTest < ActiveSupport::TestCase
+  test "fixtures keyed at or below zero, then a create" do
+    assert_equal 0, comments(:one).id
+    assert_equal(-1, comments(:two).id)
+    comment = Comment.create!(article: articles(:one), commenter: "Carol", body: "A new comment")
+    assert_equal 1, comment.id
+  end
+end
+"#;
 
 #[test]
 fn a_sqlite_primary_keeps_the_sqlite_tree() {
