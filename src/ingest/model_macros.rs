@@ -858,6 +858,11 @@ fn expand_rest_each(
             if locals.contains(item) || locals.contains(rest) {
                 return None;
             }
+            // Not a String binding read as a value, which would allocate a fresh String per call (as the
+            // parameterless path declines it).
+            if string_binding_read_as_value(body, &bindings) {
+                return None;
+            }
             let body = substitute_body(body.clone(), &bindings, &mut locals, owner, app_names)?;
             let mut generated = def.clone();
             generated.name = name;
