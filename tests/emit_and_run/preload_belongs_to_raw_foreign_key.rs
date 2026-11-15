@@ -34,6 +34,7 @@ end
     Bridge.create!(span: 20, river: t)
     bridges = Bridge.order(:span).preload(:river).to_a
     # Rails: ["avon", "tay"], and the override still answers
+    check("preloaded", bridges.all? { |b| b.association(:river).loaded? })
     check("preload", bridges.map { |b| b.river.name } == ["avon", "tay"])
     check("override", bridges.first.river_id == "river-#{a.id}")
   end

@@ -42,9 +42,12 @@ end
     Vault.create!(size: 3, branch_id: 20)
     branches = Branch.order(:id).preload(:tellers, :vault).to_a
     # Rails: keyed on the id column
+    check("preloaded", branches.all? { |b| b.association(:tellers).loaded? && b.association(:vault).loaded? })
     check("has_many", branches.map { |b| b.tellers.map(&:name).sort } == [["kim"], ["lee", "max"]])
     check("has_one", branches.map { |b| b.vault && b.vault.size } == [nil, 3])
-    check("belongs_to", Teller.order(:name).preload(:branch).map { |t| t.branch.name } == ["high street", "station", "station"])
+    tellers = Teller.order(:name).preload(:branch).to_a
+    check("belongs_to preloaded", tellers.all? { |t| t.association(:branch).loaded? })
+    check("belongs_to", tellers.map { |t| t.branch.name } == ["high street", "station", "station"])
   end
 end
 "##)

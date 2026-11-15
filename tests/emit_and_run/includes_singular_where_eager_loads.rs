@@ -33,10 +33,12 @@ end
     farms = Farm.includes(:barn).where(barns: { color: "red" }).to_a
     # Rails: only the farm with the red barn, its barn in hand
     check("has_one filtered", farms.map(&:name) == ["upper"])
-    check("has_one loaded", farms.first.barn.color == "red")
+    check("has_one loaded", farms.first.association(:barn).loaded?)
+    check("has_one record", farms.first.barn.color == "red")
     barns = Barn.includes(:farm).where(farms: { name: "lower" }).to_a
     check("belongs_to filtered", barns.map(&:color) == ["grey"])
-    check("belongs_to loaded", barns.first.farm.name == "lower")
+    check("belongs_to loaded", barns.first.association(:farm).loaded?)
+    check("belongs_to record", barns.first.farm.name == "lower")
   end
 end
 "##)

@@ -33,7 +33,9 @@ end
     Fixture.create!(venue: "b", season: "autumn", league_id: spring.id)
     Fixture.create!(venue: "c", season: "autumn", league_id: autumn.id)
     Fixture.create!(venue: "d", season: "spring", league_id: spring.id)
-    preloaded = Fixture.order(:venue).preload(:league).map { |f| f.league && f.league.name }
+    fixtures = Fixture.order(:venue).preload(:league).to_a
+    check("preloaded", fixtures.all? { |f| f.association(:league).loaded? })
+    preloaded = fixtures.map { |f| f.league && f.league.name }
     read = Fixture.order(:venue).map { |f| f.league && f.league.name }
     # Rails: ["spring cup", nil, "autumn cup", "spring cup"] both ways
     check("preload", preloaded == ["spring cup", nil, "autumn cup", "spring cup"])

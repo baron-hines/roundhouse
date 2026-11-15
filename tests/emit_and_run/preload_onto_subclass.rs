@@ -43,15 +43,20 @@ end
     Bird.create!(name: "owl", weight: 2, home: a)
     queries = 0
     counter = ->(event) { queries += 1 unless event.payload[:name] == "SCHEMA" }
-    zoos = nil
+    cats = nil
+    mascots = nil
+    classes = nil
     ActiveSupport::Notifications.subscribed(counter, "sql.active_record") do
       zoos = Zoo.order(:id).preload(:big_cats, :mascot).to_a
+      cats = zoos.map { |z| z.big_cats.map(&:name) }
+      classes = zoos.flat_map(&:big_cats).map(&:class).uniq
+      mascots = zoos.map { |z| z.mascot && z.mascot.name }
     end
-    # Rails: three queries (zoos, big cats, mascots)
+    # Rails: three queries (zoos, big cats, mascots), reads included
     check("one query per association", queries == 3)
-    check("scoped has_many", zoos.map { |z| z.big_cats.map(&:name) } == [["tiger"], ["lion"]])
-    check("as the subclass", zoos.flat_map(&:big_cats).all? { |c| c.class == Cat })
-    check("polymorphic has_one", zoos.map { |z| z.mascot && z.mascot.name } == [nil, "lion"])
+    check("scoped has_many", cats == [["tiger"], ["lion"]])
+    check("as the subclass", classes == [Cat])
+    check("polymorphic has_one", mascots == [nil, "lion"])
   end
 end
 "##)
