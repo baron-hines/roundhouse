@@ -277,6 +277,25 @@ fn a_merged_symbol_key_schema_dump_is_refused() {
     assert!(tables(&checked.app).is_empty());
 }
 
+/// A key computed by ERB could be `schema_dump` itself, after or before
+/// the written one: a file that computes a key refuses a named file, and
+/// only a named one.
+#[test]
+fn a_computed_key_refuses_a_named_file() {
+    let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  <%= \"schema_dump\" %>: other.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("computes a key")), "{:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty());
+
+    // `schema_dump: false` or null names no file, so a computed key elsewhere keeps main's behavior.
+    for dump in ["false", "~"] {
+        let yml = format!("test:\n  adapter: sqlite3\n  schema_dump: {dump}\n  <%= \"pool\" %>: 5\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.
