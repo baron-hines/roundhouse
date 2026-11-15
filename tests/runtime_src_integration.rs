@@ -1356,7 +1356,14 @@ fn every_runtime_method_body_concretely_typed() {
     // pushes its bare relation and binds its own block's value rather than
     // answering `scoping`'s, so the Spinel binary keeps it (+2 in
     // active_record/connection.rb).
-    const CEILING: usize = 993;
+    // MEASURED 996 on PostgreSQL array columns (main 6c9c58dc5: 991): a bulk
+    // write (`update_all`, `insert_all`, `upsert_all`) now passes each value
+    // through `Model._written_sql(column, value)`, which hands an Array to the
+    // model's `encode_written` and quotes the rest. Both take a column
+    // value of any type, as `escape_value` does, so their untyped `value`
+    // adds 5 sites (+5 in active_record/connection.rb); every other file is
+    // unchanged. Raise to 998, preserving the two-site headroom.
+    const CEILING: usize = 998;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"
