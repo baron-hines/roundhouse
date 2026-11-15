@@ -1565,6 +1565,18 @@ fn class_side_lambda_body(node: &Node<'_>, file: &str) -> Option<crate::expr::Ex
     if !params.is_empty() || !extra_params.is_empty() || numbered_parameters(node).is_some_and(|n| n > 0) {
         return None;
     }
+    // Not a body that reads an ivar (the class's, there) or leaves the lambda (`return`), which no assignment can hold.
+    fn unmovable(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Ivar { .. } | ExprNode::Return { .. } | ExprNode::Next { .. } | ExprNode::Break { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || unmovable(c));
+        found
+    }
+    if unmovable(body) {
+        return None;
+    }
     let mut body = body.clone();
     to_class(&mut body);
     Some(body)

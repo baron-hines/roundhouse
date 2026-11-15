@@ -7358,6 +7358,15 @@ fn substitute_params(
     Some(body)
 }
 
+fn holds_lambda(e: &crate::expr::Expr) -> bool {
+    if matches!(&*e.node, crate::expr::ExprNode::Lambda { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || holds_lambda(c));
+    found
+}
+
 /// `before_action :guard, **{ unless: … }`, as a forwarded `**options` reads once bound to the call's literal
 /// keywords: the keywords themselves, which the filter reader takes (`guard_feature(**options)` in maybe).
 fn flatten_literal_keyword_splats(expr: &mut crate::expr::Expr) {
@@ -7726,8 +7735,10 @@ fn filter_from_send(
                 Some(which @ ("if" | "unless")) => {
                     let (sym, body) = match &*value.node {
                         ExprNode::Lit { value: Literal::Sym { value } } => (Some(value.clone()), None),
+                        // Not one holding a block of its own: the macro's parameters were substituted by name through
+                        // it, so a block parameter of the same name was rewritten too.
                         ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
-                            if params.is_empty() && extra_params.is_empty() =>
+                            if params.is_empty() && extra_params.is_empty() && !holds_lambda(body) =>
                         {
                             (None, Some(body.clone()))
                         }
