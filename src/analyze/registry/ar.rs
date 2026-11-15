@@ -641,7 +641,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_node(classes, "Arel::Nodes::Not", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::NamedFunction", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     // An ordering's `expr` is what it sorts by: the column's attribute
-    // for every term `relation.order_values` builds.
+    // for a term `relation.order_values` builds from a Symbol or Hash,
+    // or the SQL literal an app ordering wraps
+    // (`Arel::Nodes::Ascending.new(Arel.sql("LOWER(title)"))`), kept as
+    // given as Rails' Arel::Nodes::Unary keeps it. `name` still reads on
+    // the attribute arm.
+    let ordering_expr = Ty::Union { variants: vec![arel_attribute_ty.clone(), sql_literal.clone()].into() };
     for order in ["Arel::Nodes::Ordering", "Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
         let node = Ty::Class { id: ClassId(Symbol::from(order)), args: vec![].into() };
         register_node(
@@ -649,7 +654,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             order,
             &[],
             &[
-                ("expr", arel_attribute_ty.clone()),
+                ("expr", ordering_expr.clone()),
                 ("nulls_first", node.clone()),
                 ("nulls_last", node),
                 ("to_s", Ty::Str),

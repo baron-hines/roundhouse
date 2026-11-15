@@ -49,6 +49,9 @@ end
     check("reorder", shape(Song.order(:id).reorder(title: :desc).order_values), ["Descending title"])
     check("rows", charts.pluck(:title), ["Amber", "Blue", "Cyan"])
     check("reordered by the list", Song.order(:id).reorder(charts.order_values).pluck(:title), ["Amber", "Blue", "Cyan"])
+    lowered = Arel::Nodes::Ascending.new(Arel.sql("LOWER(songs.title)"))
+    check("a literal term", [lowered.expr.is_a?(Arel::Nodes::SqlLiteral), lowered.expr.to_s], [true, "LOWER(songs.title)"])
+    check("an attribute term", Arel::Nodes::Descending.new(Song.arel_table[:plays]).expr.name, "plays")
   end
 end
 "##)
