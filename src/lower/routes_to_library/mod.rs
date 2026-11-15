@@ -1024,7 +1024,7 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             collect_url_options_in_url(else_branch, out);
         }
         ExprNode::Send { recv: Some(base), method, args, block: None, .. }
-            if method.as_str() == "merge" && args.len() == 1 =>
+            if method.as_str() == "merge" && args.len() == 1 && url_hash_names_action(base) =>
         {
             collect_url_options_in_url(base, out);
         }
@@ -1051,6 +1051,23 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             }
         }
         _ => {}
+    }
+}
+
+/// A url-options Hash literal with an `action:` key. Under a `.merge` the
+/// merged keys could name the action, so only such a base resolves there
+/// (`emit_url_options_hash`).
+pub(crate) fn url_hash_names_action(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, _)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "action")
+        }),
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            url_hash_names_action(base)
+        }
+        _ => false,
     }
 }
 

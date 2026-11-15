@@ -37,6 +37,7 @@ end
   <%= link_to "Start", { controller: "shortcuts" }, id: "start" %>
   <%= link_to "Again", { controller: "shortcuts", action: nil }, id: "again" %>
   <%= link_to "Away", { controller: "shortcuts", action: "away" }, id: "away" %>
+  <%= link_to "Merged", { controller: "shortcuts" }.merge(action: "away"), id: "merged" %>
 </nav>
 "#,
         )
@@ -51,6 +52,7 @@ class ShortcutsControllerTest < ActionDispatch::IntegrationTest
     assert_select "a#start[href=?]", "/shortcut"
     assert_select "a#again[href=?]", "/shortcut"
     assert_select "a#away[href=?]", "/shortcut/away"
+    assert_select "a#merged[href=?]", "/shortcut/away"
   end
 end
 "##,
