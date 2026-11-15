@@ -98,6 +98,17 @@ end
     check("update_column rolled back", article.reload.status, "kept")
     direct.save!
     check("update_column cleared the change before its rollback", article.reload.status, "kept")
+    later = Article.where(id: article.id).select(:id, :title).take!
+    Article.transaction do
+      later.title = "Retitled"
+      later.save!
+      later.status = nil
+      later.save!
+      raise ActiveRecord::Rollback
+    end
+    check("second save rolled back", [article.reload.title, article.reload.status], ["Hello", "kept"])
+    later.save!
+    check("retry after a two-save rollback", [article.reload.title, article.reload.status], ["Retitled", "kept"])
   end
 
   def self.index(record, key)
