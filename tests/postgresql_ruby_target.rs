@@ -355,3 +355,21 @@ fn a_postgresql_generated_expression_is_computed_on_postgresql() {
         .run_test_env("test/models/generated_column_test.rb", &[("DATABASE_URL", db.url.as_str())])
         .assert_passes();
 }
+
+/// A later migration on the table revalidates it under the grammar that
+/// kept the expression, and a precision the schema can't hold is refused
+/// rather than dropped.
+#[test]
+fn a_native_generated_column_survives_a_migration_and_an_unheld_precision_is_refused() {
+    use roundhouse::ingest::{ingest_migration_with_generated_expression_dialect, ingest_schema_with_generated_expression_dialect};
+    use roundhouse::schema::generated::GeneratedExpressionDialect::OtherDatabase;
+    let schema_rb = |columns: &str| format!("ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"articles\", force: :cascade do |t|\n    t.string \"title\"\n{columns}  end\nend\n");
+    let mut schema = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb(GENERATED).as_bytes(), "db/schema.rb", OtherDatabase)).0.unwrap();
+    let migration = "class AddNote < ActiveRecord::Migration[8.1]\n  def change\n    add_column :articles, :note, :string\n  end\nend\n";
+    roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(migration.as_bytes(), "db/migrate/20260101000000_add_note.rb", &mut schema, OtherDatabase)).0.unwrap();
+    let articles = &schema.tables[&roundhouse::Symbol::from("articles")];
+    assert!(articles.columns.iter().any(|c| c.name.as_str() == "note"));
+    assert!(articles.columns.iter().find(|c| c.name.as_str() == "doubled").and_then(|c| c.generated.as_ref()).is_some_and(|g| g.native));
+    let wide = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.decimal \"price\", precision: 300, scale: 2\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
+    assert!(wide.is_err_and(|e| e.to_string().contains("precision 300")));
+}

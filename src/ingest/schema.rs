@@ -2954,7 +2954,13 @@ fn column_with_type(
         "integer" | "smallint" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
-        "decimal" | "numeric" => ColumnType::Decimal { precision: opts.precision.and_then(|p| u8::try_from(p).ok()), scale: opts.precision.and(opts.scale).and_then(|s| u8::try_from(s).ok()) },
+        "decimal" | "numeric" => {
+            let narrow = |n: Option<u32>, what: &str| n.map(u8::try_from).transpose().map_err(|_| IngestError::Unsupported {
+                file: file.into(),
+                message: format!("decimal {what} {} for {table}.{col_name} is beyond what this build carries", n.unwrap_or_default()),
+            });
+            ColumnType::Decimal { precision: narrow(opts.precision, "precision")?, scale: narrow(opts.precision.and(opts.scale), "scale")? }
+        }
         "string" | "inet" | "cidr" | "macaddr" | "enum" => ColumnType::String { limit: opts.limit },
         "text" | "citext" => ColumnType::Text,
         "boolean" => ColumnType::Boolean,

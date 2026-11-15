@@ -89,7 +89,8 @@ pub(crate) fn validate_column_with_dialect(
     };
     if generated.native {
         return match dialect {
-            GeneratedExpressionDialect::Postgres => Ok(()),
+            // OtherDatabase is the grammar that kept it: a migration revalidating the table reads it again.
+            GeneratedExpressionDialect::Postgres | GeneratedExpressionDialect::OtherDatabase => Ok(()),
             _ => Err(format!(
                 "`{}` is the app's own database's SQL, which only a tree running on that database carries",
                 generated.expression.trim()
