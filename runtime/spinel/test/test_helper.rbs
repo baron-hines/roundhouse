@@ -130,6 +130,7 @@ class ActionResponse
   # lowercase-keyed the way Rack 3 normalizes — the values are the
   # response's own Strings, not the caller's Hash.
   def headers: () -> Hash[String, String]
+  def header: () -> Hash[String, String]
 
   def initialize: (
     status: Integer,

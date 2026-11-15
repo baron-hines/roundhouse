@@ -1258,7 +1258,8 @@ fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
     classes.insert(ClassId(Symbol::from("TestCase")), info);
 }
 
-/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`.
+/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`,
+/// and the same through `response.header`, Rails' alias of `headers`.
 ///
 /// Rails' `response.headers` is case-insensitive (Rack 3's `Headers`);
 /// the harness's is a plain Hash keyed the way Rack normalizes —
@@ -1281,7 +1282,7 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
         return changed;
     }
     let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return changed };
-    if inner.as_str() != "headers" || !inner_args.is_empty() {
+    if !matches!(inner.as_str(), "headers" | "header") || !inner_args.is_empty() {
         return changed;
     }
     if let ExprNode::Lit { value: crate::expr::Literal::Str { value } } = &mut *args[0].node {

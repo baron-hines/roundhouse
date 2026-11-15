@@ -939,6 +939,12 @@ class ActionResponse
     out
   end
 
+  # Rails' `response.header`, `alias_method :header, :headers` on
+  # ActionDispatch::Response.
+  def header
+    headers
+  end
+
   # Rails' `response.cache_control` — the mixed Hash Rails hands back,
   # because the subscript spelling is what a test writes:
   #
