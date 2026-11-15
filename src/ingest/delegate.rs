@@ -233,14 +233,13 @@ fn lower_library_class_delegates(
                 let mut seen = ["Object", "Kernel", "BasicObject"].into_iter().map(|name| crate::ident::ClassId(crate::ident::Symbol::from(name))).collect::<crate::det::HashSet<_>>();
                 let mut pending = vec![name];
                 while let Some(name) = pending.pop() { if !seen.insert(name.clone()) { continue; }
-                    if let Some(class) = lookup.first.get(name.0.as_str()) {
+                    for class in app.library_classes.iter().filter(|class| class.name == name) {
                         if class.methods.iter().any(|method| method.receiver == MethodReceiver::Class && method.name.as_str() == "new") { return None; }
                         for (parent, span) in class.includes.iter().zip(&class.include_spans).chain(class.parent.iter().map(|parent| (parent, &class.parent_span))) {
-                            let path = parent.0.as_str().split("::").map(crate::ident::Symbol::from).collect::<Vec<_>>();
-                            pending.push(resolver.namespace(*span, &path)?.clone());
+                            pending.push(resolver.namespace(*span, &parent.0.as_str().split("::").map(crate::ident::Symbol::from).collect::<Vec<_>>())?.clone());
                         }
                     }
-                    if let Some(model) = app.models.iter().find(|model| model.name == name) { pending.extend(model.parent.iter().cloned()); }
+                    for model in app.models.iter().filter(|model| model.name == name) { if model.methods().any(|method| method.receiver == MethodReceiver::Class && method.name.as_str() == "new") { return None; } pending.extend(crate::analyze::model_includes(model)); pending.extend(model.parent.iter().cloned()); }
                 }
                 Some(seen)
             });

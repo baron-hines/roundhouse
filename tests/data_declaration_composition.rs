@@ -253,3 +253,15 @@ fn base_data_visibility_wrappers_and_named_strings_keep_their_meaning() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
     }
 }
+
+fn assert_query_refusal(source: &str) {
+    let (_, errors) = contract::app(source).emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|error| error.contains("Data delegation with source nil? or respond_to? overrides")), "{source}: {errors:?}");
+}
+
+#[test]
+fn a_reopened_targets_query_override_stays_refused() {
+    let source = contract::LITERAL_CASES[3].1.replace("class Unrelated\n def nil? = false\nend", "module QueryOverride\n  def nil? = true\nend\nclass Entry\n  include QueryOverride\nend");
+    assert!(source.contains("include QueryOverride"));
+    assert_query_refusal(&source);
+}
