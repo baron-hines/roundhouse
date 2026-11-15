@@ -431,14 +431,13 @@ pub(super) fn ingest_model_with_enum_constants(
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
-            let items = match ingest_model_body_items(
-                &stmt,
-                &owner,
-                file,
-                leading,
-                Some(&mut class_attr_defaults),
-                &class_consts,
-            ) {
+            let classified = {
+                let was = CLASSIFYING_MODEL_BODY.with(|c| c.replace(true));
+                let items = ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults), &class_consts);
+                CLASSIFYING_MODEL_BODY.with(|c| c.set(was));
+                items
+            };
+            let items = match classified {
                 Ok(items) => items,
                 Err(err) if super::survey::is_active() => {
                     super::survey::record(&err);
@@ -560,6 +559,28 @@ fn model_alias_method_copy(call: &ruby_prism::CallNode<'_>, body: &[ModelBodyIte
 /// through to the unsupported-DSL ledger rather than being flattened
 /// into an unconditional one. Numericality, inclusion, and format use
 /// the same option parse as `validates`.
+thread_local! {
+    /// Set while a model's own class body is classified, not a concern's `included do` or a macro expansion.
+    static CLASSIFYING_MODEL_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A model's own state-machine block, by its call's offset: its recorded gap is withdrawn if the class body replays it.
+    static DEFERRED_STATE_MACHINES: std::cell::RefCell<Vec<(u32, String, IngestError)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Withdraw the gap of each model state-machine block the class body replays (`app_extension_calls`): the gem's
+/// class method runs it as Ruby does.
+pub(super) fn report_unreplayed_state_machines(app: &crate::App) {
+    let deferred = DEFERRED_STATE_MACHINES.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (start, method, gap) in deferred {
+        let replayed = app.models.iter().flat_map(|m| m.body.iter()).any(|item| matches!(item,
+            ModelBodyItem::Unknown { expr, .. } if expr.span.start == start
+                && expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
+                && matches!(&*expr.node, crate::expr::ExprNode::Send { method: m, .. } if m.as_str() == method)));
+        if replayed {
+            super::survey::forget(&gap);
+        }
+    }
+}
+
 pub(super) fn ingest_model_body_items(
     stmt: &Node<'_>,
     owner: &ClassId,
@@ -1143,14 +1164,20 @@ pub(super) fn ingest_model_body_item(
         // The same classifier sees model declarations and a concern's
         // `included do`. Record before the latter drops the Unknown,
         // and before ingesting a block that may contain further gaps.
-        // Name the DSL shape, not unverified gem ownership.
+        // Name the DSL shape, not unverified gem ownership. A model's own
+        // call is judged once the class-body replay is decided
+        // (`app::report_unreplayed_state_machines`).
         if matches!(method.as_str(), "aasm" | "state_machine")
             && call.block().and_then(|b| b.as_block_node()).is_some()
         {
-            super::survey::record(&IngestError::Unsupported {
+            let gap = IngestError::Unsupported {
                 file: file.into(),
                 message: format!("state-machine DSL block `{method}` is not modeled"),
-            });
+            };
+            super::survey::record(&gap);
+            if CLASSIFYING_MODEL_BODY.with(|c| c.get()) {
+                DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().push((call.location().start_offset() as u32, method.to_string(), gap)));
+            }
         }
         return Ok(ModelBodyItem::Unknown {
             expr: ingest_expr(stmt, file)?,

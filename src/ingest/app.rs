@@ -3447,6 +3447,7 @@ end
     // Between the two: a class body's `respond_to?(:status=)` asks for the writers just made, and the settled branch's writes join the body statements.
     super::settled_conditionals::settle(&mut app);
     super::app_extension_calls::mark(&mut app);
+    super::model::report_unreplayed_state_machines(&app);
     super::body_statements::mark(&mut app);
     report_unmodelled_records(&app);
     super::unreached_gem_modules::drop(&mut app, dir);
@@ -15379,3 +15380,4 @@ fn mime_extension_lookups(app: &mut App) {
     }
     crate::lower::for_each_emit_body(app, &mut rewrite);
 }
+

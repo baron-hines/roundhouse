@@ -275,6 +275,24 @@ module ActiveRecord
       @null = null
     end
 
+    # Rails' `type`: the declared SQL type as the Symbol Rails' type map names it.
+    def type
+      declared = @sql_type.downcase
+      return :integer if declared.start_with?("int", "bigint", "smallint", "serial", "bigserial")
+      return :string if declared.start_with?("varchar", "character varying", "char")
+      return :boolean if declared.start_with?("bool")
+      return :float if declared.start_with?("real", "float", "double")
+      return :decimal if declared.start_with?("decimal", "numeric")
+      return :datetime if declared.start_with?("datetime", "timestamp")
+      return :date if declared.start_with?("date")
+      return :time if declared.start_with?("time")
+      return :binary if declared.start_with?("blob", "bytea")
+      return :jsonb if declared.start_with?("jsonb")
+      return :json if declared.start_with?("json")
+      return :uuid if declared.start_with?("uuid")
+      :text
+    end
+
     # `varchar(255)` declares 255; a bare type (sqlite's `text`) none, as Rails reads it.
     def limit
       open = @sql_type.index("(")
@@ -509,6 +527,16 @@ module ActiveRecord
     # Rails' `columns`: each of the table's columns, with whether it may be null (Doorkeeper's `secret_required?`).
     def self.columns
       SchemaCache.new.columns_hash(table_name).values
+    end
+
+    # Rails' `columns_hash`, by column name (aasm's `columns_hash[column_name].type`).
+    def self.columns_hash
+      SchemaCache.new.columns_hash(table_name)
+    end
+
+    # Rails' `attribute_names`: the record's attributes, its table's columns, as Strings.
+    def attribute_names
+      self.class.column_names
     end
 
     # Rails' read-only records: one a `readonly` relation loaded, or one

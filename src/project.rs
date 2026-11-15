@@ -8487,28 +8487,33 @@ fn apply_app_requires(files: &mut [(String, String)], app: &App, target: Require
 fn apply_rails_version(files: &mut [(String, String)], app: &App) {
     const MARK: &str = "# Rails::VERSION from the app's Gemfile.lock";
     let Some(lock) = &app.gem_lock else { return };
-    let Some(version) = ["rails", "railties"].iter().find_map(|g| {
-        lock.specs.iter().find(|(n, _)| n == g).map(|(_, v)| v.clone())
-    }) else {
-        return;
-    };
-    // A version is digits, letters and dots (`8.1.0.rc1`); anything else
-    // would be spelled into a double-quoted Ruby string as written.
-    if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
-        return;
-    }
+    let locked = |gems: &[&str]| gems.iter().find_map(|g| lock.specs.iter().find(|(n, _)| n == g).map(|(_, v)| v.clone()));
+    let Some(rails) = locked(&["rails", "railties"]) else { return };
     let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else { return };
     if boot.contains(MARK) {
         return;
     }
-    let parts: Vec<&str> = version.split('.').collect();
-    let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
-    let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
-    let block = format!(
-        "{MARK} (see project.rs::apply_rails_version).\n\
-         module Rails\n  module VERSION\n    MAJOR = {}\n    MINOR = {}\n    TINY = {}\n    PRE = {pre}\n    STRING = {version:?}\n  end\nend\n",
-        num(0), num(1), num(2)
-    );
+    let mut block = format!("{MARK} (see project.rs::apply_rails_version).\n");
+    // Also the frameworks' own, which a gem branches on (aasm's `ActiveRecord::VERSION::MAJOR >= 3`).
+    for (namespace, version) in [
+        ("Rails", Some(rails.clone())),
+        ("ActiveRecord", locked(&["activerecord"]).or(Some(rails.clone()))),
+        ("ActiveSupport", locked(&["activesupport"]).or(Some(rails.clone()))),
+    ] {
+        let Some(version) = version else { continue };
+        // A version is digits, letters and dots (`8.1.0.rc1`); anything else
+        // would be spelled into a double-quoted Ruby string as written.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+            continue;
+        }
+        let parts: Vec<&str> = version.split('.').collect();
+        let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+        let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
+        block.push_str(&format!(
+            "module {namespace}\n  module VERSION\n    MAJOR = {}\n    MINOR = {}\n    TINY = {}\n    PRE = {pre}\n    STRING = {version:?}\n  end\nend\n",
+            num(0), num(1), num(2)
+        ));
+    }
     const AFTER: &str = "require_relative \"runtime/rails\"\n";
     match boot.find(AFTER) {
         Some(at) => boot.insert_str(at + AFTER.len(), &block),
