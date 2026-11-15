@@ -24,6 +24,12 @@
 //! same raise in Rails. The primary key is not guarded: Rails' `id` reads
 //! it without the raising block (PrimaryKey#id).
 //!
+//! Assigning a left-out column loads it, as Rails' writer replaces the
+//! uninitialized attribute: each generated column writer (`_write_<col>_raw`
+//! where the model defines the writer itself) and each column arm of the
+//! generated `[]=` starts with `_note_loaded(:title) if @__unloaded_columns`,
+//! which drops the column from the row's list.
+//!
 //! The generated `serializable_hash` reads every column's reader, so it
 //! would raise too. Rails' writes the
 //! record's `attribute_names` instead (activemodel serialization.rb,
@@ -55,20 +61,29 @@ pub fn apply(lcs: &mut [LibraryClass], app: &App) {
         let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
         let primary_key = model.primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
         for col in table.columns.iter().filter(|c| c.name != primary_key) {
-            let renamed = Symbol::from(format!("_read_{}_raw", col.name.as_str()));
-            let instance = |name: &Symbol| {
-                lc.methods.iter().position(|m| m.receiver == MethodReceiver::Instance && &m.name == name)
+            let instance = |name: String| {
+                let name = Symbol::from(name);
+                lc.methods.iter().position(|m| m.receiver == MethodReceiver::Instance && m.name == name)
             };
-            let Some(at) = instance(&renamed).or_else(|| instance(&col.name)) else { continue };
-            let body = &mut lc.methods[at].body;
-            let guard = guard(&col.name);
-            match &mut *body.node {
-                ExprNode::Seq { exprs } => exprs.insert(0, guard),
-                _ => {
-                    let read = std::mem::replace(body, Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }));
-                    let ty = read.ty.clone();
-                    *body = Expr::new(read.span, ExprNode::Seq { exprs: vec![guard, read] });
-                    body.ty = ty;
+            let col_name = col.name.as_str();
+            let reader = instance(format!("_read_{col_name}_raw")).or_else(|| instance(col_name.to_string()));
+            let writer = instance(format!("_write_{col_name}_raw")).or_else(|| instance(format!("{col_name}=")));
+            if let Some(at) = reader {
+                prepend(&mut lc.methods[at].body, if_unloaded("_missing_attribute", &col.name));
+            }
+            if let Some(at) = writer {
+                prepend(&mut lc.methods[at].body, if_unloaded("_note_loaded", &col.name));
+            }
+        }
+        // `record[:col] = value` loads the column as its writer does.
+        if let Some(m) = lc.methods.iter_mut().find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "[]=")
+            && let ExprNode::Case { arms, .. } = &mut *m.body.node
+        {
+            for arm in arms {
+                let crate::expr::Pattern::Lit { value: Literal::Sym { value: col } } = &arm.pattern else { continue };
+                if col != &primary_key {
+                    let note = if_unloaded("_note_loaded", col);
+                    prepend(&mut arm.body, note);
                 }
             }
         }
@@ -240,8 +255,22 @@ fn loaded_serializable_hash(body: &mut Expr) {
     when_unloaded(body, stmts);
 }
 
-/// `_missing_attribute(:<col>) if @__unloaded_columns`.
-fn guard(col: &Symbol) -> Expr {
+/// `body` with `stmt` run first, its value still the body's.
+fn prepend(body: &mut Expr, stmt: Expr) {
+    match &mut *body.node {
+        ExprNode::Seq { exprs } => exprs.insert(0, stmt),
+        _ => {
+            let rest = std::mem::replace(body, Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }));
+            let ty = rest.ty.clone();
+            *body = Expr::new(rest.span, ExprNode::Seq { exprs: vec![stmt, rest] });
+            body.ty = ty;
+        }
+    }
+}
+
+/// `<method>(:<col>) if @__unloaded_columns`: the reader's
+/// `_missing_attribute` guard, or the writer's `_note_loaded`.
+fn if_unloaded(method: &str, col: &Symbol) -> Expr {
     let s = Span::synthetic();
     Expr::new(
         s,
@@ -251,7 +280,7 @@ fn guard(col: &Symbol) -> Expr {
                 s,
                 ExprNode::Send {
                     recv: None,
-                    method: Symbol::from("_missing_attribute"),
+                    method: Symbol::from(method),
                     args: vec![Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: col.clone() } })],
                     block: None,
                     parenthesized: true,

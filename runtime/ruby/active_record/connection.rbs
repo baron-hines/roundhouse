@@ -262,6 +262,7 @@ module ActiveRecord
     def _note_unloaded: (Hash[String, untyped] row) -> nil
     def has_attribute?: (Symbol name) -> bool
     def _missing_attribute: (Symbol name) -> nil
+    def _note_loaded: (Symbol name) -> nil
     def attribute_previously_was: (String name) -> untyped
     def self.first: () -> Base?
     def self.take: () -> Base?

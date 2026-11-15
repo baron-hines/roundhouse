@@ -591,7 +591,10 @@ fn untyped_subexpressions_baseline() {
     // `_missing_attribute` and `_as_json_only` in active_record/connection.rb
     // (+3), less `unscope_part!` and `order_sql!` (-5, -1). relation.rbs and
     // connection.rbs type them for the RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1341;
+    // MEASURED 1342 on partial-select writes (1341): `_note_loaded` in
+    // active_record/connection.rb drops its column `name`, a var on this
+    // RBS-less probe (+1); connection.rbs types it for the RBS-paired gate.
+    const CEILING: usize = 1342;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

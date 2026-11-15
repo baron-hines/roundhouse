@@ -2530,6 +2530,20 @@ module ActiveRecord
       raise ActiveModel::MissingAttributeError, "missing attribute '#{name}' for #{self.class.name}"
     end
 
+    # Assigning a column the row's `select` left out loads it: Rails'
+    # writer replaces the uninitialized attribute with the assigned one
+    # (attribute_set.rb, `write_from_user`), so the column then reads,
+    # answers `has_attribute?` true and serializes. Each generated column
+    # writer calls this first when the row noted any
+    # (`lower::missing_attribute`).
+    def _note_loaded(name)
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil?
+      unloaded.delete(name)
+      @__unloaded_columns = nil if unloaded.empty?
+      nil
+    end
+
     # The pending diff: current attributes against the baseline the
     # last save (or hydration) left, in the same `[prev, value]` shape
     # as `saved_changes`. `save` runs validations and before_* hooks

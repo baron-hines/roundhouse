@@ -58,6 +58,14 @@ end
     check("whole to_json", whole.to_json.include?("\"status\":\"draft\""), true)
     check("whole as_json", whole.as_json.keys.sort, ["author_id", "byline", "id", "status", "title"])
     check("whole serializable_hash", whole.serializable_hash, { "id" => article.id, "author_id" => 3, "title" => "Hello", "status" => "draft", "byline" => "staff" })
+    assigned = Article.where(id: article.id).select(:title).take!
+    assigned.status = "published"
+    check("assigned reads", read { assigned.status }, "\"published\"")
+    check("assigned has_attribute?", assigned.has_attribute?(:status), true)
+    check("assigned as_json", assigned.as_json.keys.sort, ["id", "status", "title"])
+    assigned[:author_id] = 4
+    check("index-assigned reads", read { assigned.author_id }, "4")
+    check("index-assigned as_json", assigned.as_json["author_id"], 4)
   end
 end
 "##)
