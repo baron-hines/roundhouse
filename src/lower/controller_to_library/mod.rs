@@ -2291,7 +2291,9 @@ fn build_filter_preamble(
     // them. Multiple prepends within one walk end up front-to-back in
     // REVERSE declaration order: each `prepend_before_action` Rails
     // sees unshifts onto the same head, so the last one declared is the
-    // first one that runs.
+    // first one that runs. A `prepend_around_action` joins them as an
+    // around `Call` at its place in that head: the dispatcher runs
+    // everything after it inside its block.
     let mut prepends: Vec<PreambleStmt> = Vec::new();
     let bodies = chain.iter().map(|c| (*c, false)).chain(std::iter::once((controller, true)));
     for (c, is_own) in bodies {
@@ -2321,7 +2323,9 @@ fn build_filter_preamble(
                     if find_target(&f.target).is_none() {
                         continue;
                     }
-                    if matches!(f.kind, FilterKind::Around) {
+                    if matches!(f.kind, FilterKind::Around) && f.prepend {
+                        prepends.push(PreambleStmt::Call { filter: f, halt_check: false });
+                    } else if matches!(f.kind, FilterKind::Around) {
                         wraps.around.push(f);
                     } else {
                         wraps.after.push(PreambleStmt::Call { filter: f, halt_check: false });
@@ -2363,8 +2367,8 @@ fn build_filter_preamble(
             }
         }
     }
-    // Hoist every `prepend_before_action` to the head of the chain, in
-    // reverse declaration order — see the comment where `prepends` is
+    // Hoist every `prepend_before_action` and `prepend_around_action` to
+    // the head of the chain, in reverse declaration order — see the comment where `prepends` is
     // declared above.
     if !prepends.is_empty() {
         prepends.reverse();

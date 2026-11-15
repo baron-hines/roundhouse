@@ -7659,7 +7659,7 @@ fn filter_from_send(
     };
     let kind = match method.as_str() {
         "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
-        "around_action" | "append_around_action" => FilterKind::Around,
+        "around_action" | "append_around_action" | "prepend_around_action" => FilterKind::Around,
         "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
@@ -7690,7 +7690,7 @@ fn filter_from_send(
     let mut only: Vec<crate::ident::Symbol> = Vec::new();
     let mut except: Vec<crate::ident::Symbol> = Vec::new();
     let mut only_present = false;
-    let mut prepend = method.as_str() == "prepend_before_action";
+    let mut prepend = matches!(method.as_str(), "prepend_before_action" | "prepend_around_action");
     let (mut if_cond, mut unless_cond, mut if_cond_expr, mut unless_cond_expr) = (None, None, None, None);
     for arg in args {
         if let Some(sym) = sym_of(arg) {
