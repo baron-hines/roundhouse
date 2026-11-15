@@ -13,7 +13,16 @@ const HOOK: &str = r##"module Stampy
     base.before_save ->(record) { record.title = record.title.upcase }
     base.before_save { self.body = body + " (stamped)" }
     base.after_initialize :count_init, unless: ->(record) { record.persisted? }
+    base.before_save Auditor.new
   end
+
+  class Auditor
+    def before_save(record)
+      record.audited = true
+    end
+  end
+
+  attr_accessor :audited
 
   def mark
     self.title = "#{title}!"
@@ -50,8 +59,8 @@ fn hook_registered_callbacks_run_as_rails_runs_them() {
         .run_ruby(
             r#"
 a = Article.create!(title: "hello", body: "a body long enough")
-got = [a.title, a.body, a.inits, Article.find(a.id).inits]
-want = ["HELLO!", "a body long enough (stamped)", 1, nil]
+got = [a.title, a.body, a.inits, Article.find(a.id).inits, a.audited]
+want = ["HELLO!", "a body long enough (stamped)", 1, nil, true]
 raise "got #{got.inspect}" unless got == want
 puts "ok"
 "#,

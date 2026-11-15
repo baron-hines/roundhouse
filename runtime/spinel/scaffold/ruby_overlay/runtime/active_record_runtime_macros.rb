@@ -28,9 +28,15 @@ module ActiveRecord
         if kind == :after_initialize
           # Not through the record's own `after_initialize`: the constructor calls it only when the app declares one.
           define_method(:initialize) do |*args, **kwargs, &blk|
+            # The outermost wrapper runs the chain once the constructor is done; an ancestor's, reached through
+            # `super`, only passes on.
+            outer = !@__runtime_initializing
+            @__runtime_initializing = true
             super(*args, **kwargs, &blk)
+            return unless outer
+            @__runtime_initializing = false
             # Not on a loaded record's empty shell: the hydration factory runs them once its columns are set.
-            __run_runtime_callbacks_once(:after_initialize) {} unless Thread.current[:__roundhouse_hydrating]
+            __run_runtime_callbacks(:after_initialize) unless Thread.current[:__roundhouse_hydrating]
           end
         else
           # Rails runs callbacks in declaration order, and a gem's `include` comes before the app's own.
@@ -69,7 +75,7 @@ module ActiveRecord
             ensure
               Thread.current[:__roundhouse_hydrating] = was
             end
-            record.__run_runtime_callbacks_once(:after_initialize) {} if record.is_a?(ActiveRecord::Base) && !was
+            record.__run_runtime_callbacks(:after_initialize) if record.is_a?(ActiveRecord::Base) && !was
             record
           end
         end
@@ -101,13 +107,15 @@ module ActiveRecord
       chain = chain.each_with_index.reject { |(cb, _), i| cb.is_a?(Symbol) && chain[(i + 1)..].any? { |(later, _)| later == cb } }.map(&:first)
       chain.each do |callback, options|
         next unless __runtime_callback_condition(options)
-        __call_runtime_callback(callback)
+        __call_runtime_callback(callback, kind)
       end
     end
 
-    # Rails hands a Proc that takes an argument the record; one that takes none runs on it.
-    def __call_runtime_callback(callback)
-      return send(callback) unless callback.is_a?(Proc)
+    # Rails hands a Proc that takes an argument the record, runs one that takes none on it, and calls a callback
+    # object's method of the callback's name with the record.
+    def __call_runtime_callback(callback, kind = nil)
+      return send(callback) if callback.is_a?(Symbol)
+      return callback.public_send(kind, self) unless callback.is_a?(Proc) || kind.nil?
       callback.arity.zero? ? instance_exec(&callback) : instance_exec(self, &callback)
     end
 
