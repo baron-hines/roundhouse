@@ -340,7 +340,26 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         yaml.push_str(part);
         yaml
     });
-    let Ok(mut doc) = serde_yaml_ng::from_str::<Value>(&distinct) else { return out };
+    let mut doc = match serde_yaml_ng::from_str::<Value>(&distinct) {
+        Ok(doc) => doc,
+        Err(error) => {
+        // Unparsed: a `schema_dump` that names a file can't be checked, so it is refused rather
+        // than dropped. `false`, null or no `schema_dump` keeps main's behavior.
+        let named = text.match_indices("schema_dump").find(|(at, key)| {
+            let value = text[at + key.len()..].lines().next().unwrap_or_default().trim_start_matches(['\'', '"']).trim_start();
+            let value = value.strip_prefix(':').map(|v| v.split(" #").next().unwrap_or_default().trim().trim_matches(|c| c == '\'' || c == '"'));
+            value.is_some_and(|v| !["", "~", "null", "yes", "no", "on", "off", "true", "false"].iter().any(|w| v.eq_ignore_ascii_case(w)))
+        });
+        if let Some((at, _)) = named {
+            out.primary = Some(Err(()));
+            // The parser's own reason ("duplicate entry ...", "unknown anchor ..."), placeholders shown as ERB.
+            let reason: String = shown(error.to_string().lines().next().unwrap_or_default()).chars().take(120).collect();
+            let detail = format!("config/database.yml couldn't be parsed to check `test.primary`'s `schema_dump` ({reason}), so the file it names isn't read");
+            out.refusals.push(DatabaseRefusal { span: Span { file: FileId(0), start: at as u32, end: at as u32 }, construct: "schema_dump".to_string(), detail, warning: false });
+        }
+        return out;
+        }
+    };
     if doc.apply_merge().is_err() {
         return out;
     }

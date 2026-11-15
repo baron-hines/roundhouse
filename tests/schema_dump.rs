@@ -325,6 +325,24 @@ fn two_computed_keys_still_refuse_a_named_file() {
     }
 }
 
+/// A file that no longer parses once its ERB is set aside (here an anchor
+/// computed by ERB, aliased later) refuses a named file rather than
+/// reading a stale db/schema.rb. Without `schema_dump`, it builds as on main.
+#[test]
+fn an_unparsed_file_refuses_a_named_file() {
+    let anchored = |dump: &str| format!("defaults: &<%= \"base\" %>\n  adapter: sqlite3\ntest:\n  <<: *<%= \"base\" %>\n{dump}");
+    let named = anchored("  schema_dump: catalog_schema.rb\n");
+    let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump` (unknown anchor")), "{:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty());
+    for dump in ["", "  schema_dump: false\n"] {
+        let yml = anchored(dump);
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.
