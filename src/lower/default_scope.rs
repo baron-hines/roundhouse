@@ -303,6 +303,63 @@ pub fn static_default_scope(model: &Model) -> Option<Vec<(Symbol, Literal)>> {
     Some(out)
 }
 
+/// The `(column, literal)` conditions of a join into `target` through an
+/// association whose `scope` runs over the target's default scope
+/// (`defaults`), as Rails builds the join's ON clause: the scope is
+/// evaluated on the default-scoped relation, so `unscope(where: :col)`
+/// drops the default's condition on `col` and `where(col: literal)` adds
+/// one. Ordering, eager loading, `references` and `readonly` leave the ON
+/// clause alone, as Rails joins on the scope's conditions only. `None` for any
+/// other call, a column the target lacks, or a `where` on a column a
+/// condition already names, which this does not render.
+pub fn join_scope_conditions(
+    target: &Model,
+    defaults: Vec<(Symbol, Literal)>,
+    scope: &Expr,
+) -> Option<Vec<(Symbol, Literal)>> {
+    let (recv, method, args) = match &*scope.node {
+        ExprNode::Send { recv, method, args, block: None, .. } => (recv, method, args),
+        _ => return None,
+    };
+    let mut out = match recv.as_ref().map(|r| (r, &*r.node)) {
+        None | Some((_, ExprNode::SelfRef)) => defaults,
+        Some((r, _)) => join_scope_conditions(target, defaults, r)?,
+    };
+    match (method.as_str(), args.as_slice()) {
+        ("order" | "reorder" | "includes" | "preload" | "eager_load" | "references" | "readonly", _) => {}
+        ("where", [hash]) => {
+            let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
+            for (k, v) in entries {
+                let ExprNode::Lit { value: Literal::Sym { value: col } } = &*k.node else { return None };
+                let ExprNode::Lit { value } = &*v.node else { return None };
+                let column = target.attributes.fields.get(col)?;
+                if !literal_fits(value, column) || out.iter().any(|(c, _)| c == col) {
+                    return None;
+                }
+                out.push((col.clone(), value.clone()));
+            }
+        }
+        ("unscope", [hash]) => {
+            let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
+            for (k, v) in entries {
+                if !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "where") {
+                    return None;
+                }
+                let cols: Vec<&Expr> = match &*v.node {
+                    ExprNode::Array { elements, .. } => elements.iter().collect(),
+                    _ => vec![v],
+                };
+                for col in cols {
+                    let ExprNode::Lit { value: Literal::Sym { value: col } } = &*col.node else { return None };
+                    out.retain(|(c, _)| c != col);
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
 /// A literal a column of type `ty` stores as written. A Symbol is left
 /// out: on an enum column it names a stored value, elsewhere a String.
 fn literal_fits(value: &Literal, ty: &Ty) -> bool {

@@ -1426,7 +1426,8 @@ module ActiveRecord
       raise("joins(#{spec}): an association join is resolved at transpile " \
             "time and this one was not — the receiver's class has no entry " \
             "in the association registry (an STI subclass, a habtm, or an " \
-            "unresolvable `through`). Appending the name raw would answer " \
+            "unresolvable `through`), or the association's or its target's " \
+            "scope does not render as SQL. Appending the name raw would answer " \
             "the wrong rows rather than fail.")
     end
 

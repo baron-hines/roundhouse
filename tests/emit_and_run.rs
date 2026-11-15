@@ -22253,6 +22253,8 @@ mod association_scopes;
 mod association_relation_calls;
 #[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
 mod polymorphic_belongs_to_scope;
+#[path = "emit_and_run/belongs_to_scope_join.rs"]
+mod belongs_to_scope_join;
 #[path = "emit_and_run/helper_content_for.rs"]
 mod helper_content_for;
 #[path = "emit_and_run/view_statement_helper_call.rs"]

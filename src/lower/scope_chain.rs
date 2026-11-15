@@ -2238,9 +2238,13 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
 /// AND gadgets.archived = FALSE`). A `through:` join touching a scoped
 /// model, or a scope this cannot render (one read when the relation is
 /// built), keeps no tail: the join is not composed rather than composed
-/// without the scope.
+/// without the scope. A `belongs_to`'s own scope runs over the target's
+/// default scope there too (`default_scope::join_scope_conditions`), so
+/// `belongs_to :shelf, -> { unscope(where: :archived) }` joins archived
+/// shelves, as Rails' association join does, and a scope it cannot
+/// render keeps no tail either.
 fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
-    use super::default_scope::{default_scope, sql_predicate, DefaultScope};
+    use super::default_scope::{default_scope, join_scope_conditions, sql_predicate, DefaultScope};
     let scoped: HashMap<ClassId, Vec<(Symbol, Literal)>> = models
         .iter()
         .filter_map(|m| {
@@ -2252,12 +2256,21 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             })
         })
         .collect();
-    if scoped.is_empty() {
-        return;
-    }
+    let belongs_to_scope = |owner: &ClassId, name: &Symbol| {
+        models.iter().find(|m| &m.name == owner).and_then(|m| {
+            m.associations().find_map(|a| match a {
+                Association::BelongsTo { name: n, polymorphic: false, scope: Some(scope), .. } if n == name => Some(scope),
+                _ => None,
+            })
+        })
+    };
     let keys: Vec<((ClassId, Symbol), ClassId)> =
         reg.assoc_target.iter().map(|(k, t)| (k.clone(), t.clone())).collect();
     for ((owner, name), target) in keys {
+        let own_scope = belongs_to_scope(&owner, &name);
+        if scoped.is_empty() && own_scope.is_none() {
+            continue;
+        }
         let through = models
             .iter()
             .find(|m| m.name == owner)
@@ -2274,24 +2287,32 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             });
         let key = (owner.clone(), name.clone());
         let through_scoped = through.as_ref().is_some_and(|t| scoped.contains_key(t));
-        let Some(preds) = scoped.get(&target) else {
+        let defaults = scoped.get(&target);
+        if defaults.is_none() && own_scope.is_none() {
             if through_scoped {
                 reg.join_tails.remove(&key);
                 reg.aliased_join_tails.remove(&key);
             }
             continue;
-        };
+        }
         if through.is_some() {
             reg.join_tails.remove(&key);
             reg.aliased_join_tails.remove(&key);
             continue;
         }
+        // An empty default is one no SQL here can read (`Dynamic`).
+        let preds = match (defaults, own_scope) {
+            (Some(d), _) if d.is_empty() => None,
+            (d, Some(scope)) => models
+                .iter()
+                .find(|m| m.name == target)
+                .and_then(|t| join_scope_conditions(t, d.cloned().unwrap_or_default(), scope)),
+            (d, None) => d.cloned(),
+        };
         let table = reg.table_for(&target);
         let render = |alias: &str| -> Option<String> {
-            if preds.is_empty() {
-                return None;
-            }
             preds
+                .as_ref()?
                 .iter()
                 .map(|(col, lit)| sql_predicate(alias, col, lit).map(|p| format!(" AND {p}")))
                 .collect()
