@@ -55,6 +55,15 @@ module ActiveRecord
         answer = body.respond_to?(:to_proc) ? instance_exec(*args, **kwargs, &body) : body.call(*args, **kwargs)
         answer || all
       end
+      # Rails forwards a relation's call of the scope to the model under the relation's `scoping`, so the scope
+      # starts from the relation's conditions (`Article.where(…).published`). Not over a Relation method of the name.
+      return if Relation.method_defined?(name) && !Relation.instance_variable_get(:@__runtime_scopes)&.include?(name)
+      (Relation.instance_variable_get(:@__runtime_scopes) || Relation.instance_variable_set(:@__runtime_scopes, [])) << name
+      Relation.define_method(name) do |*args, **kwargs|
+        target = model
+        raise NoMethodError, "undefined method '#{name}' for an instance of ActiveRecord::Relation" unless target.respond_to?(name)
+        scoping { target.public_send(name, *args, **kwargs) }
+      end
     end
 
     def self.__runtime_callbacks_module

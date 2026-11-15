@@ -57,7 +57,8 @@ rescue AASM::InvalidTransition => e
   got << e.class.name
 end
 got << Article.published.count
-want = ["draft", true, true, "published", true, "published", false, "AASM::InvalidTransition", 1]
+got << Article.where(title: "Elsewhere").published.count
+want = ["draft", true, true, "published", true, "published", false, "AASM::InvalidTransition", 1, 0]
 raise "got #{got.inspect}" unless got == want
 puts "aasm passed"
 "#;
