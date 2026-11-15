@@ -1,7 +1,7 @@
 //! A belongs_to preload reads the foreign-key column itself, past a
 //! method the model defines under the column's name, as Rails'
-//! `Preloader` reads `owner._read_attribute(foreign_key)`. Ignored as a fork spec until
-//! the compiler does; the expected values are ActiveRecord 8.1.4's answers.
+//! `Preloader` reads `owner._read_attribute(foreign_key)`. The probe's
+//! expected values are ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -55,7 +55,6 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: preload"]
 fn a_belongs_to_preload_reads_the_foreign_key_column() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
@@ -63,7 +62,7 @@ fn a_belongs_to_preload_reads_the_foreign_key_column() {
 }
 
 #[test]
-#[ignore = "fork spec: preload"]
+#[ignore = "requires the Spinel toolchain"]
 fn a_belongs_to_preload_reads_the_foreign_key_column_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();

@@ -12583,7 +12583,10 @@ fn key_helpers(string_key: bool) -> (&'static str, &'static str) {
 /// One preloadable association, resolved against the app's model set.
 enum PreloadKind {
     /// (fk column on the owner, target class, target table, the `Db`
-    /// helper that renders the target's key list for `IN (...)`)
+    /// helper that renders the target's key list for `IN (...)`). The
+    /// owner's key is read from the column (`r[:<fk>]`), not from its
+    /// reader, as Rails' `Preloader` reads `_read_attribute(foreign_key)`
+    /// past a method the model defines under the column's name.
     BelongsTo { fk: String, target: String, table: String, key_list: &'static str },
     /// (fk column on the target, target class)
     HasMany { fk: String, owner_key: String, target: String },
@@ -12880,7 +12883,7 @@ def self._preload_batch_{name}(records)
   ids = []
   records.each do |r|
     unless r.{name}_loaded?
-      v = r.{fk}
+      v = r[:{fk}]
       ids << v unless v.nil? || v == 0
     end
   end
@@ -12897,7 +12900,7 @@ def self._preload_batch_{name}(records)
       held = r.{name}
       out << held unless held.nil?
     else
-      r._preload_{name}(by_id[r.{fk}])
+      r._preload_{name}(by_id[r[:{fk}]])
     end
   end
   out
