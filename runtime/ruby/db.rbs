@@ -115,4 +115,9 @@ module Db
   # The tables inside a `Model.unscoped` block on this thread, innermost
   # last (relation.rb's `Relation.unscoped_tables`).
   def self._unscoped_tables: () -> Array[String]
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`): nil
+  # until the first push, which seeds the list with its element.
+  def self._current_scopes: () -> Array[ActiveRecord::Relation]?
+  def self._push_current_scope: (ActiveRecord::Relation scope) -> Array[ActiveRecord::Relation]
 end

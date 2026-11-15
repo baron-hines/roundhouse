@@ -202,9 +202,13 @@ fn article_renders_residualized_fill_timestamps() {
         src.contains("if creating && (@created_at_raw.nil? || @created_at_raw.empty?)\n      @__t_created_at = nil\n      @created_at_raw = now"),
         "{src}",
     );
-    // The runtime schema probe must be fully residualized away.
+    // The runtime schema probe must be fully residualized away. Read in
+    // `fill_timestamps` itself: a partial row's serializers ask
+    // `@__unloaded_columns.include?(:updated_at)`, which is no schema probe.
+    let start = src.find("def fill_timestamps(creating)").unwrap();
+    let body = &src[start..start + src[start..].find("\n  end\n").unwrap()];
     assert!(
-        !src.contains(".include?(:updated_at)") && !src.contains(".include?(:created_at)"),
+        !body.contains(".include?(:updated_at)") && !body.contains(".include?(:created_at)"),
         "fill_timestamps still probes the schema at runtime:\n{src}",
     );
 }

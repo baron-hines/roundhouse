@@ -24,7 +24,12 @@ module ActiveRecord
           self.class.schema_columns.map { |n| n.to_s }
         end
       h = {}
+      # A column a partial `select` left out is not among Rails'
+      # `attribute_names`, so it gets no key and its reader, which
+      # raises MissingAttributeError, is not called.
+      unloaded = @__unloaded_columns
       names.each do |n|
+        next if unloaded && unloaded.include?(n.to_sym)
         # Rails' serializable_hash reads COLUMN attributes only: a
         # requested name with no column storage behind it (a
         # typed_store accessor like lobsters' homepage, which lives

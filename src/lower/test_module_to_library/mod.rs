@@ -1258,7 +1258,10 @@ fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
     classes.insert(ClassId(Symbol::from("TestCase")), info);
 }
 
-/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`.
+/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`,
+/// and the same through `response.header`, Rails' alias of `headers`.
+/// On the response, a key known only at run time reads as
+/// `key.to_s.downcase`.
 ///
 /// Rails' `response.headers` is case-insensitive (Rack 3's `Headers`);
 /// the harness's is a plain Hash keyed the way Rack normalizes —
@@ -1280,8 +1283,26 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
     if method.as_str() != "[]" || args.len() != 1 {
         return changed;
     }
-    let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return changed };
-    if inner.as_str() != "headers" || !inner_args.is_empty() {
+    let ExprNode::Send { recv: inner_recv, method: inner, args: inner_args, .. } = &*recv.node else {
+        return changed;
+    };
+    // `header` only on the response itself: the name is a common one,
+    // and another object's `header` Hash is not case-insensitive.
+    let on_response = || match inner_recv.as_ref().map(|r| &*r.node) {
+        Some(ExprNode::Send { recv, method, args, .. }) => {
+            method.as_str() == "response"
+                && args.is_empty()
+                && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        }
+        Some(ExprNode::Ivar { name }) => name.as_str() == "response",
+        _ => false,
+    };
+    let header_read = match inner.as_str() {
+        "headers" => true,
+        "header" => on_response(),
+        _ => false,
+    };
+    if !header_read || !inner_args.is_empty() {
         return changed;
     }
     if let ExprNode::Lit { value: crate::expr::Literal::Str { value } } = &mut *args[0].node {
@@ -1290,6 +1311,16 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
             *value = lower;
             return true;
         }
+        return changed;
+    }
+    // A key known only at run time, on the response: lowercased there.
+    let lowered = matches!(&*args[0].node, ExprNode::Send { method, .. } if method.as_str() == "downcase");
+    if on_response() && !lowered {
+        let key = args[0].clone();
+        let span = key.span;
+        let to_s = Expr::new(span, ExprNode::Send { recv: Some(key), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false });
+        args[0] = Expr::new(span, ExprNode::Send { recv: Some(to_s), method: Symbol::from("downcase"), args: vec![], block: None, parenthesized: false });
+        return true;
     }
     changed
 }

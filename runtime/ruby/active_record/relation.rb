@@ -127,22 +127,69 @@ module ActiveRecord
     end
   end
 
+  # Rails' `ActiveRecord::Promise` (promise.rb), what an `async_*` query
+  # answers: `value` is the query's result, `then` chains a block onto it
+  # and answers a Promise of the block's value. With no async executor
+  # configured Rails runs the query at once and answers a
+  # `Promise::Complete`; this runtime has no executor, so every Promise
+  # is complete.
+  class Promise
+    def initialize(value)
+      @value = value
+    end
+
+    def value
+      @value
+    end
+
+    def pending?
+      false
+    end
+
+    def then
+      Complete.new(yield(@value))
+    end
+
+    class Complete < Promise
+    end
+  end
+
   class Relation
     # `scoped` false is `Model.unscoped`: no default scope. Otherwise the
     # model's `default_scope { where(…) }` is added here, when the
     # relation is built, as Rails evaluates it — every query root on a
     # model is a `Relation.new`, so this is the one place it applies.
+    #
+    # Inside `rel.scoping { … }` of the same model the root starts from
+    # that relation instead, as Rails' `all` answers `scope.clone`
+    # (scoping/named.rb): its conditions, order, limit, offset, select
+    # and preloads, in place of the default scope. `Model.unscoped`
+    # (`scoped` false) is Rails' bare `relation`, which never reads it.
+    #
+    # Known gap: Rails builds an association's relation from
+    # `scope_for_association`, which ignores the current scope. The
+    # compiler's association seeds are `Relation.new(Target)` too; the
+    # `where_scope` seed (a class method reached through an association)
+    # drops what it copied, but the `where` seeds (an association chain
+    # such as `owner.items.where(…)`, a through reader, a preload batch)
+    # cannot be told from a class-level `Target.where`, so under a
+    # `scoping` of their target model they keep that scope.
     def initialize(model, scoped = true)
       @model = model
       @table = model._table_sql
       @wheres = []
       @joins = []
       @orders = []
+      # Rails' `reordering_value`: set by `reorder`, so a merge of this
+      # relation replaces the receiver's ordering instead of extending it.
+      @reordering = false
       @groups = []
       @havings = []
       @select_sql = nil
       @distinct = false
       @optimizer_hints = ""
+      # `annotate`'s comments, as given (Rails' `annotate_values`).
+      @annotations = []
       @limit = nil
       @offset = nil
       @includes = []
@@ -173,7 +220,108 @@ module ActiveRecord
       @friendly = false
       names = @model._sti_type_names
       where!(type: names) unless names.empty?
-      apply_default_scope! if scoped
+      @inherited_scope = false
+      scope = scoped ? Relation.current_scope_for(@model) : nil
+      if scope.nil?
+        apply_default_scope! if scoped
+      else
+        scope.copy_query_state_to(self)
+        @inherited_scope = true
+      end
+    end
+
+    # The innermost `scoping { … }` relation of exactly this model on
+    # this thread, or nil. A scope of an STI relative is not taken: Rails
+    # merges an ancestor's scope (`relation.merge!(scope)`) rather than
+    # cloning it, which this runtime does not model.
+    def self.current_scope_for(model)
+      scopes = Db._current_scopes
+      return nil if scopes.nil?
+      # Innermost last: the last match wins.
+      found = nil
+      scopes.each { |scope| found = scope if scope.model.name == model.name }
+      found
+    end
+
+    # Rails' `Relation#scoping`: for the block, this relation is the
+    # current scope of its model, so `Model.all`, `Model.where` and every
+    # other class-level query start from it. Per thread, as Rails' scope
+    # registry is, and restored after the block, also when it raises.
+    # Answers the block's value.
+    def scoping
+      scopes = Db._push_current_scope(self)
+      value = nil
+      begin
+        value = yield
+      ensure
+        scopes.pop
+      end
+      value
+    end
+
+    # Copy this relation's query state onto `target`, as Rails' `clone`
+    # copies a relation's values: not its loaded rows or memos.
+    def copy_query_state_to(target)
+      target.take_query_lists(
+        @wheres,
+        @where_cols,
+        @where_null,
+        @joins,
+        @orders,
+        @groups,
+        @havings,
+        @ctes,
+        @includes,
+        @scope_attributes
+      )
+      target.take_query_scalars(
+        @select_sql,
+        @distinct,
+        @optimizer_hints,
+        @limit,
+        @offset,
+        @skip_preloading,
+        @null,
+        @none,
+        @opaque_wheres,
+        @from,
+        @readonly,
+        @lock_clause,
+        @friendly,
+        @reordering
+      )
+    end
+
+    def take_query_scalars(select_sql, distinct, hints, limit, offset, skip_preloading, null, none, opaque, from, readonly, lock_clause, friendly, reordering)
+      @select_sql = select_sql
+      @distinct = distinct
+      @optimizer_hints = hints
+      @limit = limit
+      @offset = offset
+      @skip_preloading = skip_preloading
+      @null = null
+      @none = none
+      @opaque_wheres = opaque
+      @from = from
+      @readonly = readonly
+      @lock_clause = lock_clause
+      @friendly = friendly
+      @reordering = reordering
+      unload_records
+      self
+    end
+
+    # An association's relation ignores the current scope, as Rails'
+    # `scope_for_association` does: put back what a root built outside
+    # any `scoping` holds (the bare relation, then the default scope).
+    # Only the compiler's association seed reaches it, `where_scope`
+    # straight on a `Relation.new`, so nothing else is lost.
+    def drop_inherited_scope!
+      return self unless @inherited_scope
+      @inherited_scope = false
+      Relation.new(@model, false).copy_query_state_to(self)
+      apply_default_scope!
+      self
     end
 
     # Rails' `default_scope`: the model's conditions (`{}` for a model
@@ -402,6 +550,7 @@ module ActiveRecord
     end
 
     def where_scope!(condition)
+      drop_inherited_scope!
       own_lists
       @scope_attributes = condition
       add_condition(condition, [], false)
@@ -653,6 +802,82 @@ module ActiveRecord
       self
     end
 
+    # Rails' `SpawnMethods#except(*skips)`: this relation without the
+    # named query values (`values.except(*skips)`), the rest kept.
+    # `scope.except(:order).order(...)` orders a scope afresh; a name
+    # this relation holds no value for drops nothing, as `Hash#except`.
+    def except(*skips)
+      unloaded_spawn.except_parts!(skips)
+    end
+
+    # Rails' `SpawnMethods#only(*onlies)`: the relation with just the
+    # named query values (`values.slice(*onlies)`), so `distinct` goes
+    # too unless named. `merge(scope.only(:order))` carries a scope's
+    # ordering onto another relation.
+    def only(*onlies)
+      skips = []
+      query_parts.each { |part| skips << part unless onlies.include?(part) }
+      unloaded_spawn.except_parts!(skips)
+    end
+
+    # The query values this relation holds, named as Rails'
+    # `Relation::VALUE_METHODS` key them. `:reordering` is its own value
+    # there, so `only(:order)` of a reordered relation merges as an
+    # ordering that extends, not replaces.
+    def query_parts
+      [:where, :order, :reordering, :limit, :offset, :select, :group, :having, :distinct, :joins, :left_outer_joins,
+       :includes, :preload, :eager_load, :from, :with, :lock, :readonly, :optimizer_hints]
+    end
+
+    def except_parts!(skips)
+      # Rails keeps `joins` and `left_outer_joins` apart, and `includes`,
+      # `preload` and `eager_load`; here each group is one list, so
+      # dropping one member and keeping another cannot be told apart.
+      split_parts!(skips, [:joins, :left_outer_joins], !@joins.empty?)
+      split_parts!(skips, [:includes, :preload, :eager_load], !@includes.empty?)
+      skips.each { |part| except_part!(part) }
+      self
+    end
+
+    def split_parts!(skips, group, held)
+      return nil unless held
+      named = 0
+      group.each { |part| named += 1 if skips.include?(part) }
+      return nil if named == 0 || named == group.length
+      raise NotImplementedError, "except/only: :#{group.join(", :")} are one list here, so they are dropped or kept together"
+    end
+
+    def except_part!(part)
+      if part == :where || part == :order || part == :limit || part == :offset
+        unscope_part!(part)
+      elsif part == :reordering
+        @reordering = false
+      elsif part == :select
+        @select_sql = nil
+      elsif part == :group
+        @groups = []
+      elsif part == :having
+        @havings = []
+      elsif part == :distinct
+        @distinct = false
+      elsif part == :joins || part == :left_outer_joins
+        @joins = []
+      elsif part == :includes || part == :preload || part == :eager_load
+        @includes = []
+      elsif part == :from
+        @from = nil
+      elsif part == :with
+        @ctes = []
+      elsif part == :lock
+        @lock_clause = ""
+      elsif part == :readonly
+        @readonly = false
+      elsif part == :optimizer_hints
+        @optimizer_hints = ""
+      end
+      self
+    end
+
     def unscope_where!
       own_lists
       @wheres = []
@@ -813,7 +1038,13 @@ module ActiveRecord
     def reorder_sql(fragment)
       rel = spawn
       rel.clear_ordering
+      rel.reordered!
       rel.order_sql!(fragment)
+    end
+
+    def reordered!
+      @reordering = true
+      self
     end
 
     # Rails requires at least one argument to the public `reorder` API.
@@ -842,6 +1073,7 @@ module ActiveRecord
     def reorder_parts!(parts)
       own_lists
       @orders = []
+      @reordering = true
       order_parts!(parts)
     end
 
@@ -1245,6 +1477,13 @@ module ActiveRecord
       self
     end
 
+    # Rails' `reselect(*args)`: the projection replaced by these columns
+    # (query_methods.rb `reselect!` assigns `select_values`).
+    def reselect(*specs)
+      raise ArgumentError, "The method .reselect() must contain arguments." if specs.empty?
+      spawn.select_specs!(specs)
+    end
+
     # Rails' `QueryMethods#distinct(value = true)`: any truthy value
     # turns DISTINCT on (`distinct(:name)` is not a column list; it is
     # `distinct(true)`), `false` turns it off.
@@ -1266,6 +1505,30 @@ module ActiveRecord
         @optimizer_hints = @optimizer_hints.empty? ? text : "#{@optimizer_hints} #{text}"
       end
       self
+    end
+
+    # Rails' `annotate(*comments)`: SQL comments written after the query
+    # (`SELECT … /* comment */`). `annotate!` takes the union with the
+    # comments already given (`annotate_values |= args`) and keeps them as
+    # given; they are sanitized only where the SQL is written, as arel's
+    # `visit_Arel_Nodes_Comment` does. The list is replaced, never
+    # mutated, so a spawned copy shares it safely.
+    def annotate(*comments)
+      raise ArgumentError, "The method .annotate() must contain arguments." if comments.empty?
+      spawn.annotate!(*comments)
+    end
+
+    def annotate!(*comments)
+      unload_records
+      merged = copy_string_list(@annotations)
+      comments.each { |comment| merged << comment unless merged.include?(comment) }
+      @annotations = merged
+      self
+    end
+
+    # Rails' `annotate_values`: the comments `annotate` was given.
+    def annotate_values
+      copy_string_list(@annotations)
     end
 
     def distinct!(value = true)
@@ -1335,8 +1598,8 @@ module ActiveRecord
       unloaded_spawn
     end
 
-    # `merge(other)` — fold another relation's WHEREs in. v1 handles the
-    # common case (merging a same-table scope's conditions).
+    # `merge(other)` — fold another relation's WHEREs and ORDER BY in.
+    # v1 handles the common case (merging a same-table scope's conditions).
     def merge(other)
       spawn.merge!(other)
     end
@@ -1348,13 +1611,47 @@ module ActiveRecord
         push_where(w)
         @opaque_wheres = true
       end
+      merge_orders!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
       self
     end
 
+    # Rails' `Merger#merge_multi_values`: the other relation's orderings
+    # follow this one's, each term once (`order!`), so a query can order
+    # rows ahead of a scope's own ordering and merge the scope's back
+    # after; a reordered other replaces this one's (`reorder!`). A column term here is unqualified (it reads the
+    # receiver's output alias), so another table's would sort this
+    # relation by the wrong column: that merge raises rather than order
+    # the rows wrongly.
+    def merge_orders!(other)
+      theirs = other.order_clauses
+      if other.reordering?
+        @orders = []
+        @reordering = true
+      end
+      return nil if theirs.empty?
+      unless other.table_sql == @table
+        raise NotImplementedError, "merge: the ordering of a relation on #{other.table_sql} cannot be applied to one on #{@table}"
+      end
+      theirs.each { |o| @orders << o unless @orders.include?(o) }
+      nil
+    end
+
     def where_clauses
       @wheres
+    end
+
+    def order_clauses
+      @orders
+    end
+
+    def reordering?
+      @reordering
+    end
+
+    def table_sql
+      @table
     end
 
     def having_clauses
@@ -2050,6 +2347,14 @@ module ActiveRecord
       first
     end
 
+    # `take!` — `take`, raising `RecordNotFound` when there is no row, as
+    # Rails' FinderMethods#take! does (`take || raise_record_not_found_exception!`).
+    def take!
+      record = take
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
     # `first!` — like `first`, but raises `RecordNotFound` (→ 404 in the
     # dispatch layer) instead of returning nil when the relation is empty.
     def first!
@@ -2061,6 +2366,125 @@ module ActiveRecord
     def last
       rows = last_n(1)
       rows.length == 0 ? nil : rows[0]
+    end
+
+    # Rails' ordinal finders (finder_methods.rb): `second` … `fifth` are
+    # `find_nth(index)`, `second_to_last` / `third_to_last` are
+    # `find_nth_from_last(index)`, and each bang form raises
+    # RecordNotFound where the plain one answers nil.
+    def second
+      find_nth(1)
+    end
+
+    def third
+      find_nth(2)
+    end
+
+    def fourth
+      find_nth(3)
+    end
+
+    def fifth
+      find_nth(4)
+    end
+
+    def second_to_last
+      find_nth_from_last(2)
+    end
+
+    def third_to_last
+      find_nth_from_last(3)
+    end
+
+    def second!
+      found_or_raise(second)
+    end
+
+    def third!
+      found_or_raise(third)
+    end
+
+    def fourth!
+      found_or_raise(fourth)
+    end
+
+    def fifth!
+      found_or_raise(fifth)
+    end
+
+    def second_to_last!
+      found_or_raise(second_to_last)
+    end
+
+    def third_to_last!
+      found_or_raise(third_to_last)
+    end
+
+    # Rails' `raise_record_not_found_exception!` with no ids, as `first!`.
+    def found_or_raise(record)
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
+    # Rails' `find_nth(index)`: the record at that position of the
+    # relation's own LIMIT/OFFSET window, in its order (the primary key
+    # when it has none, as `ordered_relation` imposes). A loaded
+    # relation answers from its rows.
+    def find_nth(index)
+      loaded = @records
+      return row_at(loaded, index) unless loaded.nil?
+      limit = 1
+      cap = @limit
+      unless cap.nil?
+        limit = cap - index if cap - index < limit
+      end
+      return nil if limit <= 0
+      start = @offset
+      rel = ordered_spawn
+      rel.offset!(start.nil? ? index : start + index)
+      rel.limit!(limit)
+      rows = rel.to_a
+      rows.length == 0 ? nil : rows[0]
+    end
+
+    # Rails' `find_nth_from_last(index)`: a loaded or LIMIT/OFFSET-windowed
+    # relation answers from its rows; otherwise the order reversed,
+    # OFFSET index - 1, and its first row.
+    def find_nth_from_last(index)
+      loaded = @records
+      return row_from_end(loaded, index) unless loaded.nil?
+      return row_from_end(ordered_spawn.to_a, index) unless @limit.nil? && @offset.nil?
+      reversed = []
+      if @orders.empty?
+        reversed << "#{@table}.#{@model.primary_key} DESC"
+      else
+        @orders.each { |term| reversed << reverse_order_term(term) }
+      end
+      rel = unloaded_spawn
+      rel.clear_ordering
+      reversed.each { |term| rel.order_sql!(term) }
+      rel.offset!(index - 1)
+      rel.first
+    end
+
+    # Rails' `ordered_relation`: this relation, ordered by its primary key
+    # when it has no order of its own.
+    def ordered_spawn
+      rel = unloaded_spawn
+      rel.order_sql!("#{@table}.#{@model.primary_key} ASC") if @orders.empty?
+      rel
+    end
+
+    # `rows[index]`. A helper, as `loaded_tail` is, so the loaded rows
+    # read as the narrowed `Array[Base]` rather than `@records`' own type.
+    def row_at(rows, index)
+      rows[index]
+    end
+
+    # `rows[-index]`, nil past the front.
+    def row_from_end(rows, index)
+      at = rows.length - index
+      at < 0 ? nil : rows[at]
     end
 
     # Rails' `first(n)` / `last(n)` — the COUNTED forms, which answer an
@@ -2306,6 +2730,23 @@ module ActiveRecord
     end
     private :cast_schema_date
 
+    # `async_count(column_name = nil)` — Rails' `count` as an
+    # `ActiveRecord::Promise`, run at once as Rails runs it with no async
+    # executor. A grouped relation's value is the Hash its grouped count
+    # is. `:all` and the primary key count every row (a key is never
+    # NULL); counting another column's non-NULL values is Rails'
+    # `COUNT(column)`, which `count` here does not take yet.
+    # The primary key is counted whatever the relation selects, as Rails'
+    # `count(:id)` replaces the projection: a distinct `select(:name)`
+    # answers its distinct keys (`COUNT(DISTINCT id)`), not its names.
+    def async_count(column = nil)
+      unless column.nil? || column.to_s == "all" || column.to_s == primary_key
+        raise NotImplementedError, "async_count(#{column.inspect}): only :all and the primary key are counted here"
+      end
+      return except(:select).async_count if !column.nil? && column.to_s == primary_key && !@select_sql.nil?
+      Promise::Complete.new(@groups.empty? ? count : group_count)
+    end
+
     # `group(:col).count` — Rails hands back a Hash of group-key =>
     # COUNT. The group_count lowering renames the grouped chain's
     # terminal to this method, so the scalar `count` keeps its
@@ -2519,9 +2960,10 @@ module ActiveRecord
       rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
 
-    # `delete_all` — bulk DELETE scoped by the accumulated WHEREs.
+    # `delete_all` — bulk DELETE scoped by the accumulated WHEREs and
+    # the relation's ORDER BY / LIMIT / OFFSET (`scoped_write_where`).
     # Rails contract: no callbacks, no per-row loads, returns the
-    # affected-row count. ORDER/LIMIT don't apply to bulk ops.
+    # affected-row count.
     def delete_all
       return 0 if @null
       sql = "DELETE FROM #{@table}#{scoped_write_where}"
@@ -2554,6 +2996,18 @@ module ActiveRecord
     # the same line Rails draws between `destroy_all` and `delete_all`.
     def delete_by(conditions)
       where(conditions).delete_all
+    end
+
+    # Rails' `Relation#delete(id_or_array)` (relation.rb), which Querying
+    # hands `Model.delete(id)` to: `where(primary_key => id_or_array)
+    # .delete_all`, so one DELETE of the rows of those keys under this
+    # relation's own conditions, no callbacks, and the count deleted. Nil
+    # or `[]` deletes nothing. Rails wraps a single key on a composite
+    # primary key; every model here keys on one column
+    # (`composite_primary_key?` is false), so there is nothing to wrap.
+    def delete(id_or_array)
+      return 0 if id_or_array.nil? || (id_or_array.is_a?(Array) && id_or_array.empty?)
+      where(@model.primary_key => id_or_array).delete_all
     end
 
     # `update_all(...)` — bulk UPDATE scoped by the accumulated WHEREs.
@@ -2612,18 +3066,38 @@ module ActiveRecord
     # form is what SQLite supports (it has no `DELETE … USING`), and it
     # is portable to every adapter this runtime might grow.
     #
+    # The relation's window goes the same way. Rails' `compile_update` /
+    # `compile_delete` carry its ORDER BY, LIMIT and OFFSET, and the
+    # SQLite and PostgreSQL visitors (`ToSql#prepare_update_statement`)
+    # move them into that key subquery, so `owner.items.limit(3)
+    # .update_all(...)` writes three rows, not every row the WHERE
+    # matches. The key keeps its own name as an alias: an ordering term
+    # here is unqualified (`order(:id)` is `ORDER BY id`) and reads
+    # resolve it against the aliases `_columns_sql` gives every column,
+    # so under a JOIN the subquery needs the same aliases: a joined table
+    # can have a column of the same name (`created_at`), which a bare
+    # term would leave ambiguous. There the window runs over the model's
+    # whole aliased projection, as a read does, and the keys are taken
+    # from that.
+    #
     # Returns "" for the unscoped case so an unconditional `delete_all`
     # still emits a bare `DELETE FROM <table>` — Rails' truncate-shaped
     # statement, not a subquery over every row.
     def scoped_write_where
-      return "" if @wheres.length == 0 && @joins.length == 0
-      if @joins.length == 0
+      windowed = @orders.length > 0 || !@limit.nil? || !@offset.nil?
+      return "" if @wheres.length == 0 && @joins.length == 0 && !windowed
+      if @joins.length == 0 && !windowed
         return " WHERE #{@wheres.join(" AND ")}"
       end
-      key = "#{@table}.#{@model.primary_key}"
-      inner = "SELECT #{key} FROM #{@table} #{@joins.join(" ")}"
-      inner = "#{inner} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
-      " WHERE #{@model.primary_key} IN (#{inner})"
+      primary_key = @model.primary_key
+      if windowed && @joins.length > 0
+        inner = append_window(append_join_where("SELECT #{@model._columns_sql} FROM #{@table}"))
+        return " WHERE #{primary_key} IN (SELECT #{primary_key} FROM (#{inner}) AS __rh_window)"
+      end
+      key = "#{@table}.#{primary_key}"
+      key = "#{key} AS #{primary_key}" if windowed
+      inner = append_window(append_join_where("SELECT #{key} FROM #{@table}"))
+      " WHERE #{primary_key} IN (#{inner})"
     end
 
     # `pluck(*cols)` projects raw values, with an Array per row when
@@ -3209,6 +3683,15 @@ module ActiveRecord
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} GROUP BY #{@groups.join(", ")}" if @groups.length > 0
       sql = "#{sql} HAVING #{@havings.join(" AND ")}" if @havings.length > 0
+      sql = append_window(sql)
+      sql = "#{sql} #{@lock_clause}" unless @lock_clause == ""
+      @annotations.each { |comment| sql = "#{sql} /* #{sql_comment(comment)} */" }
+      sql
+    end
+
+    # ORDER BY + LIMIT + OFFSET — shared by reads and the key subquery
+    # a windowed bulk write takes (`scoped_write_where`).
+    def append_window(sql)
       sql = "#{sql} ORDER BY #{@orders.join(", ")}" if @orders.length > 0
       if !@limit.nil?
         sql = "#{sql} LIMIT #{@limit}"
@@ -3219,8 +3702,15 @@ module ActiveRecord
         sql = "#{sql} LIMIT 9223372036854775807"
       end
       sql = "#{sql} OFFSET #{@offset}" unless @offset.nil?
-      sql = "#{sql} #{@lock_clause}" unless @lock_clause == ""
       sql
+    end
+
+    # Rails' `sanitize_as_sql_comment` (abstract/quoting.rb): the
+    # comment's own surrounding `/*`, `/*+` and `*/` are dropped and any
+    # inside it broken up, so it cannot end the comment early.
+    def sql_comment(comment)
+      text = comment.sub(/\A\s*\/\*\+?\s?/, "").sub(/\s?\*\/\s*\Z/, "")
+      text.gsub("*/", "* /").gsub("/*", "/ *")
     end
 
     # JOIN + WHERE only — shared by count_sql / exists_sql so DISTINCT

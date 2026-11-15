@@ -9301,6 +9301,7 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "Arel::Nodes::Not",
     "Arel::Nodes::Case",
     "Arel::Nodes::NamedFunction",
+    "Arel::Nodes::Ordering",
     "Arel::Nodes::Ascending",
     "Arel::Nodes::Descending",
     "Arel::Nodes::Predicate",
@@ -9371,7 +9372,14 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     // Spinel recognizes GeneratorError only as a literal rescue name.
     if target == "spinel" {
         // The Arel ordering and predicate nodes live on the CRuby overlay (`arel_predicates.rb`).
-        if matches!(name, "ActiveSupport::ConfigurationFile" | "Arel::Nodes::Ascending" | "Arel::Nodes::Descending" | "Arel::Nodes::Predicate") {
+        if matches!(
+            name,
+            "ActiveSupport::ConfigurationFile"
+                | "Arel::Nodes::Ordering"
+                | "Arel::Nodes::Ascending"
+                | "Arel::Nodes::Descending"
+                | "Arel::Nodes::Predicate"
+        ) {
             return Some("ruby_family_runtime_constant");
         }
         // `Observable` is `require "observer"`, which `SPINEL_LACKS` keeps
@@ -9518,10 +9526,12 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
     ("ActiveSupport", "errors_attribute_names"),
     ("ActiveSupport", "errors_delete"),
     ("ActiveSupport", "errors_details"),
+    ("ActiveSupport", "errors_group_by_attribute"),
     ("ActiveSupport", "error_detail"),
     ("ActiveSupport", "error_template"),
     ("ActiveSupport", "errors_import"),
     ("ActiveSupport", "errors_merge"),
+    ("ActiveSupport", "errors_copy"),
     ("ActiveJob::Arguments", "serialize"),
     ("ActiveJob::Arguments", "ruby2_keywords_hash"),
 ];

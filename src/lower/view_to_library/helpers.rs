@@ -1237,6 +1237,11 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
     // `**splat` into a route helper goes through.
     if let ExprNode::Send { recv: Some(base), method, args, block: None, .. } = &*url.node {
         if method.as_str() == "merge" && args.len() == 1 {
+            // The merged keys could name the action, so a base without
+            // one is not the index here.
+            if !crate::lower::routes_to_library::url_hash_names_action(base) {
+                return None;
+            }
             let path = emit_url_options_hash(base, ctx)?;
             let extra = rewrite_helpers_in_expr(&args[0], ctx);
             return Some(send(
@@ -1262,7 +1267,14 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
         by_key.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
     };
     let controller = take("controller")?;
-    let action = take("action")?;
+    // Rails' route set normalizes a Hash that names a controller:
+    // `action ||= "index"`, so no action, or a nil one, is the index.
+    let index = || Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: "index".to_string() } });
+    let action = match take("action") {
+        None => index(),
+        Some(a) if matches!(&*a.node, ExprNode::Lit { value: Literal::Nil }) => index(),
+        Some(a) => a,
+    };
     let mut extras: Vec<(String, Expr)> = by_key
         .iter()
         .filter(|(k, _)| k != "controller" && k != "action")
