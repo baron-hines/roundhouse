@@ -24,6 +24,8 @@ end
   has_many :tended_beds, -> { tended }, class_name: "Bed"
   has_many :tended_plants, through: :tended_beds, source: :plants
   has_many :named_plants, -> { order(:name) }, through: :beds, source: :plants
+  has_many :two_key_beds, -> { where(fallow: false).order(position: :asc, id: :asc) }, class_name: "Bed"
+  has_many :two_key_plants, through: :two_key_beds, source: :plants
 end
 "##)
         .write("app/models/bed.rb", r##"class Bed < ApplicationRecord
@@ -65,6 +67,18 @@ end
     # Rails: the reader's own ordering first, the through scope's after it
     check("own order first", g.named_plants.map(&:name) == ["bean", "kale", "leek"])
     check("preloaded", Garden.where(id: g.id).preload(:plants).first.plants.map(&:name).sort == ["bean", "kale", "leek"])
+    # Rails: a hash ordering of two through-table columns qualifies each
+    # one, so the rows sort by the beds' position and then the beds' id —
+    # the plants' own `position` would order them high, dup, low.
+    t = Garden.create!(name: "two keys")
+    low = Bed.create!(garden: t, position: 1, fallow: false)
+    dup = Bed.create!(garden: t, position: 1, fallow: false)
+    high = Bed.create!(garden: t, position: 2, fallow: false)
+    Plant.create!(bed: low, name: "low", position: 9)
+    Plant.create!(bed: dup, name: "dup", position: 5)
+    Plant.create!(bed: high, name: "high", position: 0)
+    t = Garden.find(t.id)
+    check("two-key through order", t.two_key_plants.map(&:name) == ["low", "dup", "high"])
   end
 end
 "##)

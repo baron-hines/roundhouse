@@ -1653,8 +1653,10 @@ module ActiveRecord
     # The terms are qualified here because the caller's query is a JOIN:
     # an unqualified column would resolve against whichever table has it.
     # Rails arrives at the same shape through the through reflection's
-    # aliased table. What a scope does to its own query with `unscope`
-    # (`beds.fallow`) is not carried onto this one.
+    # aliased table. A hash ordering of several columns comes as one
+    # clause (`"position" ASC, "id" ASC`), so each comma-separated term
+    # is qualified on its own. What a scope does to its own query with
+    # `unscope` (`beds.fallow`) is not carried onto this one.
     def merge_through_scope(other)
       own_lists
       unload_records
@@ -1663,8 +1665,10 @@ module ActiveRecord
         @opaque_wheres = true
       end
       other.order_clauses.each do |o|
-        term = qualify_order_term(o, other.table_sql)
-        @orders << term unless @orders.include?(term)
+        o.split(",").each do |clause|
+          term = qualify_order_term(clause.strip, other.table_sql)
+          @orders << term unless @orders.include?(term)
+        end
       end
       self
     end

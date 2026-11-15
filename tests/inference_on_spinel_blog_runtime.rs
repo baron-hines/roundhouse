@@ -632,7 +632,13 @@ fn untyped_subexpressions_baseline() {
     // active_record/connection.rb, `_merge_target` (+24) and
     // `_take_unchanged_attributes` (+6). relation.rbs and connection.rbs
     // type them for the RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1417;
+    // MEASURED 1421 on multi-column through ordering (1417):
+    // `merge_through_scope` splits each order clause on commas before
+    // qualifying it. `o.split(",")` and `clause.strip` are untyped on
+    // this RBS-less probe, and so are their `o` / `clause` receivers
+    // (+4 in active_record/relation.rb). relation.rbs types them for the
+    // RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1421;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
