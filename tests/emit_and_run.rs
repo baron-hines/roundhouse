@@ -22277,3 +22277,5 @@ mod request_headers_merge;
 mod prepend_around_action;
 #[path = "emit_and_run/url_for_controller_index.rs"]
 mod url_for_controller_index;
+#[path = "emit_and_run/redirect_content_type.rs"]
+mod redirect_content_type;
