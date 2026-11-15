@@ -22311,3 +22311,24 @@ mod preload_instance_dependent_belongs_to;
 mod preload_inverse_before_after_initialize;
 #[path = "emit_and_run/preload_onto_subclass.rs"]
 mod preload_onto_subclass;
+
+#[path = "emit_and_run/relation_merge_order.rs"]
+mod relation_merge_order;
+#[path = "emit_and_run/relation_except_only.rs"]
+mod relation_except_only;
+#[path = "emit_and_run/model_delete_by_id.rs"]
+mod model_delete_by_id;
+#[path = "emit_and_run/querying_delegation.rs"]
+mod querying_delegation;
+#[path = "emit_and_run/bulk_write_window.rs"]
+mod bulk_write_window;
+#[path = "emit_and_run/relation_async_count.rs"]
+mod relation_async_count;
+#[path = "emit_and_run/order_values.rs"]
+mod order_values;
+#[path = "emit_and_run/scoping_all_is_scope.rs"]
+mod scoping_all_is_scope;
+#[path = "emit_and_run/create_array.rs"]
+mod create_array;
+#[path = "emit_and_run/partial_select_missing_attribute.rs"]
+mod partial_select_missing_attribute;

@@ -72,7 +72,7 @@ mod send;
 mod active_storage;
 mod buffered_stdlib;
 pub(crate) use send::{ENUMERABLE_METHODS, PARAM_VALUE};
-pub(crate) use send::{indexed_pluck, string_answers};
+pub(crate) use send::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use send::counted_first_last;
 
@@ -3092,6 +3092,17 @@ impl<'a> BodyTyper<'a> {
                     method,
                     args,
                     block.as_ref(),
+                ) {
+                    return t;
+                }
+                // `async_count` answers a Promise of that same count.
+                if let Some(t) = self.async_count_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
                 ) {
                     return t;
                 }

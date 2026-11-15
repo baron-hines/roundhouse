@@ -31,6 +31,19 @@ module Arel
       sql = "#{sql} ESCAPE #{Nodes.embed(escape)}" unless escape.nil?
       Nodes::Predicate.new(sql)
     end
+
+    # The column, without its table, as Rails' Attribute struct holds it.
+    def name
+      @qualified.rpartition(".").last
+    end
+
+    def asc
+      Nodes::Ascending.new(self)
+    end
+
+    def desc
+      Nodes::Descending.new(self)
+    end
   end
 
   module Nodes
@@ -53,10 +66,14 @@ module Arel
       end
     end
 
-    # `Ascending.new(attr).nulls_first` — an ORDER BY term.
-    class Ascending < Node
+    # `Ascending.new(attr).nulls_first` — an ORDER BY term. `expr` is the
+    # node it orders by, as in Rails' Arel::Nodes::Unary, so a reader of
+    # `relation.order_values` can ask which column a term sorts on.
+    class Ordering < Node
+      attr_reader :expr
+
       def initialize(expr)
-        @expr = expr.to_s
+        @expr = expr
         @nulls = ""
       end
 
@@ -69,28 +86,15 @@ module Arel
         @nulls = " NULLS LAST"
         self
       end
+    end
 
+    class Ascending < Ordering
       def to_s
         "#{@expr} ASC#{@nulls}"
       end
     end
 
-    class Descending < Node
-      def initialize(expr)
-        @expr = expr.to_s
-        @nulls = ""
-      end
-
-      def nulls_first
-        @nulls = " NULLS FIRST"
-        self
-      end
-
-      def nulls_last
-        @nulls = " NULLS LAST"
-        self
-      end
-
+    class Descending < Ordering
       def to_s
         "#{@expr} DESC#{@nulls}"
       end

@@ -582,7 +582,40 @@ fn untyped_subexpressions_baseline() {
     // branch's 1276): the two notes above add up, +4 and +38.
     // MEASURED 1284 on 2026-11-13 (doorkeeper, on main's 1280): `Base.columns` and `Column`'s `null` argument in
     // active_record/connection.rb (+4), vars on this RBS-less probe; connection.rbs types them for the RBS-paired gate.
-    const CEILING: usize = 1284;
+    // MEASURED 1341 on 2026-11-14 (relation queries, on main's 1268): the
+    // parameters and block values of the Relation methods this branch adds,
+    // vars on this RBS-less probe. `scoping` (+49: `take_query_scalars` 26,
+    // `current_scope_for` 10, `copy_query_state_to` 5, `scoping` 4,
+    // `initialize` 3, `drop_inherited_scope!` 1), `merge_orders!` and
+    // `merge!` (+16), `delete` (+5), `async_count` and `Promise` (+6),
+    // `_missing_attribute` and `_as_json_only` in active_record/connection.rb
+    // (+3), less `unscope_part!` and `order_sql!` (-5, -1). relation.rbs and
+    // connection.rbs type them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1342 on partial-select writes (1341): `_note_loaded` in
+    // active_record/connection.rb drops its column `name`, a var on this
+    // RBS-less probe (+1); connection.rbs types it for the RBS-paired gate.
+    // MEASURED 1343 on partial-select reads (1342): `read_attribute`
+    // checks its `name` against the row's unloaded columns before it
+    // reads `self[name]` (+1 in active_record/connection.rb).
+    // MEASURED 1345 on scoped reordering (1343): `copy_query_state_to`
+    // hands `take_query_scalars` the relation's `@reordering` too, a var
+    // on this RBS-less probe at both ends (+2 in active_record/relation.rb).
+    // MEASURED 1347 on async_count(:id) of a select (1345): `async_count`
+    // reads its `column` twice more to count the key of a relation with a
+    // `select`, a var on this RBS-less probe (+2 in active_record/relation.rb).
+    // MEASURED 1351 on unscoped's block value (1347): `scoping` and
+    // `Model.unscoped { }` bind the block's value before their ensure, so
+    // the Spinel binary keeps it, a var on this RBS-less probe (+2 in
+    // active_record/relation.rb, +2 in active_record/connection.rb).
+    // MEASURED 1352 on partial-select writes (1351): `_note_loaded` in
+    // active_record/connection.rb names the column it assigned in the row's
+    // pending writes, so it reads the column name twice more — the early
+    // return for one that was not left out, and `name.to_s` (+2); less
+    // `read_attribute`, whose unloaded check and `[]` read now pass the
+    // Symbol it normalizes to instead of the name as given, which types
+    // both (-1). The names are vars on this RBS-less probe;
+    // connection.rbs types them for the RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1352;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
