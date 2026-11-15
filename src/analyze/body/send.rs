@@ -312,7 +312,10 @@ impl<'a> BodyTyper<'a> {
     /// `ActiveRecord::Promise` of the count: an Integer, or the Hash a
     /// grouped relation counts into, read as `grouped_count_ty` reads
     /// it. The runtime's `Relation#async_count` picks the same two by
-    /// the relation's groups.
+    /// the relation's groups. A receiver whose chain cannot be read (a
+    /// local or a named scope may hold a grouped relation) counts into
+    /// either, so its value stays untyped, as `relation_extreme_ty`
+    /// leaves such a receiver's extrema.
     pub(super) fn async_count_ty(
         &self,
         recv: Option<&Expr>,
@@ -320,13 +323,19 @@ impl<'a> BodyTyper<'a> {
         method: &Symbol,
         args: &[Expr],
         block: Option<&Expr>,
+        instance_self: Option<&Ty>,
     ) -> Option<Ty> {
         if method.as_str() != "async_count" || args.len() > 1 || block.is_some() {
             return None;
         }
         let recv_ty = recv_ty?;
-        Self::relation_model(recv_ty)?;
-        let count = self.grouped_count_hash(recv?, recv_ty).unwrap_or(Ty::Int);
+        let model = Self::relation_model(recv_ty)?;
+        let recv = recv?;
+        let count = match self.grouped_count_hash(recv, recv_ty) {
+            Some(hash) => hash,
+            None if self.direct_relation_chain(recv, model, instance_self) => Ty::Int,
+            None => Ty::Untyped,
+        };
         Some(crate::analyze::promise::of(count))
     }
 

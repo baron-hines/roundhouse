@@ -3095,6 +3095,7 @@ impl<'a> BodyTyper<'a> {
                     method,
                     args,
                     block.as_ref(),
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
                 ) {
                     return t;
                 }

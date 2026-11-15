@@ -27,6 +27,10 @@ end
     promise = Comment.where(post_id: 6).async_count(:all)
     check("plain", [promise.value, promise.pending?, promise.is_a?(ActiveRecord::Promise)], [3, false, true])
     check("then", Comment.where(approved: false).async_count(:id).then { |n| n + 100 }.value, 101)
+    grouped = Comment.group(:post_id)
+    check("grouped through a local", grouped.async_count.then { |counts| counts.keys.sort }.value, [4, 5, 6])
+    unmatched = Comment.where(post_id: 0).group(:post_id)
+    check("an empty grouped count through a local", unmatched.async_count.then { |counts| counts.blank? }.value, true)
   end
 end
 "##)
