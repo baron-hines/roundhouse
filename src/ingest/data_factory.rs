@@ -117,7 +117,7 @@ pub(super) fn collect(
         let unsupported = || {
             IngestError::Unsupported {
             file: file.into(),
-            message: "Data.define blocks support only instance methods and static visibility declarations".into(),
+            message: "Data.define blocks support only methods, delegates and static visibility declarations".into(),
         }
         };
         let block = call
@@ -136,8 +136,10 @@ pub(super) fn collect(
             owner.0.as_str(),
             constant_id_str(&name)
         )));
+        visibility::validate_data(block.body(), file, &[], &id)?;
         let visibility = Visibility::resolve(Some(&body), file, None)?;
         let mut methods = Vec::new();
+        let mut unknown_calls = Vec::new();
         for statement in flatten_statements(body) {
             if let Some(def) = visibility::definition(&statement) {
                 if def
@@ -152,6 +154,25 @@ pub(super) fn collect(
                 // also apply to singleton methods.
                 visibility.apply(&statement, &mut method);
                 methods.push(method);
+            } else if statement.as_call_node().is_some_and(|call| {
+                call.receiver().is_none() && call.block().is_none()
+                    && constant_id_str(&call.name()) == "delegate"
+            }) {
+                let delegate_call = statement.as_call_node().unwrap();
+                let args = delegate_call.arguments().map(|args| args.arguments().iter().collect::<Vec<_>>()).unwrap_or_default();
+                if args.iter().any(|arg| arg.as_hash_node().is_some()) {
+                    return Err(IngestError::Unsupported { file: file.into(), message: "Data delegate requires keyword options, not a positional Hash".into() });
+                }
+                let target = args.iter().filter_map(|arg| arg.as_keyword_hash_node()).flat_map(|hash| hash.elements().iter().collect::<Vec<_>>())
+                    .filter_map(|arg| arg.as_assoc_node()).find(|arg| super::util::symbol_or_string_value(&arg.key()).as_deref() == Some("to"))
+                    .and_then(|arg| super::util::symbol_or_string_value(&arg.value()));
+                let members = call.arguments().map(|args| args.arguments().iter().filter_map(|arg| super::util::symbol_or_string_value(&arg)).collect::<Vec<_>>()).unwrap_or_default();
+                if !target.as_ref().is_some_and(|target| members.contains(target)) {
+                    return Err(IngestError::Unsupported { file: file.into(), message: "Data delegate constant target or non-member target has unverified lexical lookup".into() });
+                }
+                // The shared delegate pass validates options and expands the
+                // forwarders, just as it does beside an ordinary class's defs.
+                unknown_calls.push(ingest_expr(&statement, file)?);
             } else if !statement.as_call_node().is_some_and(|call| {
                 visibility::marker(&call)
                     && call.receiver().is_none()
@@ -163,6 +184,9 @@ pub(super) fn collect(
             }) {
                 return Err(unsupported());
             }
+        }
+        if !unknown_calls.is_empty() && methods.iter().any(|method| method.receiver == crate::dialect::MethodReceiver::Class && method.name.as_str() == "delegate") {
+            return Err(IngestError::Unsupported { file: file.into(), message: "app-defined delegate on a Data class is not modeled".into() });
         }
         factories.push(LibraryClass {
             name: id,
@@ -179,7 +203,7 @@ pub(super) fn collect(
             }),
             constants: Vec::new(),
             conditional_definitions: Vec::new(),
-            unknown_calls: Vec::new(),
+            unknown_calls,
         });
     }
     Ok(factories)

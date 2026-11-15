@@ -3206,7 +3206,7 @@ end
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
     super::forwardable::lower_forwardable(&mut app);
-    super::delegate::lower_delegates(&mut app);
+    super::delegate::lower_delegates(&mut app, &const_resolver.for_sources(&sources));
     // `Other.include(M)` written in another body: `Other`'s include,
     // before the concern splices read the includes.
     super::external_include::carry(&mut app);

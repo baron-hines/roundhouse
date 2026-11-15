@@ -1263,9 +1263,26 @@ impl LibraryClass {
     /// file-level `X = Data.define(…)` creates.
     pub fn data_define(&self) -> Option<(&[Symbol], Span)> {
         match &self.origin {
-            Some(LibraryClassOrigin::DataDefine { members, span }) => Some((members, *span)),
+            Some(LibraryClassOrigin::DataDefine { members, span, .. }) => Some((members, *span)),
             _ => None,
         }
+    }
+
+    /// Declaration positions owned by the record, independent of value rewrites.
+    pub(crate) fn data_class_constant(&self, index: usize) -> bool {
+        matches!(&self.origin, Some(LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) if index >= *start)
+    }
+
+    /// A native marker changing one of Data's generated class constructors.
+    pub(crate) fn data_constructor_visibility(&self) -> Option<Span> {
+        self.data_define()?;
+        self.unknown_calls.iter().find(|call| {
+            let ExprNode::Send { method, args, .. } = &*call.node else { return false };
+            let class_side = method.as_str() == "private_class_method"
+                || (call.decisions & crate::expr::SINGLETON_BODY != 0 && method.as_str() == "private");
+            class_side && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if matches!(value.as_str(), "new" | "[]" | "allocate")))
+        }).map(|call| call.span)
     }
 
     /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
@@ -1397,6 +1414,8 @@ pub enum LibraryClassOrigin {
     DataDefine {
         members: Vec<Symbol>,
         span: Span,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class_constant_start: Option<usize>,
     },
     /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
     Oj,

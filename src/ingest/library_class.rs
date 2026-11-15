@@ -383,6 +383,7 @@ fn ingest_library_classes_impl(
         _ => Vec::new(),
     };
     if file_level && let Some(program) = root.as_program_node() {
+        let (mut data_constants, mut admitted_data_values) = (HashSet::default(), HashMap::<String, u32>::default());
         for statement in program.statements().body().iter() {
             if let Some(mut class) = file_data_class(&statement, file)
                 .map_err(|err| super::error_site::at(err, &statement))?
@@ -399,14 +400,53 @@ fn ingest_library_classes_impl(
                 }
                 let invalid_reopen = reopenings.iter().any(|(_, node)| {
                     node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
-                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt)))
+                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_reopening_statement(stmt)))
                 });
-                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset()).max().unwrap_or(0);
+                for (scope, node) in &reopenings {
+                    if node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| stmt.as_constant_write_node().is_some()))
+                        && (node.constant_path().as_constant_read_node().is_none()
+                            || scope.join("::") != class.name.0.as_str().rsplit_once("::").map_or("", |(owner, _)| owner)) {
+                        return Err(super::error_site::at(IngestError::Unsupported {
+                            file: file.into(), message: "qualified Data reopening initializers have a different lexical scope".into(),
+                        }, &node.as_node()));
+                    }
+                }
+                let (mut own_constants, mut file_values) = (HashSet::default(), HashSet::default());
+                let first_class_constant = class.constants.len();
+                for stmt in program.statements().body().iter() {
+                    let Some(write) = stmt.as_constant_path_write_node() else { continue };
+                    let Some(mut path) = static_constant_path(&write.target().as_node()) else { continue };
+                    let Some(name) = path.pop() else { continue };
+                    if path.join("::") != class.name.0.as_str()
+                        || stmt.location().start_offset() < statement.location().end_offset() { continue; }
+                    let mut value = ingest_expr(&write.value(), file)?;
+                    file_values.insert(value.span.start);
+                    // The RHS is evaluated at file scope, not in the reopened class.
+                    fn root_constants(expr: &mut Expr) {
+                        if let ExprNode::Const { path } = &mut *expr.node
+                            && path.first().is_some_and(|part| !part.as_str().is_empty()) {
+                            path.insert(0, Symbol::from(""));
+                        }
+                        expr.node.for_each_child_mut(&mut root_constants);
+                    }
+                    root_constants(&mut value);
+                    class.constants.push((Symbol::from(name), value));
+                    data_constants.insert(stmt.location().start_offset());
+                    own_constants.insert(stmt.location().start_offset());
+                }
+                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset())
+                    .chain(own_constants.iter().copied()).max().unwrap_or(0);
                 let separated = program.statements().body().iter().any(|stmt| {
                     let at = stmt.location().start_offset();
                     at >= statement.location().end_offset() && at < last_reopen
                         && !reopenings.iter().any(|(_, node)| node.location().start_offset() == at)
+                        && !own_constants.contains(&at)
                 });
+                if separated {
+                    return Err(super::error_site::at(IngestError::Unsupported {
+                        file: file.into(), message: "Data.define declaration group is interrupted by another statement".into(),
+                    }, &statement));
+                }
                 if invalid_reopen || separated || out.iter().any(|other| other.name == class.name && other.is_module)
                     || made.iter().any(|(_, other)| other.name == class.name) {
                     return Err(super::error_site::at(IngestError::Unsupported {
@@ -414,17 +454,43 @@ fn ingest_library_classes_impl(
                         message: "Data.define beside another declaration of the same class".into(),
                     }, &statement));
                 }
-                // Only later, method-only reopenings can join the factory without moving load-time work.
-                for reopening in out.extract_if(.., |other| other.name == class.name) {
+                // The emitter interleaves these declarations by their source spans.
+                for mut reopening in out.extract_if(.., |other| other.name == class.name) {
                     class.methods.extend(reopening.methods);
+                    for call in &mut reopening.unknown_calls {
+                        call.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+                    }
+                    class.constants.extend(reopening.constants);
+                    class.unknown_calls.extend(reopening.unknown_calls);
+                }
+                class.constants.sort_by_key(|(_, value)| value.span.start);
+                if let Some(crate::dialect::LibraryClassOrigin::DataDefine { class_constant_start, .. }) = &mut class.origin {
+                    *class_constant_start = (first_class_constant < class.constants.len()).then_some(first_class_constant);
                 }
                 class.methods.sort_by_key(|method| method.name_span.start);
+                let factory_body = file_data_declaration(&statement).and_then(|(_, call)| call.block())
+                    .and_then(|block| block.as_block_node()).and_then(|block| block.body());
+                for body in std::iter::once(factory_body).chain(reopenings.iter().map(|(_, node)| node.body())) {
+                    visibility::validate_data(body, file, &class.methods, &class.name)?;
+                }
+                admitted_data_values.insert(class.name.0.to_string(), statement.location().end_offset() as u32);
+                for (index, (name, value)) in class.constants.iter().enumerate() {
+                    if !class.data_class_constant(index) { continue; }
+                    if !data_constant_value(value, &class, !file_values.contains(&value.span.start), &admitted_data_values) {
+                        let err = IngestError::Unsupported { file: file.into(), message: "Data constant initializer is not a literal or a constructor call".into() };
+                        super::error_site::note(&err, value.span.start as usize, value.span.end as usize);
+                        return Err(err);
+                    }
+                    admitted_data_values.insert(format!("{}::{name}", class.name.0), value.span.end);
+                }
                 // Nothing runs between the block's definitions and the reopenings', so a later
                 // definition replaces an earlier one before any call can reach it, as in Ruby.
-                let mut seen = HashSet::default();
-                class.methods.reverse();
-                class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
-                class.methods.reverse();
+                if class.constants.is_empty() {
+                    let mut seen = HashSet::default();
+                    class.methods.reverse();
+                    class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
+                    class.methods.reverse();
+                }
                 made.push((class.name.0.clone(), class));
             }
         }
@@ -437,6 +503,7 @@ fn ingest_library_classes_impl(
                     .is_some_and(|(feature, relative)| !relative && super::app::APP_REQUIRABLE_STDLIB.contains(&feature.as_str()));
                 if statement.as_constant_write_node().is_none() && statement.as_class_node().is_none()
                     && statement.as_module_node().is_none() && !qualified_factory && !stdlib_require
+                    && !data_constants.contains(&statement.location().start_offset())
                 {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
@@ -484,6 +551,9 @@ fn ingest_library_classes_impl(
         // or call time (invariant 6).
         super::file_constant_hoist::ensure_safe(file, &file_constants, &out, &factories)?;
         if let Some(host) = out.first_mut().or_else(|| factories.first_mut()) {
+            if let Some(crate::dialect::LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) = &mut host.origin {
+                *start += file_constants.len();
+            }
             let mut consts = file_constants;
             consts.extend(std::mem::take(&mut host.constants));
             host.constants = consts;
@@ -581,11 +651,58 @@ fn data_block_classes(
 }
 
 fn data_method_statement(stmt: &Node<'_>) -> bool {
+    if let Some(singleton) = stmt.as_singleton_class_node() {
+        return singleton.expression().as_self_node().is_some()
+            && singleton.body().is_none_or(|body| flatten_statements(body).iter().all(data_method_statement));
+    }
     if let Some(def) = visibility::definition(stmt) {
         return def.receiver().is_none_or(|receiver| receiver.as_self_node().is_some());
     }
     stmt.as_call_node().filter(|call| call.receiver().is_none() && call.block().is_none() && visibility::marker(call))
         .is_some_and(|call| call.arguments().is_none_or(|args| args.arguments().iter().all(|arg| super::util::symbol_or_string_value(&arg).is_some())))
+}
+
+fn data_reopening_statement(stmt: &Node<'_>) -> bool {
+    data_method_statement(stmt) || stmt.as_constant_write_node().is_some()
+}
+
+fn data_literal(value: &Expr) -> bool {
+    match &*value.node {
+        ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
+        ExprNode::Array { elements, .. } => elements.iter().all(data_literal),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| data_literal(key) && data_literal(value)),
+        _ => false,
+    }
+}
+
+fn data_constant_value(value: &Expr, class: &LibraryClass, class_scope: bool, known: &HashMap<String, u32>) -> bool {
+    if data_literal(value) { return true; }
+    let earlier = |name: &str| known.get(name).is_some_and(|end| *end <= value.span.start);
+    match &*value.node {
+        ExprNode::Const { path } => {
+            let name = path.iter().filter(|part| !part.as_str().is_empty()).map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            (class_scope && path.len() == 1 && earlier(&format!("{}::{name}", class.name.0))) || earlier(&name)
+        }
+        ExprNode::Send { recv, method, args, block: None, .. } if matches!(method.as_str(), "new" | "[]") => {
+            let own = match recv.as_ref().map(|recv| &*recv.node) {
+                None | Some(ExprNode::SelfRef) => class_scope && method.as_str() == "new",
+                Some(ExprNode::Const { path }) => {
+                    let name = path.iter().filter(|part| !part.as_str().is_empty()).map(Symbol::as_str).collect::<Vec<_>>().join("::");
+                    name == class.name.0.as_str() && (!class_scope || path.first().is_some_and(|part| part.as_str().is_empty())
+                        || !class.constants.iter().any(|(name, _)| name == path.first().unwrap()))
+                }
+                _ => false,
+            };
+            own && class.includes.is_empty() && !class.methods.iter().any(|method|
+                method.receiver == MethodReceiver::Class && matches!(method.name.as_str(), "new" | "[]" | "allocate")
+                    || method.receiver == MethodReceiver::Instance && method.name.as_str() == "initialize")
+                && args.iter().all(|arg| match &*arg.node {
+                    ExprNode::Hash { entries, kwargs: true } => entries.iter().all(|(key, value)| data_literal(key) && data_constant_value(value, class, class_scope, known)),
+                    _ => data_constant_value(arg, class, class_scope, known),
+                })
+        }
+        _ => false,
+    }
 }
 
 /// The class a file-level statement `X = Data.define(:a, :b)` creates.
@@ -604,6 +721,7 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
     let Some(members) = data_members(&call) else { return Ok(None) };
     let owner = ClassId(Symbol::from(name));
     let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
+    visibility::validate_data(body(), file, &[], &owner)?;
     if let Some(body) = body() {
         let statements = flatten_statements(body);
         if statements.iter().any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
@@ -627,11 +745,16 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
             }
         }
     }
-    // Not a carried marker: a Data block's `private_class_method :new` names the constructor Data defines.
-    let visibility = Visibility::resolve_library(body().as_ref(), file, None, Some(&owner))?;
+    let visibility = Visibility::resolve_data(body().as_ref(), file, &owner)?;
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
         walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
+    for call in &mut unknown_calls {
+        if matches!(&*call.node, ExprNode::Send { method, .. }
+            if matches!(method.as_str(), "private_class_method" | "public_class_method" | "private" | "public" | "protected")) {
+            call.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+        }
+    }
     Ok(Some(LibraryClass {
         name: owner,
         is_module: false,
@@ -644,6 +767,7 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
         origin: Some(crate::dialect::LibraryClassOrigin::DataDefine {
             members,
             span: super::util::node_span(&call.as_node(), file),
+            class_constant_start: None,
         }),
         constants,
         conditional_definitions,

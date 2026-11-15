@@ -51,7 +51,7 @@ use crate::expr::{Expr, ExprNode};
 /// Runs AFTER `lower_current_attributes`, which consumes the
 /// declarations on its own classes — so what reaches here is the
 /// general shape only.
-pub fn lower_delegates(app: &mut crate::App) {
+pub fn lower_delegates(app: &mut crate::App, resolver: &crate::analyze::ConstResolver) {
     let mut model_concerns = crate::det::HashSet::default();
     let mut pending: Vec<_> = app
         .models
@@ -72,7 +72,7 @@ pub fn lower_delegates(app: &mut crate::App) {
     }
 
     spell_static_splats(app);
-    lower_library_class_delegates(app, &model_concerns);
+    lower_library_class_delegates(app, &model_concerns, resolver);
 }
 
 /// A `delegate(*names, to: …)` whose splat the source spells statically, written as its names: a literal Array, or the
@@ -208,8 +208,51 @@ fn spell_static_splats(app: &mut crate::App) {
 fn lower_library_class_delegates(
     app: &mut crate::App,
     model_concerns: &crate::det::HashSet<crate::ident::ClassId>,
+    resolver: &crate::analyze::ConstResolver,
 ) {
+    fn raises_no_method_error(expr: &Expr) -> bool {
+        let mut found = matches!(&*expr.node, ExprNode::Send { recv: None, method, args, .. }
+            if method.as_str() == "raise" && args.first().is_some_and(|arg| matches!(&*arg.node,
+                ExprNode::Const { path } if path.last().is_some_and(|part| part.as_str() == "NoMethodError"))));
+        expr.node.for_each_child(&mut |child| found |= raises_no_method_error(child));
+        found
+    }
+    let methods: Vec<_> = app.library_classes.iter().flat_map(|class| class.methods.iter().map(move |method| (&class.name, method)))
+        .chain(app.models.iter().flat_map(|model| model.methods().map(move |method| (&model.name, method)))).collect();
     let lookup = ClassLookup::new(&app.library_classes);
+    let blocked: Vec<_> = app.library_classes.iter().map(|lc| {
+        if lc.data_define().is_none() && !matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::DataFactory { .. })) { return None; }
+        lc.unknown_calls.iter().filter(|call| is_delegate_declaration(call)).find_map(|call| {
+            let ExprNode::Send { args, .. } = &*call.node else { return None };
+            let target = args.iter().find_map(|arg| match &*arg.node { ExprNode::Hash { entries, .. } => entries.iter().find_map(|(key, value)|
+                matches!(&*key.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "to").then_some(value)), _ => None });
+            let target = target.and_then(|target| match &*target.node { ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.as_str()), ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.as_str()), _ => None });
+            let known = target.and_then(|target| lc.methods.iter().rev().find(|method| method.receiver == MethodReceiver::Instance && method.name.as_str() == target))
+                .and_then(|method| delegate_target_class(&method.body, resolver));
+            let owners = known.and_then(|name| {
+                let mut seen = ["Object", "Kernel", "BasicObject"].into_iter().map(|name| crate::ident::ClassId(crate::ident::Symbol::from(name))).collect::<crate::det::HashSet<_>>();
+                let mut pending = vec![name];
+                while let Some(name) = pending.pop() { if !seen.insert(name.clone()) { continue; }
+                    if let Some(class) = lookup.first.get(name.0.as_str()) {
+                        if class.methods.iter().any(|method| method.receiver == MethodReceiver::Class && method.name.as_str() == "new") { return None; }
+                        for (parent, span) in class.includes.iter().zip(&class.include_spans).chain(class.parent.iter().map(|parent| (parent, &class.parent_span))) {
+                            let path = parent.0.as_str().split("::").map(crate::ident::Symbol::from).collect::<Vec<_>>();
+                            pending.push(resolver.namespace(*span, &path)?.clone());
+                        }
+                    }
+                    if let Some(model) = app.models.iter().find(|model| model.name == name) { pending.extend(model.parent.iter().cloned()); }
+                }
+                Some(seen)
+            });
+            let relevant = |owner: &crate::ident::ClassId| owners.as_ref().is_none_or(|owners| owners.contains(owner));
+            let reason = if methods.iter().any(|(owner, method)| relevant(owner) && method.receiver == MethodReceiver::Instance && matches!(method.name.as_str(), "nil?" | "respond_to?")) { Some("Data delegation with source nil? or respond_to? overrides is not modeled") }
+                else if methods.iter().any(|(owner, method)| relevant(owner) && method.receiver == MethodReceiver::Instance && raises_no_method_error(&method.body)
+                    && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if *value == method.name))) {
+                    Some("Data delegation to source methods raising NoMethodError has unverified native exception propagation")
+                } else { None };
+            reason.map(|reason| (call.span, reason))
+        })
+    }).collect();
     let enumerable: crate::det::HashSet<crate::ident::ClassId> = app
         .library_classes
         .iter()
@@ -218,6 +261,10 @@ fn lower_library_class_delegates(
         .collect();
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
+        if let Some((span, reason)) = blocked[i] {
+            super::prism::push(crate::diagnostic::Diagnostic::unsupported(span, None, "Data delegate", reason));
+            continue;
+        }
         // Keep module declarations deferred whenever that module contributes
         // to a model. Expanding one shared module method generically would
         // bypass association checks for the model; consumer-specific module
@@ -315,6 +362,15 @@ pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef>
     expand_delegates_with(lc, enumerable)
 }
 
+fn delegate_target_class(value: &Expr, resolver: &crate::analyze::ConstResolver) -> Option<crate::ident::ClassId> {
+    if let ExprNode::Seq { exprs } = &*value.node && exprs.len() == 1 { return delegate_target_class(&exprs[0], resolver); }
+    if let ExprNode::Send { recv: Some(recv), method, block: None, .. } = &*value.node
+        && method.as_str() == "new" && let ExprNode::Const { path } = &*recv.node {
+        return resolver.namespace(recv.span, path).cloned();
+    }
+    None
+}
+
 /// The first library class of each name, and every name a class could be
 /// written as from inside a namespace (`A::B::C` as `B::C` and `C`).
 struct ClassLookup<'a> {
@@ -359,6 +415,7 @@ fn includes_enumerable(
 fn expand_delegates_with(lc: &mut LibraryClass, enumerable: bool) -> Vec<MethodDef> {
     // Enumerable calls `each` with a block, a call no source site of the class shows.
     let implicit_block: &[&str] = if enumerable { &["each"] } else { &[] };
+    let nil_errors = lc.data_define().is_some() || matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::DataFactory { .. }));
     expand_delegates(
         &lc.name,
         &lc.methods,
@@ -369,6 +426,7 @@ fn expand_delegates_with(lc: &mut LibraryClass, enumerable: bool) -> Vec<MethodD
         &crate::det::HashSet::default(),
         &[],
         implicit_block,
+        nil_errors,
     )
 }
 
@@ -382,6 +440,7 @@ pub(super) fn expand_delegates(
     method_targets: &crate::det::HashSet<String>,
     sources: &[crate::span::SourceFile],
     implicit_block: &[&str],
+    nil_errors: bool,
 ) -> Vec<MethodDef> {
     let mut called_with_args = names_called_with_arguments(methods, additional_method_bodies);
     for name in implicit_block {
@@ -401,7 +460,7 @@ pub(super) fn expand_delegates(
     if delegates.is_empty() {
         return Vec::new();
     }
-    let src = synthesized_source(name, methods, &delegates);
+    let src = synthesized_source(name, methods, &delegates, nil_errors);
 
     // Isolated in its OWN scope — never the outer one that spans
     // the whole app's ingest — so a bug in `synthesized_source`
@@ -506,6 +565,8 @@ fn receiver(target: &str) -> std::borrow::Cow<'_, str> {
         "value",
         // The allow_nil forwarder's own local (`synthesized_source`).
         "__allow_nil_target__",
+        "__delegate_error__",
+        "__delegate_private__",
         "key",
         "other",
         "__delegate_target",
@@ -538,6 +599,7 @@ fn synthesized_source(
     name: &crate::ident::ClassId,
     methods: &[MethodDef],
     delegates: &[Delegation],
+    nil_errors: bool,
 ) -> String {
     let defined_after = |name: &str, declaration: crate::span::Span| {
         methods.iter().any(|method| {
@@ -590,6 +652,16 @@ fn synthesized_source(
         } else {
             format!("{}({params})", d.name)
         };
+        let call = if nil_errors && !d.allow_nil {
+            let message = format!("{} delegated to {t}, but {t} is nil", d.name);
+            let invoke = call.replacen(t, "__allow_nil_target__", 1);
+            let missing = format!("undefined method '{m}' for nil");
+            let private = format!("private method '{m}' called for nil");
+            let missing_args = params.split(", ").filter(|arg| !arg.starts_with('&')).collect::<Vec<_>>().join(", ");
+            // Spinel's mixed nil/object send can miss the missing-method raise.
+            // Raise that exception explicitly, retaining its name, args and receiver.
+            format!("__allow_nil_target__ = {t}\n    begin\n      if __allow_nil_target__.nil? && !nil.respond_to?(:{m})\n        __delegate_private__ = nil.respond_to?(:{m}, true)\n        raise ::NoMethodError.new(__delegate_private__ ? {private:?} : {missing:?}, :{m}, [{missing_args}], __delegate_private__, receiver: nil)\n      end\n      {invoke}\n    rescue ::NoMethodError => __delegate_error__\n      if __allow_nil_target__.nil? && __delegate_error__.name == :{m}\n        raise ::ActiveSupport::DelegationError, {message:?}\n      end\n      raise\n    end")
+        } else { call };
         body.push_str(&format!("  def {signature}\n    {call}\n  end\n\n"));
     }
     // The class name is irrelevant — only the METHODS are lifted out of
@@ -617,7 +689,7 @@ mod tests {
     /// catches Bug A (a setter `def` with no parameter and a bare
     /// `x.y=` call is two syntax errors, not zero).
     fn synthesized_methods(lc: &LibraryClass, delegates: &[Delegation]) -> Vec<MethodDef> {
-        let src = synthesized_source(&lc.name, &lc.methods, delegates);
+        let src = synthesized_source(&lc.name, &lc.methods, delegates, false);
         crate::ingest::ingest_library_classes(src.as_bytes(), "<test>")
             .unwrap_or_else(|e| panic!("synthesized source failed to parse: {e}\n{src}"))
             .into_iter()
@@ -642,7 +714,7 @@ mod tests {
         concern.is_module = true;
         app.library_classes.push(concern);
 
-        lower_delegates(&mut app);
+        lower_delegates(&mut app, &crate::App::default().const_resolver.for_sources(&[]));
 
         let concern = &app.library_classes[0];
         assert!(
@@ -669,7 +741,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        lower_library_class_delegates(&mut app, &model_concerns);
+        lower_library_class_delegates(&mut app, &model_concerns, &crate::App::default().const_resolver.for_sources(&[]));
 
         let concern = &app.library_classes[0];
         assert!(
@@ -742,7 +814,7 @@ mod tests {
         );
         let delegates = take_delegate_decls(&mut lc);
         assert_eq!(delegates.len(), 1);
-        let source = synthesized_source(&lc.name, &lc.methods, &delegates);
+        let source = synthesized_source(&lc.name, &lc.methods, &delegates, false);
         assert!(
             source.contains("second.title"),
             "later declaration should win:\n{source}"
