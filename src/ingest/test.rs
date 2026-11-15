@@ -978,7 +978,16 @@ fn ingest_setup_hoisting(
                             let mut exprs = Vec::new();
                             for inner in flatten_statements(body_node) {
                                 match inner.as_class_node() {
-                                    Some(class) if static_class_body(&class) => sink.push(library_class_from_node(&class, file)?),
+                                    // Not a second definition of a class one already holds: run in order, the two
+                                    // would redefine its methods between them.
+                                    Some(class) if static_class_body(&class) && {
+                                        let lc = library_class_from_node(&class, file)?;
+                                        let fresh = !sink.iter().any(|c| c.name == lc.name);
+                                        if fresh {
+                                            sink.push(lc);
+                                        }
+                                        fresh
+                                    } => {}
                                     _ => exprs.push(ingest_expr(&inner, file)?),
                                 }
                             }

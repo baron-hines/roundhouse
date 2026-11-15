@@ -154,9 +154,10 @@ pub(super) fn collect(
                 methods.push(method);
             } else if let Some(target) = statement.as_call_node().and_then(|call| delegate_missing_target(&call)) {
                 // Rails' `delegate_missing_to :target` (active_support/core_ext/module/delegation.rb): the two
-                // methods it defines, as written there.
+                // methods it defines. The target read through `self`, not bare: a target named `block` or `args`
+                // would read the method's own parameter.
                 let source = format!(
-                    "class {id}\n  def respond_to_missing?(name, include_private = false)\n    {target}.respond_to?(name, include_private) || super\n  end\n\n  def method_missing(method, *args, &block)\n    if {target}.respond_to?(method)\n      {target}.public_send(method, *args, &block)\n    else\n      super\n    end\n  end\nend\n",
+                    "class {id}\n  def respond_to_missing?(name, include_private = false)\n    self.{target}.respond_to?(name, include_private) || super\n  end\n\n  def method_missing(method, *args, &block)\n    if self.{target}.respond_to?(method)\n      self.{target}.public_send(method, *args, &block)\n    else\n      super\n    end\n  end\nend\n",
                     id = id.0.as_str(),
                 );
                 let classes = super::library_class::ingest_library_classes(source.as_bytes(), file)?;
