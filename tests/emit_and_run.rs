@@ -22279,3 +22279,6 @@ mod errors_delete_type;
 
 #[path = "emit_and_run/errors_copy.rs"]
 mod errors_copy;
+
+#[path = "emit_and_run/errors_computed_field.rs"]
+mod errors_computed_field;

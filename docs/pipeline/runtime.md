@@ -2403,7 +2403,18 @@ keeps `count:`, `format`, `inclusion` and `numericality` keep
 picks the details on that attribute and answers their messages, so the
 read is exact under any `errors.format`, and `:base` is an attribute
 like any other. The form builder's `field_with_errors` wrapper asks the
-same question with `any?`.
+same question with `any?`. A field known only at run time — a block
+parameter, a method's parameter, a local — reads the same when its type
+is a Symbol or a String: `errors[field]` and `errors.messages_for(field)`
+are `error_messages_for(...)` and `errors.full_messages_for(field)` is
+`error_full_messages_for(...)`, a Symbol field turned into the String
+the reader takes (a String is passed as it is). Such a field, and a
+String literal, are read so only on a model's errors: an app's own
+`errors` (a Hash keyed by String, say) answers `[]` itself. A field of
+any other type, an untyped local say, is not grounded, because nothing
+proves which String it would read: `messages_for` and
+`full_messages_for` report an error, and `errors[field]` stays a dynamic
+`[]` with its residue warning.
 
 `errors.to_hash` groups the same details by attribute:
 `ActiveSupport.errors_to_hash(error_details)`, in the order of each
