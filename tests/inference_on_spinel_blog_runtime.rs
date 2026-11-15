@@ -615,7 +615,11 @@ fn untyped_subexpressions_baseline() {
     // Symbol it normalizes to instead of the name as given, which types
     // both (-1). The names are vars on this RBS-less probe;
     // connection.rbs types them for the RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1352;
+    // MEASURED 1353 on aasm (1352): `attribute_names` in active_record/connection.rb
+    // leaves out the row's unloaded columns, reading each column `name` in its
+    // block, a var on this RBS-less probe (+1); connection.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1353;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
