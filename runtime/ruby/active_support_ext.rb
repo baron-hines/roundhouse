@@ -370,12 +370,20 @@ module ActiveSupport
   end
 
   # Not a `reject!` on each: `errors` holds each detail's full message index for index, so both lose the same entries.
-  def self.errors_delete(errors, details, attribute)
+  # A nil `type_kind` is Rails' `delete(attribute)`, every error on it; otherwise only the entries
+  # whose type is that one — a Symbol type (type_symbolic true), or the message a String type was
+  # added with, which is what Rails' `Error#type` answers for it.
+  def self.errors_delete(errors, details, attribute, type_symbolic, type_kind)
     deleted = []
     i = details.length - 1
     while i >= 0
-      if details[i].attribute == attribute
-        deleted.unshift(details[i].message)
+      detail = details[i]
+      matched = detail.attribute == attribute
+      if matched && !type_kind.nil?
+        matched = detail.symbolic == type_symbolic && detail.kind == type_kind
+      end
+      if matched
+        deleted.unshift(detail.message)
         details.delete_at(i)
         errors.delete_at(i)
       end

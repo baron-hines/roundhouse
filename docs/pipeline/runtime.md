@@ -2446,9 +2446,13 @@ error on that field with that Symbol type, and with a String type asks
 the field's messages, as Rails does. `errors.where(:field, :type)` is
 the `error_details` on that field, of that type when one is given, so
 what it answers reads like an iteration's. `errors.delete(:field)` is
-`ActiveSupport.errors_delete(errors, error_details, "field")`, which
-drops the field's entries from both, index for index, and answers their
-messages or nil; like `to_hash`, it is a gap on a strict target. Without a block, `any?`, `none?` and `count` keep
+`ActiveSupport.errors_delete(errors, error_details, "field", false,
+nil)`, which drops the field's entries from both, index for index, and
+answers their messages or nil; given a type, `errors.delete(:field,
+:type)`, it drops only the entries of that type — a Symbol, or the
+String a message was added with, which Rails' `Error#type` answers for
+such an error — and answers their messages, or nil when none matched.
+Like `to_hash`, it is a gap on a strict target. Without a block, `any?`, `none?` and `count` keep
 asking the full messages, which answer the same.
 
 `errors.details` is `ActiveSupport.errors_details(error_details)`, the
@@ -2496,8 +2500,9 @@ compile in Rust or Go. The class sits in `active_record/base.rb` so
 `Base`'s own bodies type against it.
 
 **What it costs.** A message pushed by anything other than those two
-lowerings has no detail beside it. `errors.delete` with a type is not
-modeled, nor are the option values `details` would answer; an
+lowerings has no detail beside it. `errors.delete` with options
+(`delete(:field, :type, count: 2)`) is not modeled, nor are the option
+values `details` would answer; an
 `errors <<` written by hand pushes a message no field claims. A dotted
 attribute (`comments.body`) is named by humanizing it, where Rails
 looks under the association's namespace first. `errors.add` reads its record twice

@@ -333,19 +333,22 @@ pub(crate) fn literal_field(args: &[Expr]) -> Option<String> {
 }
 
 /// `errors.delete(:field)` → `ActiveSupport.errors_delete(<owner>.errors, <owner>.error_details, "field")`.
+/// `errors.delete(:field)` → `ActiveSupport.errors_delete(<owner>.errors, <owner>.error_details, "field", false, nil)`,
+/// and `errors.delete(:field, type)` the same with the type: Rails removes only the field's errors
+/// of that type (a Symbol, or the String a message was added with) and answers their messages.
 fn rewrite_delete(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let ExprNode::Send { recv: Some(reader), method, args, block: None, .. } = &*expr.node else { return };
     if method.as_str() != "delete" || !is_model_errors_read(reader) {
         return;
     }
     let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!("an errors reader") };
-    let (Some(field), true) = (literal_field(args), super::errors_add::owner_reads_once(owner.as_ref())) else {
+    let (Some((field, kind)), true) = (where_args(args), super::errors_add::owner_reads_once(owner.as_ref())) else {
         let mut d = crate::lower::residue_diagnostic(
             "errors_index",
             "errors.delete",
             expr.span,
             "not a literal field on a plain read",
-            "`errors.delete` is grounded only with a literal field, no type, on a record read without effect".to_string(),
+            "`errors.delete` is grounded only with a literal field, an optional literal type and no options, on a record read without effect".to_string(),
         );
         d.severity = crate::diagnostic::Severity::Error;
         diags.push(d);
@@ -358,6 +361,9 @@ fn rewrite_delete(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     errors.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
     args.insert(0, errors);
     args.push(str_expr(span, &field));
+    let (symbolic, kind) = kind.unzip();
+    args.push(bool_lit(span, symbolic.unwrap_or(false)));
+    args.push(kind.as_deref().map_or_else(|| nil_lit(span), |kind| str_expr(span, kind)));
     *expr = call;
 }
 
@@ -508,6 +514,18 @@ fn rewrite_where(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
 
 pub(crate) fn error_array_ty() -> Ty {
     Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: crate::ident::ClassId(Symbol::from("ActiveModel::Error")), args: vec![].into() }) }
+}
+
+fn bool_lit(span: crate::span::Span, value: bool) -> Expr {
+    let mut e = Expr::new(span, ExprNode::Lit { value: Literal::Bool { value } });
+    e.ty = Some(Ty::Bool);
+    e
+}
+
+fn nil_lit(span: crate::span::Span) -> Expr {
+    let mut e = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    e.ty = Some(Ty::Nil);
+    e
 }
 
 fn str_expr(span: crate::span::Span, value: &str) -> Expr {

@@ -3443,7 +3443,7 @@ impl<'a> BodyTyper<'a> {
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                     && block.is_none()
-                    && crate::lower::errors_index::literal_field(args).is_some()
+                    && crate::lower::errors_index::where_args(args).is_some()
                 {
                     return Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Nil].into() };
                 }
