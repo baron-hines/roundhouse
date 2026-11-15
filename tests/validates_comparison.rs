@@ -1,6 +1,6 @@
 //! `validates :attr, comparison: { … }` (Rails' `ComparisonValidator`, activemodel 8.1): each option's bound is read
-//! on the record as it validates (a lambda's body run on it, maybe's `greater_than: -> { min_supported_date }`; a
-//! Symbol's method; a literal), a nil or blank value is "can't be blank", and the message's `%{count}` is the bound
+//! as it validates (a lambda of no parameters run on the class it was written in, maybe's `greater_than: -> {
+//! min_supported_date }`, a class method; a Symbol the record's method; a literal), checked in Rails' option order, a nil or blank value is "can't be blank", and the message's `%{count}` is the bound
 //! (`must be greater than 2020-01-01`); the last of a repeated option is checked, and an `ArgumentError` a check raises
 //! is its error (`comparison of Integer with nil failed`). Ingest refused the validator ("comparison").
 
@@ -20,7 +20,8 @@ const MODEL: &str = r#"class Article < ApplicationRecord
     nil
   end
 
-  def min_date
+  # A lambda of no parameters runs on the class (Rails' `resolve_value` calls it as it is): a class method.
+  def self.min_date
     Date.new(2020, 1, 1)
   end
 

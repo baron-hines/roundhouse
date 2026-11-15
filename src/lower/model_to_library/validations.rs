@@ -1525,10 +1525,15 @@ fn inline_comparison_check(msgs: Messages, attr: &Symbol, checks: &[(Symbol, Exp
         let count = send(var(&name), "to_s", vec![]);
         fill_count(&mut msg.full, COUNT, &count);
         fill_count(&mut msg.bare, COUNT, &count);
-        let check = Expr::new(
-            Span::synthetic(),
-            ExprNode::Seq { exprs: vec![assign(&name, bound.clone()), if_with_nil_else(fails, errors_push(attr.as_str(), msg))] },
-        );
+        let compare = if_with_nil_else(fails, errors_push(attr.as_str(), msg));
+        // Rails resolves the first bound before it asks whether the value is blank, and a blank value ends the
+        // checks there with `:blank` (`validate_each` returns), so only the first check asks.
+        let decided = if i == 0 {
+            Expr::new(Span::synthetic(), ExprNode::If { cond: blank.clone(), then_branch: blank_err.clone(), else_branch: compare })
+        } else {
+            compare
+        };
+        let check = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign(&name, bound.clone()), decided] });
         // Rails rescues an ArgumentError of each check (`5 > nil`) into an error of its message, and goes on.
         let mut raised = msgs.error(attr.as_str(), option.as_str(), &ErrorOpts { message: Some(RAISED.to_string()), ..Default::default() });
         let message = send(var("__comparison_error"), "message", vec![]);
@@ -1550,18 +1555,18 @@ fn inline_comparison_check(msgs: Messages, attr: &Symbol, checks: &[(Symbol, Exp
             },
         ));
     }
-    Expr::new(
-        Span::synthetic(),
-        ExprNode::Seq {
-            exprs: vec![
-                assign("__comparison_value", reader),
-                Expr::new(
-                    Span::synthetic(),
-                    ExprNode::If { cond: blank, then_branch: blank_err, else_branch: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: stmts }) },
-                ),
-            ],
-        },
-    )
+    let mut exprs = vec![assign("__comparison_value", reader)];
+    let mut rest = stmts.into_iter();
+    exprs.extend(rest.next());
+    let later: Vec<Expr> = rest.collect();
+    if !later.is_empty() {
+        let not_blank = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(blank), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        );
+        exprs.push(if_with_nil_else(not_blank, Expr::new(Span::synthetic(), ExprNode::Seq { exprs: later })));
+    }
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
 }
 
 /// A message built with `marker` for its `%{count}`, the marker read as `count` where it stands.

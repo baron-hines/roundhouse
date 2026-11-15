@@ -1480,11 +1480,14 @@ fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
         let child = assoc.value();
         match key.as_str() {
             "greater_than" | "greater_than_or_equal_to" | "equal_to" | "less_than" | "less_than_or_equal_to" | "other_than" => {
-                let bound = match inclusion_call(&child, file) {
-                    Some(InclusionSpec::Call(bound)) => Some(bound),
-                    _ => super::super::expr::ingest_expr(&child, file)
-                        .ok()
-                        .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
+                let bound = match class_side_lambda_body(&child, file) {
+                    Some(body) => Some(body),
+                    None => match inclusion_call(&child, file) {
+                        Some(InclusionSpec::Call(bound)) => Some(bound),
+                        _ => super::super::expr::ingest_expr(&child, file)
+                            .ok()
+                            .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
+                    },
                 };
                 // A repeated option is the last one written, as a Ruby Hash keeps it.
                 match bound {
@@ -1525,8 +1528,46 @@ fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
     if !gaps.is_empty() {
         return built.gap(gaps);
     }
+    // Rails checks in its own order (`options.slice(*COMPARE_CHECKS.keys)`), not the order written.
+    const ORDER: [&str; 6] = ["greater_than", "greater_than_or_equal_to", "equal_to", "less_than", "less_than_or_equal_to", "other_than"];
+    checks.sort_by_key(|(option, _)| ORDER.iter().position(|o| *o == option.as_str()));
     built.rule = ValidationRule::Comparison { checks };
     RuleParse::Rule(built)
+}
+
+/// Rails' `resolve_value`: a lambda of no parameters is called as it is, so its body runs on the class it was written
+/// in (maybe's `-> { min_supported_date }`, a class method). Read from the record that validates: what the body calls
+/// without a receiver, and `self`, are `self.class`.
+fn class_side_lambda_body(node: &Node<'_>, file: &str) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode};
+    fn to_class(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| to_class(c));
+        let class_of_self = |span| {
+            Expr::new(span, ExprNode::Send { recv: Some(Expr::new(span, ExprNode::SelfRef)), method: Symbol::from("class"), args: vec![], block: None, parenthesized: false })
+        };
+        match &mut *e.node {
+            ExprNode::SelfRef => *e = class_of_self(e.span),
+            ExprNode::Send { recv: recv @ None, .. } => *recv = Some(class_of_self(e.span)),
+            _ => {}
+        }
+    }
+    let expr = super::super::expr::ingest_expr(node, file).ok()?;
+    let lambda = match &*expr.node {
+        ExprNode::Lambda { .. } => expr,
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "lambda" | "proc") && matches!(&*block.node, ExprNode::Lambda { .. }) =>
+        {
+            block.clone()
+        }
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !params.is_empty() || !extra_params.is_empty() || numbered_parameters(node).is_some_and(|n| n > 0) {
+        return None;
+    }
+    let mut body = body.clone();
+    to_class(&mut body);
+    Some(body)
 }
 
 fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts) -> RuleParse {

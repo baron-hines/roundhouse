@@ -6791,7 +6791,9 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
                 };
                 other_method == method && stored_options_init(other_expr, macro_def).is_none() && !args.is_empty()
             });
-            if let Some(init) = stored_rest_init(expr, macro_def) {
+            // Not over a controller's own method of the name, which Ruby calls instead of the concern's.
+            let overridden = controller.body.iter().any(|i| matches!(i, ControllerBodyItem::ClassMethod { method: m, .. } if m.name == macro_def.name));
+            if let Some(init) = stored_rest_init(expr, macro_def).filter(|_| !overridden) {
                 // The setter is its reader too (`self.class.permitted_accountable_attributes`), which the controller
                 // answers as Rails' extend does; the class-method splice leaves a controller that called it alone.
                 if !expanded.iter().chain(controller.body.iter()).any(|i| matches!(i, ControllerBodyItem::ClassMethod { method: m, .. } if m.name == macro_def.name)) {
@@ -7148,7 +7150,7 @@ fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef
     let reads_rest = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name == &param.name);
     let store = match &*first.node {
         ExprNode::If { cond, then_branch, else_branch }
-            if matches!(&*cond.node, ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "any?" && args.is_empty() && reads_rest(r))
+            if matches!(&*cond.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "any?" && args.is_empty() && reads_rest(r))
                 && matches!(&*else_branch.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) =>
         {
             then_branch
@@ -7163,7 +7165,7 @@ fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef
     let only_its_reader = match rest {
         [] => true,
         [read] => match &*read.node {
-            ExprNode::OpAssign { target: LValue::Ivar { name: n }, .. } => n == name,
+            ExprNode::OpAssign { target: LValue::Ivar { name: n }, op: crate::expr::OpAssignOp::OrOr, .. } => n == name,
             _ => reads_slot(read),
         },
         _ => false,
@@ -7172,7 +7174,13 @@ fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef
         return None;
     }
     let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };
-    if args.is_empty() || !args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { .. } | ExprNode::Hash { .. } | ExprNode::Array { .. })) {
+    // A literal that is truthy: `attrs.any?` is false for a list of nil and false, which keeps the reader's default.
+    if args.is_empty()
+        || !args.iter().all(|a| {
+            matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Array { .. })
+                || matches!(&*a.node, ExprNode::Lit { value } if !matches!(value, crate::expr::Literal::Nil | crate::expr::Literal::Bool { value: false }))
+        })
+    {
         return None;
     }
     let list = Expr::new(expr.span, ExprNode::Array { elements: args.clone(), style: Default::default() });
@@ -7707,7 +7715,15 @@ fn filter_from_send(
                 // A guard Rails runs on the controller instance, as a hand-written filter's: a Symbol names the
                 // predicate, a parameterless lambda's body is it. Any other value is refused: dropping a guard
                 // changes when a filter fires.
-                Some(which @ ("if" | "unless")) if !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) => {
+                // The last of a repeated key is the one Ruby keeps: a final nil is no guard.
+                Some(which @ ("if" | "unless")) if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) => {
+                    if which == "if" {
+                        (if_cond, if_cond_expr) = (None, None);
+                    } else {
+                        (unless_cond, unless_cond_expr) = (None, None);
+                    }
+                }
+                Some(which @ ("if" | "unless")) => {
                     let (sym, body) = match &*value.node {
                         ExprNode::Lit { value: Literal::Sym { value } } => (Some(value.clone()), None),
                         ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
