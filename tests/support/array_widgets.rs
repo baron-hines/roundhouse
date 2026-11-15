@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use crate::emit_and_run;
+use super::emit_and_run;
 
 pub const SCHEMA: &str = "ActiveRecord::Schema[8.1].define(version: 1) do
   create_table \"widgets\", force: :cascade do |t|
