@@ -78,6 +78,8 @@ struct Names {
     top_level: std::rc::Rc<crate::det::HashSet<String>>,
     /// Every segment (`EnumConstants::defines_name`).
     segments: crate::det::HashSet<String>,
+    /// Each segment below the first, by the segment before it.
+    by_owner: crate::det::HashMap<String, crate::det::HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -86,6 +88,12 @@ pub(in crate::ingest) struct EnumConstants {
     /// [`Names`] of `values`' keys, with how many keys that was: names are
     /// only ever added, so the count says whether it is still current.
     names: std::cell::RefCell<Option<(usize, std::rc::Rc<Names>)>>,
+    /// By last segment, each class's superclass and each owner's
+    /// `include`/`extend`/`prepend` arguments (`Object`'s at a file's top
+    /// level): the edges an ancestor lookup follows.
+    ancestor_edges: crate::det::HashMap<String, Vec<String>>,
+    /// Owners (last segment) that include an argument this pass cannot name.
+    unknown_ancestors: crate::det::HashSet<String>,
     /// Lexical owners at each class/module open, keyed by (file, start).
     /// Concern `included do` resolution reads the same table models use.
     pub(in crate::ingest) nesting: crate::det::HashMap<(String, usize), Vec<String>>,
@@ -149,13 +157,42 @@ impl EnumConstants {
     }
 
     /// Every name the app's recorded sources define BELOW the top level
-    /// (`URI` for `Admin::URI` or `ApplicationRecord::URI`). An unrooted
-    /// path starting with one of these could resolve to the app's own
-    /// constant through a lexical owner or an ancestor (superclass or
-    /// included module), so callers that fold a well-known top-level
-    /// constant treat it as possibly shadowed.
+    /// (`URI` for `Admin::URI` or `ApplicationRecord::URI`).
     pub(in crate::ingest) fn nested_names(&self) -> std::rc::Rc<crate::det::HashSet<String>> {
         self.names().nested.clone()
+    }
+
+    /// The names the recorded sources define directly in one of `class`'s
+    /// possible ancestors (`URI` for `ApplicationRecord::URI` when `class`
+    /// inherits `ApplicationRecord`, not for `Addressable::URI` unless an
+    /// ancestor includes `Addressable`). An unrooted path starting with one
+    /// of these could resolve to the app's own constant, so callers that
+    /// fold a well-known top-level constant treat it as possibly shadowed.
+    /// Owners are matched by last segment, so a same-named owner elsewhere
+    /// counts too; an ancestor that includes what this pass cannot name
+    /// gives every nested name. A lexical owner is the caller's to rule out.
+    pub(in crate::ingest) fn ancestor_names(&self, class: &str) -> std::rc::Rc<crate::det::HashSet<String>> {
+        let names = self.names();
+        let last = |name: &str| name.rsplit("::").next().unwrap_or(name).to_string();
+        // Object, Kernel and BasicObject are every class's ancestors without being named as one.
+        let mut pending: Vec<String> = vec![last(class), "Object".into(), "Kernel".into(), "BasicObject".into()];
+        let mut seen = crate::det::HashSet::default();
+        let mut found = crate::det::HashSet::default();
+        while let Some(owner) = pending.pop() {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            if self.unknown_ancestors.contains(&owner) {
+                return names.nested.clone();
+            }
+            if let Some(defined) = names.by_owner.get(&owner) {
+                found.extend(defined.iter().cloned());
+            }
+            if let Some(targets) = self.ancestor_edges.get(&owner) {
+                pending.extend(targets.iter().cloned());
+            }
+        }
+        std::rc::Rc::new(found)
     }
 
     /// The first segment of every name the app's recorded sources define
@@ -179,18 +216,18 @@ impl EnumConstants {
         let mut nested = crate::det::HashSet::default();
         let mut top_level = crate::det::HashSet::default();
         let mut segments = crate::det::HashSet::default();
+        let mut by_owner: crate::det::HashMap<String, crate::det::HashSet<String>> = Default::default();
         for key in self.values.keys() {
-            let mut parts = key.split("::");
-            if let Some(first) = parts.next() {
-                top_level.insert(first.to_string());
-                segments.insert(first.to_string());
-            }
-            for part in parts {
-                nested.insert(part.to_string());
-                segments.insert(part.to_string());
+            let parts: Vec<&str> = key.split("::").collect();
+            top_level.insert(parts[0].to_string());
+            segments.insert(parts[0].to_string());
+            for pair in parts.windows(2) {
+                nested.insert(pair[1].to_string());
+                segments.insert(pair[1].to_string());
+                by_owner.entry(pair[0].to_string()).or_default().insert(pair[1].to_string());
             }
         }
-        let names = std::rc::Rc::new(Names { nested: nested.into(), top_level: top_level.into(), segments });
+        let names = std::rc::Rc::new(Names { nested: nested.into(), top_level: top_level.into(), segments, by_owner });
         *self.names.borrow_mut() = Some((self.values.len(), names.clone()));
         names
     }
@@ -447,6 +484,20 @@ mod names_tests {
             record(&mut constants, &["Billing::Regexp"]);
         }
         assert!(constants.defines_name("Regexp"));
+    }
+
+    #[test]
+    fn a_name_is_an_ancestors_only_under_an_owner_the_class_inherits_or_includes() {
+        let mut constants = EnumConstants::default();
+        record(&mut constants, &["Addressable::URI", "ROTP::OTP::URI", "Kernel::Shade", "Concern::Inner"]);
+        constants.ancestor_edges.insert("TOTP".into(), vec!["OTP".into()]);
+        constants.ancestor_edges.insert("User".into(), vec!["ApplicationRecord".into(), "Concern".into()]);
+        let user = constants.ancestor_names("User");
+        assert!(!user.contains("URI"));
+        assert!(user.contains("Shade") && user.contains("Inner"));
+        assert!(constants.ancestor_names("ROTP::TOTP").contains("URI"));
+        constants.unknown_ancestors.insert("Concern".into());
+        assert!(constants.ancestor_names("User").contains("URI"));
     }
 
     #[test]

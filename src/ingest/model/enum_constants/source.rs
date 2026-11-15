@@ -262,6 +262,7 @@ impl EnumConstants {
                 // and leaves. Push/pop below is solely the traversal contract.
                 self.record_reference(&node);
                 self.record_singleton(&node);
+                self.constants.record_ancestor_target(&node, &self.parents, &self.nesting);
                 let direct = matches!(self.kind, SourceKind::Inputs)
                     && self.parents.iter().all(|parent| {
                         matches!(
@@ -495,6 +496,49 @@ impl EnumConstants {
         }
     }
 
+    fn record_ancestor_target(&mut self, node: &Node<'_>, parents: &[Node<'_>], nesting: &[String]) {
+        let last = |name: &str| name.rsplit("::").next().unwrap_or(name).to_string();
+        if let Some(class) = node.as_class_node() {
+            // `class C < Struct.new(:a)` inherits an anonymous class, whose constants no name can define.
+            if let (Some(own), Some(base)) =
+                (Self::path(&class.constant_path()), class.superclass().and_then(|base| Self::path(&base)))
+            {
+                self.ancestor_edges.entry(last(&own)).or_default().push(last(&base));
+            }
+            return;
+        }
+        let Some(call) = node.as_call_node() else { return };
+        if call.receiver().is_some_and(|r| r.as_self_node().is_none() && Self::path(&r).is_none()) {
+            return;
+        }
+        let method = constant_id_str(&call.name());
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let targets = match method.as_ref() {
+            "include" | "extend" | "prepend" => &args[..],
+            "send" | "public_send" | "__send__"
+                if args.first().and_then(|a| a.as_symbol_node()).is_some_and(|s| {
+                    matches!(&*String::from_utf8_lossy(s.unescaped()), "include" | "extend" | "prepend")
+                }) =>
+            {
+                &args[1..]
+            }
+            _ => return,
+        };
+        let owner = match call.receiver().and_then(|r| Self::path(&r)) {
+            Some(receiver) => last(&receiver),
+            None => nesting.last().map(|n| last(n)).unwrap_or_else(|| "Object".to_string()),
+        };
+        // `extend self` names the module being declared, whose own definition already counts.
+        for target in targets.iter().filter(|t| t.as_self_node().is_none() && !anonymous_module(t, parents)) {
+            match Self::path(target) {
+                Some(path) => self.ancestor_edges.entry(owner.clone()).or_default().push(last(&path)),
+                None => {
+                    self.unknown_ancestors.insert(owner.clone());
+                }
+            }
+        }
+    }
+
     fn record_write(&mut self, node: &Node<'_>, nesting: &[String], direct: bool) {
         let owner = nesting.last().map(String::as_str).unwrap_or("");
         let override_receiver = node
@@ -648,4 +692,32 @@ impl EnumConstants {
         path.push_str(constant_id_str(&name));
         Some(path)
     }
+}
+
+/// An `include` argument that is a module no constant names: Rails' route helper modules
+/// (`Rails.application.routes.url_helpers`, built with `Module.new`), or a local the enclosing
+/// statements assign only `Module.new` (ViewComponent's `generated_slot_methods`).
+fn anonymous_module(target: &Node<'_>, parents: &[Node<'_>]) -> bool {
+    fn module_new(node: &Node<'_>) -> bool {
+        node.as_call_node().is_some_and(|call| {
+            constant_id_str(&call.name()) == "new"
+                && call.receiver().and_then(|r| EnumConstants::path(&r)).is_some_and(|r| r == "Module" || r == "::Module")
+        })
+    }
+    if let Some(call) = target.as_call_node() {
+        let method = constant_id_str(&call.name());
+        return matches!(method.as_ref(), "url_helpers" | "mounted_helpers")
+            && call.arguments().is_none()
+            && call.receiver().and_then(|r| r.as_call_node()).is_some_and(|r| constant_id_str(&r.name()) == "routes");
+    }
+    let Some(local) = target.as_local_variable_read_node() else { return false };
+    let Some(statements) = parents.iter().rev().find_map(|p| p.as_statements_node()) else { return false };
+    let writes: Vec<bool> = statements
+        .body()
+        .iter()
+        .filter_map(|st| st.as_local_variable_write_node())
+        .filter(|w| w.name().as_slice() == local.name().as_slice())
+        .map(|w| module_new(&w.value()))
+        .collect();
+    !writes.is_empty() && writes.iter().all(|&m| m)
 }
