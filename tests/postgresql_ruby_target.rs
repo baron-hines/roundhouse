@@ -370,6 +370,13 @@ fn a_native_generated_column_survives_a_migration_and_an_unheld_precision_is_ref
     let articles = &schema.tables[&roundhouse::Symbol::from("articles")];
     assert!(articles.columns.iter().any(|c| c.name.as_str() == "note"));
     assert!(articles.columns.iter().find(|c| c.name.as_str() == "doubled").and_then(|c| c.generated.as_ref()).is_some_and(|g| g.native));
+    let add = "class AddTripled < ActiveRecord::Migration[8.1]\n  def change\n    add_column :articles, :tripled, :decimal, precision: 10, scale: 2, as: \"(price * (3)::numeric)\", stored: true\n  end\nend\n";
+    roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(add.as_bytes(), "db/migrate/20260102000000_add_tripled.rb", &mut schema, OtherDatabase)).0.unwrap();
+    let articles = &schema.tables[&roundhouse::Symbol::from("articles")];
+    assert!(articles.columns.iter().find(|c| c.name.as_str() == "tripled").and_then(|c| c.generated.as_ref()).is_some_and(|g| g.native));
+    // Native SQL still keeps Roundhouse's own name rules.
+    let reserved = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.virtual \"updated_at\", type: :decimal, as: \"(1)::numeric\", stored: true\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
+    assert!(reserved.is_err_and(|e| e.to_string().contains("updated_at")));
     let wide = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.decimal \"price\", precision: 300, scale: 2\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
     assert!(wide.is_err_and(|e| e.to_string().contains("precision 300")));
 }

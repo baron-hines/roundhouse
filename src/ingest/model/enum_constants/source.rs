@@ -499,19 +499,19 @@ impl EnumConstants {
     fn record_ancestor_target(&mut self, node: &Node<'_>, parents: &[Node<'_>], nesting: &[String]) {
         // Each lexical scope's spelling of `path`, innermost first: the one an owner of that name answers is Ruby's.
         let candidates = |path: &str| -> Vec<String> {
-            match path.strip_prefix("::") {
-                Some(rooted) => vec![rooted.to_string()],
-                None => nesting.iter().rev().map(|n| format!("{n}::{path}")).chain(std::iter::once(path.to_string())).collect(),
+            if path.starts_with("::") {
+                return vec![path.to_string()];
             }
+            nesting.iter().rev().map(|n| format!("{n}::{path}")).chain(std::iter::once(path.to_string())).collect()
         };
-        let owner_here = || nesting.last().cloned().unwrap_or_else(|| "Object".to_string());
+        let owner_here = || vec![format!("::{}", nesting.last().map(String::as_str).unwrap_or("Object"))];
         if let Some(class) = node.as_class_node() {
             // `class C < Struct.new(:a)` inherits an anonymous class, whose constants no name can define.
             if let (Some(own), Some(base)) =
                 (Self::path(&class.constant_path()), class.superclass().and_then(|base| Self::path(&base)))
             {
                 let own = Self::qualify(nesting.last().map(String::as_str).unwrap_or(""), &own);
-                self.ancestor_edges.entry(own).or_default().push(candidates(&base));
+                self.ancestor_edges.push((vec![format!("::{own}")], candidates(&base)));
             }
             return;
         }
@@ -536,21 +536,28 @@ impl EnumConstants {
             }
             _ => return,
         };
-        let owner = match call.receiver().filter(|r| r.as_local_variable_read_node().is_none()).and_then(|r| Self::path(&r)) {
-            Some(receiver) => {
-                let spellings = candidates(&receiver);
-                spellings.iter().find(|c| self.values.contains_key(*c)).cloned().unwrap_or_else(|| spellings.last().cloned().unwrap_or(receiver))
-            }
+        let receiver = call.receiver().filter(|r| r.as_local_variable_read_node().is_none()).and_then(|r| Self::path(&r));
+        let named_receiver = receiver.is_some();
+        let owner = match receiver {
+            Some(receiver) => candidates(&receiver),
             None => owner_here(),
         };
-        // `extend self` names the module being declared, whose own definition already counts.
-        for target in targets.iter().filter(|t| t.as_self_node().is_none() && !anonymous_module(t, parents)) {
-            match Self::path(target) {
-                Some(path) => self.ancestor_edges.entry(owner.clone()).or_default().push(candidates(&path)),
-                None => {
-                    self.unknown_ancestors.insert(owner.clone());
+        for target in targets.iter().filter(|t| !anonymous_module(t, parents)) {
+            let spellings = match Self::path(target) {
+                Some(path) => candidates(&path),
+                // `Base.include self` gives the module being declared to another owner; `extend self` gives it to itself.
+                None if target.as_self_node().is_some() => {
+                    if !named_receiver {
+                        continue;
+                    }
+                    owner_here()
                 }
-            }
+                None => {
+                    self.unknown_ancestors.push(owner.clone());
+                    continue;
+                }
+            };
+            self.ancestor_edges.push((owner.clone(), spellings));
         }
     }
 
@@ -736,6 +743,30 @@ fn anonymous_module(target: &Node<'_>, parents: &[Node<'_>]) -> bool {
                 self.found.push(module_new(&node.value()));
             }
             ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        // Not only `m = …`: a destructuring or compound write may give it any module.
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
         }
     }
     // The whole enclosing method, not the nearest statements: the write may sit in a branch (`unless …; m = Module.new`).

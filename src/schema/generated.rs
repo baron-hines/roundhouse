@@ -87,17 +87,6 @@ pub(crate) fn validate_column_with_dialect(
     let Some(generated) = &column.generated else {
         return Ok(());
     };
-    if generated.native {
-        return match dialect {
-            // OtherDatabase is the grammar that kept it: a migration revalidating the table reads it again.
-            GeneratedExpressionDialect::Postgres | GeneratedExpressionDialect::OtherDatabase => Ok(()),
-            _ => Err(format!(
-                "`{}` is the app's own database's SQL, which only a tree running on that database carries",
-                generated.expression.trim()
-            )),
-        };
-    }
-
     if column.primary_key {
         return Err("generated columns cannot be primary keys".into());
     }
@@ -112,6 +101,16 @@ pub(crate) fn validate_column_with_dialect(
     }
     if column.default.is_some() || column.default_expression.is_some() {
         return Err("generated columns cannot also have a default".into());
+    }
+    if generated.native {
+        return match dialect {
+            // OtherDatabase is the grammar that kept it: a migration revalidating the table reads it again.
+            GeneratedExpressionDialect::Postgres | GeneratedExpressionDialect::OtherDatabase => Ok(()),
+            _ => Err(format!(
+                "`{}` is the app's own database's SQL, which only a tree running on that database carries",
+                generated.expression.trim()
+            )),
+        };
     }
     let text_result = is_text_type(&column.col_type);
     let int4_result = matches!(&column.col_type, ColumnType::Integer);

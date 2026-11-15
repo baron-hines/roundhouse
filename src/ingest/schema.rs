@@ -863,7 +863,7 @@ fn fold_column(
     }
     let generated_option = has_generated_column_options(option_args);
     let generated = ty == "virtual" || generated_option;
-    let col = if generated {
+    let mut col = if generated {
         if verb == "change_column" {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -933,6 +933,10 @@ fn fold_column(
         let mut candidate = table.clone();
         candidate.columns.retain(|existing| existing.name != col.name);
         candidate.columns.push(col.clone());
+        promote_native_generated(&mut candidate, dialect);
+        if let Some(promoted) = candidate.columns.last() {
+            col = promoted.clone();
+        }
         if table.columns.iter().any(|column| column.generated.is_some()) || col.generated.is_some() {
             validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
         }
@@ -1315,6 +1319,31 @@ fn refuse_indexed_generated_column_mutation(
 /// Keep migration-derived schema state unchanged when a candidate
 /// mutation breaks a generated expression or another generated-table
 /// invariant. Expressions remain source SQL; renames never rewrite them.
+/// Under [`GeneratedExpressionDialect::OtherDatabase`], a generated
+/// expression the shared grammar can't read is the app's database's own SQL:
+/// it is kept as written, marked native, when nothing else about the column
+/// is refused.
+fn promote_native_generated(table: &mut Table, dialect: GeneratedExpressionDialect) {
+    if dialect != GeneratedExpressionDialect::OtherDatabase {
+        return;
+    }
+    for at in 0..table.columns.len() {
+        let column = &table.columns[at];
+        if column.generated.as_ref().is_none_or(|g| g.native)
+            || crate::schema::generated::validate_column_with_dialect(table, column, dialect).is_ok()
+        {
+            continue;
+        }
+        let mut native = column.clone();
+        if let Some(generated) = native.generated.as_mut() {
+            generated.native = true;
+        }
+        if crate::schema::generated::validate_column_with_dialect(table, &native, dialect).is_ok() {
+            table.columns[at] = native;
+        }
+    }
+}
+
 fn validate_generated_migration_candidate(
     table: &Table,
     verb: &str,
@@ -2223,14 +2252,8 @@ fn table_from_create_table(
     if table.primary_key_columns.iter().any(|k| !table.columns.iter().any(|c| &c.name == k)) {
         gaps.push(IngestError::Unsupported { file: file.into(), message: format!("primary key on {table_name} names a column the schema does not model") });
     }
-    let mut invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
-    if dialect == GeneratedExpressionDialect::OtherDatabase {
-        invalid_generated.retain(|(name, _)| {
-            let Some(generated) = table.columns.iter_mut().find(|c| c.name.as_str() == name).and_then(|c| c.generated.as_mut()) else { return true };
-            generated.native = true;
-            false
-        });
-    }
+    promote_native_generated(&mut table, dialect);
+    let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
     for (column, reason) in &invalid_generated {
         gaps.push(IngestError::Unsupported {
             file: file.into(),

@@ -663,6 +663,13 @@ fn class_body_statement(
     // hoist them to file scope above the lowered test class.
     if let Some(inner) = stmt.as_class_node() {
         let lc = library_class_from_node(&inner, file)?;
+        // Not a second definition beside a setup's hoisted one: Ruby runs the body before setup, so setup's wins.
+        if acc.inner_classes.iter().any(|c| c.name == lc.name) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("class `{}` is defined twice in the test class", lc.name.0),
+            });
+        }
         acc.inner_classes.push(lc);
         return Ok(true);
     }

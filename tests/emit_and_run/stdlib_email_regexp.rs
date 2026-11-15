@@ -156,6 +156,9 @@ fn a_uri_outside_the_models_ancestry_does_not_shadow() {
             .write("lib/link.rb", "class Link\n  include Shortener\nend\n")
             .write("app/models/concerns/linked.rb", "module Linked\n  extend ActiveSupport::Concern\n  include Shortener\nend\n")
             .write("app/models/concerns/opaque.rb", "module Opaque\n  extend ActiveSupport::Concern\n  include helper_module\nend\n")
+            .write("app/models/concerns/swapped.rb", "module Swapped\n  extend ActiveSupport::Concern\n  m = Module.new\n  m, _unused = [Shortener, nil]\n  include m\nend\n")
+            .write("app/models/concerns/offered.rb", "module Offered\n  extend ActiveSupport::Concern\nend\n")
+            .write("lib/offer.rb", "module Shortener\n  Offered.include self\nend\n")
             .write("app/models/concerns/wrapped.rb", "module Wrapped\n  extend ActiveSupport::Concern\n  m = Module.new\n  m.include Shortener\n  include m\nend\n")
             .write(
                 "db/schema.rb",
@@ -175,5 +178,9 @@ fn a_uri_outside_the_models_ancestry_does_not_shadow() {
     let warnings = app("  include Opaque\n");
     assert!(gap(&warnings), "{warnings:?}");
     let warnings = app("  include Wrapped\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Swapped\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Offered\n");
     assert!(gap(&warnings), "{warnings:?}");
 }
