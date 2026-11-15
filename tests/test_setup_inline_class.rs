@@ -1,0 +1,36 @@
+//! A class a test's `setup do` block declares (maybe's `class MockProcessor; include PlaidAccount::TypeMappable; end`),
+//! whose body only declares: Ruby defines it in the test class's lexical scope as the block first runs, and each
+//! later run reopens it to the same effect. Ingest refused it ("class/module defined inside a method or block"); it is
+//! now hoisted with the test class's inline classes.
+
+#[path = "support/emit_and_run.rs"]
+#[allow(dead_code)]
+mod emit_and_run;
+
+const CONCERN: &str = "module Shouty\n  def shout(word)\n    word.upcase\n  end\nend\n";
+
+const TEST: &str = r#"require "test_helper"
+
+class ShoutyTest < ActiveSupport::TestCase
+  setup do
+    class Speaker
+      include Shouty
+    end
+
+    @speaker = Speaker.new
+  end
+
+  test "the hoisted class answers its concern's method" do
+    assert_equal "HI", @speaker.shout("hi")
+  end
+end
+"#;
+
+#[test]
+fn a_class_declared_in_setup_runs_on_ruby() {
+    emit_and_run::real_blog()
+        .write("app/models/concerns/shouty.rb", CONCERN)
+        .write("test/models/shouty_test.rb", TEST)
+        .run_test("test/models/shouty_test.rb")
+        .assert_passes();
+}

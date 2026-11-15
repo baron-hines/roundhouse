@@ -7,7 +7,7 @@
 
 use ruby_prism::Node;
 
-use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::VarId;
@@ -635,7 +635,7 @@ fn class_body_statement(
         acc.teardowns.push(body);
         return Ok(true);
     }
-    if let Some(body) = ingest_setup_declaration(&stmt, file)? {
+    if let Some(body) = ingest_setup_hoisting(&stmt, file, Some(&mut acc.inner_classes))? {
         // Multiple setup hooks compose in source order — append
         // by wrapping in a Seq. Rare in practice; first wins
         // when stored as Option, so accumulate.
@@ -938,6 +938,29 @@ fn ingest_setup_declaration(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Expr>> {
+    ingest_setup_hoisting(stmt, file, None)
+}
+
+/// A class whose body only declares (`include`, `extend`, `attr_*`, `def`): one `setup do` may define, since running
+/// it again reopens the same class to the same effect. Ruby puts it in the test class's lexical scope, as the class
+/// body's own inline classes are.
+fn static_class_body(class: &ruby_prism::ClassNode<'_>) -> bool {
+    let Some(body) = class.body() else { return true };
+    flatten_statements(body).iter().all(|stmt| {
+        stmt.as_def_node().is_some()
+            || stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none()
+                    && call.block().is_none()
+                    && matches!(constant_id_str(&call.name()).as_ref(), "include" | "extend" | "attr_reader" | "attr_writer" | "attr_accessor")
+            })
+    })
+}
+
+fn ingest_setup_hoisting(
+    stmt: &Node<'_>,
+    file: &str,
+    mut hoisted: Option<&mut Vec<LibraryClass>>,
+) -> IngestResult<Option<Expr>> {
     // `setup do ... end` form.
     if let Some(call) = stmt.as_call_node() {
         if call.receiver().is_some() {
@@ -949,7 +972,20 @@ fn ingest_setup_declaration(
         if let Some(block_ref) = call.block() {
             if let Some(block) = block_ref.as_block_node() {
                 let body = match block.body() {
-                    Some(body_node) => ingest_expr(&body_node, file)?,
+                    Some(body_node) => match hoisted.as_deref_mut() {
+                        // maybe's `setup do class MockProcessor; include PlaidAccount::TypeMappable; end … end`.
+                        Some(sink) => {
+                            let mut exprs = Vec::new();
+                            for inner in flatten_statements(body_node) {
+                                match inner.as_class_node() {
+                                    Some(class) if static_class_body(&class) => sink.push(library_class_from_node(&class, file)?),
+                                    _ => exprs.push(ingest_expr(&inner, file)?),
+                                }
+                            }
+                            Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+                        }
+                        None => ingest_expr(&body_node, file)?,
+                    },
                     None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 };
                 return Ok(Some(body));
