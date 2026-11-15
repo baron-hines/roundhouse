@@ -159,6 +159,11 @@ pub struct GeneratedColumn {
     /// Source SQL retained from `as:` or `GENERATED ALWAYS AS (...)`.
     pub expression: String,
     pub storage: GeneratedColumnStorage,
+    /// The expression is the app's own database's SQL, outside the grammar
+    /// SQLite and PostgreSQL read alike (`config/database.yml` names another
+    /// database than SQLite): only a tree that runs on that database carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

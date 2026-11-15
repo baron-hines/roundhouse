@@ -2223,7 +2223,14 @@ fn table_from_create_table(
     if table.primary_key_columns.iter().any(|k| !table.columns.iter().any(|c| &c.name == k)) {
         gaps.push(IngestError::Unsupported { file: file.into(), message: format!("primary key on {table_name} names a column the schema does not model") });
     }
-    let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
+    let mut invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
+    if dialect == GeneratedExpressionDialect::OtherDatabase {
+        invalid_generated.retain(|(name, _)| {
+            let Some(generated) = table.columns.iter_mut().find(|c| c.name.as_str() == name).and_then(|c| c.generated.as_mut()) else { return true };
+            generated.native = true;
+            false
+        });
+    }
     for (column, reason) in &invalid_generated {
         gaps.push(IngestError::Unsupported {
             file: file.into(),
@@ -2546,6 +2553,9 @@ struct ColumnOpts {
     /// `change_column` keeps the old default only when it was not.
     default_given: bool,
     limit: Option<u32>,
+    /// A decimal's `precision:` and `scale:` (PostgreSQL's `numeric(p,s)` rounds to them).
+    precision: Option<u32>,
+    scale: Option<u32>,
     /// A present array option is non-scalar unless explicitly false or nil.
     array: bool,
     /// `default: []`, which `default_value` reads as no default.
@@ -2700,6 +2710,10 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         }
                     }
                 }
+                "precision" | "scale" => {
+                    let n = integer_value(value).and_then(|n| u32::try_from(n).ok());
+                    if key == "precision" { opts.precision = n } else { opts.scale = n }
+                }
                 "array" => {
                     opts.array = match bool_value(value) {
                         Some(enabled) => enabled,
@@ -2844,6 +2858,14 @@ fn generated_column_from_options(
                     };
                     opts.limit = Some(limit);
                 }
+                "precision" | "scale" => {
+                    let Some(n) = integer_value(&value).and_then(|n| u32::try_from(n).ok()) else {
+                        return Err(unsupported(format!(
+                            "generated column {key} for {table}.{col_name} must be a non-negative integer"
+                        )));
+                    };
+                    if key == "precision" { opts.precision = Some(n) } else { opts.scale = Some(n) }
+                }
                 "default" => {
                     return Err(unsupported(format!(
                         "generated columns cannot also have a default: {table}.{col_name}"
@@ -2879,6 +2901,7 @@ fn generated_column_from_options(
         } else {
             GeneratedColumnStorage::Virtual
         },
+        native: false,
     });
     Ok(column)
 }
@@ -2931,7 +2954,7 @@ fn column_with_type(
         "integer" | "smallint" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
-        "decimal" | "numeric" => ColumnType::Decimal { precision: None, scale: None },
+        "decimal" | "numeric" => ColumnType::Decimal { precision: opts.precision.and_then(|p| u8::try_from(p).ok()), scale: opts.precision.and(opts.scale).and_then(|s| u8::try_from(s).ok()) },
         "string" | "inet" | "cidr" | "macaddr" | "enum" => ColumnType::String { limit: opts.limit },
         "text" | "citext" => ColumnType::Text,
         "boolean" => ColumnType::Boolean,

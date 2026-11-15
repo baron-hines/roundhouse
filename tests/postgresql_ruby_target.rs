@@ -294,3 +294,64 @@ fn integer_query_limits_follow_the_database() {
         assert!(model.contains(&format!("def self.schema_integer_query_limits\n    {limits}\n  end")), "{model}");
     }
 }
+
+/// A generated column whose expression is PostgreSQL's own SQL (maybe's
+/// `balances.end_balance`, a `numeric` sum with `::numeric` casts, and
+/// `accounts.classification`, a `CASE … = ANY (ARRAY[…])`), which the
+/// grammar SQLite and PostgreSQL read alike can't read: the tree that runs
+/// on PostgreSQL carries it as written, with the column's `numeric(p,s)`,
+/// and PostgreSQL computes the stored values. A target that runs SQLite
+/// refuses the schema rather than drop the column.
+const GENERATED: &str = concat!(
+    "    t.decimal \"price\", precision: 10, scale: 2\n",
+    "    t.virtual \"doubled\", type: :decimal, precision: 10, scale: 2, as: \"((price * (2)::numeric) + 0.005)\", stored: true\n",
+    "    t.virtual \"shelf\", type: :string, as: \"\\nCASE\\n    WHEN ((title)::text = ANY ((ARRAY['Alpha'::character varying, 'Beta'::character varying])::text[])) THEN 'listed'::text\\n    ELSE 'other'::text\\nEND\", stored: true\n",
+);
+
+const GENERATED_TEST: &str = r#"require "test_helper"
+
+class GeneratedColumnTest < ActiveSupport::TestCase
+  test "postgresql computes the stored generated columns" do
+    listed = Article.create!(title: "Alpha", body: "A body long enough", price: "1.25")
+    other = Article.create!(title: "Gamma", body: "A body long enough", price: "3.10")
+    listed.reload
+    other.reload
+    assert_equal 251, (listed.doubled * 100).round
+    # numeric(10,2) rounds 6.205 half away from zero.
+    assert_equal 621, (other.doubled * 100).round
+    assert_equal "listed", listed.shelf
+    assert_equal "other", other.shelf
+  end
+end
+"#;
+
+fn generated_blog() -> emit_and_run::Overlay {
+    let articles = "  create_table \"articles\", force: :cascade do |t|\n";
+    postgresql_blog().edit("db/schema.rb", articles, &format!("{articles}{GENERATED}"))
+}
+
+#[test]
+fn a_postgresql_generated_expression_is_carried_as_written() {
+    let (emitted, errors) = generated_blog().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let schema = read(&emitted, "config/schema.rb");
+    assert!(schema.contains("numeric(10,2) GENERATED ALWAYS AS (((price * (2)::numeric) + 0.005)) STORED"), "{schema}");
+    assert!(schema.contains("'listed'::text"), "{schema}");
+    assert!(schema.contains("\\\"price\\\" numeric(10,2)"), "{schema}");
+    // JRuby runs SQLite and persists generated columns, so the schema itself is what it refuses.
+    let Err(refusal) = std::panic::catch_unwind(|| generated_blog().emit(BuildTarget::Jruby)) else { panic!("JRuby emits the schema") };
+    let message = refusal.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains("articles.doubled") && message.contains("own database's SQL"), "{message}");
+}
+
+#[test]
+fn a_postgresql_generated_expression_is_computed_on_postgresql() {
+    let Some(db) = pg_test_url::pg_test_db("postgresql_ruby_target_generated") else { return };
+    generated_blog()
+        // Not the blog's fixtures: their explicit ids leave the key's sequence behind (docs/guide/spinel.md, PostgreSQL).
+        .write("test/fixtures/comments.yml", "")
+        .write("test/fixtures/articles.yml", "")
+        .write("test/models/generated_column_test.rb", GENERATED_TEST)
+        .run_test_env("test/models/generated_column_test.rb", &[("DATABASE_URL", db.url.as_str())])
+        .assert_passes();
+}

@@ -87,6 +87,15 @@ pub(crate) fn validate_column_with_dialect(
     let Some(generated) = &column.generated else {
         return Ok(());
     };
+    if generated.native {
+        return match dialect {
+            GeneratedExpressionDialect::Postgres => Ok(()),
+            _ => Err(format!(
+                "`{}` is the app's own database's SQL, which only a tree running on that database carries",
+                generated.expression.trim()
+            )),
+        };
+    }
 
     if column.primary_key {
         return Err("generated columns cannot be primary keys".into());
