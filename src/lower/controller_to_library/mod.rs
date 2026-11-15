@@ -2194,6 +2194,8 @@ fn build_filter_preamble(
         for skip in skips
             .iter()
             .filter(|s| s.target == f.target && s.kind.skipped_kind().as_ref() == Some(&f.kind))
+            // A skip with `only: []` skips no action.
+            .filter(|s| !(s.only_present && s.only.is_empty()))
         {
             if skip.only.is_empty() && skip.except.is_empty() {
                 return None;

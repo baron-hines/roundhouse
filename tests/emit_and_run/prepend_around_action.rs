@@ -72,6 +72,7 @@ end
   prepend_around_action :toll, only: []
   prepend_around_action :survey, only: :show
   skip_around_action :survey, only: :show
+  skip_around_action :city, only: []
 
   def show
     @stops << "ride"
