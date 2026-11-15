@@ -441,16 +441,14 @@ pub(super) fn push_association_methods(
                 let type_col = foreign_type
                     .clone()
                     .unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str())));
-                let assoc_pk = primary_key
-                    .clone()
-                    .unwrap_or_else(|| Symbol::from("id"));
                 // Each class is read and written by its own key, unless
                 // the declaration names one (`primary_key:`), as Rails'
                 // `association_primary_key(klass)` answers.
                 let key_of = |t: &ClassId| {
                     crate::lower::scope_chain::association_primary_key(models, t, primary_key.as_ref())
                 };
-                let scope = belongs_to_scope(scope.as_ref(), &assoc_pk, runtime_relation, span, owner, name);
+                let keys: Vec<Symbol> = polymorphic_targets.iter().map(key_of).collect();
+                let scope = belongs_to_scope(scope.as_ref(), &keys, runtime_relation, span, owner, name);
                 methods.push(synth_polymorphic_reader(
                     owner,
                     name,
@@ -510,7 +508,7 @@ pub(super) fn push_association_methods(
                 // target's own primary key.
                 let assoc_pk =
                     crate::lower::scope_chain::association_primary_key(models, target, primary_key.as_ref());
-                let scope = belongs_to_scope(scope.as_ref(), &assoc_pk, runtime_relation, span, owner, name);
+                let scope = belongs_to_scope(scope.as_ref(), std::slice::from_ref(&assoc_pk), runtime_relation, span, owner, name);
                 methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone(), keeps_nil, &scope));
                 // Rails provides the writer alongside the reader
                 // (`comment.story = obj` stores the foreign key). A
@@ -1785,10 +1783,11 @@ enum BelongsToScope<'a> {
 /// repeated one (`where(id: 1)` on the key, or `where(kind: "a").where(kind:
 /// "b")`) would be one keyword argument, where Rails applies both. Any
 /// other scope chains on the runtime Relation, which a strict target lacks:
-/// there the reader finds by the key alone, the reported gap.
+/// there the reader finds by the key alone, the reported gap. `keys` are
+/// the columns the reader finds by: one, or each polymorphic class's.
 fn belongs_to_scope<'a>(
     scope: Option<&'a Expr>,
-    assoc_pk: &Symbol,
+    keys: &[Symbol],
     runtime_relation: super::RuntimeRelation,
     span: Span,
     owner: &ClassId,
@@ -1796,7 +1795,7 @@ fn belongs_to_scope<'a>(
 ) -> BelongsToScope<'a> {
     match scope.map(|scope| (scope, hash_where_entries(scope))) {
         None => BelongsToScope::None,
-        Some((_, Some(entries))) if distinct_columns(&entries, assoc_pk) => BelongsToScope::Conditions(entries),
+        Some((_, Some(entries))) if distinct_columns(&entries, keys) => BelongsToScope::Conditions(entries),
         Some((scope, _)) if runtime_relation == super::RuntimeRelation::Present => BelongsToScope::Chain(scope),
         Some(_) => {
             let kind = crate::diagnostic::DiagnosticKind::LowerResidue {
@@ -1877,12 +1876,14 @@ fn hash_where_entries(scope: &Expr) -> Option<Vec<(Expr, Expr)>> {
     Some(out)
 }
 
-/// No two of a hash scope's columns, nor any with the key `find_by` reads
-/// (`assoc_pk`), are the same: each stays its own keyword argument.
-fn distinct_columns(entries: &[(Expr, Expr)], assoc_pk: &Symbol) -> bool {
-    let mut seen = std::collections::BTreeSet::from([assoc_pk.as_str().to_string()]);
+/// No two of a hash scope's columns are the same, nor is any a key
+/// `find_by` reads by (`keys`): each stays its own keyword argument.
+fn distinct_columns(entries: &[(Expr, Expr)], keys: &[Symbol]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
     entries.iter().all(|(k, _)| match &*k.node {
-        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => seen.insert(value.as_str().to_string()),
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => {
+            !keys.contains(value) && seen.insert(value.as_str().to_string())
+        }
         _ => false,
     })
 }
