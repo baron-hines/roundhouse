@@ -10,6 +10,12 @@ use super::*;
 
 const POSTGRES: &str = "default: &default\n  adapter: postgresql\n  encoding: unicode\n\ndevelopment:\n  <<: *default\n  database: exports_development\n\ntest:\n  <<: *default\n  database: exports_test\n";
 const SQLITE: &str = "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
+/// A schema dumped from PostgreSQL (the `development` database) in an app
+/// that tests on SQLite. The dump's CHECKs are carried, since the file
+/// names a database other than SQLite (`OtherDatabase`), and the Spinel
+/// tree runs the `test` database's SQLite, so they reach SQLite's DDL.
+/// With `POSTGRES` the Spinel tree runs PostgreSQL instead (#2144).
+const POSTGRES_DUMP_SQLITE_TEST: &str = "development:\n  adapter: postgresql\n  database: exports_development\n\ntest:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
 
 fn exports_schema(declarations: &str) -> String {
     format!("ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  enable_extension \"pg_catalog.plpgsql\"\n\n  create_table \"exports\", force: :cascade do |t|\n    t.string \"status\", default: \"pending\", null: false\n    t.string \"email\", null: false\n{declarations}  end\nend\n")
@@ -180,12 +186,16 @@ const CARRIED_ROWS: &[&str] = &[
 ];
 
 fn carried_app() -> emit_and_run::Overlay {
+    carried_app_on(POSTGRES)
+}
+
+fn carried_app_on(database: &str) -> emit_and_run::Overlay {
     let tables: String = CARRIED.iter().chain([&LEFT_OUT]).map(|(name, dump, _)| format!(
         "  create_table \"{name}\", force: :cascade do |t|\n    t.string \"status\"\n    t.text \"label\"\n    t.string \"kind\", limit: 20\n    t.integer \"amount\"\n    t.string \"email\"\n    t.check_constraint \"{dump}\", name: \"{name}_check\"\n  end\n"
     )).collect();
     emit_and_run::empty_app()
         .write("db/schema.rb", &format!("ActiveRecord::Schema[8.1].define(version: 1) do\n  enable_extension \"pg_catalog.plpgsql\"\n{tables}end\n"))
-        .write("config/database.yml", POSTGRES)
+        .write("config/database.yml", database)
 }
 
 /// One line per table: its name and what SQLite did with each row.
@@ -248,12 +258,29 @@ fn sqlite_ddl_enforces_carried_checks_as_postgres_does() {
     assert_carried(&stdout);
 }
 
+/// The same rows through the Spinel binary's own SQLite, for the app that
+/// carries the dump into SQLite's DDL natively.
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn native_spinel_enforces_carried_checks_as_postgres_does() {
-    let run = carried_app().run_spinel_with_db(&carried_contract());
+    let run = carried_app_on(POSTGRES_DUMP_SQLITE_TEST).run_spinel_with_db(&carried_contract());
     run.assert_passes();
     assert_carried(&run.stdout);
+}
+
+/// What the native test above relies on, without Spinel: that app's Spinel
+/// tree runs SQLite, and its DDL holds the carried CHECKs.
+#[test]
+fn a_postgres_dump_tested_on_sqlite_carries_its_checks_into_the_spinel_tree() {
+    let (tree, errors) = carried_app_on(POSTGRES_DUMP_SQLITE_TEST).emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    let db = std::fs::read_to_string(tree.join("runtime/db.rb")).unwrap();
+    assert!(!db.contains("Primitive Db surface over PostgreSQL"), "the Spinel tree should run SQLite");
+    let ddl = std::fs::read_to_string(tree.join("config/schema.rb")).unwrap();
+    for (name, _, _) in CARRIED {
+        assert!(ddl.contains(&format!("CONSTRAINT {name}_check CHECK (")), "{name}: {ddl}");
+    }
+    assert!(!ddl.contains("::text") && !ddl.contains(&format!("{}_check", LEFT_OUT.0)), "{ddl}");
 }
 
 /// PostgreSQL compares a column's text under the column's collation, which
