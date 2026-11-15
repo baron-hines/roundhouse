@@ -95,8 +95,9 @@ in `src/project.rs`. Shape notes worth knowing:
   PostgreSQL: on Spinel through the pure-Ruby spinel-pg driver (no
   libpq), on CRuby through the pg gem. The few places the two drivers
   differ go through `PgDriver` (`pg_driver.rb`, and
-  `pg_driver_cruby.rb`, which CRuby gets as `pg_driver.rb`). No target
-  selects it yet. `tests/spinel_pg_db.rs` compiles it with Spinel, and
+  `pg_driver_cruby.rb`, which CRuby gets as `pg_driver.rb`). The Ruby
+  and Spinel targets select it for an app whose `config/database.yml`
+  names postgresql (`project::apply_postgresql_tree`). `tests/spinel_pg_db.rs` compiles it with Spinel, and
   `tests/db_contract.rs` runs it on CRuby, each against a live server
   (`ROUNDHOUSE_PG_TEST_URL`).
   - `Db.exec_returning` answers the returned rows.
@@ -106,6 +107,10 @@ in `src/project.rs`. Shape notes worth knowing:
     class through `runtime/spinel/pg_errors.rb`.
   - A transaction keeps its connection, and a lease that ends inside
     one rolls it back.
+  - `Db.configure(url, schema_search_path: "a,b")` sets `search_path` on
+    every connection the pool opens, as Rails' `schema_search_path` does;
+    the Spinel tree's test helper puts each test process in its own schema
+    this way.
   - The pool is sharded per thread, as `runtime/spinel/db.rb`'s is.
     `Db.prepare` runs through a named statement cached per connection
     (at most 128, closed on the server when evicted); finalizing a read
@@ -3191,8 +3196,12 @@ Three gaps remain, all on spinel's side:
   `Rails.application.configure`. Each entry runs them once it has opened
   the database and set up the job drain, before it serves or works off a
   job. campfire's two (`Room::MessagesCount.ensure!` and starting the WAL
-  checkpointer outside tests) run this way. A block under a guard or in
-  any other spelling is not run, and the initializer ledger reports it.
+  checkpointer outside tests) run this way. Hooks inside an initializer's
+  top-level `if defined?(Rails::Server)`, with no `else` and nothing else
+  in its body, run from the entries that serve (the Spinel server and
+  `config.ru`), as Rails runs them under `rails server` only. A block
+  under any other guard or in any other spelling is not run, and the
+  initializer ledger reports it.
 - **`Rails.application.env_config` holds what is set and is consulted
   for nothing**: a forgery failure always renders the 422 that
   `action_dispatch.show_exceptions = :rescuable` asks for.

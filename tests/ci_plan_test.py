@@ -947,6 +947,7 @@ class Routing(unittest.TestCase):
         for path in [
             "src/ingest/after_initialize.rs",
             "tests/emit_and_run/after_initialize.rs",
+            "tests/support/after_initialize_app.rs",
             "tests/support/after_initialize_boot.rs",
             "tests/spinel_toolchain/after_initialize_boot.rs",
             "src/project.rs",
@@ -958,6 +959,30 @@ class Routing(unittest.TestCase):
                 self.assertIn("spinel-toolchain", plan["jobs"])
         # The native server check is a toolchain test, not a framework-suite binary.
         self.assertNotIn("after_initialize_boot", ci.SPINEL_TESTS)
+
+    def test_postgresql_spinel_tree_inputs_select_the_pg_gate(self):
+        # tests/spinel_pg_db.rs also compiles a test of an emitted app on
+        # PostgreSQL, so what assembles that tree selects it.
+        for path in [
+            "src/project.rs",
+            "src/lower/model_to_library/adapter_emit/mod.rs",
+            "src/emit/shared/schema_sql.rs",
+            "src/ingest/database_yml.rs",
+            "runtime/spinel/scaffold/main.rb",
+            "runtime/spinel/scaffold/Gemfile",
+            "runtime/spinel/test/test_helper.rb",
+            "tests/support/emit_and_run.rs",
+            "tests/spinel_pg_db.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("spinel_pg_db", plan["spinel_tests"])
+        # The emission checks need neither Spinel nor a server: unit only.
+        plan = ci.select(["tests/postgresql_spinel_target.rs"])
+        self.assertIn("unit", plan["jobs"])
+        self.assertNotIn("spinel-framework", plan["jobs"])
+        self.assertNotIn("postgresql_spinel_target", ci.SPINEL_TESTS)
 
     def test_param_binds_owns_lowering_drivers_and_database_runtime(self):
         for path in [
@@ -976,7 +1001,8 @@ class Routing(unittest.TestCase):
             with self.subTest(path=path):
                 plan = ci.select([path])
                 if path == "tests/support/emit_and_run.rs":
-                    expected = [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_constraints"]
+                    # spinel_pg_db's emitted-app gate emits through it too.
+                    expected = [*ci.PARAM_BIND_TESTS, "spinel_pg_db", "generated_columns_spinel", "schema_constraints"]
                 elif path == "src/lower/arel/visitor.rs":
                     expected = [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_default_expressions"]
                 elif path.startswith("src/"):

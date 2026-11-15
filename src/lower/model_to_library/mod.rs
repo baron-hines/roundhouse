@@ -575,6 +575,9 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                 crate::ModelBodyItem::Method { method, .. } if method.receiver == crate::dialect::MethodReceiver::Class => {
                     Some(method.name.clone())
                 }
+                // A scope too: a has_many whose scope names one
+                // (`-> { long }`) chains it on the key query.
+                crate::ModelBodyItem::Scope { scope, .. } => Some(scope.name.clone()),
                 _ => None,
             })
             .collect()

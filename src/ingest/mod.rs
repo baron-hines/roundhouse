@@ -33,6 +33,7 @@ pub(crate) mod each_validator;
 pub(crate) mod mailer_callbacks;
 pub(crate) mod mailer_defaults;
 pub(crate) mod has_many_hold;
+pub(crate) mod has_one_write;
 pub(crate) mod mailer_helpers;
 pub(crate) mod class_attribute;
 mod class_configuration;

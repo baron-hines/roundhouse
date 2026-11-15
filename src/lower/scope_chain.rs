@@ -2718,12 +2718,17 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                         "offset" | "limit" | "order" | "reorder" | "joins" | "left_outer_joins"
                             | "left_joins" | "includes" | "preload" | "eager_load" | "references" | "group"
                             | "having" | "merge" | "unscope"
-                    ));
+                            // Array's `load` is private (Kernel#load), so
+                            // `post.comments.load` is a NoMethodError on the
+                            // reader's Array too.
+                            | "load" | "load_async" | "from" | "extract_associated"
+                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
             if is_where || method.as_str().starts_with("find_by_") && block.is_none()
                 || is_relation_terminal(method.as_str(), args, block.as_ref())
                     && matches!(
                         method.as_str(),
                         "find"
+                            | "sum"
                             | "find_by"
                             | "find_by!"
                             | "find_sole_by"
@@ -2950,6 +2955,37 @@ pub fn mentions_bare_chain_start(expr: &Expr) -> bool {
 ///
 /// `all` is a terminal in the catalog and is checked separately at the
 /// call sites that seed a relation from it.
+/// Rails' `extract_associated(:name)`: `preload(:name).collect(&:name)`,
+/// each owner's reader answering the records the preload installed.
+fn extract_associated(span: crate::span::Span, rel: Expr, args: Vec<Expr>, aname: Symbol) -> Expr {
+    let put = |span, recv, method, args, block, parenthesized| {
+        syn(span, ExprNode::Send { recv, method, args, block, parenthesized })
+    };
+    let preloaded = put(span, Some(rel), Symbol::from("preload"), args, None, true);
+    let rows = put(span, Some(preloaded), Symbol::from("to_a"), vec![], None, false);
+    let owner = Symbol::from("__rh_owner");
+    let read = put(
+        span,
+        Some(syn(span, ExprNode::Var { id: crate::ident::VarId(0), name: owner.clone() })),
+        aname,
+        vec![],
+        None,
+        false,
+    );
+    let block = syn(
+        span,
+        ExprNode::Lambda {
+            extra_params: Vec::new(),
+            rest_param: None,
+            params: vec![owner],
+            block_param: None,
+            body: read,
+            block_style: BlockStyle::Brace,
+        },
+    );
+    put(span, Some(rows), Symbol::from("map"), vec![], Some(block), false)
+}
+
 pub(crate) fn is_relation_chain_method(name: &str) -> bool {
     crate::catalog::is_relation_builder_name(name)
 }
@@ -3294,6 +3330,9 @@ fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool
         // relation (`room.messages.find_each(&:destroy)`), where the
         // association read alone is an Array with no `find_each`.
         "find_each" | "find_in_batches" => true,
+        // A column sum (`post.comments.sum(:votes)`); Array's `sum` takes
+        // an initial value or a block, never a column.
+        "sum" => args.len() == 1 && block.is_none() && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }),
         _ => matches!(
             name,
             "ids" | "pluck" | "count" | "first" | "last" | "exists?" | "any?" | "empty?" | "size"
@@ -5357,7 +5396,20 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         // the seed is spelled `where_scope`, which records
                         // the foreign key as `scope_attributes` too.
                         let assoc_cm = ctx.assoc_class_method_params(&target, &method);
-                        if is_scope || is_chain || is_term || assoc_cm.is_some() {
+                        // `owner.posts.extract_associated(:author)`: the
+                        // association's relation, preloaded and mapped.
+                        let extracted = match args.as_slice() {
+                            [arg] if method.as_str() == "extract_associated" && block.is_none() => match &*arg.node {
+                                ExprNode::Lit { value: Literal::Sym { value } }
+                                    if ctx.assocs.assoc_target(&target, value).is_some() =>
+                                {
+                                    Some(value.clone())
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if is_scope || is_chain || is_term || assoc_cm.is_some() || extracted.is_some() {
                             let seed = build_association_seed(
                                 span, &target, fk, owner_id, type_entry.clone(), ir, aname,
                                 assoc_cm.is_some(),
@@ -5374,6 +5426,32 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 );
                                 // The method returns whatever it built —
                                 // a record, not a relation.
+                                return None;
+                            }
+                            // A collection terminal on a model that holds
+                            // what is built on it answers the held records
+                            // too (`ingest::has_many_hold`'s `__<name>_<terminal>`).
+                            if held
+                                && is_term
+                                && args.is_empty()
+                                && block.is_none()
+                                && matches!(
+                                    method.as_str(),
+                                    "first" | "last" | "size" | "length" | "empty?" | "any?" | "destroy_all"
+                                )
+                            {
+                                *expr = put(
+                                    span,
+                                    Some(ir.clone()),
+                                    Symbol::from(format!("__{aname}_{method}")),
+                                    vec![seed],
+                                    None,
+                                    true,
+                                );
+                                return None;
+                            }
+                            if let Some(aname) = extracted {
+                                *expr = extract_associated(span, seed, args, aname);
                                 return None;
                             }
                             if is_scope {
@@ -5564,6 +5642,18 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         );
                         return None;
                     }
+                }
+                // Rails' `extract_associated(:posts)`:
+                // `preload(:posts).collect(&:posts)`, each owner's reader
+                // answering the records the preload installed.
+                if method.as_str() == "extract_associated" && block.is_none()
+                    && let [arg] = args.as_slice()
+                    && let ExprNode::Lit { value: Literal::Sym { value: aname } } = &*arg.node
+                    && ctx.assocs.assoc_target(&mr, aname).is_some()
+                {
+                    let aname = aname.clone();
+                    *expr = extract_associated(span, r, args, aname);
+                    return None;
                 }
                 if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
                     *expr = put(span, Some(r), counted, args, block, parenthesized);

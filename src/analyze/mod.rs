@@ -1171,6 +1171,9 @@ impl Analyzer {
         for (class_id, methods) in &app.rbs_signatures {
             let cls = classes.entry(class_id.clone()).or_default();
             for (name, ty) in methods {
+                if !cls.instance_methods.contains_key(name) {
+                    cls.sidecar_only_instance_methods.insert(name.clone());
+                }
                 cls.instance_methods.insert(name.clone(), ty.clone());
             }
         }
@@ -6111,6 +6114,14 @@ impl Analyzer {
                 // it is not a definition, so it must not claim the name on
                 // the includer ahead of a module that defines it.
                 inst.retain(|name, _| !ar_instance.contains(name.as_str()) || declared_instance_method(&lc.name, name));
+                // A sidecar signature for the module's `def self.name`
+                // is filed under instance_methods (see the sidecar loop)
+                // but is the singleton's, not the includers' instance.
+                inst.retain(|name, _| {
+                    !(cls.sidecar_only_instance_methods.contains(name)
+                        && cls.source_class_methods.contains(name)
+                        && !cls.source_instance_methods.contains(name))
+                });
                 Some((lc.name.clone(), (inst, cls.class_methods.clone(), cls.includes.clone())))
             })
             .collect();

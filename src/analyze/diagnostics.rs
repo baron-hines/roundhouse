@@ -1071,7 +1071,66 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     for stmt in &app.boot_program {
         diagnose_expr(stmt, &mut out);
     }
+    unresolved_test_constants(app, &mut out);
     out
+}
+
+/// A test that names a member of a Ruby core or standard-library
+/// namespace that neither Ruby nor the app defines: `Digest::BLAKE3`,
+/// which a gem adds to `Digest` and the app does not declare to
+/// Roundhouse. The tests are emitted with the app, so the reference
+/// reaches the emitted project, where nothing defines it: a strict
+/// target's test build fails on it, and a Ruby one raises `NameError`.
+/// It is the error the app's own code gets for the same constant.
+///
+/// Deliberately narrow. A test body's per-expression constant
+/// diagnostics also fire on names that resolve another way: a class the
+/// test declares inside its own body, a model an RSpec example reaches,
+/// a test-framework class (`Rack::Test::UploadedFile`) the lowering
+/// supplies, a core class the analyzer does not model (`TCPServer`). So
+/// only a path whose first segment is a Ruby namespace, but which is not
+/// itself a Ruby constant or a class of the app, is reported.
+fn unresolved_test_constants(app: &App, out: &mut Vec<Diagnostic>) {
+    use crate::emit::audit::CORE_CONSTANTS;
+    let app_classes: Vec<&str> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str())
+        .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
+        .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+        .chain(app.test_modules.iter().flat_map(|t| t.inner_classes.iter().map(|c| c.name.0.as_str())))
+        .collect();
+    let reported = |path: &[Symbol]| -> bool {
+        let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+        let [first, _, ..] = segments.as_slice() else { return false };
+        let name = segments.join("::");
+        CORE_CONSTANTS.contains(first)
+            && !CORE_CONSTANTS.contains(&name.as_str())
+            && !app_classes.iter().any(|c| *c == name || c.ends_with(&format!("::{name}")))
+    };
+    fn walk(expr: &Expr, reported: &dyn Fn(&[Symbol]) -> bool, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Const { path } = &*expr.node
+            && let Some(DiagnosticKind::Unsupported { construct, .. }) = &expr.diagnostic()
+            && construct.as_str() == "constant"
+        {
+            if reported(path) {
+                diagnose_expr(expr, out);
+            }
+            return;
+        }
+        expr.node.for_each_child(&mut |c| walk(c, reported, out));
+    }
+    for module in &app.test_modules {
+        for test in &module.tests {
+            walk(&test.body, &reported, out);
+        }
+        if let Some(setup) = &module.setup {
+            walk(setup, &reported, out);
+        }
+        for helper in &module.helpers {
+            walk(&helper.body, &reported, out);
+        }
+    }
 }
 
 /// [`diagnose`] plus the missing-preload coverage triple, for report

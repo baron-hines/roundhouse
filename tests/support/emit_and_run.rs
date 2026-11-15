@@ -494,6 +494,18 @@ impl Overlay {
         diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
     }
 
+    /// The warnings the target-aware lowering reports for `target`
+    /// (`session::analyze_and_lower_for`): a construct the target's lowering
+    /// doesn't reach, kept a reported gap there.
+    pub fn lowering_warnings(self, target: BuildTarget) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        let diags = roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
+    }
+
     fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         self.emit_app_tree_with_lowering(target, true)
     }
@@ -567,6 +579,19 @@ pub struct Run {
     exited_zero: bool,
     pub stdout: String,
     pub stderr: String,
+    /// The last process's exit status, for a failure that printed nothing (a signal).
+    pub status: String,
+}
+
+fn command_of_status(status: &std::process::ExitStatus) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return "killed by a signal";
+        }
+    }
+    if status.success() { "exited 0" } else { "exited non-zero" }
 }
 
 impl Run {
@@ -579,6 +604,7 @@ impl Run {
             exited_zero: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: format!("{} ({})", output.status, command_of_status(&output.status)),
         }
     }
 

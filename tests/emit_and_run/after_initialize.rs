@@ -12,120 +12,17 @@ mod prerequisite;
 use super::after_initialize_boot_contract as boot;
 use super::emit_and_run;
 
+#[path = "../support/after_initialize_app.rs"]
+mod probe_app;
+use probe_app::{app, base, mkpath_app, ASSERTIONS, MKPATH_ASSERTIONS};
+
 /// `config.ru` as Puma (or Falcon) loads it before serving: it opens the
 /// database and sets up the job drain, then runs the app's callbacks.
 const SERVE: &str = "require \"rack\"\nRack::Builder.new.instance_eval(File.read(\"config.ru\"), \"config.ru\")\n";
 
-const APPLICATION: &str = r#"require "rails"
-require "active_record/railtie"
-module Probe
-  class Application < Rails::Application
-    config.load_defaults 8.1
-    config.after_initialize do
-      BootLog.record("application")
-    end
-  end
-end
-"#;
-
-fn base() -> emit_and_run::Overlay {
-    emit_and_run::empty_app()
-        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
-        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
-        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
-        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :widgets do |t|\n    t.string :label\n  end\nend\n")
-        .write("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n")
-        .write("app/models/boot_log.rb", r#"class BootLog
-  ENTRIES = []
-
-  def self.record(entry)
-    ENTRIES << entry
-  end
-
-  def self.entries
-    ENTRIES
-  end
-end
-"#)
-        .write("app/models/greeting.rb", "module Greeting\n  def greet(name)\n    \"hello \" + name\n  end\nend\n")
-        .write("app/models/greeter.rb", "class Greeter\n  include Greeting\nend\n")
-}
-
-/// Six callbacks: the Application class body's, a reopen of a compiled
-/// module with `alias_method`, one inside `Rails.application.configure`
-/// that reads what the earlier ones recorded, one that leaves by `next`
-/// before recording, one gated on `Rails::Server` (defined on neither lane,
-/// as under Rails without `rails server`), and one that requires an app file
-/// holding a reopen.
-fn app() -> emit_and_run::Overlay {
-    base()
-        .write("config/application.rb", APPLICATION)
-        .write("config/initializers/a_patch.rb", r#"Rails.application.config.after_initialize do
-  Greeting.module_eval do
-    alias_method :original_greet, :greet
-
-    def greet(name)
-      original_greet(name) + "!"
-    end
-  end
-  BootLog.record("patched")
-end
-"#)
-        .write("config/initializers/b_order.rb", r#"Rails.application.configure do
-  config.after_initialize do
-    next if BootLog.entries.empty?
-    BootLog.record("configure")
-  end
-end
-
-Rails.application.config.after_initialize do
-  next unless BootLog.entries.empty?
-  BootLog.record("skipped")
-end
-
-Rails.application.config.after_initialize do
-  next unless defined?(Rails::Server)
-  BootLog.record("server")
-end
-"#)
-        .write("config/initializers/c_require.rb", r#"Rails.application.config.after_initialize do
-  require Rails.root.join("lib/ext/greeter_patch").to_s
-end
-"#)
-        .write("lib/ext/greeter_patch.rb", r#"Greeter.class_eval do
-  def wave
-    "wave"
-  end
-end
-BootLog.record("required")
-"#)
-}
-
-const ASSERTIONS: &str = r#"
-entries = BootLog.entries
-raise "after_initialize order: #{entries.inspect}" unless entries == ["application", "patched", "configure", "required"]
-greeter = Greeter.new
-raise "patched greet: #{greeter.greet("ann").inspect}" unless greeter.greet("ann") == "hello ann!"
-raise "aliased original: #{greeter.original_greet("ann").inspect}" unless greeter.original_greet("ann") == "hello ann"
-raise "required reopen: #{greeter.wave.inspect}" unless greeter.wave == "wave"
-puts "after_initialize callbacks ran"
-"#;
-
 #[test]
 fn after_initialize_callbacks_run_at_boot_on_ruby() {
     app().run_ruby(&format!("{SERVE}{ASSERTIONS}")).assert_passes();
-}
-
-/// A contract loads the libraries (`require_relative "boot"`) and starts no
-/// server, so it calls the runner as the server's `main.rb` does once the
-/// database and the job drain are set up;
-/// `tests/spinel_toolchain/after_initialize_boot.rs` boots the server itself.
-const SPINEL_RUN: &str = "AppInitializers.run\n";
-
-#[test]
-#[ignore = "requires the Spinel toolchain"]
-fn after_initialize_callbacks_run_at_boot_on_spinel() {
-    app().run_spinel(&format!("{SPINEL_RUN}{ASSERTIONS}")).assert_passes();
 }
 
 /// The body is analyzed like the app's own code: a call no runtime
@@ -167,31 +64,6 @@ end
     assert_eq!(unchecked.len(), 2, "one error per unchecked chain: {unchecked:#?}");
 }
 
-/// `Rails.root` is a Pathname in Rails and `Rails::AppPath` on both lanes,
-/// typed so its calls are checked. The storage-directory callback an app
-/// writes (`Rails.root.join("storage", dir).mkpath`) makes the directories
-/// as Rails 8.1.4 does (`topics/after-initialize-analyzed/oracle_mkpath.rb`):
-/// both exist after boot, `mkpath` answers the path, and a second call is a
-/// no-op. `Rails.public_path` is typed the same way.
-fn mkpath_app() -> emit_and_run::Overlay {
-    base().write("config/initializers/storage_paths.rb", r#"Rails.application.config.after_initialize do
-  %w[db files].each do |dir|
-    Rails.root.join("tmp", "boot_paths", dir).mkpath
-  end
-  Rails.public_path.join("boot_uploads").mkpath
-end
-"#)
-}
-
-const MKPATH_ASSERTIONS: &str = r#"
-raise "boot_paths/db missing" unless Dir.exist?("tmp/boot_paths/db")
-raise "boot_paths/files missing" unless Dir.exist?("tmp/boot_paths/files")
-raise "public/boot_uploads missing" unless Dir.exist?("public/boot_uploads")
-again = Rails.root.join("tmp", "boot_paths", "db")
-raise "mkpath does not answer the path" unless again.mkpath.to_s == again.to_s
-puts "Rails.root mkpath ran"
-"#;
-
 #[test]
 fn a_rails_root_mkpath_callback_runs_on_ruby() {
     // Pathname#mkpath raises Errno::EEXIST through a file, as here.
@@ -206,12 +78,6 @@ end
     let run = mkpath_app().run_ruby(&format!("{SERVE}{MKPATH_ASSERTIONS}{through_a_file}"));
     run.assert_passes();
     assert!(run.stdout.contains("Rails.root mkpath ran"));
-}
-
-#[test]
-#[ignore = "requires the Spinel toolchain"]
-fn a_rails_root_mkpath_callback_runs_on_spinel() {
-    mkpath_app().run_spinel(&format!("{SPINEL_RUN}{MKPATH_ASSERTIONS}")).assert_passes();
 }
 
 /// A target that does not boot through `boot.rb` cannot run a callback:
@@ -566,4 +432,119 @@ require "active_record"
     }
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "Rails agrees");
+}
+
+/// A hook registered under `if defined?(Rails::Server)` runs where the
+/// emitted tree serves and nowhere else. With one shipment queued, the
+/// one-request script (`ruby main.rb`, CGI variables) runs the other two
+/// hooks and leaves it queued; `config.ru` runs all three in registration
+/// order and the job sends it. Rails 8.1.4 answers the same without and
+/// with `rails server` (`a_server_guarded_hook_matches_rails`). `sidekiq.rb`
+/// passes `false` as the script does (`project::tests`).
+#[test]
+fn a_server_guarded_hook_runs_from_config_ru_and_not_the_one_request_script() {
+    let (tree, errors) = boot::server_guarded_app().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let ruby = |args: &[&str], env: &[(&str, &str)]| {
+        let output = emit_and_run::ruby()
+            .args(args)
+            .current_dir(&tree)
+            .env("BLOG_DB", "boot.sqlite3")
+            .envs(env.iter().copied())
+            .output()
+            .expect("spawn ruby");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "ruby {args:?}:\n{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        stdout
+    };
+    ruby(&["-e", "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\nShipment.create!(status: \"queued\")\n"], &[]);
+    let script = ruby(&["main.rb"], &[("REQUEST_METHOD", "GET"), ("PATH_INFO", "/shipments"), ("QUERY_STRING", "")]);
+    assert!(script.trim_end().ends_with(boot::NOT_SERVED_AFTER_BOOT), "{script}");
+    let served = ruby(
+        &["-e", &format!(
+            "{SERVE}deadline = Time.now + 10\nsleep 0.02 while Shipment.where(status: \"queued\").count > 0 && Time.now < deadline\nprint Shipment.order(:id).pluck(:status).join(\",\") + \"|\" + BootLog.entries.join(\",\")\n"
+        )],
+        &[],
+    );
+    assert_eq!(served, boot::SERVED_AFTER_BOOT);
+}
+
+/// Rails 8.1.4 boots the server-guarded app twice, with one shipment queued
+/// each time: `rails/commands/server/server_command` loaded, as
+/// `rails server` loads it before the app, defines `Rails::Server`, so the
+/// guarded hook is registered and runs between the other two; without it
+/// only the other two run.
+#[test]
+fn a_server_guarded_hook_matches_rails() {
+    for (server, expected) in [(false, boot::NOT_SERVED_AFTER_BOOT), (true, boot::SERVED_AFTER_BOOT)] {
+        let Some(answer) = rails_boot(boot::SERVER_GUARDED_FILES, server) else { return };
+        assert_eq!(answer, expected, "Rails::Server defined: {server}");
+    }
+}
+
+/// Boot the shared app's files, `extra` written over them, with Rails
+/// 8.1.4 on a database holding one queued shipment and the `:async`
+/// adapter, and answer `statuses|log`; `None` when the oracle is not
+/// installed (a reasoned skip).
+fn rails_boot(extra: &[(&str, &str)], server: bool) -> Option<String> {
+    let root = std::env::temp_dir().join(format!(
+        "roundhouse_after_initialize_server_oracle_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    for (path, content) in boot::FILES.iter().chain(extra) {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).expect("create app directory");
+        std::fs::write(file, content).expect("write app file");
+    }
+    let database = root.join("boot.sqlite3");
+    std::fs::write(
+        root.join("config/database.yml"),
+        format!("development:\n  adapter: sqlite3\n  database: {}\n", database.display()),
+    )
+    .expect("write database.yml");
+    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/rails_oracle.rb");
+    // As `rails server` loads it: the command framework, then the command.
+    let server_command = if server { "require \"rails/command\"\nrequire \"rails/commands/server/server_command\"\n" } else { "" };
+    let script = format!(
+        r#"require {helper:?}
+gems = ["railties", "activerecord", "activejob", "actionpack"]
+unless RailsOracle.available?(*gems, sqlite3: ">= 2.1", rackup: ">= 2")
+  warn "skipping server-guard oracle: #{{RailsOracle.label}} needs railties, activerecord, activejob, actionpack, rackup and sqlite3"
+  exit 77
+end
+RailsOracle.activate(*gems, sqlite3: ">= 2.1", rackup: ">= 2")
+require "rails"
+require "active_record/railtie"
+require "active_job/railtie"
+require "sqlite3"
+{server_command}SQLite3::Database.new({database:?}) do |db|
+  db.execute({table:?})
+  db.execute("INSERT INTO shipments (status) VALUES ('queued')")
+end
+class ServerGuardOracle < Rails::Application
+  config.root = {root:?}
+  config.load_defaults 8.1
+  config.eager_load = false
+  config.logger = Logger.new(File::NULL)
+  config.secret_key_base = "server-guard-oracle"
+  config.active_job.queue_adapter = :async
+end
+ServerGuardOracle.initialize!
+deadline = Time.now + 10
+sleep 0.02 while BootLog.entries.include?("resumed 1") && Shipment.where(status: "queued").exists? && Time.now < deadline
+print Shipment.order(:id).pluck(:status).join(",") + "|" + BootLog.entries.join(",")
+"#,
+        database = database.display().to_string(),
+        table = boot::TABLE_SQL,
+        root = root.display().to_string(),
+    );
+    let output = std::process::Command::new("ruby").args(["-e", &script]).output().expect("Rails oracle");
+    let _ = std::fs::remove_dir_all(&root);
+    if output.status.code() == Some(77) {
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
+        return None;
+    }
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }

@@ -33,6 +33,9 @@
 //!   cross-target-safe. Each target's test_helper handles them; Ruby's
 //!   TestBase provides both.)
 //!   - `assert_predicate o, :sym`       → `raise "…" if !o.sym` (sym from Symbol literal)
+//!   - `assert_respond_to o, :sym`      → `raise "…" if !o.respond_to?(:sym)`
+//!   - `refute_respond_to o, :sym` / `assert_not_respond_to o, :sym`
+//!                                      → `raise "…" if o.respond_to?(:sym)`
 //!   - `flunk msg`                      → `raise msg` (Minitest's "Epic Fail!" without one)
 //!   - `assert_difference("X.m"[, d]) { body }` → before/after capture
 //!   - `assert_no_difference("X.m") { body }`   → same, delta 0
@@ -374,6 +377,20 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
                 send_method(span, obj, &sym, vec![]),
                 "refute_predicate failed".to_string(),
             ))
+        }
+        // `assert_respond_to obj, :sym` — Minitest's own wording of
+        // `assert obj.respond_to?(:sym)`, and refuted the same way. Only
+        // a Symbol literal: a computed name is left to the helper.
+        "assert_respond_to" | "refute_respond_to" | "assert_not_respond_to" if args.len() >= 2 => {
+            if !matches!(&*args[1].node, ExprNode::Lit { value: Literal::Sym { .. } }) {
+                return None;
+            }
+            let responds = send_method(span, args[0].clone(), "respond_to?", vec![args[1].clone()]);
+            Some(if method.as_str() == "assert_respond_to" {
+                raise_if(span, not_expr(span, responds), "assert_respond_to failed".to_string())
+            } else {
+                raise_if(span, responds, format!("{} failed", method.as_str()))
+            })
         }
         // `assert_raise` is Test::Unit's spelling, aliased by Rails and
         // written by campfire's `unfurl_links_controller_test`. Same

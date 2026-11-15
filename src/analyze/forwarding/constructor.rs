@@ -7,7 +7,7 @@
 use crate::det::{HashMap, HashSet};
 
 use crate::App;
-use crate::dialect::{MethodDef, MethodReceiver};
+use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
 
@@ -170,12 +170,15 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
 fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
     let resolver = app.const_resolver.for_sources(&app.sources);
     let initialize = Symbol::from("initialize");
-    let plain = |owner: &ClassId, method: &MethodDef| {
+    let declared = |owner: &ClassId, method: &MethodDef| {
         let span = method.name_span;
         !span.is_synthetic()
             // A `def`'s name token; an alias copy spans its statement.
             && (span.end - span.start) as usize == initialize.as_str().len()
             && resolver.namespaces_declared_in(span.file).any(|name| name == owner.0.as_str())
+    };
+    let plain = |owner: &ClassId, method: &MethodDef| {
+        declared(owner, method)
             && !contains_super(&method.body)
             && method.params.iter().all(|param| param.default.as_ref().is_none_or(|d| !contains_super(d)))
     };
@@ -190,20 +193,63 @@ fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
                 && (target == full || full.ends_with(&format!("::{target}")) || target.ends_with(&format!("::{full}")))
         })
     };
+    let mut parts_of: HashMap<&ClassId, Vec<&LibraryClass>> = HashMap::default();
+    for class in super::classes(app) {
+        parts_of.entry(&class.name).or_default().push(class);
+    }
     let mut out = HashSet::default();
-    for class in super::classes(app).filter(|class| !class.is_module) {
-        let defs: Vec<&MethodDef> = class
-            .methods
+    // Every reopening's together: one's plain `initialize` does not answer for another's `super`.
+    for (name, parts) in &parts_of {
+        if parts.iter().any(|class| class.is_module) {
+            continue;
+        }
+        let defs: Vec<&MethodDef> = parts
             .iter()
+            .flat_map(|class| class.methods.iter())
             .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
             .collect();
         if !defs.is_empty()
-            && defs.iter().all(|m| plain(&class.name, m))
-            && !class.unknown_calls.iter().any(prepends)
-            && !prepended_elsewhere(&class.name)
+            && defs.iter().all(|m| plain(name, m))
+            && !parts.iter().any(|class| class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
         {
-            out.insert(class.name.clone());
+            out.insert((*name).clone());
         }
+    }
+    // A `super`, or no `initialize` at all, lands on the parent's: when that one never passes the call on and no mixin of
+    // the owner's own sits between them with an `initialize`, the call stops there too (maybe's `DS::Button` and
+    // `DS::Link` under `DS::Buttonish`).
+    let brings_initialize = |module: &ClassId| match parts_of.get(module) {
+        None => !catalog_leaves(module.0.as_str(), Question::NewOrInitialize),
+        Some(known) => known.iter().any(|c| {
+            !c.is_module
+                || !c.includes.is_empty()
+                || c.unknown_calls.iter().any(prepends)
+                || c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+        }),
+    };
+    let stops_at_parent = |name: &ClassId, parts: &[&LibraryClass], out: &HashSet<ClassId>| {
+        parts.iter().all(|class| !class.is_module)
+            && parts
+                .iter()
+                .flat_map(|class| class.methods.iter())
+                .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+                .all(|m| declared(name, m))
+            && parts.iter().all(|class| class.parent.as_ref().is_none_or(|parent| out.contains(parent)))
+            && parts.iter().any(|class| class.parent.is_some())
+            && !parts.iter().any(|class| class.includes.iter().any(&brings_initialize) || class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
+    };
+    loop {
+        let found: Vec<ClassId> = parts_of
+            .iter()
+            .filter(|(name, parts)| !out.contains(**name) && stops_at_parent(name, parts, &out))
+            .map(|(name, _)| (*name).clone())
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        out.extend(found);
     }
     for model in &app.models {
         let defs: Vec<&MethodDef> =
@@ -258,6 +304,8 @@ const MIXINS_WITHOUT_CONSTRUCTOR_HOOK: &[(&str, bool)] = &[
     ("ActionView::Helpers::SanitizeHelper", false),
     ("ActionView::Helpers::JavaScriptHelper", false),
     ("Rails.application.routes.url_helpers", true),
+    // The same module as ingest records its include (`library_class`: the program's generated route helpers).
+    ("RouteHelpers", true),
     ("ActiveModel::Model", true),
     ("ActiveModel::Validations", false),
     ("ActiveModel::Attributes", true),

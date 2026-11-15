@@ -457,6 +457,14 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                     return vec![assign_accumulator_string_new(disc), stmt];
                 }
             }
+            // `<% page_title "Orders" %>`: an app helper called for its
+            // effect (a `content_for` deposit), its value discarded, as
+            // Rails' `<% %>` does. It takes the same rewrite an output
+            // tag's helper call does. A bare read of a template local of
+            // that name is the local, not the helper.
+            if ctx.app_helper_names.contains(method.as_str()) && !ctx.reads_local(stmt) {
+                return vec![rewrite_helpers_in_expr(stmt, ctx)];
+            }
             vec![todo_io_append("unknown stmt", stmt.span)]
         }
         // `<% case action_name when "all" %>…<% when … %>…<% end %>` at
@@ -590,9 +598,11 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             let mut cap_stmts = vec![assign_accumulator_string_new(&cap)];
             cap_stmts.extend(walk_body(body, &cap_ctx));
             // Not a plain String: Rails' `capture` answers the block's markup safe, and the slot escapes one that is not.
+            // `raw`, not `.html_safe`, which the emit unwraps where it reads the mark statically.
+            let helpers = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")] });
             cap_stmts.push(Expr::new(
                 Span::synthetic(),
-                ExprNode::Send { recv: Some(accumulator_result_ref(&cap)), method: Symbol::from("html_safe"), args: Vec::new(), block: None, parenthesized: false },
+                ExprNode::Send { recv: Some(helpers), method: Symbol::from("raw"), args: vec![accumulator_result_ref(&cap)], block: None, parenthesized: true },
             ));
             let new_block = Expr::new(
                 block.span,
@@ -1540,7 +1550,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 };
                 // A helper a gem mixes into the view (`simple_form_for`): Rails' method, on a view context, whose block's
                 // capture is the template's markup, a safe buffer.
-                let on_view_context = recv.is_none() && ctx.view_context_helpers.contains(method.as_str());
+                let on_view_context = recv.is_none()
+                    && ctx.view_context_helpers.contains(method.as_str())
+                    && !ctx.app_helper_names.contains(method.as_str());
                 let mut cap_stmts = vec![assign_accumulator_string_new(cap)];
                 cap_stmts.extend(walk_body(body, &cap_ctx));
                 cap_stmts.push(if on_view_context {
@@ -1977,6 +1989,7 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
                 },
             );
             call.ty = e.ty.clone();
+            call.decisions |= e.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
             return call;
         }
     }
@@ -2148,6 +2161,9 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
     out.decisions |= e.decisions & crate::expr::CONST_PATH;
     // A grounded `iso8601` (`to_rfc3339`) stays one: the Ruby emit prints `iso8601` by this flag.
     out.decisions |= e.decisions & crate::expr::GROUNDED_TIME_FORMAT;
+    // A `**opts` argument the keyword lowering made positional stays a
+    // splat on the Ruby emit (`expr::ERASED_KEYWORD_SPLAT`).
+    out.decisions |= e.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
     // Not a fresh, untyped node: a rebuilt `[]` the i18n lowering typed `Array[String]` would read as `Array[untyped]`
     out.ty = e.ty.clone();
     out
@@ -2512,6 +2528,7 @@ mod tests {
             lexxy: false,
             lexxy_editor_adapter: false,
             partial_ivars: Default::default(),
+            partial_record_locals: Default::default(),
             ivar_records: Default::default(),
             formats: vec!["html".to_string()],
             view_formats: Default::default(),

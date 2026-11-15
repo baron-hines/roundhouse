@@ -205,6 +205,10 @@ mod stdlib_rexml_include;
 mod gem_reopen_source_contract;
 #[path = "emit_and_run/gem_reopen_source.rs"]
 mod gem_reopen_source;
+#[path = "support/gem_nested_once.rs"]
+mod gem_nested_once_contract;
+#[path = "emit_and_run/gem_nested_once.rs"]
+mod gem_nested_once;
 #[path = "support/stdlib_singleton.rs"]
 mod stdlib_singleton_contract;
 #[path = "emit_and_run/stdlib_singleton.rs"]
@@ -22193,6 +22197,14 @@ mod load_time_constants;
 mod doorkeeper;
 #[path = "emit_and_run/render_object.rs"]
 mod render_object;
+#[path = "support/ordered_options_app.rs"]
+mod ordered_options_app;
+#[path = "emit_and_run/ordered_options.rs"]
+mod ordered_options;
+#[path = "support/class_ext_app.rs"]
+mod class_ext_app;
+#[path = "emit_and_run/class_ext.rs"]
+mod class_ext;
 #[path = "support/view_component_gem.rs"]
 mod view_component_gem;
 #[path = "emit_and_run/view_component.rs"]
@@ -22225,3 +22237,33 @@ mod param_default_constant_rooting;
 mod compiled_rooted_constants;
 #[path = "emit_and_run/serializable_resource_as_json.rs"]
 mod serializable_resource_as_json;
+#[path = "emit_and_run/belongs_to_target.rs"]
+mod belongs_to_target;
+#[path = "emit_and_run/has_one_writer.rs"]
+mod has_one_writer;
+#[path = "emit_and_run/has_one_validate.rs"]
+mod has_one_validate;
+#[path = "emit_and_run/has_many_target.rs"]
+mod has_many_target;
+#[path = "emit_and_run/has_many_writer.rs"]
+mod has_many_writer;
+#[path = "emit_and_run/association_scopes.rs"]
+mod association_scopes;
+#[path = "emit_and_run/association_relation_calls.rs"]
+mod association_relation_calls;
+#[path = "emit_and_run/helper_content_for.rs"]
+mod helper_content_for;
+#[path = "emit_and_run/view_statement_helper_call.rs"]
+mod view_statement_helper_call;
+#[path = "emit_and_run/helper_view_context.rs"]
+mod helper_view_context;
+#[path = "emit_and_run/view_keyword_splat.rs"]
+mod view_keyword_splat;
+#[path = "emit_and_run/link_to_app_helper_path.rs"]
+mod link_to_app_helper_path;
+#[path = "emit_and_run/partial_object_as.rs"]
+mod partial_object_as;
+#[path = "emit_and_run/helper_asset_url.rs"]
+mod helper_asset_url;
+#[path = "emit_and_run/safe_join_safe.rs"]
+mod safe_join_safe;

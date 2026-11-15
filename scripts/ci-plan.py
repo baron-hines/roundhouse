@@ -240,6 +240,8 @@ SPINEL_TOOLCHAIN_SECONDS = {
     "real_blog_spinel_tests_pass": 265,
     "identical_cli_emission_reuses_native_build_but_changed_ruby_rebuilds": 187,
     "finite_concern_class_configuration_runs_natively": 133,
+    # The whole blog with view_component's sources built natively (about 700 s on a CI runner, 2026-11-14).
+    "view_component::a_component_renders_its_template_natively": 700,
 }
 SPINEL_TOOLCHAIN_DEFAULT_SECONDS = 80
 SPINEL_TOOLCHAIN_SHARDS = 5
@@ -272,6 +274,21 @@ PG_DB_INPUTS = {
     "runtime/ruby/db.rbs",
     "runtime/spinel/active_support_time_parsing.rb",
     "runtime/spinel/active_support_time_parsing.rbs",
+}
+# Inputs of the emitted-app gate in tests/spinel_pg_db.rs, which compiles
+# a test of an app on PostgreSQL: the dialect choice and DDL, the tree's
+# assembly (project::apply_postgresql_tree, spin_shape's `pg` dependency),
+# the inserts its keyless tables take (adapter_emit), the scaffold files
+# that assembly rewrites, and the harness that emits it.
+PG_APP_INPUTS = {
+    "src/project.rs",
+    "src/lower/model_to_library/adapter_emit/mod.rs",
+    "src/emit/shared/schema_sql.rs",
+    "src/ingest/database_yml.rs",
+    "runtime/spinel/scaffold/main.rb",
+    "runtime/spinel/scaffold/Gemfile",
+    "runtime/spinel/test/test_helper.rb",
+    "tests/support/emit_and_run.rs",
 }
 # The Db contract suite (tests/support/db_contract.rs): the Spinel lanes
 # each of its files feeds, and the runtime files its LANES copy beside a
@@ -315,12 +332,13 @@ NET_HTTP_INPUTS = {
     "runtime/spinel/tcp_socket_stub.rb",
     "runtime/spinel/tcp_socket_stub.rbs",
 }
-# Inputs of the after_initialize boot order's native server check
+# Inputs of the after_initialize native checks
 # (tests/spinel_toolchain/after_initialize_boot.rs): the pass that carries
-# the callbacks, the app the check boots, and its Ruby family half.
+# the callbacks, the apps the checks build, and their Ruby family half.
 AFTER_INITIALIZE_BOOT_INPUTS = {
     "src/ingest/after_initialize.rs",
     "tests/emit_and_run/after_initialize.rs",
+    "tests/support/after_initialize_app.rs",
     "tests/support/after_initialize_boot.rs",
 }
 # Inputs of the reopen gate (tests/app_reopens_runtime_class.rs): the
@@ -703,7 +721,7 @@ def native_coverage(path):
         "src/lower/view_instrumentation.rs",
     }:
         suites.update(("spinel_active_support_instrumentation", "spinel_mini_profiler"))
-    if path in PG_DB_INPUTS:
+    if path in PG_DB_INPUTS or path in PG_APP_INPUTS:
         suites.add("spinel_pg_db")
     suites.update(DB_CONTRACT_INPUTS.get(path, ()))
     if path in {
@@ -1147,7 +1165,7 @@ def spinel_framework_shards(tests, count=SPINEL_FRAMEWORK_SHARDS, timings=None):
 
 
 def spinel_toolchain_shard(tests, shard, count=SPINEL_TOOLCHAIN_SHARDS, timings=None, units=None):
-    """This shard's tests: longest first onto the shard that would end first, by name order within it.
+    """This shard's tests: longest first onto the shard that would end first, and longest first within it.
 
     A unit (tests one shared Spinel build would take, from spinel_bundle_plan) goes to one
     shard whole: split across shards, each part pays the build again. A shard ends once its
@@ -1185,7 +1203,9 @@ def spinel_toolchain_shard(tests, shard, count=SPINEL_TOOLCHAIN_SHARDS, timings=
         longest[i] = max(longest[i], cost(item))
         if i == shard:
             mine.extend(item)
-    return sorted(mine)
+    # Not by name order: the threads start the tests in this order, and a long test listed last starts after the
+    # short ones and passes the shard's deadline (view_component's native build, about ten minutes).
+    return sorted(mine, key=lambda t: (-spinel_toolchain_seconds(t, timings), t))
 
 
 def record_timing(kind, name, seconds, ok, timed_out=False, cpu=None):

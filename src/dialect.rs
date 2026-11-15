@@ -487,6 +487,11 @@ pub enum Association {
         /// `None` means `id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `belongs_to :live_author, -> { where(active: true) }` — the
+        /// scope lambda's body. Rails' reader and preload find the record
+        /// through it, so a key whose record the scope excludes reads nil.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<Expr>,
     },
     HasMany {
         name: Symbol,
@@ -568,6 +573,11 @@ pub enum Association {
         /// `after_save` that stamps the FK (and `as:` type) then saves.
         #[serde(default, skip_serializing_if = "is_false")]
         autosave: bool,
+        /// `validate: true` — the owner is invalid while its new or changed
+        /// target is (Rails' `validate_single_association`). Default false,
+        /// matching Rails for a has_one.
+        #[serde(default, skip_serializing_if = "is_false")]
+        validate: bool,
         /// `primary_key: :source_id` — the OWNER column the foreign key
         /// matches (Rails' `join_primary_key`). `None` means the owner's
         /// own key, `id`. Every reader of this association must go

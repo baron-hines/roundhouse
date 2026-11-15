@@ -321,6 +321,7 @@ mod tests {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         }
     }
 

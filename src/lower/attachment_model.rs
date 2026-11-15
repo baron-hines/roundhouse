@@ -104,6 +104,7 @@ pub fn synthesize_attachment_model(app: &mut App) {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         },
         leading_comments: Vec::new(),
         leading_blank_line: false,

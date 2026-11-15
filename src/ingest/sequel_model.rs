@@ -267,6 +267,7 @@ fn parse_sequel_association(
             as_interface: None,
             scope: None,
             autosave: false,
+            validate: false,
             primary_key: None,
         },
         "many_to_one" => Association::BelongsTo {
@@ -288,6 +289,7 @@ fn parse_sequel_association(
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         },
         "many_to_many" => Association::HasAndBelongsToMany {
             name: name.clone(),

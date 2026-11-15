@@ -3473,6 +3473,7 @@ end
     // After every body is in: a `config_for` call anywhere names a file.
     super::config_for::lift(vfs, dir, &mut app);
     collect_binary_assets(vfs, dir, &mut app);
+    collect_source_gem_data(vfs, dir, auto_source_gems, &mut app);
     let mut require_roots: Vec<PathBuf> = roots.iter().map(|root| dir.join(root)).collect();
     require_roots.extend(
         support_roots(vfs, dir, &roots, &path_gems, &lib_ignores)
@@ -3719,6 +3720,51 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
     // Deterministic order: the emit is byte-compared across runs, and
     // `read_dir` order is explicitly unspecified by the trait.
     app.binary_assets.sort_by(|a, b| a.0.cmp(&b.0));
+}
+
+/// A gem compiled from source reads its own files by a path from its code (lucide-rails' `GEM_ROOT.join("icons/
+/// stripped.bin.gz")`), which the emitted `__FILE__` names under the gem's mount: the directories beside its code are
+/// carried there, as the installed gem holds them. Not its `lib/` and `app/`, whose code is compiled (and `lib/`'s text
+/// carried, `project::carry_source_gem_data`), nor what only its development reads.
+fn collect_source_gem_data<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[String], app: &mut App) {
+    const CODE_OR_DEVELOPMENT: &[&str] =
+        &["lib", "app", "spec", "test", "tests", "bin", "exe", "sig", "rbi", "script", "gemfiles", "node_modules", "doc", "docs", "tmp", "coverage"];
+    let Some(lock) = app.gem_lock.clone() else { return };
+    let roots = crate::i18n::gems::gem_roots(vfs, dir);
+    let mut names: Vec<&String> = lock.source.iter().chain(auto_source_gems.iter()).collect();
+    names.sort();
+    names.dedup();
+    let mut found = Vec::new();
+    for name in names {
+        let Some(version) = lock.version_of(name) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem_locked(vfs, &roots, &lock, name, version) else { continue };
+        let Ok(entries) = vfs.read_dir(&installed) else { continue };
+        for entry in entries {
+            let Some(top) = entry.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            // Not through a link: its target may lie outside the gem.
+            if vfs.is_symlink(&entry) || !vfs.is_dir(&entry) || top.starts_with('.') || CODE_OR_DEVELOPMENT.contains(&top.as_str()) {
+                continue;
+            }
+            let mut stack = vec![entry];
+            while let Some(at) = stack.pop() {
+                let Ok(children) = vfs.read_dir(&at) else { continue };
+                for child in children {
+                    if vfs.is_symlink(&child) || child.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                        continue;
+                    }
+                    if vfs.is_dir(&child) {
+                        stack.push(child);
+                        continue;
+                    }
+                    let Ok(bytes) = vfs.read(&child) else { continue };
+                    let rel = child.strip_prefix(&installed).unwrap_or(&child).to_string_lossy().replace('\\', "/");
+                    found.push((format!("{}/{name}-{version}/{rel}", super::source_gems::MOUNT), bytes));
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    app.binary_assets.extend(found);
 }
 
 fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &mut App) {

@@ -4063,6 +4063,16 @@ fn spelled_lambda_parts<'a>(
     Some((block.parameters(), block.body()))
 }
 
+/// `where(…).order(…)`: sends down to one with no receiver, the shape an
+/// association reader grafts onto its query.
+fn is_implicit_call_chain(e: &crate::expr::Expr) -> bool {
+    match &*e.node {
+        crate::expr::ExprNode::Send { recv: None, .. } => true,
+        crate::expr::ExprNode::Send { recv: Some(inner), .. } => is_implicit_call_chain(inner),
+        _ => false,
+    }
+}
+
 fn parse_association(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
@@ -4094,23 +4104,56 @@ fn parse_association(
     let mut belongs_to_default: Option<crate::expr::Expr> = None;
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
+    let mut validate: Option<bool> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
         // scope (`has_many :x, -> { where(...) }, through: :y`).
         // Recorded as its raw body Expr; the reader synthesis grafts it
-        // onto the relation seed. Param-taking lambdas (rare
-        // owner-dependent scopes) are skipped — they need the owner
-        // threaded and no exercised corpus does this yet.
+        // onto the relation seed. A lambda that takes the owner, through a
+        // parameter of any kind (`->(owner)`, `->(owner = nil)`, `-> { it }`),
+        // is skipped, and reported: the owner isn't threaded, so its
+        // body would read an unbound name.
+        //
+        // The readers graft the body onto their query as a chain of calls
+        // on the implicit receiver (`where(…).order(…)`). Any other body
+        // (`-> { where(active: true) if flag }`, two statements) is dropped
+        // there, so it is reported here.
         if let Some(lambda) = arg.as_lambda_node() {
+            // Every macro passes through here (`scope :x, ->(k) { … }`
+            // too); only an association's lambda is its scope.
+            let association =
+                matches!(method, "belongs_to" | "has_one" | "has_many" | "has_and_belongs_to_many");
             if scope.is_none() {
-                let param_free = lambda
-                    .parameters()
-                    .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
-                    .map(|pn| pn.requireds().iter().next().is_none())
-                    .unwrap_or(true);
+                let param_free = match lambda.parameters() {
+                    None => true,
+                    Some(p) => p.as_block_parameters_node().is_some_and(|b| b.parameters().is_none()),
+                };
+                let unapplied = |shape: String, reason: &str| {
+                    let mut diagnostic = crate::diagnostic::Diagnostic::unsupported(
+                        super::util::node_span(&arg, file),
+                        None,
+                        shape,
+                        reason,
+                    );
+                    diagnostic.severity = crate::diagnostic::Severity::Warning;
+                    super::prism::push(diagnostic);
+                };
                 if param_free {
                     scope = lambda.body().and_then(|b| ingest_expr(&b, file).ok());
+                    if association && scope.as_ref().is_some_and(|body| !is_implicit_call_chain(body)) {
+                        // The body stays, so the analyzer still checks it
+                        // (an unsupported construct in it is an error).
+                        unapplied(
+                            format!("{method} :{name_str}, -> {{ ... }}"),
+                            "an association scope that isn't a chain of query calls is not applied, so its reads skip the scope's conditions",
+                        );
+                    }
+                } else if association {
+                    unapplied(
+                        format!("{method} :{name_str}, ->(owner) {{ ... }}"),
+                        "an association scope that takes the owner is not applied, so its reads skip the scope's conditions",
+                    );
                 }
             }
             continue;
@@ -4171,6 +4214,9 @@ fn parse_association(
                 "polymorphic" => polymorphic = bool_value(&value),
                 "as" => as_interface = symbol_value(&value),
                 "autosave" => autosave = bool_value(&value),
+                // A has_one's `validate: true` (`HasOne::validate`); any
+                // other association's `validate:` stays reported below.
+                "validate" if method == "has_one" && bool_value(&value).is_some() => validate = bool_value(&value),
                 // `default: -> { Current.user }` — the lambda BODY, not
                 // the lambda. Rails calls it with `instance_exec`, so
                 // the body is already written against the record; a
@@ -4316,6 +4362,7 @@ fn parse_association(
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             autosave: autosave.unwrap_or(false),
+            validate: validate.unwrap_or(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
         }),
         "belongs_to" => Some(Association::BelongsTo {
@@ -4335,6 +4382,7 @@ fn parse_association(
             touch,
             foreign_type: None,
             primary_key: primary_key.as_deref().map(Symbol::from),
+            scope,
         }),
         "has_and_belongs_to_many" => Some(Association::HasAndBelongsToMany {
             name: name.clone(),

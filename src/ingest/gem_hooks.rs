@@ -1294,7 +1294,9 @@ const VIEW_COMPONENT_HOOK: &str = "(roundhouse)/view_component.rb";
 /// `ActionView::Template` and a `class_eval` of the template's Ruby), which no compiled tree can do. The templates are
 /// compiled here instead, each into its component's `call`, as an inline component writes it; the gem's compiler then
 /// only registers the component, and `render_template_for` calls `call`. `Base.inherited` is the gem's without the
-/// per-child `render_template_for` it `class_eval`s for a compiler that redefines it, which this one does not.
+/// per-child `render_template_for` it `class_eval`s for a compiler that redefines it, which this one does not, and
+/// without the source location where a tree has no caller locations (Spinel's): the identifier and virtual path only
+/// name the sidecar files (translations, previews) the compiled templates no longer read.
 /// `renders_one` / `renders_many` only check and register the slot: its methods are written per component
 /// ([`view_component_slots`]), where the gem `define_method`s them as it runs. A variant or another format's template
 /// (`foo_component.html+phone.erb`) is not compiled. A polymorphic slot (`types:`) and `use_helpers` are not
@@ -1315,7 +1317,7 @@ pub(super) fn view_component_templates<V: crate::vfs::Vfs + ?Sized>(app: &mut Ap
 
 fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
     let indexed = app.sources.len();
-    let hook = "module ViewComponent\n  class Compiler\n    def compile(raise_errors: false, force: false)\n      return if compiled? && !force\n      return if @component == ViewComponent::Base\n      @component.validate_initialization_parameters! if raise_errors\n      @component.register_default_slots\n      @component.build_i18n_backend\n      CompileCache.register(@component)\n    end\n  end\n\n  class Base\n    def render_template_for(variant = nil, format = nil)\n      call\n    end\n\n    def self.inherited(child)\n      compile\n      if defined?(Rails) && Rails.application && !(child < Rails.application.routes.url_helpers)\n        child.include Rails.application.routes.url_helpers\n      end\n      child.identifier = caller_locations(1, 10).reject { |l| l.base_label == \"inherited\" }[0].path\n      if defined?(Rails) && Rails.application\n        child.virtual_path = child.identifier.gsub(/(.*#{Regexp.quote(ViewComponent::Base.config.view_component_path)})|(\\.rb)/, \"\")\n      end\n      child.with_collection_parameter provided_collection_parameter\n      super\n    end\n\n    def self.renders_one(slot_name, callable = nil)\n      validate_singular_slot_name(slot_name)\n      validate_plural_slot_name(ActiveSupport::Inflector.pluralize(slot_name).to_sym)\n      register_slot(slot_name, collection: false, callable: callable)\n    end\n\n    def self.renders_many(slot_name, callable = nil)\n      validate_plural_slot_name(slot_name)\n      validate_singular_slot_name(ActiveSupport::Inflector.singularize(slot_name).to_sym)\n      register_slot(slot_name, collection: true, callable: callable)\n    end\n\n    def self.define_slot(slot_name, collection:, callable:)\n      slot = {collection: collection}\n      return slot unless callable\n      if callable.respond_to?(:method_defined?) && callable.method_defined?(:render_in)\n        slot[:renderable] = callable\n      elsif callable.is_a?(String)\n        slot[:renderable_class_name] = callable\n      elsif callable.respond_to?(:call)\n        slot[:renderable_function] = instance_method(:\"_call_#{slot_name}\")\n      else\n        raise(InvalidSlotDefinitionError)\n      end\n      slot\n    end\n\n    def self.register_polymorphic_slot(slot_name, types, collection:)\n      raise NotImplementedError, \"roundhouse: polymorphic slots are not supported\"\n    end\n\n    def self.use_helper(helper_method, from: nil, prefix: false)\n      raise NotImplementedError, \"roundhouse: use_helpers is not supported\"\n    end\n  end\nend\n";
+    let hook = "module ViewComponent\n  class Compiler\n    def compile(raise_errors: false, force: false)\n      return if compiled? && !force\n      return if @component == ViewComponent::Base\n      @component.validate_initialization_parameters! if raise_errors\n      @component.register_default_slots\n      @component.build_i18n_backend\n      CompileCache.register(@component)\n    end\n  end\n\n  class Base\n    def render_template_for(variant = nil, format = nil)\n      call\n    end\n\n    def self.inherited(child)\n      compile\n      location = caller_locations(1, 10).to_a.reject { |l| l.base_label == \"inherited\" }.first\n      child.identifier = location.nil? ? nil : location.path\n      if defined?(Rails) && Rails.application && !child.identifier.nil?\n        child.virtual_path = child.identifier.gsub(/(.*#{Regexp.quote(ViewComponent::Base.config.view_component_path)})|(\\.rb)/, \"\")\n      end\n      child.with_collection_parameter provided_collection_parameter\n      child.registered_slots = registered_slots.clone\n      super\n    end\n\n    def self.renders_one(slot_name, callable = nil)\n      validate_singular_slot_name(slot_name)\n      validate_plural_slot_name(ActiveSupport::Inflector.pluralize(slot_name).to_sym)\n      register_slot(slot_name, collection: false, callable: callable)\n    end\n\n    def self.renders_many(slot_name, callable = nil)\n      validate_plural_slot_name(slot_name)\n      validate_singular_slot_name(ActiveSupport::Inflector.singularize(slot_name).to_sym)\n      register_slot(slot_name, collection: true, callable: callable)\n    end\n\n    def self.define_slot(slot_name, collection:, callable:)\n      slot = {collection: collection}\n      return slot unless callable\n      if callable.is_a?(Module) && callable.method_defined?(:render_in)\n        slot[:renderable] = callable\n      elsif callable.is_a?(String)\n        slot[:renderable_class_name] = callable\n      elsif callable.respond_to?(:call)\n        slot[:renderable_function] = slot_name\n      else\n        raise(InvalidSlotDefinitionError)\n      end\n      slot\n    end\n\n    def self.register_polymorphic_slot(slot_name, types, collection:)\n      raise NotImplementedError, \"roundhouse: polymorphic slots are not supported\"\n    end\n\n    def self.use_helper(helper_method, from: nil, prefix: false)\n      raise NotImplementedError, \"roundhouse: use_helpers is not supported\"\n    end\n\n    def __vc_call_slot_function(slot_name, *args, **kwargs, &block)\n      raise(InvalidSlotDefinitionError)\n    end\n\n    def self.build_i18n_backend\n      nil\n    end\n\n    def self.translate(key = nil, **options)\n      raise NotImplementedError, \"roundhouse: component translations are not supported\"\n    end\n\n    def self.t(key = nil, **options)\n      raise NotImplementedError, \"roundhouse: component translations are not supported\"\n    end\n  end\n\n  module Translatable\n    def translate(key = nil, **options)\n      raise NotImplementedError, \"roundhouse: component translations are not supported\"\n    end\n\n    def t(key = nil, **options)\n      raise NotImplementedError, \"roundhouse: component translations are not supported\"\n    end\n  end\n\n  module Slotable\n    def set_slot(slot_name, slot_definition = nil, *args, **kwargs, &block)\n      slot_definition ||= self.class.registered_slots[slot_name]\n      slot = Slot.new(self)\n      slot.__vc_content_block = block if block\n      if slot_definition[:renderable]\n        slot.__vc_component_instance = slot_definition[:renderable].new(*args, **kwargs)\n      elsif slot_definition[:renderable_class_name]\n        slot.__vc_component_instance = self.class.const_get(slot_definition[:renderable_class_name]).new(*args, **kwargs)\n      elsif slot_definition[:renderable_function]\n        renderable_value =\n          if block\n            __vc_call_slot_function(slot_definition[:renderable_function], *args, **kwargs) do |*rargs|\n              view_context.capture(*rargs, &block)\n            end\n          else\n            __vc_call_slot_function(slot_definition[:renderable_function], *args, **kwargs)\n          end\n        if renderable_value.respond_to?(:render_in)\n          slot.__vc_component_instance = renderable_value\n        else\n          slot.__vc_content = renderable_value\n        end\n      end\n      @__vc_set_slots ||= {}\n      if slot_definition[:collection]\n        @__vc_set_slots[slot_name] ||= []\n        @__vc_set_slots[slot_name].push(slot)\n      else\n        @__vc_set_slots[slot_name] = slot\n      end\n      slot\n    end\n  end\n\n  class Slot\n    def to_s\n      return @content if defined?(@content)\n      view_context = @parent.send(:view_context)\n      if defined?(@__vc_content_block) && defined?(@__vc_content_set_by_with_content)\n        raise DuplicateSlotContentError.new(self.class.name)\n      end\n      @content =\n        if __vc_component_instance?\n          @__vc_component_instance.__vc_original_view_context = @parent.__vc_original_view_context\n          if defined?(@__vc_content_block)\n            @__vc_component_instance.render_in(view_context) do |*args|\n              @__vc_content_block.call(*args)\n            end\n          else\n            @__vc_component_instance.render_in(view_context)\n          end\n        elsif defined?(@__vc_content)\n          @__vc_content\n        elsif defined?(@__vc_content_block)\n          view_context.capture(&@__vc_content_block)\n        elsif defined?(@__vc_content_set_by_with_content)\n          @__vc_content_set_by_with_content\n        end\n      @content = @content.to_s\n    end\n  end\nend\n";
     if let Ok(replacements) = super::library_class::ingest_library_classes(hook.as_bytes(), VIEW_COMPONENT_HOOK) {
         for replacement in replacements {
             // Every part of the class drops the gem's own definition (a reopening holds one too), and the first takes
@@ -1334,13 +1336,50 @@ fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
             }
         }
     }
+    // The run-time template compiler the hook's `compile` no longer calls, and Base's `method_missing`, which the gem
+    // defines only in development and test to hint at `helpers.`: Rails' production class has none.
+    for lc in app.library_classes.iter_mut() {
+        let unused: &[&str] = match lc.name.0.as_str() {
+            "ViewComponent::Compiler" => &["define_render_template_for", "gather_templates", "template_errors"],
+            "ViewComponent::Template" => &["compile_to_component", "compiled_source"],
+            "ViewComponent::Base" => &["method_missing"],
+            _ => continue,
+        };
+        lc.methods.retain(|m| m.receiver != crate::dialect::MethodReceiver::Instance || !unused.contains(&m.name.as_str()));
+        lc.conditional_definitions.retain(|c| {
+            !c.arms.iter().all(|arm| arm.methods.iter().all(|m| unused.contains(&m.name.as_str())) && arm.nested.is_empty())
+        });
+    }
     let files: Vec<(String, Vec<crate::ident::ClassId>)> = app.library_class_files.iter().filter(|(path, _)| path.starts_with("app/components/") || path.contains("/app/components/")).cloned().collect();
     for (path, names) in files {
         let Some(file_stem) = path.strip_suffix(".rb") else { continue };
         let file_leaf = file_stem.rsplit_once('/').map_or(file_stem, |(_, n)| n);
         for class in &names {
             if renders_as_component(app, class) {
+                // Base.inherited's `child.include Rails.application.routes.url_helpers unless child < url_helpers`, which a
+                // tree's ancestry fixes as it builds (Spinel's): a component under another already has them.
+                let inherits_them = app
+                    .library_classes
+                    .iter()
+                    .filter(|c| &c.name == class)
+                    .find_map(|c| c.parent.clone())
+                    .is_some_and(|parent| parent.0.as_str() != "ViewComponent::Base" && renders_as_component(app, &parent));
+                if !inherits_them
+                    && let Some(lc) = app.library_classes.iter_mut().find(|c| &c.name == class)
+                    && !lc.includes.iter().any(|i| i.0.as_str() == "RouteHelpers")
+                {
+                    lc.includes.insert(0, crate::ident::ClassId(crate::ident::Symbol::from("RouteHelpers")));
+                    lc.include_spans.insert(0, crate::span::Span::synthetic());
+                }
                 view_component_slots(app, vfs, &path, class);
+                let instance = translations_answered(app, class, crate::dialect::MethodReceiver::Instance);
+                let singleton = translations_answered(app, class, crate::dialect::MethodReceiver::Class);
+                for lc in app.library_classes.iter().filter(|c| &c.name == class) {
+                    for m in &lc.methods {
+                        let answered = if m.receiver == crate::dialect::MethodReceiver::Class { &singleton } else { &instance };
+                        report_component_translations(&m.body, answered);
+                    }
+                }
             }
             // Each class's own template: the file's class beside it (as the file is spelled: maybe's `DS/button.rb`),
             // a class nested in it under the file's name (`Outer::InnerComponent` in outer_component.rb is
@@ -1351,11 +1390,22 @@ fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
             let template = [format!("{stem}.html.erb"), format!("{stem}/{leaf}.html.erb")]
                 .into_iter()
                 .find(|t| vfs.exists(std::path::Path::new(t)));
-            let Some(template) = template else { continue };
-            let Ok(source) = vfs.read_to_string(std::path::Path::new(&template)) else { continue };
+            // Else the template its class body writes (`erb_template <<~ERB … ERB`, maybe's `DS::Tabs::Nav`), whose
+            // call the gem answers with a `class_eval` of the compiled source: compiled here as a sidecar file is.
+            let (template, source) = match template {
+                Some(template) => {
+                    let Ok(source) = vfs.read_to_string(std::path::Path::new(&template)) else { continue };
+                    (template, source)
+                }
+                None => {
+                    let Some(source) = take_inline_erb_template(app, class) else { continue };
+                    (format!("{stem}.inline.html.erb"), source)
+                }
+            };
             if !renders_as_component(app, class) {
                 continue;
             }
+            let answered_here = translations_answered(app, class, crate::dialect::MethodReceiver::Instance);
             let Some(lc) = app.library_classes.iter_mut().find(|c| &c.name == class) else { continue };
             if lc.methods.iter().any(|m| m.name.as_str() == "call" && m.receiver == crate::dialect::MethodReceiver::Instance) {
                 continue;
@@ -1364,6 +1414,7 @@ fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
             let (compiled, map) = crate::erb::compile_erb_mapped(&source);
             let Ok(mut body) = super::expr::ingest_ruby_program(&compiled, &template) else { continue };
             crate::erb::translate_spans(&mut body, &map);
+            report_component_translations(&body, &answered_here);
             // Not its own file's: one outside the app's `app/components` (a gem's) was not registered before the index.
             if late {
                 synthetic_constants(&mut body);
@@ -1377,12 +1428,85 @@ fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
     }
 }
 
+/// A component class body's `erb_template "…"`, taken out of the body: the template it names is compiled into `call`.
+fn take_inline_erb_template(app: &mut App, class: &crate::ident::ClassId) -> Option<String> {
+    // A heredoc reads as an interpolation of its lines; one with no `#{}` is its text.
+    fn text(e: &Expr) -> Option<String> {
+        match &*e.node {
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+            ExprNode::StringInterp { parts } => parts
+                .iter()
+                .map(|p| match p {
+                    crate::expr::InterpPart::Text { value } => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|t| t.concat()),
+            _ => None,
+        }
+    }
+    for lc in app.library_classes.iter_mut().filter(|c| &c.name == class) {
+        let at = lc.unknown_calls.iter().position(|call| {
+            matches!(&*call.node, ExprNode::Send { recv: None, method, args, .. }
+                if method.as_str() == "erb_template" && matches!(args.as_slice(), [arg] if text(arg).is_some()))
+        });
+        if let Some(at) = at {
+            let call = lc.unknown_calls.remove(at);
+            let ExprNode::Send { args, .. } = &*call.node else { unreachable!() };
+            return text(&args[0]);
+        }
+    }
+    None
+}
+
 /// The hook's constants read from the program's classes, not from an index of a file none was built for.
 fn synthetic_constants(e: &mut Expr) {
     if matches!(&*e.node, ExprNode::Const { .. }) {
         e.span = crate::span::Span::synthetic();
     }
     e.node.for_each_child_mut(&mut |c| synthetic_constants(c));
+}
+
+/// A component's `t` / `translate`, which the hook answers with a raise: the gem's per-component I18n backend (sidecar
+/// `*.yml` loaded into an `I18n::Backend::Simple` subclass) is not modelled.
+/// Which of `t` / `translate` a component's own lineage answers below `ViewComponent::Base` (its own class, an
+/// `ApplicationComponent` it extends) on `receiver`'s side, each apart: one does not answer the other's calls.
+fn translations_answered(app: &App, class: &crate::ident::ClassId, receiver: crate::dialect::MethodReceiver) -> Vec<&'static str> {
+    let mut answered = Vec::new();
+    let mut current = Some(class.clone());
+    for _ in 0..32 {
+        let Some(name) = current else { break };
+        if name.0.as_str() == "ViewComponent::Base" {
+            break;
+        }
+        let mut parent = None;
+        for c in app.library_classes.iter().filter(|c| c.name == name) {
+            for method in ["t", "translate"] {
+                if c.methods.iter().any(|m| m.receiver == receiver && m.name.as_str() == method) && !answered.contains(&method) {
+                    answered.push(method);
+                }
+            }
+            parent = parent.or_else(|| c.parent.clone());
+        }
+        current = parent;
+    }
+    answered
+}
+
+fn report_component_translations(body: &Expr, answered: &[&str]) {
+    if let ExprNode::Send { recv: None, method, .. } = &*body.node
+        && matches!(method.as_str(), "t" | "translate")
+        && !answered.contains(&method.as_str())
+        && !body.span.is_synthetic()
+    {
+        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+            body.span,
+            None,
+            "view_component",
+            "a component's translation (its sidecar locale files read through the gem's I18n backend) is not supported",
+        ));
+    }
+    body.node.for_each_child(&mut |c| report_component_translations(c, answered));
 }
 
 fn unsupported_component_macro(call: &ruby_prism::CallNode<'_>) -> Option<&'static str> {
@@ -1512,6 +1636,26 @@ fn view_component_slots<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V, pat
         }
         source.push_str(&format!("  def {name}\n    get_slot(:{name})\n  end\n\n  def {name}?\n    get_slot(:{name}).present?\n  end\n\n"));
     }
+    // Not the gem's `instance_method(:"_call_#{name}")`, a name built as it runs: the lambda slots' methods, by name.
+    let mut lambdas: Vec<String> = app
+        .library_classes
+        .iter()
+        .filter(|c| &c.name == class)
+        .flat_map(|c| c.methods.iter())
+        .filter_map(|m| m.name.as_str().strip_prefix("_call_").map(str::to_string))
+        .collect();
+    for (name, ..) in calls.iter().filter(|(_, _, _, lambda)| lambda.is_some()) {
+        if !lambdas.contains(name) {
+            lambdas.push(name.clone());
+        }
+    }
+    if !lambdas.is_empty() {
+        source.push_str("  def __vc_call_slot_function(slot_name, *args, **kwargs, &block)\n    case slot_name\n");
+        for name in lambdas {
+            source.push_str(&format!("    when :{name}\n      _call_{name}(*args, **kwargs, &block)\n"));
+        }
+        source.push_str("    else\n      super\n    end\n  end\n");
+    }
     source.push_str("end\n");
     let file = format!("(roundhouse)/view_component_slots/{}.rb", crate::naming::underscore(class.0.as_str()));
     let classes = match super::library_class::ingest_library_classes(source.as_bytes(), &file) {
@@ -1527,6 +1671,10 @@ fn view_component_slots<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V, pat
             synthetic_constants(&mut method.body);
             if let Some(first) = first {
                 method.name_span = crate::span::Span { file: first.file, start: first.start.saturating_sub(1), end: first.start.saturating_sub(1) };
+            }
+            // Not the first file's dispatcher alone: a reopening's lambda slots join it (rebuilt below).
+            if method.name.as_str() == "__vc_call_slot_function" {
+                lc.methods.retain(|m| m.name.as_str() != "__vc_call_slot_function");
             }
             if !lc.methods.iter().any(|m| m.name == method.name && m.receiver == method.receiver) {
                 lc.methods.push(method);
@@ -1576,6 +1724,67 @@ fn renders_as_component(app: &App, class: &crate::ident::ClassId) -> bool {
     false
 }
 
+/// `<%= helper do %>INNER<% end %>` as Rails' `capture` runs it: INNER writes a buffer of its own, which the block
+/// answers marked safe, not the template's `_buf`, which would take INNER ahead of the helper's own markup.
+fn capture_output_blocks(e: &mut Expr, depth: usize, prefix: &str) {
+    // Under the escaping `html_escape((EXPR).to_s)` and the `.to_s` the compile closes the block with.
+    fn output_block_body(e: &mut Expr) -> Option<&mut Expr> {
+        let step = match &*e.node {
+            ExprNode::Send { method, args, block: None, .. } if method.as_str() == "html_escape" && args.len() == 1 => 1,
+            ExprNode::Send { recv: Some(_), method, args, block: None, .. } if method.as_str() == "to_s" && args.is_empty() => 2,
+            _ => 0,
+        };
+        match (&mut *e.node, step) {
+            (ExprNode::Send { args, .. }, 1) => output_block_body(&mut args[0]),
+            (ExprNode::Send { recv: Some(recv), .. }, 2) => output_block_body(recv),
+            (ExprNode::Send { block: Some(block), .. }, _) => match &mut *block.node {
+                ExprNode::Lambda { body, .. } => Some(body),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn writes_buf(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "_buf");
+        e.node.for_each_child(&mut |c| found = found || writes_buf(c));
+        found
+    }
+    fn rename(e: &mut Expr, to: &crate::ident::Symbol) {
+        match &mut *e.node {
+            ExprNode::Var { name, .. } | ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "_buf" => *name = to.clone(),
+            _ => {}
+        }
+        e.node.for_each_child_mut(&mut |c| rename(c, to));
+    }
+    if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &mut *e.node
+        && name.as_str() == "_buf"
+        && let ExprNode::Send { method, args, .. } = &mut *value.node
+        && method.as_str() == "+"
+        && let [arg] = args.as_mut_slice()
+    {
+        let inner = output_block_body(arg);
+        if let Some(body) = inner
+            && writes_buf(body)
+        {
+            capture_output_blocks(body, depth + 1, prefix);
+            let cap = crate::ident::Symbol::from(format!("{prefix}{depth}").as_str());
+            rename(body, &cap);
+            let span = body.span;
+            let init = Expr::new(span, ExprNode::Assign {
+                target: LValue::Var { name: cap.clone(), id: crate::ident::VarId(0) },
+                value: Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Str { value: String::new() } }),
+            });
+            let helpers = Expr::new(crate::span::Span::synthetic(), ExprNode::Const { path: vec![crate::ident::Symbol::from("ActionView"), crate::ident::Symbol::from("ViewHelpers")] });
+            let read = Expr::new(span, ExprNode::Var { name: cap, id: crate::ident::VarId(0) });
+            let result = Expr::new(span, ExprNode::Send { recv: Some(helpers), method: crate::ident::Symbol::from("raw"), args: vec![read], block: None, parenthesized: true });
+            let old = std::mem::replace(body, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+            *body = Expr::new(span, ExprNode::Seq { exprs: vec![init, old, result] });
+            return;
+        }
+    }
+    e.node.for_each_child_mut(&mut |c| capture_output_blocks(c, depth, prefix));
+}
+
 /// A compiled template's `_buf = _buf + (EXPR).to_s` as Rails' `<%= %>` writes it: escaped unless html_safe; its text
 /// as written; and the buffer, at the end, marked safe as a template's output is. Not with `.html_safe`, which the
 /// emit drops from an app's code: `ActionView::ViewHelpers.raw`, which it keeps.
@@ -1603,6 +1812,21 @@ fn escape_template_output(body: &mut Expr) {
         e.node.for_each_child_mut(&mut |c| walk(c));
     }
     walk(body);
+    // Not a name the template's own code holds: its locals live in the same method.
+    fn locals(e: &Expr, out: &mut Vec<String>) {
+        match &*e.node {
+            ExprNode::Var { name, .. } | ExprNode::Assign { target: LValue::Var { name, .. }, .. } => out.push(name.as_str().to_string()),
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| locals(c, out));
+    }
+    let mut held = Vec::new();
+    locals(body, &mut held);
+    let mut prefix = String::from("_vc_cap");
+    while held.iter().any(|n| n.starts_with(&prefix)) {
+        prefix.push('_');
+    }
+    capture_output_blocks(body, 1, &prefix);
     if let ExprNode::Seq { exprs } = &mut *body.node
         && let Some(last) = exprs.last_mut()
         && matches!(&*last.node, ExprNode::Var { name, .. } if name.as_str() == "_buf")
