@@ -60,7 +60,8 @@ module ActiveRecord
         String? from,
         bool readonly,
         String lock_clause,
-        bool friendly
+        bool friendly,
+        bool reordering
       ) -> Relation
     def drop_inherited_scope!: () -> Relation
 

@@ -597,7 +597,10 @@ fn untyped_subexpressions_baseline() {
     // MEASURED 1343 on partial-select reads (1342): `read_attribute`
     // checks its `name` against the row's unloaded columns before it
     // reads `self[name]` (+1 in active_record/connection.rb).
-    const CEILING: usize = 1343;
+    // MEASURED 1345 on scoped reordering (1343): `copy_query_state_to`
+    // hands `take_query_scalars` the relation's `@reordering` too, a var
+    // on this RBS-less probe at both ends (+2 in active_record/relation.rb).
+    const CEILING: usize = 1345;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

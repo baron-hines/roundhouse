@@ -285,11 +285,12 @@ module ActiveRecord
         @from,
         @readonly,
         @lock_clause,
-        @friendly
+        @friendly,
+        @reordering
       )
     end
 
-    def take_query_scalars(select_sql, distinct, hints, limit, offset, skip_preloading, null, none, opaque, from, readonly, lock_clause, friendly)
+    def take_query_scalars(select_sql, distinct, hints, limit, offset, skip_preloading, null, none, opaque, from, readonly, lock_clause, friendly, reordering)
       @select_sql = select_sql
       @distinct = distinct
       @optimizer_hints = hints
@@ -303,6 +304,7 @@ module ActiveRecord
       @readonly = readonly
       @lock_clause = lock_clause
       @friendly = friendly
+      @reordering = reordering
       unload_records
       self
     end

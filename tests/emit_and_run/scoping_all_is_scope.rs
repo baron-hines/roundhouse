@@ -48,6 +48,8 @@ end
     check("scoping where", Book.where(title: "Emma").scoping { Book.all.map(&:title) }, ["Emma"])
     check("class-level count under scoping", Book.where(title: "Emma").scoping { Book.count }, 1)
     check("association under scoping", Book.where(title: "Emma").scoping { library.books.on_shelf }, ["Dune", "Emma", "Ivanhoe", "Ulysses"])
+    shelf = Book.order(:id)
+    check("scoping reorder merged", Book.reorder(title: :desc).scoping { shelf.merge(Book.all).map(&:title) }, ["Ulysses", "Ivanhoe", "Emma", "Dune"])
     check("restored after", Book.all.map(&:title), ["Dune", "Emma", "Ivanhoe", "Ulysses"])
   end
 end
