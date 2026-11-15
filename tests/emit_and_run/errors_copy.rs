@@ -55,10 +55,21 @@ end
     [c.errors.full_messages, c.errors.empty?]
   end
 
+  # Rails: [["is smudged"], ["is smudged!"]]
+  def self.copied_messages_are_their_own_strings
+    s = Sketch.new(caption: "x", ink_colour: "black")
+    s.errors.add(:caption, String.new("is smudged"))
+    c = Poster.new(caption: "ok")
+    c.errors.copy!(s.errors)
+    s.errors.objects.first.message << "!"
+    [c.errors[:caption], s.errors[:caption]]
+  end
+
   def self.run
     check("copy_replaces_own_errors", copy_replaces_own_errors == [["Caption can't be blank", "Ink colour is not included in the list"], [:caption, :ink_colour]])
     check("copies_are_independent", copies_are_independent == [["can't be blank"], 2, 2])
     check("copy_of_no_errors_clears", copy_of_no_errors_clears == [[], true])
+    check("copied_messages_are_their_own_strings", copied_messages_are_their_own_strings == [["is smudged"], ["is smudged!"]])
   end
 end
 "##)

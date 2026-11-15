@@ -537,7 +537,11 @@ module ActiveSupport
     return details if others.equal?(details)
     errors.clear
     details.clear
-    others.each { |error| errors_import(errors, details, error, nil, names, before, between, after) }
+    # Each copy's Strings are its own, as Rails' deep_dup of an error dups its attribute and type.
+    others.each do |error|
+      copy = ActiveRecord::ErrorDetail.new(error.attribute.dup, error.kind.dup, error.message.dup, error.full_message.dup, error.symbolic, error.optionless)
+      errors_import(errors, details, copy, nil, names, before, between, after)
+    end
     details
   end
 
