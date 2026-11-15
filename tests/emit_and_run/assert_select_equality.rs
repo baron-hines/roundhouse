@@ -21,6 +21,7 @@ class ListingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "aside.sidebar", false
     assert_select "table", 0
     assert_select "p#notice", false
+    assert_select "a[href='/articles?page=2']", false
   end
 "##;
 

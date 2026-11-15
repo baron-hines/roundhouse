@@ -3016,10 +3016,11 @@ module RequestDispatch
     nodes = Dom.select(Dom.parse(body), selector)
     options = content_or_opts.is_a?(Hash) ? content_or_opts : opts
     # rails-dom-testing's equality `false` or `0` is `count: 0`
-    # (`HTMLSelector#equality_tests`); `true` is presence, below. Not
-    # while the selector still holds a `?`: Rails would substitute the
-    # value there, which only a String gets above.
-    none = !selector.to_s.include?("?") && (content_or_opts == false || content_or_opts == 0)
+    # (`HTMLSelector#equality_tests`); `true` is presence, below. A `0`
+    # is not one while the selector still holds a `?`: Rails substitutes
+    # a number there (`SubstitutionContext`), which only a String gets
+    # above. `false` is never substituted.
+    none = content_or_opts == false || (content_or_opts == 0 && !selector.to_s.include?("?"))
     if none || (options.is_a?(Hash) && options[:count] == 0)
       raise "expected no #{selector.inspect} in response body" unless nodes.empty?
       return
