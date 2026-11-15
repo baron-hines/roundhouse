@@ -625,25 +625,30 @@ fn untyped_subexpressions_baseline() {
     // leaves out the row's unloaded columns, reading each column `name` in its
     // block, a var on this RBS-less probe (+1); connection.rbs types it for the
     // RBS-paired gate, which stays at 0.
-    // MEASURED 1417 on has_many merges (1352): the parameters and block
+    // MEASURED 1420 on has_many merges (1355): the parameters and block
     // values of the runtime methods this branch adds, vars on this
     // RBS-less probe. In active_record/relation.rb, `qualify_order_term`
     // (+25) and `merge_through_scope` (+10). In
     // active_record/connection.rb, `_merge_target` (+24) and
     // `_take_unchanged_attributes` (+6). relation.rbs and connection.rbs
     // type them for the RBS-paired gate, which stays at 0.
-    // MEASURED 1421 on multi-column through ordering (1417):
+    // MEASURED 1424 on multi-column through ordering (1420):
     // `merge_through_scope` splits each order clause on commas before
     // qualifying it. `o.split(",")` and `clause.strip` are untyped on
     // this RBS-less probe, and so are their `o` / `clause` receivers
     // (+4 in active_record/relation.rb). relation.rbs types them for the
     // RBS-paired gate, which stays at 0.
-    // MEASURED 1422 on a nil through-scope body (1421):
+    // MEASURED 1425 on a nil through-scope body (1424):
     // `merge_through_scope`'s `return self if other.nil?` reads `other`
     // once more, a var on this RBS-less probe (+1 in
     // active_record/relation.rb); relation.rbs types it for the
     // RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1422;
+    // MEASURED 1427 on expression orderings of a through scope (1425):
+    // `merge_through_scope` asks each ordering clause whether it holds a
+    // parenthesis or a quote before it splits it, two reads of a var on
+    // this RBS-less probe (+2 in active_record/relation.rb); relation.rbs
+    // types it for the RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1427;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

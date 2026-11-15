@@ -1668,7 +1668,10 @@ module ActiveRecord
         @opaque_wheres = true
       end
       other.order_clauses.each do |o|
-        o.split(",").each do |clause|
+        # A clause with parentheses or a quoted literal is an expression
+        # (`COALESCE(a, b)`), whose commas are not term separators: kept whole.
+        clauses = o.include?("(") || o.include?("'") ? [o] : o.split(",")
+        clauses.each do |clause|
           term = qualify_order_term(clause.strip, other.table_sql)
           @orders << term unless @orders.include?(term)
         end

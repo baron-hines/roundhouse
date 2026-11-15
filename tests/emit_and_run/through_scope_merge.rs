@@ -28,6 +28,12 @@ end
   has_many :two_key_plants, through: :two_key_beds, source: :plants
   has_many :ignored_beds, -> { where(fallow: false); nil }, class_name: "Bed"
   has_many :ignored_plants, through: :ignored_beds, source: :plants
+  has_many :false_beds, -> { where(fallow: false); false }, class_name: "Bed"
+  has_many :false_plants, through: :false_beds, source: :plants
+  has_many :computed_beds, -> { where(fallow: false) unless Bed.exists? }, class_name: "Bed"
+  has_many :computed_plants, through: :computed_beds, source: :plants
+  has_many :coalesced_beds, -> { where(fallow: false).order(Arel.sql("COALESCE(NULL, beds.position) DESC")) }, class_name: "Bed"
+  has_many :coalesced_plants, through: :coalesced_beds, source: :plants
 end
 "##)
         .write("app/models/bed.rb", r##"class Bed < ApplicationRecord
@@ -84,6 +90,10 @@ end
     # Rails: a scope whose body answers nil stands for the unscoped
     # relation, so its `where` is discarded and the fallow bed is back.
     check("nil scope body", g.ignored_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
+    check("false scope body", g.false_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
+    check("computed nil scope body", g.computed_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
+    # Rails: an expression ordering keeps its commas
+    check("expression order", g.coalesced_plants.map(&:name).first == "kale")
   end
 end
 "##)
