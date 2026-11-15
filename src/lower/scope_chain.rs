@@ -2728,7 +2728,18 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             // reader's Array too.
                             | "load" | "load_async" | "from" | "extract_associated"
                     ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
-            if is_where || method.as_str().starts_with("find_by_") && block.is_none()
+            // `owner.items.update(attrs)` alone in a method body is the
+            // proxy's bulk update over the records the association holds
+            // (`rewrite_send` lowers it to the generated
+            // `__<name>_update`). Array answers no one-Hash `update`, so
+            // the site is a NoMethodError today and a call after. Only
+            // this exact shape — one Hash argument, no block — is
+            // admitted; which associations the model actually holds is
+            // the rewriter's check, as it is for every gate here.
+            let is_held_update = method.as_str() == "update"
+                && block.is_none()
+                && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Hash { .. }));
+            if is_where || is_held_update || method.as_str().starts_with("find_by_") && block.is_none()
                 || is_relation_terminal(method.as_str(), args, block.as_ref())
                     && matches!(
                         method.as_str(),
@@ -7222,6 +7233,83 @@ mod tests {
             matches!(&*r.node, ExprNode::Send { recv: None, .. }),
             "a non-association bare read keeps its shape, got {:?}",
             r.node
+        );
+    }
+
+    /// `owner.items.update(attrs)` alone in a method body is the one
+    /// association call no gate used to admit: a body whose only relation
+    /// surface is the proxy's bulk update reached no rewriter and stayed
+    /// `Array#update`. The lookup gate now admits exactly that shape, and
+    /// the rewrite still requires the model to HOLD the association, so a
+    /// plain has_many keeps the call it had.
+    #[test]
+    fn a_lone_held_update_is_admitted_and_a_plain_has_many_is_left_alone() {
+        let kennel = ingest(
+            "class Kennel < ApplicationRecord\n  has_many :dogs\nend\n",
+            "app/models/kennel.rb",
+        );
+        let dog = ingest(
+            "class Dog < ApplicationRecord\n  belongs_to :kennel\nend\n",
+            "app/models/dog.rb",
+        );
+        let models_v = vec![kennel.clone(), dog];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let mut assocs = build_assoc_registry(&models_v);
+        let owner = kennel.name.clone();
+        let body = || {
+            let read = Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(span(), ExprNode::SelfRef)),
+                    method: Symbol::from("dogs"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(read),
+                    method: Symbol::from("update"),
+                    args: vec![hash_arg(vec![(sym_lit("age"), int_lit(7))])],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        };
+
+        let plain = body();
+        assert!(mentions_assoc_lookup(&plain, &assocs), "the gate admits the one-hash update");
+        let mut plain_rewritten = body();
+        rewrite_call_site(&mut plain_rewritten, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { method, .. } = &*plain_rewritten.node else {
+            panic!("expected Send, got {:?}", plain_rewritten.node)
+        };
+        assert_eq!(
+            method.as_str(),
+            "update",
+            "an association the model does not hold keeps its reader call: {:?}",
+            plain_rewritten.node
+        );
+
+        assocs.has_many_held.insert((owner.clone(), Symbol::from("dogs")));
+        let mut held = body();
+        rewrite_call_site(&mut held, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { method, .. } = &*held.node else {
+            panic!("expected Send, got {:?}", held.node)
+        };
+        assert_eq!(method.as_str(), "__dogs_update", "held association: {:?}", held.node);
+
+        // Nothing broader: a variable argument is not the shape.
+        let mut var_arg = body();
+        if let ExprNode::Send { args, .. } = &mut *var_arg.node {
+            args[0] = Expr::new(span(), ExprNode::Var { id: VarId(0), name: Symbol::from("attrs") });
+        }
+        assert!(
+            !mentions_assoc_lookup(&var_arg, &assocs),
+            "a bare variable argument is not admitted"
         );
     }
 

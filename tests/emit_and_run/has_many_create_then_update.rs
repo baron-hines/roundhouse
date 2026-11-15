@@ -14,6 +14,10 @@ end
 "##)
         .write("app/models/kennel.rb", r##"class Kennel < ApplicationRecord
   has_many :dogs
+
+  def retagged
+    dogs.update(age: 7)
+  end
 end
 "##)
         .write("app/models/dog.rb", r##"class Dog < ApplicationRecord
@@ -34,6 +38,13 @@ end
     # Rails: the held record itself is updated and saved
     check("held record updated", d.age == 3 && updated.length == 1 && updated.first.equal?(d))
     check("row updated", Dog.find(d.id).age == 3)
+    # Rails: a method whose body is only the association's `update` runs
+    # the proxy's, updating the records the owner holds
+    m = Kennel.create!(name: "second")
+    mdog = m.dogs.create!(name: "fido", age: 1)
+    retagged = m.retagged
+    check("method body update", retagged.length == 1 && retagged.first.equal?(mdog) && mdog.age == 7)
+    check("method body row", Dog.find(mdog.id).age == 7)
   end
 end
 "##)

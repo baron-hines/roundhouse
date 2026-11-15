@@ -963,6 +963,14 @@ impl Analyzer {
                         && scope.as_ref().is_none_or(crate::lower::scope_chain::scope_is_row_preserving)
                     {
                         cls.direct_has_many.insert(name.clone());
+                        // Mirrors `lower::scope_chain::build_assoc_registry`'s
+                        // `has_many_held`: the association holds what app code
+                        // builds, creates or pushes onto it.
+                        if model.methods().any(|m| {
+                            m.name.as_str() == format!("__hold_{}", name.as_str())
+                        }) {
+                            cls.held_has_many.insert(name.clone());
+                        }
                     }
                     for m in extension {
                         cls.assoc_extensions
