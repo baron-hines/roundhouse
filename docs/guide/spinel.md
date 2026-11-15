@@ -200,6 +200,11 @@ PostgreSQL schema of its own, created when it starts and dropped when it
 exits; every connection of the pool takes it as its `search_path`, as
 Rails' `schema_search_path` setting does.
 
+A generated column whose expression is PostgreSQL's own SQL (`::numeric`
+casts, `CASE … = ANY (ARRAY[…])`) is carried as written, and a decimal
+column keeps its `numeric(precision,scale)`. A target that runs SQLite
+refuses such a schema instead of dropping the column.
+
 Not carried yet:
 
 - array columns (`array: true`), which are stored as JSON text;

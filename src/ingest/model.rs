@@ -161,7 +161,7 @@ pub(super) fn ingest_model_with_enum_constants(
         let mut class_consts = ClassConsts::collect(&stmts, file);
         class_consts.set_lexical_scope(
             name_path.len() == 1,
-            enum_constants.nested_names(),
+            enum_constants.ancestor_names(class_name.as_str()),
             enum_constants.top_level_names(),
         );
         class_consts.import(&stmts, enum_constants, &enum_owners);

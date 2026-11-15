@@ -863,7 +863,7 @@ fn fold_column(
     }
     let generated_option = has_generated_column_options(option_args);
     let generated = ty == "virtual" || generated_option;
-    let col = if generated {
+    let mut col = if generated {
         if verb == "change_column" {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -906,6 +906,7 @@ fn fold_column(
         }
         col
     };
+    let mut promoted_others: Vec<Symbol> = Vec::new();
     if let Some(table) = schema.tables.get(&Symbol::from(t)) {
         // This fold replaces a same-named column for both
         // verbs. Do not let an ordinary add/change erase the
@@ -933,11 +934,22 @@ fn fold_column(
         let mut candidate = table.clone();
         candidate.columns.retain(|existing| existing.name != col.name);
         candidate.columns.push(col.clone());
+        promote_native_generated(&mut candidate, dialect);
+        if let Some(promoted) = candidate.columns.last() {
+            col = promoted.clone();
+        }
+        // Not only the folded column: a change to an operand may move another's expression out of the shared grammar.
+        promoted_others = candidate.columns.iter().filter(|c| c.name != col.name && c.generated.as_ref().is_some_and(|g| g.native)).map(|c| c.name.clone()).collect();
         if table.columns.iter().any(|column| column.generated.is_some()) || col.generated.is_some() {
             validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
         }
     }
     if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+        for other in table.columns.iter_mut().filter(|c| promoted_others.contains(&c.name)) {
+            if let Some(generated) = other.generated.as_mut() {
+                generated.native = true;
+            }
+        }
         match table.columns.iter().position(|x| x.name == col.name) {
             // `change_column` redefines the column where it stands.
             Some(at) if verb == "change_column" => table.columns[at] = col,
@@ -1315,6 +1327,31 @@ fn refuse_indexed_generated_column_mutation(
 /// Keep migration-derived schema state unchanged when a candidate
 /// mutation breaks a generated expression or another generated-table
 /// invariant. Expressions remain source SQL; renames never rewrite them.
+/// Under [`GeneratedExpressionDialect::OtherDatabase`], a generated
+/// expression the shared grammar can't read is the app's database's own SQL:
+/// it is kept as written, marked native, when nothing else about the column
+/// is refused.
+fn promote_native_generated(table: &mut Table, dialect: GeneratedExpressionDialect) {
+    if dialect != GeneratedExpressionDialect::OtherDatabase {
+        return;
+    }
+    for at in 0..table.columns.len() {
+        let column = &table.columns[at];
+        if column.generated.as_ref().is_none_or(|g| g.native)
+            || crate::schema::generated::validate_column_with_dialect(table, column, dialect).is_ok()
+        {
+            continue;
+        }
+        let mut native = column.clone();
+        if let Some(generated) = native.generated.as_mut() {
+            generated.native = true;
+        }
+        if crate::schema::generated::validate_column_with_dialect(table, &native, dialect).is_ok() {
+            table.columns[at] = native;
+        }
+    }
+}
+
 fn validate_generated_migration_candidate(
     table: &Table,
     verb: &str,
@@ -2223,6 +2260,7 @@ fn table_from_create_table(
     if table.primary_key_columns.iter().any(|k| !table.columns.iter().any(|c| &c.name == k)) {
         gaps.push(IngestError::Unsupported { file: file.into(), message: format!("primary key on {table_name} names a column the schema does not model") });
     }
+    promote_native_generated(&mut table, dialect);
     let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
     for (column, reason) in &invalid_generated {
         gaps.push(IngestError::Unsupported {
@@ -2546,6 +2584,11 @@ struct ColumnOpts {
     /// `change_column` keeps the old default only when it was not.
     default_given: bool,
     limit: Option<u32>,
+    /// A decimal's `precision:` and `scale:` (PostgreSQL's `numeric(p,s)` rounds to them).
+    precision: Option<u32>,
+    scale: Option<u32>,
+    /// A `precision:`/`scale:` written as a value the column type can't hold (a negative scale).
+    unheld_decimal: Option<String>,
     /// A present array option is non-scalar unless explicitly false or nil.
     array: bool,
     /// `default: []`, which `default_value` reads as no default.
@@ -2700,6 +2743,11 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         }
                     }
                 }
+                "precision" | "scale" => match integer_value(value).map(u32::try_from) {
+                    Some(Ok(n)) => if key == "precision" { opts.precision = Some(n) } else { opts.scale = Some(n) },
+                    Some(Err(_)) => opts.unheld_decimal = Some(format!("{key} {}", integer_value(value).unwrap_or_default())),
+                    None => {}
+                },
                 "array" => {
                     opts.array = match bool_value(value) {
                         Some(enabled) => enabled,
@@ -2844,6 +2892,14 @@ fn generated_column_from_options(
                     };
                     opts.limit = Some(limit);
                 }
+                "precision" | "scale" => {
+                    let Some(n) = integer_value(&value).and_then(|n| u32::try_from(n).ok()) else {
+                        return Err(unsupported(format!(
+                            "generated column {key} for {table}.{col_name} must be a non-negative integer"
+                        )));
+                    };
+                    if key == "precision" { opts.precision = Some(n) } else { opts.scale = Some(n) }
+                }
                 "default" => {
                     return Err(unsupported(format!(
                         "generated columns cannot also have a default: {table}.{col_name}"
@@ -2879,6 +2935,7 @@ fn generated_column_from_options(
         } else {
             GeneratedColumnStorage::Virtual
         },
+        native: false,
     });
     Ok(column)
 }
@@ -2931,7 +2988,19 @@ fn column_with_type(
         "integer" | "smallint" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
-        "decimal" | "numeric" => ColumnType::Decimal { precision: None, scale: None },
+        "decimal" | "numeric" => {
+            if let Some(unheld) = &opts.unheld_decimal {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("decimal {unheld} for {table}.{col_name} is beyond what this build carries"),
+                });
+            }
+            let narrow = |n: Option<u32>, what: &str| n.map(u8::try_from).transpose().map_err(|_| IngestError::Unsupported {
+                file: file.into(),
+                message: format!("decimal {what} {} for {table}.{col_name} is beyond what this build carries", n.unwrap_or_default()),
+            });
+            ColumnType::Decimal { precision: narrow(opts.precision, "precision")?, scale: narrow(opts.precision.and(opts.scale), "scale")? }
+        }
         "string" | "inet" | "cidr" | "macaddr" | "enum" => ColumnType::String { limit: opts.limit },
         "text" | "citext" => ColumnType::Text,
         "boolean" => ColumnType::Boolean,
