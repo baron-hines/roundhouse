@@ -3072,7 +3072,11 @@ module ActiveRecord
     # matches. The key keeps its own name as an alias: an ordering term
     # here is unqualified (`order(:id)` is `ORDER BY id`) and reads
     # resolve it against the aliases `_columns_sql` gives every column,
-    # so under a JOIN the subquery needs the same alias for it.
+    # so under a JOIN the subquery needs the same aliases: a joined table
+    # can have a column of the same name (`created_at`), which a bare
+    # term would leave ambiguous. There the window runs over the model's
+    # whole aliased projection, as a read does, and the keys are taken
+    # from that.
     #
     # Returns "" for the unscoped case so an unconditional `delete_all`
     # still emits a bare `DELETE FROM <table>` — Rails' truncate-shaped
@@ -3083,10 +3087,15 @@ module ActiveRecord
       if @joins.length == 0 && !windowed
         return " WHERE #{@wheres.join(" AND ")}"
       end
-      key = "#{@table}.#{@model.primary_key}"
-      key = "#{key} AS #{@model.primary_key}" if windowed
+      primary_key = @model.primary_key
+      if windowed && @joins.length > 0
+        inner = append_window(append_join_where("SELECT #{@model._columns_sql} FROM #{@table}"))
+        return " WHERE #{primary_key} IN (SELECT #{primary_key} FROM (#{inner}) AS __rh_window)"
+      end
+      key = "#{@table}.#{primary_key}"
+      key = "#{key} AS #{primary_key}" if windowed
       inner = append_window(append_join_where("SELECT #{key} FROM #{@table}"))
-      " WHERE #{@model.primary_key} IN (#{inner})"
+      " WHERE #{primary_key} IN (#{inner})"
     end
 
     # `pluck(*cols)` projects raw values, with an Array per row when

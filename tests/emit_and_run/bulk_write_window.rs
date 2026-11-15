@@ -35,12 +35,15 @@ end
     check("joined", [Message.joins(:inbox).where(inboxes: { name: "work" }).order(:id).limit(1).update_all(state: 4), Message.where(state: 4).pluck(:subject)], [1, ["m1"]])
     check("delete", [Message.order(:id).limit(3).delete_all, Message.order(:id).pluck(:subject)], [3, ["m4", "m5", "m6", "m7"]])
     check("no window", [Message.where(state: 0).update_all(state: 5), Message.where(state: 5).pluck(:subject)], [1, ["m4"]])
+    check("joined, a column both tables have", [Message.joins(:inbox).order(state: :desc, id: :asc).limit(1).update_all(state: 6), Message.where(state: 6).pluck(:subject)], [1, ["m4"]])
+    check("joined delete", [Message.joins(:inbox).order(:state, :id).limit(1).delete_all, Message.order(:id).pluck(:subject)], [1, ["m4", "m6", "m7"]])
   end
 end
 "##)
         .write("db/schema.rb", r##"ActiveRecord::Schema.define do
   create_table "inboxes", force: :cascade do |t|
     t.string "name"
+    t.integer "state"
   end
   create_table "messages", force: :cascade do |t|
     t.string "subject"
