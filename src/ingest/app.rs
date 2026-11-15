@@ -597,6 +597,7 @@ fn owns_rack_call(source: &str, target: &str, start: u32) -> bool {
 }
 
 pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<App> {
+    super::model::reset_deferred_state_machines();
     // Front-end dispatch: a rack app with no config/routes.rb whose
     // app.rb subclasses Roda takes the Roda + Sequel walker (issue
     // #67); everything else is a Rails-convention tree.

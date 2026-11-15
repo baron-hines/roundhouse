@@ -566,6 +566,11 @@ thread_local! {
     static DEFERRED_STATE_MACHINES: std::cell::RefCell<Vec<(crate::span::FileId, u32, String, IngestError)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Forget what an earlier ingest attempt on this thread left queued.
+pub(super) fn reset_deferred_state_machines() {
+    DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().clear());
+}
+
 /// Withdraw the gap of each model state-machine block the class body replays (`app_extension_calls`): the gem's
 /// class method runs it as Ruby does.
 pub(super) fn report_unreplayed_state_machines(app: &crate::App) {

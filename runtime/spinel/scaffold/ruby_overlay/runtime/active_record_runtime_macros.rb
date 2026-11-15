@@ -51,7 +51,9 @@ module ActiveRecord
     def self.scope(name, body, &block)
       raise ArgumentError, "roundhouse: a scope's extension block is not supported at run time" if block
       define_singleton_method(name) do |*args, **kwargs|
-        instance_exec(*args, **kwargs, &body) || all
+        # Not only a Proc: Rails calls any body that answers `call`.
+        answer = body.respond_to?(:to_proc) ? instance_exec(*args, **kwargs, &body) : body.call(*args, **kwargs)
+        answer || all
       end
     end
 
