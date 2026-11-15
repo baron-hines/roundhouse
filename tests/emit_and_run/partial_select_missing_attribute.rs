@@ -88,6 +88,16 @@ end
     check("nil assignment rolled back", article.reload.status, "later")
     rolled.save!
     check("nil assignment saved after a rollback", article.reload.status, nil)
+    Article.where(id: article.id).update_all(status: "kept")
+    direct = Article.where(id: article.id).select(:id, :title).take!
+    direct.status = nil
+    Article.transaction do
+      direct.update_column(:status, nil)
+      raise ActiveRecord::Rollback
+    end
+    check("update_column rolled back", article.reload.status, "kept")
+    direct.save!
+    check("update_column cleared the change before its rollback", article.reload.status, "kept")
   end
 
   def self.index(record, key)
