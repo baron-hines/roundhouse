@@ -22269,3 +22269,5 @@ mod helper_asset_url;
 mod safe_join_safe;
 #[path = "emit_and_run/response_header_alias.rs"]
 mod response_header_alias;
+#[path = "emit_and_run/assert_select_equality.rs"]
+mod assert_select_equality;

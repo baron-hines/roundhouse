@@ -383,16 +383,17 @@ module RequestDispatch
   # this file cannot name it.
   #
   # Second arg is either the selector (root form), the content string
-  # to match against the rendered tag, or an options Hash, or nil.
+  # to match against the rendered tag, an equality (`false` or `0`: no
+  # match; `true`: one), or an options Hash, or nil.
   # Returns void (raises on mismatch).
   def assert_select: (
     untyped selector_or_root,
-    ?(String | Hash[Symbol, untyped])? content_or_opts,
+    ?(String | bool | Integer | Hash[Symbol, untyped])? content_or_opts,
     ?Hash[Symbol, untyped]? opts
   ) { () -> void } -> void
        | (
     untyped selector_or_root,
-    ?(String | Hash[Symbol, untyped])? content_or_opts,
+    ?(String | bool | Integer | Hash[Symbol, untyped])? content_or_opts,
     ?Hash[Symbol, untyped]? opts
   ) -> void
 end
