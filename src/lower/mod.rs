@@ -1782,7 +1782,7 @@ pub use model_to_library::{
     lower_models_to_library_classes_with_params, lower_models_with_registry,
     lower_models_with_registry_and_params, lower_models_with_registry_params_and_views,
 };
-pub use fixture_to_library::{lower_fixtures_to_library_classes, rewrite_fixture_calls};
+pub use fixture_to_library::{lower_fixtures_to_library_classes, lower_fixtures_to_library_classes_keeping_keys, rewrite_fixture_calls};
 pub use importmap_to_library::lower_importmap_to_library_functions;
 pub use library_extras::{extras_from_funcs, extras_from_lcs};
 pub use routes_to_library::{
