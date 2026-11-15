@@ -906,6 +906,7 @@ fn fold_column(
         }
         col
     };
+    let mut promoted_others: Vec<Symbol> = Vec::new();
     if let Some(table) = schema.tables.get(&Symbol::from(t)) {
         // This fold replaces a same-named column for both
         // verbs. Do not let an ordinary add/change erase the
@@ -937,11 +938,18 @@ fn fold_column(
         if let Some(promoted) = candidate.columns.last() {
             col = promoted.clone();
         }
+        // Not only the folded column: a change to an operand may move another's expression out of the shared grammar.
+        promoted_others = candidate.columns.iter().filter(|c| c.name != col.name && c.generated.as_ref().is_some_and(|g| g.native)).map(|c| c.name.clone()).collect();
         if table.columns.iter().any(|column| column.generated.is_some()) || col.generated.is_some() {
             validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
         }
     }
     if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+        for other in table.columns.iter_mut().filter(|c| promoted_others.contains(&c.name)) {
+            if let Some(generated) = other.generated.as_mut() {
+                generated.native = true;
+            }
+        }
         match table.columns.iter().position(|x| x.name == col.name) {
             // `change_column` redefines the column where it stands.
             Some(at) if verb == "change_column" => table.columns[at] = col,

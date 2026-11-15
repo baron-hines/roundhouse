@@ -374,6 +374,12 @@ fn a_native_generated_column_survives_a_migration_and_an_unheld_precision_is_ref
     roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(add.as_bytes(), "db/migrate/20260102000000_add_tripled.rb", &mut schema, OtherDatabase)).0.unwrap();
     let articles = &schema.tables[&roundhouse::Symbol::from("articles")];
     assert!(articles.columns.iter().find(|c| c.name.as_str() == "tripled").and_then(|c| c.generated.as_ref()).is_some_and(|g| g.native));
+    // A change to an operand moves another column's expression out of the shared grammar: that column is kept native too.
+    let mut labelled = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.virtual \"label\", type: :string, as: \"coalesce(title, '')\", stored: true\n").as_bytes(), "db/schema.rb", OtherDatabase)).0.unwrap();
+    let bound = "class BoundTitle < ActiveRecord::Migration[8.1]\n  def change\n    change_column :articles, :title, :string, limit: 10\n  end\nend\n";
+    roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(bound.as_bytes(), "db/migrate/20260103000000_bound_title.rb", &mut labelled, OtherDatabase)).0.unwrap();
+    let label = labelled.tables[&roundhouse::Symbol::from("articles")].columns.iter().find(|c| c.name.as_str() == "label").and_then(|c| c.generated.clone());
+    assert!(label.is_some_and(|g| g.native));
     // Native SQL still keeps Roundhouse's own name rules.
     let reserved = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.virtual \"updated_at\", type: :decimal, as: \"(1)::numeric\", stored: true\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
     assert!(reserved.is_err_and(|e| e.to_string().contains("updated_at")));

@@ -211,13 +211,18 @@ impl EnumConstants {
             }
         }
         let mut edges: crate::det::HashMap<String, Vec<String>> = Default::default();
+        let mut unknown: crate::det::HashSet<String> = self.unknown_ancestors.iter().flat_map(|o| self.resolve_spellings(o, names)).collect();
         for (owner, target) in &self.ancestor_edges {
             let targets = self.resolve_spellings(target, names);
+            // A constant written a value (`Contactable = EmailRules`) holds a module this pass does not follow.
+            let aliased = targets.iter().any(|t| self.values.get(t).is_some_and(|v| !matches!(v, EnumConstant::Namespace | EnumConstant::Sorbet { .. })));
             for owner in self.resolve_spellings(owner, names) {
+                if aliased {
+                    unknown.insert(owner.clone());
+                }
                 edges.entry(owner).or_default().extend(targets.iter().cloned());
             }
         }
-        let unknown = self.unknown_ancestors.iter().flat_map(|o| self.resolve_spellings(o, names)).collect();
         let resolved = std::rc::Rc::new(ResolvedAncestry { edges, unknown });
         *self.resolved_ancestry.borrow_mut() = Some((state, resolved.clone()));
         resolved
@@ -507,7 +512,7 @@ mod names_tests {
 
     fn record(constants: &mut EnumConstants, names: &[&str]) {
         for name in names {
-            constants.values.insert(name.to_string(), EnumConstant::Unsupported);
+            constants.values.insert(name.to_string(), EnumConstant::Namespace);
         }
     }
 
@@ -563,6 +568,9 @@ mod names_tests {
         assert!(constants.ancestor_names("ROTP::TOTP").contains("URI"));
         assert!(constants.ancestor_names("ViewComponent::Base").contains("Slot"));
         assert!(constants.ancestor_names("Person").contains("Mark"));
+        constants.values.insert("Aliased".into(), EnumConstant::Unsupported);
+        edge(&mut constants, &["Aliasing"], &["Aliasing::Aliased", "Aliased"]);
+        assert!(constants.ancestor_names("Aliasing").contains("URI"), "an alias's module is not followed");
         constants.unknown_ancestors.push(vec!["Concern".into()]);
         assert!(constants.ancestor_names("User").contains("URI"));
     }
