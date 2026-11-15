@@ -1281,8 +1281,26 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
     if method.as_str() != "[]" || args.len() != 1 {
         return changed;
     }
-    let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return changed };
-    if !matches!(inner.as_str(), "headers" | "header") || !inner_args.is_empty() {
+    let ExprNode::Send { recv: inner_recv, method: inner, args: inner_args, .. } = &*recv.node else {
+        return changed;
+    };
+    // `header` only on the response itself: the name is a common one,
+    // and another object's `header` Hash is not case-insensitive.
+    let on_response = || match inner_recv.as_ref().map(|r| &*r.node) {
+        Some(ExprNode::Send { recv, method, args, .. }) => {
+            method.as_str() == "response"
+                && args.is_empty()
+                && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        }
+        Some(ExprNode::Ivar { name }) => name.as_str() == "response",
+        _ => false,
+    };
+    let header_read = match inner.as_str() {
+        "headers" => true,
+        "header" => on_response(),
+        _ => false,
+    };
+    if !header_read || !inner_args.is_empty() {
         return changed;
     }
     if let ExprNode::Lit { value: crate::expr::Literal::Str { value } } = &mut *args[0].node {
