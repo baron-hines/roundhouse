@@ -545,7 +545,12 @@ module ActiveRecord
 
     # Ruby-family only, beside the other reopens here: strict targets have
     # no `Type::Value`, no untyped `self[name]` and no relation `all`.
+    # A column a partial `select` left out reads nil here, where `[]`
+    # raises: Rails' `[]` passes `read_attribute` the raising block and
+    # `read_attribute` alone has none (attribute_methods/read.rb).
     def read_attribute(name)
+      unloaded = @__unloaded_columns
+      return nil unless unloaded.nil? || !unloaded.include?(name)
       self[name]
     end
 

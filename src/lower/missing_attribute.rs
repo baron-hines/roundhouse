@@ -24,6 +24,12 @@
 //! same raise in Rails. The primary key is not guarded: Rails' `id` reads
 //! it without the raising block (PrimaryKey#id).
 //!
+//! The generated `[]`'s column arms carry the same guard, as Rails' `[]`
+//! reads with the raising block: `record[key]` raises for a left-out
+//! column. `read_attribute`, which Rails reads without the block, stays
+//! a call to the runtime's on this family (`lower::attribute_aliases`)
+//! and answers nil for it.
+//!
 //! Assigning a left-out column loads it, as Rails' writer replaces the
 //! uninitialized attribute: each generated column writer (`_write_<col>_raw`
 //! where the model defines the writer itself) and each column arm of the
@@ -73,6 +79,19 @@ pub fn apply(lcs: &mut [LibraryClass], app: &App) {
             }
             if let Some(at) = writer {
                 prepend(&mut lc.methods[at].body, if_unloaded("_note_loaded", &col.name));
+            }
+        }
+        // `record[key]` raises for a left-out column as its reader does
+        // (Rails' `[]` reads with the `missing_attribute` block).
+        if let Some(m) = lc.methods.iter_mut().find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "[]")
+            && let ExprNode::Case { arms, .. } = &mut *m.body.node
+        {
+            for arm in arms {
+                let crate::expr::Pattern::Lit { value: Literal::Str { value: col } } = &arm.pattern else { continue };
+                let col = Symbol::from(col.as_str());
+                if col != primary_key && table.columns.iter().any(|c| c.name == col) {
+                    prepend(&mut arm.body, if_unloaded("_missing_attribute", &col));
+                }
             }
         }
         // `record[:col] = value` loads the column as its writer does.

@@ -993,7 +993,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
     ran!("sti_subclass_callbacks");
     crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
-        fused::apply_fused_pre_tag_rewrites(app);
+        fused::apply_fused_pre_tag_rewrites(app, target);
     });
     ran!("attribute_aliases");
     ran!("sti_is_a");

@@ -66,6 +66,13 @@ end
     assigned[:author_id] = 4
     check("index-assigned reads", read { assigned.author_id }, "4")
     check("index-assigned as_json", assigned.as_json["author_id"], 4)
+    check("dynamic read", read { index(partial, :status) }, "missing")
+    check("dynamic read loaded", read { index(partial, :title) }, "\"Hello\"")
+    check("read_attribute", read { partial.read_attribute(:status) }, "nil")
+  end
+
+  def self.index(record, key)
+    record[key]
   end
 end
 "##)

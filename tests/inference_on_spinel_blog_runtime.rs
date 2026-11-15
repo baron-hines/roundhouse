@@ -594,7 +594,10 @@ fn untyped_subexpressions_baseline() {
     // MEASURED 1342 on partial-select writes (1341): `_note_loaded` in
     // active_record/connection.rb drops its column `name`, a var on this
     // RBS-less probe (+1); connection.rbs types it for the RBS-paired gate.
-    const CEILING: usize = 1342;
+    // MEASURED 1343 on partial-select reads (1342): `read_attribute`
+    // checks its `name` against the row's unloaded columns before it
+    // reads `self[name]` (+1 in active_record/connection.rb).
+    const CEILING: usize = 1343;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
