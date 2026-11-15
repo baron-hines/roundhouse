@@ -444,6 +444,12 @@ pub(super) fn push_association_methods(
                 let assoc_pk = primary_key
                     .clone()
                     .unwrap_or_else(|| Symbol::from("id"));
+                // Each class is read and written by its own key, unless
+                // the declaration names one (`primary_key:`), as Rails'
+                // `association_primary_key(klass)` answers.
+                let key_of = |t: &ClassId| {
+                    crate::lower::scope_chain::association_primary_key(models, t, primary_key.as_ref())
+                };
                 let scope = belongs_to_scope(scope.as_ref(), &assoc_pk, runtime_relation, span, owner, name);
                 methods.push(synth_polymorphic_reader(
                     owner,
@@ -451,7 +457,7 @@ pub(super) fn push_association_methods(
                     polymorphic_targets,
                     foreign_key,
                     &type_col,
-                    &assoc_pk,
+                    key_of,
                     &scope,
                 ));
                 let sentinel = fk_sentinel(model, foreign_key);
@@ -467,7 +473,7 @@ pub(super) fn push_association_methods(
                         polymorphic_targets,
                         foreign_key,
                         &type_col,
-                        &assoc_pk,
+                        key_of,
                         sentinel,
                         keeps_nil,
                         held_key(table, foreign_key),
@@ -1978,7 +1984,7 @@ fn synth_polymorphic_reader(
     targets: &[ClassId],
     foreign_key: &Symbol,
     type_col: &Symbol,
-    assoc_pk: &Symbol,
+    assoc_pk: impl Fn(&ClassId) -> Symbol,
     scope: &BelongsToScope<'_>,
 ) -> MethodDef {
     // def notifiable
@@ -2000,7 +2006,7 @@ fn synth_polymorphic_reader(
                 value: Literal::Str { value: t.0.as_str().to_string() },
             },
             guard: None,
-            body: scoped_find(t, foreign_key, assoc_pk, scope),
+            body: scoped_find(t, foreign_key, &assoc_pk(t), scope),
         })
         .collect();
     arms.push(crate::expr::Arm {
@@ -2073,7 +2079,7 @@ fn synth_polymorphic_writer(
     targets: &[ClassId],
     foreign_key: &Symbol,
     type_col: &Symbol,
-    assoc_pk: &Symbol,
+    assoc_pk: impl Fn(&ClassId) -> Symbol,
     sentinel: Expr,
     keeps_nil: bool,
     key_held: bool,
@@ -2093,7 +2099,9 @@ fn synth_polymorphic_writer(
     //
     // Both halves of the (type, id) pair, mirroring the plain writer's
     // `@fk == 0` nil sentinel. The class-pattern `when` keeps the type
-    // string a compile-time constant per arm (no `.class.name`).
+    // string a compile-time constant per arm (no `.class.name`). When the
+    // classes are keyed by different columns, each arm reads its own:
+    // `when Ticket then @subject_id = value.code; @subject_type = "Ticket"`.
     let value = Symbol::from("value");
     let type_col = type_col.clone();
     let assign = |target_ivar: &Symbol, v: Expr| {
@@ -2122,19 +2130,30 @@ fn synth_polymorphic_writer(
             parenthesized: false,
         },
     );
-    let id_read = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(var_ref(value.clone())),
-            method: assoc_pk.clone(),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    let type_switch = polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
-        assign(&type_col, lit_str(t.0.as_str()))
-    }, None);
+    let key_read = |key: Symbol| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(var_ref(value.clone())),
+                method: key,
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        )
+    };
+    let shared_key = targets.first().map(&assoc_pk).filter(|first| targets.iter().all(|t| assoc_pk(t) == *first));
+    let assign_present = match shared_key {
+        Some(key) => {
+            let type_switch = polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
+                assign(&type_col, lit_str(t.0.as_str()))
+            }, None);
+            seq(vec![assign(foreign_key, key_read(key)), type_switch])
+        }
+        None => polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
+            seq(vec![assign(foreign_key, key_read(assoc_pk(t))), assign(&type_col, lit_str(t.0.as_str()))])
+        }, None),
+    };
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::If {
@@ -2149,7 +2168,7 @@ fn synth_polymorphic_writer(
             } else {
                 seq(vec![assign(foreign_key, sentinel), assign(&type_col, lit_str(""))])
             },
-            else_branch: seq(vec![assign(foreign_key, id_read), type_switch]),
+            else_branch: assign_present,
         },
     );
 
@@ -2954,7 +2973,7 @@ mod tests {
                 &[ClassId(Symbol::from("Post"))],
                 &Symbol::from("subject_id"),
                 &Symbol::from("subject_type"),
-                &Symbol::from("id"),
+                |_: &ClassId| Symbol::from("id"),
                 lit_int(0),
                 false,
                 key_held,

@@ -1,8 +1,9 @@
 //! A polymorphic `belongs_to` that no model names with an inverse `as:`
 //! still reads and writes any model, as Rails' reader constantizes the
 //! class name the row holds: the writer stores the record's base class
-//! (an STI subclass's root), `create!` takes the association, and the
-//! reader answers the stored row. The association is named after one of
+//! (an STI subclass's root) and its own key (a `Ticket` keyed by `code`),
+//! `create!` takes the association, and the reader answers the stored
+//! row. The association is named after one of
 //! its classes (`:post`, which a `Photo` can also fill), so its preload
 //! must go by the type column too rather than load every key from
 //! `posts`. The expected values are ActiveRecord 8.1.4's answers.
@@ -24,6 +25,10 @@ end
         .write("app/models/panorama.rb", r##"class Panorama < Photo
 end
 "##)
+        .write("app/models/ticket.rb", r##"class Ticket < ApplicationRecord
+  self.primary_key = "code"
+end
+"##)
         .write("app/models/comment.rb", r##"class Comment < ApplicationRecord
   belongs_to :post, polymorphic: true, optional: true
 end
@@ -41,11 +46,13 @@ end
     Comment.create!(body: "b", post: skyline)
     Comment.create!(body: "c", post_type: "Photo", post_id: harbor.id)
     Comment.create!(body: "d")
-    # Rails: [["Post", essay.id], ["Photo", skyline.id], ["Photo", harbor.id], [nil, nil]]
-    check("stored", Comment.order(:body).map { |c| [c.post_type, c.post_id] } == [["Post", essay.id], ["Photo", skyline.id], ["Photo", harbor.id], [nil, nil]])
-    # Rails: ["essay", "skyline", "harbor", nil]
-    check("reader", Comment.order(:body).map { |c| c.post && c.post.title } == ["essay", "skyline", "harbor", nil])
-    check("preload", Comment.order(:body).preload(:post).map { |c| c.post && c.post.title } == ["essay", "skyline", "harbor", nil])
+    triage = Ticket.create!(code: 40, title: "triage")
+    Comment.create!(body: "e", post: triage)
+    # Rails: [["Post", essay.id], ["Photo", skyline.id], ["Photo", harbor.id], [nil, nil], ["Ticket", 40]]
+    check("stored", Comment.order(:body).map { |c| [c.post_type, c.post_id] } == [["Post", essay.id], ["Photo", skyline.id], ["Photo", harbor.id], [nil, nil], ["Ticket", 40]])
+    # Rails: ["essay", "skyline", "harbor", nil, "triage"]
+    check("reader", Comment.order(:body).map { |c| c.post && c.post.title } == ["essay", "skyline", "harbor", nil, "triage"])
+    check("preload", Comment.order(:body).preload(:post).map { |c| c.post && c.post.title } == ["essay", "skyline", "harbor", nil, "triage"])
     moved = Comment.find_by(body: "a")
     moved.post = harbor
     moved.save!
@@ -61,6 +68,9 @@ end
   create_table "photos", force: :cascade do |t|
     t.string "title"
     t.string "type"
+  end
+  create_table "tickets", primary_key: "code", force: :cascade do |t|
+    t.string "title"
   end
   create_table "comments", force: :cascade do |t|
     t.string "body"
