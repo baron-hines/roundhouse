@@ -3548,18 +3548,19 @@ fn through_hop_scope(
         _ => None,
     })?;
     app.models.iter().find(|m| &m.name == thr_target)?;
-    // A body that ends in a literal `nil` or `false` answers the unscoped
-    // relation (`instance_exec(...) || scope`): nothing to merge. A nil it
-    // computes is `merge_through_scope`'s to skip.
-    let tail = match &*scope.node {
-        ExprNode::Seq { exprs } => exprs.last()?,
-        _ => scope,
-    };
-    if matches!(&*tail.node, ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } }) {
-        return None;
-    }
     let rel = Symbol::from("__rel");
     let mut body = scope.clone();
+    // A body that answers `nil` or `false` stands for the unscoped relation
+    // (`instance_exec(...) || scope`): nothing to merge, though its other
+    // statements still run. `merge_through_scope` skips a nil, so a literal
+    // `false` result is answered as nil.
+    let tail = match &mut *body.node {
+        ExprNode::Seq { exprs } => exprs.last_mut()?,
+        _ => &mut body,
+    };
+    if matches!(&*tail.node, ExprNode::Lit { value: Literal::Bool { value: false } }) {
+        *tail = Expr::new(tail.span, ExprNode::Lit { value: Literal::Nil });
+    }
     crate::lower::scope_chain::rewrite_scope_body(
         &mut body,
         thr_target,

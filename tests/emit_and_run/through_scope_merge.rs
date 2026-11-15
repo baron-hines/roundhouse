@@ -30,6 +30,8 @@ end
   has_many :ignored_plants, through: :ignored_beds, source: :plants
   has_many :false_beds, -> { where(fallow: false); false }, class_name: "Bed"
   has_many :false_plants, through: :false_beds, source: :plants
+  has_many :guarded_beds, -> { where(fallow: false); raise "guarded" if Bed.exists?; nil }, class_name: "Bed"
+  has_many :guarded_plants, through: :guarded_beds, source: :plants
   has_many :computed_beds, -> { where(fallow: false) unless Bed.exists? }, class_name: "Bed"
   has_many :computed_plants, through: :computed_beds, source: :plants
   has_many :coalesced_beds, -> { where(fallow: false).order(Arel.sql("COALESCE(NULL, beds.position) DESC")) }, class_name: "Bed"
@@ -91,6 +93,14 @@ end
     # relation, so its `where` is discarded and the fallow bed is back.
     check("nil scope body", g.ignored_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
     check("false scope body", g.false_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
+    guarded = begin
+      g.guarded_plants.to_a
+      "read"
+    rescue RuntimeError => e
+      e.message
+    end
+    # Rails: the body's other statements run before its nil answers
+    check("nil body runs its statements", guarded == "guarded")
     check("computed nil scope body", g.computed_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
     # Rails: an expression ordering keeps its commas
     check("expression order", g.coalesced_plants.map(&:name).first == "kale")
