@@ -1135,16 +1135,24 @@ module ActiveRecord
       record.attributes[col]
     end
 
-    # The bare column an order term names -- `"created_at"`,
-    # `"boosts.created_at DESC"` and the quoted `"\"created_at\" DESC"`
-    # all answer `"created_at"` -- or nil for anything that is not one
-    # column with an optional ASC/DESC.
+    # The bare column an order term names -- `"created_at"`, the
+    # relation's own `"boosts.created_at DESC"` on boosts, and the quoted
+    # `"\"created_at\" DESC"` all answer `"created_at"` -- or nil for
+    # anything that is not one column of this table with an optional
+    # ASC/DESC.
     def order_column(term)
       words = term.strip.split(/\s+/)
       return nil if words.length == 0 || words.length > 2
       col = words[0]
       dot = col.rindex(".")
-      col = col[(dot + 1)..] unless dot.nil?
+      unless dot.nil?
+        # Another table's column (a through scope's `beds.position`) is not
+        # one the loaded rows carry: answer nil, so the query runs again.
+        table = col[0, dot].to_s
+        table = table[1, table.length - 2].to_s if table.length > 2 && table.start_with?("\"") && table.end_with?("\"")
+        return nil unless table == @table
+        col = col[(dot + 1)..].to_s
+      end
       col = col[1, col.length - 2].to_s if col.length > 2 && col.start_with?("\"") && col.end_with?("\"")
       return nil unless col.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
       if words.length == 2

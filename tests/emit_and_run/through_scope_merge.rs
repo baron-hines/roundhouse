@@ -79,6 +79,11 @@ end
     ranked = g.ranked_plants.map(&:name)
     check("hash order on the through table", ranked.first == "kale" && ranked.sort == ["bean", "kale", "leek"])
     # Rails: the reader's own ordering first, the through scope's after it
+    # Rails: a loaded through reader ordered again keeps the beds' position
+    # (another table's column) first and the plants' names after it
+    held = g.plants
+    held.load
+    check("reorder a loaded reader", held.order(:name).map(&:name) == ["bean", "leek", "kale"])
     check("own order first", g.named_plants.map(&:name) == ["bean", "kale", "leek"])
     check("preloaded", Garden.where(id: g.id).preload(:plants).first.plants.map(&:name).sort == ["bean", "kale", "leek"])
     # Rails: a hash ordering of two through-table columns qualifies each
