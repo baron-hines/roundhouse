@@ -582,10 +582,11 @@ fn rewrite_collection_read(expr: &mut Expr) {
     let span = expr.span;
     let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!("an errors reader") };
     match method.as_str() {
+        // A copy: Rails builds a new Array on each call, so a kept answer does not grow with later errors.
         "to_a" => {
             let mut messages = reader.clone();
             messages.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
-            *expr = messages;
+            *expr = send(span, messages, "dup", vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
         }
         "objects" => {
             let mut details = super::errors_add::error_details(owner.clone(), span);

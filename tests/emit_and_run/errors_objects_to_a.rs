@@ -54,11 +54,21 @@ end
     [r.errors.to_a, r.errors.objects]
   end
 
+  # Rails: [["Dish can't be blank"], 2]: to_a answers a new Array each time
+  def self.to_a_is_a_snapshot
+    r = Recipe.new(dish: "", serves: 3)
+    r.valid?
+    kept = r.errors.to_a
+    r.errors.add(:serves, :invalid)
+    [kept, r.errors.size]
+  end
+
   def self.run
     check("to_a_lists_full_messages", to_a_lists_full_messages == ["Dish can't be blank", "Serves is not a number"])
     check("to_a_keeps_base_messages_bare", to_a_keeps_base_messages_bare == [["Oven temperature is missing"], "Oven temperature is missing"])
     check("objects_are_the_errors", objects_are_the_errors == [[:dish, :serves], ["can't be blank", "is not a number"], 2])
     check("a_valid_record_has_none", a_valid_record_has_none == [[], []])
+    check("to_a_is_a_snapshot", to_a_is_a_snapshot == [["Dish can't be blank"], 2])
   end
 end
 "##)

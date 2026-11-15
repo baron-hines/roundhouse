@@ -2439,8 +2439,9 @@ because the accumulator's own `include?` would ask its full messages
 and answer false.
 
 `errors.to_a` is Rails' alias for `full_messages`, which is what
-`errors` already holds here, so the hop folds away and every target
-reads the accumulator. `errors.objects` is the `ActiveModel::Error`s
+`errors` already holds here, so every target reads a `dup` of the
+accumulator: Rails builds a new Array on each call, so a kept answer
+does not grow with later errors. `errors.objects` is the `ActiveModel::Error`s
 Rails collects, which is `error_details`: the lowering reads it as that
 field, and what it yields reads as an iteration's does.
 
