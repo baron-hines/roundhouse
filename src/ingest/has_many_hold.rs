@@ -5,17 +5,27 @@
 //! foreign key. `<<` on a persisted owner sets the key and saves the
 //! record at once (an invalid one stays unsaved); on a new owner it is
 //! held like a built one. A new owner's reader answers the records it
-//! holds.
+//! holds, and a record created through the association is held too, so a
+//! read answers the same object.
 //!
-//! On the ruby family ([`expand`]), each has_many that app code builds on
-//! or pushes onto (`<name>.build` / `<name> << record`, by name) gets
+//! Only a record that is still NEW is validated and saved with a
+//! persisted owner, as Rails' `associated_records_to_validate_or_save`
+//! answers the whole target for a new owner and otherwise just
+//! `target.find_all(&:new_record?)`. A held record that is already
+//! persisted is therefore neither re-validated nor re-saved when the
+//! owner saves.
+//!
+//! On the ruby family ([`expand`]), each has_many that app code creates,
+//! builds, pushes onto or updates in place, by name (`<name>.build`,
+//! `<name> << record`, `<name>.create!`, `<name>.update(…)`), gets
 //! model source, after its declaration:
 //!
 //! ```ruby
 //! def __hold_tasks(record)        # a lowered `tasks.build(…)` passes its record
 //! def __push_tasks(record)        # a lowered `tasks << record`
-//! validate :__held_tasks_valid    # each held record valid, else `errors.add(:tasks, :invalid)`
-//! after_save :__held_tasks_save   # each held record saved, with the key
+//! def __tasks_update(attrs)       # a lowered `tasks.update(…)`
+//! validate :__held_tasks_valid    # each held record still new is valid, else `errors.add(:tasks, :invalid)`
+//! after_save :__held_tasks_save   # each held record still new is saved, with the key
 //! after_save_commit :__held_tasks_committed  # the held list cleared once the save commits
 //! def __tasks_first(rel)          # and _last, _size, _length, _empty?, _any?, _destroy_all
 //! def tasks=(records)             # app code assigns it: Rails' replace
@@ -154,7 +164,7 @@ pub(crate) fn expand(app: &mut App) {
             // (matz/spinel#10291).
             let owner = model.name.0.as_str();
             let src = format!(
-                "class Generated\n  def __hold_{n}(record)\n    @__held_{n} = [] if @__held_{n}.nil?\n    @__held_{n} << record\n    record\n  end\n\n  def __push_{n}(record)\n    if new_record?\n{set_owner}{set_type}      __hold_{n}(record)\n      {n}\n    else\n      record.{fk} = id\n{set_type}      return nil unless record.save\n      @{n}_loaded = false\n      {n}\n    end\n  end\n\n  def __push_all_{n}(records)\n    if new_record?\n      records.each {{ |record| __push_{n}(record) }}\n      return {n}\n    end\n    pushed = true\n    {owner}.transaction do\n      records.each do |record|\n        next unless __push_{n}(record).nil?\n        pushed = false\n        raise ActiveRecord::Rollback\n      end\n    end\n    pushed ? {n} : nil\n  end\n\n  def __held_{n}_list\n    @__held_{n}.nil? ? [] : @__held_{n}\n  end\n\n  def __held_{n}_unsaved\n    unsaved = __held_{n}_list.select {{ |record| record.new_record? }}\n    return unsaved unless {n}_loaded?\n    loaded = {n}_target\n    unsaved.reject {{ |record| loaded.any? {{ |c| c.equal?(record) }} }}\n  end\n\n  def __{n}_first(rel)\n    return __held_{n}_list.first if new_record?\n    unsaved = __held_{n}_unsaved\n    return rel.first if unsaved.empty?\n    found = rel.first\n    found.nil? ? unsaved.first : found\n  end\n\n  def __{n}_last(rel)\n    return __held_{n}_list.last if new_record?\n    unsaved = __held_{n}_unsaved\n    unsaved.empty? ? rel.last : unsaved.last\n  end\n\n  def __{n}_size(rel)\n    return __held_{n}_list.size if new_record?\n    rel.size + __held_{n}_unsaved.size\n  end\n\n  def __{n}_length(rel)\n    return __held_{n}_list.size if new_record?\n    rel.length + __held_{n}_unsaved.size\n  end\n\n  def __{n}_empty?(rel)\n    return __held_{n}_list.empty? if new_record?\n    __held_{n}_unsaved.empty? && rel.empty?\n  end\n\n  def __{n}_any?(rel)\n    return !__held_{n}_list.empty? if new_record?\n    !__held_{n}_unsaved.empty? || rel.any?\n  end\n\n  def __{n}_destroy_all(rel)\n    if new_record?\n      destroyed = __held_{n}_list\n      destroyed.each {{ |record| record.destroy }}\n    else\n      unsaved = __held_{n}_unsaved\n      destroyed = rel.destroy_all\n      unsaved.each do |record|\n        record.destroy\n        destroyed << record\n      end\n    end\n    @__held_{n} = nil\n    @{n}_loaded = false\n    destroyed\n  end\n\n  def __held_{n}_valid\n    return if @__held_{n}.nil?\n    invalid = false\n    __held_{n}_list.each do |child|\n      next if !new_record? && !child.new_record?\n      next if child.valid?\n{counts}    end\n    errors.add(:{n}, :invalid) if invalid\n  end\n\n  validate :__held_{n}_valid\n\n  def __held_{n}_save\n    return if @__held_{n}.nil? || @__held_{n}_saving\n    @__held_{n}_saving = true\n    begin\n      __held_{n}_list.each do |child|\n        next if !previously_new_record? && !child.new_record?\n        child.{fk} = id\n        child.save!\n      end\n    ensure\n      @__held_{n}_saving = false\n    end\n  end\n\n  after_save :__held_{n}_save\n\n  def __held_{n}_committed\n    @__held_{n} = nil\n  end\n\n  after_save_commit :__held_{n}_committed\nend\n"
+                "class Generated\n  def __hold_{n}(record)\n    @__held_{n} = [] if @__held_{n}.nil?\n    @__held_{n} << record\n    record\n  end\n\n  def __push_{n}(record)\n    if new_record?\n{set_owner}{set_type}      __hold_{n}(record)\n      {n}\n    else\n      record.{fk} = id\n{set_type}      return nil unless record.save\n      @{n}_loaded = false\n      {n}\n    end\n  end\n\n  def __push_all_{n}(records)\n    if new_record?\n      records.each {{ |record| __push_{n}(record) }}\n      return {n}\n    end\n    pushed = true\n    {owner}.transaction do\n      records.each do |record|\n        next unless __push_{n}(record).nil?\n        pushed = false\n        raise ActiveRecord::Rollback\n      end\n    end\n    pushed ? {n} : nil\n  end\n\n  def __{n}_update(attrs)\n    records = {n}\n    records.each {{ |record| record.update(attrs) }}\n    records\n  end\n\n  def __held_{n}_list\n    @__held_{n}.nil? ? [] : @__held_{n}\n  end\n\n  def __held_{n}_unsaved\n    unsaved = __held_{n}_list.select {{ |record| record.new_record? }}\n    return unsaved unless {n}_loaded?\n    loaded = {n}_target\n    unsaved.reject {{ |record| loaded.any? {{ |c| c.equal?(record) }} }}\n  end\n\n  def __{n}_first(rel)\n    return __held_{n}_list.first if new_record?\n    unsaved = __held_{n}_unsaved\n    return rel.first if unsaved.empty?\n    found = rel.first\n    found.nil? ? unsaved.first : found\n  end\n\n  def __{n}_last(rel)\n    return __held_{n}_list.last if new_record?\n    unsaved = __held_{n}_unsaved\n    unsaved.empty? ? rel.last : unsaved.last\n  end\n\n  def __{n}_size(rel)\n    return __held_{n}_list.size if new_record?\n    rel.size + __held_{n}_unsaved.size\n  end\n\n  def __{n}_length(rel)\n    return __held_{n}_list.size if new_record?\n    rel.length + __held_{n}_unsaved.size\n  end\n\n  def __{n}_empty?(rel)\n    return __held_{n}_list.empty? if new_record?\n    __held_{n}_unsaved.empty? && rel.empty?\n  end\n\n  def __{n}_any?(rel)\n    return !__held_{n}_list.empty? if new_record?\n    !__held_{n}_unsaved.empty? || rel.any?\n  end\n\n  def __{n}_destroy_all(rel)\n    if new_record?\n      destroyed = __held_{n}_list\n      destroyed.each {{ |record| record.destroy }}\n    else\n      unsaved = __held_{n}_unsaved\n      destroyed = rel.destroy_all\n      unsaved.each do |record|\n        record.destroy\n        destroyed << record\n      end\n    end\n    @__held_{n} = nil\n    @{n}_loaded = false\n    destroyed\n  end\n\n  def __held_{n}_valid\n    return if @__held_{n}.nil?\n    invalid = false\n    __held_{n}_list.each do |child|\n      next if !new_record? && !child.new_record?\n      next if child.valid?\n{counts}    end\n    errors.add(:{n}, :invalid) if invalid\n  end\n\n  validate :__held_{n}_valid\n\n  def __held_{n}_save\n    return if @__held_{n}.nil? || @__held_{n}_saving\n    @__held_{n}_saving = true\n    begin\n      __held_{n}_list.each do |child|\n        next if !previously_new_record? && !child.new_record?\n        child.{fk} = id\n        child.save!\n      end\n    ensure\n      @__held_{n}_saving = false\n    end\n  end\n\n  after_save :__held_{n}_save\n\n  def __held_{n}_committed\n    @__held_{n} = nil\n  end\n\n  after_save_commit :__held_{n}_committed\nend\n"
             );
             let writer = format!("{n}=");
             let writes = assigned.contains(n)
@@ -237,6 +247,26 @@ pub(crate) fn expand(app: &mut App) {
                 .into(),
                 block: None,
                 ret: pushed.into(),
+                effects: Default::default(),
+            })),
+        );
+        // `owner.items.update(attrs)` — Rails' `CollectionProxy#update`
+        // updates every record the association holds and answers them.
+        table.insert(
+            crate::ident::Symbol::from(format!("__{name}_update")),
+            crate::ty::Ty::Fn(Box::new(crate::ty::FnTy {
+                params: vec![crate::ty::Param {
+                    name: crate::ident::Symbol::from("attrs"),
+                    ty: crate::ty::Ty::Hash {
+                        key: std::sync::Arc::new(crate::ty::Ty::Sym),
+                        value: std::sync::Arc::new(crate::ty::Ty::Untyped),
+                    }
+                    .into(),
+                    kind: crate::ty::ParamKind::Required,
+                }]
+                .into(),
+                block: None,
+                ret: crate::ty::Ty::Array { elem: record.clone().into() }.into(),
                 effects: Default::default(),
             })),
         );

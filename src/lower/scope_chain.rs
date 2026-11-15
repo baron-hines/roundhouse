@@ -5277,6 +5277,26 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             *expr = put(span, Some(ir.clone()), Symbol::from(callee), vec![arg], None, true);
                             return None;
                         }
+                        // `owner.items.update(attrs)` — Rails'
+                        // `CollectionProxy#update` updates each record the
+                        // association holds (`to_a`, held records included)
+                        // and answers the records.
+                        if held
+                            && method.as_str() == "update"
+                            && args.len() == 1
+                            && block.is_none()
+                            && matches!(&*args[0].node, ExprNode::Hash { .. })
+                        {
+                            *expr = put(
+                                span,
+                                Some(ir.clone()),
+                                Symbol::from(format!("__{aname}_update")),
+                                args,
+                                None,
+                                true,
+                            );
+                            return None;
+                        }
                         let ctor = match method.as_str() {
                             "build" => Some("new"),
                             "create" => Some("create"),

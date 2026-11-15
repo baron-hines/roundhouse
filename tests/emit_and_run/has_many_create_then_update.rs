@@ -1,8 +1,8 @@
 //! `owner.items.create!` holds the saved record in the has_many's target
 //! without loading it, and `owner.items.update(attrs)` then updates the
 //! records the owner holds in place, as Rails' `add_to_target` and the
-//! proxy's `update` over its records do. Ignored as a fork spec until the
-//! compiler does; the expected values are ActiveRecord 8.1.4's answers.
+//! proxy's `update` over its records do. The probe's expected values are
+//! ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -53,7 +53,6 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: association targets"]
 fn a_has_many_update_updates_the_records_its_create_holds() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
@@ -61,7 +60,7 @@ fn a_has_many_update_updates_the_records_its_create_holds() {
 }
 
 #[test]
-#[ignore = "fork spec: association targets"]
+#[ignore = "requires the Spinel toolchain"]
 fn a_has_many_update_updates_the_records_its_create_holds_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();
