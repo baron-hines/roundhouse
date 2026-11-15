@@ -497,27 +497,31 @@ impl EnumConstants {
     }
 
     fn record_ancestor_target(&mut self, node: &Node<'_>, parents: &[Node<'_>], nesting: &[String]) {
-        let last = |name: &str| name.rsplit("::").next().unwrap_or(name).to_string();
+        // Each lexical scope's spelling of `path`, innermost first: the one an owner of that name answers is Ruby's.
+        let candidates = |path: &str| -> Vec<String> {
+            match path.strip_prefix("::") {
+                Some(rooted) => vec![rooted.to_string()],
+                None => nesting.iter().rev().map(|n| format!("{n}::{path}")).chain(std::iter::once(path.to_string())).collect(),
+            }
+        };
+        let owner_here = || nesting.last().cloned().unwrap_or_else(|| "Object".to_string());
         if let Some(class) = node.as_class_node() {
             // `class C < Struct.new(:a)` inherits an anonymous class, whose constants no name can define.
             if let (Some(own), Some(base)) =
                 (Self::path(&class.constant_path()), class.superclass().and_then(|base| Self::path(&base)))
             {
-                self.ancestor_edges.entry(last(&own)).or_default().push(last(&base));
+                let own = Self::qualify(nesting.last().map(String::as_str).unwrap_or(""), &own);
+                self.ancestor_edges.entry(own).or_default().push(candidates(&base));
             }
             return;
         }
         let Some(call) = node.as_call_node() else { return };
         let method = constant_id_str(&call.name());
-        let owner_here = || nesting.last().map(|n| last(n)).unwrap_or_else(|| "Object".to_string());
-        // `m = Module.new; m.include X; include m`: the local's module is one the enclosing owner may include.
-        if call.receiver().is_some_and(|r| r.as_local_variable_read_node().is_some())
-            && matches!(method.as_ref(), "include" | "extend" | "prepend")
-        {
-            self.unknown_ancestors.insert(owner_here());
-            return;
-        }
-        if call.receiver().is_some_and(|r| r.as_self_node().is_none() && Self::path(&r).is_none()) {
+        // A local receiver is `self.included(base)`'s includer, or a module the owner goes on to include (`m.include X;
+        // include m`): either way the owner's ancestry reaches what it gains.
+        if call.receiver().is_some_and(|r| {
+            r.as_self_node().is_none() && r.as_local_variable_read_node().is_none() && Self::path(&r).is_none()
+        }) {
             return;
         }
         let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
@@ -532,14 +536,17 @@ impl EnumConstants {
             }
             _ => return,
         };
-        let owner = match call.receiver().and_then(|r| Self::path(&r)) {
-            Some(receiver) => last(&receiver),
+        let owner = match call.receiver().filter(|r| r.as_local_variable_read_node().is_none()).and_then(|r| Self::path(&r)) {
+            Some(receiver) => {
+                let spellings = candidates(&receiver);
+                spellings.iter().find(|c| self.values.contains_key(*c)).cloned().unwrap_or_else(|| spellings.last().cloned().unwrap_or(receiver))
+            }
             None => owner_here(),
         };
         // `extend self` names the module being declared, whose own definition already counts.
         for target in targets.iter().filter(|t| t.as_self_node().is_none() && !anonymous_module(t, parents)) {
             match Self::path(target) {
-                Some(path) => self.ancestor_edges.entry(owner.clone()).or_default().push(last(&path)),
+                Some(path) => self.ancestor_edges.entry(owner.clone()).or_default().push(candidates(&path)),
                 None => {
                     self.unknown_ancestors.insert(owner.clone());
                 }
@@ -719,13 +726,22 @@ fn anonymous_module(target: &Node<'_>, parents: &[Node<'_>]) -> bool {
             && call.receiver().and_then(|r| r.as_call_node()).is_some_and(|r| constant_id_str(&r.name()) == "routes");
     }
     let Some(local) = target.as_local_variable_read_node() else { return false };
-    let Some(statements) = parents.iter().rev().find_map(|p| p.as_statements_node()) else { return false };
-    let writes: Vec<bool> = statements
-        .body()
-        .iter()
-        .filter_map(|st| st.as_local_variable_write_node())
-        .filter(|w| w.name().as_slice() == local.name().as_slice())
-        .map(|w| module_new(&w.value()))
-        .collect();
+    struct Writes<'n> {
+        name: &'n [u8],
+        found: Vec<bool>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(module_new(&node.value()));
+            }
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+    }
+    // The whole enclosing method, not the nearest statements: the write may sit in a branch (`unless …; m = Module.new`).
+    let Some(scope) = parents.iter().rev().find(|p| p.as_def_node().is_some() || p.as_program_node().is_some()) else { return false };
+    let mut writes = Writes { name: local.name().as_slice(), found: Vec::new() };
+    ruby_prism::Visit::visit(&mut writes, scope);
+    let writes = writes.found;
     !writes.is_empty() && writes.iter().all(|&m| m)
 }
