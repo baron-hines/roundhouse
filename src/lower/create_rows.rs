@@ -36,14 +36,24 @@ pub fn apply_create_rows_lowering(app: &mut App) {
         .filter(|(model, name)| crate::analyze::source_class_method(app, model, name))
         .collect();
     let models: Vec<ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
-    super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, owner, &models, &defines));
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let mut bound = 0;
+        rewrite(body, owner, &models, &defines, &mut bound);
+    });
     for view in &mut app.views {
-        rewrite(&mut view.body, None, &models, &defines);
+        let mut bound = 0;
+        rewrite(&mut view.body, None, &models, &defines, &mut bound);
     }
 }
 
-fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines: &[(ClassId, &str)]) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, owner, models, defines));
+fn rewrite(
+    expr: &mut Expr,
+    owner: Option<&ClassId>,
+    models: &[ClassId],
+    defines: &[(ClassId, &str)],
+    bound: &mut u32,
+) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, owner, models, defines, bound));
     let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { return };
     if !crate::analyze::creates_rows(method, args) {
         return;
@@ -69,11 +79,19 @@ fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines
     let record_ty = (**elem).clone();
     let span = expr.span;
     // Rails reads the receiver once, before the rows, and for an empty
-    // Array too: a receiver that is more than a read (a `where` chain
-    // whose arguments call out) is bound first and the binding read per row.
+    // Array too, so it is bound first and the binding read per row. A
+    // receiver that is more than a read (a `where` chain whose arguments
+    // call out) has to be bound for that to hold.
+    // Each binding takes its own name: a nested array-create inside these
+    // rows (`where(…).create!([{ …, other.create!([…]) }])`) binds one too,
+    // and a shared name left the outer rows created on the inner receiver.
     let (bind_recv, recv) = match recv {
         Some(r) if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Const { .. } | ExprNode::SelfRef) => {
-            let name = Symbol::from("__creator");
+            let name = match *bound {
+                0 => Symbol::from("__creator"),
+                n => Symbol::from(format!("__creator{n}").as_str()),
+            };
+            *bound += 1;
             let recv_ty = r.ty.clone().unwrap_or(Ty::Untyped);
             let assign = with_ty(
                 Expr::new(

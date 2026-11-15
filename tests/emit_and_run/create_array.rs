@@ -62,6 +62,8 @@ end
     check("the receiver once", scoped.map { |t| row(t) }, [[12, "g", "s1"], [12, "h", "s1"]])
     Tagging.where(source: next_source).create([])
     check("the receiver of an empty Array", SOURCES, ["s1", "s2"])
+    nested = Tagging.where(source: "outer").create!([{ post_id: 21, tag_name: Tagging.where(source: "inner").create!([{ post_id: 20, tag_name: "x" }]).first.tag_name }])
+    check("nested rows", [row(Tagging.where(post_id: 21).first), row(Tagging.where(post_id: 20).first)], [[21, "x", "outer"], [20, "x", "inner"]])
   end
 end
 "##)
