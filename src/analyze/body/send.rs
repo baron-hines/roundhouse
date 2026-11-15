@@ -61,9 +61,11 @@ impl<'a> BodyTyper<'a> {
     /// can only describe their fallback shape, but a literal key and a
     /// concrete model receiver make the exact column type available.
     ///
-    /// Only an ActiveRecord record's: another class's `[]` is its own
-    /// method, whatever a method of the key's name answers. A gem's
-    /// `self[:dn].first`, with `[]` answering an Array, read `dn`'s String.
+    /// Only an ActiveRecord record's, or a graphql-ruby input object's
+    /// (whose `[]` reads the argument of the key's name): another class's
+    /// `[]` is its own method, whatever a method of the key's name answers.
+    /// A gem's `self[:dn].first`, with `[]` answering an Array, read `dn`'s
+    /// String.
     pub(super) fn column_attribute_access_ty(
         &self,
         recv_ty: Option<&Ty>,
@@ -80,7 +82,7 @@ impl<'a> BodyTyper<'a> {
             _ => return None,
         };
         let info = self.classes().get(model)?;
-        if !info.active_record_model {
+        if !info.active_record_model && !info.reads_arguments_by_key {
             return None;
         }
         let methods = &info.instance_methods;
