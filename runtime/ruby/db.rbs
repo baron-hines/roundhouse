@@ -20,6 +20,9 @@ module Db
   # holder is in a transaction of its own (not the request snapshot).
   def self.database_path: () -> String
   def self.adapter_name: () -> String
+  # The pool slot a connection handle taken now stays on (`ActiveRecord::Base.connection`), for Base itself or for the
+  # connection class; -1 on a Db with one database, where the handle is the shared one, and -2 before `configure`.
+  def self.connection_slot: (bool) -> Integer
   def self.transaction_open?: () -> bool
   def self.close: () -> void
   def self.exec: (String) -> void

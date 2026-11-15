@@ -1179,6 +1179,11 @@ pub fn insert_db_stub(
         Symbol::from("adapter_name"),
         fn_sig(vec![], Ty::Str),
     );
+    // A connection handle's pool slot, and the pair its statements run
+    // between (connection.rb).
+    db_info.class_methods.insert(Symbol::from("connection_slot"), fn_sig(vec![(Symbol::from("base"), Ty::Bool)], Ty::Int));
+    db_info.class_methods.insert(Symbol::from("enter_slot"), fn_sig(vec![(Symbol::from("slot"), Ty::Int), (Symbol::from("base"), Ty::Bool)], Ty::Nil));
+    db_info.class_methods.insert(Symbol::from("leave_slot"), fn_sig(vec![], Ty::Nil));
     // A write that returns rows (`INSERT … RETURNING`): a statement
     // handle, read as `prepare`'s is.
     db_info.class_methods.insert(

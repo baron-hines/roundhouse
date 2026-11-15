@@ -3399,7 +3399,8 @@ end
     key_composite_tables(&mut app)?;
     // Model-to-database ownership reads every model, concern splice and
     // library module, so it runs once they all exist.
-    super::database_ownership::resolve(&mut app);
+    super::database_ownership::resolve(&mut app, vfs.exists(&schema_path));
+    super::database_ownership::refuse_routing_settings(&mut app, vfs, dir);
     // Not an error: the queue's tables joined the primary at ingest, so solid_queue's record runs there, where the runtime's one connection is.
     if solid_queue_root.is_some() {
         for refusal in &mut app.database_refusals {

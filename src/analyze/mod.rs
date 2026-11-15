@@ -1128,6 +1128,15 @@ impl Analyzer {
         // ActiveRecord::AdapterInterface contract, and the Arel node family —
         // see `registry::ar`.
         registry::ar::register(&mut classes);
+        // Role and shard switching on the literal Base, which only a routed
+        // app's runtime answers; any other app keeps the refusal of an
+        // unknown Base method.
+        if app.database_routes.is_some() {
+            let base = classes.entry(ClassId(Symbol::from("ActiveRecord::Base"))).or_default();
+            for (method, ty) in ROUTED_SCOPE_METHODS {
+                base.class_methods.entry(Symbol::from(*method)).or_insert(ty.clone());
+            }
+        }
         registry::ar::register_action_text(&mut classes);
         registry::ar::register_action_cable(&mut classes);
         if app.gem_lock.as_ref().is_some_and(|lock| lock.has("sentry-ruby")) {
@@ -5872,6 +5881,15 @@ impl Analyzer {
         self.fold_concern_surfaces(app);
         self.fold_host_surfaces(app);
         self.fold_extended_modules(app);
+        // A routed app's models inherit Rails' switching methods from Base,
+        // unless the app's own is in their place (also from an `extend`,
+        // above).
+        for model in app.models.iter().filter(|_| app.database_routes.is_some()) {
+            let Some(cls) = self.classes.get_mut(&model.name) else { continue };
+            for (method, ty) in ROUTED_SCOPE_METHODS {
+                cls.class_methods.entry(Symbol::from(*method)).or_insert(ty.clone());
+            }
+        }
         self.fold_current_attribute_forwarders(app);
     }
 
@@ -11864,6 +11882,18 @@ fn register_attr_accessors(body: &[ModelBodyItem], methods: &mut HashMap<Symbol,
         }
     }
 }
+
+/// Rails' role and shard switching, the class methods `runtime/spinel/db.rb` answers on ActiveRecord::Base.
+const ROUTED_SCOPE_METHODS: &[(&str, Ty)] = &[
+    ("connected_to", Ty::Untyped),
+    ("while_preventing_writes", Ty::Untyped),
+    ("connected_to?", Ty::Bool),
+    ("current_preventing_writes", Ty::Bool),
+    ("current_role", Ty::Sym),
+    ("current_shard", Ty::Sym),
+    ("default_shard", Ty::Sym),
+    ("with_connection", Ty::Untyped),
+];
 
 /// `attribute :name, :type` (ActiveModel::Attributes) declares a typed
 /// virtual attribute backed by something other than a schema column

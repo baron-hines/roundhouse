@@ -935,6 +935,18 @@ def select(
             spinel = True
             jobs_selected.update(CORE)
             spinel_tests.add("data_record_composition")
+        if path in {
+            "src/database.rs",
+            "src/ingest/database_ownership.rs",
+            "src/ingest/database_yml.rs",
+            "src/ingest/expr.rs",
+            "tests/database_routes.rs",
+            "tests/spinel_toolchain/database_routes.rs",
+            "tests/support/database_routes.rs",
+        }:
+            reasons.append(f"{path}: unit and spinel-toolchain (role and shard routes)")
+            spinel = True
+            jobs_selected.update(CORE)
         if path in {"tests/emit_and_run/class_body_calls.rs", "tests/support/class_body_calls.rs"}:
             reasons.append(f"{path}: unit (emit_and_run), spinel-toolchain (ordinary class-body calls)")
             spinel = True

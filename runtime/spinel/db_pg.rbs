@@ -130,6 +130,8 @@ module Db
   def self.current_conn: () -> PgConn
   def self.database_path: () -> String
   def self.adapter_name: () -> String
+  def self.enter_slot: (Integer, bool) -> nil
+  def self.leave_slot: () -> nil
   def self.transaction_open?: () -> bool
   def self.in_lease?: () -> bool
   def self.pin_transaction: (PgConn conn) -> nil

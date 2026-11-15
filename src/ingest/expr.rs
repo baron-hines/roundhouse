@@ -1209,17 +1209,19 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 return Ok(source_file_path_lit(span, dir));
             }
             if let Some(body) = writing_connection_block(&c) {
-                return match body {
-                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file),
-                    WritingBlock::Body(None) => Ok(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
-                    WritingBlock::Forwarded(name) => Ok(Expr::new(span, ExprNode::Send {
+                let mut body = match body {
+                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file)?,
+                    WritingBlock::Body(None) => Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+                    WritingBlock::Forwarded(name) => Expr::new(span, ExprNode::Send {
                         recv: Some(Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name })),
                         method: Symbol::from("call"),
                         args: Vec::new(),
                         block: None,
                         parenthesized: false,
-                    })),
+                    }),
                 };
+                body.decisions |= crate::expr::ERASED_WRITING_SCOPE;
+                return Ok(body);
             }
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
                 ingest_forwardable_arguments(&a, file)?
@@ -4482,7 +4484,12 @@ fn desugar_post_params(rest_param: &mut Option<Symbol>, posts: Vec<Symbol>, body
         .collect();
     match *body.node {
         ExprNode::Seq { exprs: inner } => exprs.extend(inner),
-        other => exprs.push(Expr::new(body.span, other)),
+        other => {
+            // With the statement's own marks: a writing block read as its body is still one (`ERASED_WRITING_SCOPE`).
+            let mut only = Expr::new(body.span, other);
+            only.decisions = body.decisions;
+            exprs.push(only);
+        }
     }
     Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
 }

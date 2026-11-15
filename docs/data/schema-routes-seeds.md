@@ -288,8 +288,9 @@ the environment is a mapping, otherwise the one configuration
 the adapter (`adapter:`, or the scheme of a literal `url:`, which wins;
 an environment given as a URL string is that URL's configuration).
 Only identity keys are read (`adapter`, `url`, `replica`,
-`database_tasks`, `migrations_paths`, `schema_search_path`), so no
-connection value or credential reaches the IR. ERB is not run: an
+`database_tasks`, `migrations_paths`, `schema_search_path`, a literal
+`schema_dump`, and a SQLite configuration's literal `database`), so no
+credential reaches the IR. ERB is not run: an
 output tag in a connection value does not matter, one in an identity key
 leaves that configuration out with a warning, and a control tag leaves
 them all out. `DATABASE_URL` is not read. The primary's SQLite
@@ -308,6 +309,42 @@ for `connected_to`, `connected_to_many` and `connecting_to`, passes the
 `role:` or `shard:` Rails requires; a call on another object is the
 app's own method. A `connects_to` whose
 writing database is the primary checks clean and runs.
+
+The Spinel target on SQLite carries one routed shape
+(`App::database_routes`): one abstract class directly under
+`ActiveRecord::Base` declares a literal `connects_to database:` or
+`connects_to shards:`, and every model descends from it. Each
+configuration it names is a SQLite file written as a literal
+`database:` (which is read for this), and each writable one is the
+primary or says `schema_dump: schema.rb`, the app's own schema file:
+Rails' default for another database is a schema file of its own, which
+is not read. `Db.configure` then opens a pool per shard and role, in an
+arm per environment the file describes this way, and creates the
+schema's tables in each writable file; an environment without an arm
+raises at boot. The roles are Rails' defaults, `writing` and `reading`.
+
+In such an app `connected_to` and `while_preventing_writes` run as in
+Rails 8.1.4, on `ActiveRecord::Base` or the connection class, with a
+block of their own: the role and shard resolve separately through the
+enclosing blocks, the block's selection is restored when it returns,
+raises, or is left by `return` or `break`, a pool nothing defines
+raises `ActiveRecord::ConnectionNotDefined` at the first query, and a
+reading role, `while_preventing_writes` or a `replica: true`
+configuration raises `ActiveRecord::ReadOnlyError` before a write
+runs. The selection belongs to the thread, as under Rails' default
+`isolation_level`. `current_role`, `current_shard`,
+`current_preventing_writes`, `connected_to?` and `default_shard`
+answer as Rails does. Still refused there, each by name: a string or
+configured role name, computed options, a forwarded block,
+`connected_to_many`, `connecting_to`, `prohibit_shard_swapping`,
+`connection_handler`, a registration at run time, and any of these
+blocks in a view, a seed or a test helper. A connection handle
+(`connection`, `lease_connection`, `with_connection`) is routed when
+it is taken and stays on that pool, as in Rails. Refused when called,
+with `NotImplementedError`: a block that selects another database
+inside an open transaction, a block that returns a relation,
+`connection_pool`, `raw_connection`, and `ActiveRecord::Base.transaction`
+when Base's database is not the models'. Every other target keeps one error for the app.
 
 The primary the test environment names decides the SQL dialect of the
 Ruby target's emit (`schema_sql::Dialect::for_app`). For postgresql, the

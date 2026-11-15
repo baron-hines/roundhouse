@@ -7775,6 +7775,53 @@ fn apply_database_pragmas(files: &mut [(String, String)], app: &App) {
     }
 }
 
+/// `App::database_routes` into the Spinel SQLite shim's `Db.configure`:
+/// one `route` per shard and role, under an arm per environment whose
+/// configurations the runtime can open (`Database::routable`). The
+/// primary is the database `configure` was given, so its route names no
+/// file. An environment without an arm raises at boot: a model is never
+/// left on the primary because its own database is unknown.
+fn apply_database_routes(files: &mut [(String, String)], app: &App) {
+    const MARK: &str = "    # >>> generated: database-routes\n";
+    let Some(routes) = &app.database_routes else { return };
+    let Some((_, content)) = files.iter_mut().find(|(path, content)| path == "runtime/db.rb" && content.contains(MARK)) else { return };
+    let lit = |text: &str| crate::emit::ruby::expr::ruby_str_literal(text);
+    let symbol = |name: &str| {
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { format!(":{name}") } else { format!(":{}", lit(name)) }
+    };
+    let mut envs: Vec<&str> = app.databases.iter().map(|d| d.env.as_str()).collect();
+    envs.dedup();
+    let mut generated = format!("{MARK}    case Rails.env_name.to_s\n");
+    for env in envs {
+        let config = |name: &str| app.databases.iter().find(|d| d.env == env && d.name == name);
+        let primary_is_sqlite = app.databases.iter().any(|d| d.env == env && d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3);
+        let opens = |(_, role, name): &(String, String, String)| config(name).is_some_and(|d| d.routable(role == "writing"));
+        if !primary_is_sqlite || !routes.routes.iter().all(opens) {
+            continue;
+        }
+        let names = if env == "development" { format!("{}, \"\"", lit(env)) } else { lit(env) };
+        generated.push_str(&format!("    when {names}\n"));
+        for (shard, role, name) in &routes.routes {
+            let Some(database) = config(name) else { continue };
+            let file = if database.primary { "" } else { database.database.as_deref().unwrap_or("") };
+            generated.push_str(&format!(
+                "      route({}, {}, {}, {}, {}, n)\n",
+                symbol(shard),
+                symbol(role),
+                lit(file),
+                database.replica,
+                role == "writing"
+            ));
+        }
+    }
+    generated.push_str(&format!(
+        "    else\n      raise \"Db.configure: config/database.yml names no SQLite files to route `{}` in the \" + Rails.env_name.to_s + \" environment\"\n    end\n    @default_shard = {}\n",
+        routes.owner.0.as_str(),
+        symbol(&routes.default_shard)
+    ));
+    *content = content.replacen(MARK, &generated, 1);
+}
+
 /// Write `JobRegistry` — each payload job's writer and reader, and the
 /// record locators they use — into `runtime/job_registry.rb`, from
 /// `App::job_plans`. A span replace between markers, like
@@ -11528,6 +11575,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     // Every SQLite shim in the base set (db.rb, db_cruby.rb); the JDBC one
     // is read in later, by `ruby_family_runtime_files`.
     apply_database_pragmas(&mut files, app);
+    apply_database_routes(&mut files, app);
     apply_attachable_locate(&mut files, app);
     // Same reason: both lanes require `runtime/job_registry.rb`.
     apply_job_registry(&mut files, app);

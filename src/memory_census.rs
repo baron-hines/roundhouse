@@ -319,6 +319,7 @@ pub fn census(stage: &str, app: &crate::App) {
         databases,
         model_databases,
         database_refusals,
+        database_routes: _,
         ingest_drops,
         library_class_files,
         rails_application,

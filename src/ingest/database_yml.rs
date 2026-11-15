@@ -14,7 +14,8 @@
 //! are applied. Only the keys that decide identity are read: `adapter`
 //! (or the scheme of a `url`, then a literal `adapter` beside a computed
 //! `url`), `replica`, `database_tasks`,
-//! `migrations_paths` and `schema_search_path`.
+//! `migrations_paths` and `schema_search_path`, and, as literals, a
+//! SQLite configuration's `database` (its file) and `schema_dump`.
 //!
 //! Resolution is at build time, so ERB is not run. An output tag
 //! (`<%= ... %>`) in a connection value (a password, a pool size) does
@@ -219,6 +220,11 @@ pub(crate) fn database_configurations(text: &str, file: FileId) -> Configuration
                     .collect(),
                 _ => Vec::new(),
             };
+            let literal = |key: &str| match scalar(key) {
+                Some(Value::String(text)) if !text.contains(ERB_VALUE) => Some(text),
+                _ => None,
+            };
+            let is_sqlite = adapter == DatabaseAdapter::Sqlite3;
             let schema_search_path = match scalar("schema_search_path") {
                 Some(Value::String(path)) => Some(path),
                 _ => None,
@@ -232,6 +238,9 @@ pub(crate) fn database_configurations(text: &str, file: FileId) -> Configuration
                 database_tasks,
                 migrations_paths,
                 schema_search_path,
+                // Not beside a `url:`, which names the database itself.
+                database: literal("database").filter(|_| is_sqlite && scalar("url").is_none()),
+                schema_dump: literal("schema_dump"),
             });
         }
     }

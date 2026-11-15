@@ -183,6 +183,7 @@ fn tiny_blog_round_trips() {
         databases: Vec::new(),
         model_databases: Default::default(),
         database_refusals: Vec::new(),
+        database_routes: None,
         ingest_drops: Vec::new(),
         library_class_files: Vec::new(),
         rbs_includes: Default::default(),

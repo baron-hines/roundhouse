@@ -28,10 +28,13 @@
 //! `connecting_to`, `while_preventing_writes`) anywhere in the app is
 //! refused at its call, except the `connected_to(role: :writing)` block
 //! ingest already reads as its body (`ingest::expr`).
+//!
+//! One app is carried instead, on the Spinel target ([`admitted_routes`],
+//! [`scoped_call`], [`restore_writing_scopes`]).
 
 use crate::det::HashMap;
 
-use crate::database::{DatabaseRefusal, ModelDatabase};
+use crate::database::{Database, DatabaseRefusal, DatabaseRoutes, ModelDatabase};
 use crate::dialect::{MethodReceiver, Model, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
@@ -68,6 +71,10 @@ enum Own {
     Named { writing: String, reading: Option<String>, span: Span },
     AppDefined { method: Symbol, defined_by: ClassId, span: Span },
     Unresolved { construct: &'static str, reason: String, span: Span },
+    /// A literal `connects_to shards:`: each shard with its writing and
+    /// reading configuration. Refused with `reason` unless
+    /// [`admitted_routes`] takes the app.
+    Shards { pools: Vec<(String, String, Option<String>)>, reason: String, span: Span },
 }
 
 fn on_self(recv: &Option<Expr>) -> bool {
@@ -106,7 +113,7 @@ fn connects_to(model: &Model, args: &[Expr], block: &Option<Expr>, span: Span) -
     if block.is_some() {
         return unresolved(format!("`connects_to` on `{class}` passes a block"));
     }
-    let [ExprNode::Hash { entries, .. }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else {
+    let [ExprNode::Hash { entries, kwargs: true }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else {
         return unresolved(format!(
             "`connects_to` on `{class}` is not a literal `database: {{ writing: :name, reading: :name }}`"
         ));
@@ -115,9 +122,21 @@ fn connects_to(model: &Model, args: &[Expr], block: &Option<Expr>, span: Span) -
     for (k, v) in entries {
         match sym(k).as_deref() {
             Some("shards") => {
-                return unresolved(format!(
-                    "`connects_to shards:` on `{class}` declares horizontal shards; shard routing is not modeled"
-                ));
+                let reason = format!("`connects_to shards:` on `{class}` declares horizontal shards; shard routing is not modeled");
+                let pools = match &*v.node {
+                    ExprNode::Hash { entries: shards, .. } if entries.len() == 1 && !shards.is_empty() => shards
+                        .iter()
+                        .map(|(shard, pool)| match (sym(shard), roles(pool)) {
+                            (Some(shard), Some((Some(writing), reading))) => Some((shard, writing, reading)),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>(),
+                    _ => None,
+                };
+                return match pools {
+                    Some(pools) if crate::lower::model_to_library::markers::is_abstract_class(model) => Own::Shards { pools, reason, span },
+                    _ => unresolved(reason),
+                };
             }
             Some("database") if database.is_none() => database = Some(v),
             _ => {
@@ -167,8 +186,8 @@ fn calls_named(expr: &Expr, names: &[&str], out: &mut Vec<(Span, String)>) {
 /// `connected_to` family with the `role:` or `shard:` Rails requires of
 /// it. A call on another object, or without those keywords, is the
 /// app's own method of the same name.
-fn switches_in(expr: &Expr, out: &mut Vec<(Span, String)>) {
-    if let ExprNode::Send { recv, method, args, .. } = &*expr.node {
+fn switches_in(expr: &Expr, routes: Option<&DatabaseRoutes>, out: &mut Vec<(Span, String, String)>) {
+    if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node {
         let name = method.as_str();
         let on_class = recv.as_ref().is_none_or(|r| matches!(*r.node, ExprNode::SelfRef | ExprNode::Const { .. }));
         let keyed = || {
@@ -177,16 +196,188 @@ fn switches_in(expr: &Expr, out: &mut Vec<(Span, String)>) {
                 _ => false,
             })
         };
+        let class = recv.as_ref().and_then(|r| match &*r.node {
+            ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")),
+            _ => None,
+        });
+        // On a routed app's connection class the method is Rails', so
+        // options that cannot be read (a splat, a variable) may name a
+        // role or shard.
+        let unread = || {
+            let ours = routes.zip(class.as_deref()).is_some_and(|(routes, class)| class == "ActiveRecord::Base" || class == routes.owner.0.as_str());
+            ours && !args.iter().all(|arg| matches!(&*arg.node, ExprNode::Hash { entries, .. } if entries.iter().all(|(k, _)| sym(k).is_some())))
+        };
         let switch = match name {
-            "connected_to" | "connected_to_many" | "connecting_to" => keyed(),
+            "connected_to" | "connected_to_many" | "connecting_to" => keyed() || unread(),
             _ => SWITCHES.contains(&name),
         };
-        if on_class && switch {
-            out.push((expr.span, name.to_string()));
+        let detail = if !(on_class && switch) {
+            // What a routed app's build cannot route: a default changed
+            // or a connection registered while it runs.
+            match (routes, class.as_deref()) {
+                (Some(_), _) if on_class && matches!(name, "default_shard=" | "default_role=") => Some(format!(
+                    "`{name}` changes the default a query runs on; the routed runtime reads the first declared shard and the writing role"
+                )),
+                (Some(_), Some(class)) if matches!(name, "connects_to" | "establish_connection") => Some(format!(
+                    "`{class}.{name}` registers a connection while the app runs; only the class-body `connects_to` is routed"
+                )),
+                _ => None,
+            }
+        } else if name == "connection_handler" {
+            Some(
+                "`connection_handler` is Rails' connection handler (pools by connection name, role and shard); \
+                 the emitted runtime has one connection, to the primary"
+                    .to_string(),
+            )
+        } else {
+            match routes {
+                Some(routes) if scoped_call(routes, class.as_deref(), name, args, block) => None,
+                Some(routes) if matches!(name, "connected_to" | "while_preventing_writes") => Some(format!(
+                    "`{name}` here is not a scope the routed runtime carries: called on ActiveRecord::Base or `{}`, with a literal `role: :writing` or `:reading`, a symbol or computed `shard:`, a literal `prevent_writes:`, and a block of its own without parameters",
+                    routes.owner.0.as_str()
+                )),
+                _ => Some(format!("`{name}` switches the role or shard a block runs on; role and shard switching is not modeled")),
+            }
+        };
+        if let Some(detail) = detail {
+            out.push((expr.span, name.to_string(), detail));
         }
     }
-    expr.node.for_each_child(&mut |child| switches_in(child, out));
+    expr.node.for_each_child(&mut |child| switches_in(child, routes, out));
 }
+
+/// Every switch in a body a routed app is not carried in (a view, a seed,
+/// a test helper): a [`SWITCHES`] call on a class, whatever it passes,
+/// and a writing block ingest read as its body.
+fn switches_aside(expr: &Expr, out: &mut Vec<(Span, String, String)>) {
+    let name = match &*expr.node {
+        ExprNode::Send { recv, method, .. }
+            if SWITCHES.contains(&method.as_str()) && recv.as_ref().is_none_or(|r| matches!(*r.node, ExprNode::SelfRef | ExprNode::Const { .. })) =>
+        {
+            Some(method.as_str())
+        }
+        _ if expr.decisions & crate::expr::ERASED_WRITING_SCOPE != 0 => Some("connected_to"),
+        _ => None,
+    };
+    if let Some(name) = name {
+        let detail = format!("`{name}` in a view, a seed or a test helper is not carried in an app that routes by role and shard; switch in a model, a controller or a library class");
+        out.push((expr.span, name.to_string(), detail));
+    }
+    expr.node.for_each_child(&mut |child| switches_aside(child, out));
+}
+
+/// Whether a switch is one the routed runtime runs as Rails does:
+/// `connected_to` or `while_preventing_writes` on ActiveRecord::Base or
+/// the connection class (Rails raises for any other), with the default
+/// roles as literals and its own block.
+fn scoped_call(routes: &DatabaseRoutes, class: Option<&str>, name: &str, args: &[Expr], block: &Option<Expr>) -> bool {
+    let literal = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value } => Some(value.clone()),
+        _ => None,
+    };
+    let own_block = block.as_ref().is_some_and(|b| {
+        matches!(&*b.node, ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, .. } if params.is_empty() && extra_params.is_empty())
+    });
+    if !own_block || !class.is_some_and(|c| c == "ActiveRecord::Base" || c == routes.owner.0.as_str()) {
+        return false;
+    }
+    match (name, args) {
+        ("while_preventing_writes", []) => true,
+        ("while_preventing_writes", [enabled]) => matches!(literal(enabled), Some(Literal::Bool { .. })),
+        ("connected_to", [options]) => match &*options.node {
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| match (sym(key).as_deref(), literal(value)) {
+                (Some("role"), Some(Literal::Sym { value })) => matches!(value.as_str(), "writing" | "reading"),
+                (Some("shard"), value) => value.is_none_or(|value| matches!(value, Literal::Sym { .. })),
+                (Some("prevent_writes"), Some(Literal::Bool { .. })) => true,
+                _ => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Put back each `ActiveRecord::Base.connected_to(role: :writing)` call
+/// ingest read as its block's body ([`crate::expr::ERASED_WRITING_SCOPE`]):
+/// in an app that switches roles it lifts an outer reading block's guard.
+fn restore_writing_scopes(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut |child| restore_writing_scopes(child));
+    if expr.decisions & crate::expr::ERASED_WRITING_SCOPE == 0 {
+        return;
+    }
+    expr.decisions &= !crate::expr::ERASED_WRITING_SCOPE;
+    let span = expr.span;
+    let symbol = |name: &str| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
+    let body = std::mem::replace(expr, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+    let block = ExprNode::Lambda { params: Vec::new(), rest_param: None, extra_params: Vec::new(), block_param: None, body, block_style: Default::default() };
+    let mut base = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveRecord"), Symbol::from("Base")] });
+    base.decisions |= crate::expr::GENERATED_CONST_REF;
+    *expr = Expr::new(span, ExprNode::Send {
+        recv: Some(base),
+        method: Symbol::from("connected_to"),
+        args: vec![Expr::new(span, ExprNode::Hash { entries: vec![(symbol("role"), symbol("writing"))], kwargs: true })],
+        block: Some(Expr::new(span, block)),
+        parenthesized: true,
+    });
+}
+
+/// The routes of an app the Spinel SQLite runtime carries, with the
+/// span of their declaration; `None` for any other app, whose refusals
+/// stand. Rails' primary class alone declares `connects_to`, as a
+/// literal `database:` or `shards:`, and every model descends from it,
+/// so no query runs on the primary by default. Every configuration it
+/// names is one the runtime can open ([`Database::routable`]) beside a
+/// SQLite primary, and the app's schema is `db/schema.rb`. A `database:`
+/// that names only the primary routes nothing.
+fn admitted_routes(
+    app: &App,
+    own: &[Option<Own>],
+    deciding: &[Option<usize>],
+    environment: &[&Database],
+    schema_rb: bool,
+) -> Option<(DatabaseRoutes, Span)> {
+    let mut declared = own.iter().enumerate().filter_map(|(j, own)| own.as_ref().map(|own| (j, own)));
+    let (j, declaration) = declared.next()?;
+    let owner = &app.models[j];
+    let under_base = owner.parent.as_ref().is_some_and(|p| p.0.as_str().trim_start_matches("::") == "ActiveRecord::Base");
+    // Rails' primary class, whose pools are ActiveRecord::Base's own: any
+    // other connection class keeps pools of its own beside the primary's.
+    let names_primary = |m: &Model| {
+        m.body.iter().any(|item| matches!(item, ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "primary_abstract_class")))
+    };
+    let primary = (owner.name.0.as_str() == "ApplicationRecord" || names_primary(owner)) && app.models.iter().filter(|m| names_primary(m)).count() <= usize::from(names_primary(owner));
+    if declared.next().is_some() || !under_base || !primary || !schema_rb || deciding.iter().any(|d| *d != Some(j)) {
+        return None;
+    }
+    let (pools, span) = match declaration {
+        Own::Named { writing, reading, span } => (vec![("default".to_string(), writing.clone(), reading.clone())], *span),
+        Own::Shards { pools, span, .. } => (pools.clone(), *span),
+        _ => return None,
+    };
+    let mut envs: Vec<&str> = environment.iter().map(|d| d.env.as_str()).collect();
+    envs.dedup();
+    let mut routes = Vec::new();
+    let mut beyond_primary = false;
+    for (shard, writing, reading) in &pools {
+        for (role, name) in [("writing", Some(writing)), ("reading", reading.as_ref())] {
+            let Some(name) = name else { continue };
+            for env in &envs {
+                let database = environment.iter().find(|d| d.env == *env && d.name == *name)?;
+                if !database.routable(role == "writing") {
+                    return None;
+                }
+                beyond_primary |= !database.primary;
+            }
+            routes.push((shard.clone(), role.to_string(), name.clone()));
+        }
+    }
+    let sqlite_primary = |env: &&str| environment.iter().any(|d| d.env == *env && d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3);
+    if !beyond_primary || !envs.iter().all(sqlite_primary) {
+        return None;
+    }
+    Some((DatabaseRoutes { owner: owner.name.clone(), default_shard: pools[0].0.clone(), routes }, span))
+}
+
 
 /// The first thing `model`'s own body says about its connection, plus
 /// the refusals for anything else it says.
@@ -286,7 +477,7 @@ fn own_decision(
         _ => {
             let first = found.remove(0);
             let second_span = match &found[0] {
-                Own::Named { span, .. } | Own::AppDefined { span, .. } | Own::Unresolved { span, .. } => *span,
+                Own::Named { span, .. } | Own::AppDefined { span, .. } | Own::Unresolved { span, .. } | Own::Shards { span, .. } => *span,
             };
             match first {
                 Own::Unresolved { .. } => Some(first),
@@ -300,6 +491,81 @@ fn own_decision(
                 }),
             }
         }
+    }
+}
+
+/// A routed app whose configuration changes what a role or shard block
+/// means keeps an error on every target: the runtime reads Rails'
+/// defaults. Read as text; a line that sets one is enough.
+pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V, dir: &std::path::Path) {
+    const SETTINGS: &[(&str, &str)] = &[
+        ("writing_role", "a configured role name"),
+        ("reading_role", "a configured role name"),
+        ("isolation_level", "an isolation level other than the default `:thread`"),
+        ("database_selector", "the middleware that switches roles for a request"),
+        ("database_resolver", "the middleware that switches roles for a request"),
+        ("shard_selector", "the middleware that switches shards for a request"),
+        ("shard_resolver", "the middleware that switches shards for a request"),
+    ];
+    let Some(span) = app.database_refusals.iter().find(|r| r.construct == "database_routes").map(|r| r.span) else { return };
+    let mut files = vec![dir.join("config/application.rb")];
+    for part in ["config/environments", "config/initializers"] {
+        files.extend(super::app::read_rb_files(vfs, &dir.join(part)).unwrap_or_default());
+    }
+    for file in files {
+        let Ok(text) = vfs.read_to_string(&file) else { continue };
+        let set = |line: &&str| !line.starts_with('#') && !line.ends_with("isolation_level = :thread");
+        // An assignment to the setting, not a mention or a comparison;
+        // without a trailing comment.
+        let assigns = |line: &str, key: &str| {
+            line.split_once(&format!(".{key}")).is_some_and(|(_, rest)| rest.trim_start().starts_with('=') && !rest.trim_start().starts_with("=="))
+        };
+        for line in text.lines().map(|line| line.split(" #").next().unwrap_or(line).trim()).filter(set) {
+            if let Some((key, what)) = SETTINGS.iter().find(|(key, _)| assigns(line, key)) {
+                app.database_refusals.push(DatabaseRefusal {
+                    span,
+                    construct: "database_routes_setting".to_string(),
+                    detail: format!("{} sets `{key}`: {what} is not carried by the routed runtime, which reads Rails' defaults", super::sources::relative_path(&file.display().to_string())),
+                    warning: false,
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// Every body the switch walk reads.
+fn each_body(app: &mut App, f: &mut dyn FnMut(&mut Expr)) {
+    // A method's body and its parameters' defaults, which a call runs too.
+    fn method(m: &mut crate::dialect::MethodDef, f: &mut dyn FnMut(&mut Expr)) {
+        f(&mut m.body);
+        m.params.iter_mut().filter_map(|p| p.default.as_mut()).for_each(f);
+    }
+    for model in &mut app.models {
+        for item in &mut model.body {
+            match item {
+                ModelBodyItem::Method { method: m, .. } => method(m, f),
+                ModelBodyItem::Unknown { expr, .. } => f(expr),
+                ModelBodyItem::Scope { scope, .. } => f(&mut scope.body),
+                _ => {}
+            }
+        }
+    }
+    for controller in &mut app.controllers {
+        for item in &mut controller.body {
+            match item {
+                crate::dialect::ControllerBodyItem::Action { action, .. } => f(&mut action.body),
+                crate::dialect::ControllerBodyItem::ClassMethod { method: m, .. } => method(m, f),
+                _ => {}
+            }
+        }
+    }
+    for class in app.library_classes.iter_mut().chain(app.rails_application.iter_mut()) {
+        class.methods.iter_mut().for_each(|m| method(m, f));
+    }
+    for module in &mut app.test_modules {
+        module.tests.iter_mut().for_each(|t| f(&mut t.body));
+        module.setup.iter_mut().for_each(&mut *f);
     }
 }
 
@@ -323,7 +589,7 @@ fn resolve_parent<'a>(child: &str, parent: &str, by_name: &HashMap<&'a str, usiz
 /// Record `app.model_databases` and the routing refusals. Runs after
 /// every model, concern splice and library class exists, and after
 /// `config/database.yml` is read into `app.databases`.
-pub(super) fn resolve(app: &mut App) {
+pub(super) fn resolve(app: &mut App, schema_rb: bool) {
     let modules: HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().filter(|c| c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
     let by_name: HashMap<&str, usize> =
@@ -433,9 +699,50 @@ pub(super) fn resolve(app: &mut App) {
                 note(span, construct, reason.clone(), name);
                 ModelDatabase::Unresolved { reason, span }
             }
+            Some((_, Own::Shards { reason, span, .. })) => {
+                note(span, "connects_to", reason.clone(), name);
+                ModelDatabase::Unresolved { reason, span }
+            }
         };
         owners.insert(model.name.clone(), ownership);
     }
+    // Role and shard switches, wherever the app makes one.
+    let admitted = admitted_routes(app, &own, &deciding, &environment, schema_rb);
+    let mut switches = Vec::new();
+    each_body(app, &mut |e| switches_in(e, None, &mut switches));
+    // Read for a routed app only, where a switch in one is refused: a
+    // view's block does not write its output, and a writing block read as
+    // its body stays one there.
+    let mut aside = Vec::new();
+    let mut read_aside = |e: &Expr| switches_aside(e, &mut aside);
+    app.views.iter().for_each(|view| read_aside(&view.body));
+    app.seeds.iter().for_each(&mut read_aside);
+    app.test_modules.iter().flat_map(|module| &module.helpers).for_each(|helper| read_aside(&helper.body));
+    // The routing the Spinel SQLite runtime carries, when the app needs
+    // it (a declaration or a switch refused until now), stands for those
+    // refusals: one, which that target drops
+    // (`session::drop_runtime_answered`).
+    let routes = admitted.filter(|_| !by_site.is_empty() || !switches.is_empty() || !aside.is_empty());
+    if let Some((routes, span)) = &routes {
+        by_site.clear();
+        switches.clear();
+        refusals.push(DatabaseRefusal {
+            span: *span,
+            construct: "database_routes".to_string(),
+            detail: format!(
+                "`connects_to` on `{}` routes {} model(s) by role and shard across SQLite files: only the spinel target's runtime opens them, and no other database is substituted",
+                routes.owner.0.as_str(),
+                app.models.len()
+            ),
+            warning: false,
+        });
+        each_body(app, &mut |e| {
+            restore_writing_scopes(e);
+            switches_in(e, Some(routes), &mut switches);
+        });
+        switches.append(&mut aside);
+    }
+    let routes = routes.map(|(routes, _)| routes);
     for (span, construct, detail, models) in by_site {
         let shown: Vec<&str> = models.iter().take(4).map(String::as_str).collect();
         let more = if models.len() > 4 { format!(", and {} more", models.len() - 4) } else { String::new() };
@@ -447,51 +754,16 @@ pub(super) fn resolve(app: &mut App) {
         });
     }
 
-    // Role and shard switches, wherever the app makes one.
-    let mut switches = Vec::new();
-    let mut walk = |e: &Expr| switches_in(e, &mut switches);
-    for model in &app.models {
-        for item in &model.body {
-            match item {
-                ModelBodyItem::Method { method, .. } => walk(&method.body),
-                ModelBodyItem::Unknown { expr, .. } => walk(expr),
-                ModelBodyItem::Scope { scope, .. } => walk(&scope.body),
-                _ => {}
-            }
-        }
-    }
-    for controller in &app.controllers {
-        for item in &controller.body {
-            match item {
-                crate::dialect::ControllerBodyItem::Action { action, .. } => walk(&action.body),
-                crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => walk(&method.body),
-                _ => {}
-            }
-        }
-    }
-    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
-        class.methods.iter().for_each(|m| walk(&m.body));
-    }
-    for module in &app.test_modules {
-        module.tests.iter().for_each(|t| walk(&t.body));
-        module.setup.iter().for_each(&mut walk);
-    }
-    switches.sort_by_key(|(s, _)| (s.file.0, s.start));
-    switches.dedup_by_key(|(s, _)| *s);
-    for (span, method) in switches {
-        let detail = if method == "connection_handler" {
-            "`connection_handler` is Rails' connection handler (pools by connection name, role and shard); \
-             the emitted runtime has one connection, to the primary"
-                .to_string()
-        } else {
-            format!("`{method}` switches the role or shard a block runs on; role and shard switching is not modeled")
-        };
-        refusals.push(DatabaseRefusal { span, construct: method.clone(), detail, warning: false });
+    switches.sort_by_key(|(s, _, _)| (s.file.0, s.start));
+    switches.dedup_by_key(|(s, _, _)| *s);
+    for (span, method, detail) in switches {
+        refusals.push(DatabaseRefusal { span, construct: method, detail, warning: false });
     }
 
     let any_routing = owners.values().any(|o| !matches!(o, ModelDatabase::Primary));
     if any_routing {
         app.model_databases = owners;
     }
+    app.database_routes = routes;
     app.database_refusals.extend(refusals);
 }

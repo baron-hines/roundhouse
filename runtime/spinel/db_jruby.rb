@@ -260,6 +260,11 @@ module Db
     "sqlite3"
   end
 
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
+  end
+
   def self.transaction_open?
     current_dbh.in_txn
   end
