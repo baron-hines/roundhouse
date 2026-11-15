@@ -474,8 +474,10 @@ pub(super) fn push_association_methods(
                     ));
                 }
             }
-            // Unresolved polymorphic (`polymorphic: true` but no inverse
-            // `as:` filled `polymorphic_targets`): do **not** fall through
+            // Unresolved polymorphic (`polymorphic: true` with an empty
+            // `polymorphic_targets`, which ingest leaves only on the
+            // framework records it synthesizes after resolving, as
+            // ActionText::RichText's `record`): do **not** fall through
             // to the monomorphic synthesizer. The phantom target is often
             // `Record` (ActionText::RichText / Markdown), and emitting
             // `Record.find_by` is a boot-time `NameError` if the accessor

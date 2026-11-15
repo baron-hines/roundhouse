@@ -1598,7 +1598,8 @@ impl AssocRegistry {
         self.belongs_to_fk.get(&(model.clone(), assoc.clone()))
     }
     /// `(type column, resolved implementor classes)` of a polymorphic
-    /// belongs_to; the set is empty when no `as:` inverse resolved it.
+    /// belongs_to; the set is empty only on a framework record ingest
+    /// synthesizes after `resolve_polymorphic_targets` runs.
     fn polymorphic_belongs_to(&self, model: &ClassId, assoc: &Symbol) -> Option<&(Symbol, Vec<ClassId>)> {
         self.polymorphic_belongs_to.get(&(model.clone(), assoc.clone()))
     }

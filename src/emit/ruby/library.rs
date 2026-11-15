@@ -12580,8 +12580,11 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
         }
         match assoc {
             // A scoped one keeps its lazy reader, which finds through the
-            // scope, as a scoped has_many does below.
-            Association::BelongsTo { name, target, foreign_key, scope: None, .. } => {
+            // scope, as a scoped has_many does below. So does a polymorphic
+            // one, whose class is in each row's type column: `target` is
+            // only the name's class (`belongs_to :post` reads `Post`), which
+            // may be an app model all the same.
+            Association::BelongsTo { name, target, foreign_key, scope: None, polymorphic: false, .. } => {
                 let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
                     continue;
                 };

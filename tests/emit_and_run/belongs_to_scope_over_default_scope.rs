@@ -2,8 +2,9 @@
 //! the association is read: the polymorphic reader, its preload, a plain
 //! reader and a join, so a scope that unscopes the default condition reaches the rows
 //! the default scope hides, as Rails builds the association scope on the
-//! target's `default_scoped` relation. Ignored as a fork spec until the
-//! compiler does; the expected values are ActiveRecord 8.1.4's answers.
+//! target's `default_scoped` relation. `Comment`'s polymorphic association
+//! has no inverse `as:`, so its reader reads any model, as Rails'
+//! constantize does. The expected values are ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -66,7 +67,6 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: preload"]
 fn a_belongs_to_scope_applies_over_the_targets_default_scope() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
@@ -74,7 +74,7 @@ fn a_belongs_to_scope_applies_over_the_targets_default_scope() {
 }
 
 #[test]
-#[ignore = "fork spec: preload"]
+#[ignore = "requires the Spinel toolchain"]
 fn a_belongs_to_scope_applies_over_the_targets_default_scope_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();
