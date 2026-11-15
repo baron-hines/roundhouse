@@ -1386,8 +1386,12 @@ module Db
     # Threads are assigned round-robin, so shards carry equal numbers of them;
     # sizing keeps at least 4 handles per shard, since a shard of one is a
     # mutex with extra steps.
-    @permits[path] = DbPermit.new if !@permits.key?(path)
-    @slots = [DbSlot.new(path, open_pools(path, n), @permits[path])]
+    # One permit per database file, keyed by its expanded path so that
+    # `data.sqlite3` and `./data.sqlite3` share it; the slot opens `path`
+    # as given.
+    key = File.expand_path(path)
+    @permits[key] = DbPermit.new if !@permits.key?(key)
+    @slots = [DbSlot.new(path, open_pools(path, n), @permits[key])]
     @assign_lock = Mutex.new
     @next_pool = 0
   end
