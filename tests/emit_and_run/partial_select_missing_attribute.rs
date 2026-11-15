@@ -79,6 +79,15 @@ end
     Article.where(id: article.id).update_all(status: "later")
     cleared.save!
     check("later save keeps another write", article.reload.status, "later")
+    rolled = Article.where(id: article.id).select(:id, :title).take!
+    rolled.status = nil
+    Article.transaction do
+      rolled.save!
+      raise ActiveRecord::Rollback
+    end
+    check("nil assignment rolled back", article.reload.status, "later")
+    rolled.save!
+    check("nil assignment saved after a rollback", article.reload.status, nil)
   end
 
   def self.index(record, key)

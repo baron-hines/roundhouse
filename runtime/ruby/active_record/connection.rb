@@ -2154,6 +2154,7 @@ module ActiveRecord
       unless @__rollback_saved
         @__rollback_saved = true
         @__rollback_baseline = @__last_saved_attributes
+        @__rollback_unloaded_writes = @__unloaded_writes
       end
       _enlist_or_run(kind)
     end
@@ -2173,6 +2174,7 @@ module ActiveRecord
       unless @__rollback_saved
         @__rollback_saved = true
         @__rollback_baseline = @__last_saved_attributes
+        @__rollback_unloaded_writes = @__unloaded_writes
       end
       Db._txn_records << ActiveRecord::EnlistedRecord.new(self, 4)
       nil
@@ -2182,6 +2184,7 @@ module ActiveRecord
     def _forget_rollback_state
       @__rollback_saved = false
       @__rollback_baseline = nil
+      @__rollback_unloaded_writes = nil
       nil
     end
 
@@ -2448,6 +2451,8 @@ module ActiveRecord
       end
       if @__rollback_saved
         @__last_saved_attributes = @__rollback_baseline
+        # A partial row's assigned left-out columns are pending again too.
+        @__unloaded_writes = @__rollback_unloaded_writes
         _forget_rollback_state
       end
       nil
