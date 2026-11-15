@@ -313,15 +313,28 @@ fn a_handles_lease_trims_before_release() {
     assert!(leave[trim..release].contains("ensure") && leave[release..pop].contains("ensure"));
 }
 
-/// A block with a trailing parameter after a splat is rebuilt at ingest;
-/// a writing block that is its only statement is still put back.
+/// A block whose parameters make ingest rebuild its body (a trailing
+/// parameter after a splat, a destructured one, a block-local) keeps a
+/// writing block that is its only statement as one statement, so a routed
+/// app puts the call back: with one statement in it, and with two.
 #[test]
 fn a_writing_block_in_a_rebuilt_block_body_is_restored() {
-    let report = "class RouteReport\n  def self.run(rows)\n    ApplicationRecord.connected_to(role: :reading) do\n      rows.each do |*head, tail|\n        ActiveRecord::Base.connected_to(role: :writing) { Note.create!(tag: tail.to_s) }\n      end\n    end\n  end\nend\n";
-    let (emitted, errors) = contract::app(contract::SHARDS, report).emit(BuildTarget::Spinel);
-    assert!(errors.is_empty(), "{errors:#?}");
-    let text = std::fs::read_to_string(emitted.join("app/models/route_report.rb")).unwrap_or_default();
-    assert!(text.contains("connected_to(role: :writing)"), "{text}");
+    let blocks = [
+        ("a post parameter, one statement", "|*head, tail|", "Note.create!(tag: tail.to_s)"),
+        ("a post parameter", "|*head, tail|", "Note.create!(tag: tail.to_s); Note.count"),
+        ("a destructured parameter", "|(first, second)|", "Note.create!(tag: first.to_s); Note.count"),
+        ("a block-local", "|row; tag|", "Note.create!(tag: tag.to_s + row.to_s); Note.count"),
+    ];
+    let mut missed = Vec::new();
+    for (name, params, body) in blocks {
+        let report = format!("class RouteReport\n  def self.run(rows)\n    ApplicationRecord.connected_to(role: :reading) do\n      rows.each do {params}\n        ActiveRecord::Base.connected_to(role: :writing) {{ {body} }}\n      end\n    end\n  end\nend\n");
+        let (emitted, errors) = contract::app(contract::SHARDS, &report).emit(BuildTarget::Spinel);
+        let text = std::fs::read_to_string(emitted.join("app/models/route_report.rb")).unwrap_or_default();
+        if !errors.is_empty() || !text.contains("connected_to(role: :writing)") {
+            missed.push(format!("{name}: {errors:?}\n{text}"));
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
 
 /// The settings scan reads assignments: a mention in a string or a

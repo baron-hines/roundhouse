@@ -4383,8 +4383,12 @@ fn destructure_block_params(params_node: Option<Node<'_>>, body: Expr, file: &st
     // otherwise become the value: a rest binding answers the tail, and
     // `map { |(month, *row)| }` would return those tails.
     let body_empty = matches!(&*body.node, ExprNode::Seq { exprs } if exprs.is_empty());
+    // A writing block read as its body stays one statement, with its mark
+    // (`ERASED_WRITING_SCOPE`): spliced in, a routed app could not put the
+    // call back around it.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs } => prelude.extend(exprs),
+        ExprNode::Seq { exprs } if !erased => prelude.extend(exprs),
         other => prelude.push(Expr { node: Box::new(other), ..body }),
     }
     if body_empty {
@@ -4482,10 +4486,11 @@ fn desugar_post_params(rest_param: &mut Option<Symbol>, posts: Vec<Symbol>, body
             )
         })
         .collect();
+    // As in `destructure_block_params`: a marked body stays one statement.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs: inner } => exprs.extend(inner),
+        ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
         other => {
-            // With the statement's own marks: a writing block read as its body is still one (`ERASED_WRITING_SCOPE`).
             let mut only = Expr::new(body.span, other);
             only.decisions = body.decisions;
             exprs.push(only);
@@ -4520,8 +4525,10 @@ fn scope_block_locals(params_node: Option<Node<'_>>, mut body: Expr) -> Expr {
                 },
             );
             let mut exprs = vec![init];
+            // As in `destructure_block_params`: a marked body stays one statement.
+            let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
             match *body.node {
-                ExprNode::Seq { exprs: inner } => exprs.extend(inner),
+                ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
                 other => exprs.push(Expr { node: Box::new(other), ..body }),
             }
             body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs });
