@@ -50,6 +50,16 @@ end
     s.label = "third"
     check("owner still saves", s.save == true)
     check("held row not validated", s.valid? == true)
+    # Rails: a create! on a preloaded association joins the loaded target
+    # too, so the reader answers it and the count sees it once.
+    p = Shelf.create!(label: "seeded")
+    first = p.books.create!(title: "first", pages: 1)
+    p = Shelf.where(id: p.id).preload(:books).first
+    late = p.books.create!(title: "later", pages: 2)
+    check("created joins the loaded target", p.books.to_a.map(&:title) == ["first", "later"])
+    check("same created object", p.books.to_a.last.equal?(late))
+    check("size counts it once", p.books.size == 2 && p.books.length == 2)
+    check("presence sees it", p.books.any? == true && p.books.empty? == false)
   end
 end
 "##)
