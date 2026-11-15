@@ -51,6 +51,22 @@ module ActiveRecord
       order_parts_sql!(parts.flatten)
     end
 
+    alias_method :copy_query_state_sql_to, :copy_query_state_to
+
+    # A relation built from a scope (`Model.all` under `scoping`) is
+    # Rails' clone of it, orderings included: the nodes go with the SQL
+    # terms they describe. Shared, as `order_term` replaces the Hash
+    # rather than writing into it.
+    def copy_query_state_to(target)
+      copy_query_state_sql_to(target)
+      target.take_order_nodes(@order_nodes)
+    end
+
+    def take_order_nodes(nodes)
+      @order_nodes = nodes
+      self
+    end
+
     private
 
     def order_nodes(part)

@@ -47,6 +47,7 @@ end
     check("string", shape(Song.order("songs.title DESC").order_values), ["String songs.title DESC"])
     check("node", shape(Song.order(Song.arel_table[:plays].asc).order_values), ["Ascending plays"])
     check("reorder", shape(Song.order(:id).reorder(title: :desc).order_values), ["Descending title"])
+    check("under scoping", shape(Song.order(plays: :desc).scoping { Song.all.order_values }), ["Descending plays"])
     check("rows", charts.pluck(:title), ["Amber", "Blue", "Cyan"])
     check("reordered by the list", Song.order(:id).reorder(charts.order_values).pluck(:title), ["Amber", "Blue", "Cyan"])
     lowered = Arel::Nodes::Ascending.new(Arel.sql("LOWER(songs.title)"))
