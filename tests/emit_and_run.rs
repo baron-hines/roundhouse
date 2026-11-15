@@ -22295,3 +22295,19 @@ mod has_many_writer_under_overridden_reader;
 mod has_one_create_bang_holds_record;
 #[path = "emit_and_run/where_polymorphic_record.rs"]
 mod where_polymorphic_record;
+
+// Fork specs: preloads.
+#[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]
+mod belongs_to_scope_over_default_scope;
+#[path = "emit_and_run/includes_singular_where_eager_loads.rs"]
+mod includes_singular_where_eager_loads;
+#[path = "emit_and_run/preload_belongs_to_raw_foreign_key.rs"]
+mod preload_belongs_to_raw_foreign_key;
+#[path = "emit_and_run/preload_composite_key_owner.rs"]
+mod preload_composite_key_owner;
+#[path = "emit_and_run/preload_instance_dependent_belongs_to.rs"]
+mod preload_instance_dependent_belongs_to;
+#[path = "emit_and_run/preload_inverse_before_after_initialize.rs"]
+mod preload_inverse_before_after_initialize;
+#[path = "emit_and_run/preload_onto_subclass.rs"]
+mod preload_onto_subclass;
