@@ -3019,7 +3019,7 @@ module ActiveRecord
       set_sql = if updates.is_a?(Hash)
         parts = []
         updates.each do |key, val|
-          parts.push("#{key} = #{ActiveRecord.adapter.escape_value(val)}")
+          parts.push("#{key} = #{@model._written_sql(key, val)}")
         end
         parts.join(", ")
       else
