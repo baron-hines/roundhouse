@@ -41,8 +41,14 @@ end
             "app/controllers/transit_controller.rb",
             r#"class TransitController < ApplicationController
   around_action :station
+  around_action :toll
 
   private
+
+  def toll
+    @stops << "toll"
+    yield
+  end
 
   def station
     @stops << "station-in"
@@ -63,6 +69,7 @@ end
   prepend_before_action :platform
   prepend_around_action :city
   prepend_around_action :detour, only: []
+  prepend_around_action :toll, only: []
   prepend_around_action :survey, only: :show
   skip_around_action :survey, only: :show
 

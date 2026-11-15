@@ -2333,18 +2333,21 @@ fn build_filter_preamble(
                 ControllerBodyItem::Filter { filter, .. }
                     if matches!(filter.kind, FilterKind::Around | FilterKind::After) =>
                 {
-                    let Some(f) = narrow(filter) else { continue };
-                    if find_target(&f.target).is_none() {
-                        continue;
-                    }
                     // Registering an around again, a parent's in a
                     // child, moves it: Rails' callback chain removes the
                     // earlier one of the same name before it appends or
-                    // prepends the new one.
-                    if matches!(f.kind, FilterKind::Around) {
-                        wraps.around.retain(|a| a.target != f.target);
+                    // prepends the new one, whatever the new one's
+                    // scope, so this comes before the narrowing drops an
+                    // `only: []` registration.
+                    if matches!(filter.kind, FilterKind::Around) {
+                        let target = &filter.target;
+                        wraps.around.retain(|a| &a.target != target);
                         prepends.retain(|p| !matches!(p, PreambleStmt::Call { filter, .. }
-                            if matches!(filter.kind, FilterKind::Around) && filter.target == f.target));
+                            if matches!(filter.kind, FilterKind::Around) && &filter.target == target));
+                    }
+                    let Some(f) = narrow(filter) else { continue };
+                    if find_target(&f.target).is_none() {
+                        continue;
                     }
                     if matches!(f.kind, FilterKind::Around) && f.prepend {
                         prepends.push(PreambleStmt::Call { filter: f, halt_check: false });
