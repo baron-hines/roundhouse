@@ -53,6 +53,25 @@ fn a_postgresql_primary_ships_the_pg_tree() {
     assert!(!article.contains("sqlite_sequence"), "{article}");
 }
 
+/// Fixtures insert explicit ids, so on PostgreSQL the loader moves each
+/// keyed table's id sequence past them, as Rails' `reset_pk_sequence!`
+/// does after it loads fixtures: a create in a test then takes a new id
+/// (#2164). SQLite's rowid needs nothing.
+#[test]
+fn postgresql_fixtures_move_the_id_sequence_past_their_rows() {
+    let (emitted, errors) = postgresql_blog().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let comments = read(&emitted, "test/fixtures/comments.rb");
+    assert!(
+        comments.contains("setval(pg_get_serial_sequence('\\\"comments\\\"', 'id'), COALESCE(MAX(\\\"id\\\"), 0) + 1, false) FROM \\\"comments\\\""),
+        "{comments}"
+    );
+    let (emitted, errors) = emit_and_run::real_blog().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let comments = read(&emitted, "test/fixtures/comments.rb");
+    assert!(!comments.contains("setval"), "{comments}");
+}
+
 #[test]
 fn a_sqlite_primary_keeps_the_sqlite_tree() {
     let (emitted, errors) = emit_and_run::real_blog().emit(BuildTarget::Ruby);

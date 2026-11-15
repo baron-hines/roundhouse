@@ -70,7 +70,7 @@ fn postgresql_blog() -> emit_and_run::Overlay {
         .edit(
             "test/models/article_test.rb",
             "class ArticleTest < ActiveSupport::TestCase\n",
-            "class ArticleTest < ActiveSupport::TestCase\n  test \"counts published articles\" do\n    assert_equal 0, Article.published_count\n    articles(:one).update!(published: true)\n    assert_equal 1, Article.published_count\n  end\n\n  test \"stars an article in a table with no key\" do\n    Star.create!(article_id: articles(:one).id)\n    assert_equal 1, Star.where(article_id: articles(:one).id).count\n  end\n\n  test \"reads back a keyless table's generated column\" do\n    badge = Badge.create!(first_name: \"hello\")\n    assert_equal \"hello!\", badge.label\n    assert_equal 1, Badge.count\n  end\n\n  test \"reads back a keyless table's database default\" do\n    visit = Visit.create!(name: \"seen\")\n    assert_not_nil visit.recorded_at\n    assert_equal 1, Visit.count\n  end\n\n  test \"runs in a schema of its own\" do\n    schema = Article.connection.select_all(\"SELECT current_schema() AS name\").to_a.first[\"name\"]\n    assert schema.start_with?(\"rh_test_\"), schema\n  end\n\n",
+            "class ArticleTest < ActiveSupport::TestCase\n  test \"counts published articles\" do\n    assert_equal 0, Article.published_count\n    articles(:one).update!(published: true)\n    assert_equal 1, Article.published_count\n  end\n\n  test \"stars an article in a table with no key\" do\n    Star.create!(article_id: articles(:one).id)\n    assert_equal 1, Star.where(article_id: articles(:one).id).count\n  end\n\n  test \"reads back a keyless table's generated column\" do\n    badge = Badge.create!(first_name: \"hello\")\n    assert_equal \"hello!\", badge.label\n    assert_equal 1, Badge.count\n  end\n\n  test \"reads back a keyless table's database default\" do\n    visit = Visit.create!(name: \"seen\")\n    assert_not_nil visit.recorded_at\n    assert_equal 1, Visit.count\n  end\n\n  test \"creates a comment after the fixtures\" do\n    comment = Comment.create!(article: articles(:one), commenter: \"Carol\", body: \"A new comment\")\n    assert_equal 3, Comment.count\n    assert_equal \"Carol\", Comment.find(comment.id).commenter\n  end\n\n  test \"runs in a schema of its own\" do\n    schema = Article.connection.select_all(\"SELECT current_schema() AS name\").to_a.first[\"name\"]\n    assert schema.start_with?(\"rh_test_\"), schema\n  end\n\n",
         )
 }
 
@@ -118,7 +118,7 @@ fn an_emitted_apps_test_runs_natively_on_postgresql() {
         db_contract::LANE_DEADLINE,
         "Spinel did not leave the compiled test behind",
     );
-    assert!(stdout.contains("ArticleTest: 9 tests passed"), "{stdout}");
+    assert!(stdout.contains("ArticleTest: 10 tests passed"), "{stdout}");
 }
 
 /// `(owner, name)` for every `def` in a Ruby or RBS source, with `self.`
