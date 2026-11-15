@@ -69,10 +69,16 @@ end
     check("dynamic read", read { index(partial, :status) }, "missing")
     check("dynamic read loaded", read { index(partial, :title) }, "\"Hello\"")
     check("read_attribute", read { partial.read_attribute(:status) }, "nil")
+    check("read_attribute String", read { named(partial, "status") }, "nil")
+    check("read_attribute String loaded", read { named(partial, "title") }, "\"Hello\"")
   end
 
   def self.index(record, key)
     record[key]
+  end
+
+  def self.named(record, key)
+    record.read_attribute(key)
   end
 end
 "##)

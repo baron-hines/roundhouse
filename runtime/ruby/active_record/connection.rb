@@ -548,10 +548,18 @@ module ActiveRecord
     # A column a partial `select` left out reads nil here, where `[]`
     # raises: Rails' `[]` passes `read_attribute` the raising block and
     # `read_attribute` alone has none (attribute_methods/read.rb).
+    # The key is normalized first: Rails keys `@attributes` by the
+    # canonical name, so `read_attribute("title")` and
+    # `read_attribute(:title)` read the same attribute. Compared as given,
+    # a String key matched no name in the unloaded list and fell through
+    # to the generated `[]`, whose column arm raises for a left-out column.
+    # Lowering turns a literal String key into a Symbol; this is for the
+    # key an app only holds at runtime (`read_attribute(key)`).
     def read_attribute(name)
+      key = name.to_sym
       unloaded = @__unloaded_columns
-      return nil unless unloaded.nil? || !unloaded.include?(name)
-      self[name]
+      return nil unless unloaded.nil? || !unloaded.include?(key)
+      self[key]
     end
 
     def write_attribute(name, value)

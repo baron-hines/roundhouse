@@ -115,7 +115,7 @@ module ActiveRecord
     def assign_attributes: (Hash[String | Symbol, untyped] attributes) -> nil
     def _assign_mass_attribute: (String name, untyped value) -> nil
     def _unknown_mass_attribute: (String name) -> nil
-    def read_attribute: (Symbol name) -> untyped
+    def read_attribute: (Symbol | String name) -> untyped
     def write_attribute: (Symbol name, untyped value) -> untyped
     def slice: (*(Symbol | String | Array[Symbol | String]) names) -> Hash[String, untyped]
     def saved_changes?: () -> bool
