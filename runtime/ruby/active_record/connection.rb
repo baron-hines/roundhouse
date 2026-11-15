@@ -534,9 +534,12 @@ module ActiveRecord
       SchemaCache.new.columns_hash(table_name)
     end
 
-    # Rails' `attribute_names`: the record's attributes, its table's columns, as Strings.
+    # Rails' `attribute_names`: the record's attributes as Strings, its table's columns less those a partial `select` left out.
     def attribute_names
-      self.class.column_names
+      unloaded = @__unloaded_columns
+      names = self.class.column_names
+      return names if unloaded.nil?
+      names.reject { |name| unloaded.include?(name.to_sym) }
     end
 
     # Rails' read-only records: one a `readonly` relation loaded, or one

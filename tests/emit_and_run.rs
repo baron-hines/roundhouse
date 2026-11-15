@@ -22362,3 +22362,5 @@ mod errors_copy;
 mod errors_computed_field;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
+#[path = "emit_and_run/runtime_registered_callbacks.rs"]
+mod runtime_registered_callbacks;

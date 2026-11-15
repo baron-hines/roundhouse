@@ -563,16 +563,16 @@ thread_local! {
     /// Set while a model's own class body is classified, not a concern's `included do` or a macro expansion.
     static CLASSIFYING_MODEL_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A model's own state-machine block, by its call's offset: its recorded gap is withdrawn if the class body replays it.
-    static DEFERRED_STATE_MACHINES: std::cell::RefCell<Vec<(u32, String, IngestError)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DEFERRED_STATE_MACHINES: std::cell::RefCell<Vec<(crate::span::FileId, u32, String, IngestError)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Withdraw the gap of each model state-machine block the class body replays (`app_extension_calls`): the gem's
 /// class method runs it as Ruby does.
 pub(super) fn report_unreplayed_state_machines(app: &crate::App) {
     let deferred = DEFERRED_STATE_MACHINES.with(|d| std::mem::take(&mut *d.borrow_mut()));
-    for (start, method, gap) in deferred {
+    for (file, start, method, gap) in deferred {
         let replayed = app.models.iter().flat_map(|m| m.body.iter()).any(|item| matches!(item,
-            ModelBodyItem::Unknown { expr, .. } if expr.span.start == start
+            ModelBodyItem::Unknown { expr, .. } if expr.span.file == file && expr.span.start == start
                 && expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
                 && matches!(&*expr.node, crate::expr::ExprNode::Send { method: m, .. } if m.as_str() == method)));
         if replayed {
@@ -1176,7 +1176,7 @@ pub(super) fn ingest_model_body_item(
             };
             super::survey::record(&gap);
             if CLASSIFYING_MODEL_BODY.with(|c| c.get()) {
-                DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().push((call.location().start_offset() as u32, method.to_string(), gap)));
+                DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().push((super::sources::file_id(file), call.location().start_offset() as u32, method.to_string(), gap)));
             }
         }
         return Ok(ModelBodyItem::Unknown {
