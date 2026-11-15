@@ -1655,9 +1655,12 @@ module ActiveRecord
     # Rails arrives at the same shape through the through reflection's
     # aliased table. A hash ordering of several columns comes as one
     # clause (`"position" ASC, "id" ASC`), so each comma-separated term
-    # is qualified on its own. What a scope does to its own query with
-    # `unscope` (`beds.fallow`) is not carried onto this one.
+    # is qualified on its own. A scope whose body answers nil is Rails'
+    # `scope.instance_exec(owner, &block) || scope` falling back to the
+    # unscoped relation: nothing to merge. What a scope does to its own
+    # query with `unscope` (`beds.fallow`) is not carried onto this one.
     def merge_through_scope(other)
+      return self if other.nil?
       own_lists
       unload_records
       other.where_clauses.each do |w|

@@ -26,6 +26,8 @@ end
   has_many :named_plants, -> { order(:name) }, through: :beds, source: :plants
   has_many :two_key_beds, -> { where(fallow: false).order(position: :asc, id: :asc) }, class_name: "Bed"
   has_many :two_key_plants, through: :two_key_beds, source: :plants
+  has_many :ignored_beds, -> { where(fallow: false); nil }, class_name: "Bed"
+  has_many :ignored_plants, through: :ignored_beds, source: :plants
 end
 "##)
         .write("app/models/bed.rb", r##"class Bed < ApplicationRecord
@@ -79,6 +81,9 @@ end
     Plant.create!(bed: high, name: "high", position: 0)
     t = Garden.find(t.id)
     check("two-key through order", t.two_key_plants.map(&:name) == ["low", "dup", "high"])
+    # Rails: a scope whose body answers nil stands for the unscoped
+    # relation, so its `where` is discarded and the fallow bed is back.
+    check("nil scope body", g.ignored_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
   end
 end
 "##)

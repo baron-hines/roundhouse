@@ -638,7 +638,12 @@ fn untyped_subexpressions_baseline() {
     // this RBS-less probe, and so are their `o` / `clause` receivers
     // (+4 in active_record/relation.rb). relation.rbs types them for the
     // RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1421;
+    // MEASURED 1422 on a nil through-scope body (1421):
+    // `merge_through_scope`'s `return self if other.nil?` reads `other`
+    // once more, a var on this RBS-less probe (+1 in
+    // active_record/relation.rb); relation.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1422;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
