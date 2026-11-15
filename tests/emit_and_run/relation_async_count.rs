@@ -31,6 +31,8 @@ end
     check("grouped through a local", grouped.async_count.then { |counts| counts.keys.sort }.value, [4, 5, 6])
     unmatched = Comment.where(post_id: 0).group(:post_id)
     check("an empty grouped count through a local", unmatched.async_count.then { |counts| counts.blank? }.value, true)
+    posts = Comment.select(:post_id).distinct
+    check("distinct select", [posts.async_count.value, posts.async_count(:id).value], [3, 6])
   end
 end
 "##)

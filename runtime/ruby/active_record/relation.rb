@@ -2734,10 +2734,14 @@ module ActiveRecord
     # is. `:all` and the primary key count every row (a key is never
     # NULL); counting another column's non-NULL values is Rails'
     # `COUNT(column)`, which `count` here does not take yet.
+    # The primary key is counted whatever the relation selects, as Rails'
+    # `count(:id)` replaces the projection: a distinct `select(:name)`
+    # answers its distinct keys (`COUNT(DISTINCT id)`), not its names.
     def async_count(column = nil)
       unless column.nil? || column.to_s == "all" || column.to_s == primary_key
         raise NotImplementedError, "async_count(#{column.inspect}): only :all and the primary key are counted here"
       end
+      return except(:select).async_count if !column.nil? && column.to_s == primary_key && !@select_sql.nil?
       Promise::Complete.new(@groups.empty? ? count : group_count)
     end
 

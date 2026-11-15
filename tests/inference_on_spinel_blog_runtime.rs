@@ -600,7 +600,10 @@ fn untyped_subexpressions_baseline() {
     // MEASURED 1345 on scoped reordering (1343): `copy_query_state_to`
     // hands `take_query_scalars` the relation's `@reordering` too, a var
     // on this RBS-less probe at both ends (+2 in active_record/relation.rb).
-    const CEILING: usize = 1345;
+    // MEASURED 1347 on async_count(:id) of a select (1345): `async_count`
+    // reads its `column` twice more to count the key of a relation with a
+    // `select`, a var on this RBS-less probe (+2 in active_record/relation.rb).
+    const CEILING: usize = 1347;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
