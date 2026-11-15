@@ -508,10 +508,18 @@ impl EnumConstants {
             return;
         }
         let Some(call) = node.as_call_node() else { return };
+        let method = constant_id_str(&call.name());
+        let owner_here = || nesting.last().map(|n| last(n)).unwrap_or_else(|| "Object".to_string());
+        // `m = Module.new; m.include X; include m`: the local's module is one the enclosing owner may include.
+        if call.receiver().is_some_and(|r| r.as_local_variable_read_node().is_some())
+            && matches!(method.as_ref(), "include" | "extend" | "prepend")
+        {
+            self.unknown_ancestors.insert(owner_here());
+            return;
+        }
         if call.receiver().is_some_and(|r| r.as_self_node().is_none() && Self::path(&r).is_none()) {
             return;
         }
-        let method = constant_id_str(&call.name());
         let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         let targets = match method.as_ref() {
             "include" | "extend" | "prepend" => &args[..],
@@ -526,7 +534,7 @@ impl EnumConstants {
         };
         let owner = match call.receiver().and_then(|r| Self::path(&r)) {
             Some(receiver) => last(&receiver),
-            None => nesting.last().map(|n| last(n)).unwrap_or_else(|| "Object".to_string()),
+            None => owner_here(),
         };
         // `extend self` names the module being declared, whose own definition already counts.
         for target in targets.iter().filter(|t| t.as_self_node().is_none() && !anonymous_module(t, parents)) {

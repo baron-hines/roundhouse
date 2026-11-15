@@ -156,6 +156,7 @@ fn a_uri_outside_the_models_ancestry_does_not_shadow() {
             .write("lib/link.rb", "class Link\n  include Shortener\nend\n")
             .write("app/models/concerns/linked.rb", "module Linked\n  extend ActiveSupport::Concern\n  include Shortener\nend\n")
             .write("app/models/concerns/opaque.rb", "module Opaque\n  extend ActiveSupport::Concern\n  include helper_module\nend\n")
+            .write("app/models/concerns/wrapped.rb", "module Wrapped\n  extend ActiveSupport::Concern\n  m = Module.new\n  m.include Shortener\n  include m\nend\n")
             .write(
                 "db/schema.rb",
                 "ActiveRecord::Schema.define do\n  create_table \"people\", force: :cascade do |t|\n    t.string \"email\"\n  end\nend\n",
@@ -172,5 +173,7 @@ fn a_uri_outside_the_models_ancestry_does_not_shadow() {
     let warnings = app("  include Linked\n");
     assert!(gap(&warnings), "{warnings:?}");
     let warnings = app("  include Opaque\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Wrapped\n");
     assert!(gap(&warnings), "{warnings:?}");
 }
