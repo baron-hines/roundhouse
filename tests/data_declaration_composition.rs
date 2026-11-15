@@ -275,3 +275,12 @@ fn a_targets_delegated_query_override_stays_refused() {
     let (_, errors) = contract::app(&prefixed).emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.is_empty(), "a prefixed method does not override nil?: {errors:?}");
 }
+
+#[test]
+fn app_visibility_macros_are_refused_before_the_builtin_skip() {
+    for marker in ["private", "public", "protected"] {
+        let source = format!("Token = Data.define(:value) do\n  def self.{marker} = nil\n  {marker}\n  def label = value\nend\n");
+        let (_, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.iter().any(|error| error.contains(&format!("Data visibility macro `{marker}`"))), "{source}: {errors:?}");
+    }
+}

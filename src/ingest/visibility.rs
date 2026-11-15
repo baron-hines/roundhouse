@@ -247,8 +247,8 @@ pub(super) fn validate_data(body: Option<Node<'_>>, file: &str, methods: &[Metho
     let (mut calls, mut mixin) = (Vec::new(), false);
     collect(body, false, &mut names, &mut calls, &mut mixin);
     for call in calls {
-        if inherited.as_ref().is_some_and(|visibility| !visibility.inherited.iter().any(|(side, name, at)| *side && matches!(name.as_str(), "new" | "[]" | "allocate") && *at == call.location().start_offset())) { continue; }
         let name = constant_id_str(&call.name()).to_string();
+        if !names.contains(&name) && inherited.as_ref().is_some_and(|visibility| !visibility.inherited.iter().any(|(side, name, at)| *side && matches!(name.as_str(), "new" | "[]" | "allocate") && *at == call.location().start_offset())) { continue; }
         if mixin || names.contains(&name) || call.receiver().is_some() || call.block().is_some()
             || !matches!(name.as_str(), "private" | "public" | "protected" | "private_class_method")
             || call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| arg.as_symbol_node().is_none())) {
