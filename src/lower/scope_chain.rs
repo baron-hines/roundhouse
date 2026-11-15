@@ -5379,9 +5379,14 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     block,
                                     true,
                                 );
-                                // A built record is the owner's to hold:
-                                // validated with it and saved after it.
-                                if held && ctor_name == "new" {
+                                // A record created, built on or pushed
+                                // onto the association is the owner's to
+                                // hold: the object the target answers, which
+                                // a later read merges the row into
+                                // (`_merge_target`). A built one is also
+                                // validated with the owner and saved after
+                                // it.
+                                if held && matches!(ctor_name, "new" | "create" | "create!") {
                                     let ty = expr.ty.clone();
                                     let built = std::mem::replace(expr, syn(span, ExprNode::Lit { value: Literal::Nil }));
                                     *expr = put(
