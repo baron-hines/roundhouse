@@ -766,7 +766,11 @@ pub(super) fn push_schema_methods(
     // narrows it once via `<Model>Row.from_raw(row)` and then constructs
     // the model via `<Model>.from_row(typed_row)`. The Hash-shaped
     // boundary stops at `from_raw`; everything downstream is typed.
-    methods.push(synth_instantiate(owner, model_declares_after_initialize(model)));
+    methods.push(synth_instantiate(
+        owner,
+        model_declares_after_initialize(model),
+        runtime_relation == super::RuntimeRelation::Present,
+    ));
 
     // def attributes_before_type_cast; { "id" => @id, "created_at" => @created_at_raw, ... }; end
     //
@@ -1937,7 +1941,7 @@ fn synth_json_storage_writer(owner: &ClassId, col: &Column) -> MethodDef {
     }
 }
 
-fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef {
+fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool, note_unloaded: bool) -> MethodDef {
     let row = Symbol::from("row");
     let instance = Symbol::from("instance");
     let row_class = row_class_id(owner);
@@ -1993,9 +1997,11 @@ fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef 
     // (`if new_record? || has_attribute?(:token)`) is exactly that test
     // — a `User.select(*attrs)` that omits `token` must not mint one.
     // Persisted first, noted second, hook last: the order Rails' hook
-    // observes. Only models with a hook note anything (see
+    // observes. On the ruby family every row is noted, since a left-out
+    // column's generated reader raises there (`lower::missing_attribute`);
+    // elsewhere only models with a hook note anything (see
     // `Base#_note_unloaded`).
-    if fire_after_initialize {
+    if fire_after_initialize || note_unloaded {
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::Send {
@@ -2006,6 +2012,8 @@ fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef 
                 parenthesized: true,
             },
         ));
+    }
+    if fire_after_initialize {
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::Send {

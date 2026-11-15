@@ -430,10 +430,13 @@ module Main
       extra_headers[controller.headers.key_at(hi)] = controller.headers.val_at(hi)
       hi += 1
     end
+    # Rails' `redirect_to` sets no type: a redirect keeps the one a
+    # filter assigned, and only an unset type is text/html, the
+    # controller's default. The spinel dispatcher does the same.
     if is_redirect
       [controller.status,
        %(<a href="#{ActionView::ViewHelpers.html_escape(controller.location.to_s)}">Redirecting</a>),
-       "text/html; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
+       controller.content_type, controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
     else
       # The controller body IS the full page: the Ruby emit path's
       # `apply_layout_lowering` wraps each html action render in

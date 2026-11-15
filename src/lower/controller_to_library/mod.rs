@@ -1911,7 +1911,7 @@ fn class_side_safe_methods(controller: &Controller) -> crate::det::HashMap<Symbo
 
 /// Does `f` apply to the action named `action_name`?
 fn filter_applies(f: &Filter, action_name: &Symbol) -> bool {
-    if !f.only.is_empty() {
+    if f.only_present || !f.only.is_empty() {
         f.only.contains(action_name)
     } else if !f.except.is_empty() {
         !f.except.contains(action_name)
@@ -2185,16 +2185,32 @@ fn build_filter_preamble(
     // dispatcher already enforces per action (`filter_cond` emits the
     // only/except guard).
     let narrow = |f: &Filter| -> Option<Filter> {
+        // `only: []` matches no action in Rails (`ActionFilter` over an
+        // empty list), so the filter never runs.
+        if f.only_present && f.only.is_empty() {
+            return None;
+        }
         let mut f = f.clone();
         for skip in skips
             .iter()
             .filter(|s| s.target == f.target && s.kind.skipped_kind().as_ref() == Some(&f.kind))
+            // A skip with `only: []` skips no action.
+            .filter(|s| !(s.only_present && s.only.is_empty()))
         {
             if skip.only.is_empty() && skip.except.is_empty() {
                 return None;
             }
+            // A filter that names its actions loses the skipped ones
+            // from that list: the guard reads `only:` alone when it has
+            // one, so an `except:` beside it would not be checked.
+            if !f.only.is_empty() && !skip.only.is_empty() {
+                f.only.retain(|a| !skip.only.contains(a));
+                if f.only.is_empty() {
+                    return None;
+                }
+            }
             for a in &skip.only {
-                if !f.except.contains(a) {
+                if f.only.is_empty() && !f.except.contains(a) {
                     f.except.push(a.clone());
                 }
             }
@@ -2291,7 +2307,9 @@ fn build_filter_preamble(
     // them. Multiple prepends within one walk end up front-to-back in
     // REVERSE declaration order: each `prepend_before_action` Rails
     // sees unshifts onto the same head, so the last one declared is the
-    // first one that runs.
+    // first one that runs. A `prepend_around_action` joins them as an
+    // around `Call` at its place in that head: the dispatcher runs
+    // everything after it inside its block.
     let mut prepends: Vec<PreambleStmt> = Vec::new();
     let bodies = chain.iter().map(|c| (*c, false)).chain(std::iter::once((controller, true)));
     for (c, is_own) in bodies {
@@ -2317,11 +2335,25 @@ fn build_filter_preamble(
                 ControllerBodyItem::Filter { filter, .. }
                     if matches!(filter.kind, FilterKind::Around | FilterKind::After) =>
                 {
+                    // Registering an around again, a parent's in a
+                    // child, moves it: Rails' callback chain removes the
+                    // earlier one of the same name before it appends or
+                    // prepends the new one, whatever the new one's
+                    // scope, so this comes before the narrowing drops an
+                    // `only: []` registration.
+                    if matches!(filter.kind, FilterKind::Around) {
+                        let target = &filter.target;
+                        wraps.around.retain(|a| &a.target != target);
+                        prepends.retain(|p| !matches!(p, PreambleStmt::Call { filter, .. }
+                            if matches!(filter.kind, FilterKind::Around) && &filter.target == target));
+                    }
                     let Some(f) = narrow(filter) else { continue };
                     if find_target(&f.target).is_none() {
                         continue;
                     }
-                    if matches!(f.kind, FilterKind::Around) {
+                    if matches!(f.kind, FilterKind::Around) && f.prepend {
+                        prepends.push(PreambleStmt::Call { filter: f, halt_check: false });
+                    } else if matches!(f.kind, FilterKind::Around) {
                         wraps.around.push(f);
                     } else {
                         wraps.after.push(PreambleStmt::Call { filter: f, halt_check: false });
@@ -2363,8 +2395,8 @@ fn build_filter_preamble(
             }
         }
     }
-    // Hoist every `prepend_before_action` to the head of the chain, in
-    // reverse declaration order — see the comment where `prepends` is
+    // Hoist every `prepend_before_action` and `prepend_around_action` to
+    // the head of the chain, in reverse declaration order — see the comment where `prepends` is
     // declared above.
     if !prepends.is_empty() {
         prepends.reverse();

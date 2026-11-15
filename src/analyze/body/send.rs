@@ -279,22 +279,64 @@ impl<'a> BodyTyper<'a> {
         if method.as_str() != "count" || !args.is_empty() || block.is_some() {
             return None;
         }
-        let group_args = Self::group_args_in_count_chain(recv?)?;
+        self.grouped_count_hash(recv?, recv_ty?)
+    }
+
+    /// The Hash a grouped count answers when `recv` is a grouped
+    /// relation chain; `None` when it is not grouped.
+    fn grouped_count_hash(&self, recv: &Expr, recv_ty: &Ty) -> Option<Ty> {
+        let group_args = Self::group_args_in_count_chain(recv)?;
         // The receiver of `count` is the `group(...)` result, so its
         // type names the model whose schema owns the grouped column.
-        // Both relation representations reach here: an inline
-        // `Model.where(...).group(...)` chain carries the Array shape,
-        // a scope or association read carries `Ty::Relation`.
-        let model = match recv_ty? {
-            Ty::Relation { of } => of,
-            Ty::Array { elem } => match &**elem {
-                Ty::Class { id, .. } => id,
-                _ => return None,
-            },
-            _ => return None,
-        };
+        let model = Self::relation_model(recv_ty)?;
         let key = self.grouped_key_ty(model, group_args).unwrap_or(Ty::Untyped);
         Some(Ty::Hash { key: std::sync::Arc::new(key), value: std::sync::Arc::new(Ty::Int) })
+    }
+
+    /// The model a relation-typed value is over. Both relation
+    /// representations reach here: an inline `Model.where(...)` chain
+    /// carries the Array shape, a scope or association read carries
+    /// `Ty::Relation`.
+    fn relation_model(ty: &Ty) -> Option<&ClassId> {
+        match ty {
+            Ty::Relation { of } => Some(of),
+            Ty::Array { elem } => match &**elem {
+                Ty::Class { id, .. } => Some(id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `relation.async_count(column)` — Rails' `count` as an
+    /// `ActiveRecord::Promise` of the count: an Integer, or the Hash a
+    /// grouped relation counts into, read as `grouped_count_ty` reads
+    /// it. The runtime's `Relation#async_count` picks the same two by
+    /// the relation's groups. A receiver whose chain cannot be read (a
+    /// local or a named scope may hold a grouped relation) counts into
+    /// either, so its value stays untyped, as `relation_extreme_ty`
+    /// leaves such a receiver's extrema.
+    pub(super) fn async_count_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+        block: Option<&Expr>,
+        instance_self: Option<&Ty>,
+    ) -> Option<Ty> {
+        if method.as_str() != "async_count" || args.len() > 1 || block.is_some() {
+            return None;
+        }
+        let recv_ty = recv_ty?;
+        let model = Self::relation_model(recv_ty)?;
+        let recv = recv?;
+        let count = match self.grouped_count_hash(recv, recv_ty) {
+            Some(hash) => hash,
+            None if self.direct_relation_chain(recv, model, instance_self) => Ty::Int,
+            None => Ty::Untyped,
+        };
+        Some(crate::analyze::promise::of(count))
     }
 
     fn group_args_in_count_chain(expr: &Expr) -> Option<&[Expr]> {
@@ -642,6 +684,10 @@ impl<'a> BodyTyper<'a> {
         let recv_ty = recv_ty?;
         if !class_object_receiver && let Some(view) = self.enumerable_view(Some(recv_ty), method) {
             return self.block_params_for(Some(&view), method, false);
+        }
+        // A Promise's `then` yields its value, not the Promise (Kernel's).
+        if method.as_str() == "then" && let Some(value) = crate::analyze::promise::value_of(recv_ty) {
+            return Some(vec![value.clone()]);
         }
         if matches!(recv_ty, Ty::Class { id, .. } if id.0.as_str() == PARAM_VALUE) {
             return match method.as_str() {
@@ -1437,6 +1483,24 @@ impl<'a> BodyTyper<'a> {
         {
             if ClassInfo::class_method_ownership_unknown(self.classes(), id, method) { return Ty::Untyped; }
             if let Some(ty) = ClassInfo::source_class_method_type(self.classes(), id, method) { return unwrap_fn_ret(ty); }
+        }
+        // A typed Promise answers its value, and `then` a Promise of the
+        // block's value (`analyze::promise`).
+        if let Some(value) = recv_ty.and_then(crate::analyze::promise::value_of) {
+            match method.as_str() {
+                "value" if args.is_empty() => return value.clone(),
+                "then" => return crate::analyze::promise::of(block_ret.cloned().unwrap_or(Ty::Untyped)),
+                _ => {}
+            }
+        }
+        // A model class's own `create` / `create!` of an Array of attribute Hashes, unless the app defines it.
+        if !instance_receiver
+            && creates_rows(method, args)
+            && let Some(Ty::Class { id, .. }) = recv_ty
+            && self.is_model_class(recv_ty)
+            && !self.source_class_side(id, method)
+        {
+            return Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: id.clone(), args: vec![].into() }) };
         }
         let controller_writer = method.as_str() == "content_type="
             && recv_ty.is_some_and(|ty| self.controller_writer_receiver(ty));
@@ -2806,7 +2870,7 @@ impl<'a> BodyTyper<'a> {
                 if let Some(t) = self.column_projection(of, method, args) {
                     return t;
                 }
-                if counted_first_last(method, args) || array_find(method, args, block_ret) {
+                if counted_first_last(method, args) || array_find(method, args, block_ret) || creates_rows(method, args) {
                     return Ty::Array {
                         elem: std::sync::Arc::new(Ty::Class { id: of.clone(), args: vec![].into() }),
                     };
@@ -3505,6 +3569,16 @@ fn sub_array_slice(method: &Symbol, args: &[crate::expr::Expr], elem: &Ty) -> Op
     (range_index || args.len() == 2).then(|| Ty::Union {
         variants: vec![Ty::Array { elem: std::sync::Arc::new(elem.clone()) }, Ty::Nil].into(),
     })
+}
+
+/// `create` / `create!` given one Array (of attribute Hashes): Rails creates
+/// one record per Hash and answers the Array of them, on the class and on a
+/// relation alike (Persistence::ClassMethods#create!, Relation#create!:
+/// `attributes.collect { |attr| create!(attr, &block) }`).
+/// `lower::create_rows` rewrites the call to that `map`.
+pub(crate) fn creates_rows(method: &Symbol, args: &[crate::expr::Expr]) -> bool {
+    matches!(method.as_str(), "create" | "create!")
+        && matches!(args, [rows] if matches!(rows.ty, Some(Ty::Array { .. })))
 }
 
 /// `first(n)` / `last(n)` — the counted form. Ruby's `Array#first(n)`,

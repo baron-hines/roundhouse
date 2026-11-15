@@ -735,6 +735,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // (`ruby_overlay/runtime/active_support_ordered_options.rb`), and Spinel's Hash-holding one
     // (`runtime/spinel/ordered_options_spinel.rb`). A name no method answers is a key, read through `method_missing`.
     let ordered_options = Ty::Class { id: ClassId(Symbol::from("ActiveSupport::OrderedOptions")), args: vec![].into() };
+    register_stdlib_class(classes, "ActiveSupport::Gzip", &[
+        ("decompress", Ty::Str),
+        ("compress", Ty::Str),
+    ], &[]);
     // Not a `new` of its own: one returning this class would type a subclass's `new` as this class too.
     register_stdlib_class(classes, "ActiveSupport::OrderedOptions", &[], &[
         ("update", ordered_options.clone()),
@@ -1150,6 +1154,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let unknown_attribute = classes.entry(ClassId(Symbol::from("ActiveModel::UnknownAttributeError"))).or_default();
     unknown_attribute.parent = Some(ClassId(Symbol::from("NoMethodError")));
     unknown_attribute.instance_methods.insert(Symbol::from("record"), Ty::Untyped);
+    // A partial `select`'s left-out column, raised by its generated reader.
+    register_stdlib_class(classes, "ActiveModel::MissingAttributeError", &[], &exception_surface);
+    classes.entry(ClassId(Symbol::from("ActiveModel::MissingAttributeError"))).or_default().parent =
+        Some(ClassId(Symbol::from("NoMethodError")));
     register_stdlib_class(classes, "ActiveRecord::StaleObjectError", &[], &[("attempted_action", Ty::Untyped)]);
     classes.entry(ClassId(Symbol::from("ActiveRecord::StaleObjectError"))).or_default().parent =
         Some(ClassId(Symbol::from("ActiveRecord::ActiveRecordError")));

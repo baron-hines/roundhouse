@@ -165,7 +165,8 @@ pub const GEM_CATALOG: &[GemClass] = &[
     // surface (`relation.async_count`, `async_sum`, …; see
     // `array_method`'s relation branch). `value` blocks until the
     // background query resolves; its type depends on the originating
-    // call, so gradual.
+    // call, so gradual here. A Promise whose call site knows its value
+    // (`relation.async_count`) is typed by `analyze::promise`.
     GemClass {
         name: "ActiveRecord::Promise",
         class_methods: &[],

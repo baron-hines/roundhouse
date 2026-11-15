@@ -545,8 +545,21 @@ module ActiveRecord
 
     # Ruby-family only, beside the other reopens here: strict targets have
     # no `Type::Value`, no untyped `self[name]` and no relation `all`.
+    # A column a partial `select` left out reads nil here, where `[]`
+    # raises: Rails' `[]` passes `read_attribute` the raising block and
+    # `read_attribute` alone has none (attribute_methods/read.rb).
+    # The key is normalized first: Rails keys `@attributes` by the
+    # canonical name, so `read_attribute("title")` and
+    # `read_attribute(:title)` read the same attribute. Compared as given,
+    # a String key matched no name in the unloaded list and fell through
+    # to the generated `[]`, whose column arm raises for a left-out column.
+    # Lowering turns a literal String key into a Symbol; this is for the
+    # key an app only holds at runtime (`read_attribute(key)`).
     def read_attribute(name)
-      self[name]
+      key = name.to_sym
+      unloaded = @__unloaded_columns
+      return nil unless unloaded.nil? || !unloaded.include?(key)
+      self[key]
     end
 
     def write_attribute(name, value)
@@ -629,7 +642,7 @@ module ActiveRecord
     # zero/empty-string key.
     def self.find(id)
       raise RecordNotFound.new("Couldn't find #{name} without an ID", name, primary_key, id) if id.nil?
-      result = _default_scope_where.empty? ? _find_primary_key_input(id) : _find_in_scope(id)
+      result = _read_through_relation? ? _find_in_scope(id) : _find_primary_key_input(id)
       raise RecordNotFound.new("Couldn't find #{name} with '#{primary_key}'=#{id.inspect}", name, primary_key, id) if result.nil?
       result
     end
@@ -653,7 +666,7 @@ module ActiveRecord
       _adapter_find_by_id(key)
     end
 
-    # `find` on a default-scoped model: the row only when the scope keeps it.
+    # `find` on a scoped model: the row only when the scope keeps it.
     def self._find_in_scope(id)
       key = _cast_primary_key(id)
       return nil if key.nil?
@@ -683,7 +696,7 @@ module ActiveRecord
       # Conditions, not a key (Rails' `exists?(name: "x")`): the Relation
       # answers them, through the default scope when the model has one.
       return all.exists?(id) if id.is_a?(Hash)
-      unless _default_scope_where.empty?
+      if _read_through_relation?
         key = _cast_primary_key(id)
         return false if key.nil?
         return all.where({ primary_key => key }).exists?
@@ -1134,7 +1147,7 @@ module ActiveRecord
     # rather than counted beforehand. Ruby-family-only because
     # `changes` is — see base.rb's default.
     def self.delete_all
-      return all.delete_all unless _default_scope_where.empty?
+      return all.delete_all if _read_through_relation?
       ActiveRecord.adapter.delete_all(table_name)
       ActiveRecord.adapter.changes
     end
@@ -1507,12 +1520,16 @@ module ActiveRecord
     # renders as ISO8601 with three fractional digits in the app's zone.
     # `schema_time_columns` is the emitted fact that says which those
     # are.
+    # A column a partial `select` left out is no attribute of the record,
+    # so it is not written either (Rails' `attribute_names`).
     def _as_json_only(only)
       h = {}
       columns = self.class.schema_columns
       time_columns = self.class.schema_time_columns
+      unloaded = @__unloaded_columns
       only.each do |k|
         next unless columns.include?(k)
+        next if !unloaded.nil? && unloaded.include?(k)
         h[k.to_s] = if time_columns.include?(k)
           ActiveSupport.json_time(self[k])
         else
@@ -1605,14 +1622,23 @@ module ActiveRecord
     # what Rails' UniquenessValidator queries (`finder_class.unscoped`).
     # With a block, Rails runs it with the model's default scope removed
     # from every relation built inside, and returns the block's value.
+    # Rails runs that block as `relation.scoping { … }`, so the bare
+    # relation is also the model's current scope: an outer `scoping` of
+    # the model does not reach in.
     def self.unscoped
       if block_given?
         tables = ActiveRecord::Relation.unscoped_tables
         tables << _table_sql
+        # The bare relation is the block's current scope, as Rails'
+        # `relation.scoping { yield }` makes it, so an outer scope does
+        # not reach in. Pushed here rather than through `scoping`, so the
+        # block's value comes straight from this `yield`.
+        scopes = Db._push_current_scope(ActiveRecord::Relation.new(self, false))
         value = nil
         begin
           value = yield
         ensure
+          scopes.pop
           tables.pop
         end
         return value
@@ -1626,22 +1652,29 @@ module ActiveRecord
       {}
     end
 
-    # A default-scoped model is read only through its Relation, which
-    # applies the scope (or not, inside `unscoped { }`): these class
+    # Whether a class-level read has to go through the Relation, the one
+    # place that applies a default scope (or not, inside `unscoped { }`)
+    # and a current scope (`rel.scoping { … }` of this model), as every
+    # Rails class-level query starts from `all`.
+    def self._read_through_relation?
+      !_default_scope_where.empty? || !ActiveRecord::Relation.current_scope_for(self).nil?
+    end
+
+    # A scoped model is read only through its Relation: these class
     # forms answer from it rather than from the model's whole-table
     # adapter primitives, which base.rb's defaults use.
     def self.count
-      return all.count unless _default_scope_where.empty?
+      return all.count if _read_through_relation?
       _adapter_count
     end
 
     def self.last
-      return all.last unless _default_scope_where.empty?
+      return all.last if _read_through_relation?
       _adapter_last
     end
 
     def self.destroy_all
-      return all.destroy_all unless _default_scope_where.empty?
+      return all.destroy_all if _read_through_relation?
       records = _adapter_all
       records.each { |r| r.destroy() }
       records
@@ -1741,6 +1774,38 @@ module ActiveRecord
 
     def self.first!
       all.first!
+    end
+
+    def self.second!
+      all.second!
+    end
+
+    def self.third!
+      all.third!
+    end
+
+    def self.fourth!
+      all.fourth!
+    end
+
+    def self.fifth!
+      all.fifth!
+    end
+
+    def self.second_to_last!
+      all.second_to_last!
+    end
+
+    def self.third_to_last!
+      all.third_to_last!
+    end
+
+    def self.reselect(*specs)
+      all.reselect(*specs)
+    end
+
+    def self.annotate(*comments)
+      all.annotate(*comments)
     end
 
     def self.from(source)
@@ -2106,6 +2171,7 @@ module ActiveRecord
       unless @__rollback_saved
         @__rollback_saved = true
         @__rollback_baseline = @__last_saved_attributes
+        @__rollback_unloaded_writes = @__unloaded_writes
       end
       _enlist_or_run(kind)
     end
@@ -2125,6 +2191,7 @@ module ActiveRecord
       unless @__rollback_saved
         @__rollback_saved = true
         @__rollback_baseline = @__last_saved_attributes
+        @__rollback_unloaded_writes = @__unloaded_writes
       end
       Db._txn_records << ActiveRecord::EnlistedRecord.new(self, 4)
       nil
@@ -2134,6 +2201,7 @@ module ActiveRecord
     def _forget_rollback_state
       @__rollback_saved = false
       @__rollback_baseline = nil
+      @__rollback_unloaded_writes = nil
       nil
     end
 
@@ -2203,6 +2271,7 @@ module ActiveRecord
         else
           @__last_saved_attributes = _attributes_snapshot
           @__touched_updated_at = nil
+          @__unloaded_writes = nil
         end
         after_touch
         _save_committed(false)
@@ -2399,6 +2468,8 @@ module ActiveRecord
       end
       if @__rollback_saved
         @__last_saved_attributes = @__rollback_baseline
+        # A partial row's assigned left-out columns are pending again too.
+        @__unloaded_writes = @__rollback_unloaded_writes
         _forget_rollback_state
       end
       nil
@@ -2424,6 +2495,7 @@ module ActiveRecord
       end
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
+      @__unloaded_writes = nil
       @saved_changes = changes
       @id_previously_changed = was_new
       nil
@@ -2466,6 +2538,7 @@ module ActiveRecord
     def _note_hydrated
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
+      @__unloaded_writes = nil
       nil
     end
 
@@ -2476,9 +2549,12 @@ module ActiveRecord
     # a `User.select(*attrs)` without `token` must not mint one. Nothing
     # is recorded when the row carries every column, so the common path
     # allocates nothing.
+    # The primary key is never noted: Rails keeps it among a partial row's
+    # attributes (`has_attribute?(:id)` true, `id` in `as_json`), reading nil.
     def _note_unloaded(row)
       missing = []
-      self.class.schema_columns.each { |c| missing << c unless row.key?(c.to_s) }
+      primary_key = self.class.primary_key
+      self.class.schema_columns.each { |c| missing << c unless row.key?(c.to_s) || c.to_s == primary_key }
       @__unloaded_columns = missing unless missing.empty?
       nil
     end
@@ -2487,6 +2563,45 @@ module ActiveRecord
       return false unless self.class.schema_columns.include?(name)
       unloaded = @__unloaded_columns
       unloaded.nil? || !unloaded.include?(name)
+    end
+
+    # Rails' generated reader raises for a column the row's `select` left
+    # out (attribute_methods/read.rb, `missing_attribute`); each generated
+    # reader calls this first when the row noted any (`lower::missing_attribute`).
+    def _missing_attribute(name)
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil? || !unloaded.include?(name)
+      raise ActiveModel::MissingAttributeError, "missing attribute '#{name}' for #{self.class.name}"
+    end
+
+    # Assigning a column the row's `select` left out loads it: Rails'
+    # writer replaces the uninitialized attribute with the assigned one
+    # (attribute_set.rb, `write_from_user`), so the column then reads,
+    # answers `has_attribute?` true and serializes. Each generated column
+    # writer calls this first when the row noted any
+    # (`lower::missing_attribute`).
+    # The assignment is also a write the next save owes the row, so the
+    # column is named in `@__unloaded_writes` until a save records it.
+    # Rails marks the attribute changed as it writes it
+    # (`@mutations_from_database`), so `changed` reports the assignment even
+    # when it is nil — and nil IS the unloaded column's baseline, so the
+    # diff in `changes_to_save` alone reads the assignment as no change and
+    # `_columns_to_write` dropped it: the row kept the value the partial
+    # `select` never showed the record.
+    def _note_loaded(name)
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil?
+      return nil unless unloaded.include?(name)
+      unloaded.delete(name)
+      @__unloaded_columns = nil if unloaded.empty?
+      wrote = @__unloaded_writes
+      key = name.to_s
+      if wrote.nil?
+        @__unloaded_writes = [key]
+      else
+        wrote.push(key) unless wrote.include?(key)
+      end
+      nil
     end
 
     # The pending diff: current attributes against the baseline the
@@ -2515,7 +2630,10 @@ module ActiveRecord
     end
 
     # The columns the emitted `_adapter_update` writes, as Rails' partial
-    # updates choose them: the ones with a pending change. A record with
+    # updates choose them: the ones with a pending change, among them a
+    # column the row's `select` left out that has been assigned since — a
+    # write the record owes the row even where the unloaded baseline makes
+    # the diff call it no change (see `_note_loaded`). A record with
     # no Dirty baseline (one this runtime didn't load or save) writes
     # every column, so nothing it holds is skipped; `update_columns`
     # names its own.
@@ -2523,7 +2641,11 @@ module ActiveRecord
       only = @__write_only
       return only unless only.nil?
       return attributes.keys if @__last_saved_attributes.nil?
-      changes_to_save.keys
+      columns = changes_to_save.keys
+      wrote = @__unloaded_writes
+      return columns if wrote.nil?
+      wrote.each { |name| columns.push(name) unless columns.include?(name) }
+      columns
     end
 
     # Rails' `<col>_was`: the value before the pending change, or the
@@ -2543,6 +2665,8 @@ module ActiveRecord
       baseline[name] = _attributes_snapshot[name]
       @__last_saved_attributes = baseline
       @__touched_updated_at = nil if name == "updated_at"
+      wrote = @__unloaded_writes
+      wrote.delete(name) unless wrote.nil?
       nil
     end
 

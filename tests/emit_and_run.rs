@@ -22267,3 +22267,96 @@ mod partial_object_as;
 mod helper_asset_url;
 #[path = "emit_and_run/safe_join_safe.rs"]
 mod safe_join_safe;
+
+// Fork specs: association targets.
+#[path = "emit_and_run/association_build_joins_target.rs"]
+mod association_build_joins_target;
+#[path = "emit_and_run/association_relation_build.rs"]
+mod association_relation_build;
+#[path = "emit_and_run/association_scope_load_inverse.rs"]
+mod association_scope_load_inverse;
+#[path = "emit_and_run/belongs_to_load_seats_inverse.rs"]
+mod belongs_to_load_seats_inverse;
+#[path = "emit_and_run/belongs_to_writer_joins_owner_target.rs"]
+mod belongs_to_writer_joins_owner_target;
+#[path = "emit_and_run/has_many_add_remove_callbacks.rs"]
+mod has_many_add_remove_callbacks;
+#[path = "emit_and_run/has_many_as_inverse_of_belongs_to.rs"]
+mod has_many_as_inverse_of_belongs_to;
+#[path = "emit_and_run/has_many_create_then_update.rs"]
+mod has_many_create_then_update;
+#[path = "emit_and_run/has_many_load_merges_held_records.rs"]
+mod has_many_load_merges_held_records;
+#[path = "emit_and_run/has_many_through_before_add.rs"]
+mod has_many_through_before_add;
+#[path = "emit_and_run/has_many_writer_under_overridden_reader.rs"]
+mod has_many_writer_under_overridden_reader;
+#[path = "emit_and_run/has_one_create_bang_holds_record.rs"]
+mod has_one_create_bang_holds_record;
+#[path = "emit_and_run/where_polymorphic_record.rs"]
+mod where_polymorphic_record;
+
+// Fork specs: preloads.
+#[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]
+mod belongs_to_scope_over_default_scope;
+#[path = "emit_and_run/includes_singular_where_eager_loads.rs"]
+mod includes_singular_where_eager_loads;
+#[path = "emit_and_run/preload_belongs_to_raw_foreign_key.rs"]
+mod preload_belongs_to_raw_foreign_key;
+#[path = "emit_and_run/preload_composite_key_owner.rs"]
+mod preload_composite_key_owner;
+#[path = "emit_and_run/preload_instance_dependent_belongs_to.rs"]
+mod preload_instance_dependent_belongs_to;
+#[path = "emit_and_run/preload_inverse_before_after_initialize.rs"]
+mod preload_inverse_before_after_initialize;
+#[path = "emit_and_run/preload_onto_subclass.rs"]
+mod preload_onto_subclass;
+
+#[path = "emit_and_run/relation_merge_order.rs"]
+mod relation_merge_order;
+#[path = "emit_and_run/relation_except_only.rs"]
+mod relation_except_only;
+#[path = "emit_and_run/model_delete_by_id.rs"]
+mod model_delete_by_id;
+#[path = "emit_and_run/querying_delegation.rs"]
+mod querying_delegation;
+#[path = "emit_and_run/bulk_write_window.rs"]
+mod bulk_write_window;
+#[path = "emit_and_run/relation_async_count.rs"]
+mod relation_async_count;
+#[path = "emit_and_run/order_values.rs"]
+mod order_values;
+#[path = "emit_and_run/scoping_all_is_scope.rs"]
+mod scoping_all_is_scope;
+#[path = "emit_and_run/create_array.rs"]
+mod create_array;
+#[path = "emit_and_run/partial_select_missing_attribute.rs"]
+mod partial_select_missing_attribute;
+
+#[path = "emit_and_run/response_header_alias.rs"]
+mod response_header_alias;
+#[path = "emit_and_run/assert_select_equality.rs"]
+mod assert_select_equality;
+#[path = "emit_and_run/request_headers_merge.rs"]
+mod request_headers_merge;
+#[path = "emit_and_run/prepend_around_action.rs"]
+mod prepend_around_action;
+#[path = "emit_and_run/url_for_controller_index.rs"]
+mod url_for_controller_index;
+#[path = "emit_and_run/redirect_content_type.rs"]
+mod redirect_content_type;
+
+#[path = "emit_and_run/errors_objects_to_a.rs"]
+mod errors_objects_to_a;
+
+#[path = "emit_and_run/errors_group_by_attribute.rs"]
+mod errors_group_by_attribute;
+
+#[path = "emit_and_run/errors_delete_type.rs"]
+mod errors_delete_type;
+
+#[path = "emit_and_run/errors_copy.rs"]
+mod errors_copy;
+
+#[path = "emit_and_run/errors_computed_field.rs"]
+mod errors_computed_field;

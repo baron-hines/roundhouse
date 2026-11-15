@@ -1319,7 +1319,8 @@ fn unmodeled_validates_options_warn_and_drop_their_rule_or_call() {
         r#"
 class Widget < ApplicationRecord
   validates :name, presence: true, uniqueness: { conditions: -> { where(active: true) } }
-  validates :stock, comparison: { less_than_or_equal_to: :max_stock }
+  # A bound computed from neither a literal, a Symbol, a lambda nor a value constant.
+  validates :stock, comparison: { less_than_or_equal_to: Time.now }
   validates :price, numericality: { greater_than: 0, odd: true }
   validates :bounded, numericality: { equal_to: 1, other_than: 2 }
   # A two-parameter lambda would splice an unbound parameter into `def

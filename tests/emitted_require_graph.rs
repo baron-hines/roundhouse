@@ -271,7 +271,7 @@ fn ruby_family_runtime_constants_are_ledgered_on_other_targets() {
   def surface
     [Arel::Nodes, Arel::Nodes::Node, Arel::Nodes::SqlLiteral, Arel::Nodes::Quoted,
      Arel::Nodes::Not, Arel::Nodes::Case, Arel::Nodes::NamedFunction,
-     Arel::Nodes::Ascending, Arel::Nodes::Descending, Arel::Nodes::Predicate,
+     Arel::Nodes::Ordering, Arel::Nodes::Ascending, Arel::Nodes::Descending, Arel::Nodes::Predicate,
      ActiveModel::UnknownAttributeError,
      ActiveRecord::ConnectionFailed, ActiveRecord::ConnectionTimeoutError,
      ActiveRecord::NoDatabaseError,
@@ -282,7 +282,7 @@ fn ruby_family_runtime_constants_are_ledgered_on_other_targets() {
      ActiveRecord::Type::String, ActiveRecord::Type::Integer, ActiveRecord::Type::Value,
      ActiveSupport::IsolatedExecutionState, ActiveSupport::Notifications,
      ActiveSupport::Notifications::Event, ActiveSupport::ConfigurationFile,
-     ActiveSupport::OrderedOptions,
+     ActiveSupport::OrderedOptions, ActiveSupport::Gzip,
      ActiveStorage::Transformers, ActiveStorage::Transformers::Transformer,
      ActiveStorage::Transformers::ImageProcessingTransformer,
      ActiveStorage::Service::GCSService,
@@ -341,8 +341,8 @@ end
             continue;
         }
         if target == BuildTarget::Spinel {
-            assert_eq!(gaps.len(), 4, "{gaps:?}");
-            for name in ["ActiveSupport::ConfigurationFile", "Arel::Nodes::Ascending", "Arel::Nodes::Descending", "Arel::Nodes::Predicate"] {
+            assert_eq!(gaps.len(), 5, "{gaps:?}");
+            for name in ["ActiveSupport::ConfigurationFile", "Arel::Nodes::Ordering", "Arel::Nodes::Ascending", "Arel::Nodes::Descending", "Arel::Nodes::Predicate"] {
                 assert!(gaps.iter().any(|g| g.message.contains(name)), "{name}: {gaps:?}");
             }
             continue;

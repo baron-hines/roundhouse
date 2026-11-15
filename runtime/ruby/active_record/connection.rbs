@@ -115,7 +115,7 @@ module ActiveRecord
     def assign_attributes: (Hash[String | Symbol, untyped] attributes) -> nil
     def _assign_mass_attribute: (String name, untyped value) -> nil
     def _unknown_mass_attribute: (String name) -> nil
-    def read_attribute: (Symbol name) -> untyped
+    def read_attribute: (Symbol | String name) -> untyped
     def write_attribute: (Symbol name, untyped value) -> untyped
     def slice: (*(Symbol | String | Array[Symbol | String]) names) -> Hash[String, untyped]
     def saved_changes?: () -> bool
@@ -207,6 +207,14 @@ module ActiveRecord
     def self.find_in_batches: () { (Array[Base]) -> void } -> Relation
     def self.first_or_initialize: () -> Base
     def self.first!: () -> Base
+    def self.second!: () -> Base
+    def self.third!: () -> Base
+    def self.fourth!: () -> Base
+    def self.fifth!: () -> Base
+    def self.second_to_last!: () -> Base
+    def self.third_to_last!: () -> Base
+    def self.reselect: (*(String | Symbol) specs) -> Relation
+    def self.annotate: (*String comments) -> Relation
     def self.from: (String source) -> Relation
     def self.group: (*(String | Symbol) parts) -> Relation
     def self.having: (String condition, *untyped args) -> Relation
@@ -239,6 +247,7 @@ module ActiveRecord
     def self.all: () -> Relation
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def self._default_scope_where: () -> Hash[Symbol, untyped]
+    def self._read_through_relation?: () -> bool
     def self._find_in_scope: (Integer | Float | String | nil id) -> Base?
     def self.count: () -> Integer
     def self.last: () -> Base?
@@ -252,6 +261,8 @@ module ActiveRecord
     def _note_hydrated: () -> void
     def _note_unloaded: (Hash[String, untyped] row) -> nil
     def has_attribute?: (Symbol name) -> bool
+    def _missing_attribute: (Symbol name) -> nil
+    def _note_loaded: (Symbol name) -> nil
     def attribute_previously_was: (String name) -> untyped
     def self.first: () -> Base?
     def self.take: () -> Base?

@@ -3419,6 +3419,7 @@ end
     // After every body is in: a `config_for` call anywhere names a file.
     super::config_for::lift(vfs, dir, &mut app);
     collect_binary_assets(vfs, dir, &mut app);
+    collect_source_gem_data(vfs, dir, auto_source_gems, &mut app);
     let mut require_roots: Vec<PathBuf> = roots.iter().map(|root| dir.join(root)).collect();
     require_roots.extend(
         support_roots(vfs, dir, &roots, &path_gems, &lib_ignores)
@@ -3665,6 +3666,51 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
     // Deterministic order: the emit is byte-compared across runs, and
     // `read_dir` order is explicitly unspecified by the trait.
     app.binary_assets.sort_by(|a, b| a.0.cmp(&b.0));
+}
+
+/// A gem compiled from source reads its own files by a path from its code (lucide-rails' `GEM_ROOT.join("icons/
+/// stripped.bin.gz")`), which the emitted `__FILE__` names under the gem's mount: the directories beside its code are
+/// carried there, as the installed gem holds them. Not its `lib/` and `app/`, whose code is compiled (and `lib/`'s text
+/// carried, `project::carry_source_gem_data`), nor what only its development reads.
+fn collect_source_gem_data<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[String], app: &mut App) {
+    const CODE_OR_DEVELOPMENT: &[&str] =
+        &["lib", "app", "spec", "test", "tests", "bin", "exe", "sig", "rbi", "script", "gemfiles", "node_modules", "doc", "docs", "tmp", "coverage"];
+    let Some(lock) = app.gem_lock.clone() else { return };
+    let roots = crate::i18n::gems::gem_roots(vfs, dir);
+    let mut names: Vec<&String> = lock.source.iter().chain(auto_source_gems.iter()).collect();
+    names.sort();
+    names.dedup();
+    let mut found = Vec::new();
+    for name in names {
+        let Some(version) = lock.version_of(name) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem_locked(vfs, &roots, &lock, name, version) else { continue };
+        let Ok(entries) = vfs.read_dir(&installed) else { continue };
+        for entry in entries {
+            let Some(top) = entry.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            // Not through a link: its target may lie outside the gem.
+            if vfs.is_symlink(&entry) || !vfs.is_dir(&entry) || top.starts_with('.') || CODE_OR_DEVELOPMENT.contains(&top.as_str()) {
+                continue;
+            }
+            let mut stack = vec![entry];
+            while let Some(at) = stack.pop() {
+                let Ok(children) = vfs.read_dir(&at) else { continue };
+                for child in children {
+                    if vfs.is_symlink(&child) || child.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                        continue;
+                    }
+                    if vfs.is_dir(&child) {
+                        stack.push(child);
+                        continue;
+                    }
+                    let Ok(bytes) = vfs.read(&child) else { continue };
+                    let rel = child.strip_prefix(&installed).unwrap_or(&child).to_string_lossy().replace('\\', "/");
+                    found.push((format!("{}/{name}-{version}/{rel}", super::source_gems::MOUNT), bytes));
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    app.binary_assets.extend(found);
 }
 
 fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &mut App) {
@@ -6745,6 +6791,30 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
                 };
                 other_method == method && stored_options_init(other_expr, macro_def).is_none() && !args.is_empty()
             });
+            // Not over a controller's own method of the name, which Ruby calls instead of the concern's.
+            let overridden = controller.body.iter().any(|i| matches!(i, ControllerBodyItem::ClassMethod { method: m, .. } if m.name == macro_def.name));
+            if let Some(init) = stored_rest_init(expr, macro_def).filter(|_| !overridden) {
+                // The setter is its reader too (`self.class.permitted_accountable_attributes`), which the controller
+                // answers as Rails' extend does; the class-method splice leaves a controller that called it alone.
+                if !expanded.iter().chain(controller.body.iter()).any(|i| matches!(i, ControllerBodyItem::ClassMethod { method: m, .. } if m.name == macro_def.name)) {
+                    let mut method = concern_class_method_copy(macro_def, &module, &Default::default());
+                    method.receiver = crate::dialect::MethodReceiver::Class;
+                    expanded.push(ControllerBodyItem::ClassMethod {
+                        method,
+                        configuration_slot: None,
+                        configuration_role: None,
+                        leading_comments: vec![],
+                        leading_blank_line: true,
+                    });
+                }
+                expanded.push(ControllerBodyItem::ClassIvarInit {
+                    expr: init,
+                    carrier: module,
+                    leading_comments: leading_comments.clone(),
+                    leading_blank_line: *leading_blank_line,
+                });
+                continue;
+            }
             if method_stores_keyword_rest(macro_def) && !another_unreadable {
                 if let Some(init) = stored_options_init(expr, macro_def) {
                     survey::record(&IngestError::Unsupported {
@@ -7063,6 +7133,60 @@ fn stored_options_init(
     ))
 }
 
+/// `permitted_accountable_attributes :a, :b` on a class method that keeps its `*rest` in an ivar (maybe's
+/// `@x = attrs if attrs.any?` then `@x ||= [:id]`): the call is the store, an `@x = [:a, :b]` as the class body runs.
+/// Only literal arguments, whose list is the stored value as written.
+fn stored_rest_init(expr: &crate::expr::Expr, method: &crate::dialect::MethodDef) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode, LValue};
+    let [param] = method.params.as_slice() else { return None };
+    if !param.rest || param.keyword || method.block_param.is_some() || method.has_anonymous_block {
+        return None;
+    }
+    // The store and, after it, at most the reader's `@x ||= default`: anything else is an effect the init would drop.
+    let (first, rest): (&Expr, &[Expr]) = match &*method.body.node {
+        ExprNode::Seq { exprs } => (exprs.first()?, &exprs[1..]),
+        _ => (&method.body, &[]),
+    };
+    let reads_rest = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name == &param.name);
+    let store = match &*first.node {
+        ExprNode::If { cond, then_branch, else_branch }
+            if matches!(&*cond.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "any?" && args.is_empty() && reads_rest(r))
+                && matches!(&*else_branch.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) =>
+        {
+            then_branch
+        }
+        _ => return None,
+    };
+    let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*store.node else { return None };
+    if !reads_rest(value) {
+        return None;
+    }
+    let reads_slot = |e: &Expr| matches!(&*e.node, ExprNode::Ivar { name: n } if n == name);
+    let only_its_reader = match rest {
+        [] => true,
+        [read] => match &*read.node {
+            ExprNode::OpAssign { target: LValue::Ivar { name: n }, op: crate::expr::OpAssignOp::OrOr, .. } => n == name,
+            _ => reads_slot(read),
+        },
+        _ => false,
+    };
+    if !only_its_reader {
+        return None;
+    }
+    let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };
+    // A literal that is truthy: `attrs.any?` is false for a list of nil and false, which keeps the reader's default.
+    if args.is_empty()
+        || !args.iter().all(|a| {
+            matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Array { .. })
+                || matches!(&*a.node, ExprNode::Lit { value } if !matches!(value, crate::expr::Literal::Nil | crate::expr::Literal::Bool { value: false }))
+        })
+    {
+        return None;
+    }
+    let list = Expr::new(expr.span, ExprNode::Array { elements: args.clone(), style: Default::default() });
+    Some(Expr::new(expr.span, ExprNode::Assign { target: LValue::Ivar { name: name.clone() }, value: list }))
+}
+
 fn method_stores_keyword_rest(method: &crate::dialect::MethodDef) -> bool {
     use crate::expr::{ExprNode, LValue};
     let [param] = method.params.as_slice() else { return false };
@@ -7229,8 +7353,34 @@ fn substitute_params(
         .collect();
     bindings.extend(extra);
     replace(&mut body, &bindings);
+    flatten_literal_keyword_splats(&mut body);
     fold_literal_hash_reads(&mut body);
     Some(body)
+}
+
+fn holds_lambda(e: &crate::expr::Expr) -> bool {
+    if matches!(&*e.node, crate::expr::ExprNode::Lambda { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || holds_lambda(c));
+    found
+}
+
+/// `before_action :guard, **{ unless: … }`, as a forwarded `**options` reads once bound to the call's literal
+/// keywords: the keywords themselves, which the filter reader takes (`guard_feature(**options)` in maybe).
+fn flatten_literal_keyword_splats(expr: &mut crate::expr::Expr) {
+    use crate::expr::ExprNode;
+    expr.node.for_each_child_mut(&mut |c| flatten_literal_keyword_splats(c));
+    let ExprNode::Send { args, .. } = &mut *expr.node else { return };
+    for arg in args.iter_mut() {
+        if let ExprNode::KeywordSplat { value } = &*arg.node
+            && let ExprNode::Hash { entries, .. } = &*value.node
+        {
+            let entries = entries.clone();
+            *arg = crate::expr::Expr::new(arg.span, ExprNode::Hash { entries, kwargs: true });
+        }
+    }
 }
 
 /// True for the call-site expression that supplies keyword arguments —
@@ -7509,7 +7659,7 @@ fn filter_from_send(
     };
     let kind = match method.as_str() {
         "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
-        "around_action" | "append_around_action" => FilterKind::Around,
+        "around_action" | "append_around_action" | "prepend_around_action" => FilterKind::Around,
         "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
@@ -7540,7 +7690,8 @@ fn filter_from_send(
     let mut only: Vec<crate::ident::Symbol> = Vec::new();
     let mut except: Vec<crate::ident::Symbol> = Vec::new();
     let mut only_present = false;
-    let mut prepend = method.as_str() == "prepend_before_action";
+    let mut prepend = matches!(method.as_str(), "prepend_before_action" | "prepend_around_action");
+    let (mut if_cond, mut unless_cond, mut if_cond_expr, mut unless_cond_expr) = (None, None, None, None);
     for arg in args {
         if let Some(sym) = sym_of(arg) {
             targets.push((sym, arg.span));
@@ -7570,14 +7721,34 @@ fn filter_from_send(
                     ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => {}
                     _ => return None,
                 },
-                // if:/unless: guards on a macro-expanded filter would
-                // need the predicate to resolve in the INCLUDER; not
-                // modeled, and silently dropping a guard changes when a
-                // filter fires.
-                Some("if") | Some("unless")
-                    if !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) =>
-                {
-                    return None
+                // A guard Rails runs on the controller instance, as a hand-written filter's: a Symbol names the
+                // predicate, a parameterless lambda's body is it. Any other value is refused: dropping a guard
+                // changes when a filter fires.
+                // The last of a repeated key is the one Ruby keeps: a final nil is no guard.
+                Some(which @ ("if" | "unless")) if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) => {
+                    if which == "if" {
+                        (if_cond, if_cond_expr) = (None, None);
+                    } else {
+                        (unless_cond, unless_cond_expr) = (None, None);
+                    }
+                }
+                Some(which @ ("if" | "unless")) => {
+                    let (sym, body) = match &*value.node {
+                        ExprNode::Lit { value: Literal::Sym { value } } => (Some(value.clone()), None),
+                        // Not one holding a block of its own: the macro's parameters were substituted by name through
+                        // it, so a block parameter of the same name was rewritten too.
+                        ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
+                            if params.is_empty() && extra_params.is_empty() && !holds_lambda(body) =>
+                        {
+                            (None, Some(body.clone()))
+                        }
+                        _ => return None,
+                    };
+                    if which == "if" {
+                        (if_cond, if_cond_expr) = (sym, body);
+                    } else {
+                        (unless_cond, unless_cond_expr) = (sym, body);
+                    }
                 }
                 _ => {}
             }
@@ -7598,10 +7769,10 @@ fn filter_from_send(
                 except: except.clone(),
                 only_style: crate::expr::ArrayStyle::default(),
                 except_style: crate::expr::ArrayStyle::default(),
-                if_cond: None,
-                unless_cond: None,
-                if_cond_expr: None,
-                unless_cond_expr: None,
+                if_cond: if_cond.clone(),
+                unless_cond: unless_cond.clone(),
+                if_cond_expr: if_cond_expr.clone(),
+                unless_cond_expr: unless_cond_expr.clone(),
                 unread_guard: false,
                 unread_options: false,
                 only_present,

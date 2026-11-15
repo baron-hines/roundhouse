@@ -1582,6 +1582,8 @@ fn rest_actions_macro_with_extract_options_expands_to_a_scoped_filter() {
     assert_eq!(mobile_version_filters("has_mobile_version *%i[index show]"), scoped);
     // A repeated key reads its last value, as Ruby does.
     assert_eq!(mobile_version_filters("has_mobile_version :index, :show, if: :x, if: nil"), scoped);
+    // The last `if:` a Symbol: the filter keeps it as its guard, as a hand-written one's.
+    assert_eq!(mobile_version_filters("has_mobile_version :index, if: nil, if: :x"), vec![vec!["index".to_string()]]);
 }
 
 /// What expansion cannot read stays unexpanded rather than becoming a
@@ -1593,8 +1595,6 @@ fn rest_actions_macro_refuses_what_it_cannot_read() {
         "has_mobile_version *ACTIONS",
         "has_mobile_version *[:index, ACTIONS.first]",
         "has_mobile_version :index, ACTIONS.first",
-        // The last `if:` is a guard this expansion does not carry.
-        "has_mobile_version :index, if: nil, if: :x",
         // A computed key might be `:if`.
         "has_mobile_version :index, \"if\".to_sym => :x",
     ] {

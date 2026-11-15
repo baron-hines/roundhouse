@@ -10,6 +10,8 @@ use std::process::Command;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/rust_record_tests_app.rs"]
 mod rust_record_tests_app;
 
@@ -80,7 +82,7 @@ fn record_tests_app_cargo_test_passes_what_it_lowers() {
 }
 
 /// A constant a test names that nothing defines (here a digest class
-/// from a gem the app does not declare) is a `check` error, as the same
+/// nothing declares) is a `check` error, as the same
 /// constant in the app's own code is. Before, test bodies were not
 /// walked for it, and the Rust project's test build failed on an
 /// undefined type with nothing reported.
@@ -89,20 +91,22 @@ fn an_unresolved_constant_in_a_test_is_reported() {
     let (_emitted, errors) = rust_record_tests_app::app()
         .write(
             "test/models/digest_test.rb",
-            "require \"test_helper\"\n\nclass DigestTest < ActiveSupport::TestCase\n  test \"a digest\" do\n    assert_nil Shelf.labelled(Digest::BLAKE3.hexdigest(\"x\"))\n  end\nend\n",
+            "require \"test_helper\"\n\nclass DigestTest < ActiveSupport::TestCase\n  test \"a digest\" do\n    assert_nil Shelf.labelled(Digest::NOT_DEFINED_IN_TEST.hexdigest(\"x\"))\n  end\nend\n",
         )
         .emit(roundhouse::project::BuildTarget::Rust);
     assert!(
-        errors.iter().any(|e| e.contains("constant not supported") && e.contains("Digest::BLAKE3")),
+        errors.iter().any(|e| e.contains("constant not supported") && e.contains("Digest::NOT_DEFINED_IN_TEST")),
         "{errors:?}"
     );
 }
 
-/// `assert_respond_to` / `refute_respond_to` with a Symbol are lowered to
-/// a check on `respond_to?`, which the Rust target answers at emit time
-/// from the model it emitted: its columns, associations and persistence
-/// methods answer `true`; another table's column, or a class method
-/// (the model's own `self.labelled`, `Base.find`), `false`.
+/// `assert_respond_to` / `refute_respond_to` with a Symbol are answered
+/// at compile time (`lower::respond_to`), from instance methods only: the
+/// model's columns, associations and persistence methods answer `true`;
+/// another table's column, or a class method (the model's own
+/// `self.labelled`, `Base.find`), `false`. The seven assertions of the
+/// test, in source order, are three asserts that hold and four refutes
+/// that hold.
 #[test]
 fn respond_to_assertions_fold_on_the_rust_target() {
     let (emitted, errors) = rust_record_tests_app::app().emit(roundhouse::project::BuildTarget::Rust);
@@ -114,6 +118,103 @@ fn respond_to_assertions_fold_on_the_rust_target() {
         .and_then(|rest| rest.split("#[test]").next())
         .expect("the respond_to test");
     assert!(!body.contains(".respond_to") && !body.contains("respond_to_pred("), "every respond_to? folded:\n{body}");
-    assert_eq!(body.matches("; true }").count(), 3, "{body}");
-    assert_eq!(body.matches("; false }").count(), 4, "{body}");
+    let answers: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("assertion failed") || line.contains("refute failed"))
+        .map(|line| line.split(" { panic!").next().unwrap())
+        .collect();
+    assert_eq!(
+        answers,
+        ["if !(true)", "if !(true)", "if !(true)", "if false", "if false", "if false", "if false"],
+        "{body}"
+    );
+}
+
+/// A concern's `def self.name` with a signature is the singleton's: an
+/// includer's instance, through one module or a nested one, does not
+/// respond to it. A module that also defines the instance method of that
+/// name does.
+#[test]
+fn a_concerns_signed_singleton_method_is_not_an_instance_method_of_its_includer() {
+    let (emitted, errors) = rust_record_tests_app::app()
+        .write(
+            "app/models/concerns/grouping.rb",
+            "module Grouping\n  #: (String name) -> Integer\n  def self.grouped(name)\n    name.size\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/nesting.rb",
+            "module Nesting\n  #: () -> String\n  def self.nested_label\n    \"n\"\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/ranking.rb",
+            "module Ranking\n  include Nesting\n\n  #: () -> Integer\n  def self.ranked\n    1\n  end\n\n  #: () -> Integer\n  def ranked\n    2\n  end\nend\n",
+        )
+        .write(
+            "app/models/item.rb",
+            "class Item < ApplicationRecord\n  include Grouping\n  include Ranking\n  belongs_to :shelf\n\n  validates :name, presence: true\n  validates :weight, presence: true\n  validates :name, uniqueness: { scope: :shelf_id }\nend\n",
+        )
+        .write(
+            "test/models/item_surface_test.rb",
+            "require \"test_helper\"\n\nclass ItemSurfaceTest < ActiveSupport::TestCase\n  test \"surface\" do\n    item = Item.new(name: \"a\", weight: 1)\n    refute_respond_to item, :grouped\n    refute_respond_to item, :nested_label\n    assert_respond_to item, :ranked\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = std::fs::read_to_string(emitted.join("src/tests/item_surface.rs")).expect("item surface test");
+    let body = test.split("fn test_surface").nth(1).expect("the surface test");
+    let answers: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("assertion failed") || line.contains("refute failed"))
+        .map(|line| line.split(" { panic!").next().unwrap())
+        .collect();
+    assert_eq!(answers, ["if false", "if false", "if !(true)"], "{body}");
+}
+
+/// What the test above expects, from Rails (the oracle the developer selected
+/// with `RH_RAILS_ORACLE`, else the pinned release; an instance's `respond_to?`
+/// for a column, association, persistence method or class method does not vary
+/// across Rails releases): an instance answers to
+/// its column and its association, and not to the class's own method
+/// (`def self.labelled`) or to another table's column.
+#[test]
+fn rails_answers_the_same_respond_to_questions() {
+    let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let components = r#""activerecord", sqlite3: ">= 2.9""#;
+    let probe = emit_and_run::ruby()
+        .args(["-e", &format!("require {oracle:?}; puts RailsOracle.available?({components})")])
+        .output()
+        .expect("oracle availability");
+    let available = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+    assert!(
+        probe.status.success() && matches!(available.as_str(), "true" | "false"),
+        "oracle availability: {available}\n{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    if available == "false" {
+        prerequisite::missing("native Rails oracle: missing activerecord, sqlite3");
+        return;
+    }
+    let program = format!(
+        r#"require {oracle:?}
+RailsOracle.activate({components})
+require 'active_record'
+ActiveRecord::Base.establish_connection(adapter: 'sqlite3', database: ':memory:')
+ActiveRecord::Schema.verbose = false
+ActiveRecord::Schema.define do
+  create_table(:shelves) {{ |t| t.integer :aisle; t.integer :position; t.string :label }}
+  create_table(:items) {{ |t| t.integer :shelf_id; t.string :name; t.integer :weight }}
+end
+class Item < ActiveRecord::Base; end
+class Shelf < ActiveRecord::Base
+  has_many :items
+  def self.labelled(text) = find_by(label: text)
+end
+shelf = Shelf.new(aisle: 1, position: 2)
+got = %i[aisle items save shelf_id weight labelled find].map {{ |name| shelf.respond_to?(name) }}
+raise got.inspect unless got == [true, true, true, false, false, false, false]
+"#
+    );
+    let result = emit_and_run::ruby().args(["-e", &program]).output().expect("native Rails oracle");
+    assert!(result.status.success(), "native Rails: {}", String::from_utf8_lossy(&result.stderr));
 }

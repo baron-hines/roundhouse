@@ -72,7 +72,7 @@ mod send;
 mod active_storage;
 mod buffered_stdlib;
 pub(crate) use send::{ENUMERABLE_METHODS, PARAM_VALUE};
-pub(crate) use send::{indexed_pluck, string_answers};
+pub(crate) use send::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use send::counted_first_last;
 
@@ -267,6 +267,13 @@ pub struct ClassInfo {
     /// what `respond_to?` (public only, by default) answers `false` for
     /// although the class defines it (`lower::respond_to`).
     pub nonpublic_instance_methods: crate::det::HashSet<Symbol>,
+    /// Names whose only `instance_methods` entry is a sidecar signature
+    /// (`app.rbs_signatures`), which names class methods too: nothing
+    /// generated (a column, association, `attr_accessor`, ...) had
+    /// registered the name before it. `lower::respond_to` does not take
+    /// such an entry for an instance method when the source defines it
+    /// class-side.
+    pub sidecar_only_instance_methods: crate::det::HashSet<Symbol>,
     /// The public ones. A name in both sets has a public and a non-public
     /// definition across reopenings, and which one Ruby keeps is load
     /// order, so `lower::respond_to` answers it neither way.
@@ -3088,6 +3095,17 @@ impl<'a> BodyTyper<'a> {
                 ) {
                     return t;
                 }
+                // `async_count` answers a Promise of that same count.
+                if let Some(t) = self.async_count_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
+                ) {
+                    return t;
+                }
                 if let Some(t) = recv.as_ref().and_then(|recv| send::literal_array_extreme_ty(recv, method, args, block.is_some())) {
                     return t;
                 }
@@ -3414,11 +3432,29 @@ impl<'a> BodyTyper<'a> {
                 {
                     return crate::lower::errors_index::error_array_ty();
                 }
+                if matches!(method.as_str(), "to_a" | "objects")
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                    && crate::lower::errors_index::collection_read_grounds(recv.as_ref(), args, block.as_ref())
+                {
+                    return if method.as_str() == "objects" {
+                        crate::lower::errors_index::error_array_ty()
+                    } else {
+                        Ty::Array { elem: std::sync::Arc::new(Ty::Str) }
+                    };
+                }
+                if method.as_str() == "group_by_attribute"
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                    && crate::lower::errors_index::collection_read_grounds(recv.as_ref(), args, block.as_ref())
+                {
+                    return crate::lower::errors_index::grouped_ty();
+                }
                 if method.as_str() == "delete"
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                     && block.is_none()
-                    && crate::lower::errors_index::literal_field(args).is_some()
+                    && crate::lower::errors_index::where_args(args).is_some()
                 {
                     return Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Nil].into() };
                 }
@@ -3430,7 +3466,7 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
                 }
-                if matches!(method.as_str(), "import" | "merge!")
+                if matches!(method.as_str(), "import" | "merge!" | "copy!")
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                     && block.is_none()
