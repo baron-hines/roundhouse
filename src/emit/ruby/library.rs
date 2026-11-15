@@ -3550,17 +3550,6 @@ fn through_hop_scope(
     app.models.iter().find(|m| &m.name == thr_target)?;
     let rel = Symbol::from("__rel");
     let mut body = scope.clone();
-    // A body that answers `nil` or `false` stands for the unscoped relation
-    // (`instance_exec(...) || scope`): nothing to merge, though its other
-    // statements still run. `merge_through_scope` skips a nil, so a literal
-    // `false` result is answered as nil.
-    let tail = match &mut *body.node {
-        ExprNode::Seq { exprs } => exprs.last_mut()?,
-        _ => &mut body,
-    };
-    if matches!(&*tail.node, ExprNode::Lit { value: Literal::Bool { value: false } }) {
-        *tail = Expr::new(tail.span, ExprNode::Lit { value: Literal::Nil });
-    }
     crate::lower::scope_chain::rewrite_scope_body(
         &mut body,
         thr_target,
@@ -3570,7 +3559,23 @@ fn through_hop_scope(
         &regs.assocs,
         &regs.unique_keys,
     );
-    substitute_rel(&mut body, &rel, &through_scope_seed(thr_target)).then_some(body)
+    if !substitute_rel(&mut body, &rel, &through_scope_seed(thr_target)) {
+        return None;
+    }
+    // A body that answers `nil` or `false` stands for the unscoped relation
+    // (`instance_exec(...) || scope`): nothing to merge, though its
+    // statements still run. `(<body>) || nil` answers either as the nil
+    // `merge_through_scope` skips.
+    let span = body.span;
+    Some(Expr::new(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: body,
+            right: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+        },
+    ))
 }
 
 /// `ActiveRecord::Relation.new(<through model>, false)` — the unscoped
