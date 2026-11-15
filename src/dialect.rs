@@ -814,6 +814,11 @@ pub enum ValidationRule {
     InclusionCall { set: Expr },
     /// `exclusion:` with a callable `in:`, as `InclusionCall`.
     ExclusionCall { set: Expr },
+    /// `comparison:` (Rails' `ComparisonValidator`): each `(option, bound)` in written order, the option one of
+    /// `greater_than`, `greater_than_or_equal_to`, `equal_to`, `less_than`, `less_than_or_equal_to` or `other_than`,
+    /// the bound read on the record as it validates (a lambda's body with `self` the record, a Symbol's method, a
+    /// literal). A nil or blank value is `:blank`.
+    Comparison { checks: Vec<(Symbol, Expr)> },
     Custom {
         method: Symbol,
         /// `validate :m, if: :pred` / `unless: :pred` — the instance

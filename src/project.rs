@@ -1960,6 +1960,10 @@ fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app:
         requires.push_str("require_relative \"runtime/ordered_options_spinel\"\n");
         sigs.push("ordered_options_spinel");
     }
+    if own(&|text| text.contains("Gzip.decompress") || text.contains("Gzip.compress") || text.contains("ActiveSupport::Gzip")) {
+        requires.push_str("require_relative \"runtime/active_support_gzip_spinel\"\n");
+        sigs.push("active_support_gzip_spinel");
+    }
     // Not only a dotted call: a class method calls them bare (`descendants.each`); not a word inside another name, nor
     // an assignment (`descendants = …`), though a comparison (`module_parent == Object`) still calls it.
     let names_bare = |text: &str, name: &str| {
@@ -2002,6 +2006,25 @@ fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app:
         files.push((format!("sig/runtime/{stem}.rbs"), rbs));
     }
     Ok(())
+}
+
+/// The ruby overlay's `ActiveSupport::Gzip` only where a file of the tree names it, as Spinel's
+/// (`inject_spinel_active_support_requires`).
+fn drop_unnamed_gzip(files: &mut Vec<(String, String)>) {
+    let named = files
+        .iter()
+        .any(|(p, text)| {
+            p.ends_with(".rb")
+                && !p.starts_with("runtime/")
+                && (text.contains("Gzip.decompress") || text.contains("Gzip.compress") || text.contains("ActiveSupport::Gzip"))
+        });
+    if named {
+        return;
+    }
+    files.retain(|(p, _)| p != "runtime/active_support_gzip.rb");
+    if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
+        *boot = boot.replace("require_relative \"runtime/active_support_gzip\"\n", "");
+    }
 }
 
 /// `boot.rb` requires `runtime/array_column` after the JSON-column seam,
@@ -5791,6 +5814,8 @@ fn ruby_family_runtime_files(
     }
     apply_conditional_declarations(&mut files, app);
     apply_file_programs(&mut files, app);
+    // After the file programs: a gem's top-level file may be the only code that calls it.
+    drop_unnamed_gzip(&mut files);
     // After every pass that writes app code into a file: the boot
     // program (an initializer may be the only caller) and the file
     // programs (a top-level statement may be).
@@ -9301,6 +9326,8 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "ActiveSupport::ConfigurationFile",
     // `config_for`'s Hash, which ships with ConfigurationFile.
     "ActiveSupport::OrderedOptions",
+    // A String gzipped and back (lucide-rails' icon bundle): the CRuby overlay's, and Spinel's on its zlib package.
+    "ActiveSupport::Gzip",
     // Exception classes and their newly exposed owners in
     // `runtime/ruby/active_storage.rb`. Registering a nested error also
     // resolves its enclosing namespace as a value, which needs the same
@@ -10327,6 +10354,11 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             for rule in &validation.rules {
                 if let crate::dialect::ValidationRule::InclusionCall { set } | crate::dialect::ValidationRule::ExclusionCall { set } = rule {
                     visit(set);
+                }
+                if let crate::dialect::ValidationRule::Comparison { checks } = rule {
+                    for (_, bound) in checks {
+                        visit(bound);
+                    }
                 }
             }
         }
@@ -14879,7 +14911,7 @@ fn carry_source_gem_data(app: &App, fixture: &Path, out: &mut Vec<(String, Strin
     };
     for name in &lock.source {
         let Some(version) = lock.version_of(name) else { continue };
-        let Some(installed) = crate::i18n::gems::installed_gem(&vfs, &roots, name, version) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem_locked(&vfs, &roots, lock, name, version) else { continue };
         let lib = installed.join("lib");
         if !lib.is_dir() {
             continue;

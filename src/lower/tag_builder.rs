@@ -150,6 +150,8 @@ pub fn apply_tag_builder_lowering(
     // `tag` column, `attr_reader :tag`, a `def tag` — calls ITS reader
     // (`tag.title`), and rewriting that compiled to `"<title></title>"`.
     let owns_tag = classes_owning(app, registry, "tag", false);
+    let owns_content_tag = classes_owning(app, registry, "content_tag", false);
+    let app_content_tag = app.helper_method_index.contains_key(&Symbol::from("content_tag"));
     // An app's own `stylesheet_link_tag` (an app/helpers method or a
     // `helper_method`) is what Rails calls; it is left to the app. So is
     // a class's own, which its bare call reaches, found as `tag`'s is.
@@ -165,7 +167,9 @@ pub fn apply_tag_builder_lowering(
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let own_tag = owner.is_some_and(|c| owns_tag.contains(c));
         let own_stylesheet = app_stylesheet || owner.is_some_and(|c| owns_stylesheet.contains(c));
-        rewrite(body, own_tag, own_stylesheet, &models, &helpers, &sti_stems, &mut diags)
+        // Not where the app's helpers define it: a helper module's bare call reaches theirs through the helper index.
+        let own_content_tag = app_content_tag || owner.is_some_and(|c| owns_content_tag.contains(c));
+        rewrite(body, own_tag, own_content_tag, own_stylesheet, &models, &helpers, &sti_stems, &mut diags)
     });
     diags
 }
@@ -230,6 +234,9 @@ pub(crate) fn helpers_including(app: &App, method: &str) -> HashSet<ClassId> {
 /// `include ActionView::Helpers::TagHelper` is dropped by the analyzer
 /// as a view-helper marker, so a model that really uses the builder
 /// keeps the rewrite.
+const FRAMEWORK_REOPENS: &[&str] =
+    &["ActionView::Base", "ActionController::Base", "ActionMailer::Base", "ActiveRecord::Base", "ActiveJob::Base"];
+
 fn classes_owning(
     app: &App,
     registry: &HashMap<ClassId, ClassInfo>,
@@ -255,6 +262,18 @@ fn classes_owning(
                 continue;
             }
             let Some(info) = registry.get(c) else { continue };
+            // Not the framework's own `tag` on a framework class the app or a gem reopens (`class ActionView::Base;
+            // include M; end` from an `on_load` or a Railtie): the reopen's methods only, and what it mixes in.
+            if FRAMEWORK_REOPENS.contains(&c.0.as_str()) {
+                let parts = app.library_classes.iter().filter(|lc| lc.name == *c);
+                for lc in parts {
+                    if lc.methods.iter().any(|m| m.name == tag && (m.receiver == crate::dialect::MethodReceiver::Instance || (class_side && !included))) {
+                        return true;
+                    }
+                    stack.extend(lc.includes.iter().map(|m| (m, true)));
+                }
+                continue;
+            }
             if info.instance_methods.contains_key(&tag)
                 || (class_side && !included && info.class_methods.contains_key(&tag))
             {
@@ -435,9 +454,11 @@ fn is_tag_helper(recv: &Expr) -> bool {
 /// nor `tag(:x)` is the builder there (see [`classes_owning`]). The
 /// other helpers this pass expands have names of their own and still
 /// apply.
+#[allow(clippy::too_many_arguments)]
 fn rewrite(
     expr: &mut Expr,
     own_tag: bool,
+    own_content_tag: bool,
     own_stylesheet: bool,
     models: &crate::det::HashSet<String>,
     helpers: &crate::det::HashSet<String>,
@@ -445,7 +466,7 @@ fn rewrite(
     diags: &mut Vec<Diagnostic>,
 ) {
     expr.node.for_each_child_mut(&mut |child| {
-        rewrite(child, own_tag, own_stylesheet, models, helpers, sti_stems, diags)
+        rewrite(child, own_tag, own_content_tag, own_stylesheet, models, helpers, sti_stems, diags)
     });
 
     if rewrite_turbo_frame_tag(expr, models) {
@@ -464,6 +485,9 @@ fn rewrite(
         return;
     }
     if rewrite_link_to_block(expr, models, helpers, sti_stems, diags) {
+        return;
+    }
+    if !own_content_tag && rewrite_content_tag(expr, diags) {
         return;
     }
 
@@ -509,8 +533,15 @@ fn rewrite(
     // 200 and a green suite, because no gate reads the attributes of a tag.
     // `computed_attrs` did not catch it: it required `args.len() > 1`, and
     // a call whose arguments are entirely keywords has exactly one.
+    // With a block, Rails reads a lone Hash as the options (`tag.dialog class: "x", **opts do`, whose merge chain starts
+    // at the literal rather than at the splat). Not any other value: `tag.div(label) { … }` is content.
+    let block_options = block.is_some()
+        && args.len() == 1
+        && opts.is_none()
+        && matches!(&*args[0].node, ExprNode::Send { recv: Some(head), method, .. }
+            if method.as_str() == "merge" && matches!(&*head.node, ExprNode::Hash { .. }));
     let lone_computed_attrs =
-        args.len() == 1 && opts.is_none() && is_kwsplat_merge_chain(&args[0]);
+        args.len() == 1 && opts.is_none() && (is_kwsplat_merge_chain(&args[0]) || block_options);
     if lone_computed_attrs {
         content = None;
     }
@@ -709,12 +740,21 @@ fn rewrite_button_to_block(expr: &mut Expr) -> bool {
         return false;
     }
     let Some(url) = args.first() else { return false };
+    let span = expr.span;
     let opts = match args.get(1).map(|a| &*a.node) {
         None => Vec::new(),
         Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+        // Computed options (maybe's `button_to(href, **merged_opts, &block)`): the runtime reads `method:` and
+        // `form_class:` out of them as this reads a literal Hash's.
+        Some(_) if args.len() == 2 => {
+            let call = view_helpers_call("button_to_html", vec![url.clone(), capture_call(block.clone(), span), args[1].clone()]);
+            let mut built = html_safe(call, span);
+            qualify_view_helpers(&mut built);
+            *expr = built;
+            return true;
+        }
         Some(_) => return false,
     };
-    let span = expr.span;
     let block = block.clone();
     let (mut parts, suffix) =
         crate::lower::view_to_library::helpers::button_to_wrapper_markup(url.clone(), opts);
@@ -984,6 +1024,77 @@ fn rewrite_link_to_block(
 /// Void-ness does not enter into it: the legacy form self-closes
 /// whatever it is handed, which is why it takes no block and no
 /// content argument here.
+/// `content_tag(name[, content][, opts]) [do … end]` written in a hook body (a helper, a component's method): the
+/// element `tag.<name>` builds, through the same attribute renderer. Rails reads the argument after the name as the
+/// OPTIONS when a block is given (maybe's `content_tag(:button, **merged_opts, &block)`), and closes even a void element.
+fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        return false;
+    };
+    if method.as_str() != "content_tag" || args.is_empty() || args.len() > 3 {
+        return false;
+    }
+    let name = match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return false,
+    };
+    if !is_html_element(&name) && !is_custom_element(&name) {
+        return false;
+    }
+    // With a block, a Hash after the name is the options; anything else there is content only when a passed-through
+    // `&block` turns out nil (maybe's `content_tag(:button, label, id:, &block)`), which Rails' `block_given?` reads.
+    let (content, opts) = match block {
+        Some(_) if args.len() > 2 => (args.get(1).cloned(), args.get(2).cloned()),
+        // `content_tag(:span, "Save", &block)`: not options unless a Hash, so the content a nil block leaves. Only a
+        // literal: a lone `**opts` reads here as the bare value, which is the options.
+        Some(b)
+            if matches!(&*b.node, ExprNode::Var { .. })
+                && args.get(1).is_some_and(|a| {
+                    matches!(&*a.node, ExprNode::StringInterp { .. } | ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
+                }) =>
+        {
+            (args.get(1).cloned(), None)
+        }
+        Some(_) => (None, args.get(1).cloned()),
+        None => (args.get(1).cloned(), args.get(2).cloned()),
+    };
+    let block = block.clone();
+    let span = expr.span;
+
+    let entries = match opts.as_ref().map(|o| &*o.node) {
+        None => Vec::new(),
+        Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+        Some(_) => {
+            diags.push(residue(expr, "attributes are a computed expression, not a literal hash"));
+            *expr = content_tag_fallback(&name, content, opts, block, span);
+            return true;
+        }
+    };
+    let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("<{name}") }];
+    append_attr_parts(&mut parts, &entries);
+    parts.push(InterpPart::Text { value: ">".to_string() });
+    // Rails' `PRE_CONTENT_STRINGS`: the newline the parser drops, so a textarea's own leading one survives.
+    if name == "textarea" {
+        parts.push(InterpPart::Text { value: "\n".to_string() });
+    }
+    match (block, content) {
+        (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
+            let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });
+            let captured = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("capture"), args: vec![], block: Some(block), parenthesized: false });
+            parts.push(InterpPart::Expr { expr: Expr::new(span, ExprNode::If { cond: given, then_branch: escaped_content(content), else_branch: captured }) });
+        }
+        (Some(block), _) => parts.push(InterpPart::Expr { expr: capture_call(block, span) }),
+        (None, Some(content)) => parts.push(InterpPart::Expr { expr: escaped_content(content) }),
+        (None, None) => {}
+    }
+    parts.push(InterpPart::Text { value: format!("</{name}>") });
+    let mut built = string_interp(parts);
+    qualify_view_helpers(&mut built);
+    *expr = html_safe(built, span);
+    true
+}
+
 fn rewrite_legacy_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
         return false;
@@ -1174,9 +1285,14 @@ fn content_tag_fallback(
         ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } },
     );
     sym.ty = Some(crate::ty::Ty::Sym);
-    let body = match block {
-        Some(block) => capture_call(block, span),
-        None => content.unwrap_or_else(|| lit_str(String::new())),
+    let body = match (block, content) {
+        (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
+            let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });
+            let captured = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("capture"), args: vec![], block: Some(block), parenthesized: false });
+            Expr::new(span, ExprNode::If { cond: given, then_branch: content, else_branch: captured })
+        }
+        (Some(block), _) => capture_call(block, span),
+        (None, content) => content.unwrap_or_else(|| lit_str(String::new())),
     };
     let mut args = vec![sym, body];
     if let Some(opts) = opts {
