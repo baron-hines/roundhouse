@@ -22276,3 +22276,6 @@ mod errors_group_by_attribute;
 
 #[path = "emit_and_run/errors_delete_type.rs"]
 mod errors_delete_type;
+
+#[path = "emit_and_run/errors_copy.rs"]
+mod errors_copy;

@@ -527,6 +527,20 @@ module ActiveSupport
     others
   end
 
+  # Rails' `errors.copy!(other)`: the record's own errors go, and each of
+  # the other's is taken as a copy — same attribute, kind and message, and
+  # a full message naming the attribute as THIS model names it, which is
+  # what `errors_import` builds. The copies are this record's own details,
+  # so clearing one errors object's leaves the other's whole. Copying a
+  # record's own errors is a no-op, as Rails' deep_dup of them is.
+  def self.errors_copy(errors, details, others, names, before, between, after)
+    return details if others.equal?(details)
+    errors.clear
+    details.clear
+    others.each { |error| errors_import(errors, details, error, nil, names, before, between, after) }
+    details
+  end
+
   # `ActiveSupport::MessageVerifier::InvalidSignature` — what a signed
   # value that does not verify raises. Rails hangs it off the verifier
   # class, and the NAME is the whole point: a controller that rescues it

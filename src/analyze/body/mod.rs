@@ -3455,7 +3455,7 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
                 }
-                if matches!(method.as_str(), "import" | "merge!")
+                if matches!(method.as_str(), "import" | "merge!" | "copy!")
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                     && block.is_none()

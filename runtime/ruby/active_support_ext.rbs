@@ -45,6 +45,7 @@ module ActiveSupport
   def self.error_template: (Hash[String, String] table, String key, String? count) -> String?
   def self.interpolate: (String template, Hash[String, String] values) -> String
   def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.errors_copy: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
 
   def self.deprecation_line: (String line) -> nil
 

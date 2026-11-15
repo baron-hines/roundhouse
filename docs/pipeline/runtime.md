@@ -2477,6 +2477,19 @@ attribute is humanized, as `human_attribute_name` falls back to.
 once each, or an `import` with options beyond a Symbol `attribute:`,
 is an error. Both helpers are gaps on a strict target.
 
+`errors.copy!(other)` drops the record's own errors and takes copies of
+the other's, its full messages named as the copying model names them,
+by the same rules: `ActiveSupport.errors_copy` clears both arrays and
+imports each of the other's details as `merge!` does, so what the record
+holds is its own, and dropping one from either leaves the other whole.
+Copying a record's own errors is a no-op, as Rails' `deep_dup` of them
+is, and `copy!` is a gap on a strict target as `merge!` is. Only
+another record's `errors` is grounded: Rails' `copy!` takes an `Errors`,
+and given a record it keeps that record's `Errors` where its Array goes.
+A copy keeps the message the other model's lookup chose; Rails looks it
+up again for the copying model, so a model-scoped locale message for
+the copier is not used.
+
 A `belongs_to` checks its record where it is declared, among the
 `validates`, so its error lists in Rails' order, and its type is
 `:blank`: Rails validates the association's presence with `message:

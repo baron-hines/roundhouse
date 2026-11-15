@@ -9517,6 +9517,7 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
     ("ActiveSupport", "error_template"),
     ("ActiveSupport", "errors_import"),
     ("ActiveSupport", "errors_merge"),
+    ("ActiveSupport", "errors_copy"),
     ("ActiveJob::Arguments", "serialize"),
     ("ActiveJob::Arguments", "ruby2_keywords_hash"),
 ];
