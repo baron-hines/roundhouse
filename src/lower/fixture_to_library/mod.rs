@@ -52,7 +52,8 @@ pub fn lower_fixtures_to_library_classes(app: &App) -> Vec<LibraryClass> {
                         .filter(|c| m.enum_defaults.contains_key(&c.name)).collect()))
                 .unwrap_or_default();
             let temporal = temporal_columns(app, &f.class);
-            build_fixture_class(f, &lowered, dynamic.contains(&f.name), &defaults, &temporal)
+            let sequence = sequence_reset(app, &f.class);
+            build_fixture_class(f, &lowered, dynamic.contains(&f.name), &defaults, &temporal, sequence.as_deref())
         })
         .collect()
 }
@@ -175,6 +176,7 @@ fn build_fixture_class(
     wants_by_label: bool,
     defaults: &[&Column],
     temporal: &HashMap<Symbol, bool>,
+    sequence: Option<&str>,
 ) -> LibraryClass {
     let owner_name = format!("{}Fixtures", camelize(f.name.as_str()));
     let owner_id = ClassId(Symbol::from(owner_name.clone()));
@@ -258,7 +260,10 @@ fn build_fixture_class(
     // the DB by `<Class>.new({...attrs...}).save`. Inserts happen in
     // 1-indexed file order so the autoincrement column matches the
     // ids the label methods look up. Body is a Seq of Sends.
-    let load_body = build_load_method_body(&f.class, &f.records, &f.preamble, &f.file_blobs, all, defaults, temporal);
+    let mut load_body = build_load_method_body(&f.class, &f.records, &f.preamble, &f.file_blobs, all, defaults, temporal);
+    if let (Some(sql), ExprNode::Seq { exprs }) = (sequence, &mut *load_body.node) {
+        exprs.push(db_exec(sql));
+    }
     methods.push(MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -292,6 +297,54 @@ fn build_fixture_class(
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
+}
+
+/// On PostgreSQL, the statement that moves a keyed table's id sequence
+/// past the rows its fixtures inserted, as Rails' `reset_pk_sequence!`
+/// does once fixtures are loaded: the rows carry explicit ids, which
+/// the sequence does not see, so a create in a test would take one of
+/// them again. None for SQLite, whose rowid follows the table, and for a
+/// table with no integer key (a uuid, a composite key, none).
+fn sequence_reset(app: &App, class: &ClassId) -> Option<String> {
+    use crate::emit::shared::schema_sql::Dialect;
+    if Dialect::current() != Dialect::Postgres {
+        return None;
+    }
+    let model = app.models.iter().find(|m| &m.name == class)?;
+    let table = app.schema.tables.get(&model.table.0)?;
+    let key = table
+        .columns
+        .iter()
+        .find(|c| c.primary_key && matches!(c.col_type, crate::schema::ColumnType::Integer | crate::schema::ColumnType::BigInt))?;
+    // Quoted, as the PostgreSQL truncate beside it quotes them.
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let table = quote(table.name.as_str());
+    let column = quote(key.name.as_str());
+    Some(format!(
+        "SELECT setval(pg_get_serial_sequence('{table}', '{}'), COALESCE(MAX({column}), 0) + 1, false) FROM {table}",
+        key.name.as_str()
+    ))
+}
+
+/// `Db.exec(<sql>)`.
+fn db_exec(sql: &str) -> Expr {
+    let db = with_ty(
+        Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("Db")] }),
+        Ty::Class { id: ClassId(Symbol::from("Db")), args: vec![].into() },
+    );
+    with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(db),
+                method: Symbol::from("exec"),
+                args: vec![lit_str(sql.to_string())],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        Ty::Nil,
+    )
 }
 
 /// Body of `by_label(label)`: an if/elsif chain comparing
