@@ -3559,8 +3559,17 @@ fn through_hop_scope(
         &regs.assocs,
         &regs.unique_keys,
     );
+    // A body that never reads its relation is not a relation chain, and
+    // stays unapplied, unless it ends in a literal `nil` or `false`: that
+    // one merges nothing, but its statements (a guard) still run.
     if !substitute_rel(&mut body, &rel, &through_scope_seed(thr_target)) {
-        return None;
+        let tail = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.last()?,
+            _ => &body,
+        };
+        if !matches!(&*tail.node, ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } }) {
+            return None;
+        }
     }
     // A body that answers `nil` or `false` stands for the unscoped relation
     // (`instance_exec(...) || scope`): nothing to merge, though its

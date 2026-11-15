@@ -32,6 +32,8 @@ end
   has_many :false_plants, through: :false_beds, source: :plants
   has_many :guarded_beds, -> { where(fallow: false); raise "guarded" if Bed.exists?; nil }, class_name: "Bed"
   has_many :guarded_plants, through: :guarded_beds, source: :plants
+  has_many :alarmed_beds, -> { raise "alarmed" if Bed.exists?; nil }, class_name: "Bed"
+  has_many :alarmed_plants, through: :alarmed_beds, source: :plants
   has_many :switched_beds, -> { Bed.exists? ? false : where(fallow: false) }, class_name: "Bed"
   has_many :switched_plants, through: :switched_beds, source: :plants
   has_many :computed_beds, -> { where(fallow: false) unless Bed.exists? }, class_name: "Bed"
@@ -103,6 +105,13 @@ end
     end
     # Rails: the body's other statements run before its nil answers
     check("nil body runs its statements", guarded == "guarded")
+    alarmed = begin
+      g.alarmed_plants.to_a
+      "read"
+    rescue RuntimeError => e
+      e.message
+    end
+    check("relation-free nil body runs its statements", alarmed == "alarmed")
     check("computed false scope body", g.switched_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
     check("computed nil scope body", g.computed_plants.map(&:name).sort == ["bean", "kale", "leek", "weed"])
     # Rails: an expression ordering keeps its commas
