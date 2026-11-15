@@ -258,6 +258,16 @@ fn queue_tables_in_the_named_schema_select_solid_queue_models() {
     assert!(checked.app.models.iter().any(|m| m.name.0.as_str() == "SolidQueue::Job"), "SolidQueue::Job was not selected");
 }
 
+/// A three-tier test environment whose configurations are named by
+/// non-String keys has no primary this can name: a named file there is
+/// refused, and ingestion doesn't panic.
+#[test]
+fn a_primary_that_cannot_be_named_refuses_a_named_file() {
+    let checked = check(&files(&[("config/database.yml", "test:\n  1:\n    adapter: sqlite3\n    schema_dump: catalog_schema.rb\n"), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert_at(&checked.errors, "config/database.yml:1:", &["`test.primary`", "can't be named"]);
+    assert!(tables(&checked.app).is_empty());
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.

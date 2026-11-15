@@ -347,7 +347,19 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     let at = |start: usize| Span { file: FileId(0), start: start as u32, end: start as u32 };
     let three_tier = !env.is_empty() && env.values().all(|v| matches!(v, Value::Mapping(_)));
     let names: Vec<String> = env.keys().filter_map(|k| k.as_str().map(str::to_string)).collect();
-    let primary_name = if !three_tier || names.iter().any(|n| n == "primary") { "primary".to_string() } else { names[0].clone() };
+    // Rails' primary is `primary`, else the first configuration. A configuration named by a non-String key can't be named here.
+    let primary_name = if !three_tier || names.iter().any(|n| n == "primary") {
+        "primary".to_string()
+    } else if let Some(first) = names.first().filter(|_| names.len() == env.len()) {
+        first.clone()
+    } else {
+        if env.values().any(|config| matches!(config, Value::Mapping(c) if c.keys().any(|k| k.as_str().is_some_and(|k| k.trim_start_matches(':') == "schema_dump")))) {
+            out.primary = Some(Err(()));
+            let detail = "`test.primary`'s `schema_dump` is not supported: the test environment names a configuration with a key that isn't a string, so its primary can't be named".to_string();
+            out.refusals.push(DatabaseRefusal { span: at(env_at.unwrap_or(0)), construct: "schema_dump".to_string(), detail, warning: false });
+        }
+        return out;
+    };
     // The lines written directly in a configuration's block: `(offset, key, value)`.
     let block = |start: Option<usize>| -> Vec<(usize, String, String)> {
         let Some(start) = start else { return Vec::new() };
