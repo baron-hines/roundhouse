@@ -296,6 +296,17 @@ fn a_computed_key_refuses_a_named_file() {
     }
 }
 
+/// Only the test primary's own `schema_dump` matters: another
+/// environment's named file beside a computed key doesn't refuse a test
+/// primary that names none.
+#[test]
+fn a_computed_key_refuses_only_beside_the_test_primarys_named_file() {
+    let yml = "test:\n  adapter: sqlite3\n  schema_dump: false\nproduction:\n  adapter: sqlite3\n  schema_dump: production_schema.rb\n  <%= \"pool\" %>: 5\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/schema.rb", WIDGETS), ("db/production_schema.rb", STALE)]));
+    assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{:?}", checked.errors);
+    assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.

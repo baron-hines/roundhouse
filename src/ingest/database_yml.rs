@@ -335,8 +335,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     if doc.apply_merge().is_err() {
         return out;
     }
-    // A key computed by ERB (`<%= "schema_dump" %>:`, or the environment's own name) could be
-    // the setting itself, so a file that names one anywhere is refused before anything is read.
+    // A key computed by ERB (`<%= "schema_dump" %>:`) could be the setting itself.
     fn computed_key(value: &Value) -> bool {
         match value {
             Value::Mapping(m) => m.iter().any(|(k, v)| k.as_str().is_some_and(|k| k.contains(ERB_VALUE)) || computed_key(v)),
@@ -344,23 +343,8 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
             _ => false,
         }
     }
-    // Only beside a named `schema_dump` (a filename): `false`, null or a boolean word keeps main's behavior.
-    fn names_file(value: &Value) -> bool {
-        match value {
-            Value::Mapping(m) => m.iter().any(|(k, v)| {
-                let file = matches!(v, Value::String(s) if !s.is_empty() && !["yes", "no", "on", "off", "true", "false"].iter().any(|w| s.eq_ignore_ascii_case(w)));
-                (file && k.as_str().is_some_and(|k| k.trim_start_matches(':') == "schema_dump")) || names_file(v)
-            }),
-            Value::Sequence(items) => items.iter().any(names_file),
-            _ => false,
-        }
-    }
-    if computed_key(&doc) && names_file(&doc) {
-        out.primary = Some(Err(()));
-        let detail = "`test.primary`'s `schema_dump` is not supported: config/database.yml computes a key with ERB, which could be the setting itself".to_string();
-        out.refusals.push(DatabaseRefusal { span: Span { file: FileId(0), start: 0, end: 0 }, construct: "schema_dump".to_string(), detail, warning: false });
-        return out;
-    }
+    // Checked once the test primary's own `schema_dump` names a file.
+    let computed = computed_key(&doc);
     let Value::Mapping(mut envs) = doc else { return out };
     // An environment given as a URL string is its one configuration's `url:`.
     let env = match envs.remove("test") {
@@ -493,6 +477,10 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         // ERB control flow can decide whether this configuration, or this key, exists at all.
         if control_tag(&text).is_some() {
             refuse(offset, unsupported(&written, "config/database.yml runs ERB control flow (`<% ... %>`), which can decide whether it applies"), false);
+            continue;
+        }
+        if computed {
+            refuse(offset, unsupported(&written, "config/database.yml computes a key with ERB, which could be the setting itself"), false);
             continue;
         }
         let why = match value {
