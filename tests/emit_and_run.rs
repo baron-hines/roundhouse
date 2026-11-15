@@ -22332,3 +22332,16 @@ mod scoping_all_is_scope;
 mod create_array;
 #[path = "emit_and_run/partial_select_missing_attribute.rs"]
 mod partial_select_missing_attribute;
+
+#[path = "emit_and_run/response_header_alias.rs"]
+mod response_header_alias;
+#[path = "emit_and_run/assert_select_equality.rs"]
+mod assert_select_equality;
+#[path = "emit_and_run/request_headers_merge.rs"]
+mod request_headers_merge;
+#[path = "emit_and_run/prepend_around_action.rs"]
+mod prepend_around_action;
+#[path = "emit_and_run/url_for_controller_index.rs"]
+mod url_for_controller_index;
+#[path = "emit_and_run/redirect_content_type.rs"]
+mod redirect_content_type;
