@@ -1,8 +1,9 @@
 //! Joining a scoped `belongs_to` puts its scope in the ON clause over the
 //! target's default scope, as Rails' association join does: a `where`
 //! adds its condition, an `unscope(where:)` lifts the default's, and
-//! `includes` or `order` change nothing. The expected values are ActiveRecord 8.1.4's
-//! answers.
+//! `includes` or `order` change nothing. A condition on a column named
+//! like a keyword (`order`) is quoted. The expected values are
+//! ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -24,6 +25,7 @@ end
   belongs_to :vendor, -> { unscope(where: :closed) }
   belongs_to :approved_vendor, -> { where(approved: true) }, class_name: "Vendor", foreign_key: :vendor_id, optional: true
   belongs_to :region, -> { where(active: true).includes(:invoices).order(:name) }, optional: true
+  belongs_to :first_region, -> { where(order: 1) }, class_name: "Region", foreign_key: :region_id, optional: true
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -32,8 +34,8 @@ end
   end
 
   def self.run
-    north = Region.create!(name: "north", active: true)
-    south = Region.create!(name: "south", active: false)
+    north = Region.create!(name: "north", active: true, order: 1)
+    south = Region.create!(name: "south", active: false, order: 2)
     open_ok = Vendor.create!(name: "open approved", approved: true)
     open_new = Vendor.create!(name: "open new", approved: false)
     shut = Vendor.create!(name: "shut approved", approved: true, closed: true)
@@ -46,6 +48,8 @@ end
     check("where over the default scope", Invoice.joins(:approved_vendor).order(:number).pluck(:number) == [1])
     # Rails: [1, 3]
     check("where", Invoice.joins(:region).order(:number).pluck(:number) == [1, 3])
+    # Rails: [1, 3]
+    check("keyword column", Invoice.joins(:first_region).order(:number).pluck(:number) == [1, 3])
     # Rails: [[1, "north"], [2, nil], [3, "north"]]
     check("left join", Invoice.left_outer_joins(:region).order(:number).pluck(:number, "regions.name") == [[1, "north"], [2, nil], [3, "north"]])
   end
@@ -60,6 +64,7 @@ end
   create_table "regions", force: :cascade do |t|
     t.string "name"
     t.boolean "active", default: true
+    t.integer "order"
   end
   create_table "invoices", force: :cascade do |t|
     t.integer "number"

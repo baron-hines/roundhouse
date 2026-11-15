@@ -378,8 +378,10 @@ fn literal_fits(value: &Literal, ty: &Ty) -> bool {
 }
 
 /// `col = literal` as SQL, for an association join's ON clause. `None`
-/// for a literal this does not render.
+/// for a literal this does not render. The column is quoted when it needs
+/// to be (`targets."order" = 1`).
 pub fn sql_predicate(table: &str, col: &Symbol, value: &Literal) -> Option<String> {
+    let col = crate::naming::sql_ident(col.as_str());
     let rhs = match value {
         Literal::Nil => return Some(format!("{table}.{col} IS NULL")),
         Literal::Bool { value: true } => "TRUE".to_string(),
