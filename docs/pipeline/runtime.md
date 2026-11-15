@@ -2423,6 +2423,12 @@ target; a field that is not a Symbol or String literal is an error,
 because the accumulator's own `include?` would ask its full messages
 and answer false.
 
+`errors.to_a` is Rails' alias for `full_messages`, which is what
+`errors` already holds here, so the hop folds away and every target
+reads the accumulator. `errors.objects` is the `ActiveModel::Error`s
+Rails collects, which is `error_details`: the lowering reads it as that
+field, and what it yields reads as an iteration's does.
+
 Iterating `errors` (`each`, `map`, `collect`, `select`, `filter`,
 `reject`, `find`, `detect`, `all?`, `first`, and `any?`, `none?` and
 `count` with a block) iterates `error_details` instead, because Rails

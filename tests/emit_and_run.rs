@@ -22267,3 +22267,6 @@ mod partial_object_as;
 mod helper_asset_url;
 #[path = "emit_and_run/safe_join_safe.rs"]
 mod safe_join_safe;
+
+#[path = "emit_and_run/errors_objects_to_a.rs"]
+mod errors_objects_to_a;

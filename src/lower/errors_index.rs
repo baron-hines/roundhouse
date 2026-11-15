@@ -255,6 +255,7 @@ fn rewrite(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     rewrite_delete(expr, diags);
     rewrite_where(expr, diags);
     rewrite_to_hash(expr);
+    rewrite_collection_read(expr);
     rewrite_render_json(expr);
 }
 
@@ -539,6 +540,39 @@ fn rewrite_to_hash(expr: &mut Expr) {
         _ => return,
     };
     *expr = details_call(expr.span, reader, helper, ty);
+}
+
+/// `<owner>.errors.to_a` is Rails' `full_messages`, which `errors` already
+/// is here, and `.objects` are the `ActiveModel::Error`s Rails collects,
+/// which `error_details` holds — the same rebinding an iteration gets.
+/// Only on a model's errors: an app's own `errors` (a Hash, say) answers `to_a` itself.
+fn rewrite_collection_read(expr: &mut Expr) {
+    let ExprNode::Send { recv: Some(reader), method, args, block: None, .. } = &*expr.node else { return };
+    if !args.is_empty() || !is_model_errors_read(reader) {
+        return;
+    }
+    let span = expr.span;
+    let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!("an errors reader") };
+    match method.as_str() {
+        "to_a" => {
+            let mut messages = reader.clone();
+            messages.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+            *expr = messages;
+        }
+        "objects" => {
+            let mut details = super::errors_add::error_details(owner.clone(), span);
+            details.ty = Some(error_array_ty());
+            *expr = details;
+        }
+        _ => {}
+    }
+}
+
+/// Shared with analyze, which types `to_a` and `objects` only on the shape
+/// `rewrite_collection_read` grounds: a zero-arg, block-free read of an
+/// `errors` sender.
+pub(crate) fn collection_read_grounds(recv: Option<&Expr>, args: &[Expr], block: Option<&Expr>) -> bool {
+    args.is_empty() && block.is_none() && recv.is_some_and(is_errors_read)
 }
 
 // Not the Array of full messages, nor `errors_to_hash`: Rails' `render json:` writes `errors.as_json` keyed by attribute, and `Base#errors_json` reaches every target with String keys, which JSON writes the same.
