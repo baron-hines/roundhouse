@@ -307,6 +307,24 @@ fn a_computed_key_refuses_only_beside_the_test_primarys_named_file() {
     assert_eq!(tables(&checked.app), ["widgets"]);
 }
 
+/// Two computed keys must not hide a named file: each placeholder is
+/// distinct, so the YAML still parses and the named file is refused.
+/// With `schema_dump: false` or none, the same file builds as on main.
+#[test]
+fn two_computed_keys_still_refuse_a_named_file() {
+    let computed = "  <%= \"pool\" %>: 5\n  <%= \"timeout\" %>: 1000\n";
+    let named = format!("test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n{computed}");
+    let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("computes a key")), "{:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty());
+    for dump in ["  schema_dump: false\n", ""] {
+        let yml = format!("test:\n  adapter: sqlite3\n{dump}{computed}");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.

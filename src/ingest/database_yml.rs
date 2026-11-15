@@ -331,7 +331,16 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     use serde_yaml_ng::Value;
     let mut out = NamedSchema::default();
     let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return out };
-    let Ok(mut doc) = serde_yaml_ng::from_str::<Value>(&erb_as_values(&text)) else { return out };
+    // Each ERB output tag gets its own placeholder: two computed keys would otherwise be one
+    // duplicate key, the YAML would not parse, and a named file would be dropped unseen.
+    let distinct = erb_as_values(&text).split(ERB_VALUE).enumerate().fold(String::new(), |mut yaml, (i, part)| {
+        if i > 0 {
+            yaml.push_str(&format!("{ERB_VALUE}{i}_"));
+        }
+        yaml.push_str(part);
+        yaml
+    });
+    let Ok(mut doc) = serde_yaml_ng::from_str::<Value>(&distinct) else { return out };
     if doc.apply_merge().is_err() {
         return out;
     }
@@ -455,7 +464,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         {
             // Only a String key written directly, with nothing merged beside it, is the key Rails ignores.
             out.primary = Some(Err(()));
-            let written = serde_yaml_ng::to_string(&config[":schema_dump"]).unwrap_or_default().trim().replace(ERB_VALUE, "<%= ... %>");
+            let written = shown(serde_yaml_ng::to_string(&config[":schema_dump"]).unwrap_or_default().trim());
             refuse(start, unsupported(&written, "it is the Symbol key `:schema_dump:`, here through a merge"), false);
         }
         let Some(value) = config.get("schema_dump") else { continue };
@@ -463,7 +472,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
             continue;
         }
         let direct = line_of("schema_dump");
-        let written = direct.map_or_else(|| serde_yaml_ng::to_string(value).unwrap_or_default().trim().replace(ERB_VALUE, "<%= ... %>"), |l| l.2.replace(ERB_VALUE, "<%= ... %>"));
+        let written = direct.map_or_else(|| shown(serde_yaml_ng::to_string(value).unwrap_or_default().trim()), |l| l.2.replace(ERB_VALUE, "<%= ... %>"));
         let offset = direct.map_or(start, |l| l.0);
         let token = direct.map(|l| l.2.as_str()).unwrap_or_default();
         let plain = token.trim_matches(|c| c == '\'' || c == '"');
@@ -524,6 +533,20 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
             out.primary = Some(Ok((dir.join(path), name.ends_with(".sql"))));
         }
     }
+    out
+}
+
+/// A value as written, with each numbered ERB placeholder shown as `<%= ... %>`.
+fn shown(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(at) = rest.find(ERB_VALUE) {
+        out.push_str(&rest[..at]);
+        out.push_str("<%= ... %>");
+        let after = rest[at + ERB_VALUE.len()..].trim_start_matches(|c: char| c.is_ascii_digit());
+        rest = after.strip_prefix('_').unwrap_or(after);
+    }
+    out.push_str(rest);
     out
 }
 
