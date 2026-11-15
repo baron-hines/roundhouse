@@ -607,7 +607,15 @@ fn untyped_subexpressions_baseline() {
     // `Model.unscoped { }` bind the block's value before their ensure, so
     // the Spinel binary keeps it, a var on this RBS-less probe (+2 in
     // active_record/relation.rb, +2 in active_record/connection.rb).
-    const CEILING: usize = 1351;
+    // MEASURED 1352 on partial-select writes (1351): `_note_loaded` in
+    // active_record/connection.rb names the column it assigned in the row's
+    // pending writes, so it reads the column name twice more — the early
+    // return for one that was not left out, and `name.to_s` (+2); less
+    // `read_attribute`, whose unloaded check and `[]` read now pass the
+    // Symbol it normalizes to instead of the name as given, which types
+    // both (-1). The names are vars on this RBS-less probe;
+    // connection.rbs types them for the RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1352;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
