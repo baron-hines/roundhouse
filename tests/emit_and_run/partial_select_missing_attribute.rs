@@ -71,6 +71,14 @@ end
     check("read_attribute", read { partial.read_attribute(:status) }, "nil")
     check("read_attribute String", read { named(partial, "status") }, "nil")
     check("read_attribute String loaded", read { named(partial, "title") }, "\"Hello\"")
+    cleared = Article.where(id: article.id).select(:id, :title).take!
+    cleared.status = nil
+    cleared.save!
+    check("nil assignment saved", article.reload.status, nil)
+    check("assigned nothing pending", cleared.changed?, false)
+    Article.where(id: article.id).update_all(status: "later")
+    cleared.save!
+    check("later save keeps another write", article.reload.status, "later")
   end
 
   def self.index(record, key)

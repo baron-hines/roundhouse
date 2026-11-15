@@ -2251,6 +2251,7 @@ module ActiveRecord
         else
           @__last_saved_attributes = _attributes_snapshot
           @__touched_updated_at = nil
+          @__unloaded_writes = nil
         end
         after_touch
         _save_committed(false)
@@ -2472,6 +2473,7 @@ module ActiveRecord
       end
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
+      @__unloaded_writes = nil
       @saved_changes = changes
       @id_previously_changed = was_new
       nil
@@ -2514,6 +2516,7 @@ module ActiveRecord
     def _note_hydrated
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
+      @__unloaded_writes = nil
       nil
     end
 
@@ -2555,11 +2558,27 @@ module ActiveRecord
     # answers `has_attribute?` true and serializes. Each generated column
     # writer calls this first when the row noted any
     # (`lower::missing_attribute`).
+    # The assignment is also a write the next save owes the row, so the
+    # column is named in `@__unloaded_writes` until a save records it.
+    # Rails marks the attribute changed as it writes it
+    # (`@mutations_from_database`), so `changed` reports the assignment even
+    # when it is nil — and nil IS the unloaded column's baseline, so the
+    # diff in `changes_to_save` alone reads the assignment as no change and
+    # `_columns_to_write` dropped it: the row kept the value the partial
+    # `select` never showed the record.
     def _note_loaded(name)
       unloaded = @__unloaded_columns
       return nil if unloaded.nil?
+      return nil unless unloaded.include?(name)
       unloaded.delete(name)
       @__unloaded_columns = nil if unloaded.empty?
+      wrote = @__unloaded_writes
+      key = name.to_s
+      if wrote.nil?
+        @__unloaded_writes = [key]
+      else
+        wrote.push(key) unless wrote.include?(key)
+      end
       nil
     end
 
@@ -2589,7 +2608,10 @@ module ActiveRecord
     end
 
     # The columns the emitted `_adapter_update` writes, as Rails' partial
-    # updates choose them: the ones with a pending change. A record with
+    # updates choose them: the ones with a pending change, among them a
+    # column the row's `select` left out that has been assigned since — a
+    # write the record owes the row even where the unloaded baseline makes
+    # the diff call it no change (see `_note_loaded`). A record with
     # no Dirty baseline (one this runtime didn't load or save) writes
     # every column, so nothing it holds is skipped; `update_columns`
     # names its own.
@@ -2597,7 +2619,11 @@ module ActiveRecord
       only = @__write_only
       return only unless only.nil?
       return attributes.keys if @__last_saved_attributes.nil?
-      changes_to_save.keys
+      columns = changes_to_save.keys
+      wrote = @__unloaded_writes
+      return columns if wrote.nil?
+      wrote.each { |name| columns.push(name) unless columns.include?(name) }
+      columns
     end
 
     # Rails' `<col>_was`: the value before the pending change, or the
@@ -2617,6 +2643,8 @@ module ActiveRecord
       baseline[name] = _attributes_snapshot[name]
       @__last_saved_attributes = baseline
       @__touched_updated_at = nil if name == "updated_at"
+      wrote = @__unloaded_writes
+      wrote.delete(name) unless wrote.nil?
       nil
     end
 
