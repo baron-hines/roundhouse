@@ -527,7 +527,8 @@ fn rewrite_whole_messages(expr: &mut Expr) {
 }
 
 /// `<owner>.errors.to_hash` and `.as_json` → `ActiveSupport.errors_to_hash(<owner>.error_details)`,
-/// `.attribute_names` → `ActiveSupport.errors_attribute_names(…)`, typed.
+/// `.attribute_names` → `ActiveSupport.errors_attribute_names(…)`, and
+/// `.group_by_attribute` → `ActiveSupport.errors_group_by_attribute(…)`, typed.
 fn rewrite_to_hash(expr: &mut Expr) {
     let ExprNode::Send { recv: Some(reader), method, args, block: None, .. } = &*expr.node else { return };
     if !args.is_empty() || !is_errors_read(reader) {
@@ -537,6 +538,7 @@ fn rewrite_to_hash(expr: &mut Expr) {
         "to_hash" | "as_json" => ("errors_to_hash", messages_ty()),
         "attribute_names" if is_model_errors_read(reader) => ("errors_attribute_names", Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
         "details" if is_model_errors_read(reader) => ("errors_details", details_ty()),
+        "group_by_attribute" if is_model_errors_read(reader) => ("errors_group_by_attribute", grouped_ty()),
         _ => return,
     };
     *expr = details_call(expr.span, reader, helper, ty);
@@ -568,8 +570,8 @@ fn rewrite_collection_read(expr: &mut Expr) {
     }
 }
 
-/// Shared with analyze, which types `to_a` and `objects` only on the shape
-/// `rewrite_collection_read` grounds: a zero-arg, block-free read of an
+/// Shared with analyze, which types `to_a`, `objects` and `group_by_attribute`
+/// only on the shape their rewrites ground: a zero-arg, block-free read of an
 /// `errors` sender.
 pub(crate) fn collection_read_grounds(recv: Option<&Expr>, args: &[Expr], block: Option<&Expr>) -> bool {
     args.is_empty() && block.is_none() && recv.is_some_and(is_errors_read)
@@ -624,6 +626,12 @@ fn json_value(value: &mut Expr) {
 pub(crate) fn details_ty() -> Ty {
     let entry = Ty::Class { id: crate::ident::ClassId(Symbol::from(DETAILS_ENTRY)), args: vec![].into() };
     Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(entry) }) }
+}
+
+/// `Hash[Symbol, Array[<an iteration's entry>]]`: Rails' `group_by_attribute`,
+/// each attribute to the errors it lists.
+pub(crate) fn grouped_ty() -> Ty {
+    Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(error_array_ty()) }
 }
 
 fn messages_ty() -> Ty {

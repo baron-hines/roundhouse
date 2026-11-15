@@ -384,6 +384,20 @@ module ActiveSupport
     deleted.empty? ? nil : deleted
   end
 
+  # Rails' `group_by_attribute`: each attribute with errors, in the order
+  # of its first one, to its `ActiveModel::Error`s — `Enumerable#group_by`
+  # over the errors, so a plain Hash with no default, not `details`. Same
+  # grouping as `errors_details`; reached from `lower::errors_index`.
+  def self.errors_group_by_attribute(details)
+    out = {}
+    details.each do |detail|
+      key = detail.attribute.to_sym
+      out[key] = [] unless out.key?(key)
+      out[key] << detail
+    end
+    out
+  end
+
   # Rails' `details`: each attribute's errors, in the order of its first
   # one. `lower::errors_index` reads an entry's `[:error]` as the type.
   def self.errors_details(details)

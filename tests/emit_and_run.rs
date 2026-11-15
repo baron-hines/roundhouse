@@ -22270,3 +22270,6 @@ mod safe_join_safe;
 
 #[path = "emit_and_run/errors_objects_to_a.rs"]
 mod errors_objects_to_a;
+
+#[path = "emit_and_run/errors_group_by_attribute.rs"]
+mod errors_group_by_attribute;
