@@ -233,6 +233,8 @@ pub struct ClassInfo {
     pub table: Option<crate::ident::TableRef>,
     /// Source ancestry grants ActiveRecord's query API; a table name alone does not.
     pub active_record_model: bool,
+    /// A graphql-ruby input object: `object[:name]` reads its declared argument `name`.
+    pub reads_arguments_by_key: bool,
     /// An include already has a load-time refusal; its method ownership is unknown.
     pub unresolved_include: bool,
     /// Retained inclusion/extension hooks can install singleton methods.

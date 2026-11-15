@@ -1178,6 +1178,14 @@ impl Analyzer {
                 cls.instance_methods.insert(name.clone(), ty.clone());
             }
         }
+        // The `[]` the graphql-ruby ingest declares marks an input object.
+        for (class_id, name) in &app.graphql_signatures {
+            if name.as_str() == "[]" {
+                if let Some(cls) = classes.get_mut(class_id) {
+                    cls.reads_arguments_by_key = true;
+                }
+            }
+        }
 
         // Library classes (route-helper/Singleton includes, superclass links),
         // ActionMailer classes, ActiveJob classes, and Sidekiq workers —

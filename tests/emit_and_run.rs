@@ -209,6 +209,10 @@ mod gem_reopen_source;
 mod gem_nested_once_contract;
 #[path = "emit_and_run/gem_nested_once.rs"]
 mod gem_nested_once;
+#[path = "support/gem_array_first.rs"]
+mod gem_array_first_contract;
+#[path = "emit_and_run/gem_array_first.rs"]
+mod gem_array_first;
 #[path = "support/stdlib_singleton.rs"]
 mod stdlib_singleton_contract;
 #[path = "emit_and_run/stdlib_singleton.rs"]
