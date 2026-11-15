@@ -239,9 +239,9 @@ fn array_columns_round_trip_natively_on_postgresql() {
     assert!(codec.contains("PostgreSQL's array input format"), "not the PostgreSQL codec:\n{codec}");
     let rbs = std::fs::read_to_string(emitted.join("app/models/widget.rbs")).expect("app/models/widget.rbs");
     for typed in [
-        "attr_reader tag_list: Array[String]\n",
-        "attr_reader scores: Array[Integer]?\n",
-        "attr_reader notes: Array[String]?\n",
+        "  def tag_list: () -> Array[String]\n",
+        "  def scores: () -> Array[Integer]?\n",
+        "  def notes: () -> Array[String]?\n",
     ] {
         assert!(rbs.contains(typed), "{typed:?} not in app/models/widget.rbs:\n{rbs}");
     }
