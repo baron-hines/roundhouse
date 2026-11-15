@@ -319,8 +319,10 @@ fn build_fixture_class(
 /// does once fixtures are loaded: the rows carry explicit ids, which
 /// the sequence does not see, so a create in a test would take one of
 /// them again. The sequence is set to the largest id, marked called so
-/// the next value is past it (1, uncalled, for an empty table):
-/// `MAX(id) + 1` would overflow a bigint key at its largest value.
+/// the next value is past it: `MAX(id) + 1` would overflow a bigint key
+/// at its largest value. With no positive id (an empty table, or rows
+/// keyed below zero) it is set to 1, uncalled: the sequence's minimum,
+/// below which `setval` raises.
 ///
 /// None for SQLite, whose rowid follows the table, and for a table with
 /// no integer key (a uuid, a composite key, none).
@@ -340,7 +342,7 @@ fn sequence_reset(app: &App, class: &ClassId) -> Option<String> {
     let table = quote(table.name.as_str());
     let column = quote(key.name.as_str());
     Some(format!(
-        "SELECT setval(pg_get_serial_sequence('{table}', '{}'), COALESCE(MAX({column}), 1), MAX({column}) IS NOT NULL) FROM {table}",
+        "SELECT setval(pg_get_serial_sequence('{table}', '{}'), GREATEST(COALESCE(MAX({column}), 0), 1), COALESCE(MAX({column}), 0) >= 1) FROM {table}",
         key.name.as_str()
     ))
 }
