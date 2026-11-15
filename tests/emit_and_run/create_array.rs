@@ -64,6 +64,10 @@ end
     check("the receiver of an empty Array", SOURCES, ["s1", "s2"])
     nested = Tagging.where(source: "outer").create!([{ post_id: 21, tag_name: Tagging.where(source: "inner").create!([{ post_id: 20, tag_name: "x" }]).first.tag_name }])
     check("nested rows", [row(Tagging.where(post_id: 21).first), row(Tagging.where(post_id: 20).first)], [[21, "x", "outer"], [20, "x", "inner"]])
+    first = Tagging.where(source: "first")
+    second = Tagging.where(source: "second")
+    moved = first.create!([(first = second; { post_id: 31, tag_name: "a" })])
+    check("the receiver before the rows", row(moved.first), [31, "a", "first"])
   end
 end
 "##)

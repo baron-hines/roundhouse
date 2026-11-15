@@ -81,12 +81,15 @@ fn rewrite(
     // Rails reads the receiver once, before the rows, and for an empty
     // Array too, so it is bound first and the binding read per row. A
     // receiver that is more than a read (a `where` chain whose arguments
-    // call out) has to be bound for that to hold.
+    // call out) has to be bound for that to hold. So does a local: the
+    // rows argument can assign it (`scope.create!([(scope = other; { … })])`),
+    // and Ruby has already read the receiver by then. A constant or `self`
+    // needs none — the rows can point neither somewhere else.
     // Each binding takes its own name: a nested array-create inside these
     // rows (`where(…).create!([{ …, other.create!([…]) }])`) binds one too,
     // and a shared name left the outer rows created on the inner receiver.
     let (bind_recv, recv) = match recv {
-        Some(r) if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Const { .. } | ExprNode::SelfRef) => {
+        Some(r) if !matches!(&*r.node, ExprNode::Const { .. } | ExprNode::SelfRef) => {
             let name = match *bound {
                 0 => Symbol::from("__creator"),
                 n => Symbol::from(format!("__creator{n}").as_str()),
