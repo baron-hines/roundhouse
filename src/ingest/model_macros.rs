@@ -198,7 +198,7 @@ pub(crate) fn expand_model_macros(
                 })
                 && supported_source_signature(def, sources, false, rest_each(def).is_some(), false)
                 && supported_source_call(expr, sources))
-            .then(|| expand(def, args, sources, &model.name, &app_names))
+            .then(|| expand(def, args, sources, &model.name, origin, &app_names))
             .flatten()
             .filter(|expansion| mixins_resolve_alike(app, origin, &expansion.items))
             .map(|mut expansion| {
@@ -668,9 +668,10 @@ fn expand(
     args: &[Expr],
     sources: &[SourceFile],
     owner: &ClassId,
+    origin: &ClassId,
     app_names: &HashSet<String>,
 ) -> Option<Expansion> {
-    if let Some(methods) = expand_rest_each(def, args, sources, owner, app_names) {
+    if let Some(methods) = expand_rest_each(def, args, sources, &[owner, origin], app_names) {
         return Some(Expansion { methods, items: Vec::new() });
     }
     if let Some(methods) = expand_define_methods(def, args, sources) {
@@ -825,7 +826,7 @@ fn expand_rest_each(
     def: &MethodDef,
     args: &[Expr],
     sources: &[SourceFile],
-    owner: &ClassId,
+    scopes: &[&ClassId],
     app_names: &HashSet<String>,
 ) -> Option<Vec<MethodDef>> {
     let (rest, item, statements) = rest_each(def)?;
@@ -863,7 +864,12 @@ fn expand_rest_each(
             if string_binding_read_as_value(body, &bindings) {
                 return None;
             }
-            let body = substitute_body(body.clone(), &bindings, &mut locals, owner, app_names)?;
+            // Not a body that writes the walked rest itself: the block's write reaches the macro's local, a method's
+            // only its own.
+            if writes_name(body, rest) {
+                return None;
+            }
+            let body = substitute_body(body.clone(), &bindings, &mut locals, scopes, app_names)?;
             let mut generated = def.clone();
             generated.name = name;
             generated.name_span = call_args[0].span;
@@ -877,6 +883,15 @@ fn expand_rest_each(
         }
     }
     (!methods.is_empty()).then_some(methods)
+}
+
+fn writes_name(e: &Expr, name: &Symbol) -> bool {
+    if matches!(&*e.node, ExprNode::Assign { target: crate::expr::LValue::Var { name: n, .. }, .. } if n == name) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || writes_name(c, name));
+    found
 }
 
 /// A method name as a bound name interpolates it: a Symbol or String, or `"#{field}_money"` with `field` bound.
@@ -931,7 +946,7 @@ fn substitute_body(
     mut expr: Expr,
     bindings: &HashMap<Symbol, Expr>,
     locals: &mut HashSet<Symbol>,
-    owner: &ClassId,
+    scopes: &[&ClassId],
     app_names: &HashSet<String>,
 ) -> Option<Expr> {
     match &mut *expr.node {
@@ -948,15 +963,18 @@ fn substitute_body(
             let rooted = names.first() == Some(&"");
             let written: Vec<&str> = names.into_iter().filter(|s| !s.is_empty()).collect();
             let [leaf] = written.as_slice() else { return None };
+            // Nor one the macro's own module holds (a load hook's, whose body is not the includer's lexical scope).
             if !rooted {
-                let mut scope = owner.0.as_str().to_string();
-                loop {
-                    if app_names.contains(&format!("{scope}::{leaf}")) {
-                        return None;
-                    }
-                    match scope.rsplit_once("::") {
-                        Some((outer, _)) => scope = outer.to_string(),
-                        None => break,
+                for owner in scopes {
+                    let mut scope = owner.0.as_str().to_string();
+                    loop {
+                        if app_names.contains(&format!("{scope}::{leaf}")) {
+                            return None;
+                        }
+                        match scope.rsplit_once("::") {
+                            Some((outer, _)) => scope = outer.to_string(),
+                            None => break,
+                        }
                     }
                 }
             }
@@ -966,7 +984,7 @@ fn substitute_body(
             if bindings.contains_key(name) {
                 return None;
             }
-            *value = substitute_body(value.clone(), bindings, locals, owner, app_names)?;
+            *value = substitute_body(value.clone(), bindings, locals, scopes, app_names)?;
             locals.insert(name.clone());
             return Some(expr);
         }
@@ -983,7 +1001,7 @@ fn substitute_body(
     expr.node.for_each_child(&mut |child| children.push(child.clone()));
     let mut replaced = Vec::new();
     for child in children {
-        match substitute_body(child, bindings, locals, owner, app_names) {
+        match substitute_body(child, bindings, locals, scopes, app_names) {
             Some(c) => replaced.push(c),
             None => valid = false,
         }
