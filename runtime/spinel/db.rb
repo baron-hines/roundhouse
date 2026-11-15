@@ -1343,6 +1343,10 @@ module Db
   # The write permit, the bounded wait for it, and the background
   # checkpointer — see `acquire_permit` and `checkpoint_in_background!`.
   @write_permit_timeout = 5.0
+  # Each file's permit, kept across `close`: a checkpoint loop outlives
+  # the pools it was started for, and must queue with the writers of a
+  # later `configure` on the same file.
+  @permits = {}
   @checkpoint_wanted = false
   @db_path = ""
   CHECKPOINT_INTERVAL = 0.25
@@ -1382,7 +1386,8 @@ module Db
     # Threads are assigned round-robin, so shards carry equal numbers of them;
     # sizing keeps at least 4 handles per shard, since a shard of one is a
     # mutex with extra steps.
-    @slots = [DbSlot.new(path, open_pools(path, n), DbPermit.new)]
+    @permits[path] = DbPermit.new if !@permits.key?(path)
+    @slots = [DbSlot.new(path, open_pools(path, n), @permits[path])]
     @assign_lock = Mutex.new
     @next_pool = 0
   end
