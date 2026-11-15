@@ -1911,7 +1911,7 @@ fn class_side_safe_methods(controller: &Controller) -> crate::det::HashMap<Symbo
 
 /// Does `f` apply to the action named `action_name`?
 fn filter_applies(f: &Filter, action_name: &Symbol) -> bool {
-    if !f.only.is_empty() {
+    if f.only_present || !f.only.is_empty() {
         f.only.contains(action_name)
     } else if !f.except.is_empty() {
         !f.except.contains(action_name)
@@ -2185,6 +2185,11 @@ fn build_filter_preamble(
     // dispatcher already enforces per action (`filter_cond` emits the
     // only/except guard).
     let narrow = |f: &Filter| -> Option<Filter> {
+        // `only: []` matches no action in Rails (`ActionFilter` over an
+        // empty list), so the filter never runs.
+        if f.only_present && f.only.is_empty() {
+            return None;
+        }
         let mut f = f.clone();
         for skip in skips
             .iter()
@@ -2193,8 +2198,17 @@ fn build_filter_preamble(
             if skip.only.is_empty() && skip.except.is_empty() {
                 return None;
             }
+            // A filter that names its actions loses the skipped ones
+            // from that list: the guard reads `only:` alone when it has
+            // one, so an `except:` beside it would not be checked.
+            if !f.only.is_empty() && !skip.only.is_empty() {
+                f.only.retain(|a| !skip.only.contains(a));
+                if f.only.is_empty() {
+                    return None;
+                }
+            }
             for a in &skip.only {
-                if !f.except.contains(a) {
+                if f.only.is_empty() && !f.except.contains(a) {
                     f.except.push(a.clone());
                 }
             }
@@ -2322,6 +2336,15 @@ fn build_filter_preamble(
                     let Some(f) = narrow(filter) else { continue };
                     if find_target(&f.target).is_none() {
                         continue;
+                    }
+                    // Registering an around again, a parent's in a
+                    // child, moves it: Rails' callback chain removes the
+                    // earlier one of the same name before it appends or
+                    // prepends the new one.
+                    if matches!(f.kind, FilterKind::Around) {
+                        wraps.around.retain(|a| a.target != f.target);
+                        prepends.retain(|p| !matches!(p, PreambleStmt::Call { filter, .. }
+                            if matches!(filter.kind, FilterKind::Around) && filter.target == f.target));
                     }
                     if matches!(f.kind, FilterKind::Around) && f.prepend {
                         prepends.push(PreambleStmt::Call { filter: f, halt_check: false });

@@ -3,7 +3,10 @@
 //! it wraps every filter registered before it, inherited ones included,
 //! and runs inside a `prepend_before_action` registered after it. Of two
 //! prepended arounds the one registered last is outermost, and a chain
-//! halted inside them returns to their code after `yield`. The test below
+//! halted inside them returns to their code after `yield`. Prepending a
+//! filter the parent registered moves it rather than adding a second
+//! one, an empty `only:` runs nowhere, and a scoped skip narrows the
+//! filter's own `only:`. The test below
 //! passes unchanged in the generated blog on Rails 8.1 (`bin/rails test`).
 
 use super::emit_and_run;
@@ -35,8 +38,23 @@ end
 "#,
         )
         .write(
+            "app/controllers/transit_controller.rb",
+            r#"class TransitController < ApplicationController
+  around_action :station
+
+  private
+
+  def station
+    @stops << "station-in"
+    yield
+    @stops << "station-out"
+  end
+end
+"#,
+        )
+        .write(
             "app/controllers/journeys_controller.rb",
-            r#"class JourneysController < ApplicationController
+            r#"class JourneysController < TransitController
   include Stamped
 
   before_action :ticket
@@ -44,6 +62,9 @@ end
   prepend_around_action :station
   prepend_before_action :platform
   prepend_around_action :city
+  prepend_around_action :detour, only: []
+  prepend_around_action :survey, only: :show
+  skip_around_action :survey, only: :show
 
   def show
     @stops << "ride"
@@ -67,10 +88,12 @@ end
     @stops << "carriage-out"
   end
 
-  def station
-    @stops << "station-in"
-    yield
-    @stops << "station-out"
+  def detour
+    render plain: "detour"
+  end
+
+  def survey
+    render plain: "survey"
   end
 
   def city
