@@ -3779,10 +3779,12 @@ fn target_files_inner(
                 target.as_str()
             ));
         }
-        crate::emit::shared::schema_sql::validate_schema_for_dialect(
-            &app.schema,
-            crate::emit::shared::schema_sql::Dialect::Sqlite,
-        )?;
+        // The Spinel and Ruby trees run the app's own database (`Dialect::for_app`); every other target SQLite.
+        let dialect = match target {
+            BuildTarget::Spinel | BuildTarget::Ruby => crate::emit::shared::schema_sql::Dialect::for_app(app),
+            _ => crate::emit::shared::schema_sql::Dialect::Sqlite,
+        };
+        crate::emit::shared::schema_sql::validate_schema_for_dialect(&app.schema, dialect)?;
         reject_generated_fixture_assignments(app)?;
     }
     // Before the refusals below: a refusal returns early, and a
@@ -4101,7 +4103,11 @@ fn target_files_inner(
     let files = if target == BuildTarget::Blog {
         files
     } else {
-        let files = ensure_seed_sql(files, app)?;
+        // The Spinel and Ruby trees run the app's own database (`Dialect::for_app`): their seed is in its SQL.
+        let files = match target {
+            BuildTarget::Spinel | BuildTarget::Ruby => crate::emit::shared::schema_sql::Dialect::for_app(app).scope(|| ensure_seed_sql(files, app))?,
+            _ => ensure_seed_sql(files, app)?,
+        };
         let files = ensure_storage_keep(files, target);
         let files = ensure_static_assets(files, target, app);
         ensure_e2e(files, target)

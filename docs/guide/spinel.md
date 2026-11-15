@@ -206,6 +206,11 @@ it. Its default is the array literal (`'{}'`, `'{0}'`), and model writes,
 `update_all` and `insert_all` write the array input format. A NULL
 element (one raw SQL wrote) reads as `""` or `0`, where Rails gives nil.
 
+A generated column whose expression is PostgreSQL's own SQL (`::numeric`
+casts, `CASE … = ANY (ARRAY[…])`) is carried as written, and a decimal
+column keeps its `numeric(precision,scale)`. A target that runs SQLite
+refuses such a schema instead of dropping the column.
+
 Not carried yet:
 
 - `where(column: [...])` on an array column, which compares element by
