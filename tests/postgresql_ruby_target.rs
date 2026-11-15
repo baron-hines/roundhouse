@@ -385,4 +385,6 @@ fn a_native_generated_column_survives_a_migration_and_an_unheld_precision_is_ref
     assert!(reserved.is_err_and(|e| e.to_string().contains("updated_at")));
     let wide = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.decimal \"price\", precision: 300, scale: 2\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
     assert!(wide.is_err_and(|e| e.to_string().contains("precision 300")));
+    let negative = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.decimal \"price\", precision: 10, scale: -2\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
+    assert!(negative.is_err_and(|e| e.to_string().contains("scale -2")));
 }

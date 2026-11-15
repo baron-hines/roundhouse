@@ -2587,6 +2587,8 @@ struct ColumnOpts {
     /// A decimal's `precision:` and `scale:` (PostgreSQL's `numeric(p,s)` rounds to them).
     precision: Option<u32>,
     scale: Option<u32>,
+    /// A `precision:`/`scale:` written as a value the column type can't hold (a negative scale).
+    unheld_decimal: Option<String>,
     /// A present array option is non-scalar unless explicitly false or nil.
     array: bool,
     /// `default: []`, which `default_value` reads as no default.
@@ -2741,10 +2743,11 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         }
                     }
                 }
-                "precision" | "scale" => {
-                    let n = integer_value(value).and_then(|n| u32::try_from(n).ok());
-                    if key == "precision" { opts.precision = n } else { opts.scale = n }
-                }
+                "precision" | "scale" => match integer_value(value).map(u32::try_from) {
+                    Some(Ok(n)) => if key == "precision" { opts.precision = Some(n) } else { opts.scale = Some(n) },
+                    Some(Err(_)) => opts.unheld_decimal = Some(format!("{key} {}", integer_value(value).unwrap_or_default())),
+                    None => {}
+                },
                 "array" => {
                     opts.array = match bool_value(value) {
                         Some(enabled) => enabled,
@@ -2986,6 +2989,12 @@ fn column_with_type(
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
         "decimal" | "numeric" => {
+            if let Some(unheld) = &opts.unheld_decimal {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("decimal {unheld} for {table}.{col_name} is beyond what this build carries"),
+                });
+            }
             let narrow = |n: Option<u32>, what: &str| n.map(u8::try_from).transpose().map_err(|_| IngestError::Unsupported {
                 file: file.into(),
                 message: format!("decimal {what} {} for {table}.{col_name} is beyond what this build carries", n.unwrap_or_default()),
