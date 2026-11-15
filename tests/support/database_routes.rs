@@ -333,6 +333,18 @@ rescue NotImplementedError => e
   puts "across=NotImplementedError: " + e.message
 end
 RouteReport.state("after-across")
+# A block whose transaction SQLite has already ended still leaves its scope:
+# the rollback at its end fails, and the selection outside is restored.
+begin
+  ActiveRecord::Base.connected_to(shard: :right) do
+    Db.exec("BEGIN")
+    SQL.sqlite3_exec(Db.current_conn.dbh, "ROLLBACK", nil, nil, nil)
+  end
+  puts "ended=left"
+rescue StandardError => e
+  puts "ended=raised"
+end
+RouteReport.state("after-ended")
 # A relation returned from a block is refused by name, not loaded on another database later.
 begin
   ApplicationRecord.connected_to(shard: :right) { Note.where(id: 1) }
@@ -354,7 +366,7 @@ pub const EXITS_EXPECTED: &str = "returned=right\nafter-return=writing/left/fals
 pub const GUARDS_EXPECTED: &str = "update-all=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: UPDATE \"notes\" SET \"tag\" = ?\ndelete-all=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: DELETE FROM \"notes\"\ninsert-all=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: INSERT INTO \"notes\" (\"tag\") VALUES ('blocked') ON CONFLICT  DO NOTHING RETURNING \"id\"\nupdate=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: UPDATE \"notes\" SET \"tag\" = ? WHERE \"notes\".\"id\" = ?\ndestroy=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: DELETE FROM \"notes\" WHERE \"notes\".\"id\" = ?\nread-on-replica=right\nshard-only=reading/right/false\nreplica=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: INSERT INTO \"notes\" (\"tag\") VALUES (?) RETURNING \"id\"\nleft-unchanged=left,inner\nright-unchanged=right\n";
 pub const ISOLATION_EXPECTED: &str = "ids=1,2/1,2\nthreads=left:left:left,right:right:right\nnew-thread=left:left\nafter-threads=writing/left/false\n";
 pub const HANDLES_EXPECTED: &str = "outside-used-inside=left,left,left\ntaken-inside=right,right\nmodel-inside=right\ninside-used-outside=right\nwith-connection=left\nhandle-write=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: INSERT INTO notes(tag) VALUES ('guarded')\ntaken-at-load=left\nbase-guarded=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: INSERT INTO notes(tag) VALUES ('guarded')\nbase-rows=2\ncreate-or-find=found\ntags=left,inner,captured-write,stored-write,found/right,right-2\n";
-pub const LEASE_EXPECTED: &str = "one-lease=left,right,right,left\nmissing-role=ActiveRecord::ConnectionNotDefined: No database connection defined for 'left' shard and 'archive' role.\nhandle-threads=300,300\nleased-handles=left,right\nleased-outside=right\nbase-transaction=NotImplementedError\nacross=NotImplementedError: connected_to selects another database inside an open transaction; a transaction across databases is not supported yet\nafter-across=writing/left/false\nrelation=NotImplementedError: connected_to returns a relation, which is not carried yet; load it in the block (to_a)\nafter-relation=writing/left/false\nleft-final=5 right-final=2\n";
+pub const LEASE_EXPECTED: &str = "one-lease=left,right,right,left\nmissing-role=ActiveRecord::ConnectionNotDefined: No database connection defined for 'left' shard and 'archive' role.\nhandle-threads=300,300\nleased-handles=left,right\nleased-outside=right\nbase-transaction=NotImplementedError\nacross=NotImplementedError: connected_to selects another database inside an open transaction; a transaction across databases is not supported yet\nafter-across=writing/left/false\nended=left\nafter-ended=writing/left/false\nrelation=NotImplementedError: connected_to returns a relation, which is not carried yet; load it in the block (to_a)\nafter-relation=writing/left/false\nleft-final=5 right-final=2\n";
 
 /// The statements of the Rails reduction `roles`.
 pub fn roles_report() -> String {

@@ -1605,12 +1605,16 @@ module Db
     rescue Exception => e
       error = e
     ensure
-      if switched
+      begin
         # A transaction the block began and never ended goes no further.
-        exec("ROLLBACK") if Thread.current[:db_txn_pin] == true
-        Thread.current[:db_conn] = outer
+        exec("ROLLBACK") if switched && Thread.current[:db_txn_pin] == true
+      rescue StandardError => e
+        # Not an error when SQLite had ended it already: the pin is gone.
+        error = e if error.nil? && Thread.current[:db_txn_pin] == true
+      ensure
+        Thread.current[:db_conn] = outer if switched
+        stack.pop
       end
-      stack.pop
     end
     raise error if !error.nil?
     result

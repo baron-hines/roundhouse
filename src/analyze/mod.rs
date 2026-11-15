@@ -420,6 +420,10 @@ impl Analyzer {
             // `Base.uncached`), and its value is the block's, as
             // `transaction`'s is.
             cls.class_methods.insert(Symbol::from("uncached"), Ty::Untyped);
+            // Inherited from Base in a routed app (below); a view's call on the connection class resolves here.
+            for (method, ty) in ROUTED_SCOPE_METHODS.iter().filter(|_| app.database_routes.is_some()) {
+                cls.class_methods.insert(Symbol::from(*method), ty.clone());
+            }
             cls.class_methods.insert(Symbol::from("current_transaction"), registry::ar::transaction_ty());
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
@@ -5881,15 +5885,6 @@ impl Analyzer {
         self.fold_concern_surfaces(app);
         self.fold_host_surfaces(app);
         self.fold_extended_modules(app);
-        // A routed app's models inherit Rails' switching methods from Base,
-        // unless the app's own is in their place (also from an `extend`,
-        // above).
-        for model in app.models.iter().filter(|_| app.database_routes.is_some()) {
-            let Some(cls) = self.classes.get_mut(&model.name) else { continue };
-            for (method, ty) in ROUTED_SCOPE_METHODS {
-                cls.class_methods.entry(Symbol::from(*method)).or_insert(ty.clone());
-            }
-        }
         self.fold_current_attribute_forwarders(app);
     }
 

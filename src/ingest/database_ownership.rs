@@ -499,13 +499,15 @@ fn own_decision(
 /// defaults. Read as text; a line that sets one is enough.
 pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V, dir: &std::path::Path) {
     const SETTINGS: &[(&str, &str)] = &[
-        ("writing_role", "a configured role name"),
-        ("reading_role", "a configured role name"),
-        ("isolation_level", "an isolation level other than the default `:thread`"),
-        ("database_selector", "the middleware that switches roles for a request"),
-        ("database_resolver", "the middleware that switches roles for a request"),
-        ("shard_selector", "the middleware that switches shards for a request"),
-        ("shard_resolver", "the middleware that switches shards for a request"),
+        ("active_record.writing_role", "a configured role name"),
+        ("active_record.reading_role", "a configured role name"),
+        ("ActiveRecord.writing_role", "a configured role name"),
+        ("ActiveRecord.reading_role", "a configured role name"),
+        ("active_support.isolation_level", "an isolation level other than the default `:thread`"),
+        ("active_record.database_selector", "the middleware that switches roles for a request"),
+        ("active_record.database_resolver", "the middleware that switches roles for a request"),
+        ("active_record.shard_selector", "the middleware that switches shards for a request"),
+        ("active_record.shard_resolver", "the middleware that switches shards for a request"),
     ];
     let Some(span) = app.database_refusals.iter().find(|r| r.construct == "database_routes").map(|r| r.span) else { return };
     let mut files = vec![dir.join("config/application.rb")];
@@ -515,10 +517,11 @@ pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App
     for file in files {
         let Ok(text) = vfs.read_to_string(&file) else { continue };
         let set = |line: &&str| !line.starts_with('#') && !line.ends_with("isolation_level = :thread");
-        // An assignment to the setting, not a mention or a comparison;
+        // An assignment to Rails' own setting (not `config.x.reading_role`),
+        // not a mention or a comparison;
         // without a trailing comment.
         let assigns = |line: &str, key: &str| {
-            line.split_once(&format!(".{key}")).is_some_and(|(_, rest)| rest.trim_start().starts_with('=') && !rest.trim_start().starts_with("=="))
+            line.split_once(key).is_some_and(|(_, rest)| rest.trim_start().starts_with('=') && !rest.trim_start().starts_with("=="))
         };
         for line in text.lines().map(|line| line.split(" #").next().unwrap_or(line).trim()).filter(set) {
             if let Some((key, what)) = SETTINGS.iter().find(|(key, _)| assigns(line, key)) {
@@ -554,7 +557,11 @@ fn each_body(app: &mut App, f: &mut dyn FnMut(&mut Expr)) {
     for controller in &mut app.controllers {
         for item in &mut controller.body {
             match item {
-                crate::dialect::ControllerBodyItem::Action { action, .. } => f(&mut action.body),
+                crate::dialect::ControllerBodyItem::Action { action, .. } => {
+                    f(&mut action.body);
+                    action.opt_params.iter_mut().for_each(|(_, default)| f(default));
+                    action.kw_params.iter_mut().filter_map(|(_, default)| default.as_mut()).for_each(&mut *f);
+                }
                 crate::dialect::ControllerBodyItem::ClassMethod { method: m, .. } => method(m, f),
                 _ => {}
             }
@@ -722,7 +729,13 @@ pub(super) fn resolve(app: &mut App, schema_rb: bool) {
     // it (a declaration or a switch refused until now), stands for those
     // refusals: one, which that target drops
     // (`session::drop_runtime_answered`).
-    let routes = admitted.filter(|_| !by_site.is_empty() || !switches.is_empty() || !aside.is_empty());
+    // Also for a switch only its routes make one: options that cannot be
+    // read on the connection class, which is then refused by name below.
+    let mut unread = Vec::new();
+    if let Some((routes, _)) = &admitted {
+        each_body(app, &mut |e| switches_in(e, Some(routes), &mut unread));
+    }
+    let routes = admitted.filter(|_| !by_site.is_empty() || !switches.is_empty() || !aside.is_empty() || !unread.is_empty());
     if let Some((routes, span)) = &routes {
         by_site.clear();
         switches.clear();

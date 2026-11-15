@@ -45,9 +45,19 @@ fn shards_route_to_their_own_files_natively() {
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn roles_guard_writes_natively() {
-    let run = contract::app(&contract::roles_plain(), &contract::roles_report())
-        .run_spinel_with_rbs(&format!("{}RouteReport.roles\n{}", contract::BOOT, contract::ONE_CONNECTION_SCRIPT));
+    // The app's own class methods win over Rails' readers of the same
+    // name, as in Ruby: one the connection class defines, and one from a
+    // module a model extends. The report calls neither.
+    let record = contract::roles_plain().replace("\nend", "\n\n  def self.default_shard\n    \"custom\"\n  end\nend");
+    let run = contract::app(&record, &contract::roles_report())
+        .write("app/models/titles.rb", "module Titles\n  def current_role\n    \"admin\"\n  end\nend\n")
+        .write("app/models/note.rb", "class Note < ApplicationRecord\n  extend Titles\nend\n")
+        .run_spinel_with_rbs(&format!(
+            "{}RouteReport.roles\nputs Note.default_shard + \"!\"\nputs Note.current_role + \"!\"\n{}",
+            contract::BOOT,
+            contract::ONE_CONNECTION_SCRIPT
+        ));
     run.assert_passes();
-    let expected = format!("{}{}", contract::ROLES_EXPECTED, contract::ONE_CONNECTION_EXPECTED);
+    let expected = format!("{}custom!\nadmin!\n{}", contract::ROLES_EXPECTED, contract::ONE_CONNECTION_EXPECTED);
     assert_eq!(contract::comparable(&run.stdout), contract::comparable(&expected), "{}", run.stderr);
 }

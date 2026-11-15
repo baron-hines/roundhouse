@@ -287,18 +287,6 @@ fn the_default_isolation_level_with_a_trailing_comment_is_not_refused() {
     assert!(errors.iter().any(|e| e.contains("isolation_level")), "{errors:#?}");
 }
 
-/// An app's own `current_role`, from a module the model extends, is the
-/// app's: Rails' reader does not take its place.
-#[test]
-fn an_extended_modules_method_wins_over_the_routing_readers() {
-    let report = "class RouteReport\n  def self.run\n    Note.current_role.gsub(\"a\", \"b\")\n  end\nend\n";
-    let app = contract::app(contract::SHARDS, report)
-        .write("app/models/titles.rb", "module Titles\n  def current_role\n    \"admin\"\n  end\nend\n")
-        .write("app/models/note.rb", "class Note < ApplicationRecord\n  extend Titles\nend\n");
-    let (_, errors) = app.emit(BuildTarget::Spinel);
-    assert!(errors.is_empty(), "{errors:#?}");
-}
-
 /// A handle's temporary lease trims its statement cache before the
 /// connection goes back, as a request's lease does.
 #[test]
@@ -342,12 +330,43 @@ fn a_writing_block_in_a_rebuilt_block_body_is_restored() {
 #[test]
 fn a_mention_of_a_routing_setting_is_not_a_setting() {
     let application = |line: &str| format!("require_relative \"boot\"\nrequire \"rails/all\"\n\nmodule Routed\n  class Application < Rails::Application\n    config.load_defaults 8.1\n    {line}\n  end\nend\n");
-    for line in ["config.x.banner = \"reading_role\"", "config.x.primary = ActiveRecord.reading_role == :reading"] {
+    for line in ["config.x.banner = \"reading_role\"", "config.x.primary = ActiveRecord.reading_role == :reading", "config.x.database_resolver = \"mine\""] {
         let (_, errors) = shards().write("config/application.rb", &application(line)).emit(BuildTarget::Spinel);
         assert!(errors.is_empty(), "{line}: {errors:#?}");
     }
     let (_, errors) = shards().write("config/application.rb", &application("config.active_record.reading_role = :replica")).emit(BuildTarget::Spinel);
     assert!(errors.iter().any(|e| e.contains("reading_role")), "{errors:#?}");
+}
+
+/// A controller action's parameter default is read like its body.
+#[test]
+fn a_switch_in_an_actions_parameter_default_is_read() {
+    let app = shards()
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/notes\", to: \"notes#index\"\nend\n")
+        .write("app/controllers/notes_controller.rb", "class NotesController < ApplicationController\n  def index(count = ApplicationRecord.connected_to(role: \"reading\") { Note.count })\n    head :ok\n  end\nend\n");
+    let (_, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("`connected_to` here is not a scope the routed runtime carries")), "{errors:#?}");
+}
+
+/// Options that cannot be read are refused by name even when they are the
+/// app's only switch: the routes are kept for it, not dropped with it.
+#[test]
+fn an_unreadable_switch_alone_keeps_the_app_routed_and_is_refused() {
+    let record = contract::ROLES.replace("writing: :left, reading: :left_reader", "writing: :primary, reading: :left_reader");
+    for call in ["ApplicationRecord.connected_to(options) { Note.count }", "ActiveRecord::Base.connected_to(**options) { Note.count }"] {
+        let report = format!("class RouteReport\n  def self.run(options)\n    {call}\n  end\nend\n");
+        let (_, errors) = contract::app(&record, &report).emit(BuildTarget::Spinel);
+        assert!(errors.iter().any(|e| e.contains("`connected_to` here is not a scope the routed runtime carries")), "{call}: {errors:#?}");
+    }
+}
+
+/// The shared Db contract declares what the connection handle calls.
+#[test]
+fn the_db_contract_declares_the_handles_slot_calls() {
+    let rbs = include_str!("../runtime/ruby/db.rbs");
+    for method in ["connection_slot", "enter_slot", "leave_slot"] {
+        assert!(rbs.contains(&format!("def self.{method}:")), "runtime/ruby/db.rbs does not declare {method}");
+    }
 }
 
 /// The spellings of a carried scope check clean on Spinel: a rooted
