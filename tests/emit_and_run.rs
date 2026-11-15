@@ -22368,3 +22368,6 @@ mod errors_computed_field;
 mod aasm_source;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
 mod runtime_registered_callbacks;
+
+#[path = "emit_and_run/through_scope_merge.rs"]
+mod through_scope_merge;

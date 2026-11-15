@@ -1638,6 +1638,58 @@ module ActiveRecord
       nil
     end
 
+    # A `has_many :through`'s through-association scope, folded into this
+    # relation the way Rails' `AssociationScope#add_constraints` folds a
+    # non-head reflection's scope into the query it builds: the scope's
+    # WHERE clauses and its orderings join, the orderings after this
+    # relation's own (`item.order_values | scope.order_values`, walked from
+    # the chain's far end, leaves the head's first), and the rest of the
+    # scope — a limit, an offset, a select, a from, a join, a hint — stays
+    # behind. `other` is that scope evaluated on the through model's
+    # own relation (`Relation.new(Through, false)`, Rails' `klass.unscoped`),
+    # so its hash conditions already name the through table and its order
+    # terms are that table's bare columns.
+    #
+    # The terms are qualified here because the caller's query is a JOIN:
+    # an unqualified column would resolve against whichever table has it.
+    # Rails arrives at the same shape through the through reflection's
+    # aliased table. What a scope does to its own query with `unscope`
+    # (`beds.fallow`) is not carried onto this one.
+    def merge_through_scope(other)
+      own_lists
+      unload_records
+      other.where_clauses.each do |w|
+        push_where(w)
+        @opaque_wheres = true
+      end
+      other.order_clauses.each do |o|
+        term = qualify_order_term(o, other.table_sql)
+        @orders << term unless @orders.include?(term)
+      end
+      self
+    end
+
+    # An ordering term of another relation, qualified so it names that
+    # relation's table in the JOINed query: `position ASC` on the through
+    # table becomes `beds.position ASC`, and the QUOTED column a hash
+    # `order(position: :desc)` renders (`"position" DESC`) becomes
+    # `"beds"."position" DESC`. A term that is already qualified, or that
+    # is an expression rather than a column, is kept as written.
+    def qualify_order_term(term, table)
+      words = term.split(" ")
+      return term if words.length == 0 || words.length > 2
+      col = words[0]
+      qualified = ""
+      if col.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
+        qualified = "#{table}.#{col}"
+      elsif col.match?(/\A"[A-Za-z_][A-Za-z0-9_]*"\z/)
+        qualified = "#{ActiveRecord.adapter.quote_column_name(table)}.#{col}"
+      else
+        return term
+      end
+      words.length == 2 ? "#{qualified} #{words[1]}" : qualified
+    end
+
     def where_clauses
       @wheres
     end
