@@ -189,8 +189,7 @@ fn build_fixture_class(
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let id = (idx + 1) as i64;
-            let body = build_find_call(&f.class, id);
+            let body = build_find_call(&f.class, record_id(idx, r));
             MethodDef {
                 visibility: crate::dialect::MethodVisibility::Public,
                 unsupported_formals: None,
@@ -352,12 +351,27 @@ fn build_by_label_body(cls: &ClassId, records: &[LoweredFixtureRecord]) -> Expr 
             Span::synthetic(),
             ExprNode::If {
                 cond,
-                then_branch: build_find_call(cls, (idx + 1) as i64),
+                then_branch: build_find_call(cls, record_id(idx, r)),
                 else_branch: chain,
             },
         );
     }
     chain
+}
+
+/// The id a fixture row is stored and found under: the integer its
+/// own `id:` gives, as Rails' `FixtureSet` keeps a row's explicit key,
+/// else its 1-based position in the file. An `id:` the YAML does not
+/// give as an integer literal (an ERB tag) keeps the position.
+fn record_id(idx: usize, r: &LoweredFixtureRecord) -> i64 {
+    r.fields
+        .iter()
+        .find(|f| f.column.as_str() == "id")
+        .and_then(|f| match &f.value {
+            LoweredFixtureValue::Literal { raw, .. } => raw.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .unwrap_or((idx + 1) as i64)
 }
 
 /// `<Class>.find(<id>)` — used by each label method to return the
@@ -419,7 +433,7 @@ fn build_load_method_body(
     exprs.extend(preamble.iter().cloned());
 
     for (idx, r) in records.iter().enumerate() {
-        let id = (idx + 1) as i64;
+        let id = record_id(idx, r);
         if let Some(blob) = file_blobs.get(&r.label) {
             exprs.push(load_file_blob(id, blob));
             continue;
@@ -690,6 +704,11 @@ fn literal_value_to_expr(ty: &Ty, raw: &str) -> Expr {
 
 /// FK resolution: find the target fixture's record by label,
 /// substitute its 1-indexed position as the literal Int id.
+///
+/// The position even when the target sets its own `id:`, which Rails
+/// does not follow either: its label reference is the label's hash
+/// (`FixtureSet.identify`), so the row it names is not there and the
+/// foreign key check after loading fails (ActiveRecord 8.1.4.1).
 fn resolve_fk_id(
     target_fixture: &Symbol,
     target_label: &Symbol,
