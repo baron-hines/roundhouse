@@ -38,6 +38,7 @@ module ActionDispatch
       # argument, as Rails' `each` over it does.
       def []=(key, value)
         @env[Headers.env_name(key)] = value
+        value
       end
 
       def merge!(headers)
