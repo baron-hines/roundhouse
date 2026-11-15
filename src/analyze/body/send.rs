@@ -492,35 +492,25 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
-    /// The same walk as [`Self::has_many_reader`], for a name the model
-    /// HOLDS (`ClassInfo::held_has_many`).
+    /// Does the owner model itself HOLD `assoc` (`ClassInfo::held_has_many`)?
+    /// Only what `lower::scope_chain` rewrites: a model that declares the
+    /// held has_many itself (the rewrite looks the association up on the
+    /// owner's own model, not its ancestors), or a nilable union of that
+    /// one model.
     fn held_has_many(&self, owner_ty: Option<&Ty>, assoc: &Symbol) -> bool {
-        let declares = |id: &ClassId| -> bool {
-            let mut current = Some(id);
-            for _ in 0..32 {
-                let Some(cid) = current else { return false };
-                let Some(cls) = self.classes().get(cid) else { return false };
-                if cls.held_has_many.contains(assoc) {
-                    return true;
-                }
-                current = cls.parent.as_ref();
-            }
-            false
-        };
+        let declares =
+            |id: &ClassId| self.classes().get(id).is_some_and(|cls| cls.held_has_many.contains(assoc));
         match owner_ty {
             Some(Ty::Class { id, .. }) => declares(id),
             Some(Ty::Union { variants }) => {
-                let owners: Vec<&ClassId> = variants
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ty::Class { id, .. } => Some(id),
-                        _ => None,
-                    })
-                    .collect();
-                !owners.is_empty()
-                    && owners.len() + 1 >= variants.len()
-                    && variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
-                    && owners.iter().all(|id| declares(id))
+                let mut owners = variants.iter().filter_map(|v| match v {
+                    Ty::Class { id, .. } => Some(id),
+                    _ => None,
+                });
+                let Some(first) = owners.next() else { return false };
+                variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
+                    && owners.all(|id| id == first)
+                    && declares(first)
             }
             _ => false,
         }

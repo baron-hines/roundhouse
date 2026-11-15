@@ -5218,10 +5218,14 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         _ if matches!(method.as_str(), "build" | "create" | "create!") => {
                             assoc_owner_seed(ctx, aname, ir, span)
                         }
-                        // The same for `<<` onto a has_many the owner holds:
-                        // the push keeps the owner as its one receiver
-                        // (`Article.find(id).comments << c`).
-                        _ if method.as_str() == "<<"
+                        // The same for `<<` onto a has_many the owner holds,
+                        // and for its `update(attrs)`: each keeps the owner as
+                        // its one receiver (`Article.find(id).comments << c`,
+                        // `Kennel.find(id).dogs.update(age: 7)`).
+                        _ if (method.as_str() == "<<"
+                            || (method.as_str() == "update"
+                                && block.is_none()
+                                && matches!(args.as_slice(), [arg] if matches!(&*arg.node, ExprNode::Hash { .. }))))
                             && args.len() == 1
                             && assoc_read_target(ir, aname, ctx.assocs)
                                 .and_then(|(owner, _, _)| owner)

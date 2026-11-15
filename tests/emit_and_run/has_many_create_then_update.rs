@@ -54,6 +54,9 @@ end
     retagged = m.retagged
     check("method body update", retagged.length == 1 && retagged.first.equal?(mdog) && mdog.age == 7)
     check("method body row", Dog.find(mdog.id).age == 7)
+    # Rails: an owner found by id updates its records the same way
+    found = Kennel.find(m.id).dogs.update(age: 9)
+    check("found owner update", found.length == 1 && Dog.find(mdog.id).age == 9)
     # Rails: `Kennel.counted.dogs.create!` evaluates the owner once
     c = Kennel.create!(name: "counted")
     cd = Kennel.counted.dogs.create!(name: "once", age: 1)
