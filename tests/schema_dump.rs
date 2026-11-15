@@ -268,6 +268,15 @@ fn a_primary_that_cannot_be_named_refuses_a_named_file() {
     assert!(tables(&checked.app).is_empty());
 }
 
+/// `:schema_dump:` is refused wherever it comes from, merges included.
+#[test]
+fn a_merged_symbol_key_schema_dump_is_refused() {
+    let yml = "defaults: &defaults\n  :schema_dump: other.rb\ntest:\n  <<: *defaults\n  adapter: sqlite3\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/other.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert_at(&checked.errors, "config/database.yml:3:", &["`test.primary`", "Symbol key"]);
+    assert!(tables(&checked.app).is_empty());
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.

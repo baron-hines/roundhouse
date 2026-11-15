@@ -376,10 +376,12 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
                 if indent <= own {
                     break;
                 }
-                // A quoted key keeps its quote, so it matches neither spelling.
-                let pair = match body.strip_prefix(':') {
-                    Some(rest) => rest.split_once(':').map(|(k, v)| (format!(":{k}"), v)),
-                    None => body.split_once(':').map(|(k, v)| (k.to_string(), v)),
+                // A quoted key keeps its quotes (`':schema_dump'`), so it matches neither spelling.
+                let quote = body.chars().next().filter(|c| *c == '\'' || *c == '"');
+                let pair = match (quote, body.strip_prefix(':')) {
+                    (Some(q), _) => body[1..].find(q).and_then(|end| body[end + 2..].strip_prefix(':').map(|v| (body[..end + 2].to_string(), v))),
+                    (None, Some(rest)) => rest.split_once(':').map(|(k, v)| (format!(":{k}"), v)),
+                    (None, None) => body.split_once(':').map(|(k, v)| (k.to_string(), v)),
                 };
                 if *child.get_or_insert(indent) == indent && let Some((key, value)) = pair {
                     lines.push((offset + indent, key, value.split(" #").next().unwrap_or_default().trim().to_string()));
@@ -438,6 +440,13 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         if let Some((offset, _, written)) = line_of(":schema_dump") {
             out.primary = Some(Err(()));
             refuse(*offset, unsupported(written, "it is written as the Symbol key `:schema_dump:`"), false);
+        } else if config.contains_key(":schema_dump")
+            && (lines.iter().any(|(_, k, _)| k == "<<") || !lines.iter().any(|(_, k, _)| k == "':schema_dump'" || k == "\":schema_dump\""))
+        {
+            // Only a String key written directly, with nothing merged beside it, is the key Rails ignores.
+            out.primary = Some(Err(()));
+            let written = serde_yaml_ng::to_string(&config[":schema_dump"]).unwrap_or_default().trim().replace(ERB_VALUE, "<%= ... %>");
+            refuse(start, unsupported(&written, "it is the Symbol key `:schema_dump:`, here through a merge"), false);
         }
         let Some(value) = config.get("schema_dump") else { continue };
         if out.primary.is_some() {
