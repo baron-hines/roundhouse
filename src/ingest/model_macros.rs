@@ -198,7 +198,7 @@ pub(crate) fn expand_model_macros(
                 })
                 && supported_source_signature(def, sources, false, rest_each(def).is_some(), false)
                 && supported_source_call(expr, sources))
-            .then(|| expand(def, args, sources, &model.name, origin, &app_names))
+            .then(|| expand(def, args, sources, &model.name, origin, &ancestors_of(app, &model.name), &app_names))
             .flatten()
             .filter(|expansion| mixins_resolve_alike(app, origin, &expansion.items))
             .map(|mut expansion| {
@@ -669,9 +669,11 @@ fn expand(
     sources: &[SourceFile],
     owner: &ClassId,
     origin: &ClassId,
+    ancestors: &[ClassId],
     app_names: &HashSet<String>,
 ) -> Option<Expansion> {
-    if let Some(methods) = expand_rest_each(def, args, sources, &[owner, origin], app_names) {
+    let scopes: Vec<&ClassId> = [owner, origin].into_iter().chain(ancestors.iter()).collect();
+    if let Some(methods) = expand_rest_each(def, args, sources, &scopes, app_names) {
         return Some(Expansion { methods, items: Vec::new() });
     }
     if let Some(methods) = expand_define_methods(def, args, sources) {
@@ -885,6 +887,20 @@ fn expand_rest_each(
     (!methods.is_empty()).then_some(methods)
 }
 
+/// The model's superclasses, as its constant lookup walks them after its lexical scope.
+fn ancestors_of(app: &App, model: &ClassId) -> Vec<ClassId> {
+    let mut out = Vec::new();
+    let mut current = app.models.iter().find(|m| &m.name == model).and_then(|m| m.parent.clone());
+    while let Some(parent) = current {
+        if out.contains(&parent) {
+            break;
+        }
+        current = app.models.iter().find(|m| m.name == parent).and_then(|m| m.parent.clone());
+        out.push(parent);
+    }
+    out
+}
+
 fn writes_name(e: &Expr, name: &Symbol) -> bool {
     if matches!(&*e.node, ExprNode::Assign { target: crate::expr::LValue::Var { name: n, .. }, .. } if n == name) {
         return true;
@@ -963,7 +979,8 @@ fn substitute_body(
             let rooted = names.first() == Some(&"");
             let written: Vec<&str> = names.into_iter().filter(|s| !s.is_empty()).collect();
             let [leaf] = written.as_slice() else { return None };
-            // Nor one the macro's own module holds (a load hook's, whose body is not the includer's lexical scope).
+            // Nor one the macro's own module holds (a load hook's, whose body is not the includer's lexical scope), nor
+            // a superclass's, which the includer's lookup reaches before the top level.
             if !rooted {
                 for owner in scopes {
                     let mut scope = owner.0.as_str().to_string();
