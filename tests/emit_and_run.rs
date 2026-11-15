@@ -19,6 +19,8 @@ mod emit_and_run;
 mod native_http;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
+#[path = "emit_and_run/fixture_explicit_id.rs"]
+mod fixture_explicit_id;
 #[path = "emit_and_run/controller_content_type_writer.rs"]
 mod controller_content_type_writer;
 #[path = "support/time_change_usec.rs"]
