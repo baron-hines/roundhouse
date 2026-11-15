@@ -219,6 +219,8 @@ fn lower_library_class_delegates(
     }
     let methods: Vec<_> = app.library_classes.iter().flat_map(|class| class.methods.iter().map(move |method| (&class.name, method)))
         .chain(app.models.iter().flat_map(|model| model.methods().map(move |method| (&model.name, method)))).collect();
+    let query_delegates: crate::det::HashSet<_> = app.library_classes.iter().filter(|class| class.unknown_calls.iter().any(declarations::declares_query_override)).map(|class| &class.name)
+        .chain(app.models.iter().filter(|model| model.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if declarations::declares_query_override(expr)))).map(|model| &model.name)).collect();
     let lookup = ClassLookup::new(&app.library_classes);
     let blocked: Vec<_> = app.library_classes.iter().map(|lc| {
         if lc.data_define().is_none() && !matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::DataFactory { .. })) { return None; }
@@ -244,7 +246,7 @@ fn lower_library_class_delegates(
                 Some(seen)
             });
             let relevant = |owner: &crate::ident::ClassId| owners.as_ref().is_none_or(|owners| owners.contains(owner));
-            let reason = if methods.iter().any(|(owner, method)| relevant(owner) && method.receiver == MethodReceiver::Instance && matches!(method.name.as_str(), "nil?" | "respond_to?")) { Some("Data delegation with source nil? or respond_to? overrides is not modeled") }
+            let reason = if query_delegates.iter().copied().any(relevant) || methods.iter().any(|(owner, method)| relevant(owner) && method.receiver == MethodReceiver::Instance && matches!(method.name.as_str(), "nil?" | "respond_to?")) { Some("Data delegation with source nil? or respond_to? overrides is not modeled") }
                 else if methods.iter().any(|(owner, method)| relevant(owner) && method.receiver == MethodReceiver::Instance && raises_no_method_error(&method.body)
                     && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if *value == method.name))) {
                     Some("Data delegation to source methods raising NoMethodError has unverified native exception propagation")

@@ -265,3 +265,13 @@ fn a_reopened_targets_query_override_stays_refused() {
     assert!(source.contains("include QueryOverride"));
     assert_query_refusal(&source);
 }
+
+#[test]
+fn a_targets_delegated_query_override_stays_refused() {
+    let source = contract::LITERAL_CASES[3].1.replace("class Unrelated\n def nil? = false\nend", "class Entry\n  def probe = nil\n  delegate :nil?, to: :probe\nend");
+    assert_query_refusal(&source);
+    assert!(source.contains("delegate :nil?"));
+    let prefixed = source.replace("delegate :nil?, to: :probe", "delegate :nil?, to: :probe, prefix: true");
+    let (_, errors) = contract::app(&prefixed).emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "a prefixed method does not override nil?: {errors:?}");
+}

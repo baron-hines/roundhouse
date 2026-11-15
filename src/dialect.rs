@@ -1268,12 +1268,10 @@ impl LibraryClass {
         }
     }
 
-    /// Declaration positions owned by the record, independent of value rewrites.
     pub(crate) fn data_class_constant(&self, index: usize) -> bool {
         matches!(&self.origin, Some(LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) if index >= *start)
     }
 
-    /// A native marker changing one of Data's generated class constructors.
     pub(crate) fn data_constructor_visibility(&self) -> Option<Span> {
         self.data_define()?;
         self.unknown_calls.iter().find(|call| {

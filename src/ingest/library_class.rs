@@ -442,16 +442,11 @@ fn ingest_library_classes_impl(
                         && !reopenings.iter().any(|(_, node)| node.location().start_offset() == at)
                         && !own_constants.contains(&at)
                 });
-                if separated {
-                    return Err(super::error_site::at(IngestError::Unsupported {
-                        file: file.into(), message: "Data.define declaration group is interrupted by another statement".into(),
-                    }, &statement));
-                }
                 if invalid_reopen || separated || out.iter().any(|other| other.name == class.name && other.is_module)
                     || made.iter().any(|(_, other)| other.name == class.name) {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
-                        message: "Data.define beside another declaration of the same class".into(),
+                        message: if separated { "Data.define declaration group is interrupted by another statement" } else { "Data.define beside another declaration of the same class" }.into(),
                     }, &statement));
                 }
                 // The emitter interleaves these declarations by their source spans.
