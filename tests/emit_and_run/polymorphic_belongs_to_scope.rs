@@ -1,8 +1,10 @@
 //! A polymorphic `belongs_to`'s scope narrows what its reader finds, on
 //! whichever class the type column names, as Rails builds the reader's
 //! query from the association scope: a tag whose photo is hidden reads
-//! nil, read lazily or preloaded. The expected values are ActiveRecord
-//! 8.1.4's answers.
+//! nil, read lazily or preloaded. A scope condition on a class's own key
+//! (`Badge`, keyed by `code`, with a value read at run time) narrows the
+//! row the key names rather than replacing the key. The expected values
+//! are ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -20,8 +22,15 @@ end
   has_many :tags, as: :taggable
 end
 "##)
+        .write("app/models/badge.rb", r##"class Badge < ApplicationRecord
+  self.primary_key = "code"
+  FEATURED = 7
+  has_many :tags, as: :award
+end
+"##)
         .write("app/models/tag.rb", r##"class Tag < ApplicationRecord
   belongs_to :taggable, -> { where(visible: true) }, polymorphic: true, optional: true
+  belongs_to :award, -> { where(code: Badge::FEATURED) }, polymorphic: true, optional: true
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -42,6 +51,11 @@ end
     # Rails: ["harbor", nil, "spring", nil]
     check("reader", Tag.order(:label).map { |t| t.taggable && t.taggable.title } == ["harbor", nil, "spring", nil])
     check("preload", Tag.order(:label).preload(:taggable).map { |t| t.taggable && t.taggable.title } == ["harbor", nil, "spring", nil])
+    Badge.create!(code: 7, title: "gold")
+    silver = Badge.create!(code: 8, title: "silver")
+    Tag.create!(label: "t", award: silver)
+    # Rails: nil
+    check("scope on the key", Tag.find_by(label: "t").award.nil?)
   end
 end
 "##)
@@ -54,10 +68,15 @@ end
     t.string "title"
     t.boolean "visible", default: true
   end
+  create_table "badges", primary_key: "code", force: :cascade do |t|
+    t.string "title"
+  end
   create_table "tags", force: :cascade do |t|
     t.string "label"
     t.string "taggable_type"
     t.integer "taggable_id"
+    t.string "award_type"
+    t.integer "award_id"
   end
 end
 "##)
