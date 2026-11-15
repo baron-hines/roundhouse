@@ -42,6 +42,8 @@ end
     check("class create!", [made.size, made.all?(&:persisted?)], [3, true])
     check("relation create", Tagging.where(source: "api").create([{ tag_name: "d" }]).map { |t| row(t) }, [[nil, "d", "api"]])
     check("an empty Array", Tagging.create!([]), [])
+    tagged = Tagging.create!([{ post_id: 11, tag_name: "e" }, { post_id: 11, tag_name: "f" }]) { |t| t.source = "block" }
+    check("a block runs per row", tagged.map { |t| row(t) }, [[11, "e", "block"], [11, "f", "block"]])
   end
 end
 "##)

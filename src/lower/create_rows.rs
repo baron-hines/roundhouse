@@ -16,8 +16,9 @@
 //! because the strict targets type that parameter as the attributes Hash.
 //! The analyzer types the call as `Array[Model]`
 //! (`analyze::creates_rows`); this pass only fires where it did,
-//! so an app's own `def self.create!` keeps its call. The block form is
-//! `create_block`'s and stays put.
+//! so an app's own `def self.create!` keeps its call. A block goes to
+//! each row's `create!`, as Rails passes `&block` on; `create_block`,
+//! which runs next, then inlines it per row.
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
@@ -41,7 +42,7 @@ pub fn apply_create_rows_lowering(app: &mut App) {
 
 fn rewrite(expr: &mut Expr, defines: &[(crate::ident::ClassId, &str)]) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, defines));
-    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return };
+    let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { return };
     if !crate::analyze::creates_rows(method, args) {
         return;
     }
@@ -68,7 +69,7 @@ fn rewrite(expr: &mut Expr, defines: &[(crate::ident::ClassId, &str)]) {
                 recv: recv.clone(),
                 method: method.clone(),
                 args: vec![row],
-                block: None,
+                block: block.clone(),
                 parenthesized: true,
             },
         ),
