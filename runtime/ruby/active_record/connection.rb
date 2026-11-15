@@ -278,7 +278,7 @@ module ActiveRecord
     # Rails' `type`: the declared SQL type as the Symbol Rails' type map names it.
     def type
       declared = @sql_type.downcase
-      return :integer if declared.start_with?("int", "bigint", "smallint", "serial", "bigserial")
+      return :integer if declared.start_with?("int", "bigint", "smallint", "tinyint", "mediumint", "serial", "bigserial")
       return :string if declared.start_with?("varchar", "character varying", "char")
       return :boolean if declared.start_with?("bool")
       return :float if declared.start_with?("real", "float", "double")
