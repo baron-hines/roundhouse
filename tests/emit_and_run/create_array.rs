@@ -23,6 +23,12 @@ end
   end
 end
 "##)
+        .write("app/models/tagging_factory.rb", r##"module TaggingFactory
+  def self.create!(rows)
+    [Tagging.new(tag_name: "built #{rows.size}")]
+  end
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, actual, expected)
     raise "#{label}: #{actual.inspect}, Rails answers #{expected.inspect}" unless actual == expected
@@ -44,6 +50,7 @@ end
     check("an empty Array", Tagging.create!([]), [])
     tagged = Tagging.create!([{ post_id: 11, tag_name: "e" }, { post_id: 11, tag_name: "f" }]) { |t| t.source = "block" }
     check("a block runs per row", tagged.map { |t| row(t) }, [[11, "e", "block"], [11, "f", "block"]])
+    check("an app factory's create!", TaggingFactory.create!([{ tag_name: "x" }, { tag_name: "y" }]).map(&:tag_name), ["built 2"])
   end
 end
 "##)

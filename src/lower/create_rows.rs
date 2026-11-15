@@ -16,13 +16,15 @@
 //! because the strict targets type that parameter as the attributes Hash.
 //! The analyzer types the call as `Array[Model]`
 //! (`analyze::creates_rows`); this pass only fires where it did,
-//! so an app's own `def self.create!` keeps its call. A block goes to
+//! so an app's own `def self.create!` keeps its call, and so does an app
+//! object's (a factory module) whose `create!` answers an Array: only a
+//! relation's or a model class's call is Rails'. A block goes to
 //! each row's `create!`, as Rails passes `&block` on; `create_block`,
 //! which runs next, then inlines it per row.
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
-use crate::ident::{Symbol, VarId};
+use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::typing::{fn_sig, with_ty};
 use crate::ty::Ty;
 
@@ -33,24 +35,33 @@ pub fn apply_create_rows_lowering(app: &mut App) {
         .flat_map(|m| ["create", "create!"].map(|name| (m.name.clone(), name)))
         .filter(|(model, name)| crate::analyze::source_class_method(app, model, name))
         .collect();
-    let mut walk = |body: &mut Expr| rewrite(body, &defines);
-    super::for_each_hook_body(app, &mut walk);
+    let models: Vec<ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
+    super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, owner, &models, &defines));
     for view in &mut app.views {
-        walk(&mut view.body);
+        rewrite(&mut view.body, None, &models, &defines);
     }
 }
 
-fn rewrite(expr: &mut Expr, defines: &[(crate::ident::ClassId, &str)]) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, defines));
+fn rewrite(expr: &mut Expr, owner: Option<&ClassId>, models: &[ClassId], defines: &[(ClassId, &str)]) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, owner, models, defines));
     let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { return };
     if !crate::analyze::creates_rows(method, args) {
         return;
     }
     let Some(Ty::Array { elem }) = &expr.ty else { return };
     let Ty::Class { id: model, .. } = &**elem else { return };
-    // An app's own class-side `create` answers what it answers; a
-    // relation's `create` is Relation#create whatever the model defines.
+    // A relation's `create` is Relation#create whatever the model
+    // defines; a model class's is Rails' unless the app defines its own.
     let on_relation = matches!(recv.as_ref().and_then(|r| r.ty.as_ref()), Some(Ty::Relation { .. }));
+    let on_model = match recv.as_ref().map(|r| (&*r.node, r.ty.as_ref())) {
+        // The implicit (or `self`) receiver of one of the model's class methods.
+        None | Some((ExprNode::SelfRef, _)) => owner == Some(model),
+        Some((ExprNode::Const { .. }, Some(Ty::Class { id, .. }))) => id == model,
+        _ => false,
+    };
+    if !on_relation && !(on_model && models.contains(model)) {
+        return;
+    }
     if !on_relation && defines.iter().any(|(m, name)| m == model && *name == method.as_str()) {
         return;
     }
