@@ -16,7 +16,8 @@ fn a_gem_class_reading_first_of_its_own_index_answers_the_arrays_first() {
 /// String parameter the Array would contradict.
 #[test]
 fn the_spinel_emit_keeps_first_on_a_classs_own_index_as_the_arrays() {
-    let (emitted, _errors) = contract::app().emit(BuildTarget::Spinel);
+    let (emitted, errors) = contract::app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
     let source = std::fs::read_to_string(emitted.join("app/models/shelf/entry.rb")).expect("app/models/shelf/entry.rb");
     assert!(!source.contains("string_first"), "{source}");
     assert!(source.contains("self[:dn].first"), "{source}");
