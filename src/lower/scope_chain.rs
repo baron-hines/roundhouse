@@ -2257,12 +2257,13 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             })
         })
         .collect();
+    // The last declaration of the name, as the registry keeps it.
     let belongs_to_scope = |owner: &ClassId, name: &Symbol| {
         models.iter().find(|m| &m.name == owner).and_then(|m| {
-            m.associations().find_map(|a| match a {
-                Association::BelongsTo { name: n, polymorphic: false, scope: Some(scope), .. } if n == name => Some(scope),
+            match m.associations().filter(|a| a.name() == name).last()? {
+                Association::BelongsTo { polymorphic: false, scope: Some(scope), .. } => Some(scope),
                 _ => None,
-            })
+            }
         })
     };
     let keys: Vec<((ClassId, Symbol), ClassId)> =
