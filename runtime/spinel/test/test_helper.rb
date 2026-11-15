@@ -1268,7 +1268,7 @@ class TestBase
   # read until `travel_back` (the block's end, or the next test's
   # setup) answers the same whole second.
   def freeze_time
-    ActiveSupport.freeze(ActiveSupport.now.to_i)
+    ActiveSupport.freeze_clock(ActiveSupport.now.to_i)
     return unless block_given?
     begin
       yield
