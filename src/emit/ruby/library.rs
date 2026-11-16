@@ -9208,7 +9208,7 @@ fn emit_library_class_decl_inner(
         .unknown_calls
         .iter()
         .filter(|call| {
-            (call.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
+            (call.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::CONSTANT_STATEMENT) != 0
                 || (call.decisions & crate::expr::BODY_STATEMENT != 0 && super::expr::carries_body_statements()))
                 && !call.span.is_synthetic()
         })

@@ -1008,6 +1008,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(super::data::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
     out.extend(crate::lower::model_to_library::encrypts_diagnostics(app));
+    out.extend(crate::lower::model_to_library::unrolled_loop_diagnostics(app));
     out.extend(route_guard_untyped_sends(app));
     // A support file the class ingest left out, at what failed it.
     out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));

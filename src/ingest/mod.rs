@@ -126,6 +126,7 @@ mod body_statements;
 mod error_site;
 mod external_include;
 mod hook_class_attribute;
+mod load_hooks;
 pub(crate) mod inherited_alias;
 mod class_macros;
 mod configured_superclass;

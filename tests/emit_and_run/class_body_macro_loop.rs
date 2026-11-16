@@ -1,8 +1,8 @@
 //! A class-body loop over literal names that runs method-defining macros
 //! (`scope`, `define_method`) defines each method, so the `def`s written
 //! below it can call them, as Ruby runs the body top to bottom (the `def`s
-//! themselves already stand here). Ignored as a fork spec until the compiler does; the expected
-//! values are ActiveRecord 8.1.4's answers.
+//! themselves already stand here). The expected values are ActiveRecord
+//! 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -56,15 +56,49 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: ruby semantics"]
 fn a_class_body_loop_defines_its_scopes_and_methods() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
 
+/// Over names known only when the class loads, the loop is not unrolled,
+/// and `check` reports it rather than letting its methods go missing.
 #[test]
-#[ignore = "fork spec: ruby semantics"]
+fn a_loop_over_names_known_only_at_load_is_a_check_error() {
+    let errors = app()
+        .edit("app/models/parcel.rb", "  %w[small large].each do |size|\n", "  def self.sizes\n    %w[small large]\n  end\n\n  sizes.each do |size|\n")
+        .check_errors();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].contains("could not unroll") && errors[0].contains("`Parcel`"), "{errors:#?}");
+    // A receiverless block that runs them is not unrolled either, nor a
+    // `while` loop, whether it calls `scope` or `self.scope`.
+    let header = "  %w[small large].each do |size|\n";
+    let scope = "    scope size, -> { where(size: size) }\n";
+    for edits in [
+        vec![(header, "  each do |size|\n")],
+        vec![(header, "  size = \"small\"\n  while size\n")],
+        vec![(header, "  size = \"small\"\n  while size\n"), (scope, "    self.scope size, -> { where(size: size) }\n")],
+    ] {
+        let errors = edits.iter().fold(app(), |app, (find, replace)| app.edit("app/models/parcel.rb", find, replace)).check_errors();
+        assert_eq!(errors.len(), 1, "{edits:?}: {errors:#?}");
+        assert!(errors[0].contains("could not unroll"), "{edits:?}: {errors:#?}");
+    }
+}
+
+/// `scope :"#{size}_ones"`: an interpolated Symbol name unrolls to each
+/// element's Symbol, as a String name does. Rails: 1, 2.
+#[test]
+fn a_loop_scope_named_by_an_interpolated_symbol_is_defined() {
+    let run = app()
+        .edit("app/models/parcel.rb", "    scope size, -> { where(size: size) }\n", "    scope size, -> { where(size: size) }\n    scope :\"#{size}_ones\", -> { where(size: size) }\n")
+        .run_ruby("Parcel.create!(size: \"small\", weight: 1)\n2.times { Parcel.create!(size: \"large\", weight: 1) }\nraise \"interpolated symbol scope\" unless Parcel.small_ones.count == 1 && Parcel.large_ones.count == 2\nputs \"probe passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
 fn a_class_body_loop_defines_its_scopes_and_methods_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();
