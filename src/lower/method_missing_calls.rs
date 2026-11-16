@@ -24,10 +24,15 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         .filter(|c| !c.is_module)
         .map(|c| (c.name.0.as_str().to_string(), c.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::").to_string())))
         .collect();
-    let core_of = |id: &ClassId| -> &'static [&'static str] {
+    // The class outside the program each class descends from, by its written parents (`ActiveSupport::OrderedOptions`
+    // for `class Settings < ActiveSupport::OrderedOptions`).
+    // The program's classes from `id` up, then the class outside it the chain ends at.
+    let chain_of = |id: &ClassId| -> (Vec<String>, String) {
         let mut current = id.0.as_str().to_string();
+        let mut chain = Vec::new();
         for _ in 0..32 {
-            let Some(Some(parent)) = parents.get(&current) else { break };
+            let Some(Some(parent)) = parents.get(&current) else { return (chain, current) };
+            chain.push(current.clone());
             let scope: Vec<&str> = current.split("::").collect();
             let resolved = (0..scope.len())
                 .rev()
@@ -35,18 +40,52 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
                 .find(|candidate| *candidate != current && parents.contains_key(candidate));
             match resolved {
                 Some(next) => current = next,
-                None => {
-                    return match parent.as_str() {
-                        "Hash" => super::core_instance_methods::HASH,
-                        "Array" => super::core_instance_methods::ARRAY,
-                        "String" => super::core_instance_methods::STRING,
-                        _ => super::core_instance_methods::OBJECT,
-                    };
-                }
+                None => return (chain, parent.clone()),
             }
         }
-        super::core_instance_methods::OBJECT
+        (chain, "Object".to_string())
     };
+    let root_of = |id: &ClassId| chain_of(id).1;
+    let own_update: crate::det::HashSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|c| c.methods.iter().any(|m| m.name.as_str() == "update" && m.receiver == crate::dialect::MethodReceiver::Instance))
+        .map(|c| c.name.0.as_str().to_string())
+        .collect();
+    // Not a subclass's own `update`, which Ruby finds before the alias.
+    let ordered_options = |id: &ClassId| {
+        let (chain, root) = chain_of(id);
+        root == "ActiveSupport::OrderedOptions" && !chain.iter().any(|c| own_update.contains(c))
+    };
+    let core_of = |id: &ClassId| -> &'static [&'static str] {
+        // Not Object's alone for Rails' OrderedOptions, a Hash on the ruby family's tree (Spinel's holds one, and
+        // answers only what its own class defines).
+        match root_of(id).as_str() {
+            "ActiveSupport::OrderedOptions" if target != crate::build_target::BuildTarget::Spinel => super::core_instance_methods::HASH,
+            "Hash" => super::core_instance_methods::HASH,
+            "Array" => super::core_instance_methods::ARRAY,
+            "String" => super::core_instance_methods::STRING,
+            _ => super::core_instance_methods::OBJECT,
+        }
+    };
+    // Not `update` on Spinel's OrderedOptions, which defines only `merge!` (Rails' alias): an `update` beside it would type
+    // openssl's `Digest#update` by its Hash (`runtime/spinel/ordered_options_spinel.rb`).
+    if target == crate::build_target::BuildTarget::Spinel {
+        fn rename(e: &mut Expr, ordered_options: &dyn Fn(&ClassId) -> bool) {
+            e.node.for_each_child_mut(&mut |c| rename(c, ordered_options));
+            // Not a class object (`PrefBox.update`, `self.class.update`): `Ty::Class` alone does not tell it from an instance.
+            if let ExprNode::Send { recv: Some(r), method, .. } = &mut *e.node
+                && method.as_str() == "update"
+                && r.decisions & crate::expr::CLASS_OBJECT_VALUE == 0
+                && !matches!(&*r.node, ExprNode::Const { .. })
+                && !matches!(&*r.node, ExprNode::Send { method, args, .. } if method.as_str() == "class" && args.is_empty())
+                && matches!(r.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Class { id, .. }) if ordered_options(id))
+            {
+                *method = Symbol::from("merge!");
+            }
+        }
+        crate::lower::for_each_emit_body(app, &mut |body| rename(body, &ordered_options));
+    }
     // The classes whose nearest `method_missing` is private, which an explicit receiver reaches only through `__send__`.
     let private_missing: crate::det::HashSet<String> = {
         let own: HashMap<String, bool> = app
@@ -94,15 +133,41 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         }
         false
     };
+    // The instance methods each class's subclasses define: a receiverless call in the class reaches one of them on a
+    // subclass's instance (view_component's `render_template_for` calls the `call` each component defines), which
+    // Ruby dispatches before `method_missing`.
+    // Not the parent as written: `class UI::Card < Base` names `UI::Base` when one is declared, as `core_of` resolves it.
+    let qualified_parent = |name: &str| -> Option<String> {
+        let parent = parents.get(name)?.clone()?;
+        let scope: Vec<&str> = name.split("::").collect();
+        (1..scope.len())
+            .rev()
+            .map(|depth| format!("{}::{parent}", scope[..depth].join("::")))
+            .find(|candidate| candidate != name && parents.contains_key(candidate))
+            .or(Some(parent))
+    };
+    let mut below: HashMap<String, crate::det::HashSet<String>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|c| !c.is_module) {
+        let names: Vec<String> = lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.as_str().to_string()).collect();
+        let mut current = qualified_parent(lc.name.0.as_str());
+        for _ in 0..32 {
+            let Some(name) = current else { break };
+            below.entry(name.clone()).or_default().extend(names.iter().cloned());
+            current = qualified_parent(&name);
+        }
+    }
     for lc in &mut app.library_classes {
         let owner = lc.name.clone();
         let own_missing = answers_missing(&owner);
+        let subclasses_define = below.get(owner.0.as_str()).cloned().unwrap_or_default();
         for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
             // Not inside `method_missing` itself, where an unanswered name is the one it was asked.
             if m.name == missing || m.name.as_str() == "respond_to_missing?" {
                 continue;
             }
-            let locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
+            let mut locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
+            // (a name a subclass defines is no miss: treated as the locals are, left as written)
+            locals.extend(subclasses_define.iter().map(|n| Symbol::from(n.as_str())));
             rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers, &private_missing);
         }
     }
@@ -200,7 +265,7 @@ fn body_reads(
         return;
     }
     let held = match info.instance_methods.get(reader) {
-        Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+        Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
         Some(t) => t.clone(),
         None => return,
     };

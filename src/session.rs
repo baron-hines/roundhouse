@@ -50,6 +50,11 @@ fn analyze_and_lower_with_target(app: &mut App, target: crate::build_target::Bui
     }
     let mut analyzer = crate::analyze::Analyzer::new(app);
     analyzer.analyze(app);
+    // Before the shake: a render that becomes `render_in` is what reaches the object's rendering code (a gem's).
+    if crate::lower::renderable::apply(app) {
+        analyzer = crate::analyze::Analyzer::new(app);
+        analyzer.analyze(app);
+    }
     // Typed again without the gem code the program does not reach: its calls are no evidence for what the reached code is
     // passed, as Warden's `update(label, &block)`, which nothing calls, would type `add`'s strategy `untyped`.
     if crate::source_gem_shake::shakes_source_gems(app, target)
@@ -116,6 +121,8 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
         let mut found = crate::ingest::validates_with::expand(app);
         crate::ingest::mailer_defaults::expand(app);
         crate::ingest::has_many_hold::expand(app);
+        crate::ingest::has_one_write::expand(app);
+        found.extend(crate::ingest::has_one_write::refuse(app, true));
         found.extend(crate::ingest::each_validator::expand(app, target.as_str()));
         found.extend(crate::ingest::mailer_helpers::apply(app, target.as_str()));
         found.extend(crate::ingest::mailer_callbacks::expand(app, target.as_str()));
@@ -123,6 +130,7 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
     } else {
         let mut found = crate::ingest::each_validator::refuse(app, target.as_str());
         found.extend(crate::ingest::mailer_callbacks::refuse(app, target.as_str()));
+        found.extend(crate::ingest::has_one_write::refuse(app, false));
         found
     };
     if !target.parses_numericality_input() {

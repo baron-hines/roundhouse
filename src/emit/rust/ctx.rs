@@ -72,6 +72,13 @@ pub struct EmitCtx {
     /// would then flag loudly, never miscompile silently.
     pub global_mutating_methods: HashSet<String>,
 
+    /// Class short name → names of its *instance* methods. Unlike
+    /// `global_class_methods`, which merges both receiver kinds, this
+    /// answers "does an instance respond to it": read by the model
+    /// `respond_to?` fold, where a class method (`Shelf.labelled`,
+    /// `Base.find`) must answer false.
+    pub global_instance_methods: HashMap<String, HashSet<String>>,
+
     /// Ivar name → declared field type for the class currently being
     /// emitted. Read by `expr/mod.rs::ivar_field_ty` so `emit_assign`
     /// can coerce mismatched RHS types (canonical case: `self.body =

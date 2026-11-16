@@ -42,10 +42,10 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::schema::{Column, ColumnType, Schema, Table};
 use crate::span::Span;
-use crate::ty::{Row, Ty};
+use crate::ty::{FnTy, Row, Ty};
 
 use self::associations::{push_association_methods, push_dependent_destroy, ThroughJoins};
-pub(crate) use self::associations::{ThroughWriterJoin, through_writer_join};
+pub(crate) use self::associations::{ThroughWriterJoin, fk_sentinel, through_writer_join};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::block_callback_shape;
@@ -575,6 +575,9 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                 crate::ModelBodyItem::Method { method, .. } if method.receiver == crate::dialect::MethodReceiver::Class => {
                     Some(method.name.clone())
                 }
+                // A scope too: a has_many whose scope names one
+                // (`-> { long }`) chains it on the key query.
+                crate::ModelBodyItem::Scope { scope, .. } => Some(scope.name.clone()),
                 _ => None,
             })
             .collect()
@@ -947,15 +950,76 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// stay in sync with the claiming passes — each entry names the pass
 /// that consumes the shape.
 fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
-    fn walk(expr: &crate::expr::Expr) -> bool {
-        if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "define_method") {
-            return true;
+    unrolled_block_call(expr).is_some()
+}
+
+/// The call on the class a model-body block runs that is not carried out
+/// of it: `define_method`, `define_singleton_method` or `scope` anywhere
+/// in the block, or any class macro among a loop's own statements
+/// (`%i[a b].each { |f| validates f, presence: true }`), which no
+/// model-body recognizer reads out of a loop.
+fn unrolled_block_call(expr: &crate::expr::Expr) -> Option<String> {
+    /// The loops a model body runs class calls through.
+    const LOOPS: &[&str] = &[
+        "each", "each_with_index", "each_with_object", "each_pair", "each_key", "each_value", "each_slice", "each_cons",
+        "reverse_each", "map", "collect", "times",
+    ];
+    fn on_class(recv: &Option<crate::expr::Expr>) -> bool {
+        recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    }
+    // `define_singleton_method` and `singleton_class` are Object's too: in
+    // a block callback (`after_initialize do … end`) they are the record's,
+    // which the callback lowering carries. Only a loop's are the class's.
+    fn walk(expr: &crate::expr::Expr, in_loop: bool) -> Option<String> {
+        if let ExprNode::Send { recv, method, .. } = &*expr.node {
+            // On the class: receiverless or `self.scope`.
+            if on_class(recv) && matches!(method.as_str(), "define_method" | "scope") {
+                return Some(method.to_string());
+            }
+            if in_loop && on_class(recv) && method.as_str() == "define_singleton_method" {
+                return Some(method.to_string());
+            }
+            if in_loop
+                && method.as_str() == "define_method"
+                && let Some(r) = recv
+                && let ExprNode::Send { recv: sc_recv, method: sc, args, block: None, .. } = &*r.node
+                && sc.as_str() == "singleton_class"
+                && args.is_empty()
+                && on_class(sc_recv)
+            {
+                return Some("singleton_class.define_method".into());
+            }
         }
-        let mut found = false;
-        expr.node.for_each_child(&mut |child| found |= walk(child));
+        let mut found = None;
+        expr.node.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = walk(child, in_loop);
+            }
+        });
         found
     }
-    matches!(&*expr.node, ExprNode::Send { block: Some(block), .. } if walk(block))
+    fn loop_call(body: &crate::expr::Expr) -> Option<String> {
+        let statements = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.as_slice(),
+            _ => std::slice::from_ref(body),
+        };
+        statements.iter().find_map(|s| match &*s.node {
+            ExprNode::Send { recv, method, .. } if on_class(recv) => Some(method.to_string()),
+            _ => None,
+        })
+    }
+    match &*expr.node {
+        ExprNode::Send { method, block: Some(block), .. } => {
+            let in_loop = LOOPS.contains(&method.as_str());
+            walk(block, in_loop).or_else(|| {
+                let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+                in_loop.then(|| loop_call(body)).flatten()
+            })
+        }
+        // `while`/`until` in the body runs its statements as a block does.
+        ExprNode::While { body, .. } => walk(body, true).or_else(|| loop_call(body)),
+        _ => None,
+    }
 }
 
 /// Interim subset of #1302's unclaimed-call errors: dropping encryption
@@ -980,6 +1044,40 @@ pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::D
                 expr.span, None, "encrypts",
                 format!(
                     "`encrypts` in the body of `{}` is not modelled, so its effect would be dropped from the output",
+                    model.name.0.as_str()
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// A model-body block that runs `define_method`, `define_singleton_method`
+/// or `scope`, or a loop that runs any class macro (`validates`,
+/// `attribute`, `before_save`), that `ingest::define_method_loop` could
+/// not unroll (`kinds.each do |kind| define_method(…) … end` over a value
+/// known only when the class loads, or a receiverless block): no lowering
+/// carries what it declares, so the emitted model would lack it. An error
+/// for `check`, as the call sites would raise NoMethodError and the
+/// declarations would not run.
+pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::default();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            // A receiverless block too (`each do |size| scope size, … end`):
+            // nothing in a model body claims one that defines methods.
+            let Some(call) = unrolled_block_call(expr) else { continue };
+            if expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
+                || expr.diagnostic().is_some() || !seen.insert(expr.span)
+            {
+                continue;
+            }
+            out.push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span, None, "runtime-defined method",
+                format!(
+                    "a block in the body of `{}` runs `{call}` in a shape the compile could not unroll; what it declares would be missing from the output",
                     model.name.0.as_str()
                 ),
             ));
@@ -1015,22 +1113,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         };
         let name = method.as_str();
+        // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: `check`'s error (`unrolled_loop_diagnostics`).
+        if defines_methods_in_block(expr) {
+            continue;
+        }
         if let Some(recv) = recv {
-            // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: its methods are dropped with it.
-            if defines_methods_in_block(expr) {
-                let mut d = Diagnostic::unsupported(
-                    expr.span,
-                    None,
-                    "runtime-defined method",
-                    format!(
-                        "a `define_method` loop in the body of `{}` the compile could not unroll; the methods it defines are not emitted",
-                        model.name.0.as_str()
-                    ),
-                );
-                d.severity = Severity::Warning;
-                crate::emit::diagnostics::push(d);
-                continue;
-            }
             // Class-body writes are sends too, and dropping an unclaimed
             // setting must report just like dropping a receiver-less DSL.
             if !matches!(&*recv.node, ExprNode::SelfRef)
@@ -2607,12 +2694,12 @@ pub(crate) fn push_scope_variants(
                     receiver: MethodReceiver::Class,
                     params,
                     body,
-                    signature: Some(Ty::Fn {
+                    signature: Some(Ty::Fn(Box::new(FnTy {
                         params: sig_params.into(),
                         block: None,
                         ret: std::sync::Arc::new(Ty::Untyped),
                         effects: crate::effect::EffectSet::default(),
-                    }),
+                    }))),
                     effects: crate::effect::EffectSet::default(),
                     enclosing_class: Some(model_name.0.clone()),
                     kind: AccessorKind::Method,
@@ -2807,7 +2894,7 @@ fn build_class_info_with_finder_inputs(
         };
         method_map
             .entry(m.name.clone())
-            .or_insert_with(|| Ty::Fn {
+            .or_insert_with(|| Ty::Fn(Box::new(FnTy {
                 // Retain the calling convention too: a positional Hash
                 // default must still normalize keyword syntax into a Hash.
                 // Unsigned methods retain default types, not call-site seeds.
@@ -2820,7 +2907,7 @@ fn build_class_info_with_finder_inputs(
                     .then(|| std::sync::Arc::new(Ty::Untyped)),
                 ret: std::sync::Arc::new(inferred.clone()),
                 effects: m.effects.clone(),
-            });
+            })));
         kind_map.entry(m.name.clone()).or_insert(m.kind);
     }
 
@@ -3228,7 +3315,7 @@ fn broadcasts_class_info() -> crate::analyze::ClassInfo {
     // Hash, Crystal NamedTuple → named params, TS object literal).
     use crate::dialect::AccessorKind;
     let opts_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
-    let sig = Ty::Fn {
+    let sig = Ty::Fn(Box::new(FnTy {
         params: vec![crate::ty::Param {
             name: Symbol::from("opts"),
             ty: opts_ty.into(),
@@ -3237,7 +3324,7 @@ fn broadcasts_class_info() -> crate::analyze::ClassInfo {
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: crate::effect::EffectSet::pure(),
-    };
+    }));
     for name in ["prepend", "replace", "remove", "append"] {
         info.class_methods.insert(Symbol::from(name), sig.clone());
         info.class_method_kinds.insert(Symbol::from(name), AccessorKind::Method);
@@ -3280,8 +3367,8 @@ fn type_method_body(
 ) {
     let typer = crate::analyze::BodyTyper::new(classes);
     let mut ctx = crate::analyze::Ctx::default();
-    if let Some(Ty::Fn { params, .. }) = &method.signature {
-        for (param, sig) in method.params.iter().zip(params.iter()) {
+    if let Some(Ty::Fn(fn_ty)) = &method.signature {
+        for (param, sig) in method.params.iter().zip(fn_ty.params.iter()) {
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
     }
@@ -3417,12 +3504,12 @@ fn backfill_scalar_signature(method: &mut MethodDef, body_ty: Ty) {
             kind: p.ty_kind(),
         })
         .collect();
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block: None,
         ret: std::sync::Arc::new(body_ty),
         effects: crate::effect::EffectSet::default(),
-    });
+    })));
 }
 
 /// Does `e` contain a `return` anywhere, nested blocks included?
@@ -3567,7 +3654,7 @@ pub fn ty_of_column_stored(col: &Column) -> Ty {
 /// Build a `Ty::Fn` signature from positional (name, type) pairs and a return type.
 /// Effects default to pure — callers refine if needed (lifecycle hooks etc.).
 pub(crate) fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
-    Ty::Fn {
+    Ty::Fn(Box::new(FnTy {
         params: params
             .into_iter()
             .map(|(name, ty)| crate::ty::Param {
@@ -3579,7 +3666,7 @@ pub(crate) fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
         block: None,
         ret: std::sync::Arc::new(ret),
         effects: crate::effect::EffectSet::pure(),
-    }
+    }))
 }
 
 pub(super) fn var_ref(name: Symbol) -> Expr {
@@ -3865,7 +3952,7 @@ mod tests {
             evens.body.ty = Some(ty);
             let got = article_info(&app, &methods).class_methods.get(&Symbol::from("evens")).cloned();
             match got {
-                Some(Ty::Fn { ret, .. }) if kept => assert_eq!(*ret, ints),
+                Some(Ty::Fn(fn_ty)) if kept => assert_eq!(*fn_ty.ret, ints),
                 None if !kept => {}
                 other => panic!("unexpected registry entry: {other:?}"),
             }

@@ -24,7 +24,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::routes::{flatten_routes, flatten_routes_for_helpers, FlatRoute};
 use crate::lower::typing::{fn_sig, lit_str, lit_sym, with_ty};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Build the `Routes` dispatch module — `RouteTable.table -> Array<Route>`
 /// (one `Route` instance per concrete `(verb, pattern, controller,
@@ -617,7 +617,7 @@ fn lower_route_helpers(app: &App, hash_query: bool) -> Vec<LibraryFunction> {
     let helper_params: crate::det::HashMap<String, Vec<Ty>> = funcs
         .iter()
         .filter_map(|f| match &f.signature {
-            Some(Ty::Fn { params, .. }) => Some((f.name.as_str().to_string(), params.iter().map(|p| (*p.ty).clone()).collect())),
+            Some(Ty::Fn(fn_ty)) => Some((f.name.as_str().to_string(), fn_ty.params.iter().map(|p| (*p.ty).clone()).collect())),
             _ => None,
         })
         .collect();
@@ -712,7 +712,7 @@ pub fn guard_required_segments(funcs: &mut [LibraryFunction], app: &App) {
         }
         let Some((controller, action)) = targets.get(f.name.as_str()) else { continue };
         let param_tys: Vec<Ty> = match &f.signature {
-            Some(Ty::Fn { params, .. }) => params.iter().map(|p| (*p.ty).clone()).collect(),
+            Some(Ty::Fn(fn_ty)) => fn_ty.params.iter().map(|p| (*p.ty).clone()).collect(),
             _ => Vec::new(),
         };
         let required: Vec<(Symbol, Ty)> = f
@@ -873,7 +873,8 @@ pub fn lower_url_option_helpers(app: &App) -> Vec<LibraryFunction> {
 /// URL built from a Hash only known at run time (lobsters' moderation log
 /// pages through `link_to "Page 2", @moderation_params.merge(page: 2)`),
 /// as Rails' route generation answers it. The request's controller and
-/// action stand for the ones the Hash leaves out.
+/// action stand for the ones the Hash leaves out, but a Hash that names a
+/// controller, or a nil action, is the index (`action ||= "index"`).
 ///
 /// Rails' Journey: a candidate is a GET route of that controller#action
 /// whose every segment the Hash or the request's path parameters supply;
@@ -945,7 +946,8 @@ fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute
          \x20 given = {{}}\n\
          \x20 params.each {{ |k, v| given[k.to_s] = v }}\n\
          \x20 c = given.key?(\"controller\") ? given.fetch(\"controller\", \"\").to_s : controller\n\
-         \x20 a = given.key?(\"action\") ? given.fetch(\"action\", \"\").to_s : action\n\
+         \x20 named = given.fetch(\"action\", nil)\n\
+         \x20 a = named.nil? ? (given.key?(\"controller\") || given.key?(\"action\") ? \"index\" : action) : named.to_s\n\
          \x20 key = c.gsub(\"::\", \"_\").gsub(\"/\", \"_\") + \"#\" + a\n\
          \x20 best = -1\n\
          \x20 path = \"\"\n\
@@ -984,8 +986,8 @@ fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute
 
 /// Every url-options hash in a view: a Hash literal in the URL argument
 /// of `link_to`, `link_to_if` or `button_to`, whose keys are all Symbols
-/// and include both `controller` and `action`. Yields the remaining
-/// keys, sorted.
+/// and include `controller` (no `action` is the index). Yields the
+/// keys other than those two, sorted.
 ///
 /// The view lowerer resolves a url-options hash only in that URL
 /// argument (`emit_url_options_hash`), so this looks only there. A Hash
@@ -1024,7 +1026,7 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             collect_url_options_in_url(else_branch, out);
         }
         ExprNode::Send { recv: Some(base), method, args, block: None, .. }
-            if method.as_str() == "merge" && args.len() == 1 =>
+            if method.as_str() == "merge" && args.len() == 1 && url_hash_names_action(base) =>
         {
             collect_url_options_in_url(base, out);
         }
@@ -1039,7 +1041,8 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
                 })
                 .collect();
             if let Some(keys) = keys {
-                if keys.iter().any(|k| k == "controller") && keys.iter().any(|k| k == "action") {
+                // No action is the controller's index (`emit_url_options_hash`).
+                if keys.iter().any(|k| k == "controller") {
                     let mut extras: Vec<String> = keys
                         .into_iter()
                         .filter(|k| k != "controller" && k != "action")
@@ -1050,6 +1053,25 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             }
         }
         _ => {}
+    }
+}
+
+/// A url-options Hash literal with an `action:` key that is not a literal
+/// `nil`. Under a `.merge` the merged keys could name the action, so only
+/// such a base resolves there (`emit_url_options_hash`); any other is
+/// left to `path_for_params`.
+pub(crate) fn url_hash_names_action(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "action")
+                && !matches!(&*v.node, ExprNode::Lit { value: Literal::Nil })
+        }),
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            url_hash_names_action(base)
+        }
+        _ => false,
     }
 }
 
@@ -1745,8 +1767,9 @@ fn build_helper_function(
         .map(|p| p.name.clone())
         .collect();
     let mark_optional = |t: Ty| -> Ty {
-        let Ty::Fn { params, block, ret, effects } = t else { return t };
-        Ty::Fn {
+        let Ty::Fn(fn_ty) = t else { return t };
+        let FnTy { params, block, ret, effects } = *fn_ty;
+        Ty::Fn(Box::new(FnTy {
             params: params
                 .into_iter()
                 .map(|mut tp| {
@@ -1759,16 +1782,16 @@ fn build_helper_function(
             block,
             ret,
             effects,
-        }
+        }))
     };
     // Segment keywords ride with the query keywords: both are keyword
     // params in the `def`, and `fn_sig` types every param Required, so
     // declaring one positionally is a call spinel cannot make.
     query_sig.splice(0..0, segment_keyword_sig);
     let signature = match mark_optional(fn_sig(sig_params, Ty::Str)) {
-        Ty::Fn { mut params, block, ret, effects } if !query_sig.is_empty() => {
-            params.extend(query_sig);
-            Ty::Fn { params, block, ret, effects }
+        Ty::Fn(mut fn_ty) if !query_sig.is_empty() => {
+            fn_ty.params.extend(query_sig);
+            Ty::Fn(fn_ty)
         }
         other => other,
     };

@@ -23,10 +23,18 @@ struct Class {
     singleton: HashSet<String>,
     includes: Vec<String>,
     extends: Vec<String>,
+    /// Methods defined as the program runs, on the instance side.
     open: bool,
+    /// The same on the class side (`define_singleton_method`), which
+    /// leaves the instance side's table whole: the ruby-family
+    /// `ActiveRecord::Base` defines its callback macros so.
+    open_singleton: bool,
     module: bool,
     definers: HashSet<String>,
     body_calls: HashSet<String>,
+    /// Constants the class body binds to a literal list of symbols
+    /// (`KINDS = %i[a b].freeze`), for a loop that defines one method per name.
+    symbol_lists: HashMap<String, Vec<String>>,
 }
 
 #[derive(Default)]
@@ -92,7 +100,7 @@ impl Index {
             let on_self = singleton || def.receiver().is_some_and(|r| r.as_self_node().is_some());
             let class = self.classes.entry(owner.to_string()).or_default();
             if name == "method_missing" {
-                class.open = true;
+                if on_self { class.open_singleton = true } else { class.open = true }
             }
             if def.body().is_some_and(|b| defines_at_runtime(&b)) {
                 class.definers.insert(name.clone());
@@ -104,9 +112,22 @@ impl Index {
                 let class = self.classes.entry(owner.to_string()).or_default();
                 if singleton { class.singleton.insert(name); } else { class.instance.insert(name); }
             }
+        } else if let Some(write) = stmt.as_constant_write_node() {
+            if let Some(names) = symbol_list(&write.value()) {
+                let name = String::from_utf8_lossy(write.name().as_slice()).to_string();
+                self.classes.entry(owner.to_string()).or_default().symbol_lists.insert(name, names);
+            }
         } else if let Some(call) = stmt.as_call_node() {
+            // `KINDS.each do |kind| define_singleton_method(kind) { … } end`
+            // over a list the body bound: one class method per name.
+            if let Some(names) = self.singleton_methods_per_name(&call, owner) {
+                self.classes.entry(owner.to_string()).or_default().singleton.extend(names);
+                return;
+            }
             if call.block().is_some() && defines_at_runtime(&stmt) {
-                self.classes.entry(owner.to_string()).or_default().open = true;
+                let class = self.classes.entry(owner.to_string()).or_default();
+                class.open_singleton = true;
+                class.open |= !only_singleton_definitions(&stmt);
                 return;
             }
             if call.receiver().is_some() {
@@ -136,7 +157,7 @@ impl Index {
                         class.open = true;
                     }
                 }
-                "define_singleton_method" => class.open = true,
+                "define_singleton_method" => class.open_singleton = true,
                 "include" | "prepend" => class.includes.extend(args.iter().filter_map(const_text)),
                 "extend" => class.extends.extend(args.iter().filter_map(const_text)),
                 "module_function" if args.is_empty() => {}
@@ -145,8 +166,55 @@ impl Index {
         } else if let Some(begin) = stmt.as_begin_node() {
             self.walk_body(begin.statements().map(|s| s.as_node()), owner, singleton);
         } else if let Some(i) = stmt.as_if_node() {
+            // Every arm: which one runs is decided at run time, and each defines what it writes.
             self.walk_body(i.statements().map(|s| s.as_node()), owner, singleton);
+            if let Some(rest) = i.subsequent() {
+                self.statement(rest, owner, singleton);
+            }
+        } else if let Some(u) = stmt.as_unless_node() {
+            self.walk_body(u.statements().map(|s| s.as_node()), owner, singleton);
+            if let Some(rest) = u.else_clause() {
+                self.walk_body(rest.statements().map(|s| s.as_node()), owner, singleton);
+            }
+        } else if let Some(e) = stmt.as_else_node() {
+            self.walk_body(e.statements().map(|s| s.as_node()), owner, singleton);
         }
+    }
+
+    /// Whether a class of the tree names `class` as its superclass: a
+    /// method the parent's body calls may be its subclasses' (an abstract
+    /// model's, an STI base's), which a record of the parent's type is.
+    fn has_subclass(&self, class: &str) -> bool {
+        self.classes.values().any(|c| c.parent.as_deref().is_some_and(|p| {
+            self.resolve(p, &c.namespace).is_some_and(|(key, _)| key == class)
+        }))
+    }
+
+    /// The names `KINDS.each do |kind| define_singleton_method(kind) …`
+    /// defines, when `KINDS` is a symbol list `owner` bound and the block
+    /// defines nothing else.
+    fn singleton_methods_per_name(&self, call: &ruby_prism::CallNode<'_>, owner: &str) -> Option<Vec<String>> {
+        if call.name().as_slice() != b"each" || call.arguments().is_some() {
+            return None;
+        }
+        let list = String::from_utf8_lossy(call.receiver()?.as_constant_read_node()?.name().as_slice()).to_string();
+        let names = self.classes.get(owner)?.symbol_lists.get(&list)?.clone();
+        let block = call.block()?.as_block_node()?;
+        let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
+        let requireds: Vec<_> = params.requireds().iter().collect();
+        let [param] = &requireds[..] else { return None };
+        let param = param.as_required_parameter_node()?.name().as_slice().to_vec();
+        let stmts: Vec<_> = block.body()?.as_statements_node()?.body().iter().collect();
+        let [stmt] = &stmts[..] else { return None };
+        let define = stmt.as_call_node()?;
+        let defines_param = define.name().as_slice() == b"define_singleton_method"
+            && define.receiver().is_none()
+            && define.arguments().is_some_and(|a| {
+                let args: Vec<_> = a.arguments().iter().collect();
+                matches!(&args[..], [arg] if arg.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == param.as_slice()))
+            });
+        let inner_defines = define.block().is_some_and(|b| defines_at_runtime(&b));
+        (defines_param && !inner_defines).then_some(names)
     }
 
     fn is_module(&self, class: &str) -> bool {
@@ -175,36 +243,53 @@ impl Index {
 
     fn defines(&self, class: &str, name: &str, class_side: bool) -> Lookup {
         let mut seen = HashSet::default();
-        self.lookup(class, "", name, class_side, &mut seen)
+        self.lookup(class, "", name, class_side, &mut seen, &HashSet::default())
     }
 
-    fn lookup(&self, class: &str, namespace: &str, name: &str, class_side: bool, seen: &mut HashSet<String>) -> Lookup {
+    /// `below`: the calls the bodies of the classes below this one make, on
+    /// the way up from where the lookup began. A macro an ancestor's mixin
+    /// supplies runs when a subclass calls it (`property :title`).
+    fn lookup(&self, class: &str, namespace: &str, name: &str, class_side: bool, seen: &mut HashSet<String>, below: &HashSet<String>) -> Lookup {
         let Some((key, info)) = self.resolve(class, namespace) else { return Lookup::Unheld };
         // Not the tree's reopen alone: `class Time` adds to Ruby's own class, whose methods it does not list.
-        if !seen.insert(key.to_string()) || info.open || (info.parent.is_none() && CORE_CONSTANTS.contains(&key)) {
+        if !seen.insert(key.to_string()) {
             return Lookup::Unheld;
         }
+        // A method the class lists is defined, whatever else it defines as it runs.
         let own = if class_side { &info.singleton } else { &info.instance };
         if own.contains(name) {
             return Lookup::Defined;
         }
+        let open = if class_side { info.open || info.open_singleton } else { info.open };
+        if open || (info.parent.is_none() && CORE_CONSTANTS.contains(&key)) {
+            return Lookup::Unheld;
+        }
         let mods = if class_side { &info.extends } else { &info.includes };
+        let mut calls = below.clone();
+        calls.extend(info.body_calls.iter().cloned());
         // Not any mixin that can define methods: only one whose definer the emitted body calls (`monetize :amount`) has run.
-        let ran = |c: &Class| c.open || c.definers.iter().any(|d| info.body_calls.contains(d));
-        if ran(info) || info.includes.iter().chain(info.extends.iter()).any(|m| self.resolve(m, &info.namespace).is_some_and(|(_, c)| ran(c))) {
+        let ran = |c: &Class| c.open || c.open_singleton || c.definers.iter().any(|d| calls.contains(d));
+        if info.definers.iter().any(|d| calls.contains(d)) || info.includes.iter().chain(info.extends.iter()).any(|m| self.resolve(m, &info.namespace).is_some_and(|(_, c)| ran(c))) {
             return Lookup::Unheld;
         }
         // Not only `extend`: a module the tree does not hold may add class methods from its `included` hook (`Singleton#instance`).
-        let mut unknown = class_side
-            && info.includes.iter().any(|m| {
+        // An included module whose `included`/`prepended` hook defines methods as it runs
+        // (`base.define_method(:title)`) adds to the includer's instance side too.
+        let hook_defines = info.includes.iter().any(|m| {
+            self.resolve(m, &info.namespace).is_some_and(|(_, held)| held.definers.contains("included") || held.definers.contains("prepended"))
+        });
+        let mut unknown = hook_defines || class_side
+            && (info.includes.iter().any(|m| {
                 let name = m.trim_start_matches("::");
                 match self.resolve(m, &info.namespace) {
                     Some((_, held)) => held.singleton.contains("included") || held.singleton.contains("prepended"),
                     None => name == "Singleton" || !CORE_CONSTANTS.contains(&name),
                 }
-            });
+            })
+            // Nor what an extended module's `extended` hook adds to the class.
+            || info.extends.iter().any(|m| self.resolve(m, &info.namespace).is_some_and(|(_, held)| held.singleton.contains("extended"))));
         for m in mods {
-            match self.lookup(m, &info.namespace, name, false, seen) {
+            match self.lookup(m, &info.namespace, name, false, seen, &calls) {
                 Lookup::Defined => return Lookup::Defined,
                 Lookup::Unheld => unknown = true,
                 Lookup::Missing => {}
@@ -212,14 +297,17 @@ impl Index {
         }
         match info.parent.as_deref() {
             Some("?") => return Lookup::Unheld,
-            Some(parent) => match self.lookup(parent, &info.namespace, name, class_side, seen) {
+            Some(parent) => match self.lookup(parent, &info.namespace, name, class_side, seen, &calls) {
                 Lookup::Defined => return Lookup::Defined,
                 Lookup::Unheld => unknown = true,
                 Lookup::Missing => {}
             },
             None => {
                 let builtin = if class_side { CLASS_METHODS } else { OBJECT_METHODS };
-                if builtin.contains(&name) {
+                // Nor what the tree's own reopen of `Object` adds (the runtime's `present?`), or
+                // of `Module` and `Class` for a class.
+                let roots: &[&str] = if class_side { &["Object", "Module", "Class"] } else { &["Object"] };
+                if builtin.contains(&name) || roots.iter().any(|r| self.classes.get(*r).is_some_and(|c| c.instance.contains(name))) {
                     return Lookup::Defined;
                 }
             }
@@ -228,12 +316,37 @@ impl Index {
     }
 }
 
+/// The names of a literal list of symbols (`%i[a b]`, `[:a, :b].freeze`).
+fn symbol_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    let node = match node.as_call_node() {
+        Some(call) if call.name().as_slice() == b"freeze" && call.arguments().is_none() => call.receiver()?,
+        _ => node.as_array_node()?.as_node(),
+    };
+    node.as_array_node()?
+        .elements()
+        .iter()
+        .map(|e| e.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).to_string()))
+        .collect()
+}
+
+/// The method a call runs: its own name, or the symbol a `send` names
+/// (`target.send(:define_method, name) { … }`).
+fn called_name(node: &ruby_prism::CallNode<'_>) -> Vec<u8> {
+    let name = node.name().as_slice().to_vec();
+    if matches!(name.as_slice(), b"send" | b"public_send" | b"__send__")
+        && let Some(sym) = node.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| a.as_symbol_node().map(|s| s.unescaped().to_vec()))
+    {
+        return sym;
+    }
+    name
+}
+
 fn defines_at_runtime(node: &ruby_prism::Node<'_>) -> bool {
     struct Finder(bool);
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if matches!(
-                node.name().as_slice(),
+                called_name(node).as_slice(),
                 b"define_method" | b"define_singleton_method" | b"attr_accessor" | b"attr_reader" | b"attr_writer" | b"alias_method" | b"class_eval" | b"instance_eval" | b"module_eval"
             ) {
                 self.0 = true;
@@ -242,6 +355,26 @@ fn defines_at_runtime(node: &ruby_prism::Node<'_>) -> bool {
         }
     }
     let mut finder = Finder(false);
+    ruby_prism::Visit::visit(&mut finder, node);
+    finder.0
+}
+
+/// Whether every runtime definition under `node` is a
+/// `define_singleton_method`, which adds to the class side alone.
+fn only_singleton_definitions(node: &ruby_prism::Node<'_>) -> bool {
+    struct Finder(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if matches!(
+                called_name(node).as_slice(),
+                b"define_method" | b"attr_accessor" | b"attr_reader" | b"attr_writer" | b"alias_method" | b"class_eval" | b"instance_eval" | b"module_eval"
+            ) {
+                self.0 = false;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut finder = Finder(true);
     ruby_prism::Visit::visit(&mut finder, node);
     finder.0
 }
@@ -266,10 +399,39 @@ fn const_text(node: &ruby_prism::Node<'_>) -> Option<String> {
     }
 }
 
-pub fn audit(classes: &[crate::dialect::LibraryClass], files: &[(String, String)]) -> Vec<Diagnostic> {
+/// Whether `target`'s emit is held to the audit's errors: the targets
+/// that write Ruby, which the audit reads back.
+pub fn gates(target: crate::build_target::BuildTarget) -> bool {
+    use crate::build_target::BuildTarget;
+    matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+}
+
+/// mocha's methods on every object, which its lowering (`lower::mocha`)
+/// rewrites where it can and leaves for the gem where it cannot: what
+/// it leaves is that pass's residue, which the Ruby family replays
+/// through the real gem, not a method the app's models lack.
+const MOCHA_METHODS: &[&str] = &["any_instance", "expects", "mocha", "responds_like", "responds_like_instance_of", "stub_everything", "stubs", "unstub"];
+
+/// Every send on an app class whose name no emitted ancestor defines.
+///
+/// A send on one of `models`, the app's own models, written in the
+/// app's source, is an error: the analysis typed the call, the emitted
+/// Ruby has nothing to dispatch it to, and the program raises
+/// NoMethodError where Rails answers. That is the drift between what
+/// `check` believes and what the lowering wrote (a reader it skipped, a
+/// writer it dropped), which no analysis-time pass can see. The rest stay
+/// warnings, as the opt-in audit (`ROUNDHOUSE_AUDIT`) reports them: a
+/// library class or a gem's runs into what the tree does not hold.
+pub fn audit(
+    classes: &[crate::dialect::LibraryClass],
+    files: &[(String, String)],
+    models: &HashSet<&str>,
+    sources: &[crate::span::SourceFile],
+) -> Vec<Diagnostic> {
     let index = Index::of(files);
     let mut out = Vec::new();
     let mut seen = HashSet::default();
+    let mut unsure = HashSet::default();
     for lc in classes {
         for m in &lc.methods {
             let class_side = m.receiver == crate::dialect::MethodReceiver::Class;
@@ -277,38 +439,179 @@ pub fn audit(classes: &[crate::dialect::LibraryClass], files: &[(String, String)
             if !index.emits(lc.name.0.as_str(), m.name.as_str(), class_side) {
                 continue;
             }
-            walk(&m.body, Some((lc.name.0.as_str(), class_side)), &index, &mut out, &mut seen);
+            // A lowered view's parameters are typed by convention (a partial's
+            // record by its directory's model), not by what its callers pass.
+            let convention: Vec<&crate::ident::Symbol> = if lc.name.0.as_str().starts_with("Views::") {
+                m.params.iter().map(|p| &p.name).collect()
+            } else {
+                Vec::new()
+            };
+            let mut walker = Walker { index: &index, out: &mut out, seen: &mut seen, convention: &convention, unsure: &mut unsure, guarded: Vec::new() };
+            walker.walk(&m.body, Some((lc.name.0.as_str(), class_side)));
+        }
+    }
+    for d in &mut out {
+        if let crate::diagnostic::DiagnosticKind::SendDispatchFailed { method, recv_ty: Ty::Class { id, .. } } = &d.kind
+            && models.contains(id.0.as_str())
+            && !index.has_subclass(id.0.as_str())
+            && !unsure.contains(&d.span)
+            && written(sources, d.span, method.as_str())
+            && !MOCHA_METHODS.contains(&method.as_str())
+        {
+            d.severity = crate::diagnostic::Severity::Error;
         }
     }
     out
 }
 
-fn walk(expr: &Expr, owner: Option<(&str, bool)>, index: &Index, out: &mut Vec<Diagnostic>, seen: &mut HashSet<(crate::span::Span, String, bool, String)>) {
+/// Whether the app's source spells the call at `span`: a span of the
+/// app's own file whose text names the method. A call the compiler wrote
+/// has no such span, or borrows one that says something else (the
+/// declaration it was lowered from).
+fn written(sources: &[crate::span::SourceFile], span: crate::span::Span, method: &str) -> bool {
+    let name = method.trim_end_matches('=');
+    let Some(file) = (span.file.0 as usize).checked_sub(1).and_then(|i| sources.get(i)) else { return false };
+    let text = file.text.get(span.start as usize..span.end as usize).unwrap_or("");
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '?' || c == '!') && text.contains(name)
+}
+
+/// The class a receiver's type names: a class, or a class or nil (a
+/// nil receiver raises too, and a `&.` call never reaches it).
+fn receiver_class(ty: Option<&Ty>) -> Option<&crate::ident::ClassId> {
+    match ty {
+        Some(Ty::Class { id, .. }) => Some(id),
+        Some(Ty::Union { variants }) => {
+            let mut classes = variants.iter().filter(|v| !matches!(v, Ty::Nil));
+            match (classes.next(), classes.next()) {
+                (Some(Ty::Class { id, .. }), None) => Some(id),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+struct Walker<'a> {
+    index: &'a Index,
+    out: &'a mut Vec<Diagnostic>,
+    seen: &'a mut HashSet<(crate::span::Span, String, bool, String)>,
+    /// The method's parameters whose type is a convention (see `audit`).
+    convention: &'a [&'a crate::ident::Symbol],
+    /// Findings whose receiver is one of them.
+    unsure: &'a mut HashSet<crate::span::Span>,
+    /// Calls an enclosing condition asked `respond_to?` about, by receiver
+    /// and method: the call runs only where that object answers it.
+    guarded: Vec<(String, String)>,
+}
+
+/// Who a call goes to, where the audit can tell two receivers are the
+/// same object: `self` (implicit or written), a local, an ivar.
+fn receiver_key(recv: Option<&Expr>) -> Option<String> {
+    match recv.map(|r| &*r.node) {
+        None | Some(ExprNode::SelfRef) => Some(String::from("self")),
+        Some(ExprNode::Var { name, .. }) => Some(format!("local {}", name.as_str())),
+        Some(ExprNode::Ivar { name }) => Some(format!("@{}", name.as_str())),
+        _ => None,
+    }
+}
+
+/// The calls `cond` asks `respond_to?` about, through `&&`: each tested
+/// receiver with the method name (a Symbol or a String).
+fn responds_to(cond: &Expr, out: &mut Vec<(String, String)>) {
+    match &*cond.node {
+        ExprNode::Send { recv, method, args, .. } if method.as_str() == "respond_to?" => {
+            let name = match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => Some(value.as_str().to_string()),
+                Some(ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => Some(value.to_string()),
+                _ => None,
+            };
+            if let (Some(key), Some(name)) = (receiver_key(recv.as_ref()), name) {
+                out.push((key, name));
+            }
+        }
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } => {
+            responds_to(left, out);
+            responds_to(right, out);
+        }
+        _ => {}
+    }
+}
+
+impl Walker<'_> {
+fn walk(&mut self, expr: &Expr, owner: Option<(&str, bool)>) {
+    let index = self.index;
+    // What runs after a `respond_to?(:m)` test (`respond_to?(:owner) && owner`, an `if`) calls `m` only where it is answered.
+    let (test, guarded_part, rest) = match &*expr.node {
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } => (left, right, None),
+        ExprNode::If { cond, then_branch, else_branch } => (cond, then_branch, Some(else_branch)),
+        _ => (expr, expr, None),
+    };
+    if !std::ptr::eq(test, expr) {
+        let mut names = Vec::new();
+        responds_to(test, &mut names);
+        if !names.is_empty() {
+            self.walk(test, owner);
+            let depth = self.guarded.len();
+            self.guarded.extend(names);
+            self.walk(guarded_part, owner);
+            self.guarded.truncate(depth);
+            if let Some(rest) = rest {
+                self.walk(rest, owner);
+            }
+            return;
+        }
+    }
+    // `defined?(x)` is a keyword the IR spells as a send.
     if let ExprNode::Send { recv, method, .. } = &*expr.node
         && expr.diagnostic().is_none()
+        && method.as_str() != "defined?"
+        && !receiver_key(recv.as_ref()).is_some_and(|key| self.guarded.iter().any(|(k, m)| *k == key && m == method.as_str()))
     {
         // Not a module's own `self`: a concern's body runs on its includer, whose methods it calls.
         let own = owner.filter(|(c, _)| !index.is_module(c)).map(|(c, side)| (c.to_string(), side));
+        // Whether the receiver may be the class itself: its type names the
+        // class for an instance and for the class object alike, so a local
+        // holding `Category` reads as a record of it (`klass = Category; klass.find_by(…)`).
+        let mut either_side = false;
         let target = match recv {
             None => own,
             Some(r) if matches!(&*r.node, ExprNode::SelfRef) => own,
-            Some(r) => match &r.ty {
-                Some(Ty::Class { id, .. }) => {
+            Some(r) => match receiver_class(r.ty.as_ref()) {
+                Some(id) => {
                     let class_side = match &*r.node {
                         ExprNode::Const { .. } => true,
                         ExprNode::Send { method, args, .. } => method.as_str() == "class" && args.is_empty(),
                         _ => false,
                     };
+                    either_side = !class_side;
                     Some((id.0.as_str().to_string(), class_side))
                 }
-                _ => None,
+                None => None,
             },
         };
         if let Some((class, class_side)) = target
             && index.defines(&class, method.as_str(), class_side) == Lookup::Missing
-            && seen.insert((expr.span, class.clone(), class_side, method.as_str().to_string()))
+            && let alternate = if either_side { index.defines(&class, method.as_str(), true) } else { Lookup::Missing }
+            && alternate != Lookup::Defined
+            && self.seen.insert((expr.span, class.clone(), class_side, method.as_str().to_string()))
         {
-            out.push(Diagnostic {
+            // The class side may answer: what it defines as it runs is not
+            // listed. And a class-side call itself is no error: a model's class
+            // methods come from more than the tree lists (Kernel's conversion
+            // functions, class attributes, a gem's macros).
+            if alternate == Lookup::Unheld || class_side {
+                self.unsure.insert(expr.span);
+            }
+            // The parameter is read as a local, or as the bare call the view's ERB spelled.
+            let reads_param = recv.as_ref().is_some_and(|r| match &*r.node {
+                ExprNode::Var { name, .. } => self.convention.contains(&name),
+                ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && self.convention.contains(&method),
+                _ => false,
+            });
+            if reads_param {
+                self.unsure.insert(expr.span);
+            }
+            self.out.push(Diagnostic {
                 span: expr.span,
                 severity: crate::diagnostic::Severity::Warning,
                 kind: crate::diagnostic::DiagnosticKind::SendDispatchFailed {
@@ -324,14 +627,75 @@ fn walk(expr: &Expr, owner: Option<(&str, bool)>, index: &Index, out: &mut Vec<D
             });
         }
     }
-    expr.node.for_each_child(&mut |child| walk(child, owner, index, out, seen));
+    expr.node.for_each_child(&mut |child| self.walk(child, owner));
+}
 }
 
 #[cfg(test)]
 mod tests {
     fn findings(src: &str) -> Vec<String> {
         let classes = crate::ingest::ingest_library_classes(src.as_bytes(), "a.rb").expect("ingest");
-        super::audit(&classes, &[("a.rb".to_string(), src.to_string())]).into_iter().map(|d| d.message).collect()
+        super::audit(&classes, &[("a.rb".to_string(), src.to_string())], &Default::default(), &[]).into_iter().map(|d| d.message).collect()
+    }
+
+    /// The errors, with `models` the app's models.
+    fn errors(src: &str, models: &[&str]) -> Vec<String> {
+        let classes = crate::ingest::ingest_library_classes(src.as_bytes(), "a.rb").expect("ingest");
+        let models = models.iter().copied().collect();
+        let sources = [crate::span::SourceFile { path: "a.rb".to_string(), text: src.to_string() }];
+        super::audit(&classes, &[("a.rb".to_string(), src.to_string())], &models, &sources)
+            .into_iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_class_side_definer_leaves_the_instance_side_checked() {
+        let found = findings("class Base\n  [:a].each do |k|\n    define_singleton_method(k) { 1 }\n  end\nend\n\nclass A < Base\n  def x\n    y\n  end\n\n  def self.z\n    w\n  end\nend\n");
+        assert_eq!(found, ["`A#y` is called, but the emitted Ruby defines no such method"]);
+    }
+
+    #[test]
+    fn a_macro_an_ancestors_mixin_supplies_runs_when_a_subclass_calls_it() {
+        let found = findings("module Macros\n  def property(name)\n    define_method(name) { 1 }\n  end\nend\n\nclass Base\n  extend Macros\nend\n\nclass Note < Base\n  property :title\n\n  def label\n    title\n  end\nend\n");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_call_a_respond_to_test_guards_is_not_reported() {
+        let found = findings("class A\n  def x\n    respond_to?(:owner) && owner\n  end\n\n  def y\n    if self.respond_to?(\"label\")\n      label\n    else\n      title\n    end\n  end\n\n  def z(other)\n    other.respond_to?(:name) && name\n  end\nend\n");
+        assert_eq!(found, [
+            "`A#title` is called, but the emitted Ruby defines no such method",
+            "`A#name` is called, but the emitted Ruby defines no such method",
+        ]);
+    }
+
+    #[test]
+    fn every_arm_of_a_conditional_definition_is_indexed() {
+        let found = findings("class A\n  if ENV[\"X\"]\n    def title; 1; end\n  elsif ENV[\"Y\"]\n    def label; 2; end\n  else\n    def name; 3; end\n  end\n  unless ENV[\"Z\"]\n    def a; 4; end\n  else\n    def b; 5; end\n  end\n\n  def x\n    [title, label, name, a, b]\n  end\nend\n");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_included_hook_that_defines_methods_leaves_the_includer_unknown() {
+        let found = findings("module Titles\n  def self.included(base)\n    base.define_method(:title) { 1 }\n  end\nend\n\nclass A\n  include Titles\n\n  def x\n    title\n  end\nend\n");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_loop_over_a_symbol_list_defines_one_class_method_per_name() {
+        let src = "class Base\n  KINDS = %i[before_save after_save].freeze\n\n  KINDS.each do |kind|\n    define_singleton_method(kind) { |*names| names }\n  end\nend\n\nclass Note < Base\n  def self.x\n    before_save\n    after_create\n  end\nend\n";
+        assert_eq!(findings(src), ["`Note.after_create` is called, but the emitted Ruby defines no such method"]);
+    }
+
+    #[test]
+    fn a_send_on_a_model_is_an_error_unless_a_subclass_may_answer_it() {
+        let src = "class Base\nend\n\nclass Note < Base\n  def label\n    title\n  end\nend\n";
+        assert_eq!(errors(src, &["Note"]), ["`Note#title` is called, but the emitted Ruby defines no such method"]);
+        assert!(errors(src, &[]).is_empty());
+        let parent = format!("{src}\nclass Memo < Note\n  def title\n    1\n  end\nend\n");
+        assert!(errors(&parent, &["Note", "Memo"]).is_empty());
     }
 
     #[test]

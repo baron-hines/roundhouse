@@ -207,7 +207,8 @@ fn dynamic_field_app() -> emit_and_run::Overlay {
     )
 }
 
-/// A field that is not a literal is not grounded, as `errors.where` is not: `check` reports it, and so does the emit.
+/// A field whose type proves neither a Symbol nor a String is not grounded, as `errors.where` with a
+/// computed field is not: `check` reports it, and so does the emit.
 #[test]
 fn a_dynamic_field_is_an_error() {
     let checked = dynamic_field_app().check_errors();
@@ -216,7 +217,7 @@ fn a_dynamic_field_is_an_error() {
     }
     let (_emitted, errors) = dynamic_field_app().emit(BuildTarget::Ruby);
     assert_eq!(
-        errors.iter().filter(|e| e.contains("with a field that is not a literal is not grounded")).count(),
+        errors.iter().filter(|e| e.contains("is neither a literal nor a value typed Symbol or String is not grounded")).count(),
         2,
         "{errors:#?}"
     );

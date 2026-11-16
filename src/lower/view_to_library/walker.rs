@@ -457,6 +457,14 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                     return vec![assign_accumulator_string_new(disc), stmt];
                 }
             }
+            // `<% page_title "Orders" %>`: an app helper called for its
+            // effect (a `content_for` deposit), its value discarded, as
+            // Rails' `<% %>` does. It takes the same rewrite an output
+            // tag's helper call does. A bare read of a template local of
+            // that name is the local, not the helper.
+            if ctx.app_helper_names.contains(method.as_str()) && !ctx.reads_local(stmt) {
+                return vec![rewrite_helpers_in_expr(stmt, ctx)];
+            }
             vec![todo_io_append("unknown stmt", stmt.span)]
         }
         // `<% case action_name when "all" %>…<% when … %>…<% end %>` at
@@ -572,6 +580,52 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
         // genuinely a statement (the prior TODO-append swallowed the
         // side effect and broke stack-walking templates).
         ExprNode::Send { recv: Some(_), block: None, .. } => vec![stmt.clone()],
+        // A call on a value with a block, for its effect (a component's slot: `<% card.with_header { "Title" } %>`,
+        // or `<% card.with_item do %> markup <% end %>`). Kept as written; a template body is captured into a string
+        // the block returns, as an output helper's is, not left as buffer writes the block does not own.
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(block), parenthesized } => {
+            let ExprNode::Lambda { rest_param, extra_params, params, block_param, body, block_style } = &*block.node else {
+                return vec![stmt.clone()];
+            };
+            if !block_body_is_template(body) {
+                return vec![stmt.clone()];
+            }
+            let cap = next_capture_name(&ctx.accumulator);
+            let cap_ctx = ViewCtx {
+                accumulator: cap.clone(),
+                ..ctx.with_locals(params.iter().chain(extra_params.iter().map(|p| &p.name)).map(|p| p.as_str().to_string()))
+            };
+            let mut cap_stmts = vec![assign_accumulator_string_new(&cap)];
+            cap_stmts.extend(walk_body(body, &cap_ctx));
+            // Not a plain String: Rails' `capture` answers the block's markup safe, and the slot escapes one that is not.
+            // `raw`, not `.html_safe`, which the emit unwraps where it reads the mark statically.
+            let helpers = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")] });
+            cap_stmts.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Send { recv: Some(helpers), method: Symbol::from("raw"), args: vec![accumulator_result_ref(&cap)], block: None, parenthesized: true },
+            ));
+            let new_block = Expr::new(
+                block.span,
+                ExprNode::Lambda {
+                    rest_param: rest_param.clone(),
+                    extra_params: extra_params.clone(),
+                    params: params.clone(),
+                    block_param: block_param.clone(),
+                    body: seq(cap_stmts),
+                    block_style: *block_style,
+                },
+            );
+            vec![Expr::new(
+                stmt.span,
+                ExprNode::Send {
+                    recv: Some(rewrite_helpers_in_expr(recv, ctx)),
+                    method: method.clone(),
+                    args: args.iter().map(|a| rewrite_helpers_in_expr(a, ctx)).collect(),
+                    block: Some(new_block),
+                    parenthesized: *parenthesized,
+                },
+            )]
+        }
         ExprNode::Raise { .. } => vec![stmt.clone()],
         // A bare literal — most often the synthesized `nil` arm `<% unless
         // %>` lowers to — renders nothing and does nothing: nothing is
@@ -1496,7 +1550,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 };
                 // A helper a gem mixes into the view (`simple_form_for`): Rails' method, on a view context, whose block's
                 // capture is the template's markup, a safe buffer.
-                let on_view_context = recv.is_none() && ctx.view_context_helpers.contains(method.as_str());
+                let on_view_context = recv.is_none()
+                    && ctx.view_context_helpers.contains(method.as_str())
+                    && !ctx.app_helper_names.contains(method.as_str());
                 let mut cap_stmts = vec![assign_accumulator_string_new(cap)];
                 cap_stmts.extend(walk_body(body, &cap_ctx));
                 cap_stmts.push(if on_view_context {
@@ -1933,6 +1989,7 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
                 },
             );
             call.ty = e.ty.clone();
+            call.decisions |= e.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
             return call;
         }
     }
@@ -2104,6 +2161,9 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
     out.decisions |= e.decisions & crate::expr::CONST_PATH;
     // A grounded `iso8601` (`to_rfc3339`) stays one: the Ruby emit prints `iso8601` by this flag.
     out.decisions |= e.decisions & crate::expr::GROUNDED_TIME_FORMAT;
+    // A `**opts` argument the keyword lowering made positional stays a
+    // splat on the Ruby emit (`expr::ERASED_KEYWORD_SPLAT`).
+    out.decisions |= e.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
     // Not a fresh, untyped node: a rebuilt `[]` the i18n lowering typed `Array[String]` would read as `Array[untyped]`
     out.ty = e.ty.clone();
     out
@@ -2468,6 +2528,7 @@ mod tests {
             lexxy: false,
             lexxy_editor_adapter: false,
             partial_ivars: Default::default(),
+            partial_record_locals: Default::default(),
             ivar_records: Default::default(),
             formats: vec!["html".to_string()],
             view_formats: Default::default(),

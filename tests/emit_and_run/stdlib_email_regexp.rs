@@ -140,3 +140,47 @@ fn an_app_defining_top_level_uri_keeps_both_spellings_a_gap() {
         assert!(warnings.iter().any(|w| w.contains("validates :backup_email, format: with:")), "{file}: {warnings:?}");
     }
 }
+
+/// A `URI` nested in a namespace the model's ancestry never reaches
+/// (Addressable's `Addressable::URI`, rotp's `ROTP::OTP::URI` under
+/// `ROTP::TOTP < ROTP::OTP`) cannot shadow, even when another class
+/// inherits or includes its owner. One the model reaches through an
+/// included module's own include, or through an include this build
+/// cannot name, still keeps the gap.
+#[test]
+fn a_uri_outside_the_models_ancestry_does_not_shadow() {
+    let app = |person_includes: &str| {
+        emit_and_run::empty_app()
+            .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+            .write("lib/shortener.rb", "module Shortener\n  class URI\n  end\n\n  class Otp\n    class URI\n    end\n  end\n\n  class Totp < Otp\n  end\nend\n")
+            .write("lib/link.rb", "class Link\n  include Shortener\nend\n")
+            .write("app/models/concerns/linked.rb", "module Linked\n  extend ActiveSupport::Concern\n  include Shortener\nend\n")
+            .write("app/models/concerns/opaque.rb", "module Opaque\n  extend ActiveSupport::Concern\n  include helper_module\nend\n")
+            .write("app/models/concerns/swapped.rb", "module Swapped\n  extend ActiveSupport::Concern\n  m = Module.new\n  m, _unused = [Shortener, nil]\n  include m\nend\n")
+            .write("app/models/concerns/offered.rb", "module Offered\n  extend ActiveSupport::Concern\nend\n")
+            .write("lib/offer.rb", "module Shortener\n  Offered.include self\nend\n")
+            .write("app/models/concerns/wrapped.rb", "module Wrapped\n  extend ActiveSupport::Concern\n  m = Module.new\n  m.include Shortener\n  include m\nend\n")
+            .write(
+                "db/schema.rb",
+                "ActiveRecord::Schema.define do\n  create_table \"people\", force: :cascade do |t|\n    t.string \"email\"\n  end\nend\n",
+            )
+            .write(
+                "app/models/person.rb",
+                &format!("class Person < ApplicationRecord\n{person_includes}  validates :email, format: {{ with: URI::MailTo::EMAIL_REGEXP }}\nend\n"),
+            )
+            .ingest_warnings()
+    };
+    let gap = |warnings: &[String]| warnings.iter().any(|w| w.contains("validates :email, format: with:"));
+    let warnings = app("");
+    assert!(!gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Linked\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Opaque\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Wrapped\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Swapped\n");
+    assert!(gap(&warnings), "{warnings:?}");
+    let warnings = app("  include Offered\n");
+    assert!(gap(&warnings), "{warnings:?}");
+}

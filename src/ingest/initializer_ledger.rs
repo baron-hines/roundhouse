@@ -100,6 +100,7 @@ use super::app::{
     load_defaults_version, queue_adapter_line, raise_on_missing_line, read_rb_files, wrap_parameters_line,
     FilterParametersLine, InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
 };
+use super::after_initialize::{carried_block, server_guarded_hooks, Site};
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
     flatten_statements,
@@ -158,6 +159,9 @@ struct Probe<'a> {
     src: &'a str,
     /// `config.autoload_lib(ignore: …)` directories, before any filtering.
     lib_ignores: &'a [String],
+    /// The file, as it is named for spans and for the passes that answer a
+    /// statement by its place in it.
+    path: &'a str,
 }
 
 /// One existing recognizer, how to ask it about a single statement, and
@@ -175,6 +179,30 @@ struct Recognizer {
 /// direction; `tests/initializer_ledger.rs` pins each entry against the
 /// effect it has on the `App`.
 const RECOGNIZERS: &[Recognizer] = &[
+    Recognizer {
+        name: "after_initialize (Rails.application.config.after_initialize do … end, run at boot)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| carried(p, Site::Initializer),
+    },
+    Recognizer {
+        name: "after_initialize (under if defined?(Rails::Server), run by the server entries)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| server_guarded_hooks(p.node).is_some(),
+    },
+    Recognizer {
+        name: "after_initialize (config.after_initialize inside Rails.application.configure, run at boot)",
+        origins: INIT,
+        levels: &[Level::Nested],
+        reads: |p| carried(p, Site::Configure),
+    },
+    Recognizer {
+        name: "after_initialize (config.after_initialize in the Application class body, run at boot)",
+        origins: APP,
+        levels: TOP,
+        reads: |p| carried(p, Site::Application),
+    },
     Recognizer {
         name: "session_store (config.session_store key:)",
         origins: INIT_APP,
@@ -408,6 +436,12 @@ const RECOGNIZERS: &[Recognizer] = &[
                 l == "Oj.mimic_JSON" || l.starts_with("Oj.mimic_JSON(") || l == "Oj.optimize_rails"
             })
         },
+    },
+    Recognizer {
+        name: "load_hooks (ActiveSupport.on_load(:name) a model's run_load_hooks(:name, self) runs as its class body)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| super::load_hooks::spliced(p.path, p.node).is_some(),
     },
     Recognizer {
         name: "content_security_policy (config.content_security_policy do |policy|)",
@@ -664,6 +698,11 @@ struct Stmt<'a> {
     text: &'a str,
 }
 
+/// An `after_initialize` block `ingest::after_initialize` carries to boot.
+fn carried(p: &Probe<'_>, site: Site) -> bool {
+    p.node.as_call_node().is_some_and(|call| carried_block(&call, site).is_some())
+}
+
 /// `X.to_prepare { … }` / `X.to_run { … }` with a statement body: the
 /// wrapper `initializer_statements` unwraps.
 fn hook_body<'a>(node: &Node<'a>) -> Option<Node<'a>> {
@@ -732,7 +771,7 @@ fn is_not_a_statement(node: &Node<'_>) -> bool {
 }
 
 /// Judge one host statement against the recognizer table.
-fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str) -> Verdict {
+fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str, path: &str) -> Verdict {
     if is_not_a_statement(&st.node) {
         return Verdict::NotAStatement;
     }
@@ -741,6 +780,7 @@ fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str) -> Ve
         node: &st.node,
         src,
         lib_ignores,
+        path,
     };
     if st.level == Level::Inflections {
         // Re-ingesting the statement goes through `ingest_expr`, which in
@@ -921,7 +961,7 @@ fn judge_all(
                 Verdict::Unconsumed
             }
         } else {
-            judge(origin, &st, lib_ignores, src)
+            judge(origin, &st, lib_ignores, src, path)
         };
         if verdict == Verdict::Unconsumed {
             // `Const.configure do |c| … end` is a container: nothing reads

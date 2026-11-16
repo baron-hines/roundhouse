@@ -72,7 +72,7 @@ mod send;
 mod active_storage;
 mod buffered_stdlib;
 pub(crate) use send::{ENUMERABLE_METHODS, PARAM_VALUE};
-pub(crate) use send::{indexed_pluck, string_answers};
+pub(crate) use send::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use send::counted_first_last;
 
@@ -233,6 +233,8 @@ pub struct ClassInfo {
     pub table: Option<crate::ident::TableRef>,
     /// Source ancestry grants ActiveRecord's query API; a table name alone does not.
     pub active_record_model: bool,
+    /// A graphql-ruby input object: `object[:name]` reads its declared argument `name`.
+    pub reads_arguments_by_key: bool,
     /// An include already has a load-time refusal; its method ownership is unknown.
     pub unresolved_include: bool,
     /// Retained inclusion/extension hooks can install singleton methods.
@@ -267,6 +269,13 @@ pub struct ClassInfo {
     /// what `respond_to?` (public only, by default) answers `false` for
     /// although the class defines it (`lower::respond_to`).
     pub nonpublic_instance_methods: crate::det::HashSet<Symbol>,
+    /// Names whose only `instance_methods` entry is a sidecar signature
+    /// (`app.rbs_signatures`), which names class methods too: nothing
+    /// generated (a column, association, `attr_accessor`, ...) had
+    /// registered the name before it. `lower::respond_to` does not take
+    /// such an entry for an instance method when the source defines it
+    /// class-side.
+    pub sidecar_only_instance_methods: crate::det::HashSet<Symbol>,
     /// The public ones. A name in both sets has a public and a non-public
     /// definition across reopenings, and which one Ruby keeps is load
     /// order, so `lower::respond_to` answers it neither way.
@@ -354,6 +363,12 @@ pub struct ClassInfo {
     /// has_many readers without `through:` — the ones `lower::scope_chain`
     /// roots onto a relation, so a relation terminal on them runs as SQL.
     pub direct_has_many: crate::det::HashSet<Symbol>,
+    /// The `direct_has_many` names the model HOLDS records for
+    /// (`ingest::has_many_hold`: the model has a generated
+    /// `__hold_<name>`). `lower::scope_chain` rewrites
+    /// `<owner>.<name>.update(attrs)` to `__<name>_update` only for these,
+    /// so the analyzer types that call only for these too.
+    pub held_has_many: crate::det::HashSet<Symbol>,
     /// Modules mixed in via `include` (e.g. a controller's
     /// `include IntervalHelper`). A mixed-in module's instance methods
     /// become instance methods of the includer, so dispatch consults
@@ -2397,12 +2412,12 @@ impl<'a> BodyTyper<'a> {
                     Some(seeds) => seeds.fn_params(params),
                     None => Vec::new(),
                 };
-                Ty::Fn {
+                Ty::Fn(Box::new(crate::ty::FnTy {
                     params: fn_params.into(),
                     block: None,
                     ret: std::sync::Arc::new(body_ty),
                     effects: crate::effect::EffectSet::pure(),
-                }
+                }))
             }
 
             // `method(:name)` / `recv.method(:name)`. Unlike `&:sym`
@@ -3038,6 +3053,19 @@ impl<'a> BodyTyper<'a> {
                 if let Some(t) = self.assoc_loaded_ty(recv.as_ref(), method, ctx.self_ty.as_ref()) {
                     return t;
                 }
+                // `owner.items.update(attrs)` on a has_many the owner HOLDS:
+                // the proxy's bulk update, which the scope-chain lowering
+                // rewrites to `__<name>_update`.
+                if let Some(t) = self.assoc_bulk_update_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
+                ) {
+                    return t;
+                }
                 // `x.attr = v` evaluates to `v` — Ruby's rule for an
                 // attribute assignment, whatever the writer's body
                 // returns. Same fact the harvest declares for a setter's
@@ -3085,6 +3113,17 @@ impl<'a> BodyTyper<'a> {
                     method,
                     args,
                     block.as_ref(),
+                ) {
+                    return t;
+                }
+                // `async_count` answers a Promise of that same count.
+                if let Some(t) = self.async_count_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
                 ) {
                     return t;
                 }
@@ -3414,11 +3453,29 @@ impl<'a> BodyTyper<'a> {
                 {
                     return crate::lower::errors_index::error_array_ty();
                 }
+                if matches!(method.as_str(), "to_a" | "objects")
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                    && crate::lower::errors_index::collection_read_grounds(recv.as_ref(), args, block.as_ref())
+                {
+                    return if method.as_str() == "objects" {
+                        crate::lower::errors_index::error_array_ty()
+                    } else {
+                        Ty::Array { elem: std::sync::Arc::new(Ty::Str) }
+                    };
+                }
+                if method.as_str() == "group_by_attribute"
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                    && crate::lower::errors_index::collection_read_grounds(recv.as_ref(), args, block.as_ref())
+                {
+                    return crate::lower::errors_index::grouped_ty();
+                }
                 if method.as_str() == "delete"
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                     && block.is_none()
-                    && crate::lower::errors_index::literal_field(args).is_some()
+                    && crate::lower::errors_index::where_args(args).is_some()
                 {
                     return Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Nil].into() };
                 }
@@ -3430,7 +3487,7 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
                 }
-                if matches!(method.as_str(), "import" | "merge!")
+                if matches!(method.as_str(), "import" | "merge!" | "copy!")
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                     && block.is_none()
@@ -3474,7 +3531,7 @@ impl<'a> BodyTyper<'a> {
                     && (matches!(dispatched, Ty::Var { .. })
                         || (matches!(dispatched, Ty::Untyped) && !self.app_defines(ctx.self_ty.as_ref(), method)))
                 {
-                    if let Some(block_ty @ Ty::Fn { .. }) = block
+                    if let Some(block_ty @ Ty::Fn(_)) = block
                         .as_ref()
                         .filter(|b| matches!(&*b.node, ExprNode::Lambda { .. }))
                         .and_then(|b| b.ty.clone())
@@ -5901,7 +5958,7 @@ mod tests {
                 *m = Symbol::from(method);
             }
             let ty = BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &Ctx::default());
-            assert!(matches!(&ty, Ty::Fn { ret, .. } if **ret == Ty::Str), "{method}: {ty:?}");
+            assert!(matches!(&ty, Ty::Fn(fn_ty) if *fn_ty.ret == Ty::Str), "{method}: {ty:?}");
         }
         // An app method of the name (inherited here) answers instead.
         let owner = ClassId(Symbol::from("Owner"));
@@ -5919,7 +5976,7 @@ mod tests {
         assert_eq!(BodyTyper::new(&classes).analyze_expr(&mut expr, &ctx), Ty::Int);
         // `proc(&blk)` and `proc(arg)` are not the literal-block form.
         let mut expr = send(None, "proc", vec![nil_lit()]);
-        assert!(!matches!(BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &Ctx::default()), Ty::Fn { .. }));
+        assert!(!matches!(BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &Ctx::default()), Ty::Fn(_)));
     }
 
     #[test]
@@ -7621,10 +7678,10 @@ mod tests {
             Ty::Date,
             Ty::Tuple { elems: vec![Ty::Int].into() },
             Ty::Record { row: Row::default() },
-            Ty::Fn {
+            Ty::Fn(Box::new(crate::ty::FnTy {
                 params: Vec::new().into(), block: None, ret: std::sync::Arc::new(Ty::Str),
                 effects: crate::effect::EffectSet::pure(),
-            },
+            })),
         ];
         for left in values {
             assert!(never_falsy(&left), "{left:?} must short-circuit `||`");
@@ -7638,10 +7695,10 @@ mod tests {
             Ty::Date,
             Ty::Tuple { elems: vec![Ty::Int].into() },
             Ty::Record { row: Row::default() },
-            Ty::Fn {
+            Ty::Fn(Box::new(crate::ty::FnTy {
                 params: Vec::new().into(), block: None, ret: std::sync::Arc::new(Ty::Str),
                 effects: crate::effect::EffectSet::pure(),
-            },
+            })),
         ] {
             let left = Ty::Union { variants: vec![truthy, Ty::Nil].into() };
             assert!(!never_falsy(&left), "{left:?} must not always short-circuit `||`");
@@ -8095,7 +8152,7 @@ fn never_falsy(ty: &Ty) -> bool {
         | Ty::Record { .. }
         | Ty::Relation { .. }
         | Ty::Class { .. }
-        | Ty::Fn { .. } => true,
+        | Ty::Fn(_) => true,
         // `Bool` is the whole point of the exclusion — it is the one
         // scalar that carries `false`.
         Ty::Union { variants } => variants.iter().all(never_falsy),

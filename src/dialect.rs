@@ -16,7 +16,7 @@ use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::span::Span;
-use crate::ty::{Row, Ty};
+use crate::ty::{FnTy, Row, Ty};
 
 /// A source comment preserved through the pipeline. We inline comments
 /// on the owning IR node (`leading_comments` / `trailing_comment` fields)
@@ -173,7 +173,9 @@ impl Model {
     /// match the source by class: a model can have two associations to
     /// one class, and each one gives other rows.
     pub fn through_source(&self, through_assoc: &Association) -> Option<&Association> {
-        let Association::HasMany { name, source, .. } = through_assoc else { return None };
+        let (Association::HasMany { name, source, .. } | Association::HasOne { name, source, .. }) = through_assoc else {
+            return None;
+        };
         let mut candidates = match source {
             Some(source) => vec![source.clone()],
             None => vec![Symbol::from(crate::naming::singularize(name.as_str())), name.clone()],
@@ -446,6 +448,9 @@ pub enum Association {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// See `HasMany::foreign_key_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        foreign_key_explicit: bool,
         optional: bool,
         /// `belongs_to :notifiable, polymorphic: true` — the target
         /// above is the assoc-name phantom; the real target set is
@@ -487,6 +492,11 @@ pub enum Association {
         /// `None` means `id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `belongs_to :live_author, -> { where(active: true) }` — the
+        /// scope lambda's body. Rails' reader and preload find the record
+        /// through it, so a key whose record the scope excludes reads nil.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<Expr>,
     },
     HasMany {
         name: Symbol,
@@ -549,12 +559,18 @@ pub enum Association {
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,
         dependent: Dependent,
-        /// `has_one :x, through: :y`. Recorded so consumers that would
-        /// treat the association as a direct query can see it is not;
-        /// the reader is still direct (a pre-existing gap), so anything
-        /// that cannot be right for it must refuse.
+        /// `has_one :x, through: :y`. The ruby family's reader and
+        /// preload go through the hop (`apply_through_assoc_lowering`);
+        /// anything else that would treat it as a direct query must
+        /// refuse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<Symbol>,
+        /// See `HasMany::source`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Symbol>,
+        /// See `HasMany::class_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        class_explicit: bool,
         /// See `HasMany::as_interface`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_interface: Option<Symbol>,
@@ -568,6 +584,11 @@ pub enum Association {
         /// `after_save` that stamps the FK (and `as:` type) then saves.
         #[serde(default, skip_serializing_if = "is_false")]
         autosave: bool,
+        /// `validate: true` — the owner is invalid while its new or changed
+        /// target is (Rails' `validate_single_association`). Default false,
+        /// matching Rails for a has_one.
+        #[serde(default, skip_serializing_if = "is_false")]
+        validate: bool,
         /// `primary_key: :source_id` — the OWNER column the foreign key
         /// matches (Rails' `join_primary_key`). `None` means the owner's
         /// own key, `id`. Every reader of this association must go
@@ -804,6 +825,11 @@ pub enum ValidationRule {
     InclusionCall { set: Expr },
     /// `exclusion:` with a callable `in:`, as `InclusionCall`.
     ExclusionCall { set: Expr },
+    /// `comparison:` (Rails' `ComparisonValidator`): each `(option, bound)` in written order, the option one of
+    /// `greater_than`, `greater_than_or_equal_to`, `equal_to`, `less_than`, `less_than_or_equal_to` or `other_than`,
+    /// the bound read on the record as it validates (a lambda's body with `self` the record, a Symbol's method, a
+    /// literal). A nil or blank value is `:blank`.
+    Comparison { checks: Vec<(Symbol, Expr)> },
     Custom {
         method: Symbol,
         /// `validate :m, if: :pred` / `unless: :pred` — the instance
@@ -1514,7 +1540,7 @@ pub struct LibraryFunction {
 }
 
 fn is_pure_effects(e: &crate::effect::EffectSet) -> bool {
-    e.effects.is_empty()
+    e.is_pure()
 }
 
 // Controllers -----------------------------------------------------------
@@ -1861,9 +1887,10 @@ pub struct Filter {
     /// (`ActiveSupport::Callbacks::CallbackChain#insert` unshifts a
     /// `prepend: true` entry). `recent_documents_filters.rb` reaches
     /// for it for exactly that reason: "so it happens ahead of the
-    /// inherited validation callback." `false` for the ordinary
-    /// `before_action` most filters are; only meaningful on a `Before`
-    /// filter — `build_filter_preamble` is where the hoist happens.
+    /// inherited validation callback." `prepend_around_action` sets it
+    /// on an `Around` filter the same way. `false` for the ordinary
+    /// filters; only meaningful on a `Before` or `Around` filter —
+    /// `build_filter_preamble` is where the hoist happens.
     #[serde(default)]
     pub prepend: bool,
 }
@@ -2604,7 +2631,7 @@ impl Fixture {
         let ret = models.iter().find(|model| model.name == class)
             .map(|model| Ty::Class { id: model.name.clone(), args: vec![].into() })
             .unwrap_or(Ty::Untyped);
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param {
                 name: Symbol::from("name"),
                 ty: Ty::Sym.into(),
@@ -2613,7 +2640,7 @@ impl Fixture {
             block: None,
             ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
-        }
+        }))
     }
 }
 

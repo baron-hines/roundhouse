@@ -161,11 +161,16 @@ pub(super) fn ingest_model_with_enum_constants(
         let mut class_consts = ClassConsts::collect(&stmts, file);
         class_consts.set_lexical_scope(
             name_path.len() == 1,
-            enum_constants.nested_names(),
+            enum_constants.ancestor_names(class_name.as_str()),
             enum_constants.top_level_names(),
         );
         class_consts.import(&stmts, enum_constants, &enum_owners);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
+        // A spliced hook statement looks constants up from its initializer's
+        // top level, as a block's lexical scope does under `class_eval`: none
+        // of the class body's own (folded, or keyed by offsets in its file).
+        let hook_consts = ClassConsts::default();
+        let resolve_hook_constant = |node: &Node<'_>| enum_constants.resolve(node, &[]);
         // As the library walk does: a `define_method` loop over a literal list unrolls into the `def`s it makes.
         let _loop_constants = super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::of(&owner, &stmts));
         let loop_visibility = super::define_method_loop::named_visibility(&stmts);
@@ -176,11 +181,79 @@ pub(super) fn ingest_model_with_enum_constants(
             .filter_map(|c| c.arguments()?.arguments().iter().next().and_then(|a| super::util::symbol_value(&a)))
             .map(|n| Symbol::from(n.as_str()))
             .collect();
-        for statement in stmts {
+        // The walk's statements: the body's own, and, at each
+        // `ActiveSupport.run_load_hooks(:name, self)` that fires one, the whole
+        // block of every `ActiveSupport.on_load(:name)` an initializer
+        // registered — Rails runs it as `base.class_eval(&block)` right there,
+        // so its statements are the class body's at that point. The blocks are
+        // parsed from their own initializer files, so the items they become
+        // carry spans into the file they were written in.
+        let splices = super::load_hooks::splices(&stmts);
+        let mut hook_files: Vec<&super::load_hooks::Splice> = Vec::new();
+        for (_, splice) in &splices {
+            if !hook_files.iter().any(|kept| kept.file == splice.file) {
+                hook_files.push(splice);
+            }
+        }
+        let mut hook_parses: Vec<ruby_prism::ParseResult<'_>> = Vec::with_capacity(hook_files.len());
+        for splice in &hook_files {
+            hook_parses.push(super::load_hooks::parse_hook_file(&splice.file, &splice.text));
+        }
+        let mut walk: Vec<WalkStmt<'_>> = Vec::with_capacity(stmts.len());
+        for (at, statement) in stmts.into_iter().enumerate() {
+            let fired = super::load_hooks::fired_by(&statement).is_some();
+            walk.push(WalkStmt { node: statement, file, source, hook: None });
+            if !fired {
+                continue;
+            }
+            for (_, splice) in splices.iter().filter(|(from, _)| *from == at) {
+                if let Some(reason) = &splice.refusal {
+                    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                        splice.span,
+                        None,
+                        super::load_hooks::ON_LOAD,
+                        super::load_hooks::refusal_message(&splice.hook, class_name.as_str(), reason),
+                    ));
+                    continue;
+                }
+                let Some(index) = hook_files.iter().position(|kept| kept.file == splice.file) else { continue };
+                super::load_hooks::mark_spliced(splice, class_name.as_str());
+                for node in super::load_hooks::block_statements(hook_parses[index].node(), splice.span.start as usize) {
+                    walk.push(WalkStmt { node, file: &splice.file, source: &splice.text, hook: Some(&splice.hook) });
+                }
+            }
+        }
+        for item in walk {
+            // The statement's own file: the model's, or the initializer a
+            // spliced hook block was written in.
+            let WalkStmt { node: statement, file, source, hook } = item;
+            let spliced = hook.is_some();
+            // A spliced statement's loops see its initializer's constants, not
+            // the class body's, and a declaration the ingest would drop with a
+            // warning is refused, so it is reported as the hook's.
+            let _hook_scope = spliced.then(|| {
+                (super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::barrier()), super::load_hooks::InHook::enter())
+            });
+            // `ActiveSupport.run_load_hooks(:name, self)` itself lowers to
+            // nothing: what it runs is in the walk, here.
+            if hook.is_none() && super::load_hooks::fired_by(&statement).is_some() {
+                note_end(&mut prev_end, spliced, &statement);
+                continue;
+            }
             let definition = visibility::definition(&statement).map(|d| d.as_node());
+            // `Visibility` and the table-name declaration know the model's
+            // statements by their offsets in the model's file, which a spliced
+            // statement's offsets (into its initializer) can equal. A spliced
+            // statement never asks them, and a visibility marker or `private
+            // def` in a hook block, which it would need, is reported.
+            if spliced && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+                let err = IngestError::Unsupported { file: file.into(), message: "visibility in a load hook block is not carried".into() };
+                report_hook_statement(hook, file, &statement, class_name.as_str(), &err);
+                continue;
+            }
             let stmt = definition.as_ref().unwrap_or(&statement);
             if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
-                prev_end = Some(statement.location().end_offset());
+                note_end(&mut prev_end, spliced, &statement);
                 if visibility.names_inherited(&statement) {
                     carried_markers.insert(statement.location().start_offset());
                     let mut expr = ingest_expr(&statement, file)?;
@@ -192,8 +265,8 @@ pub(super) fn ingest_model_with_enum_constants(
             // Explicit names override convention before schema binding.
             // Like primary_key, the setter is consumed: lowering already
             // synthesizes table_name from Model::table for every target.
-            if table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
-                prev_end = Some(stmt.location().end_offset());
+            if !spliced && table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             // `self.primary_key = "key"` is recognized into
@@ -204,29 +277,42 @@ pub(super) fn ingest_model_with_enum_constants(
             // next statement.
             if let Some(pk) = parse_primary_key_decl(&stmt) {
                 primary_key = Some(pk);
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             let stmt_start = stmt.location().start_offset();
-            let leading_area_start =
-                comments.first().map(|(off, _)| *off).filter(|off| *off < stmt_start)
-                    .unwrap_or(stmt_start);
-            let leading = drain_comments_before(&mut comments, stmt_start);
-            let leading_blank = prev_end
-                .map(|pe| source_has_blank_line(source, pe, leading_area_start))
-                .unwrap_or(false);
+            // A spliced hook statement's comments are the initializer's, not
+            // this body's, and its offsets index that file: it carries none of
+            // the body's leading comments and no blank line of its own.
+            let (leading, leading_blank) = if spliced {
+                (Vec::new(), false)
+            } else {
+                let leading_area_start =
+                    comments.first().map(|(off, _)| *off).filter(|off| *off < stmt_start)
+                        .unwrap_or(stmt_start);
+                let leading = drain_comments_before(&mut comments, stmt_start);
+                let leading_blank = prev_end
+                    .map(|pe| source_has_blank_line(source, pe, leading_area_start))
+                    .unwrap_or(false);
+                (leading, leading_blank)
+            };
             // `enum :status, %i[…]` — one statement standing for a
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
             if let Some(call) = stmt.as_call_node() {
-                match expand_class_body_dsl(&call, file, &leading, &class_consts, &resolve_constant) {
+                let expanded = if spliced {
+                    expand_class_body_dsl(&call, file, &leading, &hook_consts, &resolve_hook_constant)
+                } else {
+                    expand_class_body_dsl(&call, file, &leading, &class_consts, &resolve_constant)
+                };
+                match expanded {
                     Ok(Some(ClassBodyExpansion::DelegatedType(expanded))) => {
                         let mut blank = leading_blank;
                         for mut item in expanded {
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Ok(Some(ClassBodyExpansion::Enum(expanded))) => {
@@ -250,13 +336,20 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Ok(None) => {}
+                    Err(err) if spliced => {
+                        // A spliced hook statement the model ingest refuses: Rails
+                        // runs the block, so this one is reported, not dropped.
+                        report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                        note_end(&mut prev_end, spliced, stmt);
+                        continue;
+                    }
                     Err(err) if super::survey::is_active() => {
                         super::survey::record(&err);
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -283,24 +376,29 @@ pub(super) fn ingest_model_with_enum_constants(
                 file,
                 crate::dialect::MethodReceiver::Instance,
                 &loop_visibility,
+                true,
             ) {
                 let mut leading = Some((leading, leading_blank));
                 for mut method in methods {
-                    visibility.apply(&statement, &mut method);
+                    if !spliced {
+                        visibility.apply(&statement, &mut method);
+                    }
                     let (comments, blank) = leading.take().unwrap_or_default();
                     body.push(ModelBodyItem::Method { method, leading_comments: comments, leading_blank_line: blank });
                 }
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             if let Some(mut copy) = stmt.as_call_node().and_then(|call| model_alias_method_copy(&call, &body)) {
-                visibility.apply(&statement, &mut copy);
+                if !spliced {
+                    visibility.apply(&statement, &mut copy);
+                }
                 body.push(ModelBodyItem::Method {
                     method: copy,
                     leading_comments: leading,
                     leading_blank_line: leading_blank,
                 });
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             // `alias new old` (keyword form). Columns, associations,
@@ -328,7 +426,7 @@ pub(super) fn ingest_model_with_enum_constants(
                         leading_blank_line: leading_blank,
                         span,
                     });
-                    prev_end = Some(stmt.location().end_offset());
+                    note_end(&mut prev_end, spliced, stmt);
                     continue;
                 }
                 // Neither side is a plain name (e.g. a global variable
@@ -339,7 +437,14 @@ pub(super) fn ingest_model_with_enum_constants(
                 });
             }
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_body(&sc, &owner, file, &visibility) {
+                // A hook's `class << self` is outside what the model's `Visibility` read.
+                if spliced && sc.body().is_some_and(|b| flatten_statements(b).iter().any(|s| s.as_call_node().is_some_and(|c| visibility::marker(&c)))) {
+                    let err = IngestError::Unsupported { file: file.into(), message: "visibility in a load hook block is not carried".into() };
+                    report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                    note_end(&mut prev_end, spliced, stmt);
+                    continue;
+                }
+                match ingest_singleton_class_body(&sc, &owner, file, (!spliced).then_some(&visibility)) {
                     Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
@@ -367,12 +472,17 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
+                        continue;
+                    }
+                    Err(err) if spliced => {
+                        report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) if super::survey::is_active() => {
                         super::survey::record(&err);
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -396,6 +506,14 @@ pub(super) fn ingest_model_with_enum_constants(
             // bare `JSON` for `serialize …, coder: JSON` — leave a
             // synthetic Const-assign marker so lower::serialize can see
             // the shadow without treating the namespace as a body item.
+            // In a hook block, the declaration is a constant the library pass
+            // over the model's file never sees: reported, not skipped.
+            if spliced && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
+                let err = IngestError::Unsupported { file: file.into(), message: "a class or module declared in a load hook block is not carried".into() };
+                report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
             if let Some(path) = stmt
                 .as_class_node()
                 .and_then(|c| constant_path_of(&c.constant_path()))
@@ -428,21 +546,26 @@ pub(super) fn ingest_model_with_enum_constants(
                         leading_blank_line: false,
                     });
                 }
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
-            let items = match ingest_model_body_items(
-                &stmt,
-                &owner,
-                file,
-                leading,
-                Some(&mut class_attr_defaults),
-                &class_consts,
-            ) {
+            let classified = {
+                let was = CLASSIFYING_MODEL_BODY.with(|c| c.replace(true));
+                let consts = if spliced { &hook_consts } else { &class_consts };
+                let items = ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults), consts);
+                CLASSIFYING_MODEL_BODY.with(|c| c.set(was));
+                items
+            };
+            let items = match classified {
                 Ok(items) => items,
+                Err(err) if spliced => {
+                    report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                    note_end(&mut prev_end, spliced, stmt);
+                    continue;
+                }
                 Err(err) if super::survey::is_active() => {
                     super::survey::record(&err);
-                    prev_end = Some(stmt.location().end_offset());
+                    note_end(&mut prev_end, spliced, stmt);
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -451,7 +574,9 @@ pub(super) fn ingest_model_with_enum_constants(
             // attribute; only the first carries the blank line that
             // separated the declaration from what came before it.
             for (i, mut item) in items.into_iter().enumerate() {
-                if let ModelBodyItem::Method { method, .. } = &mut item {
+                if spliced {
+                    // Public, as a hook block without visibility markers defines it.
+                } else if let ModelBodyItem::Method { method, .. } = &mut item {
                     visibility.apply(&statement, method);
                 } else if let ModelBodyItem::Unknown { expr, .. } = &item {
                     if let Some(mut methods) = visibility.restricted_at(&statement).then(|| restricted_attr_methods(expr, &owner, &attributes, &declared_attributes)).flatten() {
@@ -475,7 +600,7 @@ pub(super) fn ingest_model_with_enum_constants(
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);
             }
-            prev_end = Some(stmt.location().end_offset());
+            note_end(&mut prev_end, spliced, stmt);
         }
     }
     visibility.uncarried_inherited(&carried_markers, file)?;
@@ -511,6 +636,41 @@ pub(super) fn ingest_model_with_enum_constants(
             end: class_loc.end_offset() as u32,
         },
     }))
+}
+
+/// One statement the class-body walk reads: the body's own, or one of an
+/// `ActiveSupport.on_load` block spliced in where the body fires it.
+struct WalkStmt<'a> {
+    node: Node<'a>,
+    /// The file its spans name: the model's, or the initializer the hook block
+    /// was written in.
+    file: &'a str,
+    /// That file's text.
+    source: &'a [u8],
+    /// The hook the statement came from, when it was spliced.
+    hook: Option<&'a str>,
+}
+
+/// Where the previous statement ended, for the blank line before the next one.
+/// A spliced hook statement lives in another file, so it leaves the body's own
+/// end where it was.
+fn note_end(prev_end: &mut Option<usize>, spliced: bool, node: &Node<'_>) {
+    if !spliced {
+        *prev_end = Some(node.location().end_offset());
+    }
+}
+
+/// A statement of a spliced `ActiveSupport.on_load` block the model ingest
+/// refuses: Rails runs it as part of the class body, so the compiled app would
+/// lose it — an error naming the hook and the model, never a silent drop.
+fn report_hook_statement(hook: Option<&str>, file: &str, node: &Node<'_>, model: &str, err: &IngestError) {
+    let Some(hook) = hook else { return };
+    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+        super::util::node_span(node, file),
+        None,
+        super::load_hooks::ON_LOAD_STATEMENT,
+        super::load_hooks::statement_message(hook, model, super::load_hooks::error_detail(err)),
+    ));
 }
 
 /// `alias_method :to, :from` (literal names) of the last instance def of
@@ -560,6 +720,33 @@ fn model_alias_method_copy(call: &ruby_prism::CallNode<'_>, body: &[ModelBodyIte
 /// through to the unsupported-DSL ledger rather than being flattened
 /// into an unconditional one. Numericality, inclusion, and format use
 /// the same option parse as `validates`.
+thread_local! {
+    /// Set while a model's own class body is classified, not a concern's `included do` or a macro expansion.
+    static CLASSIFYING_MODEL_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A model's own state-machine block, by its call's offset: its recorded gap is withdrawn if the class body replays it.
+    static DEFERRED_STATE_MACHINES: std::cell::RefCell<Vec<(crate::span::FileId, u32, String, IngestError)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Forget what an earlier ingest attempt on this thread left queued.
+pub(super) fn reset_deferred_state_machines() {
+    DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().clear());
+}
+
+/// Withdraw the gap of each model state-machine block the class body replays (`app_extension_calls`): the gem's
+/// class method runs it as Ruby does.
+pub(super) fn report_unreplayed_state_machines(app: &crate::App) {
+    let deferred = DEFERRED_STATE_MACHINES.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (file, start, method, gap) in deferred {
+        let replayed = app.models.iter().flat_map(|m| m.body.iter()).any(|item| matches!(item,
+            ModelBodyItem::Unknown { expr, .. } if expr.span.file == file && expr.span.start == start
+                && expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
+                && matches!(&*expr.node, crate::expr::ExprNode::Send { method: m, .. } if m.as_str() == method)));
+        if replayed {
+            super::survey::forget(&gap);
+        }
+    }
+}
+
 pub(super) fn ingest_model_body_items(
     stmt: &Node<'_>,
     owner: &ClassId,
@@ -574,15 +761,30 @@ pub(super) fn ingest_model_body_items(
         start: stmt.location().start_offset() as u32,
         end: stmt.location().end_offset() as u32,
     };
-    // Only `serialize` beside the `define_method`s: the other macros are read from the statement, not from a rewritten Expr.
+    // Only `serialize` and `scope` beside the `define_method`s: the other macros are read from the statement, not from a rewritten Expr.
+    enum Unrolled {
+        Serialize(Expr),
+        Scope(crate::dialect::Scope),
+    }
     let mut macros = Vec::new();
     if let Some(methods) = super::define_method_loop::unroll_with_macros(stmt, owner, file, &mut macros)
-        && macros.iter().all(|m| matches!(&*m.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "serialize"))
+        && let Some(unrolled) = macros
+            .into_iter()
+            .map(|expr| match &*expr.node {
+                ExprNode::Send { recv: None, method, .. } if method.as_str() == "serialize" => Some(Unrolled::Serialize(expr)),
+                ExprNode::Send { recv: None, method, .. } if method.as_str() == "scope" => unrolled_scope(&expr).map(Unrolled::Scope),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
     {
         let mut leading = Some(leading_comments);
         let mut items: Vec<ModelBodyItem> = Vec::new();
-        for expr in macros {
-            items.push(ModelBodyItem::Unknown { expr, leading_comments: leading.take().unwrap_or_default(), leading_blank_line: false });
+        for item in unrolled {
+            let leading_comments = leading.take().unwrap_or_default();
+            items.push(match item {
+                Unrolled::Serialize(expr) => ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line: false },
+                Unrolled::Scope(scope) => ModelBodyItem::Scope { scope, leading_comments, leading_blank_line: false },
+            });
         }
         for method in methods {
             items.push(ModelBodyItem::Method { method, leading_comments: leading.take().unwrap_or_default(), leading_blank_line: false });
@@ -593,6 +795,8 @@ pub(super) fn ingest_model_body_items(
         if with_options::is_with_options(&call) {
             return match with_options::expand(&call, &[], owner, file, class_consts) {
                 Ok(items) => Ok(items),
+                // In a spliced load hook, the hook reports it as an error.
+                Err(err @ IngestError::Unsupported { .. }) if super::load_hooks::in_hook() => Err(err),
                 // Declined: reported with what blocked it, and dropped like
                 // any unlowered model DSL (none of its calls is kept).
                 Err(IngestError::Unsupported { message, .. }) => {
@@ -1143,14 +1347,20 @@ pub(super) fn ingest_model_body_item(
         // The same classifier sees model declarations and a concern's
         // `included do`. Record before the latter drops the Unknown,
         // and before ingesting a block that may contain further gaps.
-        // Name the DSL shape, not unverified gem ownership.
+        // Name the DSL shape, not unverified gem ownership. A model's own
+        // call is judged once the class-body replay is decided
+        // (`app::report_unreplayed_state_machines`).
         if matches!(method.as_str(), "aasm" | "state_machine")
             && call.block().and_then(|b| b.as_block_node()).is_some()
         {
-            super::survey::record(&IngestError::Unsupported {
+            let gap = IngestError::Unsupported {
                 file: file.into(),
                 message: format!("state-machine DSL block `{method}` is not modeled"),
-            });
+            };
+            super::survey::record(&gap);
+            if CLASSIFYING_MODEL_BODY.with(|c| c.get()) {
+                DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().push((super::sources::file_id(file), call.location().start_offset() as u32, method.to_string(), gap)));
+            }
         }
         return Ok(ModelBodyItem::Unknown {
             expr: ingest_expr(stmt, file)?,
@@ -3248,13 +3458,15 @@ fn ingest_singleton_class_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
     owner: &ClassId,
     file: &str,
-    visibility: &Visibility,
+    visibility: Option<&Visibility>,
 ) -> IngestResult<super::singleton_class::SingletonBody> {
     super::singleton_class::ingest_singleton_body(sc, owner, file, &|def| {
         let mut method = ingest_method(def, file)?;
-        visibility.apply(&def.as_node(), &mut method);
+        if let Some(visibility) = visibility {
+            visibility.apply(&def.as_node(), &mut method);
+        }
         Ok(method)
-    })
+    }, true)
 }
 
 pub(super) fn ingest_method(
@@ -3869,6 +4081,25 @@ fn and_condition(left: Expr, right: Expr) -> Expr {
     )
 }
 
+/// One element's `scope` from a loop `define_method_loop` unrolled, the
+/// key in place: `scope "small", -> { where(size: "small") }`. Its lambda
+/// takes plain required parameters only (`define_method_loop::scope_ok`).
+fn unrolled_scope(expr: &Expr) -> Option<crate::dialect::Scope> {
+    let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };
+    let [name, lambda] = args.as_slice() else { return None };
+    let name = match &*name.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Symbol::from(value.as_str()),
+        ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !extra_params.is_empty() {
+        return None;
+    }
+    let params = params.iter().map(|p| crate::dialect::Param::positional(p.clone())).collect();
+    Some(crate::dialect::Scope { name, params, body: body.clone() })
+}
+
 fn parse_scope(
     call: &ruby_prism::CallNode<'_>,
     file: &str,
@@ -4063,6 +4294,16 @@ fn spelled_lambda_parts<'a>(
     Some((block.parameters(), block.body()))
 }
 
+/// `where(…).order(…)`: sends down to one with no receiver, the shape an
+/// association reader grafts onto its query.
+fn is_implicit_call_chain(e: &crate::expr::Expr) -> bool {
+    match &*e.node {
+        crate::expr::ExprNode::Send { recv: None, .. } => true,
+        crate::expr::ExprNode::Send { recv: Some(inner), .. } => is_implicit_call_chain(inner),
+        _ => false,
+    }
+}
+
 fn parse_association(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
@@ -4094,23 +4335,56 @@ fn parse_association(
     let mut belongs_to_default: Option<crate::expr::Expr> = None;
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
+    let mut validate: Option<bool> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
         // scope (`has_many :x, -> { where(...) }, through: :y`).
         // Recorded as its raw body Expr; the reader synthesis grafts it
-        // onto the relation seed. Param-taking lambdas (rare
-        // owner-dependent scopes) are skipped — they need the owner
-        // threaded and no exercised corpus does this yet.
+        // onto the relation seed. A lambda that takes the owner, through a
+        // parameter of any kind (`->(owner)`, `->(owner = nil)`, `-> { it }`),
+        // is skipped, and reported: the owner isn't threaded, so its
+        // body would read an unbound name.
+        //
+        // The readers graft the body onto their query as a chain of calls
+        // on the implicit receiver (`where(…).order(…)`). Any other body
+        // (`-> { where(active: true) if flag }`, two statements) is dropped
+        // there, so it is reported here.
         if let Some(lambda) = arg.as_lambda_node() {
+            // Every macro passes through here (`scope :x, ->(k) { … }`
+            // too); only an association's lambda is its scope.
+            let association =
+                matches!(method, "belongs_to" | "has_one" | "has_many" | "has_and_belongs_to_many");
             if scope.is_none() {
-                let param_free = lambda
-                    .parameters()
-                    .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
-                    .map(|pn| pn.requireds().iter().next().is_none())
-                    .unwrap_or(true);
+                let param_free = match lambda.parameters() {
+                    None => true,
+                    Some(p) => p.as_block_parameters_node().is_some_and(|b| b.parameters().is_none()),
+                };
+                let unapplied = |shape: String, reason: &str| {
+                    let mut diagnostic = crate::diagnostic::Diagnostic::unsupported(
+                        super::util::node_span(&arg, file),
+                        None,
+                        shape,
+                        reason,
+                    );
+                    diagnostic.severity = crate::diagnostic::Severity::Warning;
+                    super::prism::push(diagnostic);
+                };
                 if param_free {
                     scope = lambda.body().and_then(|b| ingest_expr(&b, file).ok());
+                    if association && scope.as_ref().is_some_and(|body| !is_implicit_call_chain(body)) {
+                        // The body stays, so the analyzer still checks it
+                        // (an unsupported construct in it is an error).
+                        unapplied(
+                            format!("{method} :{name_str}, -> {{ ... }}"),
+                            "an association scope that isn't a chain of query calls is not applied, so its reads skip the scope's conditions",
+                        );
+                    }
+                } else if association {
+                    unapplied(
+                        format!("{method} :{name_str}, ->(owner) {{ ... }}"),
+                        "an association scope that takes the owner is not applied, so its reads skip the scope's conditions",
+                    );
                 }
             }
             continue;
@@ -4171,6 +4445,9 @@ fn parse_association(
                 "polymorphic" => polymorphic = bool_value(&value),
                 "as" => as_interface = symbol_value(&value),
                 "autosave" => autosave = bool_value(&value),
+                // A has_one's `validate: true` (`HasOne::validate`); any
+                // other association's `validate:` stays reported below.
+                "validate" if method == "has_one" && bool_value(&value).is_some() => validate = bool_value(&value),
                 // `default: -> { Current.user }` — the lambda BODY, not
                 // the lambda. Rails calls it with `instance_exec`, so
                 // the body is already written against the record; a
@@ -4301,8 +4578,12 @@ fn parse_association(
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
+            // As for has_many: a `through:` one's class comes from its
+            // source association (`resolve_through_targets`).
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
+                .or_else(|| source_type.map(|s| ClassId(Symbol::from(s.as_str()))))
+                .or_else(|| source.map(|s| ClassId(Symbol::from(camelize(s.as_str())))))
                 .unwrap_or_else(|| ClassId(Symbol::from(camelize(name_str.as_str())))),
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
@@ -4313,9 +4594,12 @@ fn parse_association(
             foreign_key_explicit,
             dependent: dependent.unwrap_or_default(),
             through: through.map(|s| Symbol::from(s.as_str())),
+            source: source_name,
+            class_explicit,
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             autosave: autosave.unwrap_or(false),
+            validate: validate.unwrap_or(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
         }),
         "belongs_to" => Some(Association::BelongsTo {
@@ -4326,6 +4610,7 @@ fn parse_association(
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| Symbol::from(format!("{name_str}_id"))),
+            foreign_key_explicit,
             optional: optional.unwrap_or(false),
             polymorphic: polymorphic.unwrap_or(false),
             // Filled by `resolve_polymorphic_targets` once every
@@ -4335,6 +4620,7 @@ fn parse_association(
             touch,
             foreign_type: None,
             primary_key: primary_key.as_deref().map(Symbol::from),
+            scope,
         }),
         "has_and_belongs_to_many" => Some(Association::HasAndBelongsToMany {
             name: name.clone(),

@@ -155,6 +155,13 @@ pub const CONST_PATH: u64 = 1 << 25;
 /// class's methods; every other target drops it and reports it.
 pub const BODY_STATEMENT: u64 = 1 << 27;
 
+/// A library class or module body statement that calls a method on a
+/// constant the same body assigns (`SWATCHES.push(Swatch.new("teal"))`),
+/// making only calls the app answers (`ingest::body_statements`). Plain
+/// Ruby every Ruby-family tree runs, Spinel's too, so each writes it back
+/// where the source has it, among the constants it reads and writes.
+pub const CONSTANT_STATEMENT: u64 = 1 << 40;
+
 /// On a body statement or a constant's value: the source wrote it inside
 /// the class's own `class << self`, where Ruby runs it with the singleton
 /// class as `self` and puts a constant on the singleton class
@@ -419,10 +426,18 @@ fn deserialize_cold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box
 
 // A field that grows `Expr` grows every tree about fourfold (see
 // `ExprCold`). Put rare data in `ExprCold` instead of raising these.
+// Every node is one `ExprNode` allocation, and the allocator (mimalloc)
+// rounds it up to a size class: 248 bytes take the 256 class, past 256 a
+// node takes 320 (296 took 320, 392 took 448). The largest variants are
+// `If` (three `Expr`s) and `OpAssign`; rare large payloads are boxed
+// (`Ty::Fn`, `BeginRescue`'s `else_branch` and `ensure`). `Ty` sits
+// inline in `Expr::ty`.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Expr>() <= 120);
+const _: () = assert!(std::mem::size_of::<Expr>() <= 80);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ExprNode>() <= 392);
+const _: () = assert!(std::mem::size_of::<ExprNode>() <= 256);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<crate::ty::Ty>() <= 32);
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -865,11 +880,15 @@ pub enum ExprNode {
     /// `RescueModifier` instead. An `implicit` begin arises when a
     /// `def` body contains trailing `rescue` clauses — same shape, no
     /// surface `begin` keyword.
+    ///
+    /// `else_branch` and `ensure` are boxed: inline they made this rare
+    /// variant (0.35% of nodes) the largest, and so the size of every
+    /// `ExprNode`.
     BeginRescue {
         body: Expr,
         rescues: Vec<RescueClause>,
-        else_branch: Option<Expr>,
-        ensure: Option<Expr>,
+        else_branch: Option<Box<Expr>>,
+        ensure: Option<Box<Expr>>,
         #[serde(default)]
         implicit: bool,
     },

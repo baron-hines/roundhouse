@@ -17,7 +17,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // propagate through dispatch without bottoming out at Var.
     // `Rails.env` is the one we can type concretely as Str.
     let mut rails_cls = ClassInfo::default();
-    for m in ["application", "logger", "cache", "configuration", "public_path"] {
+    for m in ["application", "logger", "cache", "configuration"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String
@@ -42,13 +42,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let error_reporter = class("ActiveSupport::ErrorReporter");
     rails_cls.class_methods.insert(Symbol::from("event"), event_reporter.clone());
     rails_cls.class_methods.insert(Symbol::from("error"), error_reporter.clone());
-    // `Rails.root` is a Pathname in Rails; both lanes answer it with
-    // runtime/ruby/rails.rb's `Rails::AppPath`, so a call it lacks is an error.
+    // `Rails.root` and `Rails.public_path` are Pathnames in Rails; both lanes
+    // answer them with runtime/ruby/rails.rb's `Rails::AppPath`, so a call it
+    // lacks is an error.
     let app_path = class("Rails::AppPath");
     rails_cls.class_methods.insert(Symbol::from("root"), app_path.clone());
+    rails_cls.class_methods.insert(Symbol::from("public_path"), app_path.clone());
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
     register_stdlib_class(classes, "Rails::AppPath", &[], &[
-        ("join", app_path.clone()), ("+", app_path.clone()), ("expand_path", app_path.clone()),
+        ("join", app_path.clone()), ("+", app_path.clone()), ("expand_path", app_path.clone()), ("mkpath", app_path.clone()),
         ("to_s", Ty::Str), ("to_path", Ty::Str), ("read", Ty::Str),
         ("readlines", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }), ("exist?", Ty::Bool),
     ]);
@@ -730,12 +732,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("parse", Ty::Untyped),
     ], &[]);
     // `config_for`'s Hash: Rails' own class, in the ruby family's overlay
-    // (`ruby_overlay/runtime/active_support_ordered_options.rb`).
+    // (`ruby_overlay/runtime/active_support_ordered_options.rb`), and Spinel's Hash-holding one
+    // (`runtime/spinel/ordered_options_spinel.rb`). A name no method answers is a key, read through `method_missing`.
     let ordered_options = Ty::Class { id: ClassId(Symbol::from("ActiveSupport::OrderedOptions")), args: vec![].into() };
-    register_stdlib_class(classes, "ActiveSupport::OrderedOptions", &[
-        ("new", ordered_options.clone()),
-    ], &[
-        ("update", ordered_options),
+    register_stdlib_class(classes, "ActiveSupport::Gzip", &[
+        ("decompress", Ty::Str),
+        ("compress", Ty::Str),
+    ], &[]);
+    // Not a `new` of its own: one returning this class would type a subclass's `new` as this class too.
+    register_stdlib_class(classes, "ActiveSupport::OrderedOptions", &[], &[
+        ("update", ordered_options.clone()),
+        ("merge!", ordered_options),
+        ("[]", Ty::Untyped),
+        ("[]=", Ty::Untyped),
+        ("keys", Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }),
+        ("key?", Ty::Bool),
+        ("fetch", Ty::Untyped),
+        ("to_h", Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) }),
+        ("empty?", Ty::Bool),
+        ("dig", Ty::Untyped),
+        ("method_missing", Ty::Untyped),
     ]);
     {
         let continuable = classes.entry(ClassId(Symbol::from("ActiveJob::Continuable"))).or_default();
@@ -1116,6 +1132,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::ConnectionNotEstablished", None),
         ("ActiveRecord::ConnectionFailed", None),
         ("ActiveRecord::ConnectionTimeoutError", None),
+        ("ActiveRecord::NoDatabaseError", None),
         ("ActiveRecord::Encryption::Errors::Decryption", None),
         ("ActiveRecord::Encryption::Errors::Configuration", None),
         ("ActiveJob::EnqueueError", None),
@@ -1137,6 +1154,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let unknown_attribute = classes.entry(ClassId(Symbol::from("ActiveModel::UnknownAttributeError"))).or_default();
     unknown_attribute.parent = Some(ClassId(Symbol::from("NoMethodError")));
     unknown_attribute.instance_methods.insert(Symbol::from("record"), Ty::Untyped);
+    // A partial `select`'s left-out column, raised by its generated reader.
+    register_stdlib_class(classes, "ActiveModel::MissingAttributeError", &[], &exception_surface);
+    classes.entry(ClassId(Symbol::from("ActiveModel::MissingAttributeError"))).or_default().parent =
+        Some(ClassId(Symbol::from("NoMethodError")));
     register_stdlib_class(classes, "ActiveRecord::StaleObjectError", &[], &[("attempted_action", Ty::Untyped)]);
     classes.entry(ClassId(Symbol::from("ActiveRecord::StaleObjectError"))).or_default().parent =
         Some(ClassId(Symbol::from("ActiveRecord::ActiveRecordError")));

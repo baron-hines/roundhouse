@@ -180,6 +180,16 @@ impl Overlay {
         Run::new(command.join(" "), emitted, errors, output)
     }
 
+    /// Emit the Spinel tree, then run one of its test files with
+    /// `spin test <path>`. Spinel writes `test/<dir>/x_test.rb` as
+    /// `test/x_test.rb`, so `test_path` is the emitted path.
+    pub fn run_spin_test(self, test_path: &str) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Spinel);
+        let output =
+            Command::new("spin").args(["test", test_path]).current_dir(&emitted).output().expect("spawn spin");
+        Run::new(format!("spin test {test_path}"), emitted, errors, output)
+    }
+
     /// Emit, then run `script` against the booted app: `main.rb` is
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
@@ -203,6 +213,8 @@ impl Overlay {
             .arg(&script)
             .current_dir(&emitted)
             .env("BLOG_DB", ":memory:")
+            // A variable a test's guard reads, unset unless the test sets it.
+            .env_remove("SHELF_SLUG")
             .envs(env.iter().copied())
             .output()
             .expect("spawn ruby");
@@ -499,6 +511,18 @@ impl Overlay {
         roundhouse::ingest::prism::scope(|| ingest_app(&source)).1
     }
 
+    /// The warnings the target-aware lowering reports for `target`
+    /// (`session::analyze_and_lower_for`): a construct the target's lowering
+    /// doesn't reach, kept a reported gap there.
+    pub fn lowering_warnings(self, target: BuildTarget) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        let diags = roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
+    }
+
     fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         self.emit_app_tree_with_lowering(target, true)
     }
@@ -521,10 +545,17 @@ impl Overlay {
         let mut errors: Vec<_> = found.into_iter().filter(|d| d.severity == Severity::Error).collect();
 
         let emitted = scratch.join("emitted");
-        let (files, emit_diags) = roundhouse::emit::diagnostics::scope(|| {
-            roundhouse::project::target_files(&app, &source, target)
+        // As the CLI does: a send on an app model the written Ruby defines nothing for is an error.
+        let ((files, emit_diags), rendered) = roundhouse::emit::ruby::record_rendered(|| {
+            roundhouse::emit::diagnostics::scope(|| roundhouse::project::target_files(&app, &source, target))
         });
         let mut emit_diags = emit_diags;
+        if let Ok(files) = &files
+            && roundhouse::emit::audit::gates(target)
+        {
+            let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+            emit_diags.extend(roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources));
+        }
         roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut emit_diags);
         errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
         let files = match files {
@@ -572,6 +603,19 @@ pub struct Run {
     exited_zero: bool,
     pub stdout: String,
     pub stderr: String,
+    /// The last process's exit status, for a failure that printed nothing (a signal).
+    pub status: String,
+}
+
+fn command_of_status(status: &std::process::ExitStatus) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return "killed by a signal";
+        }
+    }
+    if status.success() { "exited 0" } else { "exited non-zero" }
 }
 
 impl Run {
@@ -584,6 +628,7 @@ impl Run {
             exited_zero: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: format!("{} ({})", output.status, command_of_status(&output.status)),
         }
     }
 

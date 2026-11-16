@@ -66,8 +66,8 @@ module ActiveSupport
     FROZEN_AT << 0
   end
 
-  # Stop the clock at `seconds` (the harness's `freeze_time`).
-  def self.freeze(seconds)
+  # Stop the clock at `seconds` (the harness's `freeze_time`). Not `freeze`: that is Module#freeze, which a gem calls on any class value.
+  def self.freeze_clock(seconds)
     FROZEN_AT.clear
     FROZEN_AT << seconds
   end

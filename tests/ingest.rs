@@ -1319,7 +1319,8 @@ fn unmodeled_validates_options_warn_and_drop_their_rule_or_call() {
         r#"
 class Widget < ApplicationRecord
   validates :name, presence: true, uniqueness: { conditions: -> { where(active: true) } }
-  validates :stock, comparison: { less_than_or_equal_to: :max_stock }
+  # A bound computed from neither a literal, a Symbol, a lambda nor a value constant.
+  validates :stock, comparison: { less_than_or_equal_to: Time.now }
   validates :price, numericality: { greater_than: 0, odd: true }
   validates :bounded, numericality: { equal_to: 1, other_than: 2 }
   # A two-parameter lambda would splice an unbound parameter into `def
@@ -2607,7 +2608,25 @@ fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
                 );
             }
         }
-        for default in ["**{default: 41}", "**options", "instance_reader: false, default: 41"] {
+        // `instance_reader: false` beside a default leaves only the instance copy out: the seed and the class-side
+        // accessors stand, as Rails defines them.
+        {
+            let source = format!("class Probe; {declaration} :count, instance_reader: false, default: 41; end");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
+            assert!(
+                classes[0].class_ivar_initializers.iter().any(|expr| {
+                    matches!(&*expr.node, ExprNode::Assign { target: LValue::Var { name, .. }, value }
+                        if name.as_str() == "@@count" && matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 41 } }))
+                }),
+                "{declaration}: {:?}",
+                classes[0].class_ivar_initializers
+            );
+            assert!(
+                !classes[0].methods.iter().any(|m| m.name.as_str() == "count" && m.receiver == roundhouse::dialect::MethodReceiver::Instance),
+                "{declaration}: no instance reader"
+            );
+        }
+        for default in ["**{default: 41}", "**options"] {
             let call = format!("{declaration} :count, {default}");
             let source = format!("class Probe; {call}; end");
             let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")

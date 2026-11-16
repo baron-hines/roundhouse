@@ -592,13 +592,14 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // A partial's locals are its interface: every `locals:` key any call
     // site passes becomes a trailing nil-default param (sorted; see
     // render_locals_keys). Names already on the signature as the record
-    // or flash/defined? extras are skipped here.
+    // or flash/defined? extras are skipped here. The record is a
+    // `safe_local` name, so `locals: { class: }` is the `class_` record.
     let mut extra_params = extra_params;
     if is_partial {
         let keys_map = &lx.locals_keys;
         if let Some(keys) = view_key.as_ref().and_then(|k| keys_map.get(k).cloned()) {
             for k in keys {
-                if k != arg_name && !extra_params.contains(&k) {
+                if crate::naming::safe_local(&k) != arg_name && !extra_params.contains(&k) {
                     extra_params.push(k);
                 }
             }
@@ -749,7 +750,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         sl.iter().filter(|p| form_binding.is_none_or(|b| p.name.as_str() != b.form_local)).cloned().collect::<Vec<Param>>()
     });
     if let Some(sl) = strict_without_form.as_ref().filter(|sl| is_partial && !sl.is_empty()) {
-        use crate::ty::{Param as TyParam, ParamKind, Ty};
+        use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
         // The record is a positional param, so a reserved-word name
         // (`for:`) goes through `safe_local`, as its reads do. The
         // keyword locals keep their names: callers pass them by name.
@@ -852,12 +853,12 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
                 nullable.insert(tp.name.as_str().to_string());
             }
         }
-        signature = Some(Ty::Fn {
+        signature = Some(Ty::Fn(Box::new(FnTy {
             params: sig_params.into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: crate::effect::EffectSet::default(),
-        });
+        })));
         locals = std::iter::once(record_name.clone())
             .chain(closure.iter().cloned())
             .chain(kw_locals.iter().map(|p| p.name.as_str().to_string()))
@@ -907,6 +908,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         lexxy: app.gem_lock.as_ref().is_some_and(|lock| lock.has("lexxy")),
         lexxy_editor_adapter: app.gem_lock.as_ref().is_some_and(lexxy_uses_editor_adapter),
         partial_ivars: closures.clone(),
+        partial_record_locals: lx.collection_element_locals.clone(),
         ivar_records: lx.ivar_records.clone(),
         formats: std::iter::once(view.format.as_str())
             .chain((view.format.as_str() != "html").then_some("html"))
@@ -1150,7 +1152,7 @@ pub fn insert_db_stub(
     classes: &mut crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
 ) {
     use crate::lower::typing::fn_sig;
-    use crate::ty::Ty;
+    use crate::ty::{FnTy, Ty};
 
     // Db — primitive surface the per-model `_adapter_*` Level-3
     // emit calls into. Backend-agnostic (sqlite via cruby gem here,
@@ -1420,12 +1422,12 @@ pub fn insert_db_stub(
         fn_sig(
             vec![],
             Ty::Array {
-                elem: std::sync::Arc::new(Ty::Fn {
+                elem: std::sync::Arc::new(Ty::Fn(Box::new(FnTy {
                     params: vec![].into(),
                     block: None,
                     ret: std::sync::Arc::new(Ty::Nil),
                     effects: crate::effect::EffectSet::default(),
-                }),
+                }))),
             },
         ),
     );
@@ -1435,6 +1437,19 @@ pub fn insert_db_stub(
     db_info.class_methods.insert(
         Symbol::from("_unscoped_tables"),
         fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+    );
+    // The relations whose `scoping { }` block runs on this thread
+    // (relation.rb's `Relation.current_scope_for`): nil until the first
+    // push, which answers the list it pushed onto.
+    let relation = Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Relation")), args: vec![].into() };
+    let scopes = Ty::Array { elem: std::sync::Arc::new(relation.clone()) };
+    db_info.class_methods.insert(
+        Symbol::from("_current_scopes"),
+        fn_sig(vec![], Ty::Union { variants: vec![scopes.clone(), Ty::Nil].into() }),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("_push_current_scope"),
+        fn_sig(vec![(Symbol::from("scope"), relation)], scopes),
     );
     classes.insert(ClassId(Symbol::from("Db")), db_info);
 
@@ -1579,7 +1594,7 @@ pub(crate) fn insert_framework_stubs(
 ) {
     use crate::dialect::AccessorKind;
     use crate::lower::typing::{fn_sig, fn_sig_with_block};
-    use crate::ty::Ty;
+    use crate::ty::{FnTy, Ty};
 
     // Helper: tag every method on a ClassInfo as `Method` (the
     // default for framework calls — every helper, route generator,
@@ -1911,7 +1926,7 @@ pub(crate) fn insert_framework_stubs(
     // normalize_trailing_kwargs leaves the call's `kwargs: true` flag
     // alone (preserves the bare named-args call shape across targets).
     let opts_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
-    let bc_sig = Ty::Fn {
+    let bc_sig = Ty::Fn(Box::new(FnTy {
         params: vec![crate::ty::Param {
             name: Symbol::from("opts"),
             ty: opts_ty.into(),
@@ -1920,7 +1935,7 @@ pub(crate) fn insert_framework_stubs(
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: crate::effect::EffectSet::pure(),
-    };
+    }));
     for name in ["prepend", "replace", "remove", "append"] {
         bc.class_methods.insert(Symbol::from(name), bc_sig.clone());
     }
@@ -2187,7 +2202,8 @@ fn type_method_body(method: &mut MethodDef) {
     insert_framework_stubs(&mut classes);
     let typer = crate::analyze::BodyTyper::new(&classes);
     let mut ctx = crate::analyze::Ctx::default();
-    if let Some(crate::ty::Ty::Fn { params, .. }) = &method.signature {
+    if let Some(crate::ty::Ty::Fn(fn_ty)) = &method.signature {
+        let crate::ty::FnTy { params, .. } = &**fn_ty;
         for (param, sig) in method.params.iter().zip(params.iter()) {
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
@@ -2214,7 +2230,7 @@ pub(crate) fn build_view_signature(
     extra_params: &[String],
     known_models: &[String],
 ) -> Option<crate::ty::Ty> {
-    use crate::ty::{Param as TyParam, ParamKind, Ty};
+    use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
 
     if arg_name.is_empty() && extra_params.is_empty() {
         return None;
@@ -2271,12 +2287,12 @@ pub(crate) fn build_view_signature(
         });
     }
 
-    Some(Ty::Fn {
+    Some(Ty::Fn(Box::new(FnTy {
         params: sig_params.into(),
         block: None,
         ret: std::sync::Arc::new(Ty::Str),
         effects: crate::effect::EffectSet::default(),
-    })
+    })))
 }
 
 /// The argument contract an action view expects from its controller: the
@@ -2835,11 +2851,14 @@ pub(crate) fn ivar_record_partials(
                 &|_| false,
             ) {
                 // Bound as `named_partial_call_with_record` binds it.
-                Some(RenderPartial::Named { partial, arg, locals }) => {
+                Some(RenderPartial::Named { partial, arg, locals, object }) => {
                     let target_dir = partial.rsplit_once('/').map_or(dir, |(d, _)| d);
                     let module_camel = camelize_path(&snake_case(target_dir));
                     let record = singularize(&snake_case(last_segment(&module_camel)));
                     match locals {
+                        // The explicit object binds as the record
+                        // (`named_partial_object_call`).
+                        Some(_) if object.is_some() => false,
                         Some(entries) => !entries.iter().any(|(k, _)| {
                             matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
                                 if value.as_str() == record)
@@ -3077,7 +3096,7 @@ pub(crate) fn partial_call_contracts(
             .map(|s| s.as_str().to_string());
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
-                if k != &record && !extras.contains(k) {
+                if crate::naming::safe_local(k) != record && !extras.contains(k) {
                     extras.push(k.clone());
                 }
             }
@@ -3466,7 +3485,7 @@ pub(super) fn partial_extras_map(
             closure_raw.iter().map(|s| ivar_local(&ivar_locals, s.as_str())).collect();
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
-                if k != &arg_name && !extras.contains(k) {
+                if crate::naming::safe_local(k) != arg_name && !extras.contains(k) {
                     extras.push(k.clone());
                 }
             }
@@ -3747,11 +3766,36 @@ fn collection_element_locals_from_views(
     use crate::det::{HashMap, HashSet};
     let mut out: HashMap<ViewKey, String> = HashMap::default();
     let mut conflicted: HashSet<ViewKey> = HashSet::default();
+    let mut objects = ElementLocals::default();
     for view in views {
         let (dir, _) = split_view_name(view.name.as_str());
-        collect_collection_element_locals(&view.body, dir, stems, &mut out, &mut conflicted);
+        let mut collections = ElementLocals { out: std::mem::take(&mut out), conflicted: std::mem::take(&mut conflicted) };
+        collect_collection_element_locals(&view.body, dir, stems, &mut collections, &mut objects);
+        (out, conflicted) = (collections.out, collections.conflicted);
+    }
+    // An object render's local names the partial only where no
+    // collection render does, so a partial a collection binds keeps
+    // that binding (an object render's call passes its object as the
+    // record either way).
+    for (key, local) in objects.out {
+        if !out.contains_key(&key) && !conflicted.contains(&key) {
+            out.insert(key, local);
+        }
+    }
+    for key in objects.conflicted {
+        if !out.contains_key(&key) {
+            conflicted.insert(key);
+        }
     }
     (out, conflicted)
+}
+
+/// Call sites' element locals by partial, and the partials whose call
+/// sites disagree.
+#[derive(Default)]
+struct ElementLocals {
+    out: crate::det::HashMap<ViewKey, String>,
+    conflicted: crate::det::HashSet<ViewKey>,
 }
 
 /// The record arg a view / partial takes: an unambiguous collection
@@ -3776,8 +3820,8 @@ fn collect_collection_element_locals(
     e: &Expr,
     dir: &str,
     stems: &PartialStems,
-    out: &mut crate::det::HashMap<ViewKey, String>,
-    conflicted: &mut crate::det::HashSet<ViewKey>,
+    collections: &mut ElementLocals,
+    objects: &mut ElementLocals,
 ) {
     if let ExprNode::Send { recv, method, args, block, .. } = &*e.node {
         if let Some(crate::lower::view::RenderPartial::CollectionNamed {
@@ -3799,24 +3843,64 @@ fn collect_collection_element_locals(
                     let base = partial.rsplit('/').next().unwrap_or(partial);
                     base.trim_start_matches('_').to_string()
                 });
-            if conflicted.contains(&key) {
-                return;
-            }
-            match out.get(&key) {
-                Some(existing) if *existing != local => {
-                    out.remove(&key);
-                    conflicted.insert(key);
-                }
-                Some(_) => {}
-                None => {
-                    out.insert(key, local);
-                }
-            }
+            record_element_local(key, local, collections);
+        } else if method.as_str() == "render"
+            && recv.is_none()
+            && let Some((partial, local)) = object_render_local(args)
+        {
+            record_element_local(partial_name_to_key(partial, dir, stems), local, objects);
         }
     }
     e.node.for_each_child(&mut |c| {
-        collect_collection_element_locals(c, dir, stems, out, conflicted)
+        collect_collection_element_locals(c, dir, stems, collections, objects)
     });
+}
+
+/// `render partial: "x/y", object: record[, as: "name"]`: the partial and
+/// the local Rails hands it the object as, `as.to_sym` or the partial's
+/// own name (`PartialRenderer`'s `as || template.variable`), as a
+/// collection's element is.
+fn object_render_local(args: &[Expr]) -> Option<(&str, String)> {
+    let [arg] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    let value = |key: &str| {
+        entries.iter().find_map(|(k, v)| match &*k.node {
+            ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key => Some(v),
+            _ => None,
+        })
+    };
+    if value("collection").is_some() {
+        return None;
+    }
+    value("object")?;
+    let ExprNode::Lit { value: Literal::Str { value: partial } } = &*value("partial")?.node else {
+        return None;
+    };
+    let local = match value("as").map(|v| &*v.node) {
+        None => partial.rsplit('/').next().unwrap_or(partial).trim_start_matches('_').to_string(),
+        Some(ExprNode::Lit { value: Literal::Sym { value } }) => value.as_str().to_string(),
+        Some(ExprNode::Lit { value: Literal::Str { value } }) => value.as_str().to_string(),
+        Some(_) => return None,
+    };
+    Some((partial.as_str(), local))
+}
+
+/// One call site's element local for a partial. Two sites that disagree
+/// leave the partial on its convention name.
+fn record_element_local(key: ViewKey, local: String, seen: &mut ElementLocals) {
+    if seen.conflicted.contains(&key) {
+        return;
+    }
+    match seen.out.get(&key) {
+        Some(existing) if *existing != local => {
+            seen.out.remove(&key);
+            seen.conflicted.insert(key);
+        }
+        Some(_) => {}
+        None => {
+            seen.out.insert(key, local);
+        }
+    }
 }
 
 /// The partial views a body renders, as `ViewKey`s — for the render graph.
@@ -4468,7 +4552,7 @@ pub(crate) fn build_view_signature_from(
     typed: &[(String, crate::ty::Ty)],
     extra_params: &[String],
 ) -> Option<crate::ty::Ty> {
-    use crate::ty::{Param as TyParam, ParamKind, Ty};
+    use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
     if typed.is_empty() && extra_params.is_empty() {
         return None;
     }
@@ -4487,12 +4571,12 @@ pub(crate) fn build_view_signature_from(
             kind: ParamKind::Optional,
         });
     }
-    Some(Ty::Fn {
+    Some(Ty::Fn(Box::new(FnTy {
         params: sig_params.into(),
         block: None,
         ret: std::sync::Arc::new(Ty::Str),
         effects: crate::effect::EffectSet::default(),
-    })
+    })))
 }
 
 pub(crate) fn infer_view_arg(stem: &str, dir: &str, is_partial: bool, known_models: &[String]) -> String {
@@ -4764,6 +4848,9 @@ pub(super) fn rewrite_ivars_to_locals(expr: &Expr, locals: &IvarLocals) -> Expr 
     out.decisions |= expr.decisions & crate::expr::CONST_PATH;
     // A grounded `iso8601` (`to_rfc3339`) stays one: the Ruby emit prints `iso8601` by this flag.
     out.decisions |= expr.decisions & crate::expr::GROUNDED_TIME_FORMAT;
+    // A `**opts` argument the keyword lowering made positional stays a
+    // splat on the Ruby emit (`expr::ERASED_KEYWORD_SPLAT`).
+    out.decisions |= expr.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
     // Not a fresh, untyped node: the i18n lowering's `[]` names and values are typed `Array[String]`
     out.ty = expr.ty.clone();
     out
@@ -5348,6 +5435,11 @@ pub(super) struct ViewCtx {
     /// needed ivars here and passes them as call-site args (the caller's
     /// own locals — its closure ⊇ the partial's, so it always has them).
     pub(super) partial_ivars: std::rc::Rc<crate::det::HashMap<ViewKey, Vec<Symbol>>>,
+    /// A partial's record local where its call sites name one other
+    /// than the directory's singular (`collection_element_locals`): an
+    /// explicit `locals:` hash binds the record by this name, as the
+    /// partial's definition takes it.
+    pub(super) partial_record_locals: std::rc::Rc<crate::det::HashMap<ViewKey, String>>,
     /// The partials whose record param stands for its ivar
     /// ([`ivar_record_partials`]): a render passes that ivar in the
     /// record slot. Every other partial takes it as a closure param.
@@ -6140,6 +6232,13 @@ impl ViewCtx {
     pub(super) fn binds_local(&self, n: &str) -> bool {
         self.is_local(n) && !self.ivar_params.iter().any(|x| x == n)
     }
+    /// True when `e` reads such a local: a bare name with no arguments
+    /// or parentheses. `name(...)` and `name()` call the method even
+    /// where a local has the name, as in Ruby.
+    pub(super) fn reads_local(&self, e: &Expr) -> bool {
+        matches!(&*e.node, ExprNode::Send { recv: None, method, args, block: None, parenthesized: false }
+            if args.is_empty() && self.binds_local(method.as_str()))
+    }
     /// True when `@<n>` is assigned a partial-options value in some
     /// controller action (a bare partial-name string or a `{partial: …}`
     /// hash), so a bare `render @<n>` should dispatch over the pool
@@ -6681,14 +6780,29 @@ pub(crate) fn lexxy_uses_editor_adapter(lock: &crate::gems::Lockfile) -> bool {
 }
 
 /// The instance methods of the modules a gem's load hook mixes into `ActionView::Base`.
-fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<String> {
-    app.library_classes
+pub(crate) fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<String> {
+    // Not only the modules the hook names: what those include is in the view too.
+    let mut pending: Vec<&crate::ident::ClassId> = app
+        .library_classes
         .iter()
         .filter(|c| c.name.0.as_str() == "ActionView::Base")
         .flat_map(|c| c.includes.iter())
-        .flat_map(|m| app.library_classes.iter().filter(move |c| c.name == *m))
-        .flat_map(|c| c.methods.iter())
-        .filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public)
-        .map(|m| m.name.as_str().to_string())
-        .collect()
+        .collect();
+    let mut seen = crate::det::HashSet::default();
+    let mut out = crate::det::HashSet::default();
+    while let Some(module) = pending.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        for c in app.library_classes.iter().filter(|c| c.name == *module) {
+            out.extend(
+                c.methods
+                    .iter()
+                    .filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public)
+                    .map(|m| m.name.as_str().to_string()),
+            );
+            pending.extend(c.includes.iter());
+        }
+    }
+    out
 }

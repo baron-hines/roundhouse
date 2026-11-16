@@ -23,7 +23,7 @@ use crate::expr::{ArrayStyle, Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::naming::{pluralize_snake, underscore};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::util::{bool_value, constant_id_str, string_value, symbol_or_string_value, symbol_value};
 use super::IngestResult;
@@ -254,6 +254,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             name: decl.role.clone(),
             target: ClassId(Symbol::from(crate::naming::camelize(decl.role.as_str()))),
             foreign_key: decl.foreign_key.clone(),
+            foreign_key_explicit: false,
             optional: decl.optional,
             polymorphic: true,
             polymorphic_targets: targets,
@@ -261,6 +262,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             touch: decl.touch,
             foreign_type: Some(decl.foreign_type.clone()),
             primary_key: Some(decl.primary_key.clone()),
+            scope: None,
         },
         leading_comments: leading_comments.to_vec(),
         leading_blank_line: false,
@@ -521,12 +523,12 @@ fn instance_method_typed(name: String, body: Expr, ret: Ty) -> ModelBodyItem {
         name,
         MethodReceiver::Instance,
         body,
-        Some(Ty::Fn {
+        Some(Ty::Fn(Box::new(FnTy {
             params: Vec::new().into(),
             block: None,
             ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
-        }),
+        }))),
     )
 }
 

@@ -614,11 +614,14 @@ fn assoc_scope_shape(
     // them when every call site agreed the argument is one, which is
     // what makes `create!(attributes)` mergeable without guessing.
     let hash_params: HashSet<Symbol> = match &method_def.signature {
-        Some(crate::ty::Ty::Fn { params, .. }) => params
-            .iter()
-            .filter(|p| matches!(*p.ty, crate::ty::Ty::Hash { .. }))
-            .map(|p| p.name.clone())
-            .collect(),
+        Some(crate::ty::Ty::Fn(fn_ty)) => {
+            let crate::ty::FnTy { params, .. } = &**fn_ty;
+            params
+                .iter()
+                .filter(|p| matches!(*p.ty, crate::ty::Ty::Hash { .. }))
+                .map(|p| p.name.clone())
+                .collect()
+        },
         _ => HashSet::default(),
     };
     #[allow(clippy::too_many_arguments)]
@@ -638,7 +641,12 @@ fn assoc_scope_shape(
                     || (args.len() == 1
                         && match &*args[0].node {
                             ExprNode::Hash { .. } => true,
-                            ExprNode::Var { name, .. } => hash_params.contains(name),
+                            // Or a local the analyzer typed as a Hash: the row
+                            // `lower::create_rows` hands each `create!` of an Array.
+                            ExprNode::Var { name, .. } => {
+                                hash_params.contains(name)
+                                    || matches!(args[0].ty, Some(crate::ty::Ty::Hash { .. }))
+                            }
                             _ => false,
                         });
                 if !mergeable && blocked.is_none() {
@@ -1343,6 +1351,11 @@ pub struct AssocRegistry {
     /// so their `joins(:sym)` is left untouched (visible at runtime
     /// rather than silently mis-joined).
     join_tails: HashMap<(ClassId, Symbol), String>,
+    /// (model, association) whose own scope, over its target's default
+    /// scope, renders no ON clause here (`scope_join_tails`), so its
+    /// `joins(:assoc)` keeps no tail: `analyze` refuses such a join
+    /// rather than leave it to the runtime's raise.
+    unrenderable_join_scopes: HashSet<(ClassId, Symbol)>,
     /// (model, belongs_to name) -> foreign-key column, for
     /// `where(user: user)` -> `where(user_id: user && user.id)`.
     belongs_to_fk: HashMap<(ClassId, Symbol), Symbol>,
@@ -1583,6 +1596,12 @@ impl AssocRegistry {
             None => crate::naming::rails_table_name(model.0.as_str()),
         }
     }
+    /// Does `model`'s `assoc` keep no join tail because its scope
+    /// doesn't render as SQL (see the field)?
+    pub fn join_scope_unrenderable(&self, model: &ClassId, assoc: &Symbol) -> bool {
+        self.unrenderable_join_scopes.contains(&(model.clone(), assoc.clone()))
+    }
+
     fn join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<&String> {
         self.join_tails.get(&(model.clone(), assoc.clone()))
     }
@@ -1590,14 +1609,15 @@ impl AssocRegistry {
         self.belongs_to_fk.get(&(model.clone(), assoc.clone()))
     }
     /// `(type column, resolved implementor classes)` of a polymorphic
-    /// belongs_to; the set is empty when no `as:` inverse resolved it.
+    /// belongs_to; the set is empty only on a framework record ingest
+    /// synthesizes after `resolve_polymorphic_targets` runs.
     fn polymorphic_belongs_to(&self, model: &ClassId, assoc: &Symbol) -> Option<&(Symbol, Vec<ClassId>)> {
         self.polymorphic_belongs_to.get(&(model.clone(), assoc.clone()))
     }
     fn assoc_table(&self, model: &ClassId, assoc: &Symbol) -> Option<&Symbol> {
         self.assoc_table.get(&(model.clone(), assoc.clone()))
     }
-    fn assoc_target(&self, model: &ClassId, assoc: &Symbol) -> Option<&ClassId> {
+    pub(crate) fn assoc_target(&self, model: &ClassId, assoc: &Symbol) -> Option<&ClassId> {
         self.assoc_target.get(&(model.clone(), assoc.clone()))
     }
     fn aliased_join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<&String> {
@@ -1797,6 +1817,7 @@ impl AssocRegistry {
         let Self {
             finder_classes: _,
             join_tails,
+            unrenderable_join_scopes,
             belongs_to_fk,
             polymorphic_belongs_to,
             assoc_target,
@@ -1817,6 +1838,7 @@ impl AssocRegistry {
         } = self;
         let key = (model.clone(), name.clone());
         join_tails.remove(&key);
+        unrenderable_join_scopes.remove(&key);
         belongs_to_fk.remove(&key);
         polymorphic_belongs_to.remove(&key);
         assoc_target.remove(&key);
@@ -1949,9 +1971,10 @@ pub(crate) fn association_primary_key(
 /// named after the declaring model, on the same foreign key, pointing
 /// back at it. Rails' conditions, as far as the declarations show them:
 /// no `through:`, no `as:`, no scope, no explicit `foreign_key:` on
-/// either side, and an `id` owner key.
+/// either side, and an `id` owner key. A `has_one` finds its inverse the
+/// same way.
 pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -> Option<Symbol> {
-    let Association::HasMany {
+    let (Association::HasMany {
         target,
         foreign_key,
         foreign_key_explicit: false,
@@ -1959,7 +1982,16 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         as_interface: None,
         scope: None,
         ..
-    } = assoc
+    }
+    | Association::HasOne {
+        target,
+        foreign_key,
+        foreign_key_explicit: false,
+        through: None,
+        as_interface: None,
+        scope: None,
+        ..
+    }) = assoc
     else {
         return None;
     };
@@ -1967,13 +1999,17 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         return None;
     }
     let inverse = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
-    models.iter().find(|tm| &tm.name == target)?.associations().find_map(|ta| match ta {
+    // The target's last declaration of the name, as Rails keeps it.
+    let declared = models.iter().find(|tm| &tm.name == target)?.associations().filter(|ta| ta.name().as_str() == inverse).last()?;
+    match declared {
         Association::BelongsTo {
             name: bt,
             target: bt_target,
             foreign_key: bt_fk,
+            foreign_key_explicit: false,
             polymorphic: false,
             primary_key: None,
+            scope: None,
             ..
         } if bt.as_str() == inverse
             && bt_target == &owner.name
@@ -1983,7 +2019,46 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
             Some(bt.clone())
         }
         _ => None,
-    })
+    }
+}
+
+/// The `has_one` on the target that Rails finds as `owner`'s `belongs_to`
+/// automatic inverse: named after the declaring model (`Captain
+/// belongs_to :fleet` -> `Fleet has_one :captain`), on the same foreign
+/// key, pointing back at it, with neither side scoped, keyed by an
+/// explicit `foreign_key:`, `as:` or `through:`. A has_many is never one:
+/// Rails looks the singular name up, and inverts plural associations only
+/// when `automatically_invert_plural_associations` is set.
+pub fn belongs_to_inverse(models: &[Model], owner: &Model, assoc: &Association) -> Option<Symbol> {
+    let Association::BelongsTo {
+        target,
+        foreign_key,
+        foreign_key_explicit: false,
+        polymorphic: false,
+        primary_key: None,
+        scope: None,
+        ..
+    } = assoc
+    else {
+        return None;
+    };
+    let inverse = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
+    let target_model = models.iter().find(|tm| &tm.name == target)?;
+    match target_model.associations().filter(|a| a.name().as_str() == inverse).last()? {
+        found @ Association::HasOne {
+            name: ho,
+            target: ho_target,
+            foreign_key: ho_fk,
+            foreign_key_explicit: false,
+            through: None,
+            as_interface: None,
+            scope: None,
+            ..
+        } if ho_target == &owner.name && ho_fk == foreign_key && found.owner_key().as_str() == "id" => {
+            Some(ho.clone())
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {
@@ -2230,9 +2305,17 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
 /// AND gadgets.archived = FALSE`). A `through:` join touching a scoped
 /// model, or a scope this cannot render (one read when the relation is
 /// built), keeps no tail: the join is not composed rather than composed
-/// without the scope.
+/// without the scope. A `belongs_to`'s own scope runs over the target's
+/// default scope there too (`default_scope::join_scope_conditions`), so
+/// `belongs_to :shelf, -> { unscope(where: :archived) }` joins archived
+/// shelves, as Rails' association join does, and a scope it cannot
+/// render keeps no tail either. A `has_many` / `has_one` with a scope
+/// lambda puts that lambda's conditions in the ON clause the same way
+/// (`has_many :flagged_ships, -> { where(flag: true) }` joins only
+/// flagged ships); a `through:` association is composed two hops down
+/// and keeps no tail, scoped or not.
 fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
-    use super::default_scope::{default_scope, sql_predicate, DefaultScope};
+    use super::default_scope::{default_scope, join_scope_conditions, sql_predicate, DefaultScope};
     let scoped: HashMap<ClassId, Vec<(Symbol, Literal)>> = models
         .iter()
         .filter_map(|m| {
@@ -2244,46 +2327,67 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             })
         })
         .collect();
-    if scoped.is_empty() {
-        return;
-    }
+    // The last declaration of the name, as the registry keeps it.
+    let declared_scope = |owner: &ClassId, name: &Symbol| {
+        models.iter().find(|m| &m.name == owner).and_then(|m| {
+            match m.associations().filter(|a| a.name() == name).last()? {
+                Association::BelongsTo { polymorphic: false, scope: Some(scope), .. } => Some(scope),
+                Association::HasMany { through: None, scope: Some(scope), .. }
+                | Association::HasOne { through: None, scope: Some(scope), .. } => Some(scope),
+                _ => None,
+            }
+        })
+    };
     let keys: Vec<((ClassId, Symbol), ClassId)> =
         reg.assoc_target.iter().map(|(k, t)| (k.clone(), t.clone())).collect();
     for ((owner, name), target) in keys {
+        let own_scope = declared_scope(&owner, &name);
+        if scoped.is_empty() && own_scope.is_none() {
+            continue;
+        }
         let through = models
             .iter()
             .find(|m| m.name == owner)
             .and_then(|m| {
-                m.associations().find_map(|a| match a {
-                    Association::HasMany { name: n, through: Some(thr), .. } if *n == name => {
-                        m.associations().find_map(|t| match t {
-                            Association::HasMany { name: tn, target: tt, .. } if tn == thr => Some(tt.clone()),
+                // The last declaration of each name, as the registry keeps it.
+                match m.associations().filter(|a| a.name() == &name).last()? {
+                    Association::HasMany { through: Some(thr), .. } => {
+                        match m.associations().filter(|t| t.name() == thr).last()? {
+                            Association::HasMany { target: tt, .. } => Some(tt.clone()),
                             _ => None,
-                        })
+                        }
                     }
                     _ => None,
-                })
+                }
             });
         let key = (owner.clone(), name.clone());
         let through_scoped = through.as_ref().is_some_and(|t| scoped.contains_key(t));
-        let Some(preds) = scoped.get(&target) else {
+        let defaults = scoped.get(&target);
+        if defaults.is_none() && own_scope.is_none() {
             if through_scoped {
                 reg.join_tails.remove(&key);
                 reg.aliased_join_tails.remove(&key);
             }
             continue;
-        };
+        }
         if through.is_some() {
             reg.join_tails.remove(&key);
             reg.aliased_join_tails.remove(&key);
             continue;
         }
+        // An empty default is one no SQL here can read (`Dynamic`).
+        let preds = match (defaults, own_scope) {
+            (Some(d), _) if d.is_empty() => None,
+            (d, Some(scope)) => models
+                .iter()
+                .find(|m| m.name == target)
+                .and_then(|t| join_scope_conditions(t, d.cloned().unwrap_or_default(), scope)),
+            (d, None) => d.cloned(),
+        };
         let table = reg.table_for(&target);
         let render = |alias: &str| -> Option<String> {
-            if preds.is_empty() {
-                return None;
-            }
             preds
+                .as_ref()?
                 .iter()
                 .map(|(col, lit)| sql_predicate(alias, col, lit).map(|p| format!(" AND {p}")))
                 .collect()
@@ -2300,6 +2404,9 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             _ => {
                 reg.join_tails.remove(&key);
                 reg.aliased_join_tails.remove(&key);
+                if own_scope.is_some() {
+                    reg.unrenderable_join_scopes.insert(key);
+                }
             }
         }
     }
@@ -2715,12 +2822,28 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                         "offset" | "limit" | "order" | "reorder" | "joins" | "left_outer_joins"
                             | "left_joins" | "includes" | "preload" | "eager_load" | "references" | "group"
                             | "having" | "merge" | "unscope"
-                    ));
-            if is_where || method.as_str().starts_with("find_by_") && block.is_none()
+                            // Array's `load` is private (Kernel#load), so
+                            // `post.comments.load` is a NoMethodError on the
+                            // reader's Array too.
+                            | "load" | "load_async" | "from" | "extract_associated"
+                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
+            // `owner.items.update(attrs)` alone in a method body is the
+            // proxy's bulk update over the records the association holds
+            // (`rewrite_send` lowers it to the generated
+            // `__<name>_update`). Array answers no one-Hash `update`, so
+            // the site is a NoMethodError today and a call after. Only
+            // this exact shape — one Hash argument, no block — is
+            // admitted; which associations the model actually holds is
+            // the rewriter's check, as it is for every gate here.
+            let is_held_update = method.as_str() == "update"
+                && block.is_none()
+                && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Hash { .. }));
+            if is_where || is_held_update || method.as_str().starts_with("find_by_") && block.is_none()
                 || is_relation_terminal(method.as_str(), args, block.as_ref())
                     && matches!(
                         method.as_str(),
                         "find"
+                            | "sum"
                             | "find_by"
                             | "find_by!"
                             | "find_sole_by"
@@ -2947,6 +3070,37 @@ pub fn mentions_bare_chain_start(expr: &Expr) -> bool {
 ///
 /// `all` is a terminal in the catalog and is checked separately at the
 /// call sites that seed a relation from it.
+/// Rails' `extract_associated(:name)`: `preload(:name).collect(&:name)`,
+/// each owner's reader answering the records the preload installed.
+fn extract_associated(span: crate::span::Span, rel: Expr, args: Vec<Expr>, aname: Symbol) -> Expr {
+    let put = |span, recv, method, args, block, parenthesized| {
+        syn(span, ExprNode::Send { recv, method, args, block, parenthesized })
+    };
+    let preloaded = put(span, Some(rel), Symbol::from("preload"), args, None, true);
+    let rows = put(span, Some(preloaded), Symbol::from("to_a"), vec![], None, false);
+    let owner = Symbol::from("__rh_owner");
+    let read = put(
+        span,
+        Some(syn(span, ExprNode::Var { id: crate::ident::VarId(0), name: owner.clone() })),
+        aname,
+        vec![],
+        None,
+        false,
+    );
+    let block = syn(
+        span,
+        ExprNode::Lambda {
+            extra_params: Vec::new(),
+            rest_param: None,
+            params: vec![owner],
+            block_param: None,
+            body: read,
+            block_style: BlockStyle::Brace,
+        },
+    );
+    put(span, Some(rows), Symbol::from("map"), vec![], Some(block), false)
+}
+
 pub(crate) fn is_relation_chain_method(name: &str) -> bool {
     crate::catalog::is_relation_builder_name(name)
 }
@@ -2983,7 +3137,7 @@ fn is_relation_expr(e: &Expr, ctx: &Ctx, locals: &Locals) -> bool {
             }
             let hop = is_relation_chain_method(name)
                 || crate::catalog::is_relation_context_builder(name)
-                || matches!(name, "where_scope" | "preloaded" | "skip_preloading!" | "page" | "per");
+                || matches!(name, "where_scope" | "preloaded" | "_inversed_from" | "skip_preloading!" | "page" | "per");
             hop && is_relation_expr(r, ctx, locals)
         }
         _ => false,
@@ -3261,8 +3415,14 @@ fn thread_rel(mut args: Vec<Expr>, rel: Expr, leading: Option<&Vec<Param>>, span
 ///
 /// `maximum` / `minimum` likewise: `Base` defines neither, and the arel
 /// pass leaves them to `Relation`'s SQL extrema.
+///
+/// `delete(id_or_array)` too: Querying delegates it to `all`, and
+/// Relation#delete is one DELETE of those keys. It cannot be a
+/// `def self.delete` on Base, because the runtime's signature checks key
+/// a class's methods by name and Base's instance `delete` (the record's
+/// own row, no arguments) already holds it.
 const CLASS_ROOT_TERMINALS: &[&str] = &[
-    "pluck", "pick", "ids", "destroy_by", "delete_by", "maximum", "minimum",
+    "pluck", "pick", "ids", "destroy_by", "delete_by", "delete", "maximum", "minimum",
 ];
 
 /// Relation TERMINALS our runtime implements — a seeded association
@@ -3291,6 +3451,9 @@ fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool
         // relation (`room.messages.find_each(&:destroy)`), where the
         // association read alone is an Array with no `find_each`.
         "find_each" | "find_in_batches" => true,
+        // A column sum (`post.comments.sum(:votes)`); Array's `sum` takes
+        // an initial value or a block, never a column.
+        "sum" => args.len() == 1 && block.is_none() && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }),
         _ => matches!(
             name,
             "ids" | "pluck" | "count" | "first" | "last" | "exists?" | "any?" | "empty?" | "size"
@@ -3463,6 +3626,16 @@ pub(crate) fn owner_reads_once(owner: &Expr) -> bool {
     }
 }
 
+/// True when reading `owner` a second time answers the same value
+/// without running anything: a local, an ivar, or `self`. The hold wrap
+/// a constructor on a held has_many takes names the owner twice — as
+/// `__hold_<name>`'s receiver and inside the constructor's key (or
+/// inverse) argument — so an owner this does not admit (`Shelf.counted`,
+/// `Room.find(id)`) would be evaluated once per mention.
+fn owner_repeats_safely(owner: &Expr) -> bool {
+    matches!(&*owner.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
+}
+
 /// Association resolution for the seed arm: `(target, fk, <owner>.id)`,
 /// from the owner's stamped type, else the owner's NAME, else the assoc
 /// name when it is a unique has_many across models.
@@ -3512,6 +3685,7 @@ fn build_association_seed(
     owner: &Expr,
     name: &Symbol,
     scope_attributes: bool,
+    inversed: bool,
 ) -> Expr {
     // An owner key other than `id` can be NULL, and
     // `where(fk: nil)` would match the child rows
@@ -3605,6 +3779,25 @@ fn build_association_seed(
                 args: vec![
                     owner_send(format!("{}_target", name.as_str())),
                     owner_send(format!("{}_loaded?", name.as_str())),
+                ],
+                block: None,
+                parenthesized: true,
+            },
+        );
+    }
+    // The rows it loads hold the owner through the association's
+    // automatic inverse, as an `AssociationRelation`'s do
+    // (`Relation#_inversed_from`), the create-scope spelling's too: a
+    // class method reached through the association queries on it.
+    if inversed {
+        seed = syn(
+            span,
+            ExprNode::Send {
+                recv: Some(seed),
+                method: Symbol::from("_inversed_from"),
+                args: vec![
+                    owner.clone(),
+                    syn(span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } }),
                 ],
                 block: None,
                 parenthesized: true,
@@ -5144,10 +5337,14 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         _ if matches!(method.as_str(), "build" | "create" | "create!") => {
                             assoc_owner_seed(ctx, aname, ir, span)
                         }
-                        // The same for `<<` onto a has_many the owner holds:
-                        // the push keeps the owner as its one receiver
-                        // (`Article.find(id).comments << c`).
-                        _ if method.as_str() == "<<"
+                        // The same for `<<` onto a has_many the owner holds,
+                        // and for its `update(attrs)`: each keeps the owner as
+                        // its one receiver (`Article.find(id).comments << c`,
+                        // `Kennel.find(id).dogs.update(age: 7)`).
+                        _ if (method.as_str() == "<<"
+                            || (method.as_str() == "update"
+                                && block.is_none()
+                                && matches!(args.as_slice(), [arg] if matches!(&*arg.node, ExprNode::Hash { .. }))))
                             && args.len() == 1
                             && assoc_read_target(ir, aname, ctx.assocs)
                                 .and_then(|(owner, _, _)| owner)
@@ -5222,6 +5419,26 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 None => (format!("__push_{aname}"), args[0].clone()),
                             };
                             *expr = put(span, Some(ir.clone()), Symbol::from(callee), vec![arg], None, true);
+                            return None;
+                        }
+                        // `owner.items.update(attrs)` — Rails'
+                        // `CollectionProxy#update` updates each record the
+                        // association holds (`to_a`, held records included)
+                        // and answers the records.
+                        if held
+                            && method.as_str() == "update"
+                            && args.len() == 1
+                            && block.is_none()
+                            && matches!(&*args[0].node, ExprNode::Hash { .. })
+                        {
+                            *expr = put(
+                                span,
+                                Some(ir.clone()),
+                                Symbol::from(format!("__{aname}_update")),
+                                args,
+                                None,
+                                true,
+                            );
                             return None;
                         }
                         let ctor = match method.as_str() {
@@ -5326,9 +5543,27 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     block,
                                     true,
                                 );
-                                // A built record is the owner's to hold:
-                                // validated with it and saved after it.
-                                if held && ctor_name == "new" {
+                                // A record created, built on or pushed
+                                // onto the association is the owner's to
+                                // hold: the object the target answers, which
+                                // a later read merges the row into
+                                // (`_merge_target`). A built one is also
+                                // validated with the owner and saved after
+                                // it. A created record is held only when its
+                                // owner reads the same value twice (a local,
+                                // an ivar or `self`): the wrap names the owner
+                                // again as the constructor's key, so a method
+                                // call would run once per mention. Otherwise
+                                // the create keeps its unheld shape, with the
+                                // owner read once. A built record is always
+                                // held: the owner saves it, so a memoized
+                                // owner reader (`current_shelf.books.build`)
+                                // must hold it (KNOWN GAP: that owner is read
+                                // twice).
+                                if held
+                                    && (ctor_name == "new"
+                                        || (matches!(ctor_name, "create" | "create!") && owner_repeats_safely(ir)))
+                                {
                                     let ty = expr.ty.clone();
                                     let built = std::mem::replace(expr, syn(span, ExprNode::Lit { value: Literal::Nil }));
                                     *expr = put(
@@ -5354,10 +5589,23 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         // the seed is spelled `where_scope`, which records
                         // the foreign key as `scope_attributes` too.
                         let assoc_cm = ctx.assoc_class_method_params(&target, &method);
-                        if is_scope || is_chain || is_term || assoc_cm.is_some() {
+                        // `owner.posts.extract_associated(:author)`: the
+                        // association's relation, preloaded and mapped.
+                        let extracted = match args.as_slice() {
+                            [arg] if method.as_str() == "extract_associated" && block.is_none() => match &*arg.node {
+                                ExprNode::Lit { value: Literal::Sym { value } }
+                                    if ctx.assocs.assoc_target(&target, value).is_some() =>
+                                {
+                                    Some(value.clone())
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if is_scope || is_chain || is_term || assoc_cm.is_some() || extracted.is_some() {
                             let seed = build_association_seed(
                                 span, &target, fk, owner_id, type_entry.clone(), ir, aname,
-                                assoc_cm.is_some(),
+                                assoc_cm.is_some(), inverse.is_some(),
                             );
                             if let Some(leading) = assoc_cm {
                                 let new_args = thread_rel(args, seed, Some(leading), span);
@@ -5371,6 +5619,32 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 );
                                 // The method returns whatever it built —
                                 // a record, not a relation.
+                                return None;
+                            }
+                            // A collection terminal on a model that holds
+                            // what is built on it answers the held records
+                            // too (`ingest::has_many_hold`'s `__<name>_<terminal>`).
+                            if held
+                                && is_term
+                                && args.is_empty()
+                                && block.is_none()
+                                && matches!(
+                                    method.as_str(),
+                                    "first" | "last" | "size" | "length" | "empty?" | "any?" | "destroy_all"
+                                )
+                            {
+                                *expr = put(
+                                    span,
+                                    Some(ir.clone()),
+                                    Symbol::from(format!("__{aname}_{method}")),
+                                    vec![seed],
+                                    None,
+                                    true,
+                                );
+                                return None;
+                            }
+                            if let Some(aname) = extracted {
+                                *expr = extract_associated(span, seed, args, aname);
                                 return None;
                             }
                             if is_scope {
@@ -5561,6 +5835,18 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         );
                         return None;
                     }
+                }
+                // Rails' `extract_associated(:posts)`:
+                // `preload(:posts).collect(&:posts)`, each owner's reader
+                // answering the records the preload installed.
+                if method.as_str() == "extract_associated" && block.is_none()
+                    && let [arg] = args.as_slice()
+                    && let ExprNode::Lit { value: Literal::Sym { value: aname } } = &*arg.node
+                    && ctx.assocs.assoc_target(&mr, aname).is_some()
+                {
+                    let aname = aname.clone();
+                    *expr = extract_associated(span, r, args, aname);
+                    return None;
                 }
                 if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
                     *expr = put(span, Some(r), counted, args, block, parenthesized);
@@ -7094,6 +7380,237 @@ mod tests {
             "a non-association bare read keeps its shape, got {:?}",
             r.node
         );
+    }
+
+    /// `owner.items.update(attrs)` alone in a method body is the one
+    /// association call no gate used to admit: a body whose only relation
+    /// surface is the proxy's bulk update reached no rewriter and stayed
+    /// `Array#update`. The lookup gate now admits exactly that shape, and
+    /// the rewrite still requires the model to HOLD the association, so a
+    /// plain has_many keeps the call it had.
+    #[test]
+    fn a_lone_held_update_is_admitted_and_a_plain_has_many_is_left_alone() {
+        let kennel = ingest(
+            "class Kennel < ApplicationRecord\n  has_many :dogs\nend\n",
+            "app/models/kennel.rb",
+        );
+        let dog = ingest(
+            "class Dog < ApplicationRecord\n  belongs_to :kennel\nend\n",
+            "app/models/dog.rb",
+        );
+        let models_v = vec![kennel.clone(), dog];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let mut assocs = build_assoc_registry(&models_v);
+        let owner = kennel.name.clone();
+        let body = || {
+            let read = Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(span(), ExprNode::SelfRef)),
+                    method: Symbol::from("dogs"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(read),
+                    method: Symbol::from("update"),
+                    args: vec![hash_arg(vec![(sym_lit("age"), int_lit(7))])],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        };
+
+        let plain = body();
+        assert!(mentions_assoc_lookup(&plain, &assocs), "the gate admits the one-hash update");
+        let mut plain_rewritten = body();
+        rewrite_call_site(&mut plain_rewritten, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { method, .. } = &*plain_rewritten.node else {
+            panic!("expected Send, got {:?}", plain_rewritten.node)
+        };
+        assert_eq!(
+            method.as_str(),
+            "update",
+            "an association the model does not hold keeps its reader call: {:?}",
+            plain_rewritten.node
+        );
+
+        assocs.has_many_held.insert((owner.clone(), Symbol::from("dogs")));
+        let mut held = body();
+        rewrite_call_site(&mut held, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { method, .. } = &*held.node else {
+            panic!("expected Send, got {:?}", held.node)
+        };
+        assert_eq!(method.as_str(), "__dogs_update", "held association: {:?}", held.node);
+
+        // Nothing broader: a variable argument is not the shape.
+        let mut var_arg = body();
+        if let ExprNode::Send { args, .. } = &mut *var_arg.node {
+            args[0] = Expr::new(span(), ExprNode::Var { id: VarId(0), name: Symbol::from("attrs") });
+        }
+        assert!(
+            !mentions_assoc_lookup(&var_arg, &assocs),
+            "a bare variable argument is not admitted"
+        );
+    }
+
+    /// The hold wrap names the owner twice — `__hold_<name>`'s receiver
+    /// and the constructor's key — so it is only taken for an owner that
+    /// reads the same value twice (a local, an ivar, `self`). A
+    /// method-call owner keeps the unheld shape (and its one read) for
+    /// `create!`; `build` stays held, since its owner saves the record.
+    #[test]
+    fn a_constructor_on_a_method_call_owner_is_not_hold_wrapped() {
+        let shelf = ingest(
+            "class Shelf < ApplicationRecord\n  has_many :books\nend\n",
+            "app/models/shelf.rb",
+        );
+        let book = ingest(
+            "class Book < ApplicationRecord\n  belongs_to :shelf\nend\n",
+            "app/models/book.rb",
+        );
+        let models_v = vec![shelf.clone(), book];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let mut assocs = build_assoc_registry(&models_v);
+        assocs.has_many_held.insert((shelf.name.clone(), Symbol::from("books")));
+        let ctor = |owner: Expr, method: &str| {
+            let read = Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(owner),
+                    method: Symbol::from("books"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(read),
+                    method: Symbol::from(method),
+                    args: vec![hash_arg(vec![(sym_lit("title"), int_lit(1))])],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        };
+
+        // A bareword owner (the template-local form) whose name reads
+        // `Shelf` by convention: `Shelf` declares `books`.
+        let bare_shelf = || {
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("shelf"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            )
+        };
+        let mut create = ctor(bare_shelf(), "create!");
+        rewrite_call_site(&mut create, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, args, .. } = &*create.node else {
+            panic!("expected Send, got {:?}", create.node)
+        };
+        assert_eq!(method.as_str(), "create!", "an owner read twice is not held: {:?}", create.node);
+        let ExprNode::Hash { entries, .. } = &*args[0].node else {
+            panic!("expected a kwargs hash, got {:?}", args[0].node)
+        };
+        assert!(
+            entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "shelf_id")),
+            "the constructor still carries the association's key: {entries:?}"
+        );
+
+        let ivar = Expr::new(span(), ExprNode::Ivar { name: Symbol::from("shelf") });
+        let mut built = ctor(ivar, "build");
+        rewrite_call_site(&mut built, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, .. } = &*built.node else {
+            panic!("expected Send, got {:?}", built.node)
+        };
+        assert_eq!(method.as_str(), "__hold_books", "an ivar owner is held: {:?}", built.node);
+
+        let mut built_on_call = ctor(bare_shelf(), "build");
+        rewrite_call_site(&mut built_on_call, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, .. } = &*built_on_call.node else {
+            panic!("expected Send, got {:?}", built_on_call.node)
+        };
+        assert_eq!(method.as_str(), "__hold_books", "a built record is held whatever its owner: {:?}", built_on_call.node);
+    }
+
+    #[test]
+    fn registry_scoped_has_many_and_has_one_join_carries_the_scope() {
+        // `has_many :tall_trees, -> { where(tall: true) }` joins only the
+        // tall trees, as Rails' association join does: the scope's
+        // condition lands in the ON clause, against the table alias when
+        // the association's name is not the table's.
+        let orchard = ingest(
+            "class Orchard < ApplicationRecord\n  has_many :trees\n  \
+             has_many :tall_trees, -> { where(tall: true) }, class_name: \"Tree\"\n  \
+             has_one :featured_tree, -> { where(featured: true) }, class_name: \"Tree\"\nend\n",
+            "app/models/orchard.rb",
+        );
+        let mut tree = ingest(
+            "class Tree < ApplicationRecord\n  belongs_to :orchard\nend\n",
+            "app/models/tree.rb",
+        );
+        tree.attributes.fields.insert(Symbol::from("tall"), crate::ty::Ty::Bool);
+        tree.attributes.fields.insert(Symbol::from("featured"), crate::ty::Ty::Bool);
+        let reg = build_assoc_registry(&[orchard, tree]);
+        let orchard = ClassId(Symbol::from("Orchard"));
+        let tall = Symbol::from("tall_trees");
+        assert_eq!(
+            reg.join_tail(&orchard, &tall),
+            Some(&"trees ON trees.orchard_id = orchards.id AND trees.tall = TRUE".to_string())
+        );
+        assert_eq!(
+            reg.aliased_join_tail(&orchard, &tall),
+            Some(&"trees tall_trees ON tall_trees.orchard_id = orchards.id AND tall_trees.tall = TRUE".to_string())
+        );
+        let featured = Symbol::from("featured_tree");
+        assert_eq!(
+            reg.join_tail(&orchard, &featured),
+            Some(&"trees ON trees.orchard_id = orchards.id AND trees.featured = TRUE".to_string())
+        );
+        assert_eq!(
+            reg.aliased_join_tail(&orchard, &featured),
+            Some(&"trees featured_tree ON featured_tree.orchard_id = orchards.id AND featured_tree.featured = TRUE".to_string())
+        );
+        // An unscoped association keeps the bare tail.
+        assert_eq!(
+            reg.join_tail(&orchard, &Symbol::from("trees")),
+            Some(&"trees ON trees.orchard_id = orchards.id".to_string())
+        );
+    }
+
+    #[test]
+    fn registry_scoped_has_many_join_a_scope_cannot_render_keeps_no_tail() {
+        // A scope no SQL here can read (`where("…")`) is not composed
+        // without the scope: the join is left to raise, not to answer
+        // rows the scope would exclude.
+        let orchard = ingest(
+            "class Orchard < ApplicationRecord\n  \
+             has_many :shady_trees, -> { where(\"tall = 0\") }, class_name: \"Tree\"\nend\n",
+            "app/models/orchard.rb",
+        );
+        let mut tree = ingest(
+            "class Tree < ApplicationRecord\n  belongs_to :orchard\nend\n",
+            "app/models/tree.rb",
+        );
+        tree.attributes.fields.insert(Symbol::from("tall"), crate::ty::Ty::Bool);
+        let reg = build_assoc_registry(&[orchard, tree]);
+        let orchard = ClassId(Symbol::from("Orchard"));
+        let shady = Symbol::from("shady_trees");
+        assert!(reg.join_tail(&orchard, &shady).is_none());
+        assert!(reg.aliased_join_tail(&orchard, &shady).is_none());
     }
 
     #[test]

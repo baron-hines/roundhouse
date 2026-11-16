@@ -1739,6 +1739,28 @@ fn report_time_tag_calls(app: &App, target: BuildTarget) {
     }
 }
 
+/// A target whose entries do not run the callbacks never runs them: each
+/// one is an unsupported construct there, not a silent drop.
+fn report_unrun_after_initialize(app: &App, target: BuildTarget) {
+    // Only the Ruby family's and Spinel's entries call the runner
+    // (`apply_app_initializers`); Blog and Futamura walk the source.
+    if !app.runs_after_initialize
+        || matches!(target, BuildTarget::Blog | BuildTarget::Futamura | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+    {
+        return;
+    }
+    for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == crate::app::AFTER_INITIALIZE_RUNNER) {
+        for method in class.methods.iter().filter(|m| !m.name_span.is_synthetic()) {
+            emit::diagnostics::report_unsupported(
+                method.name_span,
+                target.as_str(),
+                "after_initialize",
+                format!("{} has no boot step that runs an after_initialize callback", target.as_str()),
+            );
+        }
+    }
+}
+
 /// A non-integer primary key (`create_table …, id: :uuid`,
 /// `primary_key: "identifier", id: :string`) is carried end to end by
 /// the ruby-shape emit — CRuby, JRuby and Spinel: the analyzer types
@@ -1921,6 +1943,87 @@ fn inject_cruby_date_calendar_helpers(boot: &mut String) -> Result<(), String> {
              (CRuby date calendar inject anchor)"
                 .into(),
         )
+    }
+}
+
+/// Spinel's `ActiveSupport::OrderedOptions` (runtime/ordered_options_spinel.rb) and its `Class` reopen with
+/// `descendants` / `module_parents` (runtime/class_ext_spinel.rb), required only by a tree whose own code names them:
+/// Spinel types a method by every class that defines its name, so their `update` / `fetch` / `keys` in every tree
+/// would widen the arguments other classes' methods of those names are given (openssl's `Digest#update`).
+fn inject_spinel_active_support_requires(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
+    let own = |needle: &dyn Fn(&str) -> bool| {
+        files.iter().any(|(p, text)| p.ends_with(".rb") && !p.starts_with("runtime/") && needle(text))
+    };
+    let mut requires = String::new();
+    let mut sigs = Vec::new();
+    if own(&|text| text.contains("OrderedOptions")) {
+        requires.push_str("require_relative \"runtime/ordered_options_spinel\"\n");
+        sigs.push("ordered_options_spinel");
+    }
+    if own(&|text| text.contains("Gzip.decompress") || text.contains("Gzip.compress") || text.contains("ActiveSupport::Gzip")) {
+        requires.push_str("require_relative \"runtime/active_support_gzip_spinel\"\n");
+        sigs.push("active_support_gzip_spinel");
+    }
+    // Not only a dotted call: a class method calls them bare (`descendants.each`); not a word inside another name, nor
+    // an assignment (`descendants = …`), though a comparison (`module_parent == Object`) still calls it.
+    let names_bare = |text: &str, name: &str| {
+        text.match_indices(name).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + name.len()..].chars().next();
+            before.is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '@' || c == ':' || c == '$'))
+                && after.is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '?' || c == '!'))
+                && !text[at + name.len()..].trim_start().strip_prefix('=').is_some_and(|rest| !rest.starts_with(['=', '~', '>']))
+        })
+    };
+    if own(&|text| ["descendants", "module_parent", "module_parents", "module_parent_name"].iter().any(|n| names_bare(text, n))) {
+        requires.push_str("require_relative \"runtime/class_ext_spinel\"\n");
+        sigs.push("class_ext_spinel");
+    }
+    // After the shared view helpers, whose `html_escape` and `raw` it reopens: where the marks stay, not where a file names
+    // the class (Spinel's tree nests a namespace's classes, `module ViewComponent` / `class Base`).
+    let safe = crate::lower::html_safe::spinel_keeps_marks(app);
+    if safe {
+        sigs.push("safe_string_spinel");
+    }
+    if requires.is_empty() && !safe {
+        return Ok(());
+    }
+    let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else {
+        return Err("boot.rb missing for the ActiveSupport requires".into());
+    };
+    if !requires.is_empty() {
+        let anchor = "require_relative \"runtime/rails\"\n";
+        let at = boot.find(anchor).ok_or("boot.rb missing the rails require (ActiveSupport anchor)")?;
+        boot.insert_str(at + anchor.len(), &requires);
+    }
+    if safe {
+        let anchor = "require_relative \"runtime/action_controller\"\n";
+        let at = boot.find(anchor).ok_or("boot.rb missing the action_controller require (safe String anchor)")?;
+        boot.insert_str(at + anchor.len(), "require_relative \"runtime/safe_string_spinel\"\n");
+    }
+    for stem in sigs {
+        let rbs = crate::runtime_files::read_to_string(&format!("runtime/spinel/{stem}.rbs"))?;
+        files.push((format!("sig/runtime/{stem}.rbs"), rbs));
+    }
+    Ok(())
+}
+
+/// The ruby overlay's `ActiveSupport::Gzip` only where a file of the tree names it, as Spinel's
+/// (`inject_spinel_active_support_requires`).
+fn drop_unnamed_gzip(files: &mut Vec<(String, String)>) {
+    let named = files
+        .iter()
+        .any(|(p, text)| {
+            p.ends_with(".rb")
+                && !p.starts_with("runtime/")
+                && (text.contains("Gzip.decompress") || text.contains("Gzip.compress") || text.contains("ActiveSupport::Gzip"))
+        });
+    if named {
+        return;
+    }
+    files.retain(|(p, _)| p != "runtime/active_support_gzip.rb");
+    if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
+        *boot = boot.replace("require_relative \"runtime/active_support_gzip\"\n", "");
     }
 }
 
@@ -3382,6 +3485,42 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    target_files_lent(Lent::Shared(app), fixture, target)
+}
+
+/// [`target_files`] for a caller that is done with the app's bodies: the
+/// target lowerings that would copy the whole app to rewrite it rewrite
+/// this one instead (`lower::constantize`). The files are the same; the
+/// app is left as the emit lowered it.
+pub fn target_files_lowering_in_place(
+    app: &mut App,
+    fixture: &Path,
+    target: BuildTarget,
+) -> Result<Vec<(String, String)>, String> {
+    target_files_lent(Lent::Own(app), fixture, target)
+}
+
+/// The app an emit reads: borrowed, or the caller's own to lower in place.
+enum Lent<'a> {
+    Shared(&'a App),
+    Own(&'a mut App),
+}
+
+impl Lent<'_> {
+    fn get(&self) -> &App {
+        match self {
+            Lent::Shared(app) => app,
+            Lent::Own(app) => app,
+        }
+    }
+}
+
+fn target_files_lent(
+    lent: Lent<'_>,
+    fixture: &Path,
+    target: BuildTarget,
+) -> Result<Vec<(String, String)>, String> {
+    let app = lent.get();
     // Stage 0 of the specializer: the identity. Nothing is specialized
     // yet, so none of the trimming or refusals below apply — every construct is
     // residue, and the residue runs on Rails.
@@ -3404,16 +3543,20 @@ pub fn target_files(
             (crate::gems::native_extension_gem_namespaces(app), Default::default())
         };
         return crate::emit::ruby::with_external_gem_namespaces(&namespaces, includes, || {
-            crate::emit::ruby::expr::with_body_statements(|| target_files_inner(app, fixture, target))
+            crate::emit::ruby::expr::with_body_statements(|| target_files_inner(lent, fixture, target))
         });
     }
-    target_files_inner(app, fixture, target)
+    target_files_inner(lent, fixture, target)
 }
 
 /// The ruby family runs an automatically sourced gem as the real gem,
 /// through its Gemfile and require (`ingest::auto_source_gems`): its
 /// compiled classes leave this tree, and the gem reads as the unknown
 /// boundary the Gemfile wiring declares.
+fn is_ruby2_keywords_call(call: &crate::expr::Expr) -> bool {
+    matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, .. } if method.as_str() == "ruby2_keywords")
+}
+
 fn without_auto_source_gems(app: &App, target: BuildTarget) -> Option<App> {
     if app.auto_source_gems.is_empty() || !matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
         return None;
@@ -3476,10 +3619,11 @@ fn without_auto_source_gems(app: &App, target: BuildTarget) -> Option<App> {
 pub(crate) use crate::source_gem_shake::{compiled_on_the_ruby_family, shakes_source_gems};
 
 fn target_files_inner(
-    app: &App,
+    mut lent: Lent<'_>,
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    let app = lent.get();
     let without_inherited_replay;
     let app = if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Roda | BuildTarget::Futamura) {
         let mut trimmed = app.clone();
@@ -3513,6 +3657,21 @@ fn target_files_inner(
             &shaken_gems
         }
         None => app,
+    };
+    // Not replayed on Spinel: it defines no `ruby2_keywords`, where the source's
+    // `ruby2_keywords(:m) if respond_to?(:ruby2_keywords, true)` skips it, and its keywords are passed as written.
+    let without_ruby2_keywords;
+    let app = if target == BuildTarget::Spinel
+        && app.library_classes.iter().any(|lc| lc.unknown_calls.iter().any(is_ruby2_keywords_call))
+    {
+        let mut trimmed = app.clone();
+        for lc in &mut trimmed.library_classes {
+            lc.unknown_calls.retain(|call| !is_ruby2_keywords_call(call));
+        }
+        without_ruby2_keywords = trimmed;
+        &without_ruby2_keywords
+    } else {
+        app
     };
     let without_health;
     let app = match without_rails_health_controller(app, target) {
@@ -3554,12 +3713,20 @@ fn target_files_inner(
         None => app,
     };
     let with_closed_constantize;
-    let app = match crate::lower::constantize::lower_for_target(app, target) {
-        Some(lowered) => {
-            with_closed_constantize = lowered;
-            &with_closed_constantize
+    // No step above replaced the app: the caller's own is lowered where it is.
+    let in_place = matches!(lent, Lent::Own(_)) && std::ptr::eq(app, lent.get());
+    let app = if in_place {
+        let Lent::Own(own) = &mut lent else { unreachable!() };
+        crate::lower::constantize::lower_in_place(own, target);
+        &**own
+    } else {
+        match crate::lower::constantize::lower_for_target(app, target) {
+            Some(lowered) => {
+                with_closed_constantize = lowered;
+                &with_closed_constantize
+            }
+            None => app,
         }
-        None => app,
     };
     let with_nil_operands;
     let app = match crate::lower::nil_operand::lower_for_target(app, target) {
@@ -3612,10 +3779,12 @@ fn target_files_inner(
                 target.as_str()
             ));
         }
-        crate::emit::shared::schema_sql::validate_schema_for_dialect(
-            &app.schema,
-            crate::emit::shared::schema_sql::Dialect::Sqlite,
-        )?;
+        // The Spinel and Ruby trees run the app's own database (`Dialect::for_app`); every other target SQLite.
+        let dialect = match target {
+            BuildTarget::Spinel | BuildTarget::Ruby => crate::emit::shared::schema_sql::Dialect::for_app(app),
+            _ => crate::emit::shared::schema_sql::Dialect::Sqlite,
+        };
+        crate::emit::shared::schema_sql::validate_schema_for_dialect(&app.schema, dialect)?;
         reject_generated_fixture_assignments(app)?;
     }
     // Before the refusals below: a refusal returns early, and a
@@ -3638,6 +3807,7 @@ fn target_files_inner(
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
+    report_unrun_after_initialize(app, target);
     reject_rust_model_name_collisions(app, target)?;
     report_datetime_local_reads(app, target);
     report_roda_form_fields(app, target);
@@ -3823,13 +3993,26 @@ fn target_files_inner(
     let files = crate::timings::phase(format_args!("emit {}: assemble", target.as_str()), || crate::runtime_loader::with_app_locales(app, || match target {
         BuildTarget::Blog => blog_files(fixture),
         BuildTarget::Futamura => futamura_files(fixture),
-        BuildTarget::Spinel => spinel_files_with_source_markers(app, fixture, param_binds).and_then(|(mut files, _)| {
-            spinel_relation_model_handle(&mut files)?;
-            widen_spinel_hash_config_arrays(&mut files);
-            let mut files = spin_shape(files)?;
-            apply_spinel_int_overflow(&mut files, app);
-            Ok(files)
-        }),
+        // In the app's own dialect too, as the Ruby target below: an app
+        // on PostgreSQL runs on spinel-pg (`apply_postgresql_tree`), with
+        // the read binds off, since their `?` marks are not its `$n`.
+        BuildTarget::Spinel => {
+            let dialect = crate::emit::shared::schema_sql::Dialect::for_app(app);
+            let postgresql = dialect == crate::emit::shared::schema_sql::Dialect::Postgres;
+            dialect.scope(|| {
+                spinel_files_with_source_markers(app, fixture, param_binds && !postgresql).and_then(|(mut files, _)| {
+                    spinel_relation_model_handle(&mut files)?;
+                    widen_spinel_hash_config_arrays(&mut files);
+                    // Before spin_shape, which writes spin.toml from the Db it finds.
+                    if postgresql {
+                        apply_postgresql_tree(&mut files, app, RequireTarget::Spinel)?;
+                    }
+                    let mut files = spin_shape(files)?;
+                    apply_spinel_int_overflow(&mut files, app);
+                    Ok(files)
+                })
+            })
+        }
         // The ruby family gets the bundled-library requires too: the
         // table used to live inside `spin_shape` and so reached only
         // the spinel tree, which cost campfire two test files on a
@@ -3920,7 +4103,11 @@ fn target_files_inner(
     let files = if target == BuildTarget::Blog {
         files
     } else {
-        let files = ensure_seed_sql(files, app)?;
+        // The Spinel and Ruby trees run the app's own database (`Dialect::for_app`): their seed is in its SQL.
+        let files = match target {
+            BuildTarget::Spinel | BuildTarget::Ruby => crate::emit::shared::schema_sql::Dialect::for_app(app).scope(|| ensure_seed_sql(files, app))?,
+            _ => ensure_seed_sql(files, app)?,
+        };
         let files = ensure_storage_keep(files, target);
         let files = ensure_static_assets(files, target, app);
         ensure_e2e(files, target)
@@ -5629,10 +5816,12 @@ fn ruby_family_runtime_files(
     // already annotated in `spinel_files`.
     apply_pay_demand(&mut files, app)?;
     if flavor == RubyFlavor::CRuby && crate::emit::shared::schema_sql::Dialect::current() == crate::emit::shared::schema_sql::Dialect::Postgres {
-        apply_postgresql_tree(&mut files, app)?;
+        apply_postgresql_tree(&mut files, app, RequireTarget::RubyFamily)?;
     }
     apply_conditional_declarations(&mut files, app);
     apply_file_programs(&mut files, app);
+    // After the file programs: a gem's top-level file may be the only code that calls it.
+    drop_unnamed_gzip(&mut files);
     // After every pass that writes app code into a file: the boot
     // program (an initializer may be the only caller) and the file
     // programs (a top-level statement may be).
@@ -5640,6 +5829,8 @@ fn ruby_family_runtime_files(
         apply_digest_gem(&mut files);
     }
     drop_solid_queue_standin(app, &mut files);
+    // The overlay's entries (main.rb, config.ru, sidekiq.rb) replaced the spinel tree's.
+    apply_app_initializers(&mut files, app, RequireTarget::RubyFamily)?;
     Ok(files)
 }
 
@@ -6195,24 +6386,74 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
 }
 
 /// A class-body load-time conditional (`dialect::ConditionalDefinitions`)
-/// is written as the source has it only by the Ruby family; another
+/// is written as the source has it by the Ruby family and Spinel; another
 /// target would define every branch's methods, the last one winning, so
 /// each such statement is an error there.
 fn refuse_conditional_definitions(app: &App, target: BuildTarget) {
     for lc in &app.library_classes {
         for conditional in &lc.conditional_definitions {
+            // Not Spinel's when no other method answers the names: Spinel compiles the `if` around `def`s as Ruby
+            // loads it, and refuses only a name a builtin, an accessor or another def answers when the branch did not run.
+            if target == BuildTarget::Spinel && !conditional_names_answered_elsewhere(app, lc, conditional) {
+                continue;
+            }
             let diagnostic = crate::diagnostic::Diagnostic::unsupported(
                 conditional.span,
                 Some(crate::ident::Symbol::from(target.as_str())),
                 "conditional_definition",
-                format!(
-                    "`{}` defines methods in a load-time `if`/`unless`, which only the Ruby and JRuby targets carry",
-                    lc.name.0.as_str()
-                ),
+                if target == BuildTarget::Spinel {
+                    format!(
+                        "`{}` defines a method in a load-time `if`/`unless` that a builtin, an accessor or another def also answers, which Spinel does not compile",
+                        lc.name.0.as_str()
+                    )
+                } else {
+                    format!(
+                        "`{}` defines methods in a load-time `if`/`unless`, which only the Ruby, JRuby and Spinel targets carry",
+                        lc.name.0.as_str()
+                    )
+                },
             );
             emit::diagnostics::push(diagnostic);
         }
     }
+}
+
+fn conditional_names_answered_elsewhere(app: &App, lc: &crate::dialect::LibraryClass, conditional: &crate::dialect::ConditionalDefinitions) -> bool {
+    fn members(c: &crate::dialect::ConditionalDefinitions, out: &mut Vec<(crate::ident::Symbol, crate::dialect::MethodReceiver)>) {
+        for arm in &c.arms {
+            out.extend(arm.methods.iter().map(|m| (m.name.clone(), m.receiver)));
+            for nested in &arm.nested {
+                members(nested, out);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    members(conditional, &mut names);
+    let core = crate::lower::core_instance_methods::OBJECT.iter().chain(crate::lower::core_instance_methods::KERNEL_PRIVATE);
+    let builtins: crate::det::HashSet<&str> = core.copied().chain(["method_missing", "initialize"]).collect();
+    names.iter().any(|(name, receiver)| {
+        if *receiver == crate::dialect::MethodReceiver::Instance && builtins.contains(name.as_str()) {
+            return true;
+        }
+        let mut current = Some(lc.name.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { break };
+            let mut parent = None;
+            for class in app.library_classes.iter().filter(|c| c.name == id) {
+                let elsewhere = class.methods.iter().any(|m| {
+                    &m.name == name
+                        && m.receiver == *receiver
+                        && (class.name != lc.name || !class.conditional_definitions.iter().any(|c| c.contains(m)))
+                });
+                if elsewhere {
+                    return true;
+                }
+                parent = parent.or_else(|| class.parent.clone());
+            }
+            current = parent;
+        }
+        false
+    })
 }
 
 /// One line or item of a program as written, branches flattened
@@ -6269,6 +6510,10 @@ fn gem_declaration_order(app: &App) -> Vec<String> {
             return;
         }
         let Some(program) = programs.get(source) else { return };
+        // Not left out for being lazy: Spinel loads an autoload's file as the program starts, and a constant the gem
+        // autoloads is read before the app's files are done (view_component's `Base.inherited`, as each component
+        // loads, reads `CompileCache`). After this program's own items, as the first read comes after them.
+        let mut autoloads = Vec::new();
         for item in all_program_items(&program.items) {
             match item {
                 crate::app::ProgramItem::Require { feature, relative, .. } => {
@@ -6284,8 +6529,16 @@ fn gem_declaration_order(app: &App) -> Vec<String> {
                         }
                     }
                 }
+                crate::app::ProgramItem::Autoload { feature, .. } => {
+                    if let Some(target) = resolve_gem_require(known, source, feature, false) {
+                        autoloads.push(target);
+                    }
+                }
                 _ => {}
             }
+        }
+        for target in autoloads {
+            walk(&target, programs, known, app, seen, out);
         }
     }
     let mut seen = Default::default();
@@ -6321,14 +6574,22 @@ fn report_program_error(span: crate::span::Span, construct: &str, message: &str)
     emit::diagnostics::push(diagnostic);
 }
 
-/// The Ruby tree of an app whose primary database is PostgreSQL
+/// The tree of an app whose primary database is PostgreSQL
 /// (`Dialect::for_app`); the SQL in it was lowered for PostgreSQL by the
-/// same emit. Its Db is runtime/spinel/db_pg.rb over the pg gem, its
-/// driver differences pg_driver_cruby.rb, and its database the server
-/// `DATABASE_URL` names (with libpq's `PG*` variables as fallbacks), at
-/// boot and in the emitted tests. Each test file runs in a schema of its
-/// own, created when it starts and dropped when it exits.
-fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
+/// same emit. Its Db is runtime/spinel/db_pg.rb, and its database the
+/// server `DATABASE_URL` names (with libpq's `PG*` variables as
+/// fallbacks), at boot and in the emitted tests. Each test file runs in a
+/// schema of its own, created when it starts and dropped when it exits.
+///
+/// The Ruby tree runs db_pg.rb on the pg gem, its driver differences
+/// pg_driver_cruby.rb. The Spinel tree runs it on spinel-pg, whose
+/// runtime/pg_driver.rb it already has; `spin_shape` then lists `pg` in
+/// spin.toml for the `require "pg"` it finds in runtime/db.rb.
+fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App, target: RequireTarget) -> Result<(), String> {
+    let target_name = match target {
+        RequireTarget::RubyFamily => "ruby",
+        RequireTarget::Spinel => "spinel",
+    };
     if !app.sql_functions.is_empty() {
         // An error diagnostic as well as the refusal, as
         // `extension_gem_refusals` reports one, so `check` names it.
@@ -6339,7 +6600,7 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App) -> Result
         );
         let diagnostic = crate::diagnostic::Diagnostic::unsupported(
             crate::span::Span::synthetic(),
-            Some(crate::ident::Symbol::from("ruby")),
+            Some(crate::ident::Symbol::from(target_name)),
             "sqlite_functions",
             message,
         );
@@ -6352,10 +6613,27 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App) -> Result
         Ok(files.remove(at).1)
     };
     let db_pg = take(files, "runtime/db_pg.rb")?;
-    let driver = take(files, "runtime/pg_driver_cruby.rb")?;
-    files.retain(|(p, _)| !matches!(p.as_str(), "runtime/db.rb" | "runtime/pg_driver.rb" | "Gemfile.lock"));
+    match target {
+        RequireTarget::RubyFamily => {
+            let driver = take(files, "runtime/pg_driver_cruby.rb")?;
+            files.retain(|(p, _)| !matches!(p.as_str(), "runtime/db.rb" | "runtime/pg_driver.rb" | "Gemfile.lock"));
+            files.push(("runtime/pg_driver.rb".to_string(), driver));
+        }
+        RequireTarget::Spinel => {
+            if !files.iter().any(|(p, _)| p == "runtime/pg_driver.rb") {
+                return Err("PostgreSQL tree: runtime/pg_driver.rb (spinel-pg's) not found".to_string());
+            }
+            files.retain(|(p, _)| !matches!(p.as_str(), "runtime/db.rb" | "Gemfile.lock"));
+        }
+    }
     files.push(("runtime/db.rb".to_string(), db_pg));
-    files.push(("runtime/pg_driver.rb".to_string(), driver));
+    // A stored array column is a real PostgreSQL array (`text[]`,
+    // `schema_sql`), so its codec is the array literal's, not SQLite's
+    // JSON text: the same `ArrayColumn` API, so the lowering is unchanged.
+    if let Some((_, codec)) = files.iter_mut().find(|(p, _)| p == "runtime/array_column.rb") {
+        *codec = crate::runtime_files::read_to_string("runtime/spinel/array_column_pg.rb")
+            .map_err(|e| format!("read runtime/spinel/array_column_pg.rb: {e}"))?;
+    }
 
     // The gem, and a fresh lock: the committed one is SQLite's.
     let gemfile = files.iter_mut().find(|(p, _)| p == "Gemfile").ok_or("PostgreSQL tree: Gemfile not found")?;
@@ -6364,13 +6642,29 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App) -> Result
     }
     gemfile.1 = gemfile.1.replace("gem \"sqlite3\"", "gem \"pg\"");
 
-    const SERVER_SQLITE: &str = "    db_path = ENV[\"BLOG_DB\"]\n    path = (!db_path.nil? && !db_path.empty?) ? db_path : \"storage/development.sqlite3\"\n";
     const SERVER_POSTGRESQL: &str = "    # PostgreSQL: the server DATABASE_URL names, else libpq's PG*\n    # variables (apply_postgresql_tree).\n    path = ENV.fetch(\"DATABASE_URL\", \"\")\n";
+    // The Ruby overlay's server spells the SQLite path out; the Spinel
+    // server asks `Main.default_db_path`, and its --help names the file.
+    let server: &[(&str, &str)] = match target {
+        RequireTarget::RubyFamily => &[(
+            "    db_path = ENV[\"BLOG_DB\"]\n    path = (!db_path.nil? && !db_path.empty?) ? db_path : \"storage/development.sqlite3\"\n",
+            SERVER_POSTGRESQL,
+        )],
+        RequireTarget::Spinel => &[
+            ("    path = Main.default_db_path\n", SERVER_POSTGRESQL),
+            (
+                "    puts \"  SQLite file: BLOG_DB env (default storage/development.sqlite3)\"\n",
+                "    puts \"  PostgreSQL: DATABASE_URL env, else libpq's PG* variables\"\n",
+            ),
+        ],
+    };
     let main = files.iter_mut().find(|(p, _)| p == "main.rb").ok_or("PostgreSQL tree: main.rb not found")?;
-    if !main.1.contains(SERVER_SQLITE) {
-        return Err("PostgreSQL tree: main.rb's database path no longer matches".to_string());
+    for (sqlite, postgresql) in server {
+        if !main.1.contains(sqlite) {
+            return Err(format!("PostgreSQL tree: main.rb's database path no longer matches `{}`", sqlite.trim()));
+        }
+        main.1 = main.1.replace(sqlite, postgresql);
     }
-    main.1 = main.1.replace(SERVER_SQLITE, SERVER_POSTGRESQL);
 
     const TEST_SQLITE: &str = "Db.configure(_test_db_path)\n";
     const TEST_POSTGRESQL: &str = "# PostgreSQL (apply_postgresql_tree): the server DATABASE_URL names,\n\
@@ -6391,11 +6685,119 @@ Minitest.after_run(&_drop_test_schema)\n\
 else\n  \
 at_exit(&_drop_test_schema)\n\
 end\n";
+    // A compiled test file runs its tests inline and exits, so at_exit
+    // comes after them. spinel-pg does not read PGOPTIONS, so the schema
+    // goes to Db.configure as Rails' `schema_search_path`, which db_pg.rb
+    // sets on every connection the pool opens.
+    const TEST_POSTGRESQL_SPINEL: &str = "# PostgreSQL (apply_postgresql_tree): the server DATABASE_URL names,\n\
+# else libpq's PG* variables, in a schema of this test process's own,\n\
+# created here and dropped at exit, after the file's tests have run.\n\
+# Every connection of the pool resolves the tables to it: Db.configure\n\
+# sets it as the search_path, as Rails' `schema_search_path`. The pid\n\
+# comes first, so cutting a long file name to PostgreSQL's 63 bytes\n\
+# keeps it.\n\
+TEST_SCHEMA = (\"rh_test_\" + Process.pid.to_s + \"_\" + File.basename($0, \".rb\").gsub(/[^a-z0-9_]/, \"_\"))[0, 63]\n\
+Db.configure(ENV.fetch(\"DATABASE_URL\", \"\"), schema_search_path: TEST_SCHEMA)\n\
+Db.exec(\"DROP SCHEMA IF EXISTS \" + TEST_SCHEMA + \" CASCADE\")\n\
+Db.exec(\"CREATE SCHEMA \" + TEST_SCHEMA)\n\
+at_exit { Db.exec(\"DROP SCHEMA IF EXISTS \" + TEST_SCHEMA + \" CASCADE\") }\n";
+    let test_postgresql = match target {
+        RequireTarget::RubyFamily => TEST_POSTGRESQL,
+        RequireTarget::Spinel => TEST_POSTGRESQL_SPINEL,
+    };
     let helper = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb").ok_or("PostgreSQL tree: test/test_helper.rb not found")?;
     if !helper.1.contains(TEST_SQLITE) {
         return Err("PostgreSQL tree: test_helper.rb's database setup no longer matches".to_string());
     }
-    helper.1 = helper.1.replace(TEST_SQLITE, TEST_POSTGRESQL);
+    helper.1 = helper.1.replace(TEST_SQLITE, test_postgresql);
+    Ok(())
+}
+
+/// Run the app's `after_initialize` callbacks (the generated
+/// [`crate::app::AFTER_INITIALIZE_RUNNER`], `ingest::after_initialize`)
+/// where Rails runs them: last in `initialize!`, once the database is
+/// configured and the job queue adapter is set, before the server or a
+/// worker starts (Rails 8.1.4's `finisher_hook`). Here `boot.rb` loads the
+/// app and its initializers, and each entry then opens the database and
+/// sets up the job drain, so the call goes into each entry after that, under
+/// a connection lease as a request or a drain takes one: the Spinel server
+/// before its job loop and listener, its worker role and `sidekiq.rb` before
+/// the worker loop, `config.ru` before the stack Puma and Falcon serve, and
+/// the one-request script path once its database is open. A program that
+/// requires `boot.rb` alone runs none, as requiring Rails' `config/boot.rb`
+/// runs none. One helper for the Spinel tree and the Ruby family, so both
+/// run the same callbacks.
+///
+/// Each call says whether its entry is the server: `run(true)` also runs
+/// the hooks an initializer registers under `if defined?(Rails::Server)`,
+/// which Rails registers only under `rails server`. The Spinel server and
+/// `config.ru` pass `true`; the Spinel worker role, `sidekiq.rb` and the
+/// one-request script pass `false`, as a Rails worker or runner process
+/// leaves `Rails::Server` undefined. `config.ru` is a choice:
+/// it is what the emitted tree serves from (`rake dev` runs Puma on it),
+/// the app's own server command here, so it counts as `rails server`,
+/// which loads it too. Rails under a plain `puma` or `falcon` on the
+/// app's `config.ru` leaves `Rails::Server` undefined and skips them.
+fn apply_app_initializers(files: &mut [(String, String)], app: &App, target: RequireTarget) -> Result<(), String> {
+    if !app.runs_after_initialize {
+        return Ok(());
+    }
+    // (file, the line the step after the setup starts with, whether the
+    // entry serves); the call goes ahead of that line and the comment
+    // above it, at its indentation.
+    let sites: &[(&str, &str, bool)] = match target {
+        RequireTarget::Spinel => &[("main.rb", "  SidekiqWorker.cli(ARGV)", false), ("main.rb", "Thread.new do", true)],
+        RequireTarget::RubyFamily => &[
+            ("main.rb", "  env = {", false),
+            ("config.ru", "use ThrusterCache::Middleware", true),
+            ("sidekiq.rb", "SidekiqWorker.cli(ARGV)", false),
+        ],
+    };
+    let runner = crate::app::AFTER_INITIALIZE_RUNNER;
+    let applied = format!("Db.with_connection {{ {runner}.run(");
+    for (path, content) in files.iter_mut() {
+        let anchors: Vec<(&str, bool)> =
+            sites.iter().filter(|(file, _, _)| file == path).map(|(_, line, server)| (*line, *server)).collect();
+        if anchors.is_empty() || content.lines().any(|line| line.trim().starts_with(&applied)) {
+            continue;
+        }
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        for (anchor, server) in anchors {
+            let found: Vec<usize> = lines.iter().enumerate().filter(|(_, line)| line.as_str() == anchor).map(|(i, _)| i).collect();
+            let [at] = found.as_slice() else {
+                return Err(format!(
+                    "apply_app_initializers: {path} has {} lines `{anchor}`, where the after_initialize callbacks run before",
+                    found.len()
+                ));
+            };
+            let indent = &anchor[..anchor.len() - anchor.trim_start().len()];
+            let mut start = *at;
+            while start > 0 && lines[start - 1].trim_start().starts_with('#') && lines[start - 1].starts_with(indent) {
+                start -= 1;
+            }
+            let call = format!("Db.with_connection {{ {runner}.run({server}) }}");
+            let role = match server {
+                true => "# The server: those registered under `if defined?(Rails::Server)` run too.",
+                false => "# Not the server: those under `if defined?(Rails::Server)` do not run.",
+            };
+            let mut block: Vec<String> = [
+                "# The app's after_initialize callbacks (ingest::after_initialize), as",
+                "# Rails runs them last in initialize!: after the database and the job",
+                "# drain are set up, before anything serves or works off a job.",
+                role,
+                call.as_str(),
+            ]
+            .iter()
+            .map(|line| format!("{indent}{line}"))
+            .collect();
+            // Apart from the comment that opens the next step.
+            if start < *at {
+                block.push(String::new());
+            }
+            lines.splice(start..start, block);
+        }
+        *content = lines.join("\n") + "\n";
+    }
     Ok(())
 }
 
@@ -8092,28 +8494,33 @@ fn apply_app_requires(files: &mut [(String, String)], app: &App, target: Require
 fn apply_rails_version(files: &mut [(String, String)], app: &App) {
     const MARK: &str = "# Rails::VERSION from the app's Gemfile.lock";
     let Some(lock) = &app.gem_lock else { return };
-    let Some(version) = ["rails", "railties"].iter().find_map(|g| {
-        lock.specs.iter().find(|(n, _)| n == g).map(|(_, v)| v.clone())
-    }) else {
-        return;
-    };
-    // A version is digits, letters and dots (`8.1.0.rc1`); anything else
-    // would be spelled into a double-quoted Ruby string as written.
-    if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
-        return;
-    }
+    let locked = |gems: &[&str]| gems.iter().find_map(|g| lock.specs.iter().find(|(n, _)| n == g).map(|(_, v)| v.clone()));
+    let Some(rails) = locked(&["rails", "railties"]) else { return };
     let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else { return };
     if boot.contains(MARK) {
         return;
     }
-    let parts: Vec<&str> = version.split('.').collect();
-    let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
-    let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
-    let block = format!(
-        "{MARK} (see project.rs::apply_rails_version).\n\
-         module Rails\n  module VERSION\n    MAJOR = {}\n    MINOR = {}\n    TINY = {}\n    PRE = {pre}\n    STRING = {version:?}\n  end\nend\n",
-        num(0), num(1), num(2)
-    );
+    let mut block = format!("{MARK} (see project.rs::apply_rails_version).\n");
+    // Also the frameworks' own, which a gem branches on (aasm's `ActiveRecord::VERSION::MAJOR >= 3`).
+    for (namespace, version) in [
+        ("Rails", Some(rails.clone())),
+        ("ActiveRecord", locked(&["activerecord"]).or(Some(rails.clone()))),
+        ("ActiveSupport", locked(&["activesupport"]).or(Some(rails.clone()))),
+    ] {
+        let Some(version) = version else { continue };
+        // A version is digits, letters and dots (`8.1.0.rc1`); anything else
+        // would be spelled into a double-quoted Ruby string as written.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+            continue;
+        }
+        let parts: Vec<&str> = version.split('.').collect();
+        let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+        let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
+        block.push_str(&format!(
+            "module {namespace}\n  module VERSION\n    MAJOR = {}\n    MINOR = {}\n    TINY = {}\n    PRE = {pre}\n    STRING = {version:?}\n  end\nend\n",
+            num(0), num(1), num(2)
+        ));
+    }
     const AFTER: &str = "require_relative \"runtime/rails\"\n";
     match boot.find(AFTER) {
         Some(at) => boot.insert_str(at + AFTER.len(), &block),
@@ -8893,6 +9300,9 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "ActionDispatch::Http::Parameters::ParseError",
     "AbstractController::ActionNotFound",
     "ActionView::MissingTemplate",
+    // `runtime/ruby/action_view/base.rb`: a component render's buffer and lookup context.
+    "ActionView::OutputBuffer",
+    "ActionView::LookupContext",
     // `runtime/ruby/active_record/arel.rb` — node constructors the ruby
     // family and spinel load with that file. A strict target has no Arel
     // text nodes to construct.
@@ -8903,6 +9313,7 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "Arel::Nodes::Not",
     "Arel::Nodes::Case",
     "Arel::Nodes::NamedFunction",
+    "Arel::Nodes::Ordering",
     "Arel::Nodes::Ascending",
     "Arel::Nodes::Descending",
     "Arel::Nodes::Predicate",
@@ -8913,6 +9324,7 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     // do not load the files.
     "ActiveRecord::ConnectionFailed",
     "ActiveRecord::ConnectionTimeoutError",
+    "ActiveRecord::NoDatabaseError",
     "ActiveRecord::Encryption::Errors::Decryption",
     "ActiveRecord::Encryption::Errors::Configuration",
     "ActiveRecord::StaleObjectError",
@@ -8933,6 +9345,8 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "ActiveSupport::ConfigurationFile",
     // `config_for`'s Hash, which ships with ConfigurationFile.
     "ActiveSupport::OrderedOptions",
+    // A String gzipped and back (lucide-rails' icon bundle): the CRuby overlay's, and Spinel's on its zlib package.
+    "ActiveSupport::Gzip",
     // Exception classes and their newly exposed owners in
     // `runtime/ruby/active_storage.rb`. Registering a nested error also
     // resolves its enclosing namespace as a value, which needs the same
@@ -8970,7 +9384,14 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     // Spinel recognizes GeneratorError only as a literal rescue name.
     if target == "spinel" {
         // The Arel ordering and predicate nodes live on the CRuby overlay (`arel_predicates.rb`).
-        if matches!(name, "ActiveSupport::ConfigurationFile" | "ActiveSupport::OrderedOptions" | "Arel::Nodes::Ascending" | "Arel::Nodes::Descending" | "Arel::Nodes::Predicate") {
+        if matches!(
+            name,
+            "ActiveSupport::ConfigurationFile"
+                | "Arel::Nodes::Ordering"
+                | "Arel::Nodes::Ascending"
+                | "Arel::Nodes::Descending"
+                | "Arel::Nodes::Predicate"
+        ) {
             return Some("ruby_family_runtime_constant");
         }
         // `Observable` is `require "observer"`, which `SPINEL_LACKS` keeps
@@ -9117,10 +9538,12 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
     ("ActiveSupport", "errors_attribute_names"),
     ("ActiveSupport", "errors_delete"),
     ("ActiveSupport", "errors_details"),
+    ("ActiveSupport", "errors_group_by_attribute"),
     ("ActiveSupport", "error_detail"),
     ("ActiveSupport", "error_template"),
     ("ActiveSupport", "errors_import"),
     ("ActiveSupport", "errors_merge"),
+    ("ActiveSupport", "errors_copy"),
     ("ActiveJob::Arguments", "serialize"),
     ("ActiveJob::Arguments", "ruby2_keywords_hash"),
 ];
@@ -9960,6 +10383,11 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 if let crate::dialect::ValidationRule::InclusionCall { set } | crate::dialect::ValidationRule::ExclusionCall { set } = rule {
                     visit(set);
                 }
+                if let crate::dialect::ValidationRule::Comparison { checks } = rule {
+                    for (_, bound) in checks {
+                        visit(bound);
+                    }
+                }
             }
         }
     }
@@ -10133,6 +10561,7 @@ fn spinel_files_with_source_markers(
     // both come through here. The ruby family calls `spinel_files`
     // directly and keeps `ConfigurationFile`.
     drop_yaml_configuration_file(&mut files);
+    inject_spinel_active_support_requires(&mut files, app)?;
     Ok((files, stems))
 }
 
@@ -10411,6 +10840,9 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     // request-finder registry; one model lowering serves them all.
     let _registry = crate::lower::model_to_library::share_request_finder_registry(&app.models, &app.schema);
     let _writers = crate::lower::model_to_library::share_module_writers(app);
+    // Whole-App answers several passes ask for (`app_answers::of`), each
+    // computed once for this assembly; `app` is borrowed for the guard's life.
+    let _answers = crate::app_answers::share(app);
     let mut files: Vec<(String, String)> = Vec::new();
 
     crate::runtime_files::walk_into("runtime/spinel/scaffold", "", &mut files)?;
@@ -10520,6 +10952,9 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     } else {
         files.retain(|(p, _)| p != "runtime/array_column.rb" && p != "runtime/array_column.rbs");
     }
+    // PostgreSQL's codec, which `apply_postgresql_tree` swaps in; no tree
+    // ships it under its own name.
+    files.retain(|(p, _)| p != "runtime/array_column_pg.rb");
     inject_array_column_require(&mut files, app)?;
 
     // ActiveJob payload codecs. Same reason as the JSON-column sidecar:
@@ -11162,6 +11597,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     // Not a program's anchor: this tree writes no gem file programs.
     rewrite_carried_requires(&mut files, app, |_| None);
     drop_solid_queue_standin(app, &mut files);
+    apply_app_initializers(&mut files, app, RequireTarget::Spinel)?;
     Ok((files, test_stems))
 }
 
@@ -13198,7 +13634,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)]) {
             files.iter().any(|(p, c)| {
                 p.ends_with(".rb")
                     && (requires_feature(c, &require_line)
-                        || c.lines().any(|line| line.trim_start().starts_with(&under_gem)))
+                        || (c.contains(&under_gem) && c.lines().any(|line| line.trim_start().starts_with(&under_gem))))
             })
         })
         .collect();
@@ -14020,6 +14456,21 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              redis = { git = \"https://github.com/roundhouse-rb/spinel-redis\", ref = \"v0.3.3\" }\n",
         );
     }
+    // runtime/db.rb is db_pg.rb when the app's primary database is
+    // PostgreSQL (`apply_postgresql_tree`), and it requires spinel-pg.
+    let needs_pg = files.iter().any(|(p, c)| p == "runtime/db.rb" && c.lines().any(|l| l == "require \"pg\""));
+    if needs_pg {
+        if !manifest.lines().any(|l| l.trim() == "[dependencies]") {
+            manifest.push_str("\n[dependencies]\n");
+        }
+        manifest.push_str(
+            "# PostgreSQL, which config/database.yml names: spinel-pg, pure Ruby\n\
+             # over sp_net, under runtime/db.rb. Git form for the reason bcrypt\n\
+             # gives above: the index's pg is 0.1.0, which predates the\n\
+             # extended query protocol runtime/db.rb runs on (0.2.0).\n\
+             pg = { git = \"https://github.com/roundhouse-rb/spinel-pg\", ref = \"v0.2.0\" }\n",
+        );
+    }
     files.push(("spin.toml".to_string(), manifest));
     files.push((
         "bin/blog.rb".to_string(),
@@ -14491,7 +14942,7 @@ fn carry_source_gem_data(app: &App, fixture: &Path, out: &mut Vec<(String, Strin
     };
     for name in &lock.source {
         let Some(version) = lock.version_of(name) else { continue };
-        let Some(installed) = crate::i18n::gems::installed_gem(&vfs, &roots, name, version) else { continue };
+        let Some(installed) = crate::i18n::gems::installed_gem_locked(&vfs, &roots, lock, name, version) else { continue };
         let lib = installed.join("lib");
         if !lib.is_dir() {
             continue;
@@ -14892,6 +15343,69 @@ mod tests {
         let mut files = vec![("main.rb".into(), "Main.configure_default_adapter!\n".into())];
         let error = apply_puma_boot_hooks(&mut files, &app, RequireTarget::Spinel).unwrap_err();
         assert!(error.contains("main.rb lost its configure_default_adapter! anchor"), "{error}");
+    }
+
+    /// Each scaffold entry runs the after_initialize callbacks once, after
+    /// the line that sets up its job drain and before the line that starts
+    /// its server or worker; a second pass adds nothing. The entries that
+    /// serve (the Spinel server, `config.ru`) say so with `run(true)`, so
+    /// the hooks registered under `if defined?(Rails::Server)` run there
+    /// only; the worker role, `sidekiq.rb` and the one-request script pass
+    /// `false`.
+    #[test]
+    fn app_initializers_run_between_the_drain_and_the_server_in_each_entry() {
+        let mut app = App::new();
+        app.runs_after_initialize = true;
+        let serving = "Db.with_connection { AppInitializers.run(true) }";
+        let not_serving = "Db.with_connection { AppInitializers.run(false) }";
+        let read = |path: &str| crate::runtime_files::read_to_string(path).unwrap();
+        let mut spinel = vec![("main.rb".to_string(), read("runtime/spinel/scaffold/main.rb"))];
+        apply_app_initializers(&mut spinel, &app, RequireTarget::Spinel).unwrap();
+        apply_app_initializers(&mut spinel, &app, RequireTarget::Spinel).unwrap();
+        let main = &spinel[0].1;
+        assert_eq!((main.matches(serving).count(), main.matches(not_serving).count()), (1, 1), "{main}");
+        let at = |text: &str, needle: &str| text.find(needle).unwrap_or_else(|| panic!("no `{needle}`"));
+        let worker_role = &main[at(main, "if ARGV.length > 0 && ARGV[0] == \"sidekiq\"")..at(main, "\nport = ")];
+        assert!(!worker_role.contains(serving), "{worker_role}");
+        assert!(at(worker_role, "  ActiveJob.register_drain") < at(worker_role, &format!("  {not_serving}")));
+        assert!(at(worker_role, &format!("  {not_serving}")) < at(worker_role, "  SidekiqWorker.cli(ARGV)"));
+        let server = &main[at(main, "\nMain.configure_default_adapter!\n")..];
+        assert!(!server.contains(not_serving), "{server}");
+        assert!(at(server, "\nActiveJob.register_drain\n") < at(server, &format!("\n{serving}\n")));
+        assert!(at(server, &format!("\n{serving}\n")) < at(server, "\nThread.new do\n  Main.job_loop\n"));
+
+        let overlay = "runtime/spinel/scaffold/ruby_overlay";
+        let mut ruby: Vec<(String, String)> = ["main.rb", "config.ru", "sidekiq.rb"]
+            .iter()
+            .map(|file| (file.to_string(), read(&format!("{overlay}/{file}"))))
+            .collect();
+        apply_app_initializers(&mut ruby, &app, RequireTarget::RubyFamily).unwrap();
+        apply_app_initializers(&mut ruby, &app, RequireTarget::RubyFamily).unwrap();
+        for (path, call, other, before, after) in [
+            ("main.rb", not_serving, serving, "if __FILE__ == $PROGRAM_NAME\n  Main.configure_default_adapter!\n", "\n  env = {\n"),
+            ("config.ru", serving, not_serving, "\nActiveJob.drain_in_background!\n", "\nuse ThrusterCache::Middleware\n"),
+            ("sidekiq.rb", not_serving, serving, "\nActiveJob.register_drain\n", "\nSidekiqWorker.cli(ARGV)\n"),
+        ] {
+            let text = &ruby.iter().find(|(p, _)| p == path).unwrap().1;
+            assert_eq!((text.matches(call).count(), text.matches(other).count()), (1, 0), "{path}:\n{text}");
+            assert!(at(text, before) < at(text, call) && at(text, call) < at(text, after), "{path}:\n{text}");
+        }
+        let config_ru = &ruby.iter().find(|(p, _)| p == "config.ru").unwrap().1;
+        assert!(at(config_ru, "Broadcasts.set_transport(") < at(config_ru, serving), "{config_ru}");
+    }
+
+    /// An app with no callbacks keeps its entries as written, and an entry
+    /// that lost the line the callbacks run before is an error, not a tree
+    /// that silently skips them.
+    #[test]
+    fn app_initializers_refuse_an_entry_without_its_anchor() {
+        let mut app = App::new();
+        let mut files = vec![("main.rb".to_string(), "Main.configure_default_adapter!\n".to_string())];
+        apply_app_initializers(&mut files, &app, RequireTarget::Spinel).unwrap();
+        assert_eq!(files[0].1, "Main.configure_default_adapter!\n");
+        app.runs_after_initialize = true;
+        let error = apply_app_initializers(&mut files, &app, RequireTarget::Spinel).unwrap_err();
+        assert!(error.contains("main.rb has 0 lines `  SidekiqWorker.cli(ARGV)`"), "{error}");
     }
 
     /// A symlinked data file is carried by its contents only when its

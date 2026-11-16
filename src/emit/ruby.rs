@@ -22,6 +22,7 @@ const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
 pub(crate) mod expr;
+mod inverse_seating;
 mod library;
 mod par_render;
 pub(crate) use library::install_lookup_indexes;
@@ -200,7 +201,8 @@ pub fn emit_rails_application(app: &App) -> Option<EmittedFile> {
 fn relax_from_stmt_handle(lc: &mut LibraryClass) {
     for m in &mut lc.methods {
         if m.name.as_str() == "from_stmt" && m.receiver == MethodReceiver::Class {
-            if let Some(crate::ty::Ty::Fn { params, .. }) = m.signature.as_mut() {
+            if let Some(crate::ty::Ty::Fn(fn_ty)) = m.signature.as_mut() {
+                let crate::ty::FnTy { params, .. } = &mut **fn_ty;
                 if let Some(p) = params.first_mut() {
                     p.ty = crate::ty::Ty::Untyped.into();
                 }
@@ -410,6 +412,13 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
+    // An association's loaded records hold their owner through its
+    // inverse. AFTER the memoization above, whose cache the seat fills,
+    // and the preload pass, whose setters it extends.
+    inverse_seating::apply(&mut lcs, app);
+    // A partial `select`'s left-out column raises from its generated
+    // reader. After every pass that rewrites a reader body by its shape.
+    crate::lower::missing_attribute::apply(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated
@@ -1143,7 +1152,7 @@ pub(crate) fn emit_spinel_with_param_binds(app: &App, param_binds: bool) -> Vec<
     // + `Object.const_get` scan, which violates the spinel subset).
     // Same `fixture_lcs` is reused below for the per-fixture file emit
     // and for `fixture_extras` synthesized siblings.
-    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes(app);
+    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes_keeping_keys(app);
     // Same vestige as the view pipeline above, for the same reason:
     // fixture classes are synthesized here, after the shared post-
     // analyze hooks have already run over the App, so an ERB tag's

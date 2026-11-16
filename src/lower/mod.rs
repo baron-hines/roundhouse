@@ -18,6 +18,7 @@
 //! broadcasts orchestration, schema → DDL, and router dispatch tables.
 
 pub mod arel;
+pub mod renderable;
 pub mod route_guards;
 pub mod array_columns;
 pub mod associations;
@@ -51,6 +52,7 @@ pub mod schema_to_library;
 pub mod seeds_to_library;
 pub mod test_module_to_library;
 pub mod create_block;
+pub mod create_rows;
 pub mod as_json_poro;
 mod as_json_record;
 pub use as_json_writer::WRITER_METHOD as JSON_WRITER_METHOD;
@@ -130,7 +132,7 @@ pub mod defined_ivar_read;
 pub mod method_missing_calls;
 pub mod dynamic_try;
 pub mod primary_key_send;
-mod core_instance_methods;
+pub(crate) mod core_instance_methods;
 pub mod route_param_recall;
 pub mod expect_string_key;
 pub mod defined_ivar_memo;
@@ -235,6 +237,7 @@ pub mod view_buffer_passing;
 pub mod view_instrumentation;
 pub mod tag_block_passing;
 pub mod lazy_model_state;
+pub mod missing_attribute;
 pub(crate) mod eager_load;
 pub mod view_to_library;
 
@@ -650,6 +653,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("errors_index", &["errors_add"]),
     ("human_attribute_name", &[]),
     ("i18n_translate", &[]),
+    // `create!(rows)` of an Array → one `create!` per row. Its blockless
+    // calls are none of `create_block`'s; `params_merge` then sees the
+    // per-row call.
+    ("create_rows", &[]),
     ("create_block", &["secure_password_super"]),
     // `<params>.merge(k: v)` written a method away from the permit
     // chain → `Model.from_params(p)` + per-key setters, hoisted above
@@ -986,7 +993,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
     ran!("sti_subclass_callbacks");
     crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
-        fused::apply_fused_pre_tag_rewrites(app);
+        fused::apply_fused_pre_tag_rewrites(app, target);
     });
     ran!("attribute_aliases");
     ran!("sti_is_a");
@@ -1085,6 +1092,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("human_attribute_name");
     i18n_translate::apply_i18n_translate_lowering(app);
     ran!("i18n_translate");
+    create_rows::apply_create_rows_lowering(app);
+    ran!("create_rows");
     diags.extend(create_block::apply_create_block_inline(app));
     ran!("create_block");
     diags.extend(params_merge::apply_params_merge_lowering(app));
@@ -1773,7 +1782,7 @@ pub use model_to_library::{
     lower_models_to_library_classes_with_params, lower_models_with_registry,
     lower_models_with_registry_and_params, lower_models_with_registry_params_and_views,
 };
-pub use fixture_to_library::{lower_fixtures_to_library_classes, rewrite_fixture_calls};
+pub use fixture_to_library::{lower_fixtures_to_library_classes, lower_fixtures_to_library_classes_keeping_keys, rewrite_fixture_calls};
 pub use importmap_to_library::lower_importmap_to_library_functions;
 pub use library_extras::{extras_from_funcs, extras_from_lcs};
 pub use routes_to_library::{

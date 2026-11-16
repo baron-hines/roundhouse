@@ -359,14 +359,180 @@ fn run_transpile(
     // keeps the probe.
     let defer = !matches!(target, BuildTarget::Roda | BuildTarget::Futamura)
         && std::env::var_os("ROUNDHOUSE_DEFER_ACCESSOR_SURFACE").is_none_or(|value| value != "0");
-    if transpile(target, input, out, allow_unsupported, survey, defer)? == Transpiled::Overturned {
+    // Not by ingesting first: a cached observation is checked against the app's files.
+    if target == BuildTarget::Spinel
+        && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0")
+        && let Some(cached) = input.canonicalize().ok().and_then(|dir| roundhouse::observed_shapes::cached(&dir))
+    {
+        match cached {
+            Ok(patches) => roundhouse::observed_shapes::install(patches),
+            Err(why) => eprintln!("roundhouse: note: observing the boot did not answer what a gem does to a held class: {why}"),
+        }
+        OBSERVED.with(|c| c.set(true));
+    }
+    let mut first = transpile(target, input, out, allow_unsupported, survey, defer)?;
+    if let Transpiled::Observe { gems, key } = first {
+        match roundhouse::timings::phase("observe shapes", || observe_shapes(input, &gems, &key)) {
+            Ok(patches) => roundhouse::observed_shapes::install(patches),
+            Err(why) => eprintln!("roundhouse: note: {} change a class held in a variable, and observing the boot did not answer it: {why}", gems.join(", ")),
+        }
+        OBSERVED.with(|c| c.set(true));
+        first = transpile(target, input, out, allow_unsupported, survey, defer)?;
+    }
+    if first == Transpiled::Overturned {
         transpile(target, input, out, allow_unsupported, survey, false)?;
     }
+    roundhouse::observed_shapes::uninstall();
     Ok(())
 }
 
+thread_local! {
+    static OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Boot the app's CRuby tree once with the shape observer, or reuse the observation cached under the same key.
+fn observe_shapes(
+    input: &std::path::Path,
+    gems: &[String],
+    key: &str,
+) -> Result<roundhouse::observed_shapes::Patches, String> {
+    use roundhouse::observed_shapes as obs;
+    let cache = input.join(obs::CACHE);
+    let cached = std::fs::read(&cache)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<obs::Cached>(&b).ok())
+        .filter(|c| c.key == key && c.env.as_ref().is_none_or(|env| *env == obs::environment(input)));
+    let observation = match cached {
+        Some(c) => c.observation,
+        None => {
+            // Not reused once the Ruby or its gems differ: a failed boot may be the machine's, and a gem may shape a class by the Ruby it runs on.
+            let before = obs::environment(input);
+            let booted = boot_observer(input, gems);
+            let env = Some(before).filter(|before| *before == obs::environment(input));
+            let observation = booted.unwrap_or_else(|why| obs::Observation {
+                effects: Vec::new(),
+                refusals: vec![why],
+            });
+            // Not only a boot that answered: one that failed would otherwise be tried again on every build.
+            // Nor one whose Ruby or gems changed while it ran: which of them it saw is not known.
+            if env.is_some() {
+                if let Some(dir) = cache.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(
+                    &cache,
+                    serde_json::to_vec_pretty(&obs::Cached { key: key.to_string(), observation: observation.clone(), env })
+                        .unwrap_or_default(),
+                );
+            }
+            observation
+        }
+    };
+    obs::patches(
+        &observation,
+        &input.canonicalize().map_err(|e| e.to_string())?,
+    )
+}
+
+fn boot_observer(
+    input: &std::path::Path,
+    gems: &[String],
+) -> Result<roundhouse::observed_shapes::Observation, String> {
+    // Not a name another user can guess and create first: the boot runs the Ruby files in it.
+    let tmp = (0..16)
+        .map(|attempt| {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+            std::env::temp_dir().join(format!("roundhouse-observe-{}-{nanos:x}-{attempt}", std::process::id()))
+        })
+        .find(|dir| std::fs::create_dir(dir).is_ok())
+        .ok_or("no fresh temporary directory for the observed boot")?;
+    let observed = boot_observer_in(input, gems, &tmp);
+    if std::env::var_os("ROUNDHOUSE_OBSERVE_KEEP").is_none() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    observed
+}
+
+fn boot_observer_in(
+    input: &std::path::Path,
+    gems: &[String],
+    tmp: &std::path::Path,
+) -> Result<roundhouse::observed_shapes::Observation, String> {
+    use roundhouse::observed_shapes as obs;
+    let tmp = tmp.to_path_buf();
+    {
+        {
+            transpile(BuildTarget::Ruby, input, &tmp, true, false, false)?;
+            let mut roots = Vec::new();
+            for gem in gems {
+                let (name, version) = gem
+                    .rsplit_once('-')
+                    .ok_or_else(|| format!("`{gem}` names no version"))?;
+                // In the app's directory: its `.ruby-version` names the Ruby whose gems the app runs on.
+                let found = std::process::Command::new("ruby")
+                    .args([
+                        "-e",
+                        &format!(
+                            "print Gem::Specification.find_by_name({name:?}, {version:?}).gem_dir"
+                        ),
+                    ])
+                    .current_dir(input)
+                    .output()
+                    .map_err(|e| format!("ruby: {e}"))?;
+                if !found.status.success() {
+                    return Err(format!("CRuby does not have {gem} installed"));
+                }
+                roots.push(String::from_utf8_lossy(&found.stdout).into_owned());
+            }
+            let observer = tmp.join(".roundhouse-shape-observer.rb");
+            let out = tmp.join(".roundhouse-shapes.json");
+            std::fs::write(&observer, obs::OBSERVER).map_err(|e| e.to_string())?;
+            let mut child = std::process::Command::new("ruby")
+                .arg(format!("-r{}", observer.display()))
+                .args([
+                    "-e",
+                    &format!("require {:?}", tmp.join("boot").display().to_string()),
+                ])
+                .current_dir(input)
+                .env("RH_SHAPE_OUT", &out)
+                .env("RH_SHAPE_APP", &tmp)
+                .env("RH_SHAPE_GEMS", roots.join(":"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(tmp.join(".roundhouse-boot.log")).map_err(|e| e.to_string())?)
+                .spawn()
+                .map_err(|e| format!("ruby: {e}"))?;
+            let started = std::time::Instant::now();
+            // Not left to run: a boot that waits on a server or a socket would hold the build.
+            let status = loop {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    break status;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(120) {
+                    let _ = child.kill();
+                    return Err("the boot did not finish in 120 s".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            if !status.success() {
+                let stderr = std::fs::read_to_string(tmp.join(".roundhouse-boot.log")).unwrap_or_default();
+                return Err(format!(
+                    "the boot failed: {}",
+                    stderr.lines().next().unwrap_or("")
+                ));
+            }
+            let observation: obs::Observation =
+                serde_json::from_slice(&std::fs::read(&out).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            Ok(observation)
+        }
+    }
+}
+
+
 #[derive(PartialEq)]
 enum Transpiled {
+    /// The Spinel tree needs what these gems do to the app's classes as it boots (`observed_shapes`): nothing was written.
+    Observe { gems: Vec<String>, key: String },
     Written,
     /// The analyzed app does not occupy a name ingest refused: nothing
     /// was written.
@@ -415,6 +581,13 @@ fn transpile(
         Ok(app) => {
             #[cfg(feature = "memory-census")]
             roundhouse::memory_census::census("after ingest", &app);
+            if target == BuildTarget::Spinel && !OBSERVED.with(|c| c.get()) && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0") {
+                let gems = roundhouse::observed_shapes::needed(&app);
+                if !gems.is_empty() {
+                    let key = input.canonicalize().map(|dir| roundhouse::observed_shapes::key(&dir)).unwrap_or_default();
+                    return Ok(Transpiled::Observe { gems, key });
+                }
+            }
             app
         }
         Err(e) => {
@@ -560,25 +733,41 @@ fn transpile(
     // Each gap still degrades to a stub in the emitted output, so a
     // single run surfaces the whole inventory instead of dying on the
     // first one.
-    let emit = || {
+    // The emit below lowers `constantize` in the app itself, and on a target that refuses the call
+    // the name it resolved goes with it: what the app reaches is read before, as it was read
+    // when the emit lowered a copy.
+    let unreached_gem_code = (whole_route.is_none() && roundhouse::lower::constantize::applies(&app, target))
+        .then(|| roundhouse::source_gem_shake::UnreachedGemCode::of(&app));
+    let mut emit = || {
         roundhouse::emit::diagnostics::scope(|| match &whole_route {
             Some(wr) => project::futamura_target_files(&app, input, Some(wr)),
-            None => project::target_files(&app, input, target),
+            // What follows reads the app's sources, lockfile and assets, never its bodies.
+            None => project::target_files_lowering_in_place(&mut app, input, target),
         })
     };
-    let audit = std::env::var_os("ROUNDHOUSE_AUDIT").is_some();
-    // Not recorded on every run: the record clones each rendered class's IR, which only the audit reads.
+    // The Ruby family and Spinel write Ruby, which the audit reads back: a
+    // send on an app model the written Ruby defines nothing for is an
+    // error. `ROUNDHOUSE_AUDIT` also lists the warnings, on other classes.
+    let list_audit = std::env::var_os("ROUNDHOUSE_AUDIT").is_some();
+    let gates = roundhouse::emit::audit::gates(target);
+    let audit = list_audit || gates;
     let ((files_result, mut diags), rendered) =
         if audit { roundhouse::emit::ruby::record_rendered(emit) } else { (emit(), Vec::new()) };
     if audit
         && let Ok(files) = &files_result
     {
         let started = std::time::Instant::now();
-        let findings = roundhouse::emit::audit::audit(&rendered, files);
-        for d in &findings {
-            eprintln!("{}", d.render(&app.sources));
+        let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+        let findings = roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources);
+        if list_audit {
+            for d in &findings {
+                eprintln!("{}", d.render(&app.sources));
+            }
+            eprintln!("roundhouse: audit: {} send(s) resolve to no emitted method ({:?})", findings.len(), started.elapsed());
         }
-        eprintln!("roundhouse: audit: {} send(s) resolve to no emitted method ({:?})", findings.len(), started.elapsed());
+        if gates {
+            diags.extend(findings.into_iter().filter(|d| d.severity == Severity::Error));
+        }
     }
 
     // Same attribution pass as `analyze_diags` above, run again here:
@@ -609,8 +798,17 @@ fn transpile(
     // gate failure reports every diagnostic before the run aborts.
     diags.splice(0..0, parse_diags);
     // A gem's code the app does not reach is no error of the emitted program (`source_gem_shake`).
-    roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut diags);
-    roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut analyze_diags);
+    match &unreached_gem_code {
+        Some(unreached) => {
+            for d in [&mut diags, &mut analyze_diags] {
+                unreached.iter().for_each(|u| u.demote(d));
+            }
+        }
+        None => {
+            roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut diags);
+            roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut analyze_diags);
+        }
+    }
 
     // Policy: errors (unsupported constructs and type errors alike) fail
     // the transpile cleanly by default. With --allow-unsupported they

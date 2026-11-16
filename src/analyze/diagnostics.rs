@@ -253,6 +253,32 @@ pub(crate) fn datetime_local_time_reads(app: &App) -> Vec<crate::span::Span> {
 /// reading (or passed) its dir-convention record local, would see the
 /// body there. Those are refused, as is any other block-form render
 /// (`render partial: "x", locals: … do` raises in Rails).
+/// A view's `render` of an object (`render(Widget.new)`) that is not known to render itself: Rails asks the object to
+/// (`render_in(view_context)`), which only `lower::renderable` models, for an object typed as answering it. Left alone it was emitted as a bare `render(…)` in the
+/// view's module, which has no such method, so it raised when the page rendered.
+fn unmodeled_object_renders(app: &App) -> Vec<Diagnostic> {
+    use crate::lower::view::classify_render_partial;
+    fn visit(app: &App, e: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+            && method.as_str() == "render"
+            && crate::lower::renderable::rendered_object(app, e).is_none()
+            && !e.span.is_synthetic()
+            && let Some(first) = args.first()
+            && matches!(&*first.node, ExprNode::Send { .. } | ExprNode::Const { .. })
+            && classify_render_partial(None, method.as_str(), args, None, &|_| true, &|_| false).is_none()
+        {
+            let why = "Rails asks the object to render itself (`render_in(view_context)`), and this object is not known to answer it";
+            out.push(Diagnostic::unsupported(e.span, None, "render of an object", why));
+        }
+        e.node.for_each_child(&mut |c| visit(app, c, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(app, &view.body, &mut out);
+    }
+    out
+}
+
 fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
     use crate::lower::view::{classify_render_partial, RenderPartial};
     // Bare `yield`s, and whether any sits inside a loop: a `while`, or the
@@ -283,7 +309,8 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
     let carrying = crate::lower::view_to_library::yield_carrying_partials(app);
     let reason = |e: &Expr, caller_dir: &str| -> Option<&'static str> {
         let ExprNode::Send { recv, method, args, block: Some(block), .. } = &*e.node else { return None };
-        if method.as_str() != "render" || recv.is_some() {
+        // Not an object that renders itself: the lowering hands the block to its `render_in` (a component's slots).
+        if method.as_str() != "render" || recv.is_some() || crate::lower::renderable::rendered_object(app, e).is_some() {
             return None;
         }
         let Some(RenderPartial::LayoutBlock { layout, locals, block }) =
@@ -468,6 +495,121 @@ fn unlowered_time_tags(app: &App) -> Vec<Diagnostic> {
             visit(&method.body, false, &mut out);
         }
     }
+    out
+}
+
+/// `joins(:assoc)` (or a left join) of an association whose scope renders
+/// no ON clause here (`AssocRegistry::join_scope_unrenderable`: an enum
+/// Symbol, `where.not`, a SQL string, an Array or a Range): the lowering
+/// can't write its join, and the runtime would raise on it. Rails puts the
+/// scope in the ON clause, so joining without it would answer rows the
+/// scope excludes. Refused where it is written instead.
+fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
+    let registry = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    if !app.models.iter().any(|m| {
+        m.associations().any(|a| registry.join_scope_unrenderable(&m.name, a.name()))
+    }) {
+        return Vec::new();
+    }
+    let model_of = |recv: &Expr| -> Option<ClassId> {
+        match (&*recv.node, recv.ty.as_ref()) {
+            (_, Some(Ty::Relation { of })) => Some(of.clone()),
+            // A query chain types as an Array of its model (`ty.rs`).
+            (_, Some(Ty::Array { elem })) => match &**elem {
+                Ty::Class { id, .. } if app.models.iter().any(|m| &m.name == id) => Some(id.clone()),
+                _ => None,
+            },
+            (ExprNode::Const { path }, _) => {
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                app.models.iter().find(|m| m.name.0.as_str() == name).map(|m| m.name.clone())
+            }
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    fn visit(
+        expr: &Expr,
+        model_of: &dyn Fn(Option<&Expr>) -> Option<ClassId>,
+        registry: &crate::lower::scope_chain::AssocRegistry,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        if let ExprNode::Send { recv, method, args, .. } = &*expr.node
+            && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
+            && let Some(model) = model_of(recv.as_ref())
+        {
+            // Each association a join spec names, with the model it is
+            // declared on: a nested hash's associations are the
+            // preceding association target's (`joins(trees: :branches)`).
+            fn names<'e>(
+                model: &ClassId,
+                spec: &'e Expr,
+                registry: &crate::lower::scope_chain::AssocRegistry,
+                out: &mut Vec<(ClassId, &'e Expr)>,
+            ) {
+                match &*spec.node {
+                    ExprNode::Array { elements, .. } => {
+                        elements.iter().for_each(|e| names(model, e, registry, out))
+                    }
+                    ExprNode::Hash { entries, .. } => {
+                        for (k, v) in entries {
+                            names(model, k, registry, out);
+                            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node
+                                && let Some(target) = registry.assoc_target(model, value)
+                            {
+                                names(target, v, registry, out);
+                            }
+                        }
+                    }
+                    _ => out.push((model.clone(), spec)),
+                }
+            }
+            let mut named: Vec<(ClassId, &Expr)> = Vec::new();
+            args.iter().for_each(|arg| names(&model, arg, registry, &mut named));
+            for (model, name) in named {
+                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
+                    && registry.join_scope_unrenderable(&model, value)
+                {
+                    out.push(Diagnostic::unsupported(
+                        name.span,
+                        None,
+                        "association join",
+                        format!(
+                            "`{}(:{})`: the association's scope doesn't render as SQL here (only hash `where`s of \
+                             literals do), so its join can't carry the scope in its ON clause, as Rails' does",
+                            method.as_str(),
+                            value.as_str(),
+                        ),
+                    ));
+                }
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, model_of, registry, out));
+    }
+    // An explicit receiver: a model constant or a query chain.
+    let explicit = |recv: Option<&Expr>| match recv {
+        Some(r) if !matches!(&*r.node, ExprNode::SelfRef) => model_of(r),
+        _ => None,
+    };
+    crate::lower::for_each_emit_body_ref(app, &mut |body| visit(body, &explicit, &registry, &mut out));
+    // A model's scopes and class methods: a bare or `self.` join there is
+    // on that model (`scope :shady, -> { joins(:shady_trees) }`), and an
+    // explicit receiver resolves as anywhere else.
+    for model in &app.models {
+        let own = |recv: Option<&Expr>| match recv {
+            None => Some(model.name.clone()),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => Some(model.name.clone()),
+            Some(r) => model_of(r),
+        };
+        for scope in model.scopes() {
+            visit(&scope.body, &own, &registry, &mut out);
+        }
+        for method in model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class) {
+            visit(&method.body, &own, &registry, &mut out);
+        }
+    }
+    // A body both walks reach reports its join once.
+    let mut seen = crate::det::HashSet::default();
+    out.retain(|d| seen.insert((d.span, d.message.clone())));
     out
 }
 
@@ -858,6 +1000,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     // evidence; this does not widen the general library diagnostic policy.
     out.extend(super::alba::diagnose(app));
     out.extend(unmodeled_block_renders(app));
+    out.extend(unmodeled_object_renders(app));
     out.extend(crate::gems::extension_gem_refusals(app, None));
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
@@ -865,6 +1008,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(super::data::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
     out.extend(crate::lower::model_to_library::encrypts_diagnostics(app));
+    out.extend(crate::lower::model_to_library::unrolled_loop_diagnostics(app));
     out.extend(route_guard_untyped_sends(app));
     // A support file the class ingest left out, at what failed it.
     out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));
@@ -964,6 +1108,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(unlowered_current_page(app));
     out.extend(helper_stylesheet_link_tags(app));
     out.extend(unlowered_time_tags(app));
+    out.extend(unrenderable_association_joins(app));
     out.extend(unlowered_simple_format(app));
     out.extend(controller_shadowed_view_helpers(app));
     out.extend(link_to_if_params_shadowing_nested_locals(app));
@@ -1018,6 +1163,20 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(app.included_hoist_conflicts.iter().cloned());
     out.extend(app.superclass_refusals.iter().cloned());
     out.extend(app.gem_route_gaps.iter().cloned());
+    // after_initialize bodies are the app's own code run at boot
+    // (`ingest::after_initialize`): checked like a model method, not under
+    // the library policy, so a call with no runtime behind it is an error.
+    if app.runs_after_initialize {
+        for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == crate::app::AFTER_INITIALIZE_RUNNER) {
+            for method in &class.methods {
+                diagnose_expr(&method.body, &mut out);
+                // `run` is generated; only the callbacks carry the app's spans.
+                if !method.name_span.is_synthetic() {
+                    unchecked_callback_calls(&method.body, &mut out);
+                }
+            }
+        }
+    }
     for class in &app.library_classes {
         for initializer in &class.class_ivar_initializers {
             diagnose_expr(initializer, &mut out);
@@ -1029,7 +1188,66 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     for stmt in &app.boot_program {
         diagnose_expr(stmt, &mut out);
     }
+    unresolved_test_constants(app, &mut out);
     out
+}
+
+/// A test that names a member of a Ruby core or standard-library
+/// namespace that neither Ruby nor the app defines: `Digest::BLAKE3`,
+/// which a gem adds to `Digest` and the app does not declare to
+/// Roundhouse. The tests are emitted with the app, so the reference
+/// reaches the emitted project, where nothing defines it: a strict
+/// target's test build fails on it, and a Ruby one raises `NameError`.
+/// It is the error the app's own code gets for the same constant.
+///
+/// Deliberately narrow. A test body's per-expression constant
+/// diagnostics also fire on names that resolve another way: a class the
+/// test declares inside its own body, a model an RSpec example reaches,
+/// a test-framework class (`Rack::Test::UploadedFile`) the lowering
+/// supplies, a core class the analyzer does not model (`TCPServer`). So
+/// only a path whose first segment is a Ruby namespace, but which is not
+/// itself a Ruby constant or a class of the app, is reported.
+fn unresolved_test_constants(app: &App, out: &mut Vec<Diagnostic>) {
+    use crate::emit::audit::CORE_CONSTANTS;
+    let app_classes: Vec<&str> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str())
+        .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
+        .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+        .chain(app.test_modules.iter().flat_map(|t| t.inner_classes.iter().map(|c| c.name.0.as_str())))
+        .collect();
+    let reported = |path: &[Symbol]| -> bool {
+        let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+        let [first, _, ..] = segments.as_slice() else { return false };
+        let name = segments.join("::");
+        CORE_CONSTANTS.contains(first)
+            && !CORE_CONSTANTS.contains(&name.as_str())
+            && !app_classes.iter().any(|c| *c == name || c.ends_with(&format!("::{name}")))
+    };
+    fn walk(expr: &Expr, reported: &dyn Fn(&[Symbol]) -> bool, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Const { path } = &*expr.node
+            && let Some(DiagnosticKind::Unsupported { construct, .. }) = &expr.diagnostic()
+            && construct.as_str() == "constant"
+        {
+            if reported(path) {
+                diagnose_expr(expr, out);
+            }
+            return;
+        }
+        expr.node.for_each_child(&mut |c| walk(c, reported, out));
+    }
+    for module in &app.test_modules {
+        for test in &module.tests {
+            walk(&test.body, &reported, out);
+        }
+        if let Some(setup) = &module.setup {
+            walk(setup, &reported, out);
+        }
+        for helper in &module.helpers {
+            walk(&helper.body, &reported, out);
+        }
+    }
 }
 
 /// [`diagnose`] plus the missing-preload coverage triple, for report
@@ -1195,6 +1413,39 @@ pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
         }
     }
     helper_out
+}
+
+/// A call in an `after_initialize` body that nothing checks: its receiver
+/// is the gradual escape or untyped, or an implicit-self call is
+/// unresolved. In a model method such a call is a warning; a carried
+/// callback runs at boot with no caller to rescue it, so the callback is
+/// carried only when every call resolves and this is an error. One report
+/// per chain: `a.b.c` on an untyped `a` names `b`, the first unchecked link.
+fn unchecked_callback_calls(expr: &Expr, out: &mut Vec<Diagnostic>) {
+    fn unchecked(expr: &Expr) -> bool {
+        match &*expr.node {
+            ExprNode::Send { recv: Some(r), .. } => {
+                matches!(r.ty, Some(Ty::Untyped)) || is_unknown_ty(r.ty.as_ref())
+            }
+            ExprNode::Send { recv: None, .. } => is_unknown_ty(expr.ty.as_ref()),
+            _ => false,
+        }
+    }
+    if let ExprNode::Send { recv, method, .. } = &*expr.node {
+        let link_of_reported_chain = recv.as_ref().is_some_and(|r| unchecked(r));
+        if unchecked(expr) && !link_of_reported_chain && expr.diagnostic().is_none() && !expr.span.is_synthetic() {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "after_initialize callback call",
+                format!(
+                    "`{}` has no typed receiver, so nothing checks that the emitted program answers it at boot",
+                    method.as_str()
+                ),
+            ));
+        }
+    }
+    expr.node.for_each_child(&mut |child| unchecked_callback_calls(child, out));
 }
 
 /// A type is "unknown" if it's `None` or `Ty::Var(n)` (a placeholder the

@@ -314,6 +314,7 @@ mod tests {
             name: sym(name),
             target: cid(target),
             foreign_key: sym(fk),
+            foreign_key_explicit: false,
             optional: false,
             polymorphic: false,
             polymorphic_targets: vec![],
@@ -321,6 +322,7 @@ mod tests {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         }
     }
 

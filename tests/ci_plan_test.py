@@ -631,6 +631,15 @@ class Routing(unittest.TestCase):
                 self.assertEqual(ci.main(), 0)
             return output.call_args.args[0]
 
+    def test_the_plan_hands_the_shards_their_cpu_seconds(self):
+        main = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"}
+        changed = {"return_value": (["README.md"], None)}
+        recorded = {"toolchain": {"a": 300}, "toolchain_cpu": {"a": 900}, "framework": {"b": 40}}
+        outputs = self.run_planner({"before": "0" * 40}, {**main, "CI_SPINEL_TIMINGS": json.dumps(recorded)}, changed)
+        self.assertEqual(outputs["spinel-timings"], recorded)
+        outputs = self.run_planner({"before": "0" * 40}, {**main, "CI_SPINEL_TIMINGS": json.dumps({"toolchain": {"a": 300}})}, changed)
+        self.assertEqual(outputs["spinel-timings"], {"framework": {}, "toolchain": {"a": 300}})
+
     def test_full_input_on_main_still_selects_every_sdk(self):
         with tempfile.TemporaryDirectory() as directory:
             event = Path(directory) / "event.json"
@@ -934,6 +943,61 @@ class Routing(unittest.TestCase):
         # This is a toolchain test, not a framework-suite binary.
         self.assertNotIn("data_record_siblings", ci.SPINEL_TESTS)
 
+    def test_after_initialize_boot_order_selects_the_native_toolchain_lane(self):
+        for path in [
+            "src/ingest/after_initialize.rs",
+            "tests/emit_and_run/after_initialize.rs",
+            "tests/support/after_initialize_app.rs",
+            "tests/support/after_initialize_boot.rs",
+            "tests/spinel_toolchain/after_initialize_boot.rs",
+            "src/project.rs",
+            "runtime/spinel/scaffold/main.rb",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("unit", plan["jobs"])
+                self.assertIn("spinel-toolchain", plan["jobs"])
+        # The native server check is a toolchain test, not a framework-suite binary.
+        self.assertNotIn("after_initialize_boot", ci.SPINEL_TESTS)
+
+    def test_postgresql_spinel_tree_inputs_select_the_pg_gate(self):
+        # tests/spinel_pg_db.rs also compiles a test of an emitted app on
+        # PostgreSQL, so what assembles that tree selects it.
+        for path in [
+            "src/project.rs",
+            "src/lower/model_to_library/adapter_emit/mod.rs",
+            "src/emit/shared/schema_sql.rs",
+            "src/ingest/database_yml.rs",
+            "runtime/spinel/scaffold/main.rb",
+            "runtime/spinel/scaffold/Gemfile",
+            "runtime/spinel/test/test_helper.rb",
+            "tests/support/emit_and_run.rs",
+            "tests/spinel_pg_db.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("spinel_pg_db", plan["spinel_tests"])
+        # The emission checks need neither Spinel nor a server: unit only.
+        plan = ci.select(["tests/postgresql_spinel_target.rs"])
+        self.assertIn("unit", plan["jobs"])
+        self.assertNotIn("spinel-framework", plan["jobs"])
+        self.assertNotIn("postgresql_spinel_target", ci.SPINEL_TESTS)
+
+    def test_postgresql_array_column_inputs_select_the_pg_gate(self):
+        # tests/spinel_pg_db.rs compiles a test of stored array columns on
+        # PostgreSQL through the PostgreSQL codec.
+        for path in [
+            "runtime/spinel/array_column_pg.rb",
+            "runtime/spinel/array_column.rbs",
+            "src/lower/array_columns.rs",
+            "tests/support/array_widgets.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("spinel_pg_db", plan["spinel_tests"])
+
     def test_param_binds_owns_lowering_drivers_and_database_runtime(self):
         for path in [
             "src/lower/arel/visitor.rs",
@@ -951,7 +1015,8 @@ class Routing(unittest.TestCase):
             with self.subTest(path=path):
                 plan = ci.select([path])
                 if path == "tests/support/emit_and_run.rs":
-                    expected = [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_constraints"]
+                    # spinel_pg_db's emitted-app gate emits through it too.
+                    expected = [*ci.PARAM_BIND_TESTS, "spinel_pg_db", "generated_columns_spinel", "schema_constraints"]
                 elif path == "src/lower/arel/visitor.rs":
                     expected = [*ci.PARAM_BIND_TESTS, "generated_columns_spinel", "schema_default_expressions"]
                 elif path.startswith("src/"):
@@ -1817,26 +1882,22 @@ class Results(unittest.TestCase):
         # #1781: a test whose contract runs from a shared bundle finishes in well under a second, and
         # recording only that put every bundled test on one shard, which then paid all their compiles.
         heavy = {"heavy0": 600, "heavy1": 500, "heavy2": 400}
-        bundled = [f"bundled{i:02}" for i in range(16)]
+        bundled = [f"bundled{i:02}" for i in range(48)]
         share = 60
         true_cost = {**heavy, **{t: 1 + share for t in bundled}}
         tests = sorted(true_cost)
+        threads = ci.SPINEL_TOOLCHAIN_THREADS
 
-        def plan(recorded):
+        def ends(recorded):
             timings = {"toolchain": {**heavy, **{t: recorded for t in bundled}}}
-            # Not the live shard count: the half-of-bundled bound below is drawn for four shards beside these three heavy tests.
+            # Not the live shard count: the bounds below are drawn for four shards beside these three heavy tests.
             shards = [ci.spinel_toolchain_shard(tests, k, count=4, timings=timings) for k in range(4)]
             self.assertEqual(sorted(t for s in shards for t in s), tests)
-            loads = [sum(true_cost[t] for t in s) for s in shards]
-            loads[-1] += ci.SPINEL_TOOLCHAIN_TAIL_SECONDS * ci.SPINEL_TOOLCHAIN_THREADS
-            return shards, loads
+            tail = [0, 0, 0, ci.SPINEL_TOOLCHAIN_TAIL_SECONDS * threads]
+            return [max((sum(true_cost[t] for t in s) + tail[k]) / threads, max(true_cost[t] for t in s)) for k, s in enumerate(shards)]
 
-        shards, loads = plan(recorded=1)
-        self.assertEqual(max(sum(t in bundled for t in s) for s in shards), len(bundled))
-        self.assertGreater(max(loads) - min(loads), len(bundled) * share // 2)
-        shards, loads = plan(recorded=1 + share)
-        self.assertLessEqual(max(sum(t in bundled for t in s) for s in shards), len(bundled) // 2)
-        self.assertLess(max(loads) - min(loads), max(heavy.values()))
+        self.assertGreater(max(ends(recorded=1)), max(heavy.values()) + share)
+        self.assertLessEqual(max(ends(recorded=1 + share)), max(heavy.values()) + share)
 
     def test_run_tests_charges_each_bundled_test_its_share_of_the_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1913,6 +1974,67 @@ class Results(unittest.TestCase):
             ],
         )
         self.assertEqual(merged, {"toolchain": {"a": 150, "b": 50}, "framework": {"d": 30}})
+
+    def test_merge_averages_a_passing_toolchain_tests_cpu_seconds_apart(self):
+        merged = ci.merge_timings(
+            {"toolchain": {"a": 300}, "toolchain_cpu": {"a": 100}},
+            [
+                {"kind": "toolchain", "name": "a", "seconds": 500, "ok": True, "cpu": 200},
+                {"kind": "toolchain", "name": "b", "seconds": 90, "ok": True, "cpu": 40.4},
+                {"kind": "toolchain", "name": "c", "seconds": 900, "ok": False, "timed_out": True},
+                {"kind": "toolchain", "name": "d", "seconds": 50, "ok": False, "cpu": 10},
+                {"kind": "framework", "name": "e", "seconds": 30, "ok": True, "cpu": 30},
+            ],
+        )
+        self.assertEqual(merged["toolchain_cpu"], {"a": 150, "b": 40})
+        self.assertEqual(merged["toolchain"], {"a": 400, "b": 90, "c": 900})
+        self.assertEqual(ci.load_spinel_timings(json.dumps(merged))["toolchain_cpu"], {"a": 150, "b": 40})
+
+    def test_cpu_seconds_place_tests_where_wall_seconds_misled(self):
+        # Wall seconds measured beside other tests: all four took as long, but a and b kept every thread busy.
+        tests = ["a", "b", "c", "d"]
+        wall = {"toolchain": {**{t: 400 for t in tests}, ci.SPINEL_TOOLCHAIN_TAIL: 1}}
+        cpu = {**wall, "toolchain_cpu": {"a": 1600, "b": 1600, "c": 100, "d": 100}}
+        shards = [ci.spinel_toolchain_shard(tests, k, count=2, timings=cpu) for k in range(2)]
+        self.assertEqual(sorted(sorted(s) for s in shards), [["a", "c"], ["b", "d"]])
+        # No shard ends before its longest test, whatever its CPU seconds.
+        lone = {"toolchain": {"long": 900, "x": 100, "y": 100, ci.SPINEL_TOOLCHAIN_TAIL: 1}, "toolchain_cpu": {"long": 900, "x": 400, "y": 400}}
+        shards = [ci.spinel_toolchain_shard(["long", "x", "y"], k, count=2, timings=lone) for k in range(2)]
+        self.assertIn(["long"], shards)
+
+    def test_equal_tests_fill_every_shard(self):
+        tests = [f"t{i:02}" for i in range(12)]
+        timings = {"toolchain": {t: 400 for t in tests}, "toolchain_cpu": {t: 400 for t in tests}}
+        shards = [ci.spinel_toolchain_shard(tests, k, timings=timings) for k in range(ci.SPINEL_TOOLCHAIN_SHARDS)]
+        self.assertTrue(all(shards), shards)
+        self.assertEqual(sorted(t for s in shards for t in s), tests)
+
+    def test_run_tests_records_cpu_seconds_with_the_bundle_share(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "records.jsonl"
+            bundle = Path(tmp) / "bundle"
+            bundle.mkdir()
+            (bundle / "seconds.json").write_text('{"a": 30, "b": 10}')
+            (bundle / "cpu.json").write_text('{"cpu": 200}')
+            env = {**os.environ, "CI_SPINEL_TIMINGS_OUT": str(out), "RH_SPINEL_BUNDLE": str(bundle)}
+            subprocess.run(
+                ["python3", spec.origin, "run-tests", "--kind", "toolchain", "--parallel", "2", "--", "true"],
+                input="a\nb\nc\n", capture_output=True, text=True, env=env, check=True,
+            )
+            cpu = {r["name"]: r["cpu"] for r in map(json.loads, out.read_text().splitlines())}
+            self.assertEqual({k: round(v) for k, v in cpu.items()}, {"a": 150, "b": 50, "c": 0})
+            self.assertLess(cpu["c"], 1)
+
+    def test_cpu_of_writes_the_commands_cpu_seconds_with_its_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "nested" / "cpu.json"
+            busy = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done"
+            run = subprocess.run(
+                ["python3", spec.origin, "cpu-of", "--out", str(out), "--", "sh", "-c", f"sh -c '{busy}'; exit 3"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(run.returncode, 3)
+            self.assertGreater(json.loads(out.read_text())["cpu"], 0.1)
 
     def test_a_stopped_tests_seconds_only_raise_its_last_value(self):
         merged = ci.merge_timings(
@@ -2039,6 +2161,15 @@ class Results(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
+    def test_tiny_api_runs_on_the_shard_the_plan_counts_it_on(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        job = re.search(r"(?ms)^  spinel-toolchain:\n(.*?)(?=^  [\w-]+:|\Z)", workflow)[1]
+        shards = re.search(r"shard: \[([0-9, ]+)\]", job)[1]
+        self.assertEqual([int(n) for n in shards.split(",")], list(range(ci.SPINEL_TOOLCHAIN_SHARDS)))
+        gate = re.search(r"- name: run tiny_api spinel_gate_ --ignored\n\s+if: \$\{\{ !cancelled\(\) && matrix.shard == (\d+) \}\}", job)
+        self.assertIsNotNone(gate, "the tiny_api step's shard condition moved")
+        self.assertEqual(int(gate[1]), ci.SPINEL_TOOLCHAIN_SHARDS - 1)
+
     def test_jruby_runs_cleanup_after_runtime_setup(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
         job = re.search(

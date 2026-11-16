@@ -15,6 +15,7 @@
 //! type. The expression-level recursive descent lives in [`expr`]; small
 //! cross-cutting Prism AST helpers live in [`util`].
 
+mod after_initialize;
 mod alba;
 mod built_send;
 mod conditional_permit;
@@ -32,6 +33,7 @@ pub(crate) mod each_validator;
 pub(crate) mod mailer_callbacks;
 pub(crate) mod mailer_defaults;
 pub(crate) mod has_many_hold;
+pub(crate) mod has_one_write;
 pub(crate) mod mailer_helpers;
 pub(crate) mod class_attribute;
 mod class_configuration;
@@ -124,6 +126,7 @@ mod body_statements;
 mod error_site;
 mod external_include;
 mod hook_class_attribute;
+mod load_hooks;
 pub(crate) mod inherited_alias;
 mod class_macros;
 mod configured_superclass;

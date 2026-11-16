@@ -111,6 +111,7 @@ require_relative "runtime/type_toolkit"
 # `config_for`'s answer: a Hash subclass with `method_missing`, so it cannot
 # live in the shared runtime that reads it (CRuby overlay only).
 require_relative "runtime/active_support_ordered_options"
+require_relative "runtime/active_support_gzip"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other
@@ -129,6 +130,7 @@ require_relative "runtime/action_view_form_builder"
 require_relative "runtime/action_view_tags"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+require_relative "runtime/active_record_runtime_macros"
 # `ActiveRecord::Base.connection_db_config`, `connection_pool` and
 # `transaction_open?` over the Db shim loaded above.
 require_relative "runtime/active_record_db_config"

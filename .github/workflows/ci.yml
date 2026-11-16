@@ -603,6 +603,11 @@ jobs:
           gem install --no-document --ignore-dependencies responders -v 3.1.1
           # doorkeeper, compiled from source (tests/emit_and_run/doorkeeper.rs).
           gem install --no-document --ignore-dependencies doorkeeper -v 5.8.2
+          # view_component, compiled from source (tests/emit_and_run/view_component.rs).
+          gem install --no-document --ignore-dependencies view_component -v 3.23.2
+          gem install --no-document --ignore-dependencies method_source -v 1.1.0
+          # aasm, compiled from source (tests/emit_and_run/aasm_source.rs).
+          gem install --no-document --ignore-dependencies aasm -v 5.5.1
           # simple_form, compiled from source (tests/emit_and_run/simple_form.rs).
           gem install --no-document --ignore-dependencies simple_form -v 5.4.1
           # OmniAuth for devise's :omniauthable, installed as the Ruby family loads it (tests/emit_and_run/devise.rs).
@@ -1923,6 +1928,9 @@ jobs:
           # addressable and its public_suffix, built natively (tests/spinel_toolchain/addressable.rs).
           gem install --no-document --ignore-dependencies public_suffix -v 7.0.5
           gem install --no-document --ignore-dependencies addressable -v 2.9.0
+          # view_component and method_source, built natively (tests/spinel_toolchain/view_component.rs).
+          gem install --no-document --ignore-dependencies view_component -v 3.23.2
+          gem install --no-document --ignore-dependencies method_source -v 1.1.0
       # One process per test, as many as libtest's threads, so each test's seconds are its own.
       - name: run spinel_toolchain ignored suite (${{ matrix.shard }})
         env:
@@ -1954,7 +1962,9 @@ jobs:
           sed -n 's/^now //p' "$RUNNER_TEMP/split.txt" | python3 scripts/ci-plan.py run-tests --kind toolchain --parallel "$(nproc)" -- "$SPINEL_TOOLCHAIN_BIN" --ignored --nocapture --exact &
           alone=$!
           left=$(( CI_SPINEL_DEADLINE - $(date +%s) ))
+          # Not run bare: the tests it builds for are charged a share of its CPU seconds, which the plan balances on.
           [ "$left" -le 0 ] || RH_SPINEL_BUNDLE_COLLECT="$RUNNER_TEMP/bundle-cases" RH_SPINEL_BUNDLE_OUT="$RUNNER_TEMP/spinel-bundles" \
+            python3 scripts/ci-plan.py cpu-of --out "$RUNNER_TEMP/spinel-bundles/cpu.json" -- \
             timeout "$left" "$SPINEL_TOOLCHAIN_BIN" --ignored --exact spinel_bundle_build --nocapture || true
           echo "bundled in $(( $(date +%s) - start ))s"
           status=0
@@ -1966,8 +1976,9 @@ jobs:
       # app entry, HTTP requests to the binary, and the model script
       # compiled natively. Filtered by name, so the ignored test named
       # after an open issue (#163) is not selected.
+      # Not any shard: spinel_toolchain_shard counts tiny_api's seconds on the last one (loads[-1]).
       - name: run tiny_api spinel_gate_ --ignored
-        if: ${{ !cancelled() && matrix.shard == 3 }}
+        if: ${{ !cancelled() && matrix.shard == 4 }}
         env:
           CI_SPINEL_TIMINGS_OUT: ${{ runner.temp }}/spinel-timings/toolchain-${{ matrix.shard }}.jsonl
         run: |
