@@ -66,7 +66,9 @@ fn through_chain_custom_key(
             model.name.0
         ));
     }
-    let hop = model.associations().find(|a| a.name() == thr_name)?;
+    // A later declaration of the name replaces an earlier one, as the
+    // through reader reads it.
+    let hop = model.associations().filter(|a| a.name() == thr_name).last()?;
     if let Some(k) = custom_primary_key(hop) {
         return Some(format!("`{}#{}` declares `primary_key: :{}`", model.name.0, thr_name, k));
     }
@@ -83,7 +85,11 @@ fn through_chain_custom_key(
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
     let src = thr_model.through_source(assoc)?;
     match src {
-        Association::HasMany { through: None, .. } | Association::HasOne { through: None, .. } => {
+        // A belongs_to source's target column too: the join reads the
+        // target's `id` (a polymorphic one's join names its key).
+        Association::HasMany { through: None, .. }
+        | Association::HasOne { through: None, .. }
+        | Association::BelongsTo { polymorphic: false, .. } => {
             custom_primary_key(src).map(|k| {
                 format!("`{}#{}` declares `primary_key: :{}`", thr_model.name.0, src.name(), k)
             })

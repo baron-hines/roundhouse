@@ -546,6 +546,7 @@ pub(super) fn push_association_methods(
                 as_interface,
                 scope,
                 autosave,
+                through,
                 ..
             } => {
                 if crate::lower::assoc_primary_key::refuse(model, models, assoc, span) {
@@ -554,6 +555,23 @@ pub(super) fn push_association_methods(
                 if refuse_scoped_through_source(model, models, assoc, span) {
                     continue;
                 }
+                // The autosave below writes the owner's key on the target,
+                // where a through association keeps it on the hop.
+                let autosave = if *autosave && through.is_some() {
+                    crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                        span,
+                        None,
+                        "through_autosave",
+                        format!(
+                            "`{}.{name}`: `autosave: true` on a has_one :through is not supported: \
+                             its save would write the owner's key on the target, not on the hop",
+                            model.name.0
+                        ),
+                    ));
+                    &false
+                } else {
+                    autosave
+                };
                 let owner_key = assoc.owner_key();
                 methods.push(synth_has_one_reader(
                     owner,

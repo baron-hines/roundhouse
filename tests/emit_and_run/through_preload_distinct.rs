@@ -81,6 +81,11 @@ end
     check("has_many source read", queries { names = crews.map { |c| c.kit.map(&:name) } } == 0)
     check("has_many source rows", names == [["saw", "drill"], ["saw", "drill"], []])
     check("hop record without its rows", crews.none? { |c| c.depot && c.depot.association(:tools).loaded? })
+    crews = Crew.order(:id).preload(shifts: :worker).to_a
+    held = crews.first.shifts.first.worker
+    # Rails: shifts already holding their workers answer them, with no query
+    check("held sources", queries { ActiveRecord::Associations::Preloader.new(records: crews, associations: :workers).call } == 0)
+    check("held source answers", crews.first.workers.to_a.first.equal?(held) && crews.first.workers.map(&:name) == ["lee", "kim"])
   end
 end
 "##)

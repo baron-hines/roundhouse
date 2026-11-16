@@ -59,6 +59,12 @@ end
     own = nil
     check("hop source read", queries { own = collars.first.dog.kennel } == 1)
     check("hop source writable", own.name == "oak" && !own.readonly? && !own.equal?(homes.first))
+    collars = Collar.order(:id).preload(dog: :kennel).to_a
+    held = collars.first.dog.kennel
+    # Rails: a dog already holding its kennel answers it, with no query, and
+    # that record stays writable
+    check("held sources", queries { ActiveRecord::Associations::Preloader.new(records: collars, associations: :home).call } == 0)
+    check("held source answers", collars.first.home.equal?(held) && !collars.first.home.readonly?)
   end
 end
 "##)

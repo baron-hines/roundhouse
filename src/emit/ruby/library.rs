@@ -3554,15 +3554,30 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 ));
                 continue;
             }
-            let Some((joins, edge)) = resolve_through_chain(&app.models, model, assoc, 0) else {
+            // Every table the chain joins is named bare, so one that
+            // appears twice (a self-referential hop) would be ambiguous.
+            let resolved = resolve_through_chain(&app.models, model, assoc, 0).filter(|(joins, _)| {
+                let target_table = app.models.iter().find(|m| &m.name == target).map(|m| m.table.0.as_str().to_string());
+                let mut tables: Vec<String> = joins
+                    .iter()
+                    .filter_map(|j| j.strip_prefix("INNER JOIN ")?.split(' ').next().map(str::to_string))
+                    .chain(target_table)
+                    .collect();
+                let count = tables.len();
+                tables.sort();
+                tables.dedup();
+                tables.len() == count
+            });
+            let Some((joins, edge)) = resolved else {
                 crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                     span,
                     None,
                     "through_chain",
                     format!(
                         "`{}.{name}`: no join through its `through:` association reaches `{}` \
-                         (a hop or source that is not an app model, or a polymorphic or scoped \
-                         belongs_to), so its reader would read a column the target does not have",
+                         (a hop or source that is not an app model, a polymorphic or scoped \
+                         belongs_to, a scoped hop below the first, or a table joined twice), so \
+                         its reader would not answer the rows Rails does",
                         model.name.0, target.0
                     ),
                 ));
@@ -3799,6 +3814,15 @@ fn resolve_through_chain(
     // `:event`); a later declaration of the name replaces an earlier one.
     let thr = model.associations().filter(|a| a.name() == thr_name).last()?;
     let (thr_target, thr_through, as_interface) = match thr {
+        // Only the owner's own direct hop has its scope merged
+        // (`through_hop_scope`): a scoped hop further down the chain, or
+        // a scoped hop that is itself a through, would be joined without
+        // its scope.
+        Association::HasMany { scope: Some(_), through, .. } | Association::HasOne { scope: Some(_), through, .. }
+            if depth > 0 || through.is_some() =>
+        {
+            return None;
+        }
         Association::HasMany { target, through, as_interface, .. }
         | Association::HasOne { target, through, as_interface, .. } => (target, through, as_interface),
         // Not a scoped one: `through_hop_scope` merges a has_many or
@@ -13298,29 +13322,41 @@ end
                 } else {
                     format!("      r.{name}_target.each do |s|\n        out << s\n      end")
                 };
+                // A hop record already holding its source answers it, in
+                // either branch, as Rails' loader reuses a loaded target
+                // (`already_loaded_records_by_key`), scope or not.
+                let held_source = if *source_many {
+                    format!("        h.{source}_target.each do |s|\n          list << s\n        end")
+                } else {
+                    format!("        s = h.{source}\n        list << s unless s.nil?")
+                };
                 let (load, push) = match apart {
                     None => (
-                        format!("  {hop_model}._preload_batch_{source}(middle) if middle.length > 0"),
-                        if *source_many {
-                            format!("      h.{source}_target.each do |s|\n        list << s\n      end")
-                        } else {
-                            format!("      s = h.{source}\n      list << s unless s.nil?")
-                        },
+                        format!(
+                            r#"  unloaded = []
+  middle.each do |h|
+    unloaded << h unless h.{source}_loaded?
+  end
+  {hop_model}._preload_batch_{source}(unloaded) if unloaded.length > 0"#
+                        ),
+                        held_source,
                     ),
                     Some((column, key)) => {
                         let distinct = if *distinct { ".distinct" } else { "" };
                         let readonly = if *readonly { ".readonly" } else { "" };
                         let take = if *source_many {
-                            "        got.each do |s|\n          list << s\n        end"
+                            "          got.each do |s|\n            list << s\n          end"
                         } else {
-                            "        list << got[0]"
+                            "          list << got[0]"
                         };
                         (
                             format!(
                                 r#"  keys = []
   middle.each do |h|
-    v = h{key}
-    keys << v unless v.nil?
+    unless h.{source}_loaded?
+      v = h{key}
+      keys << v unless v.nil?
+    end
   end
   found = {{}}
   if keys.length > 0
@@ -13331,7 +13367,9 @@ end
     end
   end"#
                             ),
-                            format!("      got = found[h{key}]\n      unless got.nil?\n{take}\n      end"),
+                            format!(
+                                "      if h.{source}_loaded?\n{held_source}\n      else\n        got = found[h{key}]\n        unless got.nil?\n{take}\n        end\n      end"
+                            ),
                         )
                     }
                 };

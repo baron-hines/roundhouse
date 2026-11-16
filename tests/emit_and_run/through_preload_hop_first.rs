@@ -122,6 +122,12 @@ end
     check("has_many source read", queries { names = venues.map { |v| v.tickets.map(&:seat) } } == 0)
     check("has_many source rows", names == [["a1", "c3"], ["b2"]])
     check("hop records hold the rows", venues.all? { |v| v.events.all? { |e| e.association(:tickets).loaded? } })
+    venues = Venue.order(:id).preload(events: :tickets).to_a
+    held = venues.first.events.first.tickets.first
+    held.seat = "edited"
+    # Rails: the held events and their held tickets answer, with no query
+    check("held hop and source", queries { ActiveRecord::Associations::Preloader.new(records: venues, associations: :tickets).call } == 0)
+    check("held source kept", venues.first.tickets.to_a.first.equal?(held) && venues.first.tickets.to_a.first.seat == "edited")
   end
 end
 "##)

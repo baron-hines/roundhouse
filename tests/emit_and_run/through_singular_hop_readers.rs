@@ -157,19 +157,66 @@ const SCOPED_SOURCES: &str = r##"class Event < ApplicationRecord
 end
 "##;
 
+const SELF_HOP: &str = r##"class Employee < ApplicationRecord
+  belongs_to :manager, class_name: "Employee", optional: true
+  has_one :grand_manager, through: :manager, source: :manager
+end
+"##;
+
+const SCOPED_THROUGH_HOP: &str = r##"class Wristband < ApplicationRecord
+  belongs_to :ticket
+  has_one :gated_stub, -> { where(gate_id: 1) }, through: :ticket, source: :stub
+  has_one :gate, through: :gated_stub
+end
+"##;
+
+const KEYED_AND_AUTOSAVED: &str = r##"class Usher < ApplicationRecord
+  belongs_to :event
+  has_one :coded_venue, through: :event
+  has_one :venue, through: :event, autosave: true
+end
+"##;
+
+const KEYED_EVENT: &str = r##"class Event < ApplicationRecord
+  belongs_to :venue
+  belongs_to :coded_venue, class_name: "Venue", foreign_key: :venue_code, primary_key: :code
+  has_one :poster
+  has_many :tickets
+end
+"##;
+
 /// No join follows a polymorphic belongs_to hop, so the reader would
-/// read a column the target does not have, and Rails refuses a has_one
-/// :through over a collection: each an error, not a reader.
+/// read a column the target does not have; a table the chain joins twice
+/// would be ambiguous; a scoped hop that is itself a through would be
+/// joined without its scope; and Rails refuses a has_one :through over a
+/// collection: each an error, not a reader.
 #[test]
 fn a_through_no_join_follows_is_unsupported() {
     let (_emitted, errors) = app()
         .write("app/models/badge.rb", POLYMORPHIC_HOP)
         .write("app/models/venue.rb", COLLECTION_HOP)
+        .write("app/models/employee.rb", SELF_HOP)
+        .write("app/models/wristband.rb", SCOPED_THROUGH_HOP)
         .emit(roundhouse::project::BuildTarget::Ruby);
     let refused: Vec<&String> = errors.iter().filter(|e| e.contains("through_chain")).collect();
-    assert_eq!(refused.len(), 2, "{errors:?}");
-    assert!(refused.iter().any(|e| e.contains("Badge.venue")), "{errors:?}");
+    assert_eq!(refused.len(), 4, "{errors:?}");
+    for name in ["Badge.venue", "Employee.grand_manager", "Wristband.gate"] {
+        assert!(refused.iter().any(|e| e.contains(name)), "{name}: {errors:?}");
+    }
     assert!(refused.iter().any(|e| e.contains("Venue.poster") && e.contains("collection")), "{errors:?}");
+}
+
+/// A belongs_to source keyed by another column than `id` would be joined
+/// on `id`, and an autosaving has_one :through would write the owner's key
+/// on its target: both refused.
+#[test]
+fn a_keyed_source_or_an_autosaving_through_is_unsupported() {
+    let (_emitted, errors) = app()
+        .write("app/models/event.rb", KEYED_EVENT)
+        .write("app/models/usher.rb", KEYED_AND_AUTOSAVED)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("Usher.coded_venue") && e.contains("primary_key")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("through_autosave") && e.contains("Usher.venue")), "{errors:?}");
 }
 
 /// The reader applies the through's own scope and its hop's, not its
