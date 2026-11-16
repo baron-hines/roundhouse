@@ -41,6 +41,16 @@ end
   include Shippable
 end
 "##)
+        .write("app/models/concerns/stackable.rb", r##"module Stackable
+  def stack_height
+    2
+  end
+end
+"##)
+        .write("app/models/carton.rb", r##"class Carton < ApplicationRecord
+  include Shippable, Stackable
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -54,14 +64,27 @@ end
     [Parcel.heavy_total, Parcel.order(:grams).last.kilos]
   end
 
+  # Rails: [700, 2] — the hook runs for a module named among several in
+  # one `include`.
+  def self.hook_in_a_multi_argument_include
+    Carton.create!(grams: 300)
+    Carton.create!(grams: 700)
+    [Carton.heavy_total, Carton.first.stack_height]
+  end
+
   def self.run
     Parcel.delete_all
+    Carton.delete_all
     check("class_eval_include", class_eval_include == [2400, 1.5])
+    check("hook_in_a_multi_argument_include", hook_in_a_multi_argument_include == [700, 2])
   end
 end
 "##)
         .write("db/schema.rb", r##"ActiveRecord::Schema.define do
   create_table "parcels", force: :cascade do |t|
+    t.integer "grams"
+  end
+  create_table "cartons", force: :cascade do |t|
     t.integer "grams"
   end
 end

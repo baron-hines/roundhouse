@@ -80,11 +80,11 @@ pub(super) fn carry(app: &mut App) {
         let mut known: HashSet<ClassId> = crate::analyze::model_includes(model).into_iter().collect();
         let mut i = 0;
         while i < model.body.len() {
-            let Some((mixin, span)) = include_statement(&model.body[i]) else {
+            let Some((mixins, span)) = include_statement(&model.body[i]) else {
                 i += 1;
                 continue;
             };
-            let mut queue = hops.get(&mixin).cloned().unwrap_or_default();
+            let mut queue: Vec<ClassId> = mixins.iter().filter_map(|m| hops.get(m)).flatten().cloned().collect();
             let mut added: Vec<ModelBodyItem> = Vec::new();
             let mut next = 0;
             while next < queue.len() {
@@ -142,16 +142,23 @@ pub(super) fn carry(app: &mut App) {
     }
 }
 
-/// The `include X` a model body item is, with its span.
-fn include_statement(item: &ModelBodyItem) -> Option<(ClassId, crate::span::Span)> {
+/// The modules an `include X, Y` model body item names, in the order
+/// Ruby runs their hooks (the last argument first), with its span.
+fn include_statement(item: &ModelBodyItem) -> Option<(Vec<ClassId>, crate::span::Span)> {
     let ModelBodyItem::Unknown { expr, .. } = item else { return None };
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
     if method.as_str() != "include" {
         return None;
     }
-    let [arg] = args.as_slice() else { return None };
-    let ExprNode::Const { path } = &*arg.node else { return None };
-    Some((crate::analyze::mixin_path_id(path), expr.span))
+    let mixins: Vec<ClassId> = args
+        .iter()
+        .rev()
+        .filter_map(|arg| match &*arg.node {
+            ExprNode::Const { path } => Some(crate::analyze::mixin_path_id(path)),
+            _ => None,
+        })
+        .collect();
+    (!mixins.is_empty()).then_some((mixins, expr.span))
 }
 
 fn include_expr(module: &ClassId, span: crate::span::Span) -> Expr {
