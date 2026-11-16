@@ -4405,6 +4405,7 @@ fn parse_association(
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| Symbol::from(format!("{name_str}_id"))),
+            foreign_key_explicit,
             optional: optional.unwrap_or(false),
             polymorphic: polymorphic.unwrap_or(false),
             // Filled by `resolve_polymorphic_targets` once every

@@ -1958,9 +1958,10 @@ pub(crate) fn association_primary_key(
 /// named after the declaring model, on the same foreign key, pointing
 /// back at it. Rails' conditions, as far as the declarations show them:
 /// no `through:`, no `as:`, no scope, no explicit `foreign_key:` on
-/// either side, and an `id` owner key.
+/// either side, and an `id` owner key. A `has_one` finds its inverse the
+/// same way.
 pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -> Option<Symbol> {
-    let Association::HasMany {
+    let (Association::HasMany {
         target,
         foreign_key,
         foreign_key_explicit: false,
@@ -1968,7 +1969,16 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         as_interface: None,
         scope: None,
         ..
-    } = assoc
+    }
+    | Association::HasOne {
+        target,
+        foreign_key,
+        foreign_key_explicit: false,
+        through: None,
+        as_interface: None,
+        scope: None,
+        ..
+    }) = assoc
     else {
         return None;
     };
@@ -1981,8 +1991,10 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
             name: bt,
             target: bt_target,
             foreign_key: bt_fk,
+            foreign_key_explicit: false,
             polymorphic: false,
             primary_key: None,
+            scope: None,
             ..
         } if bt.as_str() == inverse
             && bt_target == &owner.name
@@ -1993,6 +2005,45 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         }
         _ => None,
     })
+}
+
+/// The `has_one` on the target that Rails finds as `owner`'s `belongs_to`
+/// automatic inverse: named after the declaring model (`Captain
+/// belongs_to :fleet` -> `Fleet has_one :captain`), on the same foreign
+/// key, pointing back at it, with neither side scoped, keyed by an
+/// explicit `foreign_key:`, `as:` or `through:`. A has_many is never one:
+/// Rails looks the singular name up, and inverts plural associations only
+/// when `automatically_invert_plural_associations` is set.
+pub fn belongs_to_inverse(models: &[Model], owner: &Model, assoc: &Association) -> Option<Symbol> {
+    let Association::BelongsTo {
+        target,
+        foreign_key,
+        foreign_key_explicit: false,
+        polymorphic: false,
+        primary_key: None,
+        scope: None,
+        ..
+    } = assoc
+    else {
+        return None;
+    };
+    let inverse = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
+    let target_model = models.iter().find(|tm| &tm.name == target)?;
+    match target_model.associations().filter(|a| a.name().as_str() == inverse).last()? {
+        found @ Association::HasOne {
+            name: ho,
+            target: ho_target,
+            foreign_key: ho_fk,
+            foreign_key_explicit: false,
+            through: None,
+            as_interface: None,
+            scope: None,
+            ..
+        } if ho_target == &owner.name && ho_fk == foreign_key && found.owner_key().as_str() == "id" => {
+            Some(ho.clone())
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {

@@ -254,6 +254,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             name: decl.role.clone(),
             target: ClassId(Symbol::from(crate::naming::camelize(decl.role.as_str()))),
             foreign_key: decl.foreign_key.clone(),
+            foreign_key_explicit: false,
             optional: decl.optional,
             polymorphic: true,
             polymorphic_targets: targets,

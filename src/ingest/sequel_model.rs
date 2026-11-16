@@ -275,6 +275,7 @@ fn parse_sequel_association(
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
                 .unwrap_or_else(|| ClassId(Symbol::from(camelize(name_str.as_str())))),
+            foreign_key_explicit: key.is_some(),
             foreign_key: key
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| Symbol::from(format!("{name_str}_id"))),

@@ -22,6 +22,7 @@ const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
 pub(crate) mod expr;
+mod inverse_seating;
 mod library;
 mod par_render;
 pub(crate) use library::install_lookup_indexes;
@@ -411,6 +412,10 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
+    // An association's loaded records hold their owner through its
+    // inverse. AFTER the memoization above, whose cache the seat fills,
+    // and the preload pass, whose setters it extends.
+    inverse_seating::apply(&mut lcs, app);
     // A partial `select`'s left-out column raises from its generated
     // reader. After every pass that rewrites a reader body by its shape.
     crate::lower::missing_attribute::apply(&mut lcs, app);

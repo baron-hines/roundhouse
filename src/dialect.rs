@@ -446,6 +446,9 @@ pub enum Association {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// See `HasMany::foreign_key_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        foreign_key_explicit: bool,
         optional: bool,
         /// `belongs_to :notifiable, polymorphic: true` — the target
         /// above is the assoc-name phantom; the real target set is
