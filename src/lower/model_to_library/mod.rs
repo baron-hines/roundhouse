@@ -958,7 +958,12 @@ fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
         expr.node.for_each_child(&mut |child| found |= walk(child));
         found
     }
-    matches!(&*expr.node, ExprNode::Send { block: Some(block), .. } if walk(block))
+    match &*expr.node {
+        ExprNode::Send { block: Some(block), .. } => walk(block),
+        // `while`/`until` in the body runs its statements as a block does.
+        ExprNode::While { body, .. } => walk(body),
+        _ => false,
+    }
 }
 
 /// Interim subset of #1302's unclaimed-call errors: dropping encryption

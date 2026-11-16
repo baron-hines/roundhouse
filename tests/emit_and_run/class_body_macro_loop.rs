@@ -71,12 +71,15 @@ fn a_loop_over_names_known_only_at_load_is_a_check_error() {
         .check_errors();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].contains("could not unroll") && errors[0].contains("`Parcel`"), "{errors:#?}");
-    // A receiverless block that runs them is not unrolled either.
-    let errors = app()
-        .edit("app/models/parcel.rb", "  %w[small large].each do |size|\n", "  each do |size|\n")
-        .check_errors();
-    assert_eq!(errors.len(), 1, "{errors:#?}");
-    assert!(errors[0].contains("could not unroll"), "{errors:#?}");
+    // A receiverless block that runs them is not unrolled either, nor a `while` loop.
+    for (find, replace) in [
+        ("  %w[small large].each do |size|\n", "  each do |size|\n"),
+        ("  %w[small large].each do |size|\n", "  size = \"small\"\n  while size\n"),
+    ] {
+        let errors = app().edit("app/models/parcel.rb", find, replace).check_errors();
+        assert_eq!(errors.len(), 1, "{replace}: {errors:#?}");
+        assert!(errors[0].contains("could not unroll"), "{replace}: {errors:#?}");
+    }
 }
 
 /// `scope :"#{size}_ones"`: an interpolated Symbol name unrolls to each
