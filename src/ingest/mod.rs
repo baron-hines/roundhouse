@@ -125,6 +125,7 @@ mod app_extension_calls;
 mod body_statements;
 mod error_site;
 mod external_include;
+mod included_hook_includes;
 mod hook_class_attribute;
 mod load_hooks;
 pub(crate) mod inherited_alias;

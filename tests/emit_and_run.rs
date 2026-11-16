@@ -22451,3 +22451,8 @@ mod concern_model_callbacks;
 // Concern shapes: a prepended concern.
 #[path = "emit_and_run/concern_prepended.rs"]
 mod concern_prepended;
+
+// Concern shapes: a plain module's included hook class_eval'ing an include.
+#[path = "emit_and_run/concern_class_eval_include.rs"]
+mod concern_class_eval_include;
+

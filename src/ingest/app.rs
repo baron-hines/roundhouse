@@ -3208,6 +3208,10 @@ end
     // `attribute :x, :type` under `include ActiveModel::Attributes` -> real
     // casting accessors, before anything reads the class's methods.
     super::active_model_attributes::lower_active_model_attributes(&mut app);
+    // `def self.included(base); base.class_eval { include X }; end` mixes X
+    // into every includer: written into each of them first, so the splices
+    // below carry X's own block and class methods there.
+    super::included_hook_includes::carry(&mut app);
     super::library_concern_items::splice(&mut app);
     super::thread_mattr::lower_thread_mattr(&mut app);
     // Alba declarations become ordinary property-reading methods before
