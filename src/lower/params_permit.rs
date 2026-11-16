@@ -217,8 +217,12 @@ fn rewrite_element_block(expr: &mut Expr, lists: &HelperLists) {
     rewrite_element_calls(body, &item, lists);
 }
 
-/// Whether `expr` writes the local `name` (`name = …`, `name ||= …`, `name, x = …`).
+/// Whether `expr` writes the local `name` (`name = …`, `name ||= …`, `name, x = …`). Not inside a nested block or
+/// lambda that binds its own `name`: that write is to its parameter.
 fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
+    if binds_name(expr, name) {
+        return false;
+    }
     let is_name = |lv: &crate::expr::LValue| matches!(lv, crate::expr::LValue::Var { name: n, .. } if n == name);
     let mut found = match &*expr.node {
         ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is_name(target),
@@ -229,15 +233,19 @@ fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
     found
 }
 
+/// Whether `expr` is a block or lambda that binds `name` under any parameter kind (`|name|`, `name = {}`, `*name`,
+/// `name:`, `&name`), so `name` inside it is its own value.
+fn binds_name(expr: &Expr, name: &Symbol) -> bool {
+    matches!(&*expr.node, ExprNode::Lambda { params, rest_param, extra_params, block_param, .. }
+        if params.contains(name)
+            || rest_param.as_ref() == Some(name)
+            || block_param.as_ref() == Some(name)
+            || extra_params.iter().any(|p| &p.name == name))
+}
+
 fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {
-    // A nested block or lambda that binds the element's name under any parameter kind (`|item|`, `item = {}`,
-    // `*item`, `item:`, `&item`) reads its own value there, not the element.
-    if let ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } = &*expr.node
-        && (params.contains(item)
-            || rest_param.as_ref() == Some(item)
-            || block_param.as_ref() == Some(item)
-            || extra_params.iter().any(|p| &p.name == item))
-    {
+    // A nested block or lambda that binds the element's name reads its own value there, not the element.
+    if binds_name(expr, item) {
         return;
     }
     expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item, lists));

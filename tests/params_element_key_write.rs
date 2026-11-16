@@ -82,3 +82,11 @@ fn a_reassigned_element_name_is_left_alone() {
     assert!(src.contains("w[:kind] = \"new\""), "{src}");
     assert!(!src.contains(r#"w["kind"]"#), "{src}");
 }
+
+/// A nested block that reassigns its own parameter of the element's name does not stop the element's rewrite.
+#[test]
+fn a_nested_blocks_own_reassignment_keeps_the_rewrite() {
+    let body = "    params.require(:widgets).each do |w|\n      w[:kind] = \"x\"\n      [1].each { |w| w = 2 }\n      Widget.create!(w.permit(:name, :kind))\n    end";
+    let src = controller_for(BuildTarget::Ruby, body);
+    assert!(src.contains(r#"w["kind"] = "x""#), "{src}");
+}
