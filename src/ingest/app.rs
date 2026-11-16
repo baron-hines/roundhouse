@@ -4491,8 +4491,12 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             } else {
                 named.clone()
             };
-            let concern_ids: Vec<crate::ident::ClassId> =
-                ordered.iter().flat_map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
+            // One expansion per argument, each concern after its own
+            // dependencies: what the splice inserts, and, reversed, the
+            // order its seeds merge in (see `seed_order`).
+            let groups: Vec<Vec<crate::ident::ClassId>> =
+                ordered.iter().map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
+            let concern_ids: Vec<crate::ident::ClassId> = groups.iter().flatten().cloned().collect();
             if claimed
                 && let ModelBodyItem::Unknown { expr, .. } = &mut model.body[i]
             {
@@ -4522,11 +4526,24 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             // never replaces a seed; an explicit default — `nil` too —
             // always does. Where the order cannot be established, the
             // overlap is refused rather than guessed.
+            //
+            // One statement's arguments run LAST first: `include First,
+            // Second` runs Second's `included do` block before First's
+            // (`Module#include` appends from the end, so First ends up
+            // ahead), and First's seed is the one left standing. Each
+            // concern's own dependencies run before it. Separate
+            // statements are their own pass through this loop, so they
+            // keep source order.
+            let seed_order: Vec<crate::ident::ClassId> = if prepended {
+                Vec::new()
+            } else {
+                groups.iter().rev().flatten().filter(|id| fresh.contains(id)).cloned().collect()
+            };
             let seed_at = match &model.body[i] {
                 ModelBodyItem::Unknown { expr, .. } => Some(expr.span),
                 _ => None,
             };
-            for id in fresh.iter().filter(|_| !prepended) {
+            for id in &seed_order {
                 let Some(defaults) = app.concern_class_attr_defaults.get(id) else { continue };
                 for (name, value) in defaults {
                     let explicit = !value.span.is_synthetic();
