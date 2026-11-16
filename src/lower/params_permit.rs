@@ -84,6 +84,17 @@ fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
         return;
     }
     expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item));
+    // A write by Symbol key (`item[:kind] = v`, `item[:kind] ||= v`) stores the String key the reads beside it read:
+    // on Rails' Parameters both spellings are one key.
+    if let ExprNode::Assign { target: crate::expr::LValue::Index { recv, index }, .. }
+    | ExprNode::OpAssign { target: crate::expr::LValue::Index { recv, index }, .. } = &mut *expr.node
+        && matches!(&*recv.node, ExprNode::Var { name, .. } if name == item)
+    {
+        if let Some(name) = sym_name(index) {
+            *index = str_lit(index.span, name);
+        }
+        return;
+    }
     let ExprNode::Send { recv: Some(r), method, args, block, .. } = &mut *expr.node else { return };
     if !matches!(&*r.node, ExprNode::Var { name, .. } if name == item) {
         return;
@@ -95,7 +106,7 @@ fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
                 *expr = new;
             }
         }
-        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" => {
+        "[]" | "[]=" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" => {
             let keys = if method.as_str() == "dig" { args.len() } else { args.len().min(1) };
             for key in args.iter_mut().take(keys) {
                 if let Some(name) = sym_name(key) {
