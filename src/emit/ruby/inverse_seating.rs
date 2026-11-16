@@ -36,7 +36,6 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         let class = lc.name.clone();
         let Some(model) = app.models.iter().find(|m| m.name == class) else { continue };
         let own = |name: &Symbol| model.methods().any(|m| &m.name == name && m.receiver == MethodReceiver::Instance);
-        let mut from_queries: Vec<(Symbol, Symbol)> = Vec::new();
         for inv in inverses.iter().filter(|i| i.owner == class) {
             let seat = seat_method(&inv.inverse);
             if !own(&inv.name) {
@@ -50,9 +49,19 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
                     seat_param(setter, &seat, inv.arity);
                 }
             }
-            if inv.collection {
-                from_queries.push((inv.name.clone(), seat));
+        }
+        // The relation hook answers for the has_many this model inherits
+        // too: it replaces its parent's, and a subclass's own name comes
+        // first, as its declaration replaces the parent's.
+        let mut from_queries: Vec<&Inverse> = Vec::new();
+        let mut at = Some(model);
+        while let Some(m) = at {
+            for inv in inverses.iter().filter(|i| i.owner == m.name && i.collection) {
+                if !from_queries.iter().any(|seen| seen.name == inv.name) {
+                    from_queries.push(inv);
+                }
             }
+            at = m.parent.as_ref().and_then(|p| app.models.iter().find(|pm| &pm.name == p));
         }
         if !from_queries.is_empty() {
             push_parsed(lc, &set_inverse_from_queries_source(&from_queries));
@@ -83,6 +92,8 @@ struct Inverse {
     arity: Arity,
     /// A has_many, whose relations seat their rows too.
     collection: bool,
+    /// The key column on `target` that names the owner's `id`.
+    foreign_key: Symbol,
 }
 
 /// Every association of the app's models that has an automatic inverse,
@@ -98,10 +109,16 @@ fn inverses(app: &App) -> Vec<Inverse> {
                 continue;
             }
             names.push(assoc.name());
-            let (target, inverse, arity) = match assoc {
-                Association::HasMany { target, .. } => (target, automatic_inverse(&app.models, model, assoc), Arity::Many),
-                Association::HasOne { target, .. } => (target, automatic_inverse(&app.models, model, assoc), Arity::One),
-                Association::BelongsTo { target, .. } => (target, belongs_to_inverse(&app.models, model, assoc), Arity::One),
+            let (target, foreign_key, inverse, arity) = match assoc {
+                Association::HasMany { target, foreign_key, .. } => {
+                    (target, foreign_key, automatic_inverse(&app.models, model, assoc), Arity::Many)
+                }
+                Association::HasOne { target, foreign_key, .. } => {
+                    (target, foreign_key, automatic_inverse(&app.models, model, assoc), Arity::One)
+                }
+                Association::BelongsTo { target, foreign_key, .. } => {
+                    (target, foreign_key, belongs_to_inverse(&app.models, model, assoc), Arity::One)
+                }
                 Association::HasAndBelongsToMany { .. } => continue,
             };
             let Some(inverse) = inverse else { continue };
@@ -112,6 +129,7 @@ fn inverses(app: &App) -> Vec<Inverse> {
                 inverse,
                 arity,
                 collection: matches!(assoc, Association::HasMany { .. }),
+                foreign_key: foreign_key.clone(),
             });
         }
     }
@@ -128,12 +146,19 @@ fn instance_method<'a>(lc: &'a mut LibraryClass, name: &Symbol) -> Option<&'a mu
 
 /// The owner's `_set_inverse_from_queries`, which `Relation#load_records`
 /// calls for a relation built off one of its has_many (`_inversed_from`).
-fn set_inverse_from_queries_source(arms: &[(Symbol, Symbol)]) -> String {
+/// A row is seated only when its key names this owner, or the owner is
+/// unsaved, as Rails' `inversed_from_queries` checks `matches_foreign_key?`:
+/// a chain can drop the key's condition (`unscope(where: :fleet_id)`) and
+/// load other owners' rows.
+fn set_inverse_from_queries_source(arms: &[&Inverse]) -> String {
     let mut src = String::from("def _set_inverse_from_queries(name, records)\n  case name\n");
-    for (name, seat) in arms {
-        src.push_str(&format!("  when :{name}\n    records.each {{ |r| r.{seat}(self) }}\n"));
+    for inv in arms {
+        let (name, seat, fk) = (&inv.name, seat_method(&inv.inverse), &inv.foreign_key);
+        src.push_str(&format!(
+            "  when :{name}\n    records.each {{ |r| r.{seat}(self) if new_record? || r.{fk} == id }}\n"
+        ));
     }
-    src.push_str("  end\n  nil\nend\n");
+    src.push_str("  end\nend\n");
     src
 }
 

@@ -16,6 +16,14 @@ end
   has_many :ships
 end
 "##)
+        .write("app/models/flotilla.rb", r##"class Flotilla < Fleet
+  has_many :buoys
+end
+"##)
+        .write("app/models/buoy.rb", r##"class Buoy < ApplicationRecord
+  belongs_to :flotilla
+end
+"##)
         .write("app/models/ship.rb", r##"class Ship < ApplicationRecord
   belongs_to :fleet
 end
@@ -43,12 +51,28 @@ end
     seen = []
     f.ships.where("tons < ?", 100).each { |s| seen << s.fleet }
     check("each", seen.length == 2 && seen.all? { |o| o.equal?(f) })
+    # Rails: a row whose key names another owner is not seated
+    other = Fleet.create!(name: "red")
+    Ship.create!(name: "yawl", fleet: other, tons: 3)
+    all = f.ships.unscope(where: :fleet_id).order(:id).to_a
+    check("another owner's row", all.length == 3 && all.last.fleet.name == "red" && !all.last.fleet.equal?(f))
+    # Rails: a subclass's relation off an inherited has_many seats it too,
+    # beside the subclass's own has_many
+    fl = Flotilla.create!(name: "grey")
+    Ship.create!(name: "skiff", fleet: fl, tons: 1)
+    fl = Flotilla.find(fl.id)
+    check("inherited has_many", fl.ships.where(name: "skiff").first.fleet.equal?(fl))
   end
 end
 "##)
         .write("db/schema.rb", r##"ActiveRecord::Schema.define do
   create_table "fleets", force: :cascade do |t|
     t.string "name"
+    t.string "type"
+  end
+  create_table "buoys", force: :cascade do |t|
+    t.string "color"
+    t.integer "flotilla_id"
   end
   create_table "ships", force: :cascade do |t|
     t.string "name"
