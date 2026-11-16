@@ -28,6 +28,10 @@ end
     "[#{super}]"
   end
 
+  def initial
+    label[0, 1].upcase
+  end
+
   private
 
   def trim_label
@@ -217,6 +221,12 @@ end
     Gadget.new.wrapped_label
   end
 
+  # Rails: "B" — a method only the prepended concern defines answers on
+  # the model.
+  def self.prepended_only_method
+    Badge.order(:label).first.initial
+  end
+
   def self.run
     Badge.delete_all
     check("prepended_concern", prepended_concern == [["blue", "red"], "[RED]"])
@@ -224,6 +234,7 @@ end
     check("separate_prepends", separate_prepends == ["B>A>K", "KAB"])
     check("repeated_prepend", repeated_prepend == ["R>L>K", "KLR", "Right"])
     check("method_only_prepended_concern", method_only_prepended_concern == "[gadget]")
+    check("prepended_only_method", prepended_only_method == "B")
   end
 end
 "##)
