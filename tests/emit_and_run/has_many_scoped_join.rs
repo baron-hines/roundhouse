@@ -43,6 +43,10 @@ end
     check("has_one count", Orchard.joins(:featured_tree).count == 1)
     check("has_one pluck", Orchard.joins(:featured_tree).pluck(:name) == ["north"])
     check("has_one where", Orchard.joins(:featured_tree).where(name: "south").pluck(:name) == [])
+    # Rails: in an outer join the scope stays in ON, so every orchard is a
+    # row and only matching trees join it.
+    check("has_many left join", Orchard.left_joins(:tall_trees).pluck(:name).sort == ["east", "north", "south"])
+    check("has_one left join", Orchard.left_joins(:featured_tree).pluck(:name).sort == ["east", "north", "south"])
   end
 end
 "##)
@@ -91,10 +95,12 @@ fn a_join_whose_scope_does_not_render_is_a_check_error() {
         )
         .write(
             "app/models/report.rb",
-            "class Report\n  def self.shady\n    Orchard.joins(:shady_trees).count\n  end\n\n  def self.plain\n    Orchard.where(name: \"north\").left_joins(:plain_tree, :tall_trees).count\n  end\nend\n",
+            "class Report\n  def self.shady\n    Orchard.joins(:shady_trees).count\n  end\n\n  def self.plain\n    Orchard.where(name: \"north\").left_joins(:plain_tree, :tall_trees).count\n  end\n\n  def self.nested\n    Tree.joins(orchard: :shady_trees).count\n  end\nend\n",
         )
         .check_errors();
-    assert_eq!(errors.len(), 2, "{errors:#?}");
+    assert_eq!(errors.len(), 3, "{errors:#?}");
     assert!(errors[0].contains("`joins(:shady_trees)`") || errors[1].contains("`joins(:shady_trees)`"), "{errors:#?}");
     assert!(errors.iter().any(|e| e.contains("`left_joins(:plain_tree)`")), "{errors:#?}");
+    // A nested association is checked on the preceding one's target.
+    assert_eq!(errors.iter().filter(|e| e.contains("`joins(:shady_trees)`")).count(), 2, "{errors:#?}");
 }

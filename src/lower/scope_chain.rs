@@ -1617,7 +1617,7 @@ impl AssocRegistry {
     fn assoc_table(&self, model: &ClassId, assoc: &Symbol) -> Option<&Symbol> {
         self.assoc_table.get(&(model.clone(), assoc.clone()))
     }
-    fn assoc_target(&self, model: &ClassId, assoc: &Symbol) -> Option<&ClassId> {
+    pub(crate) fn assoc_target(&self, model: &ClassId, assoc: &Symbol) -> Option<&ClassId> {
         self.assoc_target.get(&(model.clone(), assoc.clone()))
     }
     fn aliased_join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<&String> {
@@ -2349,15 +2349,16 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             .iter()
             .find(|m| m.name == owner)
             .and_then(|m| {
-                m.associations().find_map(|a| match a {
-                    Association::HasMany { name: n, through: Some(thr), .. } if *n == name => {
-                        m.associations().find_map(|t| match t {
-                            Association::HasMany { name: tn, target: tt, .. } if tn == thr => Some(tt.clone()),
+                // The last declaration of each name, as the registry keeps it.
+                match m.associations().filter(|a| a.name() == &name).last()? {
+                    Association::HasMany { through: Some(thr), .. } => {
+                        match m.associations().filter(|t| t.name() == thr).last()? {
+                            Association::HasMany { target: tt, .. } => Some(tt.clone()),
                             _ => None,
-                        })
+                        }
                     }
                     _ => None,
-                })
+                }
             });
         let key = (owner.clone(), name.clone());
         let through_scoped = through.as_ref().is_some_and(|t| scoped.contains_key(t));

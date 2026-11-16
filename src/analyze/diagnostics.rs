@@ -514,6 +514,11 @@ fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
     let model_of = |recv: &Expr| -> Option<ClassId> {
         match (&*recv.node, recv.ty.as_ref()) {
             (_, Some(Ty::Relation { of })) => Some(of.clone()),
+            // A query chain types as an Array of its model (`ty.rs`).
+            (_, Some(Ty::Array { elem })) => match &**elem {
+                Ty::Class { id, .. } if app.models.iter().any(|m| &m.name == id) => Some(id.clone()),
+                _ => None,
+            },
             (ExprNode::Const { path }, _) => {
                 let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
                 app.models.iter().find(|m| m.name.0.as_str() == name).map(|m| m.name.clone())
@@ -533,15 +538,35 @@ fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
                 && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
                 && let Some(model) = model_of(recv)
             {
-                let mut names: Vec<&Expr> = Vec::new();
-                for arg in args {
-                    match &*arg.node {
-                        ExprNode::Array { elements, .. } => names.extend(elements.iter()),
-                        ExprNode::Hash { entries, .. } => names.extend(entries.iter().map(|(k, _)| k)),
-                        _ => names.push(arg),
+                // Each association a join spec names, with the model it is
+                // declared on: a nested hash's associations are the
+                // preceding association target's (`joins(trees: :branches)`).
+                fn names<'e>(
+                    model: &ClassId,
+                    spec: &'e Expr,
+                    registry: &crate::lower::scope_chain::AssocRegistry,
+                    out: &mut Vec<(ClassId, &'e Expr)>,
+                ) {
+                    match &*spec.node {
+                        ExprNode::Array { elements, .. } => {
+                            elements.iter().for_each(|e| names(model, e, registry, out))
+                        }
+                        ExprNode::Hash { entries, .. } => {
+                            for (k, v) in entries {
+                                names(model, k, registry, out);
+                                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node
+                                    && let Some(target) = registry.assoc_target(model, value)
+                                {
+                                    names(target, v, registry, out);
+                                }
+                            }
+                        }
+                        _ => out.push((model.clone(), spec)),
                     }
                 }
-                for name in names {
+                let mut named: Vec<(ClassId, &Expr)> = Vec::new();
+                args.iter().for_each(|arg| names(&model, arg, registry, &mut named));
+                for (model, name) in named {
                     if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
                         && registry.join_scope_unrenderable(&model, value)
                     {
