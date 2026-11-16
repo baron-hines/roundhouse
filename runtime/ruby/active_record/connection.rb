@@ -372,6 +372,19 @@ module ActiveRecord
       @base = base
     end
 
+    # `Base.with_connection`'s hold on the handle's slot for its block.
+    # Nothing to hold for the shared handle (-1) or one taken before the
+    # databases are open (-2): their statements stay as they were.
+    def _hold_slot
+      Db.enter_slot(@slot, @base) if @slot >= 0
+      nil
+    end
+
+    def _release_slot
+      Db.leave_slot if @slot >= 0
+      nil
+    end
+
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.
     def adapter_name
@@ -783,8 +796,20 @@ module ActiveRecord
       connection
     end
 
+    # Rails' `with_connection` holds one connection for its block: the
+    # handle's slot, leased once, so each statement through it is on that
+    # connection (a raw BEGIN carries to the next one). The block's value
+    # is bound before the slot is left, so the Spinel binary keeps it.
     def self.with_connection
-      yield connection
+      handle = connection
+      handle._hold_slot
+      result = nil
+      begin
+        result = yield handle
+      ensure
+        handle._release_slot
+      end
+      result
     end
 
     # Rails' `Model.sanitize_sql(["insert … values (?, ?)", a, b])` —

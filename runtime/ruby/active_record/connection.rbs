@@ -72,6 +72,8 @@ module ActiveRecord
     @base: bool
     def self.shared: () -> Connection
     def initialize: (?Integer slot, ?bool base) -> void
+    def _hold_slot: () -> nil
+    def _release_slot: () -> nil
     def adapter_name: () -> String
     def quote: (String | Symbol | Integer | Float | bool | nil value) -> String
     def quote_string: (String str) -> String

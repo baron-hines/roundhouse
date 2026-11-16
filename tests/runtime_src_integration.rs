@@ -1373,7 +1373,13 @@ fn every_runtime_method_body_concretely_typed() {
     // (+1 in active_record/connection.rb), as `transaction` does. The
     // handle, `lease_connection` and the Db slot calls are typed and add
     // none; every other file is unchanged. The ceiling is the measure.
-    const CEILING: usize = 1004;
+    // MEASURED 1006 on a held `with_connection` (1004): its block runs
+    // inside the handle's slot and binds its value before the slot is
+    // left, so the Spinel binary keeps it, as `Model.unscoped { }` does.
+    // `result = yield handle` and the `begin ... ensure` holding it are
+    // the block's untyped value (+2 in active_record/connection.rb);
+    // `_hold_slot`, `_release_slot` and the handle are typed and add none.
+    const CEILING: usize = 1006;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

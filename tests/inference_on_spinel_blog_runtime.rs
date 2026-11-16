@@ -670,7 +670,13 @@ fn untyped_subexpressions_baseline() {
     // `Connection.new` on one arm, so its callers' chains in
     // migration_runner.rb, schema_reader.rb and tasks.rb type (-13).
     // db.rbs and connection.rbs type them for the RBS-paired gate.
-    const CEILING: usize = 1434;
+    // MEASURED 1436 on a held `with_connection` (1434): the handle's
+    // `_hold_slot` and `_release_slot` call `Db.enter_slot` and
+    // `Db.leave_slot`, the Db contract this probe does not model, as the
+    // handle's statements do (+2 in active_record/connection.rb);
+    // `with_connection` itself adds none. db.rbs and connection.rbs type
+    // them for the RBS-paired gate.
+    const CEILING: usize = 1436;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
