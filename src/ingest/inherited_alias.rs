@@ -314,6 +314,10 @@ fn calls_super(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Super { .. }) {
         return true;
     }
+    // Not left to the child walk: it does not enter `defined?`, and `defined?(super)` asks the alias name's super too.
+    if let ExprNode::Defined { operand } = &*expr.node {
+        return calls_super(operand);
+    }
     let mut found = false;
     expr.node.for_each_child(&mut |c| found = found || calls_super(c));
     found
