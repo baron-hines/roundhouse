@@ -111,8 +111,9 @@ pub struct Model {
     pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
 
     /// An enclosing module (via EnumConstants nesting) defines a `JSON`
-    /// constant that would shadow bare `JSON` in `serialize` coder
-    /// resolution. Fail closed: claim only `::JSON` when set.
+    /// constant, or the body nests a `JSON` class, module or value class,
+    /// that would shadow bare `JSON` in `serialize` coder resolution.
+    /// Fail closed: claim only `::JSON` when set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lexical_json_shadow: bool,
 

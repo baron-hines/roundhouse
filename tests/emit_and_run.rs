@@ -22504,3 +22504,5 @@ mod save_touch_false;
 
 #[path = "emit_and_run/after_initialize_require_class.rs"]
 mod after_initialize_require_class;
+#[path = "emit_and_run/model_value_class_blocks.rs"]
+mod model_value_class_blocks;
