@@ -86,6 +86,22 @@ fn a_loop_over_names_known_only_at_load_is_a_check_error() {
     }
 }
 
+/// A loop that runs any other class macro per element (a validation, an
+/// attribute, a callback) is not unrolled, and `check` reports the macro
+/// rather than dropping it.
+#[test]
+fn a_loop_of_other_class_macros_is_a_check_error() {
+    for (line, call) in [
+        ("  %i[size weight].each { |f| validates f, presence: true }\n", "validates"),
+        ("  %i[note label].each { |f| attribute f, :string }\n", "attribute"),
+        ("  %i[size].each do |f|\n    before_save { self[f] = self[f].to_s.strip }\n  end\n", "before_save"),
+    ] {
+        let errors = app().edit("app/models/parcel.rb", "  def heavy?\n", &format!("{line}\n  def heavy?\n")).check_errors();
+        assert_eq!(errors.len(), 1, "{line}: {errors:#?}");
+        assert!(errors[0].contains(&format!("runs `{call}`")) && errors[0].contains("could not unroll"), "{line}: {errors:#?}");
+    }
+}
+
 /// `scope :"#{size}_ones"`: an interpolated Symbol name unrolls to each
 /// element's Symbol, as a String name does. Rails: 1, 2.
 #[test]

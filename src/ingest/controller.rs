@@ -361,7 +361,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 Some(
                     super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
                         super::library_class::ingest_library_method(def, &owner, file)
-                    })
+                    }, false)
                     .map(|b| (b.methods, b.class_body)),
                 )
             } else {
