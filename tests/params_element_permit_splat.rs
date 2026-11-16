@@ -21,6 +21,11 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 /// and a `create` action that saves each of `widget_list_params`. `base` is
 /// the body of the `ApplicationController` it inherits from.
 fn controller_for(target: BuildTarget, helpers: &str, base: &str) -> String {
+    controller_with(target, helpers, base, &[])
+}
+
+/// [`controller_for`] with `extra` source files (path, body) in the tree.
+fn controller_with(target: BuildTarget, helpers: &str, base: &str, extra: &[(&str, &str)]) -> String {
     let controller = format!(
         "class WidgetsController < ApplicationController\n  def create\n    widget_list_params.each {{ |attrs| Widget.create!(attrs) }}\n    head :created\n  end\n\n  private\n\n{helpers}\nend\n"
     );
@@ -36,6 +41,9 @@ fn controller_for(target: BuildTarget, helpers: &str, base: &str) -> String {
         format!("class ApplicationController < ActionController::Base\n{base}\nend\n").into_bytes(),
     );
     tree.insert(PathBuf::from("app/controllers/widgets_controller.rb"), controller.into_bytes());
+    for (path, body) in extra {
+        tree.insert(PathBuf::from(path), body.as_bytes().to_vec());
+    }
     let mut app = ingest_app_from_tree(tree).expect("ingest");
     roundhouse::session::analyze_and_lower(&mut app);
     let files = target_files(&app, Path::new("fixtures/tiny-blog"), target).expect("emit");
@@ -94,4 +102,21 @@ fn a_helper_a_descendant_overrides_is_not_inlined() {
     assert!(src.contains(ALLOWED), "{src}");
     let src = controller_for(BuildTarget::Spinel, "", &base);
     assert!(src.contains(ALLOWED), "{src}");
+}
+
+/// A concern a descendant includes overrides the helper as the descendant's own method does: the ancestor's list
+/// is not inlined. A module the tree does not define cannot be read, so it may override the helper too.
+#[test]
+fn a_helper_an_included_module_may_override_is_not_inlined() {
+    let base = format!("  private\n\n  def shared_fields\n    %i[name kind]\n  end\n\n{LIST_PARAMS}");
+    let concern = "module NarrowFields\n  extend ActiveSupport::Concern\n\n  private\n\n  def shared_fields\n    %i[name]\n  end\nend\n";
+    let src = controller_with(
+        BuildTarget::Spinel,
+        "  include NarrowFields\n",
+        &base,
+        &[("app/controllers/concerns/narrow_fields.rb", concern)],
+    );
+    assert!(!src.contains(ALLOWED), "{src}");
+    let src = controller_with(BuildTarget::Spinel, "  include ExternalFields\n", &base, &[]);
+    assert!(!src.contains(ALLOWED), "{src}");
 }

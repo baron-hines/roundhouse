@@ -18,7 +18,7 @@ type HelperLists = crate::det::HashMap<Symbol, Vec<Expr>>;
 /// Per controller, the methods it has or inherits whose body is a literal list of Symbols or Strings (`%i[a b]`,
 /// `%w[a b]`, `[:a, "b"]`, optionally `.freeze`), so `permit(*helper)` can be read as the list written inline (as
 /// `permit_splat` does for the typed params chain, #858). The nearest definition wins, and a list a descendant
-/// overrides with another is left out.
+/// overrides with another, or that may hide behind a module a descendant includes, is left out.
 fn helper_filter_lists(
     controllers: &[crate::dialect::Controller],
 ) -> crate::det::HashMap<crate::ident::ClassId, HelperLists> {
@@ -63,7 +63,8 @@ fn helper_filter_lists(
             controllers.iter().any(|d| {
                 d.name != **owner
                     && descends_from(d, owner, &by_name)
-                    && out.get(&d.name).and_then(|l| l.get(*name)).map(names_of) != Some(names_of(list))
+                    && (out.get(&d.name).and_then(|l| l.get(*name)).map(names_of) != Some(names_of(list))
+                        || includes_unread_module(d))
             })
         })
         .map(|(owner, name, _)| (owner.clone(), name.clone()))
@@ -74,6 +75,15 @@ fn helper_filter_lists(
         }
     }
     out
+}
+
+/// Whether `controller` still includes or prepends a module after ingest spliced in the concerns it could read (a
+/// gem's, or one the tree does not define): that module's methods are unknown here and may override a helper.
+fn includes_unread_module(controller: &crate::dialect::Controller) -> bool {
+    controller.body.iter().any(|item| {
+        matches!(item, crate::dialect::ControllerBodyItem::Unknown { expr, .. }
+            if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "prepend")))
+    })
 }
 
 /// Whether `ancestor` is on `controller`'s superclass chain.
