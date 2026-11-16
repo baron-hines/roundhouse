@@ -1999,7 +1999,9 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         return None;
     }
     let inverse = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
-    models.iter().find(|tm| &tm.name == target)?.associations().find_map(|ta| match ta {
+    // The target's last declaration of the name, as Rails keeps it.
+    let declared = models.iter().find(|tm| &tm.name == target)?.associations().filter(|ta| ta.name().as_str() == inverse).last()?;
+    match declared {
         Association::BelongsTo {
             name: bt,
             target: bt_target,
@@ -2017,7 +2019,7 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
             Some(bt.clone())
         }
         _ => None,
-    })
+    }
 }
 
 /// The `has_one` on the target that Rails finds as `owner`'s `belongs_to`
