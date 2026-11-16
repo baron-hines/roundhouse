@@ -4517,15 +4517,17 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             // prepended block's seeds are refused where they are
             // collected, so none of these belong to a prepender.
             //
-            // Rails runs the class body top to bottom: a concern's seed
-            // set at this `include` replaces a declaration the model ran
-            // ABOVE it, and loses to one below it. A declaration with no
-            // default sets the class variable only when it is not already
-            // defined (`class_variable_set(...) unless
-            // sym_default_value.nil? && class_variable_defined?`), so it
-            // never replaces a seed; an explicit default — `nil` too —
-            // always does. Where the order cannot be established, the
-            // overlap is refused rather than guessed.
+            // Rails runs the class body top to bottom, and decides each
+            // declaration by the VALUE of its default: a non-nil default
+            // always sets the class variable, while no default — and an
+            // explicit `default: nil` — sets it only when nothing has
+            // (`class_variable_set(...) unless sym_default_value.nil? &&
+            // class_variable_defined?`). So a concern's seed at this
+            // `include` replaces a non-nil declaration the model ran
+            // ABOVE it and loses to one below it, while a `nil`
+            // declaration never blocks it. Where the order cannot be
+            // established, or the default's value cannot be evaluated,
+            // the overlap is refused rather than guessed.
             //
             // One statement's arguments run LAST first: `include First,
             // Second` runs Second's `included do` block before First's
@@ -4546,12 +4548,17 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             for id in &seed_order {
                 let Some(defaults) = app.concern_class_attr_defaults.get(id) else { continue };
                 for (name, value) in defaults {
-                    let explicit = !value.span.is_synthetic();
-                    let stored = match model.class_attr_defaults.get(name) {
+                    let seed = super::model::Seed::of(value);
+                    let existing = model.class_attr_defaults.get(name);
+                    let stored = match existing {
                         None => true,
-                        // A no-default declaration only seeds an undefined
-                        // variable, so it leaves an earlier seed alone.
-                        Some(_) if !explicit => false,
+                        // No default, or a literal `nil`: the variable is
+                        // only set where nothing defined it, so an earlier
+                        // seed stands.
+                        Some(_) if matches!(seed, super::model::Seed::Absent | super::model::Seed::Nil) => false,
+                        // A literal `nil` declaration set nothing, so it
+                        // is not a seed this one has to displace.
+                        Some(existing) if matches!(super::model::Seed::of(existing), super::model::Seed::Nil) => true,
                         // An earlier concern's seed, at an earlier include.
                         Some(_) if concern_seeded.contains(name) => true,
                         // The model's own no-default declaration: it wrote
@@ -4581,12 +4588,31 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                             }
                         }
                     };
+                    // A default this cannot evaluate might be nil, leaving
+                    // the earlier seed in place — so where it would replace
+                    // one, the overlap is refused rather than guessed.
+                    if stored
+                        && existing.is_some()
+                        && matches!(seed, super::model::Seed::Computed)
+                    {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            seed_at.unwrap_or_else(crate::span::Span::synthetic),
+                            None,
+                            "cattr_accessor",
+                            format!(
+                                "`{}` is seeded both by the class body and by `{}`'s `included do` block with a default this cannot evaluate, so whether it replaces the seed cannot be established here",
+                                name.as_str(),
+                                id.0.as_str(),
+                            ),
+                        ));
+                        continue;
+                    }
                     // Only a seed that holds: one the model's own later
                     // declaration overrode must not let the next concern's
                     // seed replace that declaration.
                     if stored {
                         model.class_attr_defaults.insert(name.clone(), value.clone());
-                        if explicit {
+                        if !matches!(seed, super::model::Seed::Absent) {
                             concern_seeded.insert(name.clone());
                         }
                     }

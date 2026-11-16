@@ -925,6 +925,39 @@ pub(super) fn ingest_model_body_items(
     Ok(items)
 }
 
+/// What a `cattr_*` / `mattr_*` declaration's default does to a class
+/// variable a seed may already hold. Rails' answer is `class_variable_set(sym,
+/// default) unless default.nil? && class_variable_defined?(sym)`: the
+/// VALUE decides, not whether an argument was written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seed {
+    /// No default (`cattr_writer :cap`; the synthetic nil placeholder the
+    /// collectors store): sets the variable only where nothing has.
+    Absent,
+    /// A literal `nil`: never replaces a variable something defined.
+    Nil,
+    /// A literal that is not `nil`: always replaces.
+    Fixed,
+    /// A constant, a call, a lambda…: it may evaluate to nil, so whether
+    /// it replaces an earlier seed is only known when nothing is seeded.
+    Computed,
+}
+
+impl Seed {
+    pub(super) fn of(value: &Expr) -> Self {
+        if value.span.is_synthetic() {
+            return Seed::Absent;
+        }
+        match &*value.node {
+            ExprNode::Lit { value: Literal::Nil } => Seed::Nil,
+            // A literal of any other kind, and a literal collection, are
+            // values that cannot be nil.
+            ExprNode::Lit { .. } | ExprNode::Array { .. } | ExprNode::Hash { .. } => Seed::Fixed,
+            _ => Seed::Computed,
+        }
+    }
+}
+
 /// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
 /// parameterless block. Other kwargs (`instance_reader:`, splats, …) stay
 /// unexpanded so a partial reader cannot drop the initializer.
@@ -1023,18 +1056,48 @@ pub(super) fn expand_mattr_cattr(
         return Ok(None);
     }
     if let Some(defaults) = class_attr_defaults {
-        // Rails `cattr_*` (`mattr_reader`'s twin): a non-nil default —
-        // and an explicit `default: nil` — sets the class variable
-        // unconditionally. A declaration with NO default sets it only when
-        // it is not already defined (`class_variable_set(...) unless
-        // sym_default_value.nil? && class_variable_defined?`), so it never
-        // replaces an earlier seed (`cattr_reader :cap, default: 3;
-        // cattr_writer :cap` stays 3). `@@` storage still needs a seed for
-        // its first read (unlike `@ivar`), so an absent default seeds nil
-        // where nothing has.
+        // Rails `cattr_*` (`mattr_reader`'s twin) decides a declaration by
+        // the VALUE of its default (`class_variable_set(...) unless
+        // sym_default_value.nil? && class_variable_defined?`): a non-nil
+        // default always sets, while no default — and an explicit
+        // `default: nil` — sets only a variable nothing has defined yet
+        // (`cattr_reader :cap, default: 3; cattr_writer :cap` stays 3).
+        // Two declarations that both set it are decided by which runs
+        // last; a default this cannot evaluate (a constant, a call, a
+        // lambda) might be nil, so it must not be guessed. `@@` storage
+        // still needs a seed for its first read (unlike `@ivar`), so an
+        // absent default seeds nil where nothing has.
         match default {
             Some(default) => {
+                let seed = Seed::of(&default);
                 for attr in &names {
+                    let Some(existing) = defaults.get(attr) else {
+                        defaults.insert(attr.clone(), default.clone());
+                        continue;
+                    };
+                    if seed == Seed::Nil {
+                        // `nil` never replaces a defined class variable.
+                        continue;
+                    }
+                    if matches!(Seed::of(existing), Seed::Absent | Seed::Nil) {
+                        // Nothing has set the variable yet, so this does.
+                        defaults.insert(attr.clone(), default.clone());
+                        continue;
+                    }
+                    if seed == Seed::Computed {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&call.as_node(), file),
+                            None,
+                            "cattr_accessor",
+                            format!(
+                                "`{}` is declared twice with defaults this cannot evaluate, so whether the later one replaces the earlier seed cannot be established here",
+                                attr.as_str(),
+                            ),
+                        ));
+                        continue;
+                    }
+                    // Both set the variable: the later declaration, which
+                    // is this one, wins.
                     defaults.insert(attr.clone(), default.clone());
                 }
             }
