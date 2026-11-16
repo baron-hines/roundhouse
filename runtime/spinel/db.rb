@@ -2381,6 +2381,15 @@ module Db
     # Any exec is (per the Db contract) DDL or a write — Rails
     # invalidates the whole query cache on write; so do we.
     conn.qc_clear
+    # Every pool's on this thread, as Rails' `clear_query_caches_for_current_thread`:
+    # a connection a block set aside, a reader's on the same file among them,
+    # would otherwise replay a read from before this write.
+    if @routed
+      scopes.each do |f|
+        held = f.held
+        held.qc_clear if !held.nil?
+      end
+    end
     end_snapshot(conn)
     if conn.holds_permit
       # Inside this connection's own transaction: already permitted.
