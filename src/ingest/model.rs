@@ -1023,18 +1023,33 @@ pub(super) fn expand_mattr_cattr(
         return Ok(None);
     }
     if let Some(defaults) = class_attr_defaults {
-        // Rails `class_variable_set`: nil when no default, else the value.
-        // `@@` storage requires an explicit seed (unlike `@ivar`).
-        let expr = default.unwrap_or_else(|| {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit {
-                    value: Literal::Nil,
-                },
-            )
-        });
-        for attr in &names {
-            defaults.insert(attr.clone(), expr.clone());
+        // Rails `cattr_*` (`mattr_reader`'s twin): a non-nil default —
+        // and an explicit `default: nil` — sets the class variable
+        // unconditionally. A declaration with NO default sets it only when
+        // it is not already defined (`class_variable_set(...) unless
+        // sym_default_value.nil? && class_variable_defined?`), so it never
+        // replaces an earlier seed (`cattr_reader :cap, default: 3;
+        // cattr_writer :cap` stays 3). `@@` storage still needs a seed for
+        // its first read (unlike `@ivar`), so an absent default seeds nil
+        // where nothing has.
+        match default {
+            Some(default) => {
+                for attr in &names {
+                    defaults.insert(attr.clone(), default.clone());
+                }
+            }
+            None => {
+                for attr in &names {
+                    defaults.entry(attr.clone()).or_insert_with(|| {
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Lit {
+                                value: Literal::Nil,
+                            },
+                        )
+                    });
+                }
+            }
         }
     }
     let want_reader = name.ends_with("_reader") || name.ends_with("_accessor");

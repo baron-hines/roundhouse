@@ -4388,6 +4388,11 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         // is spliced once, so an include cycle terminates.
         let mut spliced: crate::det::HashSet<crate::ident::ClassId> =
             crate::det::HashSet::default();
+        // Class-attribute names that a concern's `included do` block has
+        // seeded in this model so far, in body order: a later concern's
+        // seed replaces an earlier one.
+        let mut concern_seeded: crate::det::HashSet<crate::ident::Symbol> =
+            crate::det::HashSet::default();
         let mut i = 0;
         while i < model.body.len() {
             // `include Attachment, Broadcasts, Mentionee` is one
@@ -4502,14 +4507,65 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             // prepended block's seeds are refused where they are
             // collected, so none of these belong to a prepender.
             //
-            // `or_insert` keeps the model's own seed for a name it
-            // declares itself, which is an approximation: Rails runs the
-            // class body top to bottom, so the LAST declaration of the
-            // name is the one that holds.
+            // Rails runs the class body top to bottom: a concern's seed
+            // set at this `include` replaces a declaration the model ran
+            // ABOVE it, and loses to one below it. A declaration with no
+            // default sets the class variable only when it is not already
+            // defined (`class_variable_set(...) unless
+            // sym_default_value.nil? && class_variable_defined?`), so it
+            // never replaces a seed; an explicit default — `nil` too —
+            // always does. Where the order cannot be established, the
+            // overlap is refused rather than guessed.
+            let seed_at = match &model.body[i] {
+                ModelBodyItem::Unknown { expr, .. } => Some(expr.span),
+                _ => None,
+            };
             for id in fresh.iter().filter(|_| !prepended) {
                 let Some(defaults) = app.concern_class_attr_defaults.get(id) else { continue };
                 for (name, value) in defaults {
-                    model.class_attr_defaults.entry(name.clone()).or_insert_with(|| value.clone());
+                    let explicit = !value.span.is_synthetic();
+                    match model.class_attr_defaults.get(name) {
+                        None => {
+                            model.class_attr_defaults.insert(name.clone(), value.clone());
+                        }
+                        // A no-default declaration only seeds an undefined
+                        // variable, so it leaves an earlier seed alone.
+                        Some(_) if !explicit => {}
+                        // An earlier concern's seed, at an earlier include.
+                        Some(_) if concern_seeded.contains(name) => {
+                            model.class_attr_defaults.insert(name.clone(), value.clone());
+                        }
+                        // The model's own no-default declaration: it wrote
+                        // nil when it ran first, and nothing at all when
+                        // the concern ran first, so the concern's explicit
+                        // value stands either way.
+                        Some(existing) if existing.span.is_synthetic() => {
+                            model.class_attr_defaults.insert(name.clone(), value.clone());
+                        }
+                        Some(existing) => {
+                            // The model's own explicit seed: the include's
+                            // position decides which declaration runs last.
+                            match seed_at.filter(|at| at.file == existing.span.file) {
+                                Some(at) if existing.span.start < at.start => {
+                                    model.class_attr_defaults.insert(name.clone(), value.clone());
+                                }
+                                Some(at) if existing.span.start > at.start => {}
+                                _ => super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                                    seed_at.unwrap_or_else(crate::span::Span::synthetic),
+                                    None,
+                                    "cattr_accessor",
+                                    format!(
+                                        "`{}` is seeded both by the class body and by `{}`'s `included do` block, and which declaration runs last cannot be established here",
+                                        name.as_str(),
+                                        id.0.as_str(),
+                                    ),
+                                )),
+                            }
+                        }
+                    }
+                    if explicit {
+                        concern_seeded.insert(name.clone());
+                    }
                 }
             }
             let items: Vec<ModelBodyItem> = fresh
