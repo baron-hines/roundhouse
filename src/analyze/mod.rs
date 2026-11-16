@@ -9884,11 +9884,19 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
     body_includes(&model.body)
 }
 
-/// The modules a model's body `prepend`s, in source order: their instance
+/// The modules a model's body `prepend`s, in lookup order: their instance
 /// methods sit AHEAD of the model's own (reaching them through `super`),
-/// where an `include`d module's sit behind.
+/// where an `include`d module's sit behind. Ruby prepends each statement's
+/// modules ahead of everything already there, so the statements are read
+/// newest-first, while a multi-argument statement keeps its arguments in
+/// written order (`prepend A, B` gives `[A, B, K]`).
 pub(crate) fn model_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
-    mixes_in(&model.body, "prepend", None)
+    model
+        .body
+        .iter()
+        .rev()
+        .flat_map(|item| mixes_in(std::slice::from_ref(item), "prepend", None))
+        .collect()
 }
 
 /// The prepends this program WRITES back: a `prepend Concern` statement
@@ -9897,14 +9905,22 @@ pub(crate) fn model_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
 /// loads the module and says `prepend` in its body. A `prepend` the
 /// splice did not claim names no module this program defines, and stays
 /// the reported gap the lowering gives it.
-pub(crate) fn claimed_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
+///
+/// One entry per source statement, arguments in written order: the emit
+/// writes each entry as ONE statement: a multi-argument `prepend A, B`
+/// split into two `prepend`s would give `[B, A, K]` instead of
+/// `[A, B, K]`.
+pub(crate) fn claimed_prepend_statements(model: &crate::dialect::Model) -> Vec<Vec<ClassId>> {
     let mut out = Vec::new();
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         if expr.decisions & crate::expr::CONCERN_PREPEND == 0 {
             continue;
         }
-        out.extend(mixes_in(std::slice::from_ref(item), "prepend", None));
+        let ids = mixes_in(std::slice::from_ref(item), "prepend", None);
+        if !ids.is_empty() {
+            out.push(ids);
+        }
     }
     out
 }

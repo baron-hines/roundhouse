@@ -43,6 +43,75 @@ end
   end
 end
 "##)
+        .write("app/models/concerns/alpha.rb", r##"module Alpha
+  extend ActiveSupport::Concern
+
+  prepended do
+    before_save :mark_alpha
+  end
+
+  def who
+    "A>#{super}"
+  end
+
+  private
+
+  def mark_alpha
+    self.name = "#{name}A"
+  end
+end
+"##)
+        .write("app/models/concerns/beta.rb", r##"module Beta
+  extend ActiveSupport::Concern
+
+  prepended do
+    before_save :mark_beta
+  end
+
+  def who
+    "B>#{super}"
+  end
+
+  private
+
+  def mark_beta
+    self.name = "#{name}B"
+  end
+end
+"##)
+        .write("app/models/combo.rb", r##"class Combo < ApplicationRecord
+  prepend Alpha, Beta
+
+  def who
+    "K"
+  end
+end
+"##)
+        .write("app/models/split.rb", r##"class Split < ApplicationRecord
+  prepend Alpha
+  prepend Beta
+
+  def who
+    "K"
+  end
+end
+"##)
+        .write("app/models/concerns/wrapping.rb", r##"module Wrapping
+  extend ActiveSupport::Concern
+
+  def wrapped_label
+    "[#{super}]"
+  end
+end
+"##)
+        .write("app/models/gadget.rb", r##"class Gadget < ApplicationRecord
+  prepend Wrapping
+
+  def wrapped_label
+    "gadget"
+  end
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -55,15 +124,51 @@ end
     [Badge.trimmed_labels, Badge.order(:label).last.display_label]
   end
 
+  # Rails: ["A>B>K", "KBA"] — `prepend A, B` puts A ahead of B in the
+  # ancestry, and runs B's `prepended do` block before A's, so B's
+  # `before_save` is registered first.
+  def self.multi_argument_prepend
+    combo = Combo.new(name: "K")
+    combo.save!
+    [combo.who, combo.name]
+  end
+
+  # Rails: ["B>A>K", "KAB"] — separate statements put the LATER module
+  # ahead, and run their blocks in source order.
+  def self.separate_prepends
+    split = Split.new(name: "K")
+    split.save!
+    [split.who, split.name]
+  end
+
+  # Rails: "[gadget]" — a Concern with no `prepended` block and no
+  # `class_methods` is still prepended, so its method reaches the
+  # model's through `super`.
+  def self.method_only_prepended_concern
+    Gadget.new.wrapped_label
+  end
+
   def self.run
     Badge.delete_all
     check("prepended_concern", prepended_concern == [["blue", "red"], "[RED]"])
+    check("multi_argument_prepend", multi_argument_prepend == ["A>B>K", "KBA"])
+    check("separate_prepends", separate_prepends == ["B>A>K", "KAB"])
+    check("method_only_prepended_concern", method_only_prepended_concern == "[gadget]")
   end
 end
 "##)
         .write("db/schema.rb", r##"ActiveRecord::Schema.define do
   create_table "badges", force: :cascade do |t|
     t.string "label"
+  end
+  create_table "combos", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "splits", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "gadgets", force: :cascade do |t|
+    t.string "name"
   end
 end
 "##)

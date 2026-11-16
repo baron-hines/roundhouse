@@ -4464,8 +4464,18 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             // first (concern.rb `append_features`). `prepend_features`
             // prepends them instead; such a prepend was refused above, so
             // nothing reaching here has one left to expand.
+            //
+            // Ruby runs a multi-argument `prepend A, B` from the last
+            // argument back (B's `prepend_features`, then A's), so their
+            // `prepended do` items run in that order; separate statements
+            // run in source order.
+            let ordered: Vec<crate::ident::ClassId> = if prepended {
+                named.iter().rev().cloned().collect()
+            } else {
+                named.clone()
+            };
             let concern_ids: Vec<crate::ident::ClassId> =
-                named.iter().flat_map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
+                ordered.iter().flat_map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
             if claimed
                 && let ModelBodyItem::Unknown { expr, .. } = &mut model.body[i]
             {
