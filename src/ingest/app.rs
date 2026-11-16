@@ -4771,7 +4771,7 @@ pub(super) fn qualify_carried_constants(
 /// then `Blog::Concerns::X`), innermost first, falling back to the path as
 /// written. Keyed by the written path, a rooted include matched no
 /// concern and its `included do` block vanished from the includer.
-fn concern_named<V>(
+pub(crate) fn concern_named<V>(
     owner: &str,
     path: &[crate::ident::Symbol],
     concerns: &crate::det::HashMap<crate::ident::ClassId, V>,

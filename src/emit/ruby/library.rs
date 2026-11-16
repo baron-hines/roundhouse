@@ -9315,7 +9315,7 @@ fn emit_library_class_decl_inner(
         .models
         .iter()
         .filter(|m| m.name == lc.name)
-        .flat_map(crate::analyze::claimed_prepend_statements)
+        .flat_map(|m| crate::analyze::claimed_prepend_statements(m, &app.concern_prepended_items))
         .collect();
     for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the

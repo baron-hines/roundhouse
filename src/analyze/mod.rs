@@ -9926,14 +9926,36 @@ pub(crate) fn model_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
 /// writes each entry as ONE statement: a multi-argument `prepend A, B`
 /// split into two `prepend`s would give `[B, A, K]` instead of
 /// `[A, B, K]`.
-pub(crate) fn claimed_prepend_statements(model: &crate::dialect::Model) -> Vec<Vec<ClassId>> {
+///
+/// `concerns` is the set the splice resolved the statement against
+/// ([`crate::App::concern_prepended_items`]), so a path written relative
+/// to the model (`module Ns; class Post < ApplicationRecord; prepend
+/// Audit`) names the module it resolved to there (`Ns::Audit`) rather
+/// than the bare `Audit` its file does not define: the emitted `require`
+/// loads the file that actually holds the module.
+pub(crate) fn claimed_prepend_statements<V>(
+    model: &crate::dialect::Model,
+    concerns: &HashMap<ClassId, V>,
+) -> Vec<Vec<ClassId>> {
     let mut out = Vec::new();
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         if expr.decisions & crate::expr::CONCERN_PREPEND == 0 {
             continue;
         }
-        let ids = mixes_in(std::slice::from_ref(item), "prepend", None);
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        if method.as_str() != "prepend" {
+            continue;
+        }
+        let ids: Vec<ClassId> = args
+            .iter()
+            .filter_map(|arg| match &*arg.node {
+                ExprNode::Const { path } => {
+                    Some(crate::ingest::app::concern_named(model.name.0.as_str(), path, concerns))
+                }
+                _ => None,
+            })
+            .collect();
         if !ids.is_empty() {
             out.push(ids);
         }
