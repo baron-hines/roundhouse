@@ -30,7 +30,9 @@ end
     check("save(touch: false) keeps updated_at", n.updated_at == past)
     n.title = "c"
     n.save!(touch: false)
-    check("save!(touch: false) keeps updated_at", Note.find(n.id).updated_at == past)
+    saved = Note.find(n.id)
+    check("save!(touch: false) writes the update", saved.title == "c")
+    check("save!(touch: false) keeps updated_at", saved.updated_at == past)
     n.title = "d"
     n.save
     check("a plain save stamps", Note.find(n.id).updated_at > past)

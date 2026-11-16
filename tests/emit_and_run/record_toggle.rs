@@ -25,9 +25,10 @@ end
     check("toggle answers the record", back.equal?(t))
     check("toggle flips", t.done == true)
     check("toggle leaves the row", Task.find(t.id).done == false)
-    # Rails: true, and the row reads false again
+    t.reload
+    # Rails: true, and the row reads true
     check("toggle! answers true", t.toggle!(:done) == true)
-    check("toggle! saves", Task.find(t.id).done == false)
+    check("toggle! saves", Task.find(t.id).done == true)
     blank = Task.new(title: "dust", done: nil)
     blank.toggle(:done)
     check("nil toggles to true", blank.done == true)

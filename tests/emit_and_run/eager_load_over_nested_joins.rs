@@ -44,8 +44,9 @@ end
     end
     # Rails: one statement, one JOIN of concerts
     check("concerts joined once", statements.size == 1 && statements.first.scan(/JOIN "?concerts"? /).size == 1)
+    first = rows.first
+    check("loaded by the eager load", first.association(:concert).loaded? && first.association(:seat).loaded?)
     check("the eager reads", rows.map { |t| [t.code, t.concert.title, t.seat.row] } == [["t1", "gig", "a"]])
-    check("loaded by the eager load", rows.first.association(:concert).loaded?)
   end
 end
 "##)
