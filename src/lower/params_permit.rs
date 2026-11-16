@@ -5,7 +5,92 @@ use crate::ident::Symbol;
 use crate::ty::Ty;
 
 pub fn apply_params_permit_lowering(app: &mut App) {
-    super::for_each_hook_body(app, &mut rewrite);
+    let lists = helper_filter_lists(&app.controllers);
+    let none = HelperLists::default();
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        rewrite(body, owner.and_then(|o| lists.get(o)).unwrap_or(&none))
+    });
+}
+
+/// A controller's no-argument methods that answer a literal filter list, by name.
+type HelperLists = crate::det::HashMap<Symbol, Vec<Expr>>;
+
+/// Per controller, the methods it has or inherits whose body is a literal list of Symbols or Strings (`%i[a b]`,
+/// `%w[a b]`, `[:a, "b"]`, optionally `.freeze`), so `permit(*helper)` can be read as the list written inline (as
+/// `permit_splat` does for the typed params chain, #858). The nearest definition wins.
+fn helper_filter_lists(
+    controllers: &[crate::dialect::Controller],
+) -> crate::det::HashMap<crate::ident::ClassId, HelperLists> {
+    let by_name: crate::det::HashMap<&crate::ident::ClassId, &crate::dialect::Controller> =
+        controllers.iter().map(|c| (&c.name, c)).collect();
+    let mut out = crate::det::HashMap::default();
+    for controller in controllers {
+        let mut lists = HelperLists::default();
+        let mut seen = crate::det::HashSet::default();
+        let mut current = Some(controller);
+        let mut depth = 0;
+        while let Some(c) = current
+            && depth < 32
+        {
+            // A later definition in one class body replaces an earlier one, as Ruby's does.
+            for def in c.actions().collect::<Vec<_>>().into_iter().rev() {
+                if !seen.insert(def.name.clone()) {
+                    continue;
+                }
+                if def.formal_params().is_empty()
+                    && def.block_param.is_none()
+                    && let Some(list) = literal_filter_list(&def.body)
+                {
+                    lists.insert(def.name.clone(), list);
+                }
+            }
+            depth += 1;
+            current = c.parent.as_ref().and_then(|p| by_name.get(p).copied());
+        }
+        if !lists.is_empty() {
+            out.insert(controller.name.clone(), lists);
+        }
+    }
+    out
+}
+
+/// The elements of a literal list of Symbols or Strings (`%i[a b]`, `["a", :b].freeze`), or `None`.
+fn literal_filter_list(body: &Expr) -> Option<Vec<Expr>> {
+    let body = match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => body,
+    };
+    let array = match &*body.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => r,
+        _ => body,
+    };
+    let ExprNode::Array { elements, .. } = &*array.node else { return None };
+    elements
+        .iter()
+        .all(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }))
+        .then(|| elements.clone())
+}
+
+/// `permit`'s arguments with each splat of a literal list (`*%i[a b]`) or of a helper answering one
+/// (`*shared_fields`) written inline, or `None` when a splat is neither.
+fn inline_filter_splats(args: &[Expr], lists: &HelperLists) -> Option<Vec<Expr>> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let ExprNode::Splat { value } = &*arg.node else {
+            out.push(arg.clone());
+            continue;
+        };
+        match &*value.node {
+            ExprNode::Array { .. } => out.extend(literal_filter_list(value)?),
+            ExprNode::Send { recv, method, args, block: None, .. }
+                if args.is_empty() && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) =>
+            {
+                out.extend(lists.get(method)?.iter().cloned());
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn is_param_value(ty: Option<&Ty>) -> bool {
@@ -69,21 +154,21 @@ fn is_required_list(e: &Expr) -> bool {
 /// `params.require(:list).map { |item| ... }`: Rails makes each element an
 /// `ActionController::Parameters` (actionpack 8.1.4), and the runtime's
 /// are String-keyed Hashes, so the element's own calls lower here.
-fn rewrite_element_block(expr: &mut Expr) {
+fn rewrite_element_block(expr: &mut Expr, lists: &HelperLists) {
     let ExprNode::Send { recv: Some(r), method, block: Some(block), .. } = &mut *expr.node else { return };
     if !ELEMENT_BLOCK_METHODS.contains(&method.as_str()) || !is_required_list(r) {
         return;
     }
     let ExprNode::Lambda { params, body, .. } = &mut *block.node else { return };
     let Some(item) = params.first().cloned() else { return };
-    rewrite_element_calls(body, &item);
+    rewrite_element_calls(body, &item, lists);
 }
 
-fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
+fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {
     if matches!(&*expr.node, ExprNode::Lambda { params, .. } if params.contains(item)) {
         return;
     }
-    expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item));
+    expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item, lists));
     // A write by Symbol key (`item[:kind] = v`, `item[:kind] ||= v`) stores the String key the reads beside it read:
     // on Rails' Parameters both spellings are one key.
     if let ExprNode::Assign { target: crate::expr::LValue::Index { recv, index }, .. }
@@ -101,7 +186,19 @@ fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
     }
     match method.as_str() {
         "permit" | "expect" if block.is_none() => {
-            if let Some(mut new) = element_filter(expr) {
+            // `permit(*shared_fields, :x)`: Rails flattens the filters, so a splat of a literal list is that list.
+            let ExprNode::Send { args, .. } = &*expr.node else { return };
+            let inlined = if args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. })) {
+                let Some(args) = inline_filter_splats(args, lists) else { return };
+                let mut e = expr.clone();
+                if let ExprNode::Send { args: slot, .. } = &mut *e.node {
+                    *slot = args;
+                }
+                Some(e)
+            } else {
+                None
+            };
+            if let Some(mut new) = element_filter(inlined.as_ref().unwrap_or(expr)) {
                 new.ty = expr.ty.clone();
                 *expr = new;
             }
@@ -172,9 +269,9 @@ fn stringify_safe_nav_param_reads(expr: &mut Expr) {
     }
 }
 
-fn rewrite(expr: &mut Expr) {
-    rewrite_element_block(expr);
-    expr.node.for_each_child_mut(&mut rewrite);
+fn rewrite(expr: &mut Expr, lists: &HelperLists) {
+    rewrite_element_block(expr, lists);
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, lists));
     stringify_safe_nav_param_reads(expr);
     // A top-level `params.permit(:a, :b)` CONSUMED IN PLACE, as a call's
     // argument — the Rails 8 authentication generator's
