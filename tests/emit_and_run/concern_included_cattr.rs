@@ -39,12 +39,23 @@ end
     cattr_accessor :quantity, default: 3
     cattr_reader :unit_size, default: 3
     cattr_writer :unit_size
+    cattr_accessor :girth, default: 3
+  end
+end
+"##)
+        .write("app/models/concerns/widened.rb", r##"module Widened
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_accessor :girth, default: 5
   end
 end
 "##)
         .write("app/models/crate.rb", r##"class Crate < ApplicationRecord
   cattr_accessor :quantity, default: 1
   include Seeded
+  include Widened
+  cattr_accessor :girth, default: 1
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -72,11 +83,18 @@ end
     Crate.unit_size
   end
 
+  # Rails: 1 — the model's own declaration below both includes runs
+  # last, after each concern's seed.
+  def self.models_seed_after_two_concerns
+    Crate.girth
+  end
+
   def self.run
     Rope.delete_all
     check("class_attributes_from_the_block", class_attributes_from_the_block == [3, "cm", true, false, "4cm"])
     check("concern_seed_after_the_models_own", concern_seed_after_the_models_own == 3)
     check("seed_without_a_default_keeps_the_earlier", seed_without_a_default_keeps_the_earlier == 3)
+    check("models_seed_after_two_concerns", models_seed_after_two_concerns == 1)
   end
 end
 "##)

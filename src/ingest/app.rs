@@ -4530,47 +4530,48 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                 let Some(defaults) = app.concern_class_attr_defaults.get(id) else { continue };
                 for (name, value) in defaults {
                     let explicit = !value.span.is_synthetic();
-                    match model.class_attr_defaults.get(name) {
-                        None => {
-                            model.class_attr_defaults.insert(name.clone(), value.clone());
-                        }
+                    let stored = match model.class_attr_defaults.get(name) {
+                        None => true,
                         // A no-default declaration only seeds an undefined
                         // variable, so it leaves an earlier seed alone.
-                        Some(_) if !explicit => {}
+                        Some(_) if !explicit => false,
                         // An earlier concern's seed, at an earlier include.
-                        Some(_) if concern_seeded.contains(name) => {
-                            model.class_attr_defaults.insert(name.clone(), value.clone());
-                        }
+                        Some(_) if concern_seeded.contains(name) => true,
                         // The model's own no-default declaration: it wrote
                         // nil when it ran first, and nothing at all when
                         // the concern ran first, so the concern's explicit
                         // value stands either way.
-                        Some(existing) if existing.span.is_synthetic() => {
-                            model.class_attr_defaults.insert(name.clone(), value.clone());
-                        }
+                        Some(existing) if existing.span.is_synthetic() => true,
                         Some(existing) => {
                             // The model's own explicit seed: the include's
                             // position decides which declaration runs last.
                             match seed_at.filter(|at| at.file == existing.span.file) {
-                                Some(at) if existing.span.start < at.start => {
-                                    model.class_attr_defaults.insert(name.clone(), value.clone());
+                                Some(at) if existing.span.start < at.start => true,
+                                Some(at) if existing.span.start > at.start => false,
+                                _ => {
+                                    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                                        seed_at.unwrap_or_else(crate::span::Span::synthetic),
+                                        None,
+                                        "cattr_accessor",
+                                        format!(
+                                            "`{}` is seeded both by the class body and by `{}`'s `included do` block, and which declaration runs last cannot be established here",
+                                            name.as_str(),
+                                            id.0.as_str(),
+                                        ),
+                                    ));
+                                    false
                                 }
-                                Some(at) if existing.span.start > at.start => {}
-                                _ => super::prism::push(crate::diagnostic::Diagnostic::unsupported(
-                                    seed_at.unwrap_or_else(crate::span::Span::synthetic),
-                                    None,
-                                    "cattr_accessor",
-                                    format!(
-                                        "`{}` is seeded both by the class body and by `{}`'s `included do` block, and which declaration runs last cannot be established here",
-                                        name.as_str(),
-                                        id.0.as_str(),
-                                    ),
-                                )),
                             }
                         }
-                    }
-                    if explicit {
-                        concern_seeded.insert(name.clone());
+                    };
+                    // Only a seed that holds: one the model's own later
+                    // declaration overrode must not let the next concern's
+                    // seed replace that declaration.
+                    if stored {
+                        model.class_attr_defaults.insert(name.clone(), value.clone());
+                        if explicit {
+                            concern_seeded.insert(name.clone());
+                        }
                     }
                 }
             }
