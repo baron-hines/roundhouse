@@ -951,7 +951,11 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// that consumes the shape.
 fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
     fn walk(expr: &crate::expr::Expr) -> bool {
-        if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "define_method" | "scope")) {
+        // On the class: receiverless or `self.scope`.
+        if let ExprNode::Send { recv, method, .. } = &*expr.node
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && matches!(method.as_str(), "define_method" | "scope")
+        {
             return true;
         }
         let mut found = false;

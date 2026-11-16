@@ -71,14 +71,18 @@ fn a_loop_over_names_known_only_at_load_is_a_check_error() {
         .check_errors();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].contains("could not unroll") && errors[0].contains("`Parcel`"), "{errors:#?}");
-    // A receiverless block that runs them is not unrolled either, nor a `while` loop.
-    for (find, replace) in [
-        ("  %w[small large].each do |size|\n", "  each do |size|\n"),
-        ("  %w[small large].each do |size|\n", "  size = \"small\"\n  while size\n"),
+    // A receiverless block that runs them is not unrolled either, nor a
+    // `while` loop, whether it calls `scope` or `self.scope`.
+    let header = "  %w[small large].each do |size|\n";
+    let scope = "    scope size, -> { where(size: size) }\n";
+    for edits in [
+        vec![(header, "  each do |size|\n")],
+        vec![(header, "  size = \"small\"\n  while size\n")],
+        vec![(header, "  size = \"small\"\n  while size\n"), (scope, "    self.scope size, -> { where(size: size) }\n")],
     ] {
-        let errors = app().edit("app/models/parcel.rb", find, replace).check_errors();
-        assert_eq!(errors.len(), 1, "{replace}: {errors:#?}");
-        assert!(errors[0].contains("could not unroll"), "{replace}: {errors:#?}");
+        let errors = edits.iter().fold(app(), |app, (find, replace)| app.edit("app/models/parcel.rb", find, replace)).check_errors();
+        assert_eq!(errors.len(), 1, "{edits:?}: {errors:#?}");
+        assert!(errors[0].contains("could not unroll"), "{edits:?}: {errors:#?}");
     }
 }
 
