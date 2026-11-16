@@ -164,7 +164,8 @@ module RoundhouseShapeObserver
         when Prism::ImplicitNode then return refuse("#{name}: a shorthand `{ #{n.slice} }` reads a captured local")
         when Prism::CallNode
           # Not a captured Array or Hash the body changes: each call of the `def` would change a fresh copy.
-          if MUTATORS.include?(n.name) && n.receiver.is_a?(Prism::LocalVariableReadNode) && n.receiver.depth > level
+          if MUTATORS.include?(n.name) && n.receiver.is_a?(Prism::LocalVariableReadNode) && n.receiver.depth > level &&
+             [Array, Hash, String].any? { |k| binding_.local_variable_get(n.receiver.name).is_a?(k) }
             return refuse("#{name}: changes captured `#{n.receiver.name}` with `#{n.name}`")
           end
         when Prism::LocalVariableReadNode
@@ -180,9 +181,12 @@ module RoundhouseShapeObserver
           # Not left to the class it is written into: a constant is looked up where the block was written.
           value = (binding_.eval(n.name.to_s) rescue (return refuse("#{name}: `#{n.name}` names nothing where the block was made")))
           # Not the value it held as the app booted: read by its full name, a later assignment is what the method sees.
-          holder = (binding_.eval("::Module.nesting") + [Object]).find { |m| m.const_defined?(n.name, false) }
+          nesting = binding_.eval("::Module.nesting")
+          holder = (nesting + (nesting.first&.ancestors || []) + [Object]).find { |m| m.const_defined?(n.name, false) }
           text = value.is_a?(Module) && value.name ? "::#{value.name}" : holder && (holder == Object ? "::#{n.name}" : holder.name && "::#{holder.name}::#{n.name}")
-          return refuse("#{name}: `#{n.name}` cannot be named from the class it is written into") unless text
+          # Not a name that reads another value from the top level, or none (a `private_constant`).
+          same = text && (TOPLEVEL_BINDING.eval(text).equal?(value) rescue false)
+          return refuse("#{name}: `#{n.name}` cannot be named from the class it is written into") unless same
           edits << [n.location.start_offset, n.location.end_offset, text]
           return true
         end
