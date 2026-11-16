@@ -90,17 +90,16 @@ pub(crate) fn through_writer_join(
     }) else {
         return ThroughWriterJoin::NoJoin;
     };
-    let Some((join_class, owner_fk, thr_through, thr_as)) = model.associations().find_map(|a| match a {
-        Association::HasMany {
-            name: n,
-            target: jt,
-            foreign_key: jfk,
-            through: jthru,
-            as_interface,
-            ..
-        } if n == &thr_name => Some((jt.clone(), jfk.clone(), jthru.clone(), as_interface.clone())),
-        _ => None,
-    }) else {
+    // The last declaration of the name, which replaces an earlier one, as
+    // the reader reads it.
+    let Some((join_class, owner_fk, thr_through, thr_as)) =
+        model.associations().filter(|a| a.name() == &thr_name).last().and_then(|a| match a {
+            Association::HasMany { target: jt, foreign_key: jfk, through: jthru, as_interface, .. } => {
+                Some((jt.clone(), jfk.clone(), jthru.clone(), as_interface.clone()))
+            }
+            _ => None,
+        })
+    else {
         return ThroughWriterJoin::NoJoin;
     };
     // First hop already indirect (`through:` an association that is

@@ -13085,9 +13085,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 // merges the hop's conditions and orderings into its query
                 // (`through_hop_scope`) and this batch would not.
                 let Some(Association::HasMany { target: thr_target, as_interface, scope: None, .. }) =
-                    model.associations().find(|a| {
-                        matches!(a, Association::HasMany { name, .. } if name == thr_name)
-                    })
+                    model.associations().filter(|a| a.name() == thr_name).last()
                 else {
                     continue;
                 };
