@@ -3355,6 +3355,8 @@ end
     // After the splice too: the source association may come from a
     // concern on the through model.
     resolve_through_targets(&mut app);
+    // After the splice, which rehomes a defaulted key first.
+    resolve_inverse_foreign_keys(&mut app);
     // `allow_browser` becomes a filter plus the method it runs, on the
     // concern (before the splice carries both to the includer) or on
     // the controller that called it directly.
@@ -9152,6 +9154,87 @@ fn resolve_through_targets(app: &mut App) {
             {
                 *target = resolved;
             }
+        }
+    }
+}
+
+/// A `has_many` or `has_one` with `inverse_of:` and no `foreign_key:`
+/// or `as:` takes its key from the inverse association, as Rails'
+/// `derive_foreign_key` does: `has_many :links, inverse_of:
+/// :from_comment` reads `links.from_comment_id`, not `links.comment_id`.
+/// The inverse's key is its own, not inferred from an inverse in turn
+/// (`infer_from_inverse_of: false`), so every key is read before any
+/// changes. Rails looks the inverse up on the target class and its
+/// ancestors, and raises when none declares it, once the association is
+/// used; `check` reports it at the declaration.
+fn resolve_inverse_foreign_keys(app: &mut App) {
+    use crate::dialect::{Association, ModelBodyItem};
+
+    let mut updates = Vec::new();
+    for (i, model) in app.models.iter().enumerate() {
+        for (j, item) in model.body.iter().enumerate() {
+            let ModelBodyItem::Association { assoc, .. } = item else { continue };
+            let (Association::HasMany {
+                name,
+                target,
+                foreign_key,
+                foreign_key_explicit: false,
+                as_interface: None,
+                through: None,
+                inverse_of: Some(inverse),
+                ..
+            }
+            | Association::HasOne {
+                name,
+                target,
+                foreign_key,
+                foreign_key_explicit: false,
+                as_interface: None,
+                through: None,
+                inverse_of: Some(inverse),
+                ..
+            }) = assoc
+            else {
+                continue;
+            };
+            // A target outside the app's models (a gem's) is not read here.
+            let Some(mut class) = app.models.iter().find(|m| &m.name == target) else { continue };
+            let found = loop {
+                if let Some(found) = class.associations().filter(|a| a.name() == inverse).last() {
+                    break Some(found);
+                }
+                match class.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p)) {
+                    Some(parent) => class = parent,
+                    None => break None,
+                }
+            };
+            let Some(found) = found else {
+                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                    item.span(),
+                    None,
+                    format!("{} :{name}, inverse_of: :{inverse}", if matches!(assoc, Association::HasMany { .. }) { "has_many" } else { "has_one" }),
+                    format!("`{}` declares no association `{inverse}`, so Rails raises InverseOfAssociationNotFoundError once the association is used", target.0.as_str()),
+                ));
+                continue;
+            };
+            let key = match found {
+                Association::BelongsTo { foreign_key, .. }
+                | Association::HasMany { foreign_key, .. }
+                | Association::HasOne { foreign_key, .. } => foreign_key,
+                Association::HasAndBelongsToMany { .. } => continue,
+            };
+            if key != foreign_key {
+                updates.push((i, j, key.clone()));
+            }
+        }
+    }
+    for (i, j, key) in updates {
+        if let ModelBodyItem::Association {
+            assoc: Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. },
+            ..
+        } = &mut app.models[i].body[j]
+        {
+            *foreign_key = key;
         }
     }
 }

@@ -22553,3 +22553,5 @@ mod translation_helper_test_include;
 mod view_url_for_hash;
 #[path = "emit_and_run/class_side_multi_column_pluck.rs"]
 mod class_side_multi_column_pluck;
+#[path = "emit_and_run/has_many_inverse_of_foreign_key.rs"]
+mod has_many_inverse_of_foreign_key;

@@ -4336,6 +4336,7 @@ fn parse_association(
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
     let mut validate: Option<bool> = None;
+    let mut inverse_of: Option<String> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
@@ -4417,6 +4418,8 @@ fn parse_association(
                     primary_key = string_value(&value).or_else(|| symbol_value(&value))
                 }
                 "through" => through = symbol_value(&value),
+                // A name only: `inverse_of: false` (or `nil`) derives nothing.
+                "inverse_of" => inverse_of = symbol_value(&value).or_else(|| string_value(&value)),
                 "source" => source = symbol_value(&value),
                 "source_type" => source_type = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
                 "dependent" => {
@@ -4575,6 +4578,7 @@ fn parse_association(
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             primary_key: primary_key.as_deref().map(Symbol::from),
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
@@ -4601,6 +4605,7 @@ fn parse_association(
             autosave: autosave.unwrap_or(false),
             validate: validate.unwrap_or(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
         }),
         "belongs_to" => Some(Association::BelongsTo {
             name: name.clone(),
