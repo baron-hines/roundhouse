@@ -131,7 +131,7 @@ fn element_filter(e: &Expr) -> Option<Expr> {
     if args.is_empty() {
         return None;
     }
-    Some(allowed(args.iter().map(sym_name).collect::<Option<Vec<_>>>()?))
+    Some(allowed(filter_names(args)?))
 }
 
 fn rewrite(expr: &mut Expr) {
@@ -159,7 +159,7 @@ fn rewrite(expr: &mut Expr) {
     let replacement = match (method.as_str(), args.as_slice()) {
         ("permit!" | "to_unsafe_h", []) if nested || is_request_params(r) => Some(r.clone()),
         ("permit", keys) if nested && !keys.is_empty() => {
-            let Some(names) = keys.iter().map(sym_name).collect::<Option<Vec<_>>>() else { return };
+            let Some(names) = filter_names(keys) else { return };
             Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect()))
         }
         ("require", [key]) if nested => {
@@ -253,7 +253,7 @@ fn filtered_call(e: &Expr) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), args, .. } = &*e.node else { return None };
     let (last, scalars) = args.split_last()?;
     let ExprNode::Hash { entries, .. } = &*last.node else { return None };
-    let names = scalars.iter().map(sym_name).collect::<Option<Vec<_>>>()?;
+    let names = filter_names(scalars)?;
     let nested = nested_candidates(e, &crate::ident::ClassId(Symbol::from("")));
     // A key the parser could not read (`k: [{ … }]`) would be dropped silently.
     if entries.is_empty() || nested.len() != entries.len() {
@@ -297,7 +297,7 @@ fn permitted_chain(e: &Expr) -> Option<Expr> {
     if method.as_str() != "permit" || args.is_empty() || !is_request_params(r) || is_param_value(r.ty.as_ref()) {
         return None;
     }
-    let names = args.iter().map(sym_name).collect::<Option<Vec<_>>>()?;
+    let names = filter_names(args)?;
     let params_const = || Expr::new(e.span, ExprNode::Const { path: vec![Symbol::from("Params")] });
     let mut acc = Expr::new(e.span, ExprNode::Hash { entries: vec![], kwargs: false });
     acc.ty = Some(permitted_ty());
@@ -312,6 +312,26 @@ fn permitted_chain(e: &Expr) -> Option<Expr> {
 /// What `Params.permitted` answers: the Symbol-keyed scalars.
 fn permitted_ty() -> Ty {
     Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }
+}
+
+/// The names a `permit` filter list spells, as Rails' `permit(*filters)` reads them: a Symbol or a String literal, or an
+/// Array literal of those (`permit(%w[a b])`, `permit("a", "b")`), flattened. `None` for anything else.
+fn filter_names(args: &[Expr]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for arg in args {
+        match &*arg.node {
+            ExprNode::Array { elements, .. } => names.extend(filter_names(elements)?),
+            _ => names.push(filter_name(arg)?),
+        }
+    }
+    Some(names)
+}
+
+fn filter_name(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => sym_name(e),
+    }
 }
 
 fn sym_name(e: &Expr) -> Option<String> {
