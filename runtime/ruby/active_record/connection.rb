@@ -1173,6 +1173,43 @@ module ActiveRecord
       end
     end
 
+    # `#lock!` on the ruby family, where the database may be PostgreSQL
+    # (base.rb's `lock!` is the SQLite one every target shares). Rails
+    # reloads with `SELECT … FOR UPDATE`; on PostgreSQL that row lock is
+    # what makes a second `with_lock` on the same row wait for the first
+    # transaction to commit and then read its write. Without it, two
+    # concurrent read-check-write blocks both read the old row and both
+    # write. Here the lock is taken by its own `SELECT <key> … FOR
+    # UPDATE`, then `reload` reads the row: in the same transaction, and
+    # after the lock is held, so it reads what the holder committed.
+    # SQLite keeps base.rb's behaviour (`_lock_row` does nothing there).
+    def lock!(lock = nil)
+      _lock_row(lock)
+      reload
+    end
+
+    # The row lock `lock!` takes: Rails' `lock` argument, where `true`
+    # (and nil, this runtime's "not given") is `FOR UPDATE`, a String is
+    # the clause itself (`"FOR SHARE"`, `"FOR UPDATE NOWAIT"`), and
+    # `false` takes none. Only on PostgreSQL, and only for a persisted
+    # record: Rails' `lock!` reloads nothing for a new one. Outside a
+    # transaction the lock ends with the statement, as it does in Rails.
+    #
+    # `Db.exec`, not a read through the statement cache: a locking read
+    # must reach the server every time (Rails never answers one from the
+    # query cache), and `exec` also clears the lease's query cache, as
+    # Rails' `reload` does before it reads.
+    def _lock_row(lock)
+      return nil unless Db.adapter_name == "postgresql"
+      return nil unless persisted?
+      return nil if lock == false
+      clause = lock.is_a?(String) ? lock : "FOR UPDATE"
+      key = ActiveRecord.adapter.quote_column_name(self.class.primary_key.to_s)
+      value = ActiveRecord.adapter.escape_value(_primary_key_value)
+      Db.exec("SELECT #{key} FROM #{self.class.table_name} WHERE #{key} = #{value} #{clause}")
+      nil
+    end
+
     # `Model.delete_all` for a model without the lowerer-emitted
     # override: the rows the DELETE removed, read off the statement
     # rather than counted beforehand. Ruby-family-only because

@@ -659,7 +659,12 @@ fn untyped_subexpressions_baseline() {
     // them for the RBS-paired gate, which stays at 0.
     // MEASURED 1433 on merging #2176 and #2177 (1427): restore_attributes's
     // +1 and the association relation inverses' +5, which add up.
-    const CEILING: usize = 1433;
+    // MEASURED 1439 on PostgreSQL row locking (main 1a54a7397: 1433):
+    // the ruby family's `lock!` / `_lock_row` (active_record/connection.rb)
+    // add 6. Four read the `lock` argument, typed only by connection.rbs,
+    // which this RBS-less probe does not load; the other two are the `Db`
+    // receivers of `Db.adapter_name` and `Db.exec`, as in `Relation#lock`.
+    const CEILING: usize = 1439;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
