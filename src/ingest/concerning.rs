@@ -154,6 +154,16 @@ fn concerning<'a>(item: &'a ModelBodyItem) -> Option<(Symbol, &'a Expr)> {
     if method.as_str() != "concerning" {
         return None;
     }
+    // Rails' `concerning` hands the block to `module_eval`, so a block
+    // with parameters (`concerning :Topic do |m| … end`) reads them as the
+    // module's. The desugar copies the block's source into a module body,
+    // where a parameter is an undefined local — so such a block is left
+    // as written, with the diagnostics main already gives it.
+    if let ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } = &*block.node
+        && (!params.is_empty() || rest_param.is_some() || !extra_params.is_empty() || block_param.is_some())
+    {
+        return None;
+    }
     let [topic] = args.as_slice() else { return None };
     let topic = match &*topic.node {
         ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
