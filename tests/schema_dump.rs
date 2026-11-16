@@ -331,10 +331,13 @@ fn two_computed_keys_still_refuse_a_named_file() {
 #[test]
 fn an_unparsed_file_refuses_a_named_file() {
     let anchored = |dump: &str| format!("defaults: &<%= \"base\" %>\n  adapter: sqlite3\ntest:\n  <<: *<%= \"base\" %>\n{dump}");
-    let named = anchored("  schema_dump: catalog_schema.rb\n");
-    let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
-    assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump` (unknown anchor")), "{:?}", checked.errors);
-    assert!(tables(&checked.app).is_empty());
+    // The filename on the key's line, on the next line, or as a block scalar.
+    for dump in ["  schema_dump: catalog_schema.rb\n", "  schema_dump:\n    catalog_schema.rb\n", "  schema_dump: >-\n    catalog_schema.rb\n"] {
+        let named = anchored(dump);
+        let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump` (unknown anchor")), "{named}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{named}");
+    }
     for dump in ["", "  schema_dump: false\n"] {
         let yml = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));

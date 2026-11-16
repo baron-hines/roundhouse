@@ -344,11 +344,13 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         Ok(doc) => doc,
         Err(error) => {
         // Unparsed: a `schema_dump` that names a file can't be checked, so it is refused rather
-        // than dropped. `false`, null or no `schema_dump` keeps main's behavior.
+        // than dropped. Only an explicit `false`, null word or boolean on the key's own line, or no
+        // `schema_dump`, keeps main's behavior: an empty remainder may be a filename on the next
+        // line or a block scalar, so it is refused too.
         let named = text.match_indices("schema_dump").find(|(at, key)| {
             let value = text[at + key.len()..].lines().next().unwrap_or_default().trim_start_matches(['\'', '"']).trim_start();
             let value = value.strip_prefix(':').map(|v| v.split(" #").next().unwrap_or_default().trim().trim_matches(|c| c == '\'' || c == '"'));
-            value.is_some_and(|v| !["", "~", "null", "yes", "no", "on", "off", "true", "false"].iter().any(|w| v.eq_ignore_ascii_case(w)))
+            value.is_some_and(|v| !["~", "null", "yes", "no", "on", "off", "true", "false"].iter().any(|w| v.eq_ignore_ascii_case(w)))
         });
         if let Some((at, _)) = named {
             out.primary = Some(Err(()));
