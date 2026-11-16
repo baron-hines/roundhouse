@@ -2553,7 +2553,8 @@ impl<'a> Eval<'a> {
                     _ => return None,
                 };
                 // Not when the program defines the conversion itself: its own may answer anything.
-                (!self.classes.iter().any(|c| c.methods.iter().any(|m| m.name == *method))).then_some(class)
+                let own = self.classes.iter().any(|c| c.methods.iter().any(|m| m.name == *method)) || self.evaled.values().flatten().any(|m| m.name == *method);
+                (!own).then_some(class)
             }
             _ => None,
         }
@@ -2757,12 +2758,15 @@ impl<'a> Eval<'a> {
                         .collect(),
                     // Every method of the program by that name: which one the call reaches is not known here.
                     None => {
-                        let core = recv.as_ref().and_then(|r| self.core_value_class(r));
+                        // Not the class names alone: a module the core class or `Object` includes answers on the value too.
+                        let core: Option<HashSet<String>> = recv.as_ref().and_then(|r| self.core_value_class(r)).map(|k| {
+                            [k, "Object", "Kernel", "BasicObject", "Comparable", "Numeric"].into_iter().flat_map(|c| self.ancestry(c)).collect()
+                        });
                         self.classes
                             .iter()
                             .flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c, m)))
-                            // Not a program class's method on a core value: only the core class, a reopening of it, or what every object answers is reached.
-                            .filter(|(c, m)| core.is_none_or(|k| c.name.0.as_str() == k || (m.receiver == MethodReceiver::Instance && matches!(c.name.0.as_str(), "Object" | "Kernel" | "BasicObject" | "Comparable" | "Numeric"))))
+                            // Not a program class's method on a core value: only what the core class's lookup reaches, reopened or included, answers it.
+                            .filter(|(c, m)| core.as_ref().is_none_or(|owners| m.receiver == MethodReceiver::Instance && owners.contains(c.name.0.as_str())))
                             .collect()
                     }
                 };
@@ -4191,5 +4195,38 @@ mod tests {
         let shadowed = statement("items.each { |config| config.update }\n");
         let writes = eval.may_write_with(&shadowed, "*", false, &mut HashSet::default(), &locals).expect("bounded");
         assert!(writes.iter().any(|(owner, _, name)| owner == "Other" && name == "other"), "{writes:?}");
+    }
+
+    /// `x.to_sym == :plain` compares Symbols: a program `==` is not reached, a module String includes still is, and a program's own `to_sym` keeps every `==`.
+    #[test]
+    fn a_core_value_reaches_only_what_its_core_class_answers() {
+        let writes = |extra: &str, source: &str| {
+            let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+                ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+                ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+                ("lib/release_version.rb", "class ReleaseVersion\n  def ==(other)\n    @compared = true\n  end\nend\n"),
+                ("lib/token_ops.rb", "module TokenOps\n  def flip\n    @flipped = true\n  end\nend\n"),
+                ("lib/string_ext.rb", "class String\n  include TokenOps\nend\n"),
+                ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+            ]
+            .into_iter()
+            .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+            .collect();
+            if !extra.is_empty() {
+                tree.insert(std::path::PathBuf::from("lib/converter.rb"), extra.as_bytes().to_vec());
+            }
+            let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+            let eval = Eval::new(&app);
+            eval.may_write(&statement(source), "*", false, &mut HashSet::default()).expect("bounded")
+        };
+        let named = |w: &HashSet<Tag>, n: &str| w.iter().any(|(_, _, name)| name == n);
+        let symbols = writes("", "fallback.to_sym == :plain\n");
+        assert!(!named(&symbols, "compared"), "{symbols:?}");
+        let other = writes("", "fallback.version == :plain\n");
+        assert!(named(&other, "compared"), "{other:?}");
+        let included = writes("", "fallback.to_s.flip\n");
+        assert!(named(&included, "flipped"), "{included:?}");
+        let own = writes("class Converter\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n", "fallback.to_sym == :plain\n");
+        assert!(named(&own, "compared"), "{own:?}");
     }
 }
