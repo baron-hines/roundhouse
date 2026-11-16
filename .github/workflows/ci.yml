@@ -606,6 +606,8 @@ jobs:
           # view_component, compiled from source (tests/emit_and_run/view_component.rs).
           gem install --no-document --ignore-dependencies view_component -v 3.23.2
           gem install --no-document --ignore-dependencies method_source -v 1.1.0
+          # aasm, compiled from source (tests/emit_and_run/aasm_source.rs).
+          gem install --no-document --ignore-dependencies aasm -v 5.5.1
           # simple_form, compiled from source (tests/emit_and_run/simple_form.rs).
           gem install --no-document --ignore-dependencies simple_form -v 5.4.1
           # OmniAuth for devise's :omniauthable, installed as the Ruby family loads it (tests/emit_and_run/devise.rs).

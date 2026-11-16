@@ -148,3 +148,24 @@ fn doorkeeper_issues_a_client_credentials_token_on_ruby() {
     assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("doorkeeper passed"), "{}", run.stdout);
 }
+
+/// A setting under a condition the route evaluation passes over (`Rails.env.test?`), beside an app class whose `==`
+/// would configure Doorkeeper again: `["token"].first.to_sym == :plain` compares Symbols, so it reaches no program `==`, and
+/// `use_doorkeeper` still draws the engine's routes.
+#[test]
+fn a_passed_over_setting_comparing_symbols_reaches_no_program_equality() {
+    let Some(app) = app() else { return };
+    let initializer = INITIALIZER.replacen(
+        "  default_scopes :read\n",
+        "  if Rails.env.test? || [\"token\"].first.to_sym == :plain\n    default_scopes :read\n  else\n    default_scopes :read\n  end\n",
+        1,
+    );
+    let app = app
+        .write("config/initializers/doorkeeper.rb", &initializer)
+        .write("app/models/release_version.rb", "class ReleaseVersion\n  def ==(other)\n    Doorkeeper.configure { orm :active_record }\n    true\n  end\nend\n");
+    let run = app.run_ruby(SCRIPT);
+    let unknown: Vec<_> = run.errors.iter().filter(|e| !KNOWN_GAPS.iter().any(|gap| e.contains(gap))).collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("doorkeeper passed"), "{}", run.stdout);
+}

@@ -641,7 +641,12 @@ fn assoc_scope_shape(
                     || (args.len() == 1
                         && match &*args[0].node {
                             ExprNode::Hash { .. } => true,
-                            ExprNode::Var { name, .. } => hash_params.contains(name),
+                            // Or a local the analyzer typed as a Hash: the row
+                            // `lower::create_rows` hands each `create!` of an Array.
+                            ExprNode::Var { name, .. } => {
+                                hash_params.contains(name)
+                                    || matches!(args[0].ty, Some(crate::ty::Ty::Hash { .. }))
+                            }
                             _ => false,
                         });
                 if !mergeable && blocked.is_none() {
@@ -1593,7 +1598,8 @@ impl AssocRegistry {
         self.belongs_to_fk.get(&(model.clone(), assoc.clone()))
     }
     /// `(type column, resolved implementor classes)` of a polymorphic
-    /// belongs_to; the set is empty when no `as:` inverse resolved it.
+    /// belongs_to; the set is empty only on a framework record ingest
+    /// synthesizes after `resolve_polymorphic_targets` runs.
     fn polymorphic_belongs_to(&self, model: &ClassId, assoc: &Symbol) -> Option<&(Symbol, Vec<ClassId>)> {
         self.polymorphic_belongs_to.get(&(model.clone(), assoc.clone()))
     }
@@ -2233,9 +2239,13 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
 /// AND gadgets.archived = FALSE`). A `through:` join touching a scoped
 /// model, or a scope this cannot render (one read when the relation is
 /// built), keeps no tail: the join is not composed rather than composed
-/// without the scope.
+/// without the scope. A `belongs_to`'s own scope runs over the target's
+/// default scope there too (`default_scope::join_scope_conditions`), so
+/// `belongs_to :shelf, -> { unscope(where: :archived) }` joins archived
+/// shelves, as Rails' association join does, and a scope it cannot
+/// render keeps no tail either.
 fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
-    use super::default_scope::{default_scope, sql_predicate, DefaultScope};
+    use super::default_scope::{default_scope, join_scope_conditions, sql_predicate, DefaultScope};
     let scoped: HashMap<ClassId, Vec<(Symbol, Literal)>> = models
         .iter()
         .filter_map(|m| {
@@ -2247,12 +2257,22 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             })
         })
         .collect();
-    if scoped.is_empty() {
-        return;
-    }
+    // The last declaration of the name, as the registry keeps it.
+    let belongs_to_scope = |owner: &ClassId, name: &Symbol| {
+        models.iter().find(|m| &m.name == owner).and_then(|m| {
+            match m.associations().filter(|a| a.name() == name).last()? {
+                Association::BelongsTo { polymorphic: false, scope: Some(scope), .. } => Some(scope),
+                _ => None,
+            }
+        })
+    };
     let keys: Vec<((ClassId, Symbol), ClassId)> =
         reg.assoc_target.iter().map(|(k, t)| (k.clone(), t.clone())).collect();
     for ((owner, name), target) in keys {
+        let own_scope = belongs_to_scope(&owner, &name);
+        if scoped.is_empty() && own_scope.is_none() {
+            continue;
+        }
         let through = models
             .iter()
             .find(|m| m.name == owner)
@@ -2269,24 +2289,32 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             });
         let key = (owner.clone(), name.clone());
         let through_scoped = through.as_ref().is_some_and(|t| scoped.contains_key(t));
-        let Some(preds) = scoped.get(&target) else {
+        let defaults = scoped.get(&target);
+        if defaults.is_none() && own_scope.is_none() {
             if through_scoped {
                 reg.join_tails.remove(&key);
                 reg.aliased_join_tails.remove(&key);
             }
             continue;
-        };
+        }
         if through.is_some() {
             reg.join_tails.remove(&key);
             reg.aliased_join_tails.remove(&key);
             continue;
         }
+        // An empty default is one no SQL here can read (`Dynamic`).
+        let preds = match (defaults, own_scope) {
+            (Some(d), _) if d.is_empty() => None,
+            (d, Some(scope)) => models
+                .iter()
+                .find(|m| m.name == target)
+                .and_then(|t| join_scope_conditions(t, d.cloned().unwrap_or_default(), scope)),
+            (d, None) => d.cloned(),
+        };
         let table = reg.table_for(&target);
         let render = |alias: &str| -> Option<String> {
-            if preds.is_empty() {
-                return None;
-            }
             preds
+                .as_ref()?
                 .iter()
                 .map(|(col, lit)| sql_predicate(alias, col, lit).map(|p| format!(" AND {p}")))
                 .collect()
@@ -2723,7 +2751,18 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             // reader's Array too.
                             | "load" | "load_async" | "from" | "extract_associated"
                     ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
-            if is_where || method.as_str().starts_with("find_by_") && block.is_none()
+            // `owner.items.update(attrs)` alone in a method body is the
+            // proxy's bulk update over the records the association holds
+            // (`rewrite_send` lowers it to the generated
+            // `__<name>_update`). Array answers no one-Hash `update`, so
+            // the site is a NoMethodError today and a call after. Only
+            // this exact shape — one Hash argument, no block — is
+            // admitted; which associations the model actually holds is
+            // the rewriter's check, as it is for every gate here.
+            let is_held_update = method.as_str() == "update"
+                && block.is_none()
+                && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Hash { .. }));
+            if is_where || is_held_update || method.as_str().starts_with("find_by_") && block.is_none()
                 || is_relation_terminal(method.as_str(), args, block.as_ref())
                     && matches!(
                         method.as_str(),
@@ -3300,8 +3339,14 @@ fn thread_rel(mut args: Vec<Expr>, rel: Expr, leading: Option<&Vec<Param>>, span
 ///
 /// `maximum` / `minimum` likewise: `Base` defines neither, and the arel
 /// pass leaves them to `Relation`'s SQL extrema.
+///
+/// `delete(id_or_array)` too: Querying delegates it to `all`, and
+/// Relation#delete is one DELETE of those keys. It cannot be a
+/// `def self.delete` on Base, because the runtime's signature checks key
+/// a class's methods by name and Base's instance `delete` (the record's
+/// own row, no arguments) already holds it.
 const CLASS_ROOT_TERMINALS: &[&str] = &[
-    "pluck", "pick", "ids", "destroy_by", "delete_by", "maximum", "minimum",
+    "pluck", "pick", "ids", "destroy_by", "delete_by", "delete", "maximum", "minimum",
 ];
 
 /// Relation TERMINALS our runtime implements — a seeded association
@@ -3503,6 +3548,16 @@ pub(crate) fn owner_reads_once(owner: &Expr) -> bool {
             ExprNode::Const { .. } | ExprNode::SelfRef | ExprNode::Var { .. } | ExprNode::Ivar { .. }
         ),
     }
+}
+
+/// True when reading `owner` a second time answers the same value
+/// without running anything: a local, an ivar, or `self`. The hold wrap
+/// a constructor on a held has_many takes names the owner twice — as
+/// `__hold_<name>`'s receiver and inside the constructor's key (or
+/// inverse) argument — so an owner this does not admit (`Shelf.counted`,
+/// `Room.find(id)`) would be evaluated once per mention.
+fn owner_repeats_safely(owner: &Expr) -> bool {
+    matches!(&*owner.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
 }
 
 /// Association resolution for the seed arm: `(target, fk, <owner>.id)`,
@@ -5186,10 +5241,14 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         _ if matches!(method.as_str(), "build" | "create" | "create!") => {
                             assoc_owner_seed(ctx, aname, ir, span)
                         }
-                        // The same for `<<` onto a has_many the owner holds:
-                        // the push keeps the owner as its one receiver
-                        // (`Article.find(id).comments << c`).
-                        _ if method.as_str() == "<<"
+                        // The same for `<<` onto a has_many the owner holds,
+                        // and for its `update(attrs)`: each keeps the owner as
+                        // its one receiver (`Article.find(id).comments << c`,
+                        // `Kennel.find(id).dogs.update(age: 7)`).
+                        _ if (method.as_str() == "<<"
+                            || (method.as_str() == "update"
+                                && block.is_none()
+                                && matches!(args.as_slice(), [arg] if matches!(&*arg.node, ExprNode::Hash { .. }))))
                             && args.len() == 1
                             && assoc_read_target(ir, aname, ctx.assocs)
                                 .and_then(|(owner, _, _)| owner)
@@ -5264,6 +5323,26 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 None => (format!("__push_{aname}"), args[0].clone()),
                             };
                             *expr = put(span, Some(ir.clone()), Symbol::from(callee), vec![arg], None, true);
+                            return None;
+                        }
+                        // `owner.items.update(attrs)` — Rails'
+                        // `CollectionProxy#update` updates each record the
+                        // association holds (`to_a`, held records included)
+                        // and answers the records.
+                        if held
+                            && method.as_str() == "update"
+                            && args.len() == 1
+                            && block.is_none()
+                            && matches!(&*args[0].node, ExprNode::Hash { .. })
+                        {
+                            *expr = put(
+                                span,
+                                Some(ir.clone()),
+                                Symbol::from(format!("__{aname}_update")),
+                                args,
+                                None,
+                                true,
+                            );
                             return None;
                         }
                         let ctor = match method.as_str() {
@@ -5368,9 +5447,27 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     block,
                                     true,
                                 );
-                                // A built record is the owner's to hold:
-                                // validated with it and saved after it.
-                                if held && ctor_name == "new" {
+                                // A record created, built on or pushed
+                                // onto the association is the owner's to
+                                // hold: the object the target answers, which
+                                // a later read merges the row into
+                                // (`_merge_target`). A built one is also
+                                // validated with the owner and saved after
+                                // it. A created record is held only when its
+                                // owner reads the same value twice (a local,
+                                // an ivar or `self`): the wrap names the owner
+                                // again as the constructor's key, so a method
+                                // call would run once per mention. Otherwise
+                                // the create keeps its unheld shape, with the
+                                // owner read once. A built record is always
+                                // held: the owner saves it, so a memoized
+                                // owner reader (`current_shelf.books.build`)
+                                // must hold it (KNOWN GAP: that owner is read
+                                // twice).
+                                if held
+                                    && (ctor_name == "new"
+                                        || (matches!(ctor_name, "create" | "create!") && owner_repeats_safely(ir)))
+                                {
                                     let ty = expr.ty.clone();
                                     let built = std::mem::replace(expr, syn(span, ExprNode::Lit { value: Literal::Nil }));
                                     *expr = put(
@@ -7187,6 +7284,170 @@ mod tests {
             "a non-association bare read keeps its shape, got {:?}",
             r.node
         );
+    }
+
+    /// `owner.items.update(attrs)` alone in a method body is the one
+    /// association call no gate used to admit: a body whose only relation
+    /// surface is the proxy's bulk update reached no rewriter and stayed
+    /// `Array#update`. The lookup gate now admits exactly that shape, and
+    /// the rewrite still requires the model to HOLD the association, so a
+    /// plain has_many keeps the call it had.
+    #[test]
+    fn a_lone_held_update_is_admitted_and_a_plain_has_many_is_left_alone() {
+        let kennel = ingest(
+            "class Kennel < ApplicationRecord\n  has_many :dogs\nend\n",
+            "app/models/kennel.rb",
+        );
+        let dog = ingest(
+            "class Dog < ApplicationRecord\n  belongs_to :kennel\nend\n",
+            "app/models/dog.rb",
+        );
+        let models_v = vec![kennel.clone(), dog];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let mut assocs = build_assoc_registry(&models_v);
+        let owner = kennel.name.clone();
+        let body = || {
+            let read = Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(span(), ExprNode::SelfRef)),
+                    method: Symbol::from("dogs"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(read),
+                    method: Symbol::from("update"),
+                    args: vec![hash_arg(vec![(sym_lit("age"), int_lit(7))])],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        };
+
+        let plain = body();
+        assert!(mentions_assoc_lookup(&plain, &assocs), "the gate admits the one-hash update");
+        let mut plain_rewritten = body();
+        rewrite_call_site(&mut plain_rewritten, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { method, .. } = &*plain_rewritten.node else {
+            panic!("expected Send, got {:?}", plain_rewritten.node)
+        };
+        assert_eq!(
+            method.as_str(),
+            "update",
+            "an association the model does not hold keeps its reader call: {:?}",
+            plain_rewritten.node
+        );
+
+        assocs.has_many_held.insert((owner.clone(), Symbol::from("dogs")));
+        let mut held = body();
+        rewrite_call_site(&mut held, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { method, .. } = &*held.node else {
+            panic!("expected Send, got {:?}", held.node)
+        };
+        assert_eq!(method.as_str(), "__dogs_update", "held association: {:?}", held.node);
+
+        // Nothing broader: a variable argument is not the shape.
+        let mut var_arg = body();
+        if let ExprNode::Send { args, .. } = &mut *var_arg.node {
+            args[0] = Expr::new(span(), ExprNode::Var { id: VarId(0), name: Symbol::from("attrs") });
+        }
+        assert!(
+            !mentions_assoc_lookup(&var_arg, &assocs),
+            "a bare variable argument is not admitted"
+        );
+    }
+
+    /// The hold wrap names the owner twice — `__hold_<name>`'s receiver
+    /// and the constructor's key — so it is only taken for an owner that
+    /// reads the same value twice (a local, an ivar, `self`). A
+    /// method-call owner keeps the unheld shape (and its one read) for
+    /// `create!`; `build` stays held, since its owner saves the record.
+    #[test]
+    fn a_constructor_on_a_method_call_owner_is_not_hold_wrapped() {
+        let shelf = ingest(
+            "class Shelf < ApplicationRecord\n  has_many :books\nend\n",
+            "app/models/shelf.rb",
+        );
+        let book = ingest(
+            "class Book < ApplicationRecord\n  belongs_to :shelf\nend\n",
+            "app/models/book.rb",
+        );
+        let models_v = vec![shelf.clone(), book];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let mut assocs = build_assoc_registry(&models_v);
+        assocs.has_many_held.insert((shelf.name.clone(), Symbol::from("books")));
+        let ctor = |owner: Expr, method: &str| {
+            let read = Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(owner),
+                    method: Symbol::from("books"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(read),
+                    method: Symbol::from(method),
+                    args: vec![hash_arg(vec![(sym_lit("title"), int_lit(1))])],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        };
+
+        // A bareword owner (the template-local form) whose name reads
+        // `Shelf` by convention: `Shelf` declares `books`.
+        let bare_shelf = || {
+            Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("shelf"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            )
+        };
+        let mut create = ctor(bare_shelf(), "create!");
+        rewrite_call_site(&mut create, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, args, .. } = &*create.node else {
+            panic!("expected Send, got {:?}", create.node)
+        };
+        assert_eq!(method.as_str(), "create!", "an owner read twice is not held: {:?}", create.node);
+        let ExprNode::Hash { entries, .. } = &*args[0].node else {
+            panic!("expected a kwargs hash, got {:?}", args[0].node)
+        };
+        assert!(
+            entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "shelf_id")),
+            "the constructor still carries the association's key: {entries:?}"
+        );
+
+        let ivar = Expr::new(span(), ExprNode::Ivar { name: Symbol::from("shelf") });
+        let mut built = ctor(ivar, "build");
+        rewrite_call_site(&mut built, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, .. } = &*built.node else {
+            panic!("expected Send, got {:?}", built.node)
+        };
+        assert_eq!(method.as_str(), "__hold_books", "an ivar owner is held: {:?}", built.node);
+
+        let mut built_on_call = ctor(bare_shelf(), "build");
+        rewrite_call_site(&mut built_on_call, &regs(&scopes, &models, &assocs), None, None);
+        let ExprNode::Send { method, .. } = &*built_on_call.node else {
+            panic!("expected Send, got {:?}", built_on_call.node)
+        };
+        assert_eq!(method.as_str(), "__hold_books", "a built record is held whatever its owner: {:?}", built_on_call.node);
     }
 
     #[test]

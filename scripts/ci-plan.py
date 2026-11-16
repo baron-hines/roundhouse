@@ -290,6 +290,16 @@ PG_APP_INPUTS = {
     "runtime/spinel/test/test_helper.rb",
     "tests/support/emit_and_run.rs",
 }
+# Inputs of the array column gate in tests/spinel_pg_db.rs, which compiles
+# a test of stored array columns on PostgreSQL: the PostgreSQL codec the
+# tree ships as runtime/array_column.rb, its signatures, the storage pass,
+# and the widgets app the gate shares with tests/postgresql_array_columns.rs.
+PG_ARRAY_INPUTS = {
+    "runtime/spinel/array_column_pg.rb",
+    "runtime/spinel/array_column.rbs",
+    "src/lower/array_columns.rs",
+    "tests/support/array_widgets.rs",
+}
 # The Db contract suite (tests/support/db_contract.rs): the Spinel lanes
 # each of its files feeds, and the runtime files its LANES copy beside a
 # shim that nothing above routes to them. cruby_prelude.rb feeds only the
@@ -721,7 +731,7 @@ def native_coverage(path):
         "src/lower/view_instrumentation.rs",
     }:
         suites.update(("spinel_active_support_instrumentation", "spinel_mini_profiler"))
-    if path in PG_DB_INPUTS or path in PG_APP_INPUTS:
+    if path in PG_DB_INPUTS or path in PG_APP_INPUTS or path in PG_ARRAY_INPUTS:
         suites.add("spinel_pg_db")
     suites.update(DB_CONTRACT_INPUTS.get(path, ()))
     if path in {

@@ -3437,12 +3437,17 @@ fn fold_autosave_call_into_hook(
 /// can't prove (missing models, no matching source) are left on the
 /// shared reader rather than guessed.
 /// The association's own scope lambda is grafted onto the relation
-/// (`through_reader_body`), and the through association's, when it is
-/// hash `where`s only, filters the through table
-/// (`through_hop_conditions`). KNOWN GAP: any other scope on the through
-/// association is not applied, so its rows can differ from Rails'.
+/// (`through_reader_body`), and the through association's is evaluated on
+/// the through model's relation and merged into it
+/// (`through_hop_scope`), which is what Rails' `AssociationScope` does
+/// with a non-head reflection's scope.
 pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::Association;
+
+    // Registries the through association's scope body is threaded through
+    // before it can be evaluated (see `through_hop_scope`); an app whose
+    // through associations carry no scope builds none of them.
+    let hop_regs = app_has_scoped_through(app).then(|| HopRegistries::build(app));
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
@@ -3469,20 +3474,72 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 continue;
             };
             m.body = through_reader_body(name, target, &join_sql, &where_sql, assoc_scope);
-            if let Some(hop) = through_hop_conditions(model, assoc, app) {
+            if let Some(regs) = hop_regs.as_ref()
+                && let Some(hop) = through_hop_scope(model, assoc, app, regs)
+            {
                 graft_through_hop(&mut m.body, hop);
             }
         }
     }
 }
 
-/// The through association's own scope, when it is only `where` with
-/// hash conditions (`has_many :published_posts, -> { where(published:
-/// true) }`), as conditions on its table: `where(posts: { published:
-/// true })`. Rails applies that scope to the through rows. A direct
-/// first hop only; any other scope shape stays the gap the pass's doc
-/// records.
-fn through_hop_conditions(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> Option<Vec<Expr>> {
+/// Registries a through association's scope body is threaded through
+/// before it is evaluated on its own model's relation (see
+/// [`through_hop_scope`]).
+struct HopRegistries {
+    scopes: crate::lower::scope_chain::ScopeRegistry,
+    models: crate::det::HashSet<ClassId>,
+    assocs: crate::lower::scope_chain::AssocRegistry,
+    unique_keys: crate::lower::scope_chain::UniqueKeys,
+}
+
+impl HopRegistries {
+    fn build(app: &App) -> Self {
+        HopRegistries {
+            scopes: crate::lower::scope_chain::build_scope_registry(&app.models),
+            models: crate::lower::scope_chain::model_set(&app.models),
+            assocs: crate::lower::scope_chain::build_assoc_registry_for_app(app),
+            unique_keys: crate::lower::scope_chain::build_unique_keys(app),
+        }
+    }
+}
+
+/// Does any model's through association carry a scope on its through
+/// association? Only then does [`through_hop_scope`] have work.
+fn app_has_scoped_through(app: &App) -> bool {
+    use crate::dialect::Association;
+    app.models.iter().any(|model| {
+        model.associations().any(|assoc| {
+            let Association::HasMany { through: Some(thr_name), .. } = assoc else { return false };
+            model.associations().any(|thr| {
+                thr.name() == thr_name
+                    && matches!(
+                        thr,
+                        Association::HasMany { through: None, scope: Some(_), .. }
+                            | Association::HasOne { through: None, scope: Some(_), .. }
+                    )
+            })
+        })
+    })
+}
+
+/// The scope a through association carries (`has_many :beds, -> {
+/// where(fallow: false).order(:position) }`), evaluated on the through
+/// model's own relation: `ActiveRecord::Relation.new(Bed, false)` —
+/// Rails' `AssociationScope` starts from `klass.unscoped` — with the
+/// scope body threaded onto it, so a named scope of the through model
+/// runs as the class method it compiles to. The reader's joined query
+/// then takes its conditions and orderings through
+/// `Relation#merge_through_scope`, as Rails takes a non-head
+/// reflection's. `None` when no through association has a scope, and for
+/// a body that is not a relation chain at all (left unapplied rather than
+/// merged as something it is not).
+fn through_hop_scope(
+    model: &crate::dialect::Model,
+    assoc: &crate::dialect::Association,
+    app: &App,
+    regs: &HopRegistries,
+) -> Option<Expr> {
     use crate::dialect::Association;
     let Association::HasMany { through: Some(thr_name), .. } = assoc else { return None };
     let (thr_target, scope) = model.associations().filter(|a| a.name() == thr_name).last().and_then(|thr| match thr {
@@ -3490,54 +3547,110 @@ fn through_hop_conditions(model: &crate::dialect::Model, assoc: &crate::dialect:
         | Association::HasOne { target, through: None, scope: Some(scope), .. } => Some((target, scope)),
         _ => None,
     })?;
-    let table = app.models.iter().find(|m| &m.name == thr_target)?.table.0.clone();
-    let mut hashes = Vec::new();
-    let mut e = scope;
-    loop {
-        let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node else { return None };
-        let [hash] = args.as_slice() else { return None };
-        let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
-        if method.as_str() != "where" {
+    app.models.iter().find(|m| &m.name == thr_target)?;
+    let rel = Symbol::from("__rel");
+    let mut body = scope.clone();
+    crate::lower::scope_chain::rewrite_scope_body(
+        &mut body,
+        thr_target,
+        &rel,
+        &regs.scopes,
+        &regs.models,
+        &regs.assocs,
+        &regs.unique_keys,
+    );
+    // A body that never reads its relation is not a relation chain, and
+    // stays unapplied, unless it ends in a literal `nil` or `false`: that
+    // one merges nothing, but its statements (a guard) still run.
+    if !substitute_rel(&mut body, &rel, &through_scope_seed(thr_target)) {
+        let tail = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.last()?,
+            _ => &body,
+        };
+        if !matches!(&*tail.node, ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } }) {
             return None;
         }
-        let conditions = Expr::new(hash.span, ExprNode::Hash { entries: entries.clone(), kwargs: false });
-        hashes.push(Expr::new(
-            hash.span,
-            ExprNode::Hash {
-                entries: vec![(
-                    Expr::new(hash.span, ExprNode::Lit { value: Literal::Sym { value: table.clone() } }),
-                    conditions,
-                )],
-                kwargs: true,
-            },
-        ));
-        match recv {
-            Some(inner) => e = inner,
-            None => return Some(hashes),
-        }
     }
+    // A body that answers `nil` or `false` stands for the unscoped relation
+    // (`instance_exec(...) || scope`): nothing to merge, though its
+    // statements still run. `(<body>) || nil` answers either as the nil
+    // `merge_through_scope` skips.
+    let span = body.span;
+    Some(Expr::new(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: body,
+            right: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+        },
+    ))
 }
 
-/// `<relation>.preloaded(…)` becomes `<relation>.where(<hop>)….preloaded(…)`.
-fn graft_through_hop(body: &mut Expr, hop: Vec<Expr>) {
+/// `ActiveRecord::Relation.new(<through model>, false)` — the unscoped
+/// relation a through association's scope is evaluated on.
+fn through_scope_seed(target: &ClassId) -> Expr {
+    let span = Span::synthetic();
+    let relation = Expr::new(
+        span,
+        ExprNode::Const {
+            path: vec![Symbol::from("ActiveRecord"), Symbol::from("Relation")],
+        },
+    );
+    let model = Expr::new(
+        span,
+        ExprNode::Const { path: target.0.as_str().split("::").map(Symbol::from).collect() },
+    );
+    let unscoped = Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: false } });
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(relation),
+            method: Symbol::from("new"),
+            args: vec![model, unscoped],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// Replace every read of the scope's relation parameter with `seed`, the
+/// relation the scope is evaluated on. False when the body never read it —
+/// a scope that is not a relation chain, which stays unapplied.
+fn substitute_rel(expr: &mut Expr, rel: &Symbol, seed: &Expr) -> bool {
+    if let ExprNode::Var { name, .. } = &*expr.node
+        && name == rel
+    {
+        let span = expr.span;
+        let mut replacement = seed.clone();
+        replacement.span = span;
+        *expr = replacement;
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child_mut(&mut |c| found |= substitute_rel(c, rel, seed));
+    found
+}
+
+/// `<relation>.preloaded(…)` becomes
+/// `<relation>.merge_through_scope(<hop>).preloaded(…)`.
+fn graft_through_hop(body: &mut Expr, hop: Expr) {
     let ExprNode::Send { recv: Some(recv), method, .. } = &mut *body.node else { return };
     if method.as_str() != "preloaded" {
         return;
     }
-    for hash in hop {
-        let span = hash.span;
-        let inner = std::mem::replace(recv, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-        *recv = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(inner),
-                method: Symbol::from("where"),
-                args: vec![hash],
-                block: None,
-                parenthesized: true,
-            },
-        );
-    }
+    let span = hop.span;
+    let inner = std::mem::replace(recv, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+    *recv = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(inner),
+            method: Symbol::from("merge_through_scope"),
+            args: vec![hop],
+            block: None,
+            parenthesized: true,
+        },
+    );
 }
 
 /// Resolve the SQL join chain for `assoc`, a `has_many :through` on
@@ -12495,7 +12608,10 @@ fn key_helpers(string_key: bool) -> (&'static str, &'static str) {
 /// One preloadable association, resolved against the app's model set.
 enum PreloadKind {
     /// (fk column on the owner, target class, target table, the `Db`
-    /// helper that renders the target's key list for `IN (...)`)
+    /// helper that renders the target's key list for `IN (...)`). The
+    /// owner's key is read from the column (`r[:<fk>]`), not from its
+    /// reader, as Rails' `Preloader` reads `_read_attribute(foreign_key)`
+    /// past a method the model defines under the column's name.
     BelongsTo { fk: String, target: String, table: String, key_list: &'static str },
     /// (fk column on the target, target class)
     HasMany { fk: String, owner_key: String, target: String },
@@ -12580,8 +12696,11 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
         }
         match assoc {
             // A scoped one keeps its lazy reader, which finds through the
-            // scope, as a scoped has_many does below.
-            Association::BelongsTo { name, target, foreign_key, scope: None, .. } => {
+            // scope, as a scoped has_many does below. So does a polymorphic
+            // one, whose class is in each row's type column: `target` is
+            // only the name's class (`belongs_to :post` reads `Post`), which
+            // may be an app model all the same.
+            Association::BelongsTo { name, target, foreign_key, scope: None, polymorphic: false, .. } => {
                 let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
                     continue;
                 };
@@ -12654,9 +12773,9 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                         None => continue,
                     },
                 };
-                // A scoped hop keeps the lazy reader too: it filters the
-                // through table (`through_hop_conditions`) and this batch
-                // would not.
+                // A scoped hop keeps the lazy reader too: the reader
+                // merges the hop's conditions and orderings into its query
+                // (`through_hop_scope`) and this batch would not.
                 let Some(Association::HasMany { target: thr_target, as_interface, scope: None, .. }) =
                     model.associations().find(|a| {
                         matches!(a, Association::HasMany { name, .. } if name == thr_name)
@@ -12792,7 +12911,7 @@ def self._preload_batch_{name}(records)
   ids = []
   records.each do |r|
     unless r.{name}_loaded?
-      v = r.{fk}
+      v = r[:{fk}]
       ids << v unless v.nil? || v == 0
     end
   end
@@ -12809,7 +12928,7 @@ def self._preload_batch_{name}(records)
       held = r.{name}
       out << held unless held.nil?
     else
-      r._preload_{name}(by_id[r.{fk}])
+      r._preload_{name}(by_id[r[:{fk}]])
     end
   end
   out

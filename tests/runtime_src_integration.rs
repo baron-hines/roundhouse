@@ -1340,12 +1340,40 @@ fn every_runtime_method_body_concretely_typed() {
     // integer_list_predicate reads the elements of a hash condition's
     // untyped Array (+4 in active_record/relation.rb); its typed helpers
     // add none. Within the ceiling, which is unchanged.
-    // MEASURED 987 on routed connection handles (within 986 without it):
+    // MEASURED 989 on relation async_count (main ca6fe1626: 986): Rails'
+    // `ActiveRecord::Promise` holds a count, a grouped count's Hash or a
+    // `then` block's value, a type parameter RBS here cannot declare, so
+    // its `value` and `then` read an untyped value (+3 in
+    // active_record/relation.rb; `analyze::promise` types the call sites).
+    // MEASURED 990 on scoping: `Relation#scoping` answers what its block
+    // gives (+3 in active_record/relation.rb), and `Model.unscoped { }`
+    // now runs its block through it (-2 in active_record/connection.rb).
+    // MEASURED 991 on partial-select reads (990): `read_attribute` answers
+    // nil for a column a partial `select` left out before it reads the
+    // untyped `self[name]`, so its body is a sequence ending in that read
+    // (+1 in active_record/connection.rb).
+    // MEASURED 993 on unscoped's block value (991): `Model.unscoped { }`
+    // pushes its bare relation and binds its own block's value rather than
+    // answering `scoping`'s, so the Spinel binary keeps it (+2 in
+    // active_record/connection.rb).
+    // MEASURED 996 on PostgreSQL array columns (main 6c9c58dc5: 991): a bulk
+    // write (`update_all`, `insert_all`, `upsert_all`) now passes each value
+    // through `Model._written_sql(column, value)`, which hands an Array to the
+    // model's `encode_written` and quotes the rest. Both take a column
+    // value of any type, as `escape_value` does, so their untyped `value`
+    // adds 5 sites (+5 in active_record/connection.rb); every other file is
+    // unchanged. Raise to 998, preserving the two-site headroom.
+    // MEASURED 998 on main 641feda88 (996 above): a has_many's load keeps
+    // its held records, and `_take_unchanged_attributes` writes each
+    // untyped attribute value it takes from the loaded row (+2 in
+    // active_record/connection.rb). Within the ceiling, which is unchanged.
+    // MEASURED 999 on routed connection handles (main 641feda88: 998):
     // `ActiveRecord::Base.with_connection` answers what its block gives
-    // (active_record/connection.rb), as `transaction` does. The handle,
-    // `lease_connection` and the Db slot calls are typed and add none.
-    // Raise to 989, preserving the two-site headroom.
-    const CEILING: usize = 989;
+    // (+1 in active_record/connection.rb), as `transaction` does. The
+    // handle, `lease_connection` and the Db slot calls are typed and add
+    // none; every other method's count is main's. Raise to 1001,
+    // preserving the two-site headroom.
+    const CEILING: usize = 1001;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

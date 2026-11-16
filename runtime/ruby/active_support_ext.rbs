@@ -37,13 +37,15 @@ module ActiveSupport
   def self.errors_to_hash: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
   def self.errors_messages: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
   def self.errors_attribute_names: (Array[ActiveRecord::ErrorDetail] details) -> Array[Symbol]
-  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute) -> Array[String]?
+  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute, Bool type_symbolic, String? type_kind) -> Array[String]?
   def self.errors_details: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
+  def self.errors_group_by_attribute: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
   def self.errors_import: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, ActiveRecord::ErrorDetail error, String? attribute, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
   def self.error_detail: (String name, String? kind, String? message, Hash[String, String] options, Hash[String, String] site, Hash[String, String] names, Hash[String, String] overrides, String before, String between, String after) -> ActiveRecord::ErrorDetail
   def self.error_template: (Hash[String, String] table, String key, String? count) -> String?
   def self.interpolate: (String template, Hash[String, String] values) -> String
   def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.errors_copy: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
 
   def self.deprecation_line: (String line) -> nil
 

@@ -370,18 +370,40 @@ module ActiveSupport
   end
 
   # Not a `reject!` on each: `errors` holds each detail's full message index for index, so both lose the same entries.
-  def self.errors_delete(errors, details, attribute)
+  # A nil `type_kind` is Rails' `delete(attribute)`, every error on it; otherwise only the entries
+  # whose type is that one — a Symbol type (type_symbolic true), or the message a String type was
+  # added with, which is what Rails' `Error#type` answers for it.
+  def self.errors_delete(errors, details, attribute, type_symbolic, type_kind)
     deleted = []
     i = details.length - 1
     while i >= 0
-      if details[i].attribute == attribute
-        deleted.unshift(details[i].message)
+      detail = details[i]
+      matched = detail.attribute == attribute
+      if matched && !type_kind.nil?
+        matched = detail.symbolic == type_symbolic && detail.kind == type_kind
+      end
+      if matched
+        deleted.unshift(detail.message)
         details.delete_at(i)
         errors.delete_at(i)
       end
       i -= 1
     end
     deleted.empty? ? nil : deleted
+  end
+
+  # Rails' `group_by_attribute`: each attribute with errors, in the order
+  # of its first one, to its `ActiveModel::Error`s — `Enumerable#group_by`
+  # over the errors, so a plain Hash with no default, not `details`. Same
+  # grouping as `errors_details`; reached from `lower::errors_index`.
+  def self.errors_group_by_attribute(details)
+    out = {}
+    details.each do |detail|
+      key = detail.attribute.to_sym
+      out[key] = [] unless out.key?(key)
+      out[key] << detail
+    end
+    out
   end
 
   # Rails' `details`: each attribute's errors, in the order of its first
@@ -503,6 +525,24 @@ module ActiveSupport
     return details if others.equal?(details)
     others.each { |error| errors_import(errors, details, error, nil, names, before, between, after) }
     others
+  end
+
+  # Rails' `errors.copy!(other)`: the record's own errors go, and each of
+  # the other's is taken as a copy — same attribute, kind and message, and
+  # a full message naming the attribute as THIS model names it, which is
+  # what `errors_import` builds. The copies are this record's own details,
+  # so clearing one errors object's leaves the other's whole. Copying a
+  # record's own errors is a no-op, as Rails' deep_dup of them is.
+  def self.errors_copy(errors, details, others, names, before, between, after)
+    return details if others.equal?(details)
+    errors.clear
+    details.clear
+    # Each copy's Strings are its own, as Rails' deep_dup of an error dups its attribute and type.
+    others.each do |error|
+      copy = ActiveRecord::ErrorDetail.new(error.attribute.dup, error.kind.dup, error.message.dup, error.full_message.dup, error.symbolic, error.optionless)
+      errors_import(errors, details, copy, nil, names, before, between, after)
+    end
+    details
   end
 
   # `ActiveSupport::MessageVerifier::InvalidSignature` — what a signed

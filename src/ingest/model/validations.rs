@@ -1051,6 +1051,7 @@ fn parse_validator(key: &str, value: &Node<'_>, file: &str, class_consts: &super
         "exclusion" => parse_set(value, file, true, class_consts),
         "uniqueness" => parse_uniqueness(value, file, class_consts),
         "format" => parse_format(value, file, class_consts),
+        "comparison" => parse_comparison(value, file),
         other => RuleParse::Gap(vec![other.to_string()]),
     };
     // Scheduling is shared by every validator, independently of its own options.
@@ -1455,6 +1456,130 @@ fn parse_set(value: &Node<'_>, file: &str, exclusion: bool, class_consts: &super
         }
         None => built.gap(vec![format!("{label}: in")]),
     }
+}
+
+/// `comparison:` — Rails' `ComparisonValidator` options, each bound a literal, a Symbol (the record's method) or a
+/// lambda (`-> { min_supported_date }`, its body run on the record), with the guards and flags `inclusion:` takes.
+fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
+    use crate::dialect::ValidationRule;
+    let Some(elements) = hash_elements(value) else {
+        return RuleParse::Gap(vec!["comparison".to_string()]);
+    };
+    let mut checks: Vec<(Symbol, crate::expr::Expr)> = Vec::new();
+    let mut built = BuiltRule::bare(ValidationRule::Comparison { checks: Vec::new() });
+    let mut gaps = Vec::new();
+    for el in elements.iter() {
+        let Some(assoc) = el.as_assoc_node() else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let Some(key) = symbol_value(&assoc.key()) else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let child = assoc.value();
+        match key.as_str() {
+            "greater_than" | "greater_than_or_equal_to" | "equal_to" | "less_than" | "less_than_or_equal_to" | "other_than" => {
+                let bound = match class_side_lambda_body(&child, file) {
+                    Some(body) => Some(body),
+                    None => match inclusion_call(&child, file) {
+                        Some(InclusionSpec::Call(bound)) => Some(bound),
+                        _ => super::super::expr::ingest_expr(&child, file)
+                            .ok()
+                            .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
+                    },
+                };
+                // A repeated option is the last one written, as a Ruby Hash keeps it.
+                match bound {
+                    Some(bound) => {
+                        checks.retain(|(option, _)| option.as_str() != key.as_str());
+                        checks.push((Symbol::from(key.as_str()), bound));
+                    }
+                    None => gaps.push(format!("comparison: {key}")),
+                }
+            }
+            "prepend" => {}
+            "on" => match context_guard(&child) {
+                Some(guard) => built.on_guard = Some(guard),
+                None => gaps.push("on".to_string()),
+            },
+            "if" => push_condition(&child, file, &mut built.if_cond, "if", &mut gaps),
+            "unless" => push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps),
+            "allow_nil" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.nil_skip = flag;
+                    built.own_allow_nil = true;
+                }
+                None => gaps.push("allow_nil".to_string()),
+            },
+            "allow_blank" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.blank_skip = flag;
+                    built.own_allow_blank = true;
+                }
+                None => gaps.push("allow_blank".to_string()),
+            },
+            other => gaps.push(format!("comparison: {other}")),
+        }
+    }
+    if checks.is_empty() {
+        gaps.push("comparison".to_string());
+    }
+    if !gaps.is_empty() {
+        return built.gap(gaps);
+    }
+    // Rails checks in its own order (`options.slice(*COMPARE_CHECKS.keys)`), not the order written.
+    const ORDER: [&str; 6] = ["greater_than", "greater_than_or_equal_to", "equal_to", "less_than", "less_than_or_equal_to", "other_than"];
+    checks.sort_by_key(|(option, _)| ORDER.iter().position(|o| *o == option.as_str()));
+    built.rule = ValidationRule::Comparison { checks };
+    RuleParse::Rule(built)
+}
+
+/// Rails' `resolve_value`: a lambda of no parameters is called as it is, so its body runs on the class it was written
+/// in (maybe's `-> { min_supported_date }`, a class method). Read from the record that validates: what the body calls
+/// without a receiver, and `self`, are `self.class`.
+fn class_side_lambda_body(node: &Node<'_>, file: &str) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode};
+    fn to_class(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| to_class(c));
+        let class_of_self = |span| {
+            Expr::new(span, ExprNode::Send { recv: Some(Expr::new(span, ExprNode::SelfRef)), method: Symbol::from("class"), args: vec![], block: None, parenthesized: false })
+        };
+        match &mut *e.node {
+            ExprNode::SelfRef => *e = class_of_self(e.span),
+            ExprNode::Send { recv: recv @ None, .. } => *recv = Some(class_of_self(e.span)),
+            _ => {}
+        }
+    }
+    let expr = super::super::expr::ingest_expr(node, file).ok()?;
+    let lambda = match &*expr.node {
+        ExprNode::Lambda { .. } => expr,
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "lambda" | "proc") && matches!(&*block.node, ExprNode::Lambda { .. }) =>
+        {
+            block.clone()
+        }
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !params.is_empty() || !extra_params.is_empty() || numbered_parameters(node).is_some_and(|n| n > 0) {
+        return None;
+    }
+    // Not a body that reads an ivar (the class's, there) or leaves the lambda (`return`), which no assignment can hold.
+    fn unmovable(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Ivar { .. } | ExprNode::Return { .. } | ExprNode::Next { .. } | ExprNode::Break { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || unmovable(c));
+        found
+    }
+    if unmovable(body) {
+        return None;
+    }
+    let mut body = body.clone();
+    to_class(&mut body);
+    Some(body)
 }
 
 fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts) -> RuleParse {
@@ -1892,6 +2017,13 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
         {
             block.clone()
         }
+        // A set computed from constants (`in: DATE_FORMATS.map(&:last)`, `I18n.available_locales.map(&:to_s)`): Rails
+        // evaluates it once as the class loads; with no read of self it is the same set at validation time. Not one
+        // rooted at a class (`PtySession.drivers.keys`): an enum recipient's stored values may not be the labels Rails
+        // validates, which the enum fold decides.
+        ExprNode::Send { recv: Some(_), .. } if !reads_implicit_self(&expr) && rooted_at_a_value_constant(&expr) => {
+            return Some(InclusionSpec::Call(expr));
+        }
         _ => return None,
     };
     let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else {
@@ -1916,6 +2048,26 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
         replace_var_with_self(&mut body, param);
     }
     Some(InclusionSpec::Call(body))
+}
+
+/// The receiver chain under `e` starts at a constant holding a value (`DATE_FORMATS`, `Period::PERIODS`) or at
+/// `I18n.available_locales`, not at a class.
+fn rooted_at_a_value_constant(e: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        // Not `I18n.t(…)`, whose value is the request's locale's: only the locale list is the same set however late.
+        ExprNode::Send { recv: Some(r), method, .. }
+            if method.as_str() == "available_locales" && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["I18n"])) =>
+        {
+            true
+        }
+        ExprNode::Send { recv: Some(r), .. } => rooted_at_a_value_constant(r),
+        ExprNode::Const { path } => {
+            let names: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+            names.last().is_some_and(|n| n.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        }
+        _ => false,
+    }
 }
 
 /// The highest numbered parameter (`_1`, `_2`, …) a lambda literal or a

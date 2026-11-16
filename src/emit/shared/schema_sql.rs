@@ -157,8 +157,14 @@ impl Dialect {
             return None;
         }
         if col.array_stored {
-            // `default: []`, the only array default ingest keeps.
-            return Some(format!("'{}'", raw.replace('\'', "''")));
+            // The array default ingest keeps, as JSON (`[]`, `[0]`,
+            // `["a"]`): SQLite stores that JSON text; PostgreSQL its own
+            // array literal (`'{}'`, `'{0}'`, `'{"a"}'`).
+            let literal = match self {
+                Dialect::Sqlite => raw.to_string(),
+                Dialect::Postgres => postgres_array_literal(raw)?,
+            };
+            return Some(format!("'{}'", literal.replace('\'', "''")));
         }
         match &col.col_type {
             ColumnType::Integer | ColumnType::BigInt => {
@@ -288,10 +294,14 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
                 lines.push(dialect.key_column(col));
                 continue;
             }
-            // A stored array column holds the Array as JSON text
-            // (`lower::array_columns`).
+            // A stored array column (`lower::array_columns`) holds the
+            // Array as JSON text in SQLite, and in PostgreSQL as an array
+            // of its element (`text[]`, `integer[]`).
             let col_type = if col.array_stored {
-                dialect.column_type(&ColumnType::Text)
+                match dialect {
+                    Dialect::Sqlite => dialect.column_type(&ColumnType::Text),
+                    Dialect::Postgres => format!("{}[]", dialect.column_type(&col.col_type)),
+                }
             } else {
                 dialect.column_type(&col.col_type)
             };
@@ -1189,6 +1199,22 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
         | ColumnType::Uuid => "TEXT",
         ColumnType::Reference { .. } => "INTEGER",
     }
+}
+
+/// PostgreSQL's array literal for an array default kept as JSON
+/// (`[0]` -> `{0}`, `["a"]` -> `{"a"}`): an integer bare, a string
+/// double-quoted with `\` and `"` backslash-escaped, the same element
+/// rule as runtime/spinel/array_column_pg.rb. `None` for any other JSON.
+fn postgres_array_literal(json: &str) -> Option<String> {
+    let serde_json::Value::Array(elements) = serde_json::from_str::<serde_json::Value>(json).ok()? else { return None };
+    let elements = elements
+        .iter()
+        .map(|e| match e {
+            serde_json::Value::String(s) => Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))),
+            _ => e.as_i64().map(|n| n.to_string()),
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("{{{}}}", elements.join(",")))
 }
 
 /// Map a Roundhouse `ColumnType` to the type Rails' PostgreSQL adapter

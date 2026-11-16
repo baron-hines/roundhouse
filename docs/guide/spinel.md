@@ -200,9 +200,21 @@ PostgreSQL schema of its own, created when it starts and dropped when it
 exits; every connection of the pool takes it as its `search_path`, as
 Rails' `schema_search_path` setting does.
 
+A string or integer array column (`array: true`) is a real PostgreSQL
+array (`text[]`, `integer[]`), so `unnest`, `@>` and a GIN index work on
+it. Its default is the array literal (`'{}'`, `'{0}'`), and model writes,
+`update_all` and `insert_all` write the array input format. A NULL
+element (one raw SQL wrote) reads as `""` or `0`, where Rails gives nil.
+
+A generated column whose expression is PostgreSQL's own SQL (`::numeric`
+casts, `CASE … = ANY (ARRAY[…])`) is carried as written, and a decimal
+column keeps its `numeric(precision,scale)`. A target that runs SQLite
+refuses such a schema instead of dropping the column.
+
 Not carried yet:
 
-- array columns (`array: true`), which are stored as JSON text;
+- `where(column: [...])` on an array column, which compares element by
+  element (`IN`) where Rails compares the whole array;
 - `db/structure.sql` loaded as written, and the expression indexes the
   generated DDL can't carry (left out with a warning);
 - serialized first boots: two servers that boot on an empty database at

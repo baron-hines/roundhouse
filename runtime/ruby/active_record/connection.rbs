@@ -57,6 +57,7 @@ module ActiveRecord
     def sql_type: () -> String
     def null: () -> bool
     def initialize: (String name, String sql_type, ?bool null) -> void
+    def type: () -> Symbol
     def limit: () -> Integer?
   end
 
@@ -111,6 +112,8 @@ module ActiveRecord
     def self.table_exists?: () -> bool
     def self.column_names: () -> Array[String]
     def self.columns: () -> Array[Column]
+    def self.columns_hash: () -> Hash[String, Column]
+    def attribute_names: () -> Array[String]
     def self.lock: (?(bool | String)? locking) -> Relation
     def readonly?: () -> bool
     def readonly!: () -> Base
@@ -118,7 +121,7 @@ module ActiveRecord
     def assign_attributes: (Hash[String | Symbol, untyped] attributes) -> nil
     def _assign_mass_attribute: (String name, untyped value) -> nil
     def _unknown_mass_attribute: (String name) -> nil
-    def read_attribute: (Symbol name) -> untyped
+    def read_attribute: (Symbol | String name) -> untyped
     def write_attribute: (Symbol name, untyped value) -> untyped
     def slice: (*(Symbol | String | Array[Symbol | String]) names) -> Hash[String, untyped]
     def saved_changes?: () -> bool
@@ -212,6 +215,14 @@ module ActiveRecord
     def self.find_in_batches: () { (Array[Base]) -> void } -> Relation
     def self.first_or_initialize: () -> Base
     def self.first!: () -> Base
+    def self.second!: () -> Base
+    def self.third!: () -> Base
+    def self.fourth!: () -> Base
+    def self.fifth!: () -> Base
+    def self.second_to_last!: () -> Base
+    def self.third_to_last!: () -> Base
+    def self.reselect: (*(String | Symbol) specs) -> Relation
+    def self.annotate: (*String comments) -> Relation
     def self.from: (String source) -> Relation
     def self.group: (*(String | Symbol) parts) -> Relation
     def self.having: (String condition, *untyped args) -> Relation
@@ -244,6 +255,7 @@ module ActiveRecord
     def self.all: () -> Relation
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def self._default_scope_where: () -> Hash[Symbol, untyped]
+    def self._read_through_relation?: () -> bool
     def self._find_in_scope: (Integer | Float | String | nil id) -> Base?
     def self.count: () -> Integer
     def self.last: () -> Base?
@@ -257,6 +269,8 @@ module ActiveRecord
     def _note_hydrated: () -> void
     def _note_unloaded: (Hash[String, untyped] row) -> nil
     def has_attribute?: (Symbol name) -> bool
+    def _missing_attribute: (Symbol name) -> nil
+    def _note_loaded: (Symbol name) -> nil
     def attribute_previously_was: (String name) -> untyped
     def self.first: () -> Base?
     def self.take: () -> Base?
@@ -264,6 +278,8 @@ module ActiveRecord
     def self._adapter_all: () -> Array[Base]
     def self._adapter_find_by_id: (Integer id) -> Base?
     def self.decode_plucked: (String | Symbol column, untyped value) -> untyped
+    def self.encode_written: (String | Symbol column, untyped value) -> untyped
+    def self._written_sql: (String | Symbol column, untyped value) -> String
     def save: () -> bool
     def error_full_messages_for: (String attribute) -> Array[String]
     def valid?: () -> bool
@@ -299,6 +315,8 @@ module ActiveRecord
     def __track_saved_changes: (bool was_new) -> void
     def saved_changes: () -> Hash[String, untyped]
     def changes_to_save: () -> Hash[String, untyped]
+    def _merge_target: (Array[Base] rows, Array[Base]? held) -> Array[Base]
+    def _take_unchanged_attributes: (Base row) -> Base
     def _columns_to_write: () -> Array[String]
     def attribute_was: (String name) -> untyped
     def clear_attribute_change: (String name) -> nil

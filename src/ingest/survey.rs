@@ -108,6 +108,17 @@ pub fn record(err: &IngestError) {
     });
 }
 
+/// Withdraw the last recorded error equal to `err`: a gap a later pass found answered.
+pub(super) fn forget(err: &IngestError) {
+    SURVEY_STATE.with(|s| {
+        if let Some(buf) = s.borrow_mut().as_mut()
+            && let Some(at) = buf.iter().rposition(|e| err_file(e) == err_file(err) && err_message(e) == err_message(err))
+        {
+            buf.remove(at);
+        }
+    });
+}
+
 /// Errors recorded so far, without draining survey mode.
 pub fn recorded() -> Vec<String> {
     SURVEY_STATE.with(|s| {

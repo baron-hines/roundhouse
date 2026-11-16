@@ -33,7 +33,7 @@ mod class_configuration;
 mod data;
 mod database_identity;
 mod class_new;
-pub(crate) use body::{indexed_pluck, string_answers};
+pub(crate) use body::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
 pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
@@ -77,6 +77,7 @@ mod parallel;
 mod inferred_types;
 pub mod inquiry;
 pub mod indifferent;
+pub mod promise;
 pub(crate) mod hash_keys;
 pub use inferred_types::inferred_types;
 pub use inquiry::inquirer_methods;
@@ -966,6 +967,14 @@ impl Analyzer {
                         && scope.as_ref().is_none_or(crate::lower::scope_chain::scope_is_row_preserving)
                     {
                         cls.direct_has_many.insert(name.clone());
+                        // Mirrors `lower::scope_chain::build_assoc_registry`'s
+                        // `has_many_held`: the association holds what app code
+                        // builds, creates or pushes onto it.
+                        if model.methods().any(|m| {
+                            m.name.as_str() == format!("__hold_{}", name.as_str())
+                        }) {
+                            cls.held_has_many.insert(name.clone());
+                        }
                     }
                     for m in extension {
                         cls.assoc_extensions
@@ -1188,6 +1197,14 @@ impl Analyzer {
                     cls.sidecar_only_instance_methods.insert(name.clone());
                 }
                 cls.instance_methods.insert(name.clone(), ty.clone());
+            }
+        }
+        // The `[]` the graphql-ruby ingest declares marks an input object.
+        for (class_id, name) in &app.graphql_signatures {
+            if name.as_str() == "[]" {
+                if let Some(cls) = classes.get_mut(class_id) {
+                    cls.reads_arguments_by_key = true;
+                }
             }
         }
 
@@ -9512,8 +9529,10 @@ fn association_member_ty(assoc: &crate::dialect::Association) -> (Symbol, Ty) {
     match assoc {
         // Polymorphic belongs_to with a resolved implementor set —
         // the reader yields any implementor (or nil); dispatch on the
-        // union resolves member-wise. Unresolved (no inverse `as:`
-        // decls found) falls through to the phantom-target arm below.
+        // union resolves member-wise. Unresolved (a framework record
+        // ingest synthesizes after resolving the sets, see
+        // `resolve_polymorphic_targets`) falls through to the
+        // phantom-target arm below.
         Association::BelongsTo { name, polymorphic: true, polymorphic_targets, .. }
             if !polymorphic_targets.is_empty() =>
         {

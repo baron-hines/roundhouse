@@ -1831,7 +1831,12 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
-            refuse_block_capture(l.parameters(), file)?;
+            // A stabby lambda's `&block` is its own parameter (view_component's slot lambdas take one), kept as a
+            // `define_method` block's is; an anonymous `&` has no name to keep.
+            let block_param = named_block_param(l.parameters());
+            if block_param.is_none() {
+                refuse_block_capture(l.parameters(), file)?;
+            }
             let extra_params = block_extra_params(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = lambda_rest_param(l.parameters());
@@ -1840,7 +1845,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style }
+            ExprNode::Lambda { extra_params, rest_param, params, block_param, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
