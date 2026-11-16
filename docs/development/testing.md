@@ -131,9 +131,13 @@ The `association targets` and `preload` groups are emit_and_run probes
 (`tests/emit_and_run/`) written for behaviors the fork found, each run
 unchanged on ActiveRecord 8.1.4 first: what a has_many or has_one holds,
 the inverses it seats, its add and remove callbacks, and what a preload
-hands each owner. Each probe's `_on_spinel` variant carries the same
-ignore; once it passes, its reason goes back to `requires the Spinel
-toolchain`.
+hands each owner. The `ruby semantics` and `record queries` groups are
+probes of the same kind: how Ruby runs class and module bodies, method
+lookup and dispatch (an Array's `as_json`, `&.` on `false`,
+refinements, load hooks), and what a query answers (sums, plucks through
+joins, query constraints, custom inheritance columns). Each probe's
+`_on_spinel` variant carries the same ignore; once it passes, its reason
+goes back to `requires the Spinel toolchain`.
 
 ## Complete local verification
 
