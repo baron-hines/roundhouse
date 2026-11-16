@@ -141,8 +141,16 @@ selects of hashes, Strings and Arel attributes, plucks of Strings and
 enums, eager loads beside joins, a connection's `to_sql` of an Arel node), and the
 `persistence` group how a record is built, copied and saved (`toggle`,
 `save(touch: false)`, `dup`, `clone` and `reload`, a model's own
-`update`). Each probe's `_on_spinel` variant carries the same ignore;
-once it passes, its reason goes back to `requires the Spinel toolchain`.
+`update`). The `controller tests` group runs a test file in the real-blog
+fixture against what Rails' controllers and their tests answer
+(`action_methods`, OPTIONS requests, `response.body=`, `request.variant`,
+an app's own json renderer, uploads and `deep_munge`), and the `views
+helpers` group what a view's helpers resolve to (without `helper :all`,
+modules a controller declares, `url_for` of a Hash, `capture` arguments,
+TagHelper, NumberHelper and TranslationHelper includes); their Spinel
+variants run the same file with `spin test`. Each probe's `_on_spinel`
+variant carries the same ignore; once it passes, its reason goes back to
+`requires the Spinel toolchain`.
 
 ## Complete local verification
 
