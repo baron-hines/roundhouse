@@ -56,6 +56,12 @@ const STRUCTURE: &str = r#"CREATE TABLE articles (
     revision integer DEFAULT 1 NOT NULL,
     CONSTRAINT articles_pkey PRIMARY KEY (id)
 );
+
+CREATE TABLE "order" (
+    id bigserial NOT NULL,
+    name character varying,
+    CONSTRAINT order_pkey PRIMARY KEY (id)
+);
 "#;
 
 const DATABASE_YML: &str = r#"default: &default
@@ -73,6 +79,12 @@ end
 "#;
 
 const ARTICLE: &str = r#"class Article < ApplicationRecord
+end
+"#;
+
+/// A table named by an SQL keyword, which the lock's SELECT must quote.
+const ORDER: &str = r#"class Order < ApplicationRecord
+  self.table_name = "order"
 end
 "#;
 
@@ -96,18 +108,21 @@ const SQL_PROBE: &str = r##"class LockSqlProbe
     out << "lock! nowait: #{clauses { Article.transaction { article.lock!("FOR UPDATE NOWAIT") } }}"
     out << "lock! false: #{clauses { Article.transaction { article.lock!(false) } }}"
     out << "new record: #{clauses { Article.new(title: "c").lock! }}"
+    order = Order.create!(name: "a")
+    out << "keyword table: #{clauses { order.with_lock { order.name } }}"
     out
   end
 end
 "##;
 
-const SQL_EXPECTED: [&str; 6] = [
+const SQL_EXPECTED: [&str; 7] = [
     "lock!: update=1 share=0 title=b",
     "with_lock: update=1 share=0",
     "with_lock share: update=0 share=1",
     "lock! nowait: update=1 share=0",
     "lock! false: update=0 share=0",
     "new record: update=0 share=0",
+    "keyword table: update=1 share=0",
 ];
 
 /// Two clients edit the same article from the revision they both read
@@ -155,6 +170,41 @@ const RACE_EXPECTED: [&str; 3] = [
     "row: first r2",
 ];
 
+/// `FOR UPDATE SKIP LOCKED` on a row another transaction holds reads no
+/// row, and Rails' locked `find_by!` raises RecordNotFound rather than
+/// letting the caller go on without the lock.
+const SKIP_PROBE: &str = r##"class LockSkipProbe
+  def self.lines
+    article = Article.create!(title: "held", revision: 1)
+    locked = Queue.new
+    done = Queue.new
+    holder = Thread.new do
+      Db.with_connection do
+        Article.find(article.id).with_lock do
+          locked << true
+          done.pop
+        end
+      end
+    end
+    locked.pop
+    outcome = begin
+      Db.with_connection do
+        Article.transaction { article.lock!("FOR UPDATE SKIP LOCKED") }
+        "locked"
+      end
+    rescue ActiveRecord::RecordNotFound => e
+      "#{e.class} couldnt_find=#{e.message.start_with?("Couldn't find Article")}"
+    end
+    done << true
+    holder.join
+    free = Db.with_connection { Article.transaction { article.lock!("FOR UPDATE SKIP LOCKED") }.title }
+    ["held: #{outcome}", "free: #{free}"]
+  end
+end
+"##;
+
+const SKIP_EXPECTED: [&str; 2] = ["held: ActiveRecord::RecordNotFound couldnt_find=true", "free: held"];
+
 /// Native Rails has no `Db`: the emitted runtime's lease is Rails'
 /// `with_connection`, which a thread gets on its own anyway.
 const NATIVE_PRELUDE: &str = r#"module Db
@@ -172,6 +222,7 @@ fn files(probe_path: &'static str, probe: &'static str) -> Vec<(&'static str, &'
         ("db/structure.sql", STRUCTURE),
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/article.rb", ARTICLE),
+        ("app/models/order.rb", ORDER),
         (probe_path, probe),
     ]
 }
@@ -187,7 +238,7 @@ fn probe(name: &str, files: &[(&str, &str)], database: &str, class: &str, probe_
         &emitted,
         database,
         class,
-        &["app/models/application_record", "app/models/article", probe_load],
+        &["app/models/application_record", "app/models/article", "app/models/order", probe_load],
     )
 }
 
@@ -212,5 +263,18 @@ fn concurrent_with_lock_waits_for_the_holder_on_postgresql() {
         return;
     };
     assert_eq!(native, RACE_EXPECTED, "native");
+    assert_eq!(emitted, native, "emitted");
+}
+
+#[test]
+fn skip_locked_on_a_held_row_raises_record_not_found_on_postgresql() {
+    let mut files = files("app/models/lock_skip_probe.rb", SKIP_PROBE);
+    files.push(("native_prelude.rb", NATIVE_PRELUDE));
+    let Some((native, emitted)) =
+        probe("row-lock-skip", &files, "rh_spec_row_lock_skip", "LockSkipProbe", "app/models/lock_skip_probe")
+    else {
+        return;
+    };
+    assert_eq!(native, SKIP_EXPECTED, "native");
     assert_eq!(emitted, native, "emitted");
 }

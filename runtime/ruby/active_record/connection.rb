@@ -1195,10 +1195,13 @@ module ActiveRecord
     # record: Rails' `lock!` reloads nothing for a new one. Outside a
     # transaction the lock ends with the statement, as it does in Rails.
     #
-    # `Db.exec`, not a read through the statement cache: a locking read
-    # must reach the server every time (Rails never answers one from the
-    # query cache), and `exec` also clears the lease's query cache, as
-    # Rails' `reload` does before it reads.
+    # `Db.exec_returning`, not a read through the statement cache: a
+    # locking read must reach the server every time (Rails never answers
+    # one from the query cache), and it also clears the lease's query
+    # cache, as Rails' `reload` does before it reads. Its rows are kept:
+    # a clause that skips (`FOR UPDATE SKIP LOCKED`) answers none for a
+    # row another transaction holds, and Rails' locked `find_by!` then
+    # raises RecordNotFound instead of going on without the lock.
     def _lock_row(lock)
       return nil unless Db.adapter_name == "postgresql"
       return nil unless persisted?
@@ -1206,7 +1209,16 @@ module ActiveRecord
       clause = lock.is_a?(String) ? lock : "FOR UPDATE"
       key = ActiveRecord.adapter.quote_column_name(self.class.primary_key.to_s)
       value = ActiveRecord.adapter.escape_value(_primary_key_value)
-      Db.exec("SELECT #{key} FROM #{self.class.table_name} WHERE #{key} = #{value} #{clause}")
+      stmt = Db.exec_returning("SELECT #{key} FROM #{self.class._table_sql} WHERE #{key} = #{value} #{clause}")
+      found = false
+      begin
+        found = Db.step?(stmt)
+      ensure
+        Db.finalize(stmt)
+      end
+      unless found
+        raise RecordNotFound.new("Couldn't find #{self.class.name}", self.class.name, self.class.primary_key.to_s)
+      end
       nil
     end
 
