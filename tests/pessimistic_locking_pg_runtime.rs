@@ -57,10 +57,10 @@ const STRUCTURE: &str = r#"CREATE TABLE articles (
     CONSTRAINT articles_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE "order" (
+CREATE TABLE "groups" (
     id bigserial NOT NULL,
     name character varying,
-    CONSTRAINT order_pkey PRIMARY KEY (id)
+    CONSTRAINT groups_pkey PRIMARY KEY (id)
 );
 "#;
 
@@ -82,9 +82,11 @@ const ARTICLE: &str = r#"class Article < ApplicationRecord
 end
 "#;
 
-/// A table named by an SQL keyword, which the lock's SELECT must quote.
-const ORDER: &str = r#"class Order < ApplicationRecord
-  self.table_name = "order"
+/// `groups` is an SQL keyword (window frames), so the lock's SELECT must
+/// quote it, as `_table_sql` does (PostgreSQL itself accepts it bare,
+/// so the probe checks the statement's text). Ingest refuses a keyword in an explicit
+/// `self.table_name`, so the keyword comes from the model's own name.
+const GROUP: &str = r#"class Group < ApplicationRecord
 end
 "#;
 
@@ -95,7 +97,8 @@ const SQL_PROBE: &str = r##"class LockSqlProbe
     sub = ActiveSupport::Notifications.subscribe("sql.active_record") { |*, payload| sql << payload[:sql] }
     yield
     ActiveSupport::Notifications.unsubscribe(sub)
-    "update=#{sql.count { |s| s.include?("FOR UPDATE") }} share=#{sql.count { |s| s.include?("FOR SHARE") }}"
+    quoted = sql.count { |s| s.include?("FOR UPDATE") && s.include?('FROM "groups"') }
+    "update=#{sql.count { |s| s.include?("FOR UPDATE") }} share=#{sql.count { |s| s.include?("FOR SHARE") }} quoted=#{quoted}"
   end
 
   def self.lines
@@ -108,21 +111,21 @@ const SQL_PROBE: &str = r##"class LockSqlProbe
     out << "lock! nowait: #{clauses { Article.transaction { article.lock!("FOR UPDATE NOWAIT") } }}"
     out << "lock! false: #{clauses { Article.transaction { article.lock!(false) } }}"
     out << "new record: #{clauses { Article.new(title: "c").lock! }}"
-    order = Order.create!(name: "a")
-    out << "keyword table: #{clauses { order.with_lock { order.name } }}"
+    group = Group.create!(name: "a")
+    out << "keyword table: #{clauses { group.with_lock { group.name } }}"
     out
   end
 end
 "##;
 
 const SQL_EXPECTED: [&str; 7] = [
-    "lock!: update=1 share=0 title=b",
-    "with_lock: update=1 share=0",
-    "with_lock share: update=0 share=1",
-    "lock! nowait: update=1 share=0",
-    "lock! false: update=0 share=0",
-    "new record: update=0 share=0",
-    "keyword table: update=1 share=0",
+    "lock!: update=1 share=0 quoted=0 title=b",
+    "with_lock: update=1 share=0 quoted=0",
+    "with_lock share: update=0 share=1 quoted=0",
+    "lock! nowait: update=1 share=0 quoted=0",
+    "lock! false: update=0 share=0 quoted=0",
+    "new record: update=0 share=0 quoted=0",
+    "keyword table: update=1 share=0 quoted=1",
 ];
 
 /// Two clients edit the same article from the revision they both read
@@ -222,7 +225,7 @@ fn files(probe_path: &'static str, probe: &'static str) -> Vec<(&'static str, &'
         ("db/structure.sql", STRUCTURE),
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/article.rb", ARTICLE),
-        ("app/models/order.rb", ORDER),
+        ("app/models/group.rb", GROUP),
         (probe_path, probe),
     ]
 }
@@ -238,7 +241,7 @@ fn probe(name: &str, files: &[(&str, &str)], database: &str, class: &str, probe_
         &emitted,
         database,
         class,
-        &["app/models/application_record", "app/models/article", "app/models/order", probe_load],
+        &["app/models/application_record", "app/models/article", "app/models/group", probe_load],
     )
 }
 

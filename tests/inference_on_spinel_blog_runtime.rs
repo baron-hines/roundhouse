@@ -664,7 +664,11 @@ fn untyped_subexpressions_baseline() {
     // add 6. Four read the `lock` argument, typed only by connection.rbs,
     // which this RBS-less probe does not load; the other two are the `Db`
     // receivers of `Db.adapter_name` and `Db.exec`, as in `Relation#lock`.
-    const CEILING: usize = 1439;
+    // MEASURED 1446 on the #2201 review (1439 above): `_lock_row` keeps
+    // the lock's row through `Db.exec_returning` / `Db.step?` /
+    // `Db.finalize` (+7). The `stmt` local, its begin/ensure and the three
+    // `Db` results read as untyped on this RBS-less probe, as `Db.exec` did.
+    const CEILING: usize = 1446;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
