@@ -22439,3 +22439,33 @@ mod emitted_model_methods;
 mod association_load_seats_inverse;
 #[path = "emit_and_run/relation_predicate_blocks.rs"]
 mod relation_predicate_blocks;
+
+// Fork specs: relation queries.
+#[path = "emit_and_run/connection_to_sql_node.rs"]
+mod connection_to_sql_node;
+#[path = "emit_and_run/eager_load_joined_self_reference.rs"]
+mod eager_load_joined_self_reference;
+#[path = "emit_and_run/eager_load_over_nested_joins.rs"]
+mod eager_load_over_nested_joins;
+#[path = "emit_and_run/eager_load_string_join_order.rs"]
+mod eager_load_string_join_order;
+#[path = "emit_and_run/enumerate_columns_select.rs"]
+mod enumerate_columns_select;
+#[path = "emit_and_run/integer_bind_key_object.rs"]
+mod integer_bind_key_object;
+#[path = "emit_and_run/pluck_enum_labels.rs"]
+mod pluck_enum_labels;
+#[path = "emit_and_run/pluck_sql_string.rs"]
+mod pluck_sql_string;
+#[path = "emit_and_run/relation_rewhere.rs"]
+mod relation_rewhere;
+#[path = "emit_and_run/result_any_block.rs"]
+mod result_any_block;
+#[path = "emit_and_run/select_arel_attribute_array.rs"]
+mod select_arel_attribute_array;
+#[path = "emit_and_run/select_hash_value_no_alias.rs"]
+mod select_hash_value_no_alias;
+#[path = "emit_and_run/select_string_column.rs"]
+mod select_string_column;
+#[path = "emit_and_run/where_association_alias.rs"]
+mod where_association_alias;
