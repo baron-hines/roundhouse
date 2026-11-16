@@ -648,7 +648,29 @@ fn untyped_subexpressions_baseline() {
     // parenthesis or a quote before it splits it, two reads of a var on
     // this RBS-less probe (+2 in active_record/relation.rb); relation.rbs
     // types it for the RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1427;
+    // MEASURED 1428 on restore_attributes (1427): its block reads each
+    // restored `name`, a var on this RBS-less probe (+1 in
+    // active_record/connection.rb); connection.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    // MEASURED 1432 on association relation inverses (main e942cef18:
+    // 1427): `_inversed_from` stores its owner and association name (+4)
+    // and `load_records` hands the stored owner its rows (+1), vars on
+    // this RBS-less probe (active_record/relation.rb); relation.rbs types
+    // them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1433 on merging #2176 and #2177 (1427): restore_attributes's
+    // +1 and the association relation inverses' +5, which add up.
+    // MEASURED 1434 on routed connection handles (main 105a34827: 1433):
+    // the Db slot calls a connection handle makes in
+    // active_record/connection.rb read the Db contract, which this
+    // RBS-less probe does not model, as `self.transaction`'s `Db.exec`
+    // calls do: `Base.connection`'s `Db.connection_slot` and the `slot` it
+    // answers (+4), `transaction`'s guard (+2), and `enter_slot` /
+    // `leave_slot` in `execute`, `select_rows` and `exec_update` with
+    // `raw_connection`'s guard (+8). `Base.connection` now answers a
+    // `Connection.new` on one arm, so its callers' chains in
+    // migration_runner.rb, schema_reader.rb and tasks.rb type (-13).
+    // db.rbs and connection.rbs type them for the RBS-paired gate.
+    const CEILING: usize = 1434;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

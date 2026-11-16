@@ -951,14 +951,23 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// that consumes the shape.
 fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
     fn walk(expr: &crate::expr::Expr) -> bool {
-        if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "define_method") {
+        // On the class: receiverless or `self.scope`.
+        if let ExprNode::Send { recv, method, .. } = &*expr.node
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && matches!(method.as_str(), "define_method" | "scope")
+        {
             return true;
         }
         let mut found = false;
         expr.node.for_each_child(&mut |child| found |= walk(child));
         found
     }
-    matches!(&*expr.node, ExprNode::Send { block: Some(block), .. } if walk(block))
+    match &*expr.node {
+        ExprNode::Send { block: Some(block), .. } => walk(block),
+        // `while`/`until` in the body runs its statements as a block does.
+        ExprNode::While { body, .. } => walk(body),
+        _ => false,
+    }
 }
 
 /// Interim subset of #1302's unclaimed-call errors: dropping encryption
@@ -983,6 +992,38 @@ pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::D
                 expr.span, None, "encrypts",
                 format!(
                     "`encrypts` in the body of `{}` is not modelled, so its effect would be dropped from the output",
+                    model.name.0.as_str()
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// A model-body block that runs `define_method` or `scope` and that
+/// `ingest::define_method_loop` could not unroll (`kinds.each do |kind|
+/// define_method(…) … end` over a value known only when the class
+/// loads, or a receiverless block): no lowering defines its methods, so
+/// the emitted model would lack them. An error for `check`, as the call sites would raise
+/// NoMethodError.
+pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::default();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            // A receiverless block too (`each do |size| scope size, … end`):
+            // nothing in a model body claims one that defines methods.
+            if !defines_methods_in_block(expr)
+                || expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
+                || expr.diagnostic().is_some() || !seen.insert(expr.span)
+            {
+                continue;
+            }
+            out.push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span, None, "runtime-defined method",
+                format!(
+                    "a block in the body of `{}` runs `define_method` or `scope` in a shape the compile could not unroll; the methods it defines would be missing from the output",
                     model.name.0.as_str()
                 ),
             ));
@@ -1018,22 +1059,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         };
         let name = method.as_str();
+        // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: `check`'s error (`unrolled_loop_diagnostics`).
+        if defines_methods_in_block(expr) {
+            continue;
+        }
         if let Some(recv) = recv {
-            // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: its methods are dropped with it.
-            if defines_methods_in_block(expr) {
-                let mut d = Diagnostic::unsupported(
-                    expr.span,
-                    None,
-                    "runtime-defined method",
-                    format!(
-                        "a `define_method` loop in the body of `{}` the compile could not unroll; the methods it defines are not emitted",
-                        model.name.0.as_str()
-                    ),
-                );
-                d.severity = Severity::Warning;
-                crate::emit::diagnostics::push(d);
-                continue;
-            }
             // Class-body writes are sends too, and dropping an unclaimed
             // setting must report just like dropping a receiver-less DSL.
             if !matches!(&*recv.node, ExprNode::SelfRef)

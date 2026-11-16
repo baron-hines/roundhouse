@@ -1363,17 +1363,17 @@ fn every_runtime_method_body_concretely_typed() {
     // value of any type, as `escape_value` does, so their untyped `value`
     // adds 5 sites (+5 in active_record/connection.rb); every other file is
     // unchanged. Raise to 998, preserving the two-site headroom.
-    // MEASURED 998 on main 641feda88 (996 above): a has_many's load keeps
-    // its held records, and `_take_unchanged_attributes` writes each
-    // untyped attribute value it takes from the loaded row (+2 in
-    // active_record/connection.rb). Within the ceiling, which is unchanged.
-    // MEASURED 999 on routed connection handles (main 641feda88: 998):
+    // MEASURED 1003 on relation predicate blocks (main e942cef18: 998):
+    // Relation's any?, none?, one?, many? and count take a block that
+    // decides over the loaded records, one block-result site each, as
+    // filter_map's (+5 in active_record/relation.rb); every other file is
+    // unchanged. Main had no headroom left, so the ceiling is the measure.
+    // MEASURED 1004 on routed connection handles (main 105a34827: 1003):
     // `ActiveRecord::Base.with_connection` answers what its block gives
     // (+1 in active_record/connection.rb), as `transaction` does. The
     // handle, `lease_connection` and the Db slot calls are typed and add
-    // none; every other method's count is main's. Raise to 1001,
-    // preserving the two-site headroom.
-    const CEILING: usize = 1001;
+    // none; every other file is unchanged. The ceiling is the measure.
+    const CEILING: usize = 1004;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

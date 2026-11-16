@@ -1052,6 +1052,11 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     enum_constants.finish();
     model_bases.close_over(&base_pairs);
     model_bases.close_over_tableless();
+    // The `ActiveSupport.on_load` blocks `config/initializers` registers for a
+    // name a model fires with `run_load_hooks` run inside that model's class
+    // body, so they are read before the models (`ingest::load_hooks`), and
+    // kept until this ingest returns (the initializer ledger asks too).
+    let _load_hooks = super::load_hooks::gather(vfs, dir)?;
     for root in &roots {
         let models_dir = dir.join(root).join("models");
         if !vfs.is_dir(&models_dir) {
