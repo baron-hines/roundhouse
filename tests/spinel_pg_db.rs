@@ -130,11 +130,6 @@ const WIDGET_FIXTURES: &str = "one:\n  name: one\n  tag_list: [\"a\", \"b,c\", \
 const WIDGET_TEST: &str = r##"require "test_helper"
 
 class WidgetTest < ActiveSupport::TestCase
-  # Fixtures on PostgreSQL leave the id sequence behind (#2164).
-  setup do
-    Widget.connection.select_all("SELECT setval(pg_get_serial_sequence('widgets', 'id'), 1000)")
-  end
-
   test "boot made the GIN index" do
     index = Widget.connection.select_all("SELECT indexdef FROM pg_indexes WHERE indexname = 'index_widgets_on_tag_list'").to_a.first["indexdef"]
     assert index.include?("USING gin (tag_list)"), index
