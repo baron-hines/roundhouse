@@ -89,6 +89,9 @@ pub fn ingest_app(dir: &Path) -> IngestResult<App> {
     // Absolute lockfile remotes must resolve identically whether the CLI
     // names this app by a relative path or an absolute one.
     let dir = dir.canonicalize()?;
+    if let Some(patches) = crate::observed_shapes::installed() {
+        return ingest_app_with_vfs(&crate::observed_shapes::ObservedVfs { inner: &FsVfs::new(), patches: &patches }, &dir);
+    }
     ingest_app_with_vfs(&FsVfs::new(), &dir)
 }
 

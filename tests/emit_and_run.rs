@@ -22376,6 +22376,8 @@ mod errors_computed_field;
 mod aasm_source;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
 mod runtime_registered_callbacks;
+#[path = "emit_and_run/reopened_alias.rs"]
+mod reopened_alias;
 
 // Fork specs: ruby semantics.
 #[path = "emit_and_run/array_as_json_elements.rs"]
