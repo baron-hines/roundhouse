@@ -32,6 +32,20 @@ Removing an error diagnostic claims emitted support. Pin that claim with
 must analyze cleanly **and** execute correctly in the emitted Ruby app.
 Other target behavior still needs its own relevant evidence.
 
+Analysis checks what the analyzer believes, not what the lowering wrote. On
+the Ruby family and Spinel the emit reads its own Ruby back
+(`src/emit/audit.rs`): a call on an app model, written in the app's source,
+that no emitted class defines is an error (a reader the lowering skipped, a
+runtime method that does not exist). The audit cannot see a class whose
+methods are defined as it runs, a model with subclasses (one of them may
+answer), a class-side call on a model (`ActiveRecord::Base` defines its macros
+at run time), a view parameter typed by convention, or calls the compiler
+synthesized; those stay warnings. A receiver whose type names a model may hold
+the class itself (`klass = Note`), so a method the class side defines answers
+it too.
+`ROUNDHOUSE_AUDIT=1` lists the warnings, the same check on every other app
+class.
+
 ## Three meanings of round-trip
 
 `tests/roundtrip.rs` checks `App → JSON → App`; `tests/runtime_src_roundtrip.rs`

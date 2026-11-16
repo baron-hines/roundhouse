@@ -1,7 +1,9 @@
-//! `restore_attributes` writes every pending change back, as Rails does.
-//! The runtime lacked it while `check` stayed clean, so the emitted
-//! program raised NoMethodError. The probe's expected values are
-//! ActiveRecord 8.1.4's answers.
+//! A call on an app model names a method the emitted Ruby defines, or the
+//! emit reports it. `restore_attributes` is one Rails answers that the
+//! runtime lacked while `check` stayed clean, so the emitted program raised
+//! NoMethodError; the probe's expected values are ActiveRecord 8.1.4's
+//! answers. A call the runtime still lacks (`association(:name)` read for
+//! its own sake) is an error now, where it used to raise when run.
 
 use super::emit_and_run;
 
@@ -79,4 +81,20 @@ fn restore_attributes_answers_as_rails_does_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+/// `association(:books)` read for its own sake has no runtime behind it:
+/// the emit reports the call, on the Ruby family and on Spinel, instead of
+/// writing a program that raises NoMethodError there.
+#[test]
+fn a_model_call_the_emitted_ruby_lacks_is_an_error() {
+    for target in [roundhouse::project::BuildTarget::Ruby, roundhouse::project::BuildTarget::Spinel] {
+        let (_emitted, errors) = app()
+            .write("app/models/shelf_report.rb", "module ShelfReport\n  def self.association_of(id)\n    Library.find(id).association(:books)\n  end\nend\n")
+            .emit(target);
+        assert!(
+            errors.iter().any(|e| e.contains("`Library#association` is called, but the emitted Ruby defines no such method")),
+            "{target:?}: {errors:?}"
+        );
+    }
 }
