@@ -650,7 +650,7 @@ fn unroll_with(
             }
         }
     }
-    let mut out = Vec::new();
+    let mut defines = Vec::new();
     for (define, on_class) in &plan.defines {
         let receiver = if *on_class { MethodReceiver::Class } else { receiver };
         let names = plan_names(define, &plan)?;
@@ -667,14 +667,20 @@ fn unroll_with(
             Some(b) => ingest_expr(&b, file).ok()?,
             None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
         };
-        for (key, name) in keys.iter().zip(names) {
+        defines.push((receiver, names, params, name_span, body));
+    }
+    // In the order Ruby runs them, each element's definitions in turn, so a
+    // name two definitions spell is the later one's.
+    let mut out = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        for (receiver, names, params, name_span, body) in &defines {
             let mut body = body.clone();
             substitute(&mut body, &plan, key);
             fold_send_names(&mut body);
             out.push(MethodDef {
-                name_span,
-                name: Symbol::from(name.as_str()),
-                receiver,
+                name_span: *name_span,
+                name: Symbol::from(names[i].as_str()),
+                receiver: *receiver,
                 visibility: crate::dialect::MethodVisibility::Public,
                 params: params.clone(),
                 unsupported_formals: None,
@@ -690,6 +696,11 @@ fn unroll_with(
             });
         }
     }
+    // A definition a later one replaces never answers a call: only the last stays.
+    let mut seen = HashSet::default();
+    out.reverse();
+    out.retain(|m| seen.insert((m.name.clone(), m.receiver)));
+    out.reverse();
     Some(out)
 }
 

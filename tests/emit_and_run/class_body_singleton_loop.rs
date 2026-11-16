@@ -30,6 +30,12 @@ end
     end
   end
 
+  # The second element's first definition replaces the first element's second.
+  %w[a aa].each do |mark|
+    define_singleton_method("#{mark}_tag") { mark }
+    define_singleton_method("a#{mark}_tag") { mark }
+  end
+
   def self.tally
     "#{front_count}/#{back_count}"
   end
@@ -53,6 +59,8 @@ end
     check("singleton_class.define_method", Ticket.open_ids == [a.id, c.id] && Ticket.shut_ids == [b.id])
     # Rails: a, b
     check("define_method in class << self", Ticket.first_front == a && Ticket.first_back == b)
+    # Rails: "a", "aa", "aa"
+    check("later definition wins", Ticket.a_tag == "a" && Ticket.aa_tag == "aa" && Ticket.aaa_tag == "aa")
   end
 end
 "##)
