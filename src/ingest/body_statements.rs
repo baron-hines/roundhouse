@@ -384,12 +384,16 @@ impl Check<'_> {
                         ExprNode::Const { path } => {
                             let named: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
                             let name = named.join("::");
-                            // As Ruby looks the name up: from the class's nesting outward (`Swatch` in `Palette`).
+                            // `Swatch` in `Palette` is `Palette::Swatch` when the app has one, as
+                            // Ruby looks it up first. Not a namespace further out
+                            // (`Catalog::Swatch` from `Catalog::Palette`): the emitted body
+                            // requires its own nested classes and top-level ones only.
                             let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
+                            let nested = format!("{}::{name}", self.owner);
                             let class = if absolute {
                                 self.index.class_side.contains_key(&name).then_some(name)
                             } else {
-                                resolve(self.index.class_side, &name, Some(self.owner))
+                                resolve(self.index.class_side, &name, Some(self.owner)).filter(|found| *found == nested || *found == name)
                             };
                             if let Some(class) = class {
                                 // `new` on one of the app's classes (not a module): every class answers it.

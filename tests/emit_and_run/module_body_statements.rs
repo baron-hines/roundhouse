@@ -55,3 +55,17 @@ fn a_module_body_runs_its_statements_after_the_class_it_defines_on_spinel() {
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+/// A class from a namespace further out (`Catalog::Swatch`, read as `Swatch`
+/// inside `Catalog::Palette`) is not one the emitted body requires, so a
+/// call building it is not written back to run at load (where it would
+/// raise NameError if the palette loaded first): it stays a reported drop.
+#[test]
+fn a_call_on_a_class_from_an_outer_namespace_is_not_written_back() {
+    let (tree, _errors) = emit_and_run::empty_app()
+        .write("app/models/catalog/palette.rb", "module Catalog\n  module Palette\n    ITEMS = []\n    ITEMS.push(Swatch.new(\"teal\"))\n  end\nend\n")
+        .write("app/models/catalog/swatch.rb", "module Catalog\n  class Swatch\n    def initialize(name)\n      @name = name\n    end\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let text = std::fs::read_to_string(tree.join("app/models/catalog/palette.rb")).unwrap();
+    assert!(text.contains("ITEMS = []") && !text.contains("Swatch.new"), "{text}");
+}
