@@ -166,7 +166,18 @@ impl Index {
         } else if let Some(begin) = stmt.as_begin_node() {
             self.walk_body(begin.statements().map(|s| s.as_node()), owner, singleton);
         } else if let Some(i) = stmt.as_if_node() {
+            // Every arm: which one runs is decided at run time, and each defines what it writes.
             self.walk_body(i.statements().map(|s| s.as_node()), owner, singleton);
+            if let Some(rest) = i.subsequent() {
+                self.statement(rest, owner, singleton);
+            }
+        } else if let Some(u) = stmt.as_unless_node() {
+            self.walk_body(u.statements().map(|s| s.as_node()), owner, singleton);
+            if let Some(rest) = u.else_clause() {
+                self.walk_body(rest.statements().map(|s| s.as_node()), owner, singleton);
+            }
+        } else if let Some(e) = stmt.as_else_node() {
+            self.walk_body(e.statements().map(|s| s.as_node()), owner, singleton);
         }
     }
 
@@ -262,7 +273,12 @@ impl Index {
             return Lookup::Unheld;
         }
         // Not only `extend`: a module the tree does not hold may add class methods from its `included` hook (`Singleton#instance`).
-        let mut unknown = class_side
+        // An included module whose `included`/`prepended` hook defines methods as it runs
+        // (`base.define_method(:title)`) adds to the includer's instance side too.
+        let hook_defines = info.includes.iter().any(|m| {
+            self.resolve(m, &info.namespace).is_some_and(|(_, held)| held.definers.contains("included") || held.definers.contains("prepended"))
+        });
+        let mut unknown = hook_defines || class_side
             && (info.includes.iter().any(|m| {
                 let name = m.trim_start_matches("::");
                 match self.resolve(m, &info.namespace) {
@@ -483,17 +499,34 @@ struct Walker<'a> {
     convention: &'a [&'a crate::ident::Symbol],
     /// Findings whose receiver is one of them.
     unsure: &'a mut HashSet<crate::span::Span>,
-    /// Methods an enclosing condition asked `respond_to?` about: the call
-    /// runs only where the object answers it.
-    guarded: Vec<String>,
+    /// Calls an enclosing condition asked `respond_to?` about, by receiver
+    /// and method: the call runs only where that object answers it.
+    guarded: Vec<(String, String)>,
 }
 
-/// The methods `cond` asks `respond_to?` about, through `&&`.
-fn responds_to(cond: &Expr, out: &mut Vec<String>) {
+/// Who a call goes to, where the audit can tell two receivers are the
+/// same object: `self` (implicit or written), a local, an ivar.
+fn receiver_key(recv: Option<&Expr>) -> Option<String> {
+    match recv.map(|r| &*r.node) {
+        None | Some(ExprNode::SelfRef) => Some(String::from("self")),
+        Some(ExprNode::Var { name, .. }) => Some(format!("local {}", name.as_str())),
+        Some(ExprNode::Ivar { name }) => Some(format!("@{}", name.as_str())),
+        _ => None,
+    }
+}
+
+/// The calls `cond` asks `respond_to?` about, through `&&`: each tested
+/// receiver with the method name (a Symbol or a String).
+fn responds_to(cond: &Expr, out: &mut Vec<(String, String)>) {
     match &*cond.node {
-        ExprNode::Send { method, args, .. } if method.as_str() == "respond_to?" => {
-            if let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) = args.first().map(|a| &*a.node) {
-                out.push(value.as_str().to_string());
+        ExprNode::Send { recv, method, args, .. } if method.as_str() == "respond_to?" => {
+            let name = match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => Some(value.as_str().to_string()),
+                Some(ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => Some(value.to_string()),
+                _ => None,
+            };
+            if let (Some(key), Some(name)) = (receiver_key(recv.as_ref()), name) {
+                out.push((key, name));
             }
         }
         ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } => {
@@ -532,7 +565,7 @@ fn walk(&mut self, expr: &Expr, owner: Option<(&str, bool)>) {
     if let ExprNode::Send { recv, method, .. } = &*expr.node
         && expr.diagnostic().is_none()
         && method.as_str() != "defined?"
-        && !self.guarded.iter().any(|g| g == method.as_str())
+        && !receiver_key(recv.as_ref()).is_some_and(|key| self.guarded.iter().any(|(k, m)| *k == key && m == method.as_str()))
     {
         // Not a module's own `self`: a concern's body runs on its includer, whose methods it calls.
         let own = owner.filter(|(c, _)| !index.is_module(c)).map(|(c, side)| (c.to_string(), side));
@@ -631,8 +664,23 @@ mod tests {
 
     #[test]
     fn a_call_a_respond_to_test_guards_is_not_reported() {
-        let found = findings("class A\n  def x\n    respond_to?(:owner) && owner\n  end\n\n  def y\n    if respond_to?(:label)\n      label\n    else\n      title\n    end\n  end\nend\n");
-        assert_eq!(found, ["`A#title` is called, but the emitted Ruby defines no such method"]);
+        let found = findings("class A\n  def x\n    respond_to?(:owner) && owner\n  end\n\n  def y\n    if self.respond_to?(\"label\")\n      label\n    else\n      title\n    end\n  end\n\n  def z(other)\n    other.respond_to?(:name) && name\n  end\nend\n");
+        assert_eq!(found, [
+            "`A#title` is called, but the emitted Ruby defines no such method",
+            "`A#name` is called, but the emitted Ruby defines no such method",
+        ]);
+    }
+
+    #[test]
+    fn every_arm_of_a_conditional_definition_is_indexed() {
+        let found = findings("class A\n  if ENV[\"X\"]\n    def title; 1; end\n  elsif ENV[\"Y\"]\n    def label; 2; end\n  else\n    def name; 3; end\n  end\n  unless ENV[\"Z\"]\n    def a; 4; end\n  else\n    def b; 5; end\n  end\n\n  def x\n    [title, label, name, a, b]\n  end\nend\n");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_included_hook_that_defines_methods_leaves_the_includer_unknown() {
+        let found = findings("module Titles\n  def self.included(base)\n    base.define_method(:title) { 1 }\n  end\nend\n\nclass A\n  include Titles\n\n  def x\n    title\n  end\nend\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
