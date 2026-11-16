@@ -1135,16 +1135,24 @@ module ActiveRecord
       record.attributes[col]
     end
 
-    # The bare column an order term names -- `"created_at"`,
-    # `"boosts.created_at DESC"` and the quoted `"\"created_at\" DESC"`
-    # all answer `"created_at"` -- or nil for anything that is not one
-    # column with an optional ASC/DESC.
+    # The bare column an order term names -- `"created_at"`, the
+    # relation's own `"boosts.created_at DESC"` on boosts, and the quoted
+    # `"\"created_at\" DESC"` all answer `"created_at"` -- or nil for
+    # anything that is not one column of this table with an optional
+    # ASC/DESC.
     def order_column(term)
       words = term.strip.split(/\s+/)
       return nil if words.length == 0 || words.length > 2
       col = words[0]
       dot = col.rindex(".")
-      col = col[(dot + 1)..] unless dot.nil?
+      unless dot.nil?
+        # Another table's column (a through scope's `beds.position`) is not
+        # one the loaded rows carry: answer nil, so the query runs again.
+        table = col[0, dot].to_s
+        table = table[1, table.length - 2].to_s if table.length > 2 && table.start_with?("\"") && table.end_with?("\"")
+        return nil unless table == @table
+        col = col[(dot + 1)..].to_s
+      end
       col = col[1, col.length - 2].to_s if col.length > 2 && col.start_with?("\"") && col.end_with?("\"")
       return nil unless col.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
       if words.length == 2
@@ -1637,6 +1645,68 @@ module ActiveRecord
       end
       theirs.each { |o| @orders << o unless @orders.include?(o) }
       nil
+    end
+
+    # A `has_many :through`'s through-association scope, folded into this
+    # relation the way Rails' `AssociationScope#add_constraints` folds a
+    # non-head reflection's scope into the query it builds: the scope's
+    # WHERE clauses and its orderings join, the orderings after this
+    # relation's own (`item.order_values | scope.order_values`, walked from
+    # the chain's far end, leaves the head's first), and the rest of the
+    # scope — a limit, an offset, a select, a from, a join, a hint — stays
+    # behind. `other` is that scope evaluated on the through model's
+    # own relation (`Relation.new(Through, false)`, Rails' `klass.unscoped`),
+    # so its hash conditions already name the through table and its order
+    # terms are that table's bare columns.
+    #
+    # The terms are qualified here because the caller's query is a JOIN:
+    # an unqualified column would resolve against whichever table has it.
+    # Rails arrives at the same shape through the through reflection's
+    # aliased table. A hash ordering of several columns comes as one
+    # clause (`"position" ASC, "id" ASC`), so each comma-separated term
+    # is qualified on its own. A scope whose body answers nil is Rails'
+    # `scope.instance_exec(owner, &block) || scope` falling back to the
+    # unscoped relation: nothing to merge. What a scope does to its own
+    # query with `unscope` (`beds.fallow`) is not carried onto this one.
+    def merge_through_scope(other)
+      return self if other.nil?
+      own_lists
+      unload_records
+      other.where_clauses.each do |w|
+        push_where(w)
+        @opaque_wheres = true
+      end
+      other.order_clauses.each do |o|
+        # A clause with parentheses or a quoted literal is an expression
+        # (`COALESCE(a, b)`), whose commas are not term separators: kept whole.
+        clauses = o.include?("(") || o.include?("'") ? [o] : o.split(",")
+        clauses.each do |clause|
+          term = qualify_order_term(clause.strip, other.table_sql)
+          @orders << term unless @orders.include?(term)
+        end
+      end
+      self
+    end
+
+    # An ordering term of another relation, qualified so it names that
+    # relation's table in the JOINed query: `position ASC` on the through
+    # table becomes `beds.position ASC`, and the QUOTED column a hash
+    # `order(position: :desc)` renders (`"position" DESC`) becomes
+    # `"beds"."position" DESC`. A term that is already qualified, or that
+    # is an expression rather than a column, is kept as written.
+    def qualify_order_term(term, table)
+      words = term.split(" ")
+      return term if words.length == 0 || words.length > 2
+      col = words[0]
+      qualified = ""
+      if col.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
+        qualified = "#{table}.#{col}"
+      elsif col.match?(/\A"[A-Za-z_][A-Za-z0-9_]*"\z/)
+        qualified = "#{ActiveRecord.adapter.quote_column_name(table)}.#{col}"
+      else
+        return term
+      end
+      words.length == 2 ? "#{qualified} #{words[1]}" : qualified
     end
 
     def where_clauses

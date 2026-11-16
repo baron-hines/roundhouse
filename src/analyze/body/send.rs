@@ -492,6 +492,70 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    /// Does the owner model itself HOLD `assoc` (`ClassInfo::held_has_many`)?
+    /// Only what `lower::scope_chain` rewrites: a model that declares the
+    /// held has_many itself (the rewrite looks the association up on the
+    /// owner's own model, not its ancestors), or a nilable union of that
+    /// one model.
+    fn held_has_many(&self, owner_ty: Option<&Ty>, assoc: &Symbol) -> bool {
+        let declares =
+            |id: &ClassId| self.classes().get(id).is_some_and(|cls| cls.held_has_many.contains(assoc));
+        match owner_ty {
+            Some(Ty::Class { id, .. }) => declares(id),
+            Some(Ty::Union { variants }) => {
+                let mut owners = variants.iter().filter_map(|v| match v {
+                    Ty::Class { id, .. } => Some(id),
+                    _ => None,
+                });
+                let Some(first) = owners.next() else { return false };
+                variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
+                    && owners.all(|id| id == first)
+                    && declares(first)
+            }
+            _ => false,
+        }
+    }
+
+    /// `owner.items.update(attrs)` — the collection proxy's bulk update
+    /// over the records a has_many holds. `lower::scope_chain` rewrites
+    /// it to the generated `__<name>_update`, which answers the records,
+    /// so the call types as the reader does. Only a has_many the owner
+    /// model HOLDS is rewritten, so only that case is typed here: any
+    /// other receiver keeps the Array dispatch and its "no known method"
+    /// refusal, which is what the emitted program would raise.
+    pub(super) fn assoc_bulk_update_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+        block: Option<&Expr>,
+        instance_self: Option<&Ty>,
+    ) -> Option<Ty> {
+        if method.as_str() != "update"
+            || block.is_some()
+            || !matches!(args, [arg] if matches!(&*arg.node, ExprNode::Hash { .. }))
+        {
+            return None;
+        }
+        let ExprNode::Send { recv: owner, method: assoc, args: assoc_args, block: None, .. } =
+            &*recv?.node
+        else {
+            return None;
+        };
+        if !assoc_args.is_empty() {
+            return None;
+        }
+        let owner_ty = match owner {
+            Some(owner) => owner.ty.as_ref(),
+            None => instance_self,
+        };
+        if !self.has_many_reader(owner_ty, assoc) || !self.held_has_many(owner_ty, assoc) {
+            return None;
+        }
+        recv_ty.cloned()
+    }
+
     /// Build the Ctx used to analyze a block passed to `recv.method(...) { |p1, p2| ... }`.
     /// Seeds the block's local_bindings with parameter types derived from the receiver
     /// and method (e.g. `array.each { |x| }` binds `x` to the array's element type).

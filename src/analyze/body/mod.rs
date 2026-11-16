@@ -363,6 +363,12 @@ pub struct ClassInfo {
     /// has_many readers without `through:` — the ones `lower::scope_chain`
     /// roots onto a relation, so a relation terminal on them runs as SQL.
     pub direct_has_many: crate::det::HashSet<Symbol>,
+    /// The `direct_has_many` names the model HOLDS records for
+    /// (`ingest::has_many_hold`: the model has a generated
+    /// `__hold_<name>`). `lower::scope_chain` rewrites
+    /// `<owner>.<name>.update(attrs)` to `__<name>_update` only for these,
+    /// so the analyzer types that call only for these too.
+    pub held_has_many: crate::det::HashSet<Symbol>,
     /// Modules mixed in via `include` (e.g. a controller's
     /// `include IntervalHelper`). A mixed-in module's instance methods
     /// become instance methods of the includer, so dispatch consults
@@ -3045,6 +3051,19 @@ impl<'a> BodyTyper<'a> {
                     return t;
                 }
                 if let Some(t) = self.assoc_loaded_ty(recv.as_ref(), method, ctx.self_ty.as_ref()) {
+                    return t;
+                }
+                // `owner.items.update(attrs)` on a has_many the owner HOLDS:
+                // the proxy's bulk update, which the scope-chain lowering
+                // rewrites to `__<name>_update`.
+                if let Some(t) = self.assoc_bulk_update_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                    ctx.instance_body.then_some(ctx.self_ty.as_ref()).flatten(),
+                ) {
                     return t;
                 }
                 // `x.attr = v` evaluates to `v` — Ruby's rule for an

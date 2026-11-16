@@ -793,6 +793,11 @@ fn reroot_unscoping(body: &mut Expr, target: &ClassId, foreign_key: &Symbol) {
                 walk(recv, target, foreign_key)
             }
             ExprNode::Send { recv: Some(recv), .. } => walk(recv, target, foreign_key),
+            // A held association's reader merges its query's rows with the
+            // records it holds: `_merge_target(<query>, @__held_<name>)`.
+            ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "_merge_target" => {
+                args.first_mut().is_some_and(|query| walk(query, target, foreign_key))
+            }
             ExprNode::Seq { exprs } => exprs.iter_mut().any(|x| walk(x, target, foreign_key)),
             _ => false,
         }
@@ -944,6 +949,37 @@ fn synth_has_many_reader(
         )
     } else {
         empty
+    };
+    // A model that holds what is created on, built on or pushed onto the
+    // association (`ingest::has_many_hold`) merges the rows with those
+    // held records, as Rails' `merge_target_lists` merges the query's
+    // rows into its memory: a record it already holds stands in for its
+    // row (same object, the row's values of the attributes it has not
+    // changed) and an unsaved one follows the rows. A pure read — the
+    // held list is only read here, so the method stays read-only. Only a
+    // reader that materializes its rows merges: a scoped association's
+    // reader answers a Relation (the scope's chain), which a merged Array
+    // would not be, so it keeps its rows as the query answered them.
+    let lazy_query = if held && scope.is_none() {
+        let span = Span::synthetic();
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("_merge_target"),
+                args: vec![
+                    lazy_query,
+                    Expr::new(
+                        span,
+                        ExprNode::Ivar { name: Symbol::from(format!("__held_{name}")) },
+                    ),
+                ],
+                block: None,
+                parenthesized: true,
+            },
+        )
+    } else {
+        lazy_query
     };
     let body = match (unsaved_guard && !through).then(|| unsaved_owner_guard(owner_key, empty)) {
         Some(unsaved) => seq(vec![guard, unsaved, lazy_query]),

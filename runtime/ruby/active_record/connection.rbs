@@ -310,6 +310,8 @@ module ActiveRecord
     def __track_saved_changes: (bool was_new) -> void
     def saved_changes: () -> Hash[String, untyped]
     def changes_to_save: () -> Hash[String, untyped]
+    def _merge_target: (Array[Base] rows, Array[Base]? held) -> Array[Base]
+    def _take_unchanged_attributes: (Base row) -> Base
     def _columns_to_write: () -> Array[String]
     def attribute_was: (String name) -> untyped
     def clear_attribute_change: (String name) -> nil

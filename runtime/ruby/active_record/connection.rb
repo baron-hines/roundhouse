@@ -2660,6 +2660,42 @@ module ActiveRecord
       changes
     end
 
+    # Rails' `merge_target_lists`: the rows an association query answered,
+    # with a record the association already held (one created or built
+    # through it) standing in for its row, and the held records the query
+    # did not answer and that are not persisted (unsaved or destroyed
+    # ones, as Rails' `memory.reject(&:persisted?)`) after them. The held
+    # object is kept —
+    # it is what the target answers — and takes the row's value of every
+    # attribute it has not changed, keeping the changes it has.
+    def _merge_target(rows, held)
+      return rows if held.nil? || held.empty?
+      merged = []
+      rows.each do |row|
+        found = nil
+        held.each { |h| found = h if !h.new_record? && h.id == row.id }
+        if found.nil?
+          merged << row
+        else
+          found._take_unchanged_attributes(row)
+          merged << found
+        end
+      end
+      held.each { |h| merged << h unless h.persisted? }
+      merged
+    end
+
+    # The attribute half of `_merge_target`: each attribute `row` carries
+    # that this record has not changed, written through the column
+    # indexer, as Rails' `_write_attribute(name, record[name])` writes it.
+    def _take_unchanged_attributes(row)
+      row.attributes.each do |name, value|
+        next if attribute_changed?(name)
+        self[name.to_sym] = value
+      end
+      self
+    end
+
     # The columns the emitted `_adapter_update` writes, as Rails' partial
     # updates choose them: the ones with a pending change, among them a
     # column the row's `select` left out that has been assigned since — a

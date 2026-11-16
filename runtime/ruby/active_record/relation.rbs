@@ -245,6 +245,8 @@ module ActiveRecord
     def merge: (Relation other) -> Relation
     def merge!: (Relation other) -> Relation
     def merge_orders!: (Relation other) -> nil
+    def merge_through_scope: (Relation? other) -> Relation
+    def qualify_order_term: (String term, String table) -> String
     def where_clauses: () -> Array[String]
     def order_clauses: () -> Array[String]
     def reordering?: () -> bool
