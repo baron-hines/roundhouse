@@ -175,6 +175,12 @@ fn include_expr(module: &ClassId, span: crate::span::Span) -> Expr {
 /// condition around the include — because what follows it may not run on
 /// this includer, and a module expanded into every includer that the guard
 /// excluded is a method where Rails has none.
+///
+/// A statement of any other shape INSIDE the `class_eval` block stops the
+/// whole scan, not only the block's own walk: a `base.class_eval { return
+/// unless base.name == "P1" }` exits the hook for every includer it turns
+/// away, so a `base.include W` written after it runs on P1 alone and must
+/// not be carried into P2.
 fn hook_includes(body: &Expr, base: &Symbol, out: &mut Vec<String>) {
     for statement in statements(body) {
         let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*statement.node else { break };
@@ -189,10 +195,10 @@ fn hook_includes(body: &Expr, base: &Symbol, out: &mut Vec<String>) {
                 };
                 for statement in statements(body) {
                     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node else {
-                        break;
+                        return;
                     };
                     if method.as_str() != "include" {
-                        break;
+                        return;
                     }
                     out.extend(args.iter().filter_map(written));
                 }
