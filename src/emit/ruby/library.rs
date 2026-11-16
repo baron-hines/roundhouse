@@ -8935,6 +8935,15 @@ pub(super) fn recording_rendered() -> bool {
     RENDERED.with(|r| r.borrow().is_some())
 }
 
+/// Add classes a worker rendered to this thread's record, in order.
+pub(super) fn extend_rendered(classes: Vec<LibraryClass>) {
+    RENDERED.with(|r| {
+        if let Some(rendered) = r.borrow_mut().as_mut() {
+            rendered.extend(classes);
+        }
+    });
+}
+
 pub fn record_rendered<T>(f: impl FnOnce() -> T) -> (T, Vec<LibraryClass>) {
     let previous = RENDERED.with(|r| r.borrow_mut().replace(Vec::new()));
     let out = f();

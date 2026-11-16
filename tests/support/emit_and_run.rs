@@ -528,10 +528,17 @@ impl Overlay {
         let mut errors: Vec<_> = found.into_iter().filter(|d| d.severity == Severity::Error).collect();
 
         let emitted = scratch.join("emitted");
-        let (files, emit_diags) = roundhouse::emit::diagnostics::scope(|| {
-            roundhouse::project::target_files(&app, &source, target)
+        // As the CLI does: a send on an app model the written Ruby defines nothing for is an error.
+        let ((files, emit_diags), rendered) = roundhouse::emit::ruby::record_rendered(|| {
+            roundhouse::emit::diagnostics::scope(|| roundhouse::project::target_files(&app, &source, target))
         });
         let mut emit_diags = emit_diags;
+        if let Ok(files) = &files
+            && roundhouse::emit::audit::gates(target)
+        {
+            let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+            emit_diags.extend(roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources));
+        }
         roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut emit_diags);
         errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
         let files = match files {

@@ -745,19 +745,29 @@ fn transpile(
             None => project::target_files_lowering_in_place(&mut app, input, target),
         })
     };
-    let audit = std::env::var_os("ROUNDHOUSE_AUDIT").is_some();
-    // Not recorded on every run: the record clones each rendered class's IR, which only the audit reads.
+    // The Ruby family and Spinel write Ruby, which the audit reads back: a
+    // send on an app model the written Ruby defines nothing for is an
+    // error. `ROUNDHOUSE_AUDIT` also lists the warnings, on other classes.
+    let list_audit = std::env::var_os("ROUNDHOUSE_AUDIT").is_some();
+    let gates = roundhouse::emit::audit::gates(target);
+    let audit = list_audit || gates;
     let ((files_result, mut diags), rendered) =
         if audit { roundhouse::emit::ruby::record_rendered(emit) } else { (emit(), Vec::new()) };
     if audit
         && let Ok(files) = &files_result
     {
         let started = std::time::Instant::now();
-        let findings = roundhouse::emit::audit::audit(&rendered, files);
-        for d in &findings {
-            eprintln!("{}", d.render(&app.sources));
+        let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+        let findings = roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources);
+        if list_audit {
+            for d in &findings {
+                eprintln!("{}", d.render(&app.sources));
+            }
+            eprintln!("roundhouse: audit: {} send(s) resolve to no emitted method ({:?})", findings.len(), started.elapsed());
         }
-        eprintln!("roundhouse: audit: {} send(s) resolve to no emitted method ({:?})", findings.len(), started.elapsed());
+        if gates {
+            diags.extend(findings.into_iter().filter(|d| d.severity == Severity::Error));
+        }
     }
 
     // Same attribution pass as `analyze_diags` above, run again here:

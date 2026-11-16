@@ -1235,6 +1235,12 @@ module ActiveRecord
       nil
     end
 
+    # Rails' `restore_attributes`: every pending change written back, the
+    # names it restored. None here, for the same reason.
+    def restore_attributes
+      changes_to_save.keys
+    end
+
     # `id` never appears in the subclass `attributes` hash, so the
     # created-vs-updated question is answered by the save path itself
     # rather than the snapshot diff.

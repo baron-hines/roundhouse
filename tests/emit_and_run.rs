@@ -22428,3 +22428,5 @@ mod through_scope_merge;
 
 #[path = "emit_and_run/held_has_many_default_scope_key.rs"]
 mod held_has_many_default_scope_key;
+#[path = "emit_and_run/emitted_model_methods.rs"]
+mod emitted_model_methods;
