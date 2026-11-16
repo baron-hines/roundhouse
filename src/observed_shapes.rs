@@ -72,7 +72,7 @@ pub struct Observation {
 pub struct Cached {
     pub key: String,
     pub observation: Observation,
-    /// For a boot that failed: the Ruby and gem paths it failed with, which a later build must share to reuse it.
+    /// The Ruby and gems the boot ran with, which a later build must share to reuse it.
     #[serde(default)]
     pub env: Option<String>,
 }

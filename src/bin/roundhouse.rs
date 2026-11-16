@@ -405,26 +405,26 @@ fn observe_shapes(
     let observation = match cached {
         Some(c) => c.observation,
         None => {
+            // Not reused once the Ruby or its gems differ: a failed boot may be the machine's, and a gem may shape a class by the Ruby it runs on.
+            let before = obs::environment(input);
             let booted = boot_observer(input, gems);
-            // Not reused once the Ruby or its gems differ: a failed boot may be the machine's, not the app's.
-            let env = booted.is_err().then(|| obs::environment(input));
+            let env = Some(before).filter(|before| *before == obs::environment(input));
             let observation = booted.unwrap_or_else(|why| obs::Observation {
                 effects: Vec::new(),
                 refusals: vec![why],
             });
             // Not only a boot that answered: one that failed would otherwise be tried again on every build.
-            if let Some(dir) = cache.parent() {
-                let _ = std::fs::create_dir_all(dir);
+            // Nor one whose Ruby or gems changed while it ran: which of them it saw is not known.
+            if env.is_some() {
+                if let Some(dir) = cache.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(
+                    &cache,
+                    serde_json::to_vec_pretty(&obs::Cached { key: key.to_string(), observation: observation.clone(), env })
+                        .unwrap_or_default(),
+                );
             }
-            let _ = std::fs::write(
-                &cache,
-                serde_json::to_vec_pretty(&obs::Cached {
-                    key: key.to_string(),
-                    observation: observation.clone(),
-                    env,
-                })
-                .unwrap_or_default(),
-            );
             observation
         }
     };

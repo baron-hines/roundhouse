@@ -216,10 +216,16 @@ pub(super) fn resolve(app: &mut App) {
                         .flat_map(|c| c.methods.iter())
                         .filter(|m| m.name.as_str() == from && m.receiver == receiver)
                         .collect();
-                    // Not where an ancestor defines it too: then another file's def may come after the alias, which copied the ancestor's.
+                    // Not where anything above the class could define it: then another file's def may come after the alias,
+                    // which copied that one. `ancestor_method` finding none is no proof, so no declaration may name one.
+                    let alone = candidates.iter().filter(|c| c.name == lc.name).all(|c| {
+                        c.parent.is_none()
+                            && c.includes.is_empty()
+                            && !c.unknown_calls.iter().any(|call| matches!(&*call.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "prepend" | "extend")))
+                    });
                     if let [original] = elsewhere[..]
                         && !calls_super(&original.body)
-                        && ancestor_method(&candidates, lc, from, receiver, call.span).is_none()
+                        && alone
                     {
                         let mut copy = original.clone();
                         copy.name = Symbol::from(to);
