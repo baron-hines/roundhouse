@@ -3129,6 +3129,11 @@ end
         concern_class_method_spans.extend(carriers);
         framework_shadow_scopes.extend(shadows);
     }
+    // `concerning :Topic do … end` is a nested Concern module plus an
+    // include of it: desugared before the splices read both. The `enum`s
+    // its `included do` declares reach the model the same way a file's
+    // concern does.
+    concern_enums.extend(super::concerning::expand(&mut app, &sources, &mut concern_class_method_spans));
     app.plain_mixins = plain_mixins(&app, &concern_class_method_spans);
     // Not a module's own `class << self` defs: Ruby defines those on the module, whatever ingest also copies onto includers.
     app.concern_class_side_spans = concern_class_method_spans
@@ -4654,7 +4659,7 @@ fn inline_concern_literals(
     }
 }
 
-fn qualify_carried_constants(
+pub(super) fn qualify_carried_constants(
     expr: &mut crate::expr::Expr,
     concern: &str,
     defined: &crate::det::HashSet<String>,
@@ -10113,7 +10118,7 @@ fn project_extensions<V: Vfs + ?Sized>(
 /// be reopened in another file, and every `included do` block it has runs
 /// for the includer, so a second file's items are appended to the first's
 /// rather than replacing them.
-fn append_concern_items(
+pub(super) fn append_concern_items(
     app: &mut App,
     scan: super::library_class::ConcernModelScan,
     keep: impl Fn(&crate::ident::ClassId) -> bool,

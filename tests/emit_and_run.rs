@@ -22456,3 +22456,8 @@ mod concern_prepended;
 #[path = "emit_and_run/concern_class_eval_include.rs"]
 mod concern_class_eval_include;
 
+// Concern shapes: `concerning :Topic do … end` in a model body.
+#[path = "emit_and_run/concerning_block.rs"]
+mod concerning_block;
+
+
