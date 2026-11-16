@@ -12614,7 +12614,7 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 //
 // Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
 // with a scope or polymorphic owner, and scope-carrying through-assocs
-// (other than a plain `order("...")`) get no
+// (other than `distinct` or a plain `order("...")`) get no
 // batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
 // Rails, which also lazy-loads what `includes` doesn't name). Unscoped
@@ -12806,7 +12806,9 @@ enum PreloadKind {
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
     Through { target: String, join: String, group_col: String, order: Option<String>, string_key: bool },
     /// A through loaded hop first (`through_hop_preload_kind`): the owner's
-    /// `hop` batch, then `hop_model`'s `source` batch over the hop records.
+    /// `hop` batch, then `hop_model`'s `source` batch over the hop records,
+    /// or, when `apart` is `(target column, hop record's key read)`, one
+    /// query of the target that seats nothing on the hop records.
     ThroughHop {
         target: String,
         hop: String,
@@ -12815,6 +12817,8 @@ enum PreloadKind {
         source: String,
         source_many: bool,
         one: bool,
+        apart: Option<(String, String)>,
+        distinct: bool,
     },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
@@ -12925,16 +12929,19 @@ fn direct_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::As
 }
 
 /// Rails' through preloader (`Preloader::ThroughAssociation`) for a
-/// through with no scope: the hop loads on the owners and is seated on
-/// them, its through scope being empty; then the source loads off the hop
-/// records and is seated on them, the through's own scope being empty
-/// too. Each owner holds its hop records' sources, in hop order, and an
+/// through whose scope has no `where`: the hop loads on the owners and is
+/// seated on them, its through scope being empty; then the source loads
+/// off the hop records. The source is seated on the hop records only
+/// while the through's own scope is empty: a `distinct` one
+/// loads the source records apart (`associate_by_default: false`), so a
+/// hop's own source still loads when it is read. Each owner holds its
+/// hop records' sources, in hop order (unique for `distinct`), and an
 /// owner already holding its target keeps it.
 ///
 /// Taken when the hop and the source each have a direct batch
 /// (`direct_preload_kind`) and the source is the target's class; a
-/// `has_one :through` needs a singular hop and source. A scoped one keeps
-/// its lazy reader or the joined batch.
+/// `has_one :through` needs a singular hop and source. Any other scope
+/// (a `where`, an `order`) keeps its lazy reader or the joined batch.
 fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> Option<PreloadKind> {
     use crate::dialect::Association;
     let (target, thr_name, scope, one) = match assoc {
@@ -12947,8 +12954,23 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
     {
         return None;
     }
-    if scope.is_some() {
-        return None;
+    let mut distinct = false;
+    if let Some(scope) = scope {
+        let mut call = scope;
+        loop {
+            let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+            if !args.is_empty() {
+                return None;
+            }
+            match method.as_str() {
+                "distinct" => distinct = true,
+                _ => return None,
+            }
+            match recv {
+                Some(r) => call = r,
+                None => break,
+            }
+        }
     }
     let hop = model.associations().filter(|a| a.name() == thr_name).last()?;
     let (hop_many, hop_target) = match direct_preload_kind(model, hop, app)? {
@@ -12970,6 +12992,15 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
     if one && (hop_many || source_many) {
         return None;
     }
+    // A source loaded apart: the column its rows are keyed by, and how a
+    // hop record reads that key.
+    let apart = distinct.then(|| match &source_kind {
+        PreloadKind::BelongsTo { fk, .. } => ("id".to_string(), format!("[:{fk}]")),
+        PreloadKind::HasMany { fk, owner_key, .. } | PreloadKind::HasOne { fk, owner_key, .. } => {
+            (fk.clone(), format!(".{owner_key}"))
+        }
+        _ => unreachable!("source_target matched a direct kind"),
+    });
     Some(PreloadKind::ThroughHop {
         target: target.0.as_str().to_string(),
         hop: thr_name.as_str().to_string(),
@@ -12978,6 +13009,8 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
         source: source.name().as_str().to_string(),
         source_many,
         one,
+        apart,
+        distinct,
     })
 }
 
@@ -13249,7 +13282,7 @@ end
             // every owner that does not hold it, the source over every
             // owner's hop records, and an owner already holding its target
             // keeps it; when every owner does, nothing runs.
-            PreloadKind::ThroughHop { hop, hop_many, hop_model, source, source_many, one, .. } => {
+            PreloadKind::ThroughHop { target, hop, hop_many, hop_model, source, source_many, one, apart, distinct } => {
                 let for_hops = |body: &str| {
                     if *hop_many {
                         format!("    r.{hop}_target.each do |h|\n{body}\n    end")
@@ -13262,12 +13295,43 @@ end
                 } else {
                     format!("      r.{name}_target.each do |s|\n        out << s\n      end")
                 };
-                let load = format!("  {hop_model}._preload_batch_{source}(middle) if middle.length > 0");
-                let push = if *source_many {
-                    format!("      h.{source}_target.each do |s|\n        list << s\n      end")
-                } else {
-                    format!("      s = h.{source}\n      list << s unless s.nil?")
+                let (load, push) = match apart {
+                    None => (
+                        format!("  {hop_model}._preload_batch_{source}(middle) if middle.length > 0"),
+                        if *source_many {
+                            format!("      h.{source}_target.each do |s|\n        list << s\n      end")
+                        } else {
+                            format!("      s = h.{source}\n      list << s unless s.nil?")
+                        },
+                    ),
+                    Some((column, key)) => {
+                        let distinct = if *distinct { ".distinct" } else { "" };
+                        let take = if *source_many {
+                            "        got.each do |s|\n          list << s\n        end"
+                        } else {
+                            "        list << got[0]"
+                        };
+                        (
+                            format!(
+                                r#"  keys = []
+  middle.each do |h|
+    v = h{key}
+    keys << v unless v.nil?
+  end
+  found = {{}}
+  if keys.length > 0
+    ActiveRecord::Relation.new({target}).where({column}: keys){distinct}.to_a.each do |rec|
+      k = rec.{column}
+      found[k] = [] if found[k].nil?
+      found[k] << rec
+    end
+  end"#
+                            ),
+                            format!("      got = found[h{key}]\n      unless got.nil?\n{take}\n      end"),
+                        )
+                    }
                 };
+                let unique = if *distinct { "    list = list.uniq\n" } else { "" };
                 let seat = if *one { "list.first" } else { "list" };
                 let collect_middle = for_hops("      middle << h");
                 let collect_list = for_hops(&push);
@@ -13298,7 +13362,7 @@ def self._preload_batch_{name}(records)
   pending.each do |r|
     list = []
 {collect_list}
-    r._preload_{name}({seat})
+{unique}    r._preload_{name}({seat})
     list.each do |s|
       out << s
     end
