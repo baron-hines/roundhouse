@@ -2,9 +2,8 @@
 //! `run_load_hooks(:name, self)` runs its whole block on that class: the
 //! `class_attribute` it declares, the methods it defines and a reopening
 //! `class_eval`, as Rails' lazy load hooks run it, whether the hook is
-//! registered before the model loads or after. Ignored as a fork spec
-//! until the compiler does; the expected values are ActiveRecord 8.1.4's
-//! answers.
+//! registered before the model loads or after. The expected values are
+//! ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -64,20 +63,66 @@ end
 "##)
 }
 
+/// A hook block that takes a block parameter (Rails' `class_eval` passes it
+/// the class) is not one this splice binds. It is reported as an error
+/// naming the hook and the model that fires it, never dropped in silence.
+fn hook_with_a_block_parameter_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", r##"class ApplicationRecord < ActiveRecord::Base
+  self.abstract_class = true
+end
+"##)
+        .write("app/models/kite.rb", r##"class Kite < ApplicationRecord
+  ActiveSupport.run_load_hooks(:tether, self)
+end
+"##)
+        .write("config/initializers/tether.rb", r##"ActiveSupport.on_load(:tether) do |base|
+  base.class_attribute :tether_length
+end
+"##)
+        .write("db/schema.rb", r##"ActiveRecord::Schema.define do
+  create_table "kites", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"##)
+}
+
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: ruby semantics"]
 fn an_on_load_hook_runs_its_whole_block_on_the_model() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
 
+/// The hook's first statement (`class_attribute`) starts at the same offset
+/// in the initializer (34) as the model's `self.table_name =` does in the
+/// model (indented three spaces to land there): the spliced statement is
+/// still the hook's, not taken for the model's.
 #[test]
-#[ignore = "fork spec: ruby semantics"]
+fn a_hook_statement_at_a_model_declarations_offset_still_runs() {
+    let run = app()
+        .edit("app/models/kite.rb", "class Kite < ApplicationRecord\n", "class Kite < ApplicationRecord\n   self.table_name = \"kites\"\n")
+        .run_ruby(SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
 fn an_on_load_hook_runs_its_whole_block_on_the_model_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+fn a_hook_block_the_splice_refuses_is_reported_naming_the_hook_and_the_model() {
+    let errors = hook_with_a_block_parameter_app().check_errors();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    let error = &errors[0];
+    assert!(error.contains(":tether"), "{error}");
+    assert!(error.contains("Kite"), "{error}");
 }

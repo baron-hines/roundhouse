@@ -176,11 +176,74 @@ pub(super) fn ingest_model_with_enum_constants(
             .filter_map(|c| c.arguments()?.arguments().iter().next().and_then(|a| super::util::symbol_value(&a)))
             .map(|n| Symbol::from(n.as_str()))
             .collect();
-        for statement in stmts {
+        // The walk's statements: the body's own, and, at each
+        // `ActiveSupport.run_load_hooks(:name, self)` that fires one, the whole
+        // block of every `ActiveSupport.on_load(:name)` an initializer
+        // registered — Rails runs it as `base.class_eval(&block)` right there,
+        // so its statements are the class body's at that point. The blocks are
+        // parsed from their own initializer files, so the items they become
+        // carry spans into the file they were written in.
+        let splices = super::load_hooks::splices(&stmts);
+        let mut hook_files: Vec<&super::load_hooks::Splice> = Vec::new();
+        for (_, splice) in &splices {
+            if !hook_files.iter().any(|kept| kept.file == splice.file) {
+                hook_files.push(splice);
+            }
+        }
+        let mut hook_parses: Vec<ruby_prism::ParseResult<'_>> = Vec::with_capacity(hook_files.len());
+        for splice in &hook_files {
+            hook_parses.push(super::load_hooks::parse_hook_file(&splice.file, &splice.text));
+        }
+        let mut walk: Vec<WalkStmt<'_>> = Vec::with_capacity(stmts.len());
+        for (at, statement) in stmts.into_iter().enumerate() {
+            let fired = super::load_hooks::fired_by(&statement).is_some();
+            walk.push(WalkStmt { node: statement, file, source, hook: None });
+            if !fired {
+                continue;
+            }
+            for (_, splice) in splices.iter().filter(|(from, _)| *from == at) {
+                if let Some(reason) = &splice.refusal {
+                    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                        splice.span,
+                        None,
+                        super::load_hooks::ON_LOAD,
+                        super::load_hooks::refusal_message(&splice.hook, class_name.as_str(), reason),
+                    ));
+                    continue;
+                }
+                let Some(index) = hook_files.iter().position(|kept| kept.file == splice.file) else { continue };
+                super::load_hooks::mark_spliced(splice, class_name.as_str());
+                for node in super::load_hooks::block_statements(hook_parses[index].node(), splice.span.start as usize) {
+                    walk.push(WalkStmt { node, file: &splice.file, source: &splice.text, hook: Some(&splice.hook) });
+                }
+            }
+        }
+        for item in walk {
+            // The statement's own file: the model's, or the initializer a
+            // spliced hook block was written in.
+            let WalkStmt { node: statement, file, source, hook } = item;
+            let spliced = hook.is_some();
+            class_consts.set_foreign_offsets(spliced);
+            // `ActiveSupport.run_load_hooks(:name, self)` itself lowers to
+            // nothing: what it runs is in the walk, here.
+            if hook.is_none() && super::load_hooks::fired_by(&statement).is_some() {
+                note_end(&mut prev_end, spliced, &statement);
+                continue;
+            }
             let definition = visibility::definition(&statement).map(|d| d.as_node());
+            // `Visibility` and the table-name declaration know the model's
+            // statements by their offsets in the model's file, which a spliced
+            // statement's offsets (into its initializer) can equal. A spliced
+            // statement never asks them, and a visibility marker or `private
+            // def` in a hook block, which it would need, is reported.
+            if spliced && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+                let err = IngestError::Unsupported { file: file.into(), message: "visibility in a load hook block is not carried".into() };
+                report_hook_statement(hook, file, &statement, class_name.as_str(), &err);
+                continue;
+            }
             let stmt = definition.as_ref().unwrap_or(&statement);
             if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
-                prev_end = Some(statement.location().end_offset());
+                note_end(&mut prev_end, spliced, &statement);
                 if visibility.names_inherited(&statement) {
                     carried_markers.insert(statement.location().start_offset());
                     let mut expr = ingest_expr(&statement, file)?;
@@ -192,8 +255,8 @@ pub(super) fn ingest_model_with_enum_constants(
             // Explicit names override convention before schema binding.
             // Like primary_key, the setter is consumed: lowering already
             // synthesizes table_name from Model::table for every target.
-            if table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
-                prev_end = Some(stmt.location().end_offset());
+            if !spliced && table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             // `self.primary_key = "key"` is recognized into
@@ -204,17 +267,25 @@ pub(super) fn ingest_model_with_enum_constants(
             // next statement.
             if let Some(pk) = parse_primary_key_decl(&stmt) {
                 primary_key = Some(pk);
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             let stmt_start = stmt.location().start_offset();
-            let leading_area_start =
-                comments.first().map(|(off, _)| *off).filter(|off| *off < stmt_start)
-                    .unwrap_or(stmt_start);
-            let leading = drain_comments_before(&mut comments, stmt_start);
-            let leading_blank = prev_end
-                .map(|pe| source_has_blank_line(source, pe, leading_area_start))
-                .unwrap_or(false);
+            // A spliced hook statement's comments are the initializer's, not
+            // this body's, and its offsets index that file: it carries none of
+            // the body's leading comments and no blank line of its own.
+            let (leading, leading_blank) = if spliced {
+                (Vec::new(), false)
+            } else {
+                let leading_area_start =
+                    comments.first().map(|(off, _)| *off).filter(|off| *off < stmt_start)
+                        .unwrap_or(stmt_start);
+                let leading = drain_comments_before(&mut comments, stmt_start);
+                let leading_blank = prev_end
+                    .map(|pe| source_has_blank_line(source, pe, leading_area_start))
+                    .unwrap_or(false);
+                (leading, leading_blank)
+            };
             // `enum :status, %i[…]` — one statement standing for a
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
@@ -226,7 +297,7 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Ok(Some(ClassBodyExpansion::Enum(expanded))) => {
@@ -250,13 +321,20 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Ok(None) => {}
+                    Err(err) if spliced => {
+                        // A spliced hook statement the model ingest refuses: Rails
+                        // runs the block, so this one is reported, not dropped.
+                        report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                        note_end(&mut prev_end, spliced, stmt);
+                        continue;
+                    }
                     Err(err) if super::survey::is_active() => {
                         super::survey::record(&err);
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -286,21 +364,25 @@ pub(super) fn ingest_model_with_enum_constants(
             ) {
                 let mut leading = Some((leading, leading_blank));
                 for mut method in methods {
-                    visibility.apply(&statement, &mut method);
+                    if !spliced {
+                        visibility.apply(&statement, &mut method);
+                    }
                     let (comments, blank) = leading.take().unwrap_or_default();
                     body.push(ModelBodyItem::Method { method, leading_comments: comments, leading_blank_line: blank });
                 }
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             if let Some(mut copy) = stmt.as_call_node().and_then(|call| model_alias_method_copy(&call, &body)) {
-                visibility.apply(&statement, &mut copy);
+                if !spliced {
+                    visibility.apply(&statement, &mut copy);
+                }
                 body.push(ModelBodyItem::Method {
                     method: copy,
                     leading_comments: leading,
                     leading_blank_line: leading_blank,
                 });
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             // `alias new old` (keyword form). Columns, associations,
@@ -328,7 +410,7 @@ pub(super) fn ingest_model_with_enum_constants(
                         leading_blank_line: leading_blank,
                         span,
                     });
-                    prev_end = Some(stmt.location().end_offset());
+                    note_end(&mut prev_end, spliced, stmt);
                     continue;
                 }
                 // Neither side is a plain name (e.g. a global variable
@@ -367,12 +449,17 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
+                        continue;
+                    }
+                    Err(err) if spliced => {
+                        report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) if super::survey::is_active() => {
                         super::survey::record(&err);
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -428,7 +515,7 @@ pub(super) fn ingest_model_with_enum_constants(
                         leading_blank_line: false,
                     });
                 }
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             let classified = {
@@ -439,9 +526,14 @@ pub(super) fn ingest_model_with_enum_constants(
             };
             let items = match classified {
                 Ok(items) => items,
+                Err(err) if spliced => {
+                    report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                    note_end(&mut prev_end, spliced, stmt);
+                    continue;
+                }
                 Err(err) if super::survey::is_active() => {
                     super::survey::record(&err);
-                    prev_end = Some(stmt.location().end_offset());
+                    note_end(&mut prev_end, spliced, stmt);
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -450,7 +542,9 @@ pub(super) fn ingest_model_with_enum_constants(
             // attribute; only the first carries the blank line that
             // separated the declaration from what came before it.
             for (i, mut item) in items.into_iter().enumerate() {
-                if let ModelBodyItem::Method { method, .. } = &mut item {
+                if spliced {
+                    // Public, as a hook block without visibility markers defines it.
+                } else if let ModelBodyItem::Method { method, .. } = &mut item {
                     visibility.apply(&statement, method);
                 } else if let ModelBodyItem::Unknown { expr, .. } = &item {
                     if let Some(mut methods) = visibility.restricted_at(&statement).then(|| restricted_attr_methods(expr, &owner, &attributes, &declared_attributes)).flatten() {
@@ -474,7 +568,7 @@ pub(super) fn ingest_model_with_enum_constants(
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);
             }
-            prev_end = Some(stmt.location().end_offset());
+            note_end(&mut prev_end, spliced, stmt);
         }
     }
     visibility.uncarried_inherited(&carried_markers, file)?;
@@ -510,6 +604,41 @@ pub(super) fn ingest_model_with_enum_constants(
             end: class_loc.end_offset() as u32,
         },
     }))
+}
+
+/// One statement the class-body walk reads: the body's own, or one of an
+/// `ActiveSupport.on_load` block spliced in where the body fires it.
+struct WalkStmt<'a> {
+    node: Node<'a>,
+    /// The file its spans name: the model's, or the initializer the hook block
+    /// was written in.
+    file: &'a str,
+    /// That file's text.
+    source: &'a [u8],
+    /// The hook the statement came from, when it was spliced.
+    hook: Option<&'a str>,
+}
+
+/// Where the previous statement ended, for the blank line before the next one.
+/// A spliced hook statement lives in another file, so it leaves the body's own
+/// end where it was.
+fn note_end(prev_end: &mut Option<usize>, spliced: bool, node: &Node<'_>) {
+    if !spliced {
+        *prev_end = Some(node.location().end_offset());
+    }
+}
+
+/// A statement of a spliced `ActiveSupport.on_load` block the model ingest
+/// refuses: Rails runs it as part of the class body, so the compiled app would
+/// lose it — an error naming the hook and the model, never a silent drop.
+fn report_hook_statement(hook: Option<&str>, file: &str, node: &Node<'_>, model: &str, err: &IngestError) {
+    let Some(hook) = hook else { return };
+    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+        super::util::node_span(node, file),
+        None,
+        super::load_hooks::ON_LOAD_STATEMENT,
+        super::load_hooks::statement_message(hook, model, super::load_hooks::error_detail(err)),
+    ));
 }
 
 /// `alias_method :to, :from` (literal names) of the last instance def of
@@ -2305,6 +2434,9 @@ pub(super) struct ClassConsts {
     enum_labels: crate::det::HashMap<String, Vec<String>>,
     enum_key_lists: crate::det::HashMap<(usize, usize), Vec<Literal>>,
     enum_key_constants: crate::det::HashSet<String>,
+    /// The statement being read is a spliced load hook's, whose offsets
+    /// index its initializer, not the body `enum_key_lists` is keyed by.
+    foreign_offsets: bool,
 }
 
 /// The operators [`ClassConsts::int_expr`] folds.
@@ -2394,8 +2526,8 @@ impl ClassConsts {
     /// literal (`1.week.seconds`, folded to its Integer seconds), `.freeze`d
     /// or not, or another folded list constant.
     pub(super) fn list(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
-        if let Some(list) = self.enum_key_lists.get(&(node.location().start_offset(), node.location().end_offset())) {
-            return Some(list.clone());
+        if let Some(list) = self.key_list_at(node) {
+            return Some(list);
         }
         if let Some(inner) = single_parenthesized(node) {
             return self.list(&inner);
@@ -2707,7 +2839,20 @@ impl ClassConsts {
         {
             return self.lists.get(&key).cloned();
         }
+        self.key_list_at(node)
+    }
+
+    /// The folded list an imported constant read at `node` holds, for a node of the body's own file.
+    fn key_list_at(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
+        if self.foreign_offsets {
+            return None;
+        }
         self.enum_key_lists.get(&(node.location().start_offset(), node.location().end_offset())).cloned()
+    }
+
+    /// Whether the statements read next come from another file (a spliced load hook's).
+    pub(super) fn set_foreign_offsets(&mut self, foreign: bool) {
+        self.foreign_offsets = foreign;
     }
 
     /// `/pattern#{CONST}pattern/flags` — folds when the embedded part
