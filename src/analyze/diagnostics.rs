@@ -1139,6 +1139,16 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(link_to_if_params_shadowing_nested_locals(app));
     out.extend(devise_refusals(app));
     out.extend(unexpanded_delegated_types(app));
+    // A `direct` helper's `route_for` that names no route stays a call
+    // to a method nothing defines.
+    out.extend(crate::lower::routes_to_library::direct::unresolved_route_for_calls(app).into_iter().map(|span| {
+        Diagnostic::unsupported(
+            span,
+            None,
+            "route_for",
+            "in a `direct` helper, a name that is not a literal, or an interpolation spelling no named route that takes these arguments, so no target can call it",
+        )
+    }));
     out.extend(overridden_synthesized_accessors(app));
     out.extend(runtime_defined_surfaces(app));
     // A filter's return value is Rails' to discard (`around_action
