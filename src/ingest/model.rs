@@ -600,15 +600,30 @@ pub(super) fn ingest_model_body_items(
         start: stmt.location().start_offset() as u32,
         end: stmt.location().end_offset() as u32,
     };
-    // Only `serialize` beside the `define_method`s: the other macros are read from the statement, not from a rewritten Expr.
+    // Only `serialize` and `scope` beside the `define_method`s: the other macros are read from the statement, not from a rewritten Expr.
+    enum Unrolled {
+        Serialize(Expr),
+        Scope(crate::dialect::Scope),
+    }
     let mut macros = Vec::new();
     if let Some(methods) = super::define_method_loop::unroll_with_macros(stmt, owner, file, &mut macros)
-        && macros.iter().all(|m| matches!(&*m.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "serialize"))
+        && let Some(unrolled) = macros
+            .into_iter()
+            .map(|expr| match &*expr.node {
+                ExprNode::Send { recv: None, method, .. } if method.as_str() == "serialize" => Some(Unrolled::Serialize(expr)),
+                ExprNode::Send { recv: None, method, .. } if method.as_str() == "scope" => unrolled_scope(&expr).map(Unrolled::Scope),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
     {
         let mut leading = Some(leading_comments);
         let mut items: Vec<ModelBodyItem> = Vec::new();
-        for expr in macros {
-            items.push(ModelBodyItem::Unknown { expr, leading_comments: leading.take().unwrap_or_default(), leading_blank_line: false });
+        for item in unrolled {
+            let leading_comments = leading.take().unwrap_or_default();
+            items.push(match item {
+                Unrolled::Serialize(expr) => ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line: false },
+                Unrolled::Scope(scope) => ModelBodyItem::Scope { scope, leading_comments, leading_blank_line: false },
+            });
         }
         for method in methods {
             items.push(ModelBodyItem::Method { method, leading_comments: leading.take().unwrap_or_default(), leading_blank_line: false });
@@ -3899,6 +3914,25 @@ fn and_condition(left: Expr, right: Expr) -> Expr {
             right,
         },
     )
+}
+
+/// One element's `scope` from a loop `define_method_loop` unrolled, the
+/// key in place: `scope "small", -> { where(size: "small") }`. Its lambda
+/// takes plain required parameters only (`define_method_loop::scope_ok`).
+fn unrolled_scope(expr: &Expr) -> Option<crate::dialect::Scope> {
+    let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };
+    let [name, lambda] = args.as_slice() else { return None };
+    let name = match &*name.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Symbol::from(value.as_str()),
+        ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !extra_params.is_empty() {
+        return None;
+    }
+    let params = params.iter().map(|p| crate::dialect::Param::positional(p.clone())).collect();
+    Some(crate::dialect::Scope { name, params, body: body.clone() })
 }
 
 fn parse_scope(

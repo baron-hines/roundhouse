@@ -1,8 +1,8 @@
 //! A class-body loop over literal names that runs method-defining macros
 //! (`scope`, `define_method`) defines each method, so the `def`s written
 //! below it can call them, as Ruby runs the body top to bottom (the `def`s
-//! themselves already stand here). Ignored as a fork spec until the compiler does; the expected
-//! values are ActiveRecord 8.1.4's answers.
+//! themselves already stand here). The expected values are ActiveRecord
+//! 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -56,15 +56,25 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: ruby semantics"]
 fn a_class_body_loop_defines_its_scopes_and_methods() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
 
+/// Over names known only when the class loads, the loop is not unrolled,
+/// and `check` reports it rather than letting its methods go missing.
 #[test]
-#[ignore = "fork spec: ruby semantics"]
+fn a_loop_over_names_known_only_at_load_is_a_check_error() {
+    let errors = app()
+        .edit("app/models/parcel.rb", "  %w[small large].each do |size|\n", "  def self.sizes\n    %w[small large]\n  end\n\n  sizes.each do |size|\n")
+        .check_errors();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].contains("could not unroll") && errors[0].contains("`Parcel`"), "{errors:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
 fn a_class_body_loop_defines_its_scopes_and_methods_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();

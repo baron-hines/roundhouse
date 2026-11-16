@@ -207,7 +207,8 @@ struct Plan<'pr> {
     value_param: Option<String>,
     defines: Vec<CallNode<'pr>>,
     /// Class macros the loop runs beside its `define_method`s
-    /// (`serialize "on_#{type}", coder: JSON`), each once per element.
+    /// (`serialize "on_#{type}", coder: JSON`, `scope kind, -> { … }`),
+    /// each once per element. A loop of `scope`s alone is one too.
     macros: Vec<CallNode<'pr>>,
 }
 
@@ -255,17 +256,53 @@ fn plan<'pr>(stmt: &Node<'pr>, file: &str, named: &HashSet<String>, allow_macros
             return None;
         }
     }
-    if defines.is_empty() {
+    if defines.is_empty() && !macros.iter().any(is_scope) {
         return None;
     }
     let plan = Plan { constant, entries, key_param, value_param, defines, macros };
     let loop_params: Vec<&str> = std::iter::once(plan.key_param.as_str()).chain(plan.value_param.as_deref()).collect();
     let macros_ok = plan.macros.iter().all(|m| {
+        if is_scope(m) {
+            return scope_ok(m, &plan, &loop_params);
+        }
         let mut check = MacroCheck { loop_params: &loop_params, ok: true };
         ruby_prism::Visit::visit(&mut check, &m.as_node());
         check.ok
     });
     (macros_ok && plan.defines.iter().all(|d| define_ok(d, &plan, named))).then_some(plan)
+}
+
+fn is_scope(call: &CallNode<'_>) -> bool {
+    constant_id_str(&call.name()) == "scope"
+}
+
+/// `scope kind, -> { where(kind: kind) }` (or `"#{kind}_ones"`): a name
+/// the key decides, distinct per element, and a lambda of plain required
+/// parameters whose body reads the loop's parameters as a `define_method`
+/// body may, so each element's scope is the lambda with its key in place.
+fn scope_ok(call: &CallNode<'_>, plan: &Plan<'_>, loop_params: &[&str]) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let args: Vec<Node<'_>> = args.arguments().iter().collect();
+    let [name, body] = args.as_slice() else { return false };
+    let Some(lambda) = body.as_lambda_node() else { return false };
+    if lambda.locals().iter().any(|l| loop_params.contains(&constant_id_str(&l))) || required_params(lambda.parameters()).is_none() {
+        return false;
+    }
+    let keys = match &plan.entries {
+        Entries::Array(k) | Entries::Hash(k) => k,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for key in keys {
+        match name_for(name, &plan.key_param, key.text()) {
+            Some(n) if !names.contains(&n) => names.push(n),
+            _ => return false,
+        }
+    }
+    let mut check = BodyCheck { depth: 0, loops: 0, loop_params, ok: true };
+    if let Some(body) = lambda.body() {
+        ruby_prism::Visit::visit(&mut check, &body);
+    }
+    check.ok
 }
 
 /// Plain required parameter names, or `None` for any other shape.
