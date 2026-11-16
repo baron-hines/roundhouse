@@ -218,6 +218,10 @@ module ActiveRecord
       @lock_clause = ""
       @shared_lists = false
       @friendly = false
+      # The record whose has_many this relation was built off, and the
+      # association's name (`_inversed_from`); nil for any other relation.
+      @inverse_owner = nil
+      @inverse_name = nil
       names = @model._sti_type_names
       where!(type: names) unless names.empty?
       @inherited_scope = false
@@ -1799,6 +1803,18 @@ module ActiveRecord
       self
     end
 
+    # A relation built off `owner`'s has_many `name` (`owner.items.where(…)`)
+    # seats `owner` on each row it loads, through the association's inverse,
+    # and leaves the owner's own target alone, as Rails' `AssociationRelation`
+    # sets the inverse from queries. Chains keep it, as they keep an
+    # AssociationRelation. The owner's model answers which inverse that is
+    # (`_set_inverse_from_queries`), so the owner stays its own class there.
+    def _inversed_from(owner, name)
+      @inverse_owner = owner
+      @inverse_name = name
+      self
+    end
+
     # The model class this relation queries — Rails' Relation#klass
     # (lobsters' Search switches on it to pick per-model joins).
     def klass
@@ -2082,6 +2098,9 @@ module ActiveRecord
         @model.preload_associations(records, @includes.dup)
       end
       records.each { |record| record.readonly! } if @readonly
+      owner = @inverse_owner
+      name = @inverse_name
+      owner._set_inverse_from_queries(name, records) unless owner.nil? || name.nil?
       records
     end
 

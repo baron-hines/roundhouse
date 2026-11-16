@@ -304,7 +304,7 @@ fn seed_argument(value: &Expr, ctx: &Ctx) -> Option<Expr> {
             )
         });
     Some(super::build_association_seed(
-        value.span, &target, fk, owner_id, type_entry, owner, name, false,
+        value.span, &target, fk, owner_id, type_entry, owner, name, false, false,
     ))
 }
 

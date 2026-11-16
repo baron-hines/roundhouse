@@ -3112,7 +3112,7 @@ fn is_relation_expr(e: &Expr, ctx: &Ctx, locals: &Locals) -> bool {
             }
             let hop = is_relation_chain_method(name)
                 || crate::catalog::is_relation_context_builder(name)
-                || matches!(name, "where_scope" | "preloaded" | "skip_preloading!" | "page" | "per");
+                || matches!(name, "where_scope" | "preloaded" | "_inversed_from" | "skip_preloading!" | "page" | "per");
             hop && is_relation_expr(r, ctx, locals)
         }
         _ => false,
@@ -3660,6 +3660,7 @@ fn build_association_seed(
     owner: &Expr,
     name: &Symbol,
     scope_attributes: bool,
+    inversed: bool,
 ) -> Expr {
     // An owner key other than `id` can be NULL, and
     // `where(fk: nil)` would match the child rows
@@ -3758,6 +3759,24 @@ fn build_association_seed(
                 parenthesized: true,
             },
         );
+        // The rows it loads hold the owner through the association's
+        // automatic inverse, as an `AssociationRelation`'s do
+        // (`Relation#_inversed_from`).
+        if inversed {
+            seed = syn(
+                span,
+                ExprNode::Send {
+                    recv: Some(seed),
+                    method: Symbol::from("_inversed_from"),
+                    args: vec![
+                        owner.clone(),
+                        syn(span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } }),
+                    ],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+        }
     }
     seed
 }
@@ -5560,7 +5579,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         if is_scope || is_chain || is_term || assoc_cm.is_some() || extracted.is_some() {
                             let seed = build_association_seed(
                                 span, &target, fk, owner_id, type_entry.clone(), ir, aname,
-                                assoc_cm.is_some(),
+                                assoc_cm.is_some(), inverse.is_some(),
                             );
                             if let Some(leading) = assoc_cm {
                                 let new_args = thread_rel(args, seed, Some(leading), span);

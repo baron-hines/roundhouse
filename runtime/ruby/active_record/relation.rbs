@@ -106,6 +106,8 @@ module ActiveRecord
     @ctes: Array[String]
     @shared_lists: bool
     @friendly: bool
+    @inverse_owner: Base?
+    @inverse_name: Symbol?
     @reordering: bool
     # Rails NullRelation — `none` / empty IN. Kept across spawn/chain.
     @null: bool
@@ -279,6 +281,7 @@ module ActiveRecord
     # seeded `[]` in the constructor and therefore inferred as an int
     # array. Same over-claim as `map`/`collect` below.
     def preloaded: (untyped records, bool loaded) -> Relation
+    def _inversed_from: (Base owner, Symbol name) -> Relation
     def klass: () -> Class
     def model: () -> Class
     def primary_key: () -> String

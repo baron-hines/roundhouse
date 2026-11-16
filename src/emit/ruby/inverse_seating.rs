@@ -5,8 +5,10 @@
 //!
 //! Rails seats the owner when a has_many or has_one reader loads its
 //! target (`find_target`), when a preload installs one (`Preloader`'s
-//! `set_inverse`), and when a belongs_to reader finds its record (a
-//! has_one inverse). The inverse is the automatic one Rails finds
+//! `set_inverse`), when a belongs_to reader finds its record (a has_one
+//! inverse), and when a relation built off a has_many loads rows
+//! (`AssociationRelation#exec_queries`, which leaves the owner's own
+//! target alone). The inverse is the automatic one Rails finds
 //! (`scope_chain::automatic_inverse`, `belongs_to_inverse`).
 //!
 //! Ruby family only, and an emit pass rather than a shared lowering:
@@ -34,6 +36,7 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         let class = lc.name.clone();
         let Some(model) = app.models.iter().find(|m| m.name == class) else { continue };
         let own = |name: &Symbol| model.methods().any(|m| &m.name == name && m.receiver == MethodReceiver::Instance);
+        let mut from_queries: Vec<(Symbol, Symbol)> = Vec::new();
         for inv in inverses.iter().filter(|i| i.owner == class) {
             let seat = seat_method(&inv.inverse);
             if !own(&inv.name) {
@@ -47,6 +50,12 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
                     seat_param(setter, &seat, inv.arity);
                 }
             }
+            if inv.collection {
+                from_queries.push((inv.name.clone(), seat));
+            }
+        }
+        if !from_queries.is_empty() {
+            push_parsed(lc, &set_inverse_from_queries_source(&from_queries));
         }
         // The seat each inverse this model is the target of calls.
         let mut seated: Vec<&Symbol> = Vec::new();
@@ -72,6 +81,8 @@ struct Inverse {
     target: ClassId,
     inverse: Symbol,
     arity: Arity,
+    /// A has_many, whose relations seat their rows too.
+    collection: bool,
 }
 
 /// Every association of the app's models that has an automatic inverse,
@@ -100,6 +111,7 @@ fn inverses(app: &App) -> Vec<Inverse> {
                 target: target.clone(),
                 inverse,
                 arity,
+                collection: matches!(assoc, Association::HasMany { .. }),
             });
         }
     }
@@ -112,6 +124,17 @@ fn seat_method(inverse: &Symbol) -> Symbol {
 
 fn instance_method<'a>(lc: &'a mut LibraryClass, name: &Symbol) -> Option<&'a mut MethodDef> {
     lc.methods.iter_mut().find(|m| &m.name == name && m.receiver == MethodReceiver::Instance)
+}
+
+/// The owner's `_set_inverse_from_queries`, which `Relation#load_records`
+/// calls for a relation built off one of its has_many (`_inversed_from`).
+fn set_inverse_from_queries_source(arms: &[(Symbol, Symbol)]) -> String {
+    let mut src = String::from("def _set_inverse_from_queries(name, records)\n  case name\n");
+    for (name, seat) in arms {
+        src.push_str(&format!("  when :{name}\n    records.each {{ |r| r.{seat}(self) }}\n"));
+    }
+    src.push_str("  end\n  nil\nend\n");
+    src
 }
 
 fn push_parsed(lc: &mut LibraryClass, src: &str) {

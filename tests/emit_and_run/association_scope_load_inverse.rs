@@ -1,8 +1,8 @@
 //! Loading a relation built off a has_many (`owner.items.where(...)`)
 //! seats the owner on each row it loads, and leaves the owner's own
 //! loaded target as it was, as Rails' `AssociationRelation` sets the
-//! inverse from queries. Ignored as a fork spec until the compiler does;
-//! the expected values are ActiveRecord 8.1.4's answers.
+//! inverse from queries. The expected values are ActiveRecord 8.1.4's
+//! answers.
 
 use super::emit_and_run;
 
@@ -35,8 +35,14 @@ end
     # Rails: the owner object on the queried row, the target untouched
     check("one row", big.length == 1 && big.first.name == "brig")
     check("owner seated", big.first.fleet.equal?(f))
-    check("target untouched", f.ships.target.length == 2 && f.ships.target.map(&:name).sort == ["brig", "ketch"])
+    check("target untouched", f.ships.length == 2 && f.ships.map(&:name).sort == ["brig", "ketch"])
     check("queried row is its own object", !held.any? { |s| s.equal?(big.first) })
+    # Rails: every load off the association's relation seats the owner
+    check("ordered first", f.ships.order(:tons).first.fleet.equal?(f))
+    check("find_by", f.ships.find_by(name: "ketch").fleet.equal?(f))
+    seen = []
+    f.ships.where("tons < ?", 100).each { |s| seen << s.fleet }
+    check("each", seen.length == 2 && seen.all? { |o| o.equal?(f) })
   end
 end
 "##)
@@ -56,7 +62,6 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: association targets"]
 fn an_association_relation_load_seats_the_owner_on_its_rows() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
@@ -64,7 +69,7 @@ fn an_association_relation_load_seats_the_owner_on_its_rows() {
 }
 
 #[test]
-#[ignore = "fork spec: association targets"]
+#[ignore = "requires the Spinel toolchain"]
 fn an_association_relation_load_seats_the_owner_on_its_rows_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();
