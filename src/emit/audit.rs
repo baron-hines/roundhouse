@@ -430,7 +430,7 @@ pub fn audit(
             } else {
                 Vec::new()
             };
-            let mut walker = Walker { index: &index, out: &mut out, seen: &mut seen, convention: &convention, unsure: &mut unsure };
+            let mut walker = Walker { index: &index, out: &mut out, seen: &mut seen, convention: &convention, unsure: &mut unsure, guarded: Vec::new() };
             walker.walk(&m.body, Some((lc.name.0.as_str(), class_side)));
         }
     }
@@ -483,15 +483,56 @@ struct Walker<'a> {
     convention: &'a [&'a crate::ident::Symbol],
     /// Findings whose receiver is one of them.
     unsure: &'a mut HashSet<crate::span::Span>,
+    /// Methods an enclosing condition asked `respond_to?` about: the call
+    /// runs only where the object answers it.
+    guarded: Vec<String>,
+}
+
+/// The methods `cond` asks `respond_to?` about, through `&&`.
+fn responds_to(cond: &Expr, out: &mut Vec<String>) {
+    match &*cond.node {
+        ExprNode::Send { method, args, .. } if method.as_str() == "respond_to?" => {
+            if let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) = args.first().map(|a| &*a.node) {
+                out.push(value.as_str().to_string());
+            }
+        }
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } => {
+            responds_to(left, out);
+            responds_to(right, out);
+        }
+        _ => {}
+    }
 }
 
 impl Walker<'_> {
 fn walk(&mut self, expr: &Expr, owner: Option<(&str, bool)>) {
     let index = self.index;
+    // What runs after a `respond_to?(:m)` test (`respond_to?(:owner) && owner`, an `if`) calls `m` only where it is answered.
+    let (test, guarded_part, rest) = match &*expr.node {
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } => (left, right, None),
+        ExprNode::If { cond, then_branch, else_branch } => (cond, then_branch, Some(else_branch)),
+        _ => (expr, expr, None),
+    };
+    if !std::ptr::eq(test, expr) {
+        let mut names = Vec::new();
+        responds_to(test, &mut names);
+        if !names.is_empty() {
+            self.walk(test, owner);
+            let depth = self.guarded.len();
+            self.guarded.extend(names);
+            self.walk(guarded_part, owner);
+            self.guarded.truncate(depth);
+            if let Some(rest) = rest {
+                self.walk(rest, owner);
+            }
+            return;
+        }
+    }
     // `defined?(x)` is a keyword the IR spells as a send.
     if let ExprNode::Send { recv, method, .. } = &*expr.node
         && expr.diagnostic().is_none()
         && method.as_str() != "defined?"
+        && !self.guarded.iter().any(|g| g == method.as_str())
     {
         // Not a module's own `self`: a concern's body runs on its includer, whose methods it calls.
         let own = owner.filter(|(c, _)| !index.is_module(c)).map(|(c, side)| (c.to_string(), side));
@@ -586,6 +627,12 @@ mod tests {
     fn a_macro_an_ancestors_mixin_supplies_runs_when_a_subclass_calls_it() {
         let found = findings("module Macros\n  def property(name)\n    define_method(name) { 1 }\n  end\nend\n\nclass Base\n  extend Macros\nend\n\nclass Note < Base\n  property :title\n\n  def label\n    title\n  end\nend\n");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_call_a_respond_to_test_guards_is_not_reported() {
+        let found = findings("class A\n  def x\n    respond_to?(:owner) && owner\n  end\n\n  def y\n    if respond_to?(:label)\n      label\n    else\n      title\n    end\n  end\nend\n");
+        assert_eq!(found, ["`A#title` is called, but the emitted Ruby defines no such method"]);
     }
 
     #[test]
