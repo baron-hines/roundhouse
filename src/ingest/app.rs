@@ -356,24 +356,9 @@ fn keep_initializer_defined(
     taken
 }
 
-/// The first of an opening's spans that points at a source.
-fn opening_span(lc: &LibraryClass) -> Option<crate::span::Span> {
-    std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        // A method's name before its body: an `attr_reader`'s reader has
-        // a synthesized body but the name it was written with.
-        .chain(lc.methods.iter().map(|m| m.name_span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        // A body that only sets a class-level variable (`@configured = true`).
-        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())
-}
-
-/// The file an opening was read from.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file<'s>(lc: &LibraryClass, sources: &'s [crate::span::SourceFile]) -> Option<&'s str> {
-    let span = opening_span(lc)?;
+    let span = lc.source_span()?;
     sources.get((span.file.0 as usize).checked_sub(1)?).map(|f| f.path.as_str())
 }
 
