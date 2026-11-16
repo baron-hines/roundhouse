@@ -9888,15 +9888,31 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
 /// methods sit AHEAD of the model's own (reaching them through `super`),
 /// where an `include`d module's sit behind. Ruby prepends each statement's
 /// modules ahead of everything already there, so the statements are read
-/// newest-first, while a multi-argument statement keeps its arguments in
-/// written order (`prepend A, B` gives `[A, B, K]`).
+/// oldest-first with each one's modules moved to the front, while a
+/// multi-argument statement keeps its arguments in written order
+/// (`prepend A, B` gives `[A, B, K]`).
+///
+/// A module already prepended by an earlier statement — or by an earlier
+/// argument of the same one — is a no-op, as Ruby's `prepend_features`
+/// leaves a module the ancestors already hold where it is: `prepend A;
+/// prepend B; prepend A` is `[B, A, K]`, NOT `[A, B, K]` and not
+/// `[A, B, A, K]`. Reading the statements newest-first cannot express
+/// that (it would put the repeated A ahead of B), so the list is built in
+/// source order.
 pub(crate) fn model_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
-    model
-        .body
-        .iter()
-        .rev()
-        .flat_map(|item| mixes_in(std::slice::from_ref(item), "prepend", None))
-        .collect()
+    let mut out: Vec<ClassId> = Vec::new();
+    for item in &model.body {
+        let mut ahead: Vec<ClassId> = Vec::new();
+        for id in mixes_in(std::slice::from_ref(item), "prepend", None) {
+            if out.contains(&id) || ahead.contains(&id) {
+                continue;
+            }
+            ahead.push(id);
+        }
+        ahead.extend(out);
+        out = ahead;
+    }
+    out
 }
 
 /// The prepends this program WRITES back: a `prepend Concern` statement

@@ -112,6 +112,64 @@ end
   end
 end
 "##)
+        .write("app/models/concerns/left.rb", r##"module Left
+  extend ActiveSupport::Concern
+
+  prepended do
+    before_save :mark_left
+  end
+
+  class_methods do
+    def tag
+      "Left"
+    end
+  end
+
+  def who
+    "L>#{super}"
+  end
+
+  private
+
+  def mark_left
+    self.name = "#{name}L"
+  end
+end
+"##)
+        .write("app/models/concerns/right.rb", r##"module Right
+  extend ActiveSupport::Concern
+
+  prepended do
+    before_save :mark_right
+  end
+
+  class_methods do
+    def tag
+      "Right"
+    end
+  end
+
+  def who
+    "R>#{super}"
+  end
+
+  private
+
+  def mark_right
+    self.name = "#{name}R"
+  end
+end
+"##)
+        .write("app/models/repeat.rb", r##"class Repeat < ApplicationRecord
+  prepend Left
+  prepend Right
+  prepend Left
+
+  def who
+    "K"
+  end
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -141,6 +199,17 @@ end
     [split.who, split.name]
   end
 
+  # Rails: ["R>L>K", "KLR", "Right"] — `prepend Left; prepend Right;
+  # prepend Left` leaves the ancestry [Right, Left, K]: the second
+  # `prepend Left` is a no-op (Left is already there), so Right keeps its
+  # place ahead of it, its `prepended do` block does not run again, and
+  # Right's `class_methods` stay ahead of Left's.
+  def self.repeated_prepend
+    repeat = Repeat.new(name: "K")
+    repeat.save!
+    [repeat.who, repeat.name, Repeat.tag]
+  end
+
   # Rails: "[gadget]" — a Concern with no `prepended` block and no
   # `class_methods` is still prepended, so its method reaches the
   # model's through `super`.
@@ -153,6 +222,7 @@ end
     check("prepended_concern", prepended_concern == [["blue", "red"], "[RED]"])
     check("multi_argument_prepend", multi_argument_prepend == ["A>B>K", "KBA"])
     check("separate_prepends", separate_prepends == ["B>A>K", "KAB"])
+    check("repeated_prepend", repeated_prepend == ["R>L>K", "KLR", "Right"])
     check("method_only_prepended_concern", method_only_prepended_concern == "[gadget]")
   end
 end
@@ -165,6 +235,9 @@ end
     t.string "name"
   end
   create_table "splits", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "repeats", force: :cascade do |t|
     t.string "name"
   end
   create_table "gadgets", force: :cascade do |t|

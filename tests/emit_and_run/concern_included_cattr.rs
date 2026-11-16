@@ -58,6 +58,39 @@ end
   cattr_accessor :girth, default: 1
 end
 "##)
+        .write("app/models/concerns/first.rb", r##"module First
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_accessor :span, default: 1
+  end
+end
+"##)
+        .write("app/models/concerns/second.rb", r##"module Second
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_accessor :span, default: 2
+  end
+end
+"##)
+        .write("app/models/concerns/blank.rb", r##"module Blank
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_reader :width, default: nil
+  end
+end
+"##)
+        .write("app/models/ribbon.rb", r##"class Ribbon < ApplicationRecord
+  include First, Second
+end
+"##)
+        .write("app/models/tape.rb", r##"class Tape < ApplicationRecord
+  cattr_accessor :width, default: 1
+  include Blank
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -89,12 +122,26 @@ end
     Crate.girth
   end
 
+  # Rails: 1 — one `include First, Second` runs Ruby's hooks in reverse
+  # argument order (Second's, then First's), so First's seed lands last.
+  def self.one_statement_two_concerns
+    Ribbon.span
+  end
+
+  # Rails: 1 — `default: nil` sets the class variable only where nothing
+  # has, so the concern's nil never replaces the model's seed above it.
+  def self.nil_default_keeps_the_models_seed
+    Tape.width
+  end
+
   def self.run
     Rope.delete_all
     check("class_attributes_from_the_block", class_attributes_from_the_block == [3, "cm", true, false, "4cm"])
     check("concern_seed_after_the_models_own", concern_seed_after_the_models_own == 3)
     check("seed_without_a_default_keeps_the_earlier", seed_without_a_default_keeps_the_earlier == 3)
     check("models_seed_after_two_concerns", models_seed_after_two_concerns == 1)
+    check("one_statement_two_concerns", one_statement_two_concerns == 1)
+    check("nil_default_keeps_the_models_seed", nil_default_keeps_the_models_seed == 1)
   end
 end
 "##)
@@ -103,6 +150,12 @@ end
     t.integer "length"
   end
   create_table "crates", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "ribbons", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "tapes", force: :cascade do |t|
     t.string "name"
   end
 end
