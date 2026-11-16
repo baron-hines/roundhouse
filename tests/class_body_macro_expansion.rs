@@ -1774,3 +1774,36 @@ end
         "refused carrier must keep its class methods on the module"
     );
 }
+
+/// A `class_attribute` carrier whose `included do` runs more than the DSL is a gap only where the expansion would
+/// apply, on a controller: one only a component includes is left as written, unsurveyed (ViewComponent's `Slotable`).
+#[test]
+fn a_class_attribute_carrier_no_controller_includes_is_no_survey_gap() {
+    use roundhouse::ingest::survey;
+
+    let concern = r#"
+module Slotted
+  extend ActiveSupport::Concern
+  included do
+    class_attribute :registered_slots
+    self.registered_slots = {}
+  end
+end
+"#;
+    let gaps_with = |includer: (&str, &str)| {
+        let tree: std::collections::HashMap<_, _> = [("app/models/concerns/slotted.rb", concern), includer]
+            .into_iter()
+            .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+            .collect();
+        survey::activate();
+        let result = ingest_app_from_tree(tree);
+        let gaps = survey::drain();
+        result.expect("ingest");
+        gaps.into_iter()
+            .filter(|gap| matches!(gap, roundhouse::ingest::IngestError::Unsupported { file, message }
+                if file == "Slotted" && message.starts_with("class_attribute carrier `included do`")))
+            .count()
+    };
+    assert_eq!(gaps_with(("app/components/card_component.rb", "class CardComponent\n  include Slotted\nend\n")), 0);
+    assert_eq!(gaps_with(("app/controllers/things_controller.rb", "class ThingsController < ActionController::Base\n  include Slotted\nend\n")), 1);
+}
