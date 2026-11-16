@@ -487,7 +487,7 @@ fn boot_observer_in(
                 .env("RH_SHAPE_APP", &tmp)
                 .env("RH_SHAPE_GEMS", roots.join(":"))
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::fs::File::create(tmp.join(".roundhouse-boot.log")).map_err(|e| e.to_string())?)
                 .spawn()
                 .map_err(|e| format!("ruby: {e}"))?;
             let started = std::time::Instant::now();
@@ -503,12 +503,7 @@ fn boot_observer_in(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             };
             if !status.success() {
-                let mut stderr = String::new();
-                use std::io::Read as _;
-                child
-                    .stderr
-                    .take()
-                    .map(|mut e| e.read_to_string(&mut stderr));
+                let stderr = std::fs::read_to_string(tmp.join(".roundhouse-boot.log")).unwrap_or_default();
                 return Err(format!(
                     "the boot failed: {}",
                     stderr.lines().next().unwrap_or("")

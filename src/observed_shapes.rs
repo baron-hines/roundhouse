@@ -106,10 +106,8 @@ pub fn patches(observation: &Observation, dir: &Path) -> Result<Patches, String>
         let (Some(trigger), Some(statement)) = (&effect.trigger, &effect.statement) else {
             continue;
         };
-        let list = by_trigger.entry(trigger.clone()).or_default();
-        if !list.contains(statement) {
-            list.push(statement.clone());
-        }
+        // Not only the first of each: a later `const_set` of the same name wins, as it did as the app booted.
+        by_trigger.entry(trigger.clone()).or_default().push(statement.clone());
     }
     for edits in out.gem_edits.values_mut() {
         edits.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
@@ -351,7 +349,7 @@ pub fn key(dir: &Path) -> String {
     h.update(crate::version::describe().as_bytes());
     h.update(OBSERVER.as_bytes());
     // Not the gems' own files: an installed version does not change, and the lockfile names each.
-    for file in ["Gemfile.lock", ".ruby-version"] {
+    for file in ["Gemfile", "Gemfile.lock", ".ruby-version"] {
         h.update(std::fs::read(dir.join(file)).unwrap_or_default());
     }
     for sub in ["app", "config", "lib"] {

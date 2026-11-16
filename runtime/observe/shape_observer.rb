@@ -13,6 +13,8 @@ module RoundhouseShapeObserver
   @effects = []
   @refusals = []
   @parsed = {}
+  @captures = []
+  @sites = {}
 
   class << self
     attr_reader :effects, :refusals
@@ -43,10 +45,11 @@ module RoundhouseShapeObserver
       nil
     end
 
-    # The gem's own statement nearest the call: the frame in a gem file the call was made from.
+    # The gem statement that made the call itself; not one further out, whose callee (the framework's
+    # `after_initialize`) may define on classes of its own.
     def gem_site
-      l = caller_locations.find { |c| c.path != __FILE__ && !c.path.start_with?("<internal") && gem_file?(c.path) }
-      l && [l.path, l.lineno]
+      l = caller_locations.find { |c| c.path != __FILE__ && !c.path.start_with?("<internal") }
+      l && gem_file?(l.path) ? [l.path, l.lineno] : nil
     end
 
     def parse(path)
@@ -130,6 +133,10 @@ module RoundhouseShapeObserver
       "->(#{parts[0]}) { #{parts[1]} }"
     end
 
+    HARD_SCOPES = [Prism::DefNode, Prism::ClassNode, Prism::ModuleNode, Prism::SingletonClassNode].freeze
+    # Not as written in a `def`: there `yield` and these read the method's own call, not the one the block was made in.
+    ENCLOSING = [Prism::YieldNode, Prism::ForwardingSuperNode, Prism::SuperNode].freeze
+
     def body_of(name, proc_)
       path, line = proc_.source_location
       return refuse("#{name}: no source") unless path && File.file?(path)
@@ -141,36 +148,53 @@ module RoundhouseShapeObserver
       finder.call(parse(path).value)
       return refuse("#{name}: #{lambdas.size} blocks at #{path}:#{line}") unless lambdas.size == 1
       node = lambdas.first
-      binding_ = proc_.binding
-      own = []
-      collect_own = lambda do |n|
-        own.concat(n.locals) if n.respond_to?(:locals) && !n.equal?(node)
-        n.compact_child_nodes.each { |c| collect_own.call(c) }
+      shape = node.parameters
+      return refuse("#{name}: numbered or `it` parameters") if shape.is_a?(Prism::NumberedParametersNode) || shape.is_a?(Prism::ItParametersNode)
+      params = shape&.parameters
+      if params && (params.optionals.any? || params.keywords.any? { |k| k.is_a?(Prism::OptionalKeywordParameterNode) })
+        return refuse("#{name}: a parameter's default would read where the block was made")
       end
-      collect_own.call(node)
-      params = node.parameters&.parameters
-      param_names = node.locals
+      binding_ = proc_.binding
       edits = []
-      reads = lambda do |n|
-        if n.is_a?(Prism::LocalVariableReadNode) && !param_names.include?(n.name) && !own.include?(n.name)
-          value = binding_.local_variable_get(n.name)
-          text = literal(value)
-          return refuse("#{name}: captured `#{n.name}` is not a literal (#{value.class})") unless text
+      walk = lambda do |n, level|
+        case n
+        when *HARD_SCOPES then return refuse("#{name}: a `#{n.type}` in the block")
+        when *ENCLOSING then return refuse("#{name}: `#{n.slice[0, 20]}` reads the call the block was made in")
+        when Prism::LocalVariableReadNode
+          if n.depth > level
+            value = binding_.local_variable_get(n.name)
+            text = literal(value) or return refuse("#{name}: captured `#{n.name}` is not a literal (#{value.class})")
+            @captures << [binding_, n.name, text, name]
+            edits << [n.location.start_offset, n.location.end_offset, text]
+          end
+        when Prism::LocalVariableWriteNode, Prism::LocalVariableOperatorWriteNode, Prism::LocalVariableOrWriteNode, Prism::LocalVariableAndWriteNode, Prism::LocalVariableTargetNode
+          return refuse("#{name}: writes captured `#{n.name}`") if n.depth > level
+        when Prism::ConstantReadNode
+          # Not left to the class it is written into: a constant is looked up where the block was written.
+          value = (binding_.eval(n.name.to_s) rescue (return refuse("#{name}: `#{n.name}` names nothing where the block was made")))
+          text = value.is_a?(Module) && value.name ? "::#{value.name}" : literal(value)
+          return refuse("#{name}: `#{n.name}` is neither a named module nor a literal") unless text
           edits << [n.location.start_offset, n.location.end_offset, text]
-        elsif n.is_a?(Prism::LocalVariableWriteNode) && !param_names.include?(n.name) && !own.include?(n.name)
-          return refuse("#{name}: writes captured `#{n.name}`")
+          return true
         end
-        n.compact_child_nodes.each { |c| reads.call(c) }
+        inner = n.is_a?(Prism::BlockNode) || n.is_a?(Prism::LambdaNode) ? level + 1 : level
+        n.compact_child_nodes.each { |c| return nil unless walk.call(c, inner) }
         true
       end
       body = node.body
-      return refuse("#{name}: reads a captured local it cannot write") if body && !reads.call(body)
+      return nil if body && !walk.call(body, 0)
       source = File.binread(path)
       text = body ? source.byteslice(body.location.start_offset, body.location.end_offset - body.location.start_offset) : "nil"
       base = body ? body.location.start_offset : 0
       edits.sort_by { |s, _, _| -s }.each { |s, e, t| text = text.byteslice(0, s - base) + t + text.byteslice(e - base..) }
       signature = params ? source.byteslice(params.location.start_offset, params.location.end_offset - params.location.start_offset) : ""
       [signature, text]
+    end
+
+    # Each gem statement that changed a class's shape, and whether every class it changed is the app's.
+    def note_site(site, owner)
+      return unless site
+      (@sites[site.join(":")] ||= []) << app_class?(owner)
     end
 
     def record(owner, event, statement, site = gem_site)
@@ -180,11 +204,19 @@ module RoundhouseShapeObserver
       stmt = statement_at(*site)
       entry = gem_statement(site[0], stmt)
       return refuse("#{owner}: no statement starts at #{site.join(":")}") unless entry
-      @effects << entry.merge("owner" => owner.name, "trigger" => trig, "statement" => statement)
+      @effects << entry.merge("owner" => owner.name, "trigger" => trig, "statement" => statement, "site" => site.join(":"))
       true
     end
 
     def write
+      # Not what a capture held when the block was made, if the boot changed it after: the method reads it as it is.
+      @captures.each do |b, local, text, name|
+        refuse("#{name}: captured `#{local}` changed after the block was made") unless literal(b.local_variable_get(local)) == text
+      end
+      # Not a gem statement that also changed a class of the gem's or the framework's: read as `nil`, it would no longer change that one.
+      @effects.each do |e|
+        refuse("#{e["site"]} changes a class that is not the app's too") if e["site"] && @sites.fetch(e["site"], []).include?(false)
+      end
       File.write(OUT, JSON.pretty_generate({ "effects" => @effects, "refusals" => @refusals.uniq }))
     end
   end
@@ -192,14 +224,16 @@ module RoundhouseShapeObserver
   module Recorder
     def define_method(name, body = nil, &block)
       proc_ = body || block
-      if RoundhouseShapeObserver.gem_site
+      site = RoundhouseShapeObserver.gem_site
+      RoundhouseShapeObserver.note_site(site, self)
+      if site && RoundhouseShapeObserver.app_class?(self)
         text = proc_.is_a?(Proc) ? RoundhouseShapeObserver.definition(name, proc_) : RoundhouseShapeObserver.refuse("#{self}##{name}: body is a #{proc_.class}")
-        recorded = text && RoundhouseShapeObserver.record(self, text, text)
+        recorded = text && RoundhouseShapeObserver.record(self, text, text, site)
         if recorded && proc_.is_a?(Proc)
           path, line = proc_.source_location
           stmt = path && RoundhouseShapeObserver.gem_file?(path) && RoundhouseShapeObserver.statement_at(path, line)
           entry = stmt && RoundhouseShapeObserver.gem_statement(path, stmt)
-          RoundhouseShapeObserver.effects << entry.merge("owner" => self.name) if entry
+          RoundhouseShapeObserver.effects << entry.merge("owner" => self.name, "site" => site.join(":")) if entry
         end
       end
       body ? super(name, body) : super(name, &block)
@@ -207,20 +241,27 @@ module RoundhouseShapeObserver
 
     %i[include extend].each do |kind|
       define_method(kind) do |*mods|
-        mods.each { |m| RoundhouseShapeObserver.record(self, "#{kind} ::#{m.name}", "#{kind} ::#{m.name}") if m.name }
+        site = RoundhouseShapeObserver.gem_site
+        RoundhouseShapeObserver.note_site(site, self)
+        # Last first, as Ruby mixes them in: `include A, B` gives A the higher place.
+        mods.reverse_each { |m| RoundhouseShapeObserver.record(self, "#{kind} ::#{m.name}", "#{kind} ::#{m.name}", site) if m.name }
         super(*mods)
       end
     end
 
     def ruby2_keywords(*names)
-      names.each { |n| RoundhouseShapeObserver.record(self, "ruby2_keywords :#{n}", "ruby2_keywords :#{n}") }
+      site = RoundhouseShapeObserver.gem_site
+      RoundhouseShapeObserver.note_site(site, self)
+      names.each { |n| RoundhouseShapeObserver.record(self, "ruby2_keywords :#{n}", "ruby2_keywords :#{n}", site) }
       super
     end
 
     def const_set(name, value)
-      text = RoundhouseShapeObserver.literal(value)
-      if RoundhouseShapeObserver.gem_site
-        text ? RoundhouseShapeObserver.record(self, "#{name} = #{text}", "#{name} = #{text}") : RoundhouseShapeObserver.refuse("#{self}::#{name}: not a literal")
+      site = RoundhouseShapeObserver.gem_site
+      RoundhouseShapeObserver.note_site(site, self)
+      if site && RoundhouseShapeObserver.app_class?(self)
+        text = RoundhouseShapeObserver.literal(value)
+        text ? RoundhouseShapeObserver.record(self, "#{name} = #{text}", "#{name} = #{text}", site) : RoundhouseShapeObserver.refuse("#{self}::#{name}: not a literal")
       end
       super
     end
@@ -237,6 +278,8 @@ TracePoint.new(:call) do |tp|
   caller_frame = caller_locations(2, 1).first
   next unless caller_frame && RoundhouseShapeObserver.gem_file?(caller_frame.path)
   next if RoundhouseShapeObserver.gem_file?(tp.path)
+  RoundhouseShapeObserver.note_site([caller_frame.path, caller_frame.lineno], tp.self)
+  next unless RoundhouseShapeObserver.app_class?(tp.self)
   args = []
   ok = tp.parameters.all? do |(kind, pname)|
     next true unless pname
