@@ -22435,6 +22435,8 @@ mod through_singular_hop_readers;
 mod through_preload_hop_first;
 #[path = "emit_and_run/through_preload_distinct.rs"]
 mod through_preload_distinct;
+#[path = "emit_and_run/through_preload_readonly.rs"]
+mod through_preload_readonly;
 
 #[path = "emit_and_run/held_has_many_default_scope_key.rs"]
 mod held_has_many_default_scope_key;

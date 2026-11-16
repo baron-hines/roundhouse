@@ -12614,7 +12614,7 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 //
 // Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
 // with a scope or polymorphic owner, and scope-carrying through-assocs
-// (other than `distinct` or a plain `order("...")`) get no
+// (other than `distinct`, `readonly` or a plain `order("...")`) get no
 // batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
 // Rails, which also lazy-loads what `includes` doesn't name). Unscoped
@@ -12819,6 +12819,7 @@ enum PreloadKind {
         one: bool,
         apart: Option<(String, String)>,
         distinct: bool,
+        readonly: bool,
     },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
@@ -12932,7 +12933,7 @@ fn direct_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::As
 /// through whose scope has no `where`: the hop loads on the owners and is
 /// seated on them, its through scope being empty; then the source loads
 /// off the hop records. The source is seated on the hop records only
-/// while the through's own scope is empty: a `distinct` one
+/// while the through's own scope is empty: a `distinct` or `readonly` one
 /// loads the source records apart (`associate_by_default: false`), so a
 /// hop's own source still loads when it is read. Each owner holds its
 /// hop records' sources, in hop order (unique for `distinct`), and an
@@ -12954,7 +12955,7 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
     {
         return None;
     }
-    let mut distinct = false;
+    let (mut distinct, mut readonly) = (false, false);
     if let Some(scope) = scope {
         let mut call = scope;
         loop {
@@ -12964,6 +12965,7 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
             }
             match method.as_str() {
                 "distinct" => distinct = true,
+                "readonly" => readonly = true,
                 _ => return None,
             }
             match recv {
@@ -12994,7 +12996,7 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
     }
     // A source loaded apart: the column its rows are keyed by, and how a
     // hop record reads that key.
-    let apart = distinct.then(|| match &source_kind {
+    let apart = (distinct || readonly).then(|| match &source_kind {
         PreloadKind::BelongsTo { fk, .. } => ("id".to_string(), format!("[:{fk}]")),
         PreloadKind::HasMany { fk, owner_key, .. } | PreloadKind::HasOne { fk, owner_key, .. } => {
             (fk.clone(), format!(".{owner_key}"))
@@ -13011,6 +13013,7 @@ fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialec
         one,
         apart,
         distinct,
+        readonly,
     })
 }
 
@@ -13282,7 +13285,7 @@ end
             // every owner that does not hold it, the source over every
             // owner's hop records, and an owner already holding its target
             // keeps it; when every owner does, nothing runs.
-            PreloadKind::ThroughHop { target, hop, hop_many, hop_model, source, source_many, one, apart, distinct } => {
+            PreloadKind::ThroughHop { target, hop, hop_many, hop_model, source, source_many, one, apart, distinct, readonly } => {
                 let for_hops = |body: &str| {
                     if *hop_many {
                         format!("    r.{hop}_target.each do |h|\n{body}\n    end")
@@ -13306,6 +13309,7 @@ end
                     ),
                     Some((column, key)) => {
                         let distinct = if *distinct { ".distinct" } else { "" };
+                        let readonly = if *readonly { ".readonly" } else { "" };
                         let take = if *source_many {
                             "        got.each do |s|\n          list << s\n        end"
                         } else {
@@ -13320,7 +13324,7 @@ end
   end
   found = {{}}
   if keys.length > 0
-    ActiveRecord::Relation.new({target}).where({column}: keys){distinct}.to_a.each do |rec|
+    ActiveRecord::Relation.new({target}).where({column}: keys){distinct}{readonly}.to_a.each do |rec|
       k = rec.{column}
       found[k] = [] if found[k].nil?
       found[k] << rec
