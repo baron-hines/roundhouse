@@ -29,7 +29,9 @@
 //! the hook whose receiver is its own parameter: the scan stops at the
 //! first statement of any other shape (a condition, a guard, another
 //! receiver, `send(:include, …)`), which is left as written, and the
-//! emitted program behaves as it did before.
+//! emitted program behaves as it did before. A `class_eval` block's own
+//! statements follow the same rule, so a guard inside it stops the scan
+//! too.
 //!
 //! A reopened module's later `self.included` REPLACES the earlier one, as
 //! Ruby redefines the method: only the last definition is read.
@@ -186,11 +188,13 @@ fn hook_includes(body: &Expr, base: &Symbol, out: &mut Vec<String>) {
                     _ => block,
                 };
                 for statement in statements(body) {
-                    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node
-                        && method.as_str() == "include"
-                    {
-                        out.extend(args.iter().filter_map(written));
+                    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node else {
+                        break;
+                    };
+                    if method.as_str() != "include" {
+                        break;
                     }
+                    out.extend(args.iter().filter_map(written));
                 }
             }
             ("include", None) => out.extend(args.iter().filter_map(written)),
