@@ -264,6 +264,7 @@ fn tiny_blog_round_trips() {
         concern_model_items: roundhouse::det::HashMap::default(),
         concern_guarded_items: roundhouse::det::HashMap::default(),
         concern_class_attr_defaults: roundhouse::det::HashMap::default(),
+        concern_prepended_items: roundhouse::det::HashMap::default(),
         concern_included_redefs: roundhouse::det::HashMap::default(),
         validates_with_guards: Vec::new(),
         render_edges: roundhouse::det::HashMap::default(),

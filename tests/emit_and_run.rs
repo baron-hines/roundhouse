@@ -22443,3 +22443,7 @@ mod relation_predicate_blocks;
 // Concern shapes: an `included do` block's class/instance attributes.
 #[path = "emit_and_run/concern_included_cattr.rs"]
 mod concern_included_cattr;
+
+// Concern shapes: a prepended concern.
+#[path = "emit_and_run/concern_prepended.rs"]
+mod concern_prepended;

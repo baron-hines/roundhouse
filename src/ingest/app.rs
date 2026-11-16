@@ -1086,19 +1086,20 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                                 unwrap_or_record(ingest_nested_library_classes(&source, &path_str, outer.0.as_str()))?
                             {
                                 let nested = nested_under(&outer, classes);
-                                let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
+                                let scan =
                                     ingest_concern_model_items_with_constants(
                                         &source, &path_str, &enum_constants,
                                     );
                                 for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                                     app.concern_included_redefs.entry(id).or_default().push(name);
                                 }
-                                append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |id| {
-                                    nested.iter().any(|class| class.name == *id)
-                                });
-                                concern_enums.extend(concern_enum_decls.into_iter().filter(
-                                    |(id, _)| nested.iter().any(|class| class.name == *id),
-                                ));
+                                concern_enums.extend(
+                                    append_concern_items(&mut app, scan, |id| {
+                                        nested.iter().any(|class| class.name == *id)
+                                    })
+                                    .into_iter()
+                                    .filter(|(id, _)| nested.iter().any(|class| class.name == *id)),
+                                );
                                 app.library_classes.extend(nested);
                             }
                         }
@@ -1121,17 +1122,16 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // to every includer: filters (controller-side)
                         // and model DSL (associations/scopes).
                         record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |_| true);
-                        let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
+                        let scan =
                             ingest_concern_model_items_with_constants(
                                 &source, &path_str, &enum_constants,
                             );
                         for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                             app.concern_included_redefs.entry(id).or_default().push(name);
                         }
-                        append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |_| true);
+                        concern_enums.extend(append_concern_items(&mut app, scan, |_| true));
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
-                        concern_enums.extend(concern_enum_decls);
                     }
                 }
             }
@@ -1326,7 +1326,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // nested class in the file too.
                         if let Ok(classes) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
                             let nested = nested_under(&outer, classes);
-                            let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
+                            let scan =
                                 ingest_concern_model_items_with_constants(
                                     &source, &path_str, &enum_constants,
                                 );
@@ -1336,8 +1336,11 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             let own = |id: &crate::ident::ClassId| {
                                 nested.iter().any(|class| class.name == *id) || beside_names.contains(id)
                             };
-                            append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |id| own(id));
-                            concern_enums.extend(concern_enum_decls.into_iter().filter(|(id, _)| own(id)));
+                            concern_enums.extend(
+                                append_concern_items(&mut app, scan, |id| own(id))
+                                    .into_iter()
+                                    .filter(|(id, _)| own(id)),
+                            );
                             app.library_classes.extend(nested);
                         }
                         super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
@@ -1453,13 +1456,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                     // includes it, as one under app/*/concerns does: a
                     // controller gets its filters, a model its DSL.
                     record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |_| true);
-                    let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
+                    let scan =
                         ingest_concern_model_items_with_constants(&source, &path_str, &enum_constants);
                     for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                         app.concern_included_redefs.entry(id).or_default().push(name);
                     }
-                    append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |_| true);
-                    concern_enums.extend(concern_enum_decls);
+                    concern_enums.extend(append_concern_items(&mut app, scan, |_| true));
                 }
                 Err(err) => record_library_ingest_failure(&mut app, &path_str, &err),
             }
@@ -2284,17 +2286,16 @@ end
                     {
                         app.library_classes.extend(classes);
                         record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |_| true);
-                        let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
+                        let scan =
                             ingest_concern_model_items_with_constants(
                                 &source, &path_str, &enum_constants,
                             );
                         for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                             app.concern_included_redefs.entry(id).or_default().push(name);
                         }
-                        append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |_| true);
+                        concern_enums.extend(append_concern_items(&mut app, scan, |_| true));
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
-                        concern_enums.extend(concern_enum_decls);
                     }
                 }
             }
@@ -4320,7 +4321,10 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
-    if app.concern_model_items.is_empty() && app.concern_guarded_items.is_empty() {
+    if app.concern_model_items.is_empty()
+        && app.concern_guarded_items.is_empty()
+        && app.concern_prepended_items.is_empty()
+    {
         return;
     }
 
@@ -4350,6 +4354,12 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         .filter(|(_, consts)| !consts.is_empty())
         .collect();
 
+    // The modules that `extend ActiveSupport::Concern`, and the app's own
+    // modules: a `prepend X` is written back only when X is both (see
+    // `CONCERN_PREPEND`).
+    let concerns_named = concern_modules(carriers);
+    let app_modules: crate::det::HashSet<&str> =
+        app.library_classes.iter().filter(|c| c.origin.is_none()).map(|c| c.name.0.as_str()).collect();
     let dependencies = concern_dependencies(app, carriers);
     let facts = super::gem_hooks::Facts::of(app);
 
@@ -4371,30 +4381,90 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             // arg's items in that order and splice them as one run.
             // Matching only single-arg includes skipped campfire's
             // models entirely: every one of them writes the list form.
-            let concern_ids: Vec<crate::ident::ClassId> = match &model.body[i] {
+            //
+            // `prepend Trimmed` mixes a module in too, ahead of the
+            // class's own methods; its `prepended do` block is the same
+            // `class_eval` on this model, so the items come from that
+            // block rather than the module's `included do`.
+            let (named, prepended, claimed): (Vec<crate::ident::ClassId>, bool, bool) = match &model.body[i] {
                 ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
                     ExprNode::Send { recv: None, method, args, block: None, .. }
-                        if method.as_str() == "include" =>
+                        if matches!(method.as_str(), "include" | "prepend") =>
                     {
-                        args.iter()
+                        let prepended = method.as_str() == "prepend";
+                        let concerns = if prepended {
+                            &app.concern_prepended_items
+                        } else {
+                            &app.concern_model_items
+                        };
+                        let named: Vec<crate::ident::ClassId> = args
+                            .iter()
                             .filter_map(|arg| match &*arg.node {
                                 ExprNode::Const { path } => Some(concern_named(
                                     model.name.0.as_str(),
                                     path,
-                                    &app.concern_model_items,
+                                    concerns,
                                 )),
                                 _ => None,
                             })
-                            .collect()
+                            .collect();
+                        // Only a `prepend` whose EVERY argument names an
+                        // app-defined Concern is claimed. The emit writes
+                        // the line back and must load each module, so
+                        // anything else keeps its `model DSL call not
+                        // lowered` warning rather than becoming a
+                        // `prepend` naming a constant nothing defines.
+                        let claimed = prepended
+                            && !named.is_empty()
+                            && named.len() == args.len()
+                            && named.iter().all(|id| {
+                                concerns_named.contains(id.0.as_str())
+                                    && app_modules.contains(id.0.as_str())
+                            });
+                        (named, prepended, claimed)
                     }
-                    _ => Vec::new(),
+                    _ => (Vec::new(), false, false),
                 },
-                _ => Vec::new(),
+                _ => (Vec::new(), false, false),
             };
-            // A Concern's own Concern includes run on the includer first
-            // (concern.rb `append_features`).
+            if prepended && (!claimed || named.iter().any(|id| dependencies.contains_key(id))) {
+                // A prepend this splice does not carry: not an app Concern
+                // (nothing to load), or one with Concern dependencies of
+                // its own. `prepend_features` prepends those first
+                // (`@_dependencies.each { |dep| base.prepend(dep) }`), and
+                // the emit writes a `prepend` line only for what the
+                // source wrote — so its methods would go missing. Refused
+                // as a whole, which leaves the old warning in place.
+                if claimed
+                    && let ModelBodyItem::Unknown { expr, .. } = &model.body[i]
+                {
+                    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                        expr.span,
+                        None,
+                        "prepend",
+                        format!(
+                            "`{}` prepends a module whose own Concern dependencies are not prepended with it",
+                            named.iter().map(|id| id.0.as_str()).collect::<Vec<_>>().join("` + `"),
+                        ),
+                    ));
+                }
+                i += 1;
+                continue;
+            }
+            // A Concern's own Concern dependencies run on the includer
+            // first (concern.rb `append_features`). `prepend_features`
+            // prepends them instead; such a prepend was refused above, so
+            // nothing reaching here has one left to expand.
             let concern_ids: Vec<crate::ident::ClassId> =
-                concern_ids.iter().flat_map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
+                named.iter().flat_map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
+            if claimed
+                && let ModelBodyItem::Unknown { expr, .. } = &mut model.body[i]
+            {
+                // Claimed by this splice: the emit writes the `prepend`
+                // back from the model's body, and the lowering must not
+                // report it as DSL it did not lower.
+                expr.decisions |= crate::expr::CONCERN_PREPEND;
+            }
             let model_name = model.name.clone();
             let fresh: Vec<crate::ident::ClassId> = concern_ids
                 .iter()
@@ -4403,10 +4473,15 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                 .collect();
             // The block's `cattr_*` / `mattr_*` seeds are the includer's
             // class variables, as they are on the concern's own module:
-            // carried beside the accessors the items above declare. The
-            // model's own declaration of a name stands over an included
-            // one, so it always answers first.
-            for id in &fresh {
+            // carried beside the accessors the items above declare. A
+            // prepended block's seeds are refused where they are
+            // collected, so none of these belong to a prepender.
+            //
+            // `or_insert` keeps the model's own seed for a name it
+            // declares itself, which is an approximation: Rails runs the
+            // class body top to bottom, so the LAST declaration of the
+            // name is the one that holds.
+            for id in fresh.iter().filter(|_| !prepended) {
                 let Some(defaults) = app.concern_class_attr_defaults.get(id) else { continue };
                 for (name, value) in defaults {
                     model.class_attr_defaults.entry(name.clone()).or_insert_with(|| value.clone());
@@ -4417,11 +4492,22 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                 .flat_map(|id| {
                     // The module's unconditional items with the guarded
                     // ones that admit this model, in source order (a
-                    // callback's place in the chain is its order).
-                    let plain: &[ModelBodyItem] =
-                        app.concern_model_items.get(id).map_or(&[], Vec::as_slice);
-                    let guarded: &[crate::app::ConcernGuardedItem] =
-                        app.concern_guarded_items.get(id).map_or(&[], Vec::as_slice);
+                    // callback's place in the chain is its order). A
+                    // prepended block's items carry no guard: the
+                    // collector refuses those instead.
+                    let plain: &[ModelBodyItem] = if prepended {
+                        app.concern_prepended_items.get(id).map_or(&[], Vec::as_slice)
+                    } else {
+                        app.concern_model_items.get(id).map_or(&[], Vec::as_slice)
+                    };
+                    // A module's guards were asked in its `included do`,
+                    // which a prepender never runs: it is the includers'
+                    // question, so a prepended block's items carry none.
+                    let guarded: &[crate::app::ConcernGuardedItem] = if prepended {
+                        &[]
+                    } else {
+                        app.concern_guarded_items.get(id).map_or(&[], Vec::as_slice)
+                    };
                     let includer = model_name.0.as_str();
                     let mut ordered: Vec<&ModelBodyItem> = Vec::new();
                     for i in 0..=plain.len() {
@@ -4462,6 +4548,12 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
     }
 }
 
+/// The modules declared `extend ActiveSupport::Concern`: what Rails'
+/// `append_features` / `prepend_features` treat as a Concern.
+fn concern_modules(carriers: &[ConcernClassMethodSpans]) -> crate::det::HashSet<&str> {
+    carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| c.owner.0.as_str()).collect()
+}
+
 /// Each ActiveSupport::Concern's includes that are Concerns too: Ruby
 /// defers them to the Concern's includer (concern.rb's `@_dependencies`),
 /// resolved from the Concern's namespace outward.
@@ -4469,8 +4561,7 @@ fn concern_dependencies(
     app: &App,
     carriers: &[ConcernClassMethodSpans],
 ) -> crate::det::HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> {
-    let concerns: crate::det::HashSet<&str> =
-        carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| c.owner.0.as_str()).collect();
+    let concerns = concern_modules(carriers);
     let mut out: crate::det::HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> = Default::default();
     for lc in app.library_classes.iter().filter(|lc| lc.is_module && concerns.contains(lc.name.0.as_str())) {
         for include in &lc.includes {
@@ -4731,7 +4822,10 @@ pub(super) fn concern_class_method_copy(
 /// writes (`include Attachment, Broadcasts, Mentionee`), where
 /// `Module#include` inserts left to right so the EARLIER argument wins;
 /// the model's own definition beats every concern. Transitive, so a
-/// concern that includes another concern contributes both.
+/// concern that includes another concern contributes both. Ruby's
+/// `prepend_features` puts a PREPENDED concern's carrier ahead of the
+/// class's own instead (`singleton_class.prepend`), which a copy cannot
+/// express: a name both define is refused there, by the caller below.
 ///
 /// The module keeps its copy: it still emits as a real file, and the
 /// copy is unreachable there rather than wrong (nothing calls
@@ -4804,11 +4898,33 @@ fn splice_concern_class_methods_into_includers(
 
     let mut spliced: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::default();
     for model in &mut app.models {
-        let taken = model.methods()
+        let taken: HashSet<Symbol> = model.methods()
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance) = copies(crate::analyze::model_includes(model), taken);
+        // A prepended concern's `class_methods do` land on the class too:
+        // Rails' `prepend_features` runs `base.singleton_class.prepend
+        // const_get(:ClassMethods)`, which puts them AHEAD of the class's
+        // own `def self.x`, where an included concern's sit behind it. A
+        // copy appended to the body answers after the class's own, so a
+        // name both define is refused rather than copied with the wrong
+        // precedence.
+        for id in crate::analyze::model_prepends(model) {
+            let Some((methods, _)) = class_side.get(&id) else { continue };
+            for m in methods.iter().filter(|m| taken.contains(&m.name)) {
+                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                    m.name_span,
+                    None,
+                    "prepend",
+                    format!(
+                        "`{}` from prepended concern `{}` is not carried: the class defines it too, and Rails' `singleton_class.prepend` puts the concern's ahead of it",
+                        m.name.as_str(),
+                        id.0.as_str(),
+                    ),
+                ));
+            }
+        }
+        let (added, provenance) = copies(crate::analyze::model_mixins(model), taken);
         model.body.extend(added.into_iter().map(|method| ModelBodyItem::Method {
             method,
             leading_comments: Vec::new(),
@@ -9995,11 +10111,11 @@ fn project_extensions<V: Vfs + ?Sized>(
 /// rather than replacing them.
 fn append_concern_items(
     app: &mut App,
-    items: Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>,
-    guarded: super::library_class::ConcernGuardedItems,
-    class_attrs: super::library_class::ConcernClassAttrDefaults,
+    scan: super::library_class::ConcernModelScan,
     keep: impl Fn(&crate::ident::ClassId) -> bool,
-) {
+) -> Vec<(crate::ident::ClassId, Vec<super::library_class::ConcernEnumDecl>)> {
+    use super::library_class::ConcernModelScan;
+    let ConcernModelScan { items, enums, guarded, class_attrs, prepended } = scan;
     // A guarded item's `at` counts the unconditional items before it in
     // its own file; offset it by what earlier files already hold.
     for (id, items) in guarded.into_iter().filter(|(id, _)| keep(id)) {
@@ -10011,6 +10127,9 @@ fn append_concern_items(
     for (id, items) in items.into_iter().filter(|(id, _)| keep(id)) {
         app.concern_model_items.entry(id).or_default().extend(items);
     }
+    for (id, items) in prepended.into_iter().filter(|(id, _)| keep(id)) {
+        app.concern_prepended_items.entry(id).or_default().extend(items);
+    }
     // A reopened module's second `cattr_accessor` seed for a name the
     // first already holds is the same declaration; the first stands.
     for (id, defaults) in class_attrs.into_iter().filter(|(id, _)| keep(id)) {
@@ -10019,6 +10138,7 @@ fn append_concern_items(
             entry.entry(name).or_insert(value);
         }
     }
+    enums
 }
 
 /// A support file's library classes that failed to ingest: surveyed, and

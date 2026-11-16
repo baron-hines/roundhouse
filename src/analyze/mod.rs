@@ -9732,7 +9732,9 @@ pub(crate) fn source_finder_classes(app: &App, resolver: &ConstResolver) -> Hash
         let mut info = crate::analyze::ClassInfo::default();
         info.parent = model.parent.clone();
         info.attributes = model.attributes.clone();
-        info.includes = model_includes(model);
+        // A prepended module's methods answer on the model too, ahead of
+        // its own; a callback it registers names them.
+        info.includes = model_mixins(model);
         info.source_instance_methods = model.methods().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name.clone()).collect();
         info.unresolved_include = model.body.iter().any(|item| matches!(item,
             ModelBodyItem::Unknown { expr, .. } if matches!(expr.diagnostic(),
@@ -9882,6 +9884,40 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
     body_includes(&model.body)
 }
 
+/// The modules a model's body `prepend`s, in source order: their instance
+/// methods sit AHEAD of the model's own (reaching them through `super`),
+/// where an `include`d module's sit behind.
+pub(crate) fn model_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
+    mixes_in(&model.body, "prepend", None)
+}
+
+/// The prepends this program WRITES back: a `prepend Concern` statement
+/// the concern splice claimed and carried the module's `prepended do`
+/// items from ([`crate::expr::CONCERN_PREPEND`]), so the emitted class
+/// loads the module and says `prepend` in its body. A `prepend` the
+/// splice did not claim names no module this program defines, and stays
+/// the reported gap the lowering gives it.
+pub(crate) fn claimed_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
+    let mut out = Vec::new();
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if expr.decisions & crate::expr::CONCERN_PREPEND == 0 {
+            continue;
+        }
+        out.extend(mixes_in(std::slice::from_ref(item), "prepend", None));
+    }
+    out
+}
+
+/// The modules a model's body mixes in, in lookup order: the ones it
+/// prepends, then the ones it includes. What an instance of the model
+/// answers through a mixin, in the order Ruby asks them.
+pub(crate) fn model_mixins(model: &crate::dialect::Model) -> Vec<ClassId> {
+    let mut out = model_prepends(model);
+    out.extend(model_includes(model));
+    out
+}
+
 /// `model_includes` with relative mixin paths resolved from the model.
 pub(crate) fn model_includes_in(
     model: &crate::dialect::Model,
@@ -9909,11 +9945,21 @@ fn includes_from_body(
     body: &[ModelBodyItem],
     resolve: Option<(&ClassId, &HashMap<ClassId, ()>)>,
 ) -> Vec<ClassId> {
+    mixes_in(body, "include", resolve)
+}
+
+/// The `method X` mixins a class body names, with the framework marker
+/// mixins dropped (see [`includes_from_body`]).
+fn mixes_in(
+    body: &[ModelBodyItem],
+    method_wanted: &str,
+    resolve: Option<(&ClassId, &HashMap<ClassId, ()>)>,
+) -> Vec<ClassId> {
     let mut out = Vec::new();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-        if method.as_str() != "include" {
+        if method.as_str() != method_wanted {
             continue;
         }
         for arg in args {

@@ -6940,29 +6940,35 @@ pub(in crate::ingest) fn ingest_concern_included_redefs(source: &[u8], file: &st
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
-    let (items, enums, _guarded, _class_attrs) =
-        ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default());
-    (items, enums)
+    let scan = ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default());
+    (scan.items, scan.enums)
+}
+
+/// What one source file's concern blocks contribute to the classes that
+/// mix their modules in.
+pub(in crate::ingest) struct ConcernModelScan {
+    /// `included do` items, keyed by module.
+    pub items: Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
+    pub enums: Vec<(ClassId, Vec<ConcernEnumDecl>)>,
+    pub guarded: ConcernGuardedItems,
+    pub class_attrs: ConcernClassAttrDefaults,
+    /// `prepended do` items, keyed by module: the same model DSL, run on
+    /// the classes that `prepend` the module instead of including it.
+    pub prepended: Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
 }
 
 /// Same as [`ingest_concern_model_items`], with the app-wide constant
 /// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
 /// resolve the way model-side class-body DSL does.
 ///
-/// Third value: the `cattr_*` / `mattr_*` seeds the block sets on each
-/// includer (`included do cattr_accessor :cap, default: 3 end` seeds
-/// `@@cap` there, as Rails runs the block in the includer's class body),
-/// so the splice can hand them to the model that includes the module.
+/// The `cattr_*` / `mattr_*` seeds the blocks set are reported too:
+/// `included do cattr_accessor :cap, default: 3 end` seeds `@@cap` on
+/// every includer, as Rails runs the block in the includer's class body.
 pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     source: &[u8],
     file: &str,
     enum_constants: &super::model::EnumConstants,
-) -> (
-    Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
-    Vec<(ClassId, Vec<ConcernEnumDecl>)>,
-    ConcernGuardedItems,
-    ConcernClassAttrDefaults,
-) {
+) -> ConcernModelScan {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -6972,6 +6978,7 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     let mut enums_out = Vec::new();
     let mut guarded_out: ConcernGuardedItems = Vec::new();
     let mut class_attr_out: ConcernClassAttrDefaults = Vec::new();
+    let mut prepended_out: Vec<(ClassId, Vec<ModelBodyItem>)> = Vec::new();
     for (scope, module) in find_all_modules_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
         let mut full_path: Vec<String> = scope.clone();
@@ -7013,11 +7020,21 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         // The class-variable seeds this module's blocks set on each
         // includer, in declaration order.
         let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
+        let mut prepended_items: Vec<ModelBodyItem> = Vec::new();
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
-            if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+            if call.receiver().is_some() {
                 continue;
             }
+            // `prepended do` is the same `class_eval` on a class that
+            // `prepend`s the module, so its DSL runs there — carried into
+            // the prependers' bodies by their own splice.
+            let prepended = match constant_id_str(&call.name()) {
+                "included" => false,
+                "prepended" if is_concern => true,
+                _ => continue,
+            };
+            let items: &mut Vec<ModelBodyItem> = if prepended { &mut prepended_items } else { &mut items };
             let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
             let Some(block_body) = block.body() else { continue };
             let direct = flatten_statements(block_body);
@@ -7042,6 +7059,21 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 // must be one of those items, or the guard is left to
                 // today's handling as a whole.
                 if let Some(groups) = includer_guarded_stmts(&inner, file) {
+                    // The guard is a question each INCLUDER answers, at
+                    // the splice that carries the item into its body. A
+                    // prepended block has no such splice, so its guarded
+                    // statement is refused rather than handed to every
+                    // class that prepends the module.
+                    if prepended {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&inner, file),
+                            None,
+                            "prepended do",
+                            format!("a guarded statement inside `{}` is not carried to the classes that prepend it: the guard is not answered per prepender, so it would run there unconditionally", id.0.as_str()),
+                        ));
+                        unclaimed = true;
+                        continue;
+                    }
                     let parsed: Option<Vec<(crate::app::IncluderGuard, Vec<ModelBodyItem>)>> = groups
                         .into_iter()
                         .map(|(guard, stmts)| {
@@ -7087,6 +7119,19 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                             continue;
                         }
                         Ok(Some(super::model::ClassBodyExpansion::Enum(expanded))) => {
+                            if prepended {
+                                // Folded into includers by
+                                // `fold_concern_enums_into_models`; a
+                                // prepender has no such fold.
+                                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                                    super::util::node_span(&inner, file),
+                                    None,
+                                    "prepended do",
+                                    format!("`enum` inside `{}` is not carried to the classes that prepend it", id.0.as_str()),
+                                ));
+                                unclaimed = true;
+                                continue;
+                            }
                             if let Some(mapping) = expanded.mapping {
                                 enums.push(ConcernEnumDecl {
                                     column: expanded.column,
@@ -7112,13 +7157,27 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 // the includer's class variable and defines both sides
                 // there, exactly as the same call in a model's body does:
                 // the model-side walk expands it, and the seed travels to
-                // the splice beside the accessors.
+                // the splice beside the accessors. One per module and per
+                // block kind: a `prepended do` block's seed is the
+                // PREPENDER's class variable, which no map below holds —
+                // so a prepended one is refused rather than carried into
+                // every includer.
                 if is_concern && is_direct && let Some(call) = inner.as_call_node()
                     && call.receiver().is_none()
                     && matches!(constant_id_str(&call.name()),
                         "cattr_accessor" | "cattr_reader" | "cattr_writer"
                         | "mattr_accessor" | "mattr_reader" | "mattr_writer")
                 {
+                    if prepended {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&inner, file),
+                            None,
+                            "prepended do",
+                            format!("`{}` inside `{}` is not carried to the classes that prepend it", constant_id_str(&call.name()), id.0.as_str()),
+                        ));
+                        unclaimed = true;
+                        continue;
+                    }
                     match super::model::expand_mattr_cattr(
                         &call,
                         &id,
@@ -7240,11 +7299,20 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         if !class_attr_defaults.is_empty() {
             class_attr_out.push((id.clone(), class_attr_defaults));
         }
+        if !prepended_items.is_empty() {
+            prepended_out.push((id.clone(), prepended_items));
+        }
         if !items.is_empty() {
             out.push((id, items));
         }
     }
-    (out, enums_out, guarded_out, class_attr_out)
+    ConcernModelScan {
+        items: out,
+        enums: enums_out,
+        guarded: guarded_out,
+        class_attrs: class_attr_out,
+        prepended: prepended_out,
+    }
 }
 
 /// Does this class's ancestry, as a `sig/**/*.rbs` sidecar states it,

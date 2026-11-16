@@ -9304,7 +9304,18 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
-    for inc in &lc.includes {
+    // A model's `prepend Concern` names a module this file must load
+    // before the class body runs, exactly as an `include` does — and one
+    // the concern splice claimed, so there IS a module to load: an
+    // unclaimed `prepend` (`prepend PlainModule`) stays the reported gap
+    // the lowering gives it, and is written nowhere.
+    let prepends: Vec<crate::ident::ClassId> = app
+        .models
+        .iter()
+        .find(|m| m.name == lc.name)
+        .map(crate::analyze::claimed_prepends)
+        .unwrap_or_default();
+    for inc in lc.includes.iter().chain(prepends.iter()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -9802,6 +9813,14 @@ fn emit_library_class_decl_inner(
         }
         nested.borrow_mut().write_include(&mut s, depth, lc, inc);
         writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
+    }
+    // A model's `prepend Concern`: the module's instance methods sit
+    // AHEAD of the class's own there and reach them through `super`,
+    // which an `include` would not give it. What the module's `prepended
+    // do` block declared is already in the body above.
+    for inc in &prepends {
+        nested.borrow_mut().write_include(&mut s, depth, lc, inc);
+        writeln!(s, "{body_pad}prepend {}", include_name(inc)).unwrap();
     }
     if lc.includes.len() > positioned.len() + ordered_includes.len() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
