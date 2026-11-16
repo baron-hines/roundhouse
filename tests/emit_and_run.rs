@@ -22526,3 +22526,7 @@ mod concerning_block;
 // Active Model class.
 #[path = "emit_and_run/concern_plain_includer.rs"]
 mod concern_plain_includer;
+
+// Concern shapes: a namespaced prepend by its relative name.
+#[path = "emit_and_run/concern_prepended_namespaced.rs"]
+mod concern_prepended_namespaced;
