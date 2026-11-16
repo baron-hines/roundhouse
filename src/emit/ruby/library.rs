@@ -12607,9 +12607,15 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
+// A has_one or has_many :through whose hop and source each have a batch
+// loads hop first, as Rails' through preloader does
+// (`through_hop_preload_kind`); a has_many :through over another hop
+// keeps the joined batch.
+//
 // Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
 // with a scope or polymorphic owner, and scope-carrying through-assocs
-// (other than a plain `order("...")`) get no batch arm — the dispatch
+// (other than a plain `order("...")`) get no
+// batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
 // Rails, which also lazy-loads what `includes` doesn't name). Unscoped
 // non-polymorphic has_one uses PreloadKind::HasOne (first-wins). Assigning
@@ -12799,6 +12805,17 @@ enum PreloadKind {
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
     Through { target: String, join: String, group_col: String, order: Option<String>, string_key: bool },
+    /// A through loaded hop first (`through_hop_preload_kind`): the owner's
+    /// `hop` batch, then `hop_model`'s `source` batch over the hop records.
+    ThroughHop {
+        target: String,
+        hop: String,
+        hop_many: bool,
+        hop_model: String,
+        source: String,
+        source_many: bool,
+        one: bool,
+    },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
     /// `ActiveStorage::Attached` on each record (`attr`, owner class).
@@ -12847,6 +12864,123 @@ fn touches_default_scoped(model: &crate::dialect::Model, assoc: &crate::dialect:
     }
 }
 
+/// The batch of a direct association (`belongs_to`, `has_many`, `has_one`)
+/// whose query keeps every restriction its reader has, or `None` for one
+/// that keeps its lazy reader.
+fn direct_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> Option<PreloadKind> {
+    use crate::dialect::Association;
+    // A refused association (`assoc_primary_key`) has no reader to
+    // preload into.
+    if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some() {
+        return None;
+    }
+    // A belongs_to batch is raw SQL; one that loads a default-scoped
+    // model keeps its lazy reader, whose Relation applies the scope,
+    // rather than load the rows it hides.
+    if touches_default_scoped(model, assoc, app) {
+        return None;
+    }
+    let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
+    match assoc {
+        // A scoped one keeps its lazy reader, which finds through the
+        // scope, as a scoped has_many does below. So does a polymorphic
+        // one, whose class is in each row's type column: `target` is
+        // only the name's class (`belongs_to :post` reads `Post`), which
+        // may be an app model all the same.
+        Association::BelongsTo { target, foreign_key, scope: None, polymorphic: false, .. } => {
+            let target_model = app.models.iter().find(|m| &m.name == target)?;
+            // A uuid / string key is a quoted literal in `IN (...)`;
+            // the integer helper would `to_i` it to its leading
+            // digits and find nothing (cf. #310 for `Relation#ids`).
+            let string_key = string_primary_key(app, target_model);
+            Some(PreloadKind::BelongsTo {
+                fk: foreign_key.as_str().to_string(),
+                target: target.0.as_str().to_string(),
+                table: target_model.table.0.as_str().to_string(),
+                key_list: if string_key { "escape_string_list" } else { "escape_int_list" },
+            })
+        }
+        // This loader only applies the foreign-key predicate. A scope
+        // or polymorphic owner-type restriction must stay on the lazy
+        // reader until the batch query can preserve it as well.
+        Association::HasMany { target, foreign_key, through: None, scope: None, as_interface: None, .. } => {
+            model_exists(target).then(|| PreloadKind::HasMany {
+                fk: foreign_key.as_str().to_string(),
+                owner_key: assoc.owner_key().as_str().to_string(),
+                target: target.0.as_str().to_string(),
+            })
+        }
+        // Same restriction as has_many: FK-only batch. Scoped or
+        // polymorphic has_one stays on the lazy reader until the
+        // batch can preserve those predicates.
+        Association::HasOne { target, foreign_key, through: None, scope: None, as_interface: None, .. } => {
+            model_exists(target).then(|| PreloadKind::HasOne {
+                fk: foreign_key.as_str().to_string(),
+                owner_key: assoc.owner_key().as_str().to_string(),
+                target: target.0.as_str().to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Rails' through preloader (`Preloader::ThroughAssociation`) for a
+/// through with no scope: the hop loads on the owners and is seated on
+/// them, its through scope being empty; then the source loads off the hop
+/// records and is seated on them, the through's own scope being empty
+/// too. Each owner holds its hop records' sources, in hop order, and an
+/// owner already holding its target keeps it.
+///
+/// Taken when the hop and the source each have a direct batch
+/// (`direct_preload_kind`) and the source is the target's class; a
+/// `has_one :through` needs a singular hop and source. A scoped one keeps
+/// its lazy reader or the joined batch.
+fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> Option<PreloadKind> {
+    use crate::dialect::Association;
+    let (target, thr_name, scope, one) = match assoc {
+        Association::HasMany { target, through: Some(thr), scope, .. } => (target, thr, scope, false),
+        Association::HasOne { target, through: Some(thr), scope, .. } => (target, thr, scope, true),
+        _ => return None,
+    };
+    if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some()
+        || touches_default_scoped(model, assoc, app)
+    {
+        return None;
+    }
+    if scope.is_some() {
+        return None;
+    }
+    let hop = model.associations().filter(|a| a.name() == thr_name).last()?;
+    let (hop_many, hop_target) = match direct_preload_kind(model, hop, app)? {
+        PreloadKind::HasMany { target, .. } => (true, target),
+        PreloadKind::BelongsTo { target, .. } | PreloadKind::HasOne { target, .. } => (false, target),
+        _ => return None,
+    };
+    let hop_model = app.models.iter().find(|m| m.name.0.as_str() == hop_target)?;
+    let source = hop_model.through_source(assoc)?;
+    let source_kind = direct_preload_kind(hop_model, source, app)?;
+    let source_target = match &source_kind {
+        PreloadKind::BelongsTo { target, .. } | PreloadKind::HasMany { target, .. } | PreloadKind::HasOne { target, .. } => target,
+        _ => return None,
+    };
+    if source_target != target.0.as_str() {
+        return None;
+    }
+    let source_many = matches!(source_kind, PreloadKind::HasMany { .. });
+    if one && (hop_many || source_many) {
+        return None;
+    }
+    Some(PreloadKind::ThroughHop {
+        target: target.0.as_str().to_string(),
+        hop: thr_name.as_str().to_string(),
+        hop_many,
+        hop_model: hop_model.name.0.as_str().to_string(),
+        source: source.name().as_str().to_string(),
+        source_many,
+        one,
+    })
+}
+
 /// Select association shapes whose batch queries preserve the reader's filters,
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
@@ -12860,80 +12994,16 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
     let owner_string_key = string_primary_key(app, model);
     let mut out = Vec::new();
     for assoc in model.associations() {
-        // A refused association (`assoc_primary_key`) has no reader to
-        // preload into.
-        if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some() {
+        if let Some(kind) = direct_preload_kind(model, assoc, app).or_else(|| through_hop_preload_kind(model, assoc, app)) {
+            out.push((assoc.name().as_str().to_string(), kind));
             continue;
         }
-        // A belongs_to or `through:` batch is raw SQL; one that loads a
-        // default-scoped model keeps its lazy reader, whose Relation
-        // applies the scope, rather than load the rows it hides.
-        if touches_default_scoped(model, assoc, app) {
+        if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some()
+            || touches_default_scoped(model, assoc, app)
+        {
             continue;
         }
         match assoc {
-            // A scoped one keeps its lazy reader, which finds through the
-            // scope, as a scoped has_many does below. So does a polymorphic
-            // one, whose class is in each row's type column: `target` is
-            // only the name's class (`belongs_to :post` reads `Post`), which
-            // may be an app model all the same.
-            Association::BelongsTo { name, target, foreign_key, scope: None, polymorphic: false, .. } => {
-                let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
-                    continue;
-                };
-                // A uuid / string key is a quoted literal in `IN (...)`;
-                // the integer helper would `to_i` it to its leading
-                // digits and find nothing (cf. #310 for `Relation#ids`).
-                let string_key = string_primary_key(app, target_model);
-                out.push((
-                    name.as_str().to_string(),
-                    PreloadKind::BelongsTo {
-                        fk: foreign_key.as_str().to_string(),
-                        target: target.0.as_str().to_string(),
-                        table: target_model.table.0.as_str().to_string(),
-                        key_list: if string_key { "escape_string_list" } else { "escape_int_list" },
-                    },
-                ));
-            }
-            // This loader only applies the foreign-key predicate. A scope
-            // or polymorphic owner-type restriction must stay on the lazy
-            // reader until the batch query can preserve it as well.
-            Association::HasMany {
-                name, target, foreign_key, through: None,
-                scope: None, as_interface: None, ..
-            } => {
-                if !model_exists(target) {
-                    continue;
-                }
-                out.push((
-                    name.as_str().to_string(),
-                    PreloadKind::HasMany {
-                        fk: foreign_key.as_str().to_string(),
-                        owner_key: assoc.owner_key().as_str().to_string(),
-                        target: target.0.as_str().to_string(),
-                    },
-                ));
-            }
-            // Same restriction as has_many: FK-only batch. Scoped or
-            // polymorphic has_one stays on the lazy reader until the
-            // batch can preserve those predicates, and so does a
-            // `through:` one, whose key is on the hop.
-            Association::HasOne {
-                name, target, foreign_key, through: None,
-                scope: None, as_interface: None, ..
-            } => {
-                if !model_exists(target) {
-                    continue;
-                }
-                out.push((
-                    name.as_str().to_string(),
-                    PreloadKind::HasOne {
-                        fk: foreign_key.as_str().to_string(),
-                        owner_key: assoc.owner_key().as_str().to_string(),
-                        target: target.0.as_str().to_string(),
-                    },
-                ));
-            }
             // Through: same two-hop resolution as
             // `apply_through_assoc_lowering`; assoc scopes other than a
             // plain `order("...")` (or none) don't batch — the lazy
@@ -13175,6 +13245,69 @@ end
 "#
                 );
             }
+            // Hop first (`through_hop_preload_kind`). The hop loads for
+            // every owner that does not hold it, the source over every
+            // owner's hop records, and an owner already holding its target
+            // keeps it; when every owner does, nothing runs.
+            PreloadKind::ThroughHop { hop, hop_many, hop_model, source, source_many, one, .. } => {
+                let for_hops = |body: &str| {
+                    if *hop_many {
+                        format!("    r.{hop}_target.each do |h|\n{body}\n    end")
+                    } else {
+                        format!("    h = r.{hop}\n    unless h.nil?\n{body}\n    end")
+                    }
+                };
+                let held = if *one {
+                    format!("      held = r.{name}\n      out << held unless held.nil?")
+                } else {
+                    format!("      r.{name}_target.each do |s|\n        out << s\n      end")
+                };
+                let load = format!("  {hop_model}._preload_batch_{source}(middle) if middle.length > 0");
+                let push = if *source_many {
+                    format!("      h.{source}_target.each do |s|\n        list << s\n      end")
+                } else {
+                    format!("      s = h.{source}\n      list << s unless s.nil?")
+                };
+                let seat = if *one { "list.first" } else { "list" };
+                let collect_middle = for_hops("      middle << h");
+                let collect_list = for_hops(&push);
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  out = []
+  pending = []
+  records.each do |r|
+    if r.{name}_loaded?
+{held}
+    else
+      pending << r
+    end
+  end
+  return out if pending.length == 0
+  unheld = []
+  records.each do |r|
+    unheld << r unless r.{hop}_loaded?
+  end
+  _preload_batch_{hop}(unheld) if unheld.length > 0
+  middle = []
+  records.each do |r|
+{collect_middle}
+  end
+{load}
+  pending.each do |r|
+    list = []
+{collect_list}
+    r._preload_{name}({seat})
+    list.each do |s|
+      out << s
+    end
+  end
+  out
+end
+"#
+                );
+            }
             PreloadKind::Through { target, join, group_col, order, string_key } => {
                 let (key_list, to_key) = key_helpers(*string_key);
                 let table = crate::naming::pluralize_snake(target.as_str());
@@ -13354,6 +13487,7 @@ end
                 PreloadKind::HasMany { target, .. } => Some(target.as_str()),
                 PreloadKind::HasOne { target, .. } => Some(target.as_str()),
                 PreloadKind::Through { target, .. } => Some(target.as_str()),
+                PreloadKind::ThroughHop { target, .. } => Some(target.as_str()),
                 PreloadKind::RichText { .. } => Some("ActionText::RichText"),
                 PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already
