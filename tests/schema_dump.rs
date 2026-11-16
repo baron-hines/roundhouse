@@ -338,7 +338,13 @@ fn an_unparsed_file_refuses_a_named_file() {
         assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump` (unknown anchor")), "{named}: {:?}", checked.errors);
         assert!(tables(&checked.app).is_empty(), "{named}");
     }
-    for dump in ["", "  schema_dump: false\n"] {
+    // An uncommented `schema_dump` of any value refuses, since the parser can't say where it ends.
+    for dump in ["  schema_dump: false\n", "  schema_dump: false\n    catalog_schema.rb\n"] {
+        let named = anchored(dump);
+        let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump`")), "{named}: {:?}", checked.errors);
+    }
+    for dump in ["", "  # schema_dump: catalog_schema.rb\n"] {
         let yml = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
         assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);

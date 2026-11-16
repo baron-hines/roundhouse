@@ -343,14 +343,13 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     let mut doc = match serde_yaml_ng::from_str::<Value>(&distinct) {
         Ok(doc) => doc,
         Err(error) => {
-        // Unparsed: a `schema_dump` that names a file can't be checked, so it is refused rather
-        // than dropped. Only an explicit `false`, null word or boolean on the key's own line, or no
-        // `schema_dump`, keeps main's behavior: an empty remainder may be a filename on the next
-        // line or a block scalar, so it is refused too.
-        let named = text.match_indices("schema_dump").find(|(at, key)| {
-            let value = text[at + key.len()..].lines().next().unwrap_or_default().trim_start_matches(['\'', '"']).trim_start();
-            let value = value.strip_prefix(':').map(|v| v.split(" #").next().unwrap_or_default().trim().trim_matches(|c| c == '\'' || c == '"'));
-            value.is_some_and(|v| !["~", "null", "yes", "no", "on", "off", "true", "false"].iter().any(|w| v.eq_ignore_ascii_case(w)))
+        // Unparsed: what `schema_dump` holds can't be read without the parser (a value can
+        // continue on later lines, as a block scalar or a folded plain scalar), so any
+        // uncommented `schema_dump` key refuses the named file rather than dropping it. A file
+        // with no such key keeps main's behavior.
+        let named = text.match_indices("schema_dump").find(|(at, _)| {
+            let line_start = text[..*at].rfind('\n').map_or(0, |n| n + 1);
+            !text[line_start..*at].trim_start().starts_with('#')
         });
         if let Some((at, _)) = named {
             out.primary = Some(Err(()));
