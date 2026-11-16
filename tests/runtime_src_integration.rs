@@ -1363,7 +1363,12 @@ fn every_runtime_method_body_concretely_typed() {
     // value of any type, as `escape_value` does, so their untyped `value`
     // adds 5 sites (+5 in active_record/connection.rb); every other file is
     // unchanged. Raise to 998, preserving the two-site headroom.
-    const CEILING: usize = 998;
+    // MEASURED 1003 on relation predicate blocks (main e942cef18: 998):
+    // Relation's any?, none?, one?, many? and count take a block that
+    // decides over the loaded records, one block-result site each, as
+    // filter_map's (+5 in active_record/relation.rb); every other file is
+    // unchanged. Main had no headroom left, so the ceiling is the measure.
+    const CEILING: usize = 1003;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

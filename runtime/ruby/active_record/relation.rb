@@ -2696,7 +2696,14 @@ module ActiveRecord
       limit
     end
 
+    # With a block, the loaded records the block answers truthy for, as
+    # Rails' `count` hands a block to the records.
     def count
+      if block_given?
+        n = 0
+        loaded_records.each { |x| n += 1 if yield x }
+        return n
+      end
       return 0 if @null
       rows = ActiveRecord.adapter.select_rows(bound_count_sql)
       rows.length == 0 ? 0 : rows[0]["n"].to_i
@@ -2917,8 +2924,15 @@ module ActiveRecord
       r.nil? ? !exists? : r.length == 0
     end
 
+    # With a block, whether the block answers truthy for a loaded record,
+    # as Rails' `any?` hands a block to the records.
     def any?
       return false if @null
+      if block_given?
+        found = false
+        loaded_records.each { |x| found = true if !found && yield(x) }
+        return found
+      end
       r = @records
       r.nil? ? exists? : r.length > 0
     end
@@ -2938,19 +2952,37 @@ module ActiveRecord
     end
 
     # Enumerable#none? without a block is empty? (uses the loaded cache).
+    # With one, the block decides over the loaded records, as `any?`.
     def none?
+      if block_given?
+        found = false
+        loaded_records.each { |x| found = true if !found && yield(x) }
+        return !found
+      end
       empty?
     end
 
-    # Exactly one row. Unloaded: SELECT 1 LIMIT 2. No block form.
+    # Exactly one row. Unloaded: SELECT 1 LIMIT 2. With a block, exactly
+    # one loaded record the block answers truthy for.
     def one?
+      if block_given?
+        n = 0
+        loaded_records.each { |x| n += 1 if yield x }
+        return n == 1
+      end
       r = @records
       return r.length == 1 unless r.nil?
       probe_existence(2) == 1
     end
 
-    # More than one row. Unloaded: SELECT 1 LIMIT 2.
+    # More than one row. Unloaded: SELECT 1 LIMIT 2. With a block, more
+    # than one loaded record the block answers truthy for.
     def many?
+      if block_given?
+        n = 0
+        loaded_records.each { |x| n += 1 if yield x }
+        return n > 1
+      end
       r = @records
       return r.length > 1 unless r.nil?
       probe_existence(2) > 1

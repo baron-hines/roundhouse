@@ -376,7 +376,7 @@ module ActiveRecord
     def row_from_end: (Array[Base] rows, Integer index) -> Base?
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
-    def count: () -> Integer
+    def count: () ?{ (Base) -> bool } -> Integer
     def sum: (String | Symbol expr) -> Float
     def minimum: (String | Symbol expr) -> untyped
     def maximum: (String | Symbol expr) -> untyped
@@ -388,13 +388,13 @@ module ActiveRecord
     def group_count: () -> Hash[untyped, Integer]
     def async_count: (?(Symbol | String)? column) -> Promise
     def empty?: () -> bool
-    def any?: () -> bool
+    def any?: () ?{ (Base) -> bool } -> bool
     def blank?: () -> bool
     def present?: () -> bool
     def presence: () -> Relation?
-    def none?: () -> bool
-    def one?: () -> bool
-    def many?: () -> bool
+    def none?: () ?{ (Base) -> bool } -> bool
+    def one?: () ?{ (Base) -> bool } -> bool
+    def many?: () ?{ (Base) -> bool } -> bool
     def all?: () { (Base) -> bool } -> bool
     # Not `?condition`: the def takes `*conditions`, and spinel types a positional field by the def's own slot.
     def exists?: (*(Integer | String | Hash[String | Symbol, untyped] | nil | false) conditions) -> bool

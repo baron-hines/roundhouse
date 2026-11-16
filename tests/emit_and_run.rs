@@ -22429,3 +22429,5 @@ mod held_has_many_default_scope_key;
 
 #[path = "emit_and_run/association_load_seats_inverse.rs"]
 mod association_load_seats_inverse;
+#[path = "emit_and_run/relation_predicate_blocks.rs"]
+mod relation_predicate_blocks;
