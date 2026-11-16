@@ -2963,11 +2963,12 @@ module ActiveRecord
     end
 
     # Exactly one row. Unloaded: SELECT 1 LIMIT 2. With a block, exactly
-    # one loaded record the block answers truthy for.
+    # one loaded record the block answers truthy for; the block is not
+    # asked again after a second one, as Enumerable's `one?` stops.
     def one?
       if block_given?
         n = 0
-        loaded_records.each { |x| n += 1 if yield x }
+        loaded_records.each { |x| n += 1 if n < 2 && yield(x) }
         return n == 1
       end
       r = @records
@@ -2976,11 +2977,12 @@ module ActiveRecord
     end
 
     # More than one row. Unloaded: SELECT 1 LIMIT 2. With a block, more
-    # than one loaded record the block answers truthy for.
+    # than one loaded record the block answers truthy for, asking no
+    # further once a second one has.
     def many?
       if block_given?
         n = 0
-        loaded_records.each { |x| n += 1 if yield x }
+        loaded_records.each { |x| n += 1 if n < 2 && yield(x) }
         return n > 1
       end
       r = @records

@@ -40,6 +40,11 @@ end
     check("relation any? with a block", !tall.any? { |p| p.name == "moss" } && tall.any? { |p| p.name == "oak" })
     check("relation count with a block", tall.count { |p| p.name.length == 4 } == 1)
     check("relation none?, one? and many? with a block", tall.none? { |p| p.height < 10 } && tall.one? { |p| p.height > 500 } && !tall.many? { |p| p.height > 500 })
+    # Rails: neither asks the block again once a second record answers
+    asked = 0
+    check("one? stops at a second match", !g.plants.one? { |p| asked += 1; true } && asked == 2)
+    asked = 0
+    check("many? stops at a second match", g.plants.many? { |p| asked += 1; true } && asked == 2)
     # Rails: without a block they still ask about the rows
     check("any? without a block", g.plants.any? && !Plant.where(height: 1).any?)
     check("count without a block", g.plants.count == 3 && tall.count == 2)
