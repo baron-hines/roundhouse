@@ -145,9 +145,37 @@ fn element_filter(e: &Expr) -> Option<Expr> {
     Some(allowed(filter_names(args)?))
 }
 
+/// `params[:spec]&.dig(:arch)`, which ingest binds as `(__safe_nav = params[:spec]) && __safe_nav.dig(:arch)`: the
+/// temporary holds the same params value `params[:spec].dig(:os)` reads, so its Symbol literal keys are the String
+/// keys the request's Hash holds, as the emit writes them for the plain call.
+fn stringify_safe_nav_param_reads(expr: &mut Expr) {
+    let ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } = &mut *expr.node else { return };
+    let ExprNode::Assign { target: crate::expr::LValue::Var { name: temp, .. }, value } = &*left.node else { return };
+    let params_value = is_parameters(value.ty.as_ref())
+        || matches!(&*value.node, ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "[]" && is_request_params(r));
+    if !temp.as_str().starts_with("__safe_nav") || !params_value {
+        return;
+    }
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *right.node else { return };
+    if !matches!(&*r.node, ExprNode::Var { name, .. } if name == temp) {
+        return;
+    }
+    let keys = match method.as_str() {
+        "dig" => args.len(),
+        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" => args.len().min(1),
+        _ => 0,
+    };
+    for key in args.iter_mut().take(keys) {
+        if let Some(name) = sym_name(key) {
+            *key = str_lit(key.span, name);
+        }
+    }
+}
+
 fn rewrite(expr: &mut Expr) {
     rewrite_element_block(expr);
     expr.node.for_each_child_mut(&mut rewrite);
+    stringify_safe_nav_param_reads(expr);
     // A top-level `params.permit(:a, :b)` CONSUMED IN PLACE, as a call's
     // argument — the Rails 8 authentication generator's
     // `@user.update(params.permit(:password, :password_confirmation))`
