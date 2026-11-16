@@ -133,6 +133,7 @@ module RoundhouseShapeObserver
       "->(#{parts[0]}) { #{parts[1]} }"
     end
 
+    MUTATORS = %i[<< push append unshift prepend concat insert []= store update merge! replace clear delete delete_if keep_if select! reject! map! collect! compact! flatten! uniq! sort! sort_by! shift pop fill transform_values! transform_keys!].freeze
     HARD_SCOPES = [Prism::DefNode, Prism::ClassNode, Prism::ModuleNode, Prism::SingletonClassNode].freeze
     # Not as written in a `def`: there `yield` and these read the method's own call, not the one the block was made in.
     ENCLOSING = [Prism::YieldNode, Prism::ForwardingSuperNode, Prism::SuperNode].freeze
@@ -160,6 +161,12 @@ module RoundhouseShapeObserver
         case n
         when *HARD_SCOPES then return refuse("#{name}: a `#{n.type}` in the block")
         when *ENCLOSING then return refuse("#{name}: `#{n.slice[0, 20]}` reads the call the block was made in")
+        when Prism::ImplicitNode then return refuse("#{name}: a shorthand `{ #{n.slice} }` reads a captured local")
+        when Prism::CallNode
+          # Not a captured Array or Hash the body changes: each call of the `def` would change a fresh copy.
+          if MUTATORS.include?(n.name) && n.receiver.is_a?(Prism::LocalVariableReadNode) && n.receiver.depth > level
+            return refuse("#{name}: changes captured `#{n.receiver.name}` with `#{n.name}`")
+          end
         when Prism::LocalVariableReadNode
           if n.depth > level
             value = binding_.local_variable_get(n.name)
@@ -172,8 +179,10 @@ module RoundhouseShapeObserver
         when Prism::ConstantReadNode
           # Not left to the class it is written into: a constant is looked up where the block was written.
           value = (binding_.eval(n.name.to_s) rescue (return refuse("#{name}: `#{n.name}` names nothing where the block was made")))
-          text = value.is_a?(Module) && value.name ? "::#{value.name}" : literal(value)
-          return refuse("#{name}: `#{n.name}` is neither a named module nor a literal") unless text
+          # Not the value it held as the app booted: read by its full name, a later assignment is what the method sees.
+          holder = (binding_.eval("::Module.nesting") + [Object]).find { |m| m.const_defined?(n.name, false) }
+          text = value.is_a?(Module) && value.name ? "::#{value.name}" : holder && (holder == Object ? "::#{n.name}" : holder.name && "::#{holder.name}::#{n.name}")
+          return refuse("#{name}: `#{n.name}` cannot be named from the class it is written into") unless text
           edits << [n.location.start_offset, n.location.end_offset, text]
           return true
         end
@@ -194,7 +203,7 @@ module RoundhouseShapeObserver
     # Each gem statement that changed a class's shape, and whether every class it changed is the app's.
     def note_site(site, owner)
       return unless site
-      (@sites[site.join(":")] ||= []) << app_class?(owner)
+      (@sites[site.join(":")] ||= []) << !!app_class?(owner)
     end
 
     def record(owner, event, statement, site = gem_site)
