@@ -9308,13 +9308,15 @@ fn emit_library_class_decl_inner(
     // before the class body runs, exactly as an `include` does — and one
     // the concern splice claimed, so there IS a module to load: an
     // unclaimed `prepend` (`prepend PlainModule`) stays the reported gap
-    // the lowering gives it, and is written nowhere.
+    // the lowering gives it, and is written nowhere. Every declaration of
+    // the model's name contributes: the file is written once, and the
+    // `prepend` may sit in the reopening file rather than the first one.
     let prepends: Vec<Vec<crate::ident::ClassId>> = app
         .models
         .iter()
-        .find(|m| m.name == lc.name)
-        .map(crate::analyze::claimed_prepend_statements)
-        .unwrap_or_default();
+        .filter(|m| m.name == lc.name)
+        .flat_map(crate::analyze::claimed_prepend_statements)
+        .collect();
     for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
