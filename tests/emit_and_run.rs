@@ -22265,6 +22265,8 @@ mod belongs_to_scope_join;
 mod has_many_scoped_join;
 #[path = "emit_and_run/polymorphic_belongs_to_any_model.rs"]
 mod polymorphic_belongs_to_any_model;
+#[path = "emit_and_run/polymorphic_belongs_to_must_exist.rs"]
+mod polymorphic_belongs_to_must_exist;
 #[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]
 mod belongs_to_scope_over_default_scope;
 #[path = "emit_and_run/helper_content_for.rs"]

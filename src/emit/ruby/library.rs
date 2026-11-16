@@ -2511,16 +2511,24 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        let names: Vec<(Symbol, Symbol)> = model
+        // A polymorphic association is keyed by TWO columns — the row's
+        // `<assoc>_type` picks the class the reader queries — so a write
+        // to either one invalidates the kept target.
+        let names: Vec<(Symbol, Symbol, Option<Symbol>)> = model
             .associations()
             .filter_map(|a| match a {
-                Association::BelongsTo { name, foreign_key, polymorphic: false, .. } => {
-                    Some((name.clone(), foreign_key.clone()))
+                Association::BelongsTo { name, foreign_key, foreign_type, polymorphic, .. } => {
+                    let type_col = polymorphic.then(|| {
+                        foreign_type
+                            .clone()
+                            .unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str())))
+                    });
+                    Some((name.clone(), foreign_key.clone(), type_col))
                 }
                 _ => None,
             })
             .collect();
-        for (name, fk) in names {
+        for (name, fk, type_col) in names {
             // The reader carries the cache guard only where the preload
             // lowering ran (an app with `includes`); without it the reader
             // re-queried after a writer, a has_one's inverse or a preload
@@ -2530,9 +2538,40 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
             }
             memoize_reader(lc, &name);
             invalidate_on_fk_write(lc, &name, &fk);
+            if let Some(type_col) = &type_col {
+                invalidate_on_fk_write(lc, &name, type_col);
+            }
             invalidate_on_assoc_write(lc, &name, &fk);
+            if type_col.is_some() {
+                reset_on_reload(lc, &name);
+            }
         }
     }
+}
+
+/// `_adapter_reload` clears the load-once flags the shared lowering knows
+/// about (`associations::clear_loaded_flag_assigns`); a polymorphic
+/// belongs_to keeps its target only on this path, so its flag is reset
+/// here. Rails drops the association on `reload`, and the reader would
+/// otherwise answer the record it held before it.
+fn reset_on_reload(lc: &mut LibraryClass, name: &Symbol) {
+    let Some(m) = lc
+        .methods
+        .iter_mut()
+        .find(|m| m.name.as_str() == "_adapter_reload" && m.receiver == MethodReceiver::Instance)
+    else {
+        return;
+    };
+    let span = m.body.span;
+    let reset = Expr::new(
+        span,
+        ExprNode::Assign {
+            target: LValue::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
+            value: Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: false } }),
+        },
+    );
+    let old = std::mem::replace(&mut m.body, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+    m.body = Expr::new(span, ExprNode::Seq { exprs: vec![reset, old] });
 }
 
 /// `body` -> `Seq[return @cache if @loaded, body]`, unless it opens
@@ -3009,7 +3048,9 @@ fn sti_dispatch(type_read: &Expr, subs: &[ClassId], new_args: &[Expr], span: Spa
 /// the key stayed 0 and campfire's whole first run died on
 /// `Validation failed: Creator must exist` (four tests, two files).
 ///
-/// Three edits per non-polymorphic belongs_to:
+/// Three edits per belongs_to (`polymorphic: true` included — its
+/// writer stores the type beside the key, and its reader dispatches on
+/// it):
 ///
 ///   1. the writer keeps the assigned value in the reader's cache, as
 ///      Rails' writer sets the association target — an UNSAVED one
@@ -3083,7 +3124,7 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
         let names: Vec<(Symbol, Symbol)> = model
             .associations()
             .filter_map(|a| match a {
-                Association::BelongsTo { name, foreign_key, polymorphic: false, .. } => {
+                Association::BelongsTo { name, foreign_key, .. } => {
                     Some((name.clone(), foreign_key.clone()))
                 }
                 _ => None,
@@ -3099,22 +3140,31 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
                 continue;
             };
             // Only the SYNTHESIZED writer is patched, recognized by its
-            // shape: `if value.nil? then @fk = 0 else @fk = value.id`.
-            // A model that wrote its own `<name>=` keeps it untouched
-            // and gets no autosave either — the stash is the only thing
-            // `_autosave_<name>` reads, and watching a slot nobody
-            // fills would be worse than the gap.
+            // shape: `if value.nil? then @fk = 0 else @fk = value.id`. A
+            // polymorphic one stores the type beside the key, so its key
+            // assignment opens a sequence instead of standing alone. A
+            // model that wrote its own `<name>=` keeps it untouched and
+            // gets no autosave either — the stash is the only thing
+            // `_autosave_<name>` reads, and watching a slot nobody fills
+            // would be worse than the gap.
             let ExprNode::If { else_branch, .. } = &mut *w.body.node else { continue };
-            if !matches!(&*else_branch.node, ExprNode::Assign { target: LValue::Ivar { name: n }, .. } if n == &fk)
-            {
+            let key_assigned = |e: &Expr| {
+                matches!(&*e.node, ExprNode::Assign { target: LValue::Ivar { name: n }, .. } if n == &fk)
+            };
+            let whole = key_assigned(else_branch);
+            let keyed_seq = matches!(&*else_branch.node,
+                ExprNode::Seq { exprs } if exprs.first().is_some_and(key_assigned));
+            if !whole && !keyed_seq {
                 continue;
             }
             let span = else_branch.span;
-            let assign = else_branch.clone();
-            *else_branch = Expr::new(
-                span,
-                ExprNode::Seq { exprs: vec![assign, stash_target(&name, span)] },
-            );
+            let stash = stash_target(&name, span);
+            if whole {
+                let assign = else_branch.clone();
+                *else_branch = Expr::new(span, ExprNode::Seq { exprs: vec![assign, stash] });
+            } else if let ExprNode::Seq { exprs } = &mut *else_branch.node {
+                exprs.push(stash);
+            }
             lc.methods.push(autosave_method(&lc.name, &name, &fk));
             fold_autosave_call_into_hook(&mut lc.methods, &lc.name, &name);
             guard_default_on_reader(&mut lc.methods, &name, &fk);

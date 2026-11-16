@@ -209,7 +209,7 @@ pub(super) fn push_validate_method(
                 // record to exist before save, checked through the association
                 // reader (`inline_belongs_to_check`).
                 if let Association::BelongsTo {
-                    name, foreign_key, optional: false, polymorphic, ..
+                    name, foreign_key, optional: false, polymorphic, polymorphic_targets, foreign_type, ..
                 } = assoc
                 {
                     // A foreign key held unset for its presence check
@@ -219,7 +219,32 @@ pub(super) fn push_validate_method(
                         .flat_map(|t| t.columns.iter())
                         .find(|c| c.name == *foreign_key && c.unset_until_assigned)
                         .map(super::schema::col_storage_name);
-                    let mut check = inline_belongs_to_check(model_msgs, name, foreign_key, held.as_ref(), *polymorphic);
+                    // A polymorphic association whose implementors never
+                    // resolved has no reader and no writer to synthesize
+                    // (`associations::synth_methods`): its key pair is all
+                    // the check can read. One that resolved is checked
+                    // through its reader, which is where the writer keeps
+                    // the record it was given.
+                    // The writer keeps the record only on the Ruby family
+                    // (`emit::ruby::library::apply_belongs_to_autosave`), and a
+                    // strict target's polymorphic reader may be a stub that
+                    // raises: there the key pair stays the check.
+                    let source = if !*polymorphic {
+                        PresenceSource::KeyAndReader
+                    } else if polymorphic_targets.is_empty()
+                        || runtime_relation != super::RuntimeRelation::Present
+                    {
+                        PresenceSource::Key
+                    } else {
+                        PresenceSource::Reader {
+                            type_column: foreign_type
+                                .clone()
+                                .unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str()))),
+                            classes: polymorphic_targets.iter().map(|t| t.0.as_str().to_string()).collect(),
+                        }
+                    };
+                    let mut check =
+                        inline_belongs_to_check(model_msgs, name, foreign_key, held.as_ref(), source);
                     // `accepts_nested_attributes_for` (`ingest::nested_attributes`)
                     // builds the record before the save, which writes its id:
                     // Rails checks the object it built, so a pending one passes,
@@ -984,12 +1009,37 @@ fn inline_uniqueness_check(
     if_with_nil_else(taken, push_err)
 }
 
+/// What a required `belongs_to`'s presence check can read.
+enum PresenceSource {
+    /// The key column's unset state, then the association reader.
+    KeyAndReader,
+    /// The reader, for a polymorphic association: its writer keeps an
+    /// unsaved record under the runtime's 0 key, so the key cannot decide
+    /// whether the record is there — the reader can, because it holds
+    /// what the writer was given. The reader finds only the `classes` it
+    /// dispatches on, so a set key whose `type_column` names any other
+    /// class passes, as the key alone decided before; Rails loads that
+    /// class's row.
+    Reader { type_column: Symbol, classes: Vec<String> },
+    /// The key column alone. A polymorphic association whose implementors
+    /// never resolved has no synthesized reader to call (`Record.find_by`
+    /// would name a phantom class), so its key pair is all there is.
+    Key,
+}
+
+/// `if @fk.nil? || @fk == 0 || <assoc>.nil?` — a required `belongs_to`'s
+/// presence check, `"<Assoc> must exist"` (type `:blank`, as Rails adds
+/// it for `message: :required`). The reader is what Rails validates, so
+/// assigning the record itself makes the check pass before either side is
+/// saved, and a key pair naming no row makes it fail. For a polymorphic
+/// association the reader is also what picks the class — from the row's
+/// `<assoc>_type` column — so the check never names one.
 fn inline_belongs_to_check(
     msgs: Messages,
     assoc_name: &Symbol,
     foreign_key: &Symbol,
     held: Option<&Symbol>,
-    polymorphic: bool,
+    source: PresenceSource,
 ) -> Expr {
     let fk_ivar = ivar(foreign_key);
     // `@fk.nil?`
@@ -1012,10 +1062,10 @@ fn inline_belongs_to_check(
         Some(storage) => send(ivar(storage), "nil?", vec![]),
         None => bool_op(BoolOpKind::Or, nil_check, zero_check),
     };
-    if polymorphic {
+    if matches!(source, PresenceSource::Key) {
         return if_with_nil_else(unset, push_err);
     }
-    // `article.nil?` — the association reader, on self.
+    // `<assoc>.nil?` — the association reader, on self.
     let reader = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
@@ -1027,7 +1077,27 @@ fn inline_belongs_to_check(
         },
     );
     let missing = send(reader, "nil?", vec![]);
-    let cond = bool_op(BoolOpKind::Or, unset, missing);
+    let cond = match source {
+        PresenceSource::KeyAndReader => bool_op(BoolOpKind::Or, unset, missing),
+        // `<assoc>.nil? && (<unset> || @<type>.nil? || [<classes>].include?(@<type>))`
+        PresenceSource::Reader { type_column, classes } => {
+            let names = Expr::new(
+                Span::synthetic(),
+                ExprNode::Array {
+                    elements: classes
+                        .into_iter()
+                        .map(|value| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value } }))
+                        .collect(),
+                    style: crate::expr::ArrayStyle::Brackets,
+                },
+            );
+            let untyped = send(ivar(&type_column), "nil?", vec![]);
+            let known = send(names, "include?", vec![ivar(&type_column)]);
+            let checked = bool_op(BoolOpKind::Or, bool_op(BoolOpKind::Or, unset, untyped), known);
+            bool_op(BoolOpKind::And, missing, checked)
+        }
+        PresenceSource::Key => unreachable!("answered above"),
+    };
     if_with_nil_else(cond, push_err)
 }
 
@@ -2658,7 +2728,13 @@ mod tests {
     fn belongs_to_inline_emits_must_exist_error() {
         let assoc_name = Symbol::from("article");
         let foreign_key = Symbol::from("article_id");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, None, false);
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::KeyAndReader,
+        );
         assert_eq!(collect_error_messages(&expr), vec!["Article must exist"]);
     }
 
@@ -2669,7 +2745,13 @@ mod tests {
         // reader goes by the association's `primary_key:` itself.
         let assoc_name = Symbol::from("product");
         let foreign_key = Symbol::from("product_uuid");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, None, false);
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::KeyAndReader,
+        );
         let rendered = format!("{expr:?}");
         assert!(!rendered.contains("exists?"), "the check must not probe with exists?: {rendered}");
         assert!(rendered.contains("method: Symbol(\"product\")"), "the check reads the association: {rendered}");
@@ -2677,19 +2759,57 @@ mod tests {
     }
 
     #[test]
-    fn polymorphic_belongs_to_checks_the_id_but_names_no_class() {
+    fn polymorphic_belongs_to_checks_the_record_through_its_reader() {
         // The class to query lives in the row's `<assoc>_type` column,
         // and `target` is the assoc-name phantom — writing it out was an
-        // uninitialized-constant NameError on the first save.
+        // uninitialized-constant NameError on the first save. The reader
+        // dispatches on that column, so the check asks it.
         let assoc_name = Symbol::from("record");
         let foreign_key = Symbol::from("record_id");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, None, true);
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::Reader { type_column: Symbol::from("record_type"), classes: vec!["Post".to_string()] },
+        );
         assert_eq!(collect_error_messages(&expr), vec!["Record must exist"]);
         let rendered = format!("{expr:?}");
         assert!(
             !rendered.contains("exists?"),
             "a polymorphic check must not query a class: {rendered}"
         );
+        assert!(
+            !rendered.contains("path: [Symbol(\"Record\")]"),
+            "a polymorphic check names no class constant: {rendered}"
+        );
+        assert!(
+            rendered.contains("method: Symbol(\"record\")"),
+            "the check reads the association: {rendered}"
+        );
+        // A nil reader fails the check when the key is unset or the type
+        // names a class the reader dispatches on; a kept unsaved record,
+        // under the runtime's 0 key, is not nil, so it passes.
+        assert!(rendered.contains("method: Symbol(\"include?\")"), "the type is checked: {rendered}");
+        assert!(rendered.contains("Ivar { name: Symbol(\"record_type\") }"), "the type column: {rendered}");
+    }
+
+    #[test]
+    fn a_polymorphic_belongs_to_with_no_reader_checks_only_its_key() {
+        // An association whose implementors never resolved has no
+        // synthesized reader to call.
+        let assoc_name = Symbol::from("record");
+        let foreign_key = Symbol::from("record_id");
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::Key,
+        );
+        let rendered = format!("{expr:?}");
+        assert!(!rendered.contains("method: Symbol(\"record\")"), "no reader call: {rendered}");
+        assert_eq!(collect_error_messages(&expr), vec!["Record must exist"]);
     }
 }
 
