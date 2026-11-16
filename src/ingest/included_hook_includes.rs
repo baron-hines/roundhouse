@@ -30,6 +30,9 @@
 //! first statement of any other shape (a condition, a guard, another
 //! receiver, `send(:include, …)`), which is left as written, and the
 //! emitted program behaves as it did before.
+//!
+//! A reopened module's later `self.included` REPLACES the earlier one, as
+//! Ruby redefines the method: only the last definition is read.
 
 use crate::det::{HashMap, HashSet};
 
@@ -41,13 +44,23 @@ use crate::ident::{ClassId, Symbol};
 pub(super) fn carry(app: &mut App) {
     let mut hops: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
-        let mut included: Vec<ClassId> = Vec::new();
-        for method in lc
+        // The LAST definition of `self.included` is the live hook: a
+        // reopened module's later opening REPLACES the earlier hook
+        // rather than adding to it. A later hook that includes nothing
+        // clears the earlier expansion, and one this scan cannot read
+        // (no single `base` parameter) is still a replacement — expanding
+        // the stale earlier hook would mix a module in where Rails does
+        // not.
+        let Some(method) = lc
             .methods
             .iter()
             .filter(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "included")
-        {
-            let [base] = method.params.as_slice() else { continue };
+            .next_back()
+        else {
+            continue;
+        };
+        let mut included: Vec<ClassId> = Vec::new();
+        if let [base] = method.params.as_slice() {
             let mut written = Vec::new();
             hook_includes(&method.body, &base.name, &mut written);
             for path in written {
@@ -56,9 +69,7 @@ pub(super) fn carry(app: &mut App) {
                 }
             }
         }
-        if !included.is_empty() {
-            hops.insert(lc.name.clone(), included);
-        }
+        hops.insert(lc.name.clone(), included);
     }
     if hops.is_empty() {
         return;
