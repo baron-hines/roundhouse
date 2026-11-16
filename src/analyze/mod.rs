@@ -9508,8 +9508,10 @@ fn association_member_ty(assoc: &crate::dialect::Association) -> (Symbol, Ty) {
     match assoc {
         // Polymorphic belongs_to with a resolved implementor set —
         // the reader yields any implementor (or nil); dispatch on the
-        // union resolves member-wise. Unresolved (no inverse `as:`
-        // decls found) falls through to the phantom-target arm below.
+        // union resolves member-wise. Unresolved (a framework record
+        // ingest synthesizes after resolving the sets, see
+        // `resolve_polymorphic_targets`) falls through to the
+        // phantom-target arm below.
         Association::BelongsTo { name, polymorphic: true, polymorphic_targets, .. }
             if !polymorphic_targets.is_empty() =>
         {

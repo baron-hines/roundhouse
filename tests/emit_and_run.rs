@@ -22257,6 +22257,14 @@ mod has_many_writer;
 mod association_scopes;
 #[path = "emit_and_run/association_relation_calls.rs"]
 mod association_relation_calls;
+#[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
+mod polymorphic_belongs_to_scope;
+#[path = "emit_and_run/belongs_to_scope_join.rs"]
+mod belongs_to_scope_join;
+#[path = "emit_and_run/polymorphic_belongs_to_any_model.rs"]
+mod polymorphic_belongs_to_any_model;
+#[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]
+mod belongs_to_scope_over_default_scope;
 #[path = "emit_and_run/helper_content_for.rs"]
 mod helper_content_for;
 #[path = "emit_and_run/view_statement_helper_call.rs"]
@@ -22303,8 +22311,6 @@ mod has_one_create_bang_holds_record;
 mod where_polymorphic_record;
 
 // Fork specs: preloads.
-#[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]
-mod belongs_to_scope_over_default_scope;
 #[path = "emit_and_run/includes_singular_where_eager_loads.rs"]
 mod includes_singular_where_eager_loads;
 #[path = "emit_and_run/preload_belongs_to_raw_foreign_key.rs"]

@@ -8968,8 +8968,28 @@ fn map_enum_labels(app: &mut App) {
 /// the IR is self-describing — lowerers and the analyzer read the
 /// resolved set instead of re-scanning the app. Models are collected
 /// in ingest order (alphabetical fs walk), so the set is stable.
+///
+/// An association that neither names: every concrete, table-backed
+/// app model that stores its own name in a type column (an STI
+/// subclass stores its base class's), since Rails' reader constantizes
+/// whatever class name the row holds. Leaving the set empty dropped the
+/// reader and writer while the analyzer still typed calls to them, so a
+/// clean `check` emitted a program that raised NoMethodError there.
 fn resolve_polymorphic_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
+
+    let any_model: Vec<crate::ident::ClassId> = app
+        .models
+        .iter()
+        .filter(|m| {
+            app.schema.tables.contains_key(&m.table.0)
+                && !crate::lower::model_to_library::markers::is_abstract_class(m)
+                && !m.parent.as_ref().is_some_and(|p| {
+                    app.models.iter().any(|base| &base.name == p && base.table == m.table)
+                })
+        })
+        .map(|m| m.name.clone())
+        .collect();
 
     let mut implementors: HashMap<crate::ident::Symbol, Vec<crate::ident::ClassId>> =
         HashMap::default();
@@ -9022,6 +9042,8 @@ fn resolve_polymorphic_targets(app: &mut App) {
                 literal_sets.iter().find(|(n, _)| n == name)
             {
                 *polymorphic_targets = found.clone();
+            } else {
+                *polymorphic_targets = any_model.clone();
             }
         }
     }

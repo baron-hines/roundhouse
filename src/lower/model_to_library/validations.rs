@@ -814,11 +814,12 @@ fn validation_rule_to_calls(
 /// A POLYMORPHIC association keeps only the first two terms. The class
 /// to query is in the row's `<assoc>_type` COLUMN, and `target` for a
 /// polymorphic belongs_to is the assoc-name phantom (`Record` for
-/// `belongs_to :record`), a class that does not exist and has no typed
-/// reader. Dropping the existence half is a strict SUBSET of Rails'
-/// check — it can fail a save Rails would fail, never one Rails would
-/// pass — and the id-presence half is the part that catches the real
-/// error (an unset owner).
+/// `belongs_to :record`). Its type-switched reader keeps no target the
+/// writer assigned, so asking it would fail a save of a record Rails
+/// checks as present (one the scope hides, or not yet saved). Without the
+/// existence half the check never fails a save Rails would pass, and
+/// passes one whose key names a missing or scoped-out row, which Rails
+/// fails: the id-presence half catches the common error (an unset owner).
 /// Inline `validates :attr, uniqueness: …`, as Rails 8.1's
 /// `UniquenessValidator` queries (on a target with the runtime Relation):
 ///   if Model.unscoped.where(attr: @attr).not(<pk>: @<pk>)[.where(scope_col: @scope_col)…].exists?
