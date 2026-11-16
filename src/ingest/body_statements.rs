@@ -385,15 +385,26 @@ impl Check<'_> {
                             let named: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
                             let name = named.join("::");
                             // `Swatch` in `Palette` is `Palette::Swatch` when the app has one, as
-                            // Ruby looks it up first. Not a namespace further out
-                            // (`Catalog::Swatch` from `Catalog::Palette`): the emitted body
-                            // requires its own nested classes and top-level ones only.
+                            // Ruby looks it up first. Only when the name is that one class
+                            // alone: the call is written back with the bare name, and the
+                            // emitted body requires its own nested classes and top-level ones,
+                            // so a namespace further out (`Catalog::Swatch` from
+                            // `Catalog::Palette`), or both a nested and a top-level `Swatch`
+                            // (the require could load the other first), is refused.
                             let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
-                            let nested = format!("{}::{name}", self.owner);
+                            let mut candidates = self.owner.split("::").scan(String::new(), |prefix, part| {
+                                prefix.push_str(part);
+                                let candidate = format!("{prefix}::{name}");
+                                prefix.push_str("::");
+                                Some(candidate)
+                            }).chain(std::iter::once(name.clone())).filter(|c| self.index.class_side.contains_key(c));
                             let class = if absolute {
                                 self.index.class_side.contains_key(&name).then_some(name)
                             } else {
-                                resolve(self.index.class_side, &name, Some(self.owner)).filter(|found| *found == nested || *found == name)
+                                match (candidates.next(), candidates.next()) {
+                                    (Some(only), None) if only == format!("{}::{name}", self.owner) || only == name => Some(only),
+                                    _ => None,
+                                }
                             };
                             if let Some(class) = class {
                                 // `new` on one of the app's classes (not a module): every class answers it.
