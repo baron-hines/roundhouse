@@ -228,6 +228,12 @@ pub(super) fn ingest_model_with_enum_constants(
             // spliced hook block was written in.
             let WalkStmt { node: statement, file, source, hook } = item;
             let spliced = hook.is_some();
+            // A spliced statement's loops see its initializer's constants, not
+            // the class body's, and a declaration the ingest would drop with a
+            // warning is refused, so it is reported as the hook's.
+            let _hook_scope = spliced.then(|| {
+                (super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::barrier()), super::load_hooks::InHook::enter())
+            });
             // `ActiveSupport.run_load_hooks(:name, self)` itself lowers to
             // nothing: what it runs is in the walk, here.
             if hook.is_none() && super::load_hooks::fired_by(&statement).is_some() {
@@ -788,6 +794,8 @@ pub(super) fn ingest_model_body_items(
         if with_options::is_with_options(&call) {
             return match with_options::expand(&call, &[], owner, file, class_consts) {
                 Ok(items) => Ok(items),
+                // In a spliced load hook, the hook reports it as an error.
+                Err(err @ IngestError::Unsupported { .. }) if super::load_hooks::in_hook() => Err(err),
                 // Declined: reported with what blocked it, and dropped like
                 // any unlowered model DSL (none of its calls is kept).
                 Err(IngestError::Unsupported { message, .. }) => {

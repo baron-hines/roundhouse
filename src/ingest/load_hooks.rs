@@ -75,6 +75,28 @@ struct Hook {
 
 thread_local! {
     static HOOKS: RefCell<Vec<Hook>> = const { RefCell::new(Vec::new()) };
+    static IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A spliced hook statement is being ingested while this lives: a
+/// declaration the model ingest would drop with a warning (a declined
+/// `with_options`) is an error instead, which the hook reports.
+pub(super) struct InHook(bool);
+
+impl InHook {
+    pub(super) fn enter() -> Self {
+        InHook(IN_HOOK.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for InHook {
+    fn drop(&mut self) {
+        IN_HOOK.with(|c| c.set(self.0));
+    }
+}
+
+pub(super) fn in_hook() -> bool {
+    IN_HOOK.with(std::cell::Cell::get)
 }
 
 /// The hooks one app ingest registered, cleared when it is dropped, so a

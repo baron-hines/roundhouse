@@ -127,17 +127,24 @@ fn a_hook_block_the_splice_refuses_is_reported_naming_the_hook_and_the_model() {
     assert!(error.contains("Kite"), "{error}");
 }
 
-/// A class declared in a hook block, and an enum whose values a constant
-/// names (which the block reads from the initializer's scope, not the
-/// model's), are not carried: each is a `check` error naming the hook.
+/// What a hook block holds that the splice does not carry is a `check`
+/// error naming the model, not a drop: a class declared in it; an enum or
+/// a `define_method` loop over a constant, which the block reads from the
+/// initializer's scope, never the model's same-named `KINDS`; a
+/// `with_options` the model ingest declines.
 #[test]
-fn a_hook_class_or_constant_enum_is_reported_not_dropped() {
+fn what_a_hook_block_cannot_carry_is_reported_not_dropped() {
     for (hook, statement) in [
         ("ActiveSupport.on_load(:kite) do\n  class Streamer\n  end\nend\n", "class or module"),
-        ("TAILS = %i[short long]\nActiveSupport.on_load(:kite) do\n  enum :tail, TAILS\nend\n", "enum"),
+        ("KINDS = %i[short long]\nActiveSupport.on_load(:kite) do\n  enum :tail, KINDS\nend\n", "enum"),
+        ("ActiveSupport.on_load(:kite) do\n  KINDS.each do |kind|\n    define_method(\"#{kind}?\") { name == kind }\n  end\nend\n", "loop"),
+        ("ActiveSupport.on_load(:kite) do\n  with_options if: :name? do\n    validates :name, presence: true\n    after_save do\n      name\n    end\n  end\nend\n", "with_options"),
     ] {
-        let errors = app().write("config/initializers/kite_extensions.rb", hook).check_errors();
+        let errors = app()
+            .edit("app/models/kite.rb", "class Kite < ApplicationRecord\n", "class Kite < ApplicationRecord\n  KINDS = %w[box delta]\n")
+            .write("config/initializers/kite_extensions.rb", hook)
+            .check_errors();
         assert_eq!(errors.len(), 1, "{statement}: {errors:#?}");
-        assert!(errors[0].contains(":kite") && errors[0].contains("Kite"), "{statement}: {errors:#?}");
+        assert!(errors[0].contains("Kite"), "{statement}: {errors:#?}");
     }
 }

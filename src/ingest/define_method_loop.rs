@@ -70,6 +70,9 @@ pub(super) struct ConstTable {
     owner: Vec<String>,
     map: HashMap<String, Entries>,
     named: HashSet<String>,
+    /// Lookup stops here: the statements read under it (a spliced load
+    /// hook's) see none of the enclosing bodies' constants.
+    barrier: bool,
 }
 
 impl ConstTable {
@@ -90,7 +93,13 @@ impl ConstTable {
             ruby_prism::Visit::visit(&mut mutated, stmt);
         }
         map.retain(|name, _| written.get(name) == Some(&1) && !mutated.names.contains(name));
-        ConstTable { owner: owner.0.as_str().split("::").map(str::to_string).collect(), map, named: named_visibility(statements) }
+        ConstTable { owner: owner.0.as_str().split("::").map(str::to_string).collect(), map, named: named_visibility(statements), barrier: false }
+    }
+
+    /// A table that hides the enclosing bodies' constants: a load hook
+    /// block spliced into a class body reads its initializer's, not the class's.
+    pub(super) fn barrier() -> Self {
+        ConstTable { barrier: true, ..Default::default() }
     }
 
     /// Only the visibility markers of a body whose constants another table already holds (an `included do` block).
@@ -141,13 +150,17 @@ impl Drop for Scope {
 /// The constant's qualified path and entries, innermost scope first.
 fn lookup(name: &str) -> Option<(Vec<String>, Entries)> {
     SCOPES.with(|s| {
-        s.borrow().iter().rev().find_map(|t| {
-            t.map.get(name).map(|e| {
+        for t in s.borrow().iter().rev() {
+            if let Some(e) = t.map.get(name) {
                 let mut path = t.owner.clone();
                 path.push(name.to_string());
-                (path, e.clone())
-            })
-        })
+                return Some((path, e.clone()));
+            }
+            if t.barrier {
+                return None;
+            }
+        }
+        None
     })
 }
 
