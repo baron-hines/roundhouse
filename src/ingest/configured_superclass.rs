@@ -2537,6 +2537,28 @@ impl<'a> Eval<'a> {
         if c.is_module && m.receiver == MethodReceiver::Instance { ("*".into(), false) } else { (c.name.0.as_str().to_string(), m.receiver == MethodReceiver::Class) }
     }
 
+    /// The core class of a value only a literal or a core conversion gives (`:plain`, `fallback.to_sym`).
+    fn core_value_class(&self, e: &Expr) -> Option<&'static str> {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { .. } } => Some("Symbol"),
+            ExprNode::Lit { value: Literal::Str { .. } } => Some("String"),
+            ExprNode::Lit { value: Literal::Int { .. } } => Some("Integer"),
+            ExprNode::Lit { value: Literal::Float { .. } } => Some("Float"),
+            ExprNode::Send { recv: Some(_), method, args, block: None, .. } if args.is_empty() => {
+                let class = match method.as_str() {
+                    "to_sym" => "Symbol",
+                    "to_s" | "to_str" | "inspect" => "String",
+                    "to_i" => "Integer",
+                    "to_f" => "Float",
+                    _ => return None,
+                };
+                // Not when the program defines the conversion itself: its own may answer anything.
+                (!self.classes.iter().any(|c| c.methods.iter().any(|m| m.name == *method))).then_some(class)
+            }
+            _ => None,
+        }
+    }
+
     fn all_method_writes(&self) -> Option<HashSet<Tag>> {
         let mut out = HashSet::default();
         for c in self.classes {
@@ -2734,7 +2756,15 @@ impl<'a> Eval<'a> {
                         .take(1)
                         .collect(),
                     // Every method of the program by that name: which one the call reaches is not known here.
-                    None => self.classes.iter().flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c, m))).collect(),
+                    None => {
+                        let core = recv.as_ref().and_then(|r| self.core_value_class(r));
+                        self.classes
+                            .iter()
+                            .flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c, m)))
+                            // Not a program class's method on a core value: only the core class, a reopening of it, or what every object answers is reached.
+                            .filter(|(c, m)| core.is_none_or(|k| c.name.0.as_str() == k || (m.receiver == MethodReceiver::Instance && matches!(c.name.0.as_str(), "Object" | "Kernel" | "BasicObject" | "Comparable" | "Numeric"))))
+                            .collect()
+                    }
                 };
                 for (c, m) in callees {
                     let key = format!("{}#{}#{:?}#{:?}", c.name.0.as_str(), m.name.as_str(), m.receiver, m.body.span);
