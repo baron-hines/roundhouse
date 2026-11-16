@@ -69,3 +69,12 @@ fn a_safe_nav_read_of_a_permit_result_keeps_its_symbol_key() {
     let src = controller_for(BuildTarget::Spinel, body);
     assert!(!src.contains(r#"dig("name")"#), "{src}");
 }
+
+/// A params value may be an Array, where `include?(:x)` is not a key test: its argument is left as written.
+#[test]
+fn a_safe_nav_include_keeps_its_argument() {
+    let body = "    render json: { a: params[:tags]&.include?(:admin), b: params[:tags]&.member?(:admin) }";
+    let src = controller_for(BuildTarget::Spinel, body);
+    assert!(src.contains("include?(:admin)"), "{src}");
+    assert!(src.contains("member?(:admin)"), "{src}");
+}

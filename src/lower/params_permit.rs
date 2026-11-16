@@ -323,7 +323,8 @@ fn stringify_safe_nav_param_reads(expr: &mut Expr) {
     }
     let keys = match method.as_str() {
         "dig" => args.len(),
-        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" => args.len().min(1),
+        // Not `include?` / `member?`: a params value may be an Array, where they test an element, not a key.
+        "[]" | "fetch" | "key?" | "has_key?" => args.len().min(1),
         _ => 0,
     };
     for key in args.iter_mut().take(keys) {
