@@ -22261,6 +22261,8 @@ mod association_relation_calls;
 mod polymorphic_belongs_to_scope;
 #[path = "emit_and_run/belongs_to_scope_join.rs"]
 mod belongs_to_scope_join;
+#[path = "emit_and_run/has_many_scoped_join.rs"]
+mod has_many_scoped_join;
 #[path = "emit_and_run/polymorphic_belongs_to_any_model.rs"]
 mod polymorphic_belongs_to_any_model;
 #[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]

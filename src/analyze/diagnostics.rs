@@ -498,6 +498,74 @@ fn unlowered_time_tags(app: &App) -> Vec<Diagnostic> {
     out
 }
 
+/// `joins(:assoc)` (or a left join) of an association whose scope renders
+/// no ON clause here (`AssocRegistry::join_scope_unrenderable`: an enum
+/// Symbol, `where.not`, a SQL string, an Array or a Range): the lowering
+/// can't write its join, and the runtime would raise on it. Rails puts the
+/// scope in the ON clause, so joining without it would answer rows the
+/// scope excludes. Refused where it is written instead.
+fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
+    let registry = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    if !app.models.iter().any(|m| {
+        m.associations().any(|a| registry.join_scope_unrenderable(&m.name, a.name()))
+    }) {
+        return Vec::new();
+    }
+    let model_of = |recv: &Expr| -> Option<ClassId> {
+        match (&*recv.node, recv.ty.as_ref()) {
+            (_, Some(Ty::Relation { of })) => Some(of.clone()),
+            (ExprNode::Const { path }, _) => {
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                app.models.iter().find(|m| m.name.0.as_str() == name).map(|m| m.name.clone())
+            }
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    crate::lower::for_each_emit_body_ref(app, &mut |body| {
+        fn visit(
+            expr: &Expr,
+            model_of: &dyn Fn(&Expr) -> Option<ClassId>,
+            registry: &crate::lower::scope_chain::AssocRegistry,
+            out: &mut Vec<Diagnostic>,
+        ) {
+            if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node
+                && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
+                && let Some(model) = model_of(recv)
+            {
+                let mut names: Vec<&Expr> = Vec::new();
+                for arg in args {
+                    match &*arg.node {
+                        ExprNode::Array { elements, .. } => names.extend(elements.iter()),
+                        ExprNode::Hash { entries, .. } => names.extend(entries.iter().map(|(k, _)| k)),
+                        _ => names.push(arg),
+                    }
+                }
+                for name in names {
+                    if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
+                        && registry.join_scope_unrenderable(&model, value)
+                    {
+                        out.push(Diagnostic::unsupported(
+                            name.span,
+                            None,
+                            "association join",
+                            format!(
+                                "`{}(:{})`: the association's scope doesn't render as SQL here (only hash `where`s of \
+                                 literals do), so its join can't carry the scope in its ON clause, as Rails' does",
+                                method.as_str(),
+                                value.as_str(),
+                            ),
+                        ));
+                    }
+                }
+            }
+            expr.node.for_each_child(&mut |child| visit(child, model_of, registry, out));
+        }
+        visit(body, &model_of, &registry, &mut out);
+    });
+    out
+}
+
 /// A `simple_format` the view lowering leaves as written: any form but
 /// `sanitize: false` in a template (`lower::view::simple_format_form`
 /// gives the reason), and every call in a library class, which nothing
@@ -992,6 +1060,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(unlowered_current_page(app));
     out.extend(helper_stylesheet_link_tags(app));
     out.extend(unlowered_time_tags(app));
+    out.extend(unrenderable_association_joins(app));
     out.extend(unlowered_simple_format(app));
     out.extend(controller_shadowed_view_helpers(app));
     out.extend(link_to_if_params_shadowing_nested_locals(app));
