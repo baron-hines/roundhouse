@@ -4621,7 +4621,9 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                     // declaration overrode must not let the next concern's
                     // seed replace that declaration.
                     if stored {
-                        model.class_attr_defaults.insert(name.clone(), value.clone());
+                        let mut value = value.clone();
+                        qualify_seed_constants(&mut value, id.0.as_str(), &defined);
+                        model.class_attr_defaults.insert(name.clone(), value);
                         if !matches!(seed, super::model::Seed::Absent) {
                             concern_seeded.insert(name.clone());
                         }
@@ -4789,6 +4791,33 @@ fn inline_concern_literals(
             inline(arg, consts);
         }
     }
+}
+
+/// A concern's `cattr_*` seed read in the includer, where it is written
+/// as the class variable's initializer: a constant keeps the lexical
+/// meaning it had in the `included do` block, the concern's own first
+/// (`LIMIT` is `Capped::LIMIT` even where the includer defines one),
+/// then the concern's enclosing modules.
+fn qualify_seed_constants(
+    expr: &mut crate::expr::Expr,
+    concern: &str,
+    defined: &crate::det::HashSet<String>,
+) {
+    use crate::expr::ExprNode;
+    if let ExprNode::Const { path } = &mut *expr.node {
+        if path.first().is_some_and(|first| !first.as_str().is_empty()) {
+            let written = path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::");
+            if defined.contains(&format!("{concern}::{written}")) {
+                let mut qualified: Vec<Symbol> = concern.split("::").map(Symbol::from).collect();
+                qualified.append(path);
+                *path = qualified;
+                return;
+            }
+        }
+        qualify_carried_constants(expr, concern, defined);
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |child| qualify_seed_constants(child, concern, defined));
 }
 
 pub(super) fn qualify_carried_constants(

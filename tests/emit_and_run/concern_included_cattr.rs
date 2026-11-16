@@ -132,6 +132,21 @@ end
   include SinglePly, DoublePly
 end
 "##)
+        .write("app/models/concerns/limited.rb", r##"module Limited
+  extend ActiveSupport::Concern
+
+  LIMIT = 3
+
+  included do
+    cattr_accessor :ceiling, default: LIMIT
+  end
+end
+"##)
+        .write("app/models/reel.rb", r##"class Reel < ApplicationRecord
+  LIMIT = 9
+  include Limited
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -188,6 +203,12 @@ end
     Cord.ply
   end
 
+  # Rails: 3 — the block reads the concern's own LIMIT, not the
+  # includer's.
+  def self.seed_reads_the_concerns_constant
+    Reel.ceiling
+  end
+
   def self.run
     Rope.delete_all
     check("class_attributes_from_the_block", class_attributes_from_the_block == [3, "cm", true, false, "4cm"])
@@ -198,6 +219,7 @@ end
     check("nil_default_keeps_the_models_seed", nil_default_keeps_the_models_seed == 1)
     check("constant_default_over_a_nil_seed", constant_default_over_a_nil_seed == 7)
     check("shared_dependency_runs_once", shared_dependency_runs_once == 2)
+    check("seed_reads_the_concerns_constant", seed_reads_the_concerns_constant == 3)
   end
 end
 "##)
