@@ -2748,10 +2748,18 @@ module ActiveRecord
     end
 
     # Rails' `restore_attributes`: every pending change written back, as
-    # `restore_attribute!` writes one, answering the names it restored.
+    # `restore_attribute!` writes one, answering the names it restored. A
+    # write to a column the row's `select` left out is pending too, though
+    # the diff may not show it (nil over the unloaded nil): restoring it
+    # drops the write, so a save leaves the column as the row holds it.
     def restore_attributes
       names = changes_to_save.keys
       names.each { |name| restore_attribute!(name) }
+      wrote = @__unloaded_writes
+      unless wrote.nil?
+        wrote.each { |name| names.push(name) unless names.include?(name) }
+        @__unloaded_writes = nil
+      end
       names
     end
 
