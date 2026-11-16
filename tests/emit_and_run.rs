@@ -22460,4 +22460,7 @@ mod concern_class_eval_include;
 #[path = "emit_and_run/concerning_block.rs"]
 mod concerning_block;
 
-
+// Concern shapes: a concern's accessors and validations on a plain
+// Active Model class.
+#[path = "emit_and_run/concern_plain_includer.rs"]
+mod concern_plain_includer;
