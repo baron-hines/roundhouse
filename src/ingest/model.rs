@@ -376,6 +376,7 @@ pub(super) fn ingest_model_with_enum_constants(
                 file,
                 crate::dialect::MethodReceiver::Instance,
                 &loop_visibility,
+                true,
             ) {
                 let mut leading = Some((leading, leading_blank));
                 for mut method in methods {
@@ -3547,7 +3548,7 @@ fn ingest_singleton_class_body(
             visibility.apply(&def.as_node(), &mut method);
         }
         Ok(method)
-    })
+    }, true)
 }
 
 pub(super) fn ingest_method(
@@ -4659,8 +4660,12 @@ fn parse_association(
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
+            // As for has_many: a `through:` one's class comes from its
+            // source association (`resolve_through_targets`).
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
+                .or_else(|| source_type.map(|s| ClassId(Symbol::from(s.as_str()))))
+                .or_else(|| source.map(|s| ClassId(Symbol::from(camelize(s.as_str())))))
                 .unwrap_or_else(|| ClassId(Symbol::from(camelize(name_str.as_str())))),
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
@@ -4671,6 +4676,8 @@ fn parse_association(
             foreign_key_explicit,
             dependent: dependent.unwrap_or_default(),
             through: through.map(|s| Symbol::from(s.as_str())),
+            source: source_name,
+            class_explicit,
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             autosave: autosave.unwrap_or(false),

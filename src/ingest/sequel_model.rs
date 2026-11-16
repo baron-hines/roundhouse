@@ -264,6 +264,8 @@ fn parse_sequel_association(
                 .unwrap_or_else(|| Symbol::from(format!("{owner_snake}_id"))),
             dependent: Dependent::None,
             through: None,
+            source: None,
+            class_explicit: false,
             as_interface: None,
             scope: None,
             autosave: false,

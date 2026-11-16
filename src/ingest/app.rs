@@ -9386,9 +9386,8 @@ fn resolve_through_targets(app: &mut App) {
         for (i, model) in app.models.iter().enumerate() {
             for (j, item) in model.body.iter().enumerate() {
                 let ModelBodyItem::Association { assoc, .. } = item else { continue };
-                let Association::HasMany {
-                    target, through: Some(through), class_explicit: false, ..
-                } = assoc
+                let (Association::HasMany { target, through: Some(through), class_explicit: false, .. }
+                | Association::HasOne { target, through: Some(through), class_explicit: false, .. }) = assoc
                 else {
                     continue;
                 };
@@ -9410,7 +9409,7 @@ fn resolve_through_targets(app: &mut App) {
         }
         for (i, j, resolved) in updates {
             if let ModelBodyItem::Association {
-                assoc: Association::HasMany { target, .. }, ..
+                assoc: Association::HasMany { target, .. } | Association::HasOne { target, .. }, ..
             } = &mut app.models[i].body[j]
             {
                 *target = resolved;

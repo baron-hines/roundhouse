@@ -3240,6 +3240,7 @@ fn walk_decl_body_with_visibility<'pr>(
                 file,
                 if mode.is_class_side() { MethodReceiver::Class } else { MethodReceiver::Instance },
                 &named_visibility,
+                false,
             )
         {
             out.methods.extend(methods);

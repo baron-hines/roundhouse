@@ -135,9 +135,14 @@ hands each owner. The `ruby semantics` and `record queries` groups are
 probes of the same kind: how Ruby runs class and module bodies, method
 lookup and dispatch (an Array's `as_json`, `&.` on `false`,
 refinements, load hooks), and what a query answers (sums, plucks through
-joins, query constraints, custom inheritance columns). Each probe's
-`_on_spinel` variant carries the same ignore; once it passes, its reason
-goes back to `requires the Spinel toolchain`.
+joins, query constraints, custom inheritance columns). The `relation
+queries` group covers what a relation writes and reads (`rewhere`,
+selects of hashes, Strings and Arel attributes, plucks of Strings and
+enums, eager loads beside joins, a connection's `to_sql` of an Arel node), and the
+`persistence` group how a record is built, copied and saved (`toggle`,
+`save(touch: false)`, `dup`, `clone` and `reload`, a model's own
+`update`). Each probe's `_on_spinel` variant carries the same ignore;
+once it passes, its reason goes back to `requires the Spinel toolchain`.
 
 ## Complete local verification
 

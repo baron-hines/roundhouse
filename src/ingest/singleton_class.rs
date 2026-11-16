@@ -14,7 +14,10 @@
 //! * a constant assignment lands in the singleton class's lexical
 //!   scope, which the block's own methods read by bare name;
 //! * `sig`, `abstract!`, `private_constant`, and the visibility markers
-//!   carry no behavior the flattened method list can hold.
+//!   carry no behavior the flattened method list can hold;
+//! * in a model, a loop of `define_method` over literal names defines a
+//!   class method per name, as the class body's own loop defines
+//!   instance methods.
 //!
 //! Models and controllers both walk their class body one statement at a
 //! time, and a `class << self` is one statement that stands for many, so
@@ -62,12 +65,15 @@ const VISIBILITY: &[&str] =
 
 /// Expand one `class << self` block. `ingest_def` reads a `def` the way
 /// the enclosing walk reads its own methods, so a controller's class
-/// methods and a model's carry the parameter model of their side.
+/// methods and a model's carry the parameter model of their side. With
+/// `unroll_loops` (a model's), a `define_method` loop over literal names
+/// defines its class methods.
 pub(super) fn ingest_singleton_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
     owner: &ClassId,
     file: &str,
     ingest_def: &dyn Fn(&ruby_prism::DefNode<'_>) -> IngestResult<MethodDef>,
+    unroll_loops: bool,
 ) -> IngestResult<SingletonBody> {
     let mut out = SingletonBody::default();
     // Only `class << self` is the enclosing class's own singleton. The
@@ -77,8 +83,35 @@ pub(super) fn ingest_singleton_body(
             .map(|()| out);
     }
     let Some(body) = sc.body() else { return Ok(out) };
-    for stmt in flatten_statements(body) {
-        walk_statement(&stmt, owner, file, ingest_def, &mut out)?;
+    let statements = flatten_statements(body);
+    let named = super::define_method_loop::named_visibility(&statements);
+    // The block's own constants shadow the class's, and the loop table
+    // holds only the class's: a loop over one of them is not unrolled.
+    let assigned: Vec<&[u8]> = statements.iter().filter_map(|s| s.as_constant_write_node()).map(|w| w.name().as_slice()).collect();
+    let shadowed = |stmt: &Node<'_>| {
+        stmt.as_call_node()
+            .and_then(|c| c.receiver())
+            .and_then(|r| r.as_constant_read_node())
+            .is_some_and(|r| assigned.contains(&r.name().as_slice()))
+    };
+    // A loop after a bare marker is not unrolled: its reach into the loop's
+    // `define_method`s is not modelled, so the loop stays the error it was.
+    let mut bare_marker = false;
+    for stmt in &statements {
+        if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && VISIBILITY.contains(&constant_id_str(&c.name()))) {
+            bare_marker |= call.arguments().is_none();
+        }
+        // `%w[a b].each { |n| define_method("first_#{n}") { … } }`: class
+        // methods, one per literal name (`define_method_loop`).
+        if unroll_loops
+            && !bare_marker
+            && !shadowed(stmt)
+            && let Some(methods) = super::define_method_loop::unroll(stmt, owner, file, MethodReceiver::Class, &named, false)
+        {
+            out.methods.extend(methods);
+            continue;
+        }
+        walk_statement(stmt, owner, file, ingest_def, &mut out)?;
     }
     for method in &mut out.methods {
         mark_singleton_constants(&mut method.body);
