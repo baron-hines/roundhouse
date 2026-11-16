@@ -110,7 +110,14 @@ pub(super) fn collect(
     let Some(body) = body else {
         return Ok(factories);
     };
-    for statement in flatten_statements(body) {
+    let statements = flatten_statements(body);
+    let data_names = statements.iter().filter_map(|stmt| stmt.as_constant_write_node()).filter(|write| write.value().as_call_node().is_some_and(|call| constant_id_str(&call.name()) == "define" && call.receiver().and_then(|recv| constant_path_of(&recv)).is_some_and(|path| path == ["Data"]))).map(|write| constant_id_str(&write.name()).to_string()).collect::<Vec<_>>();
+    for statement in statements {
+        if let Some(class) = statement.as_class_node()
+            && class.constant_path().as_constant_read_node().is_some_and(|name| data_names.iter().any(|data| data == constant_id_str(&name.name())))
+            && class.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| stmt.as_call_node().is_some_and(|call| constant_id_str(&call.name()) == "delegate_missing_to"))) {
+            return Err(IngestError::Unsupported { file: file.into(), message: "delegate_missing_to in a Data reopening is not modeled".into() });
+        }
         let Some(call) = declaration(&statement) else {
             continue;
         };
@@ -170,9 +177,18 @@ pub(super) fn collect(
                 if !target.as_ref().is_some_and(|target| members.contains(target)) {
                     return Err(IngestError::Unsupported { file: file.into(), message: "Data delegate constant target or non-member target has unverified lexical lookup".into() });
                 }
-                // The shared delegate pass validates options and expands the
-                // forwarders, just as it does beside an ordinary class's defs.
+                // The shared delegate pass validates options and expands these forwarders.
                 unknown_calls.push(ingest_expr(&statement, file)?);
+            } else if let Some(target) = statement.as_call_node().and_then(|call| delegate_missing_target(&call)) {
+                // Rails' `delegate_missing_to :target` (active_support/core_ext/module/delegation.rb): the two
+                // methods it defines. The target read through `self`, not bare: a target named `block` or `args`
+                // would read the method's own parameter.
+                let source = format!(
+                    "class {id}\n  def respond_to_missing?(name, include_private = false)\n    self.{target}.respond_to?(name, include_private) || super\n  end\n\n  def method_missing(method, *args, &block)\n    if self.{target}.respond_to?(method)\n      self.{target}.public_send(method, *args, &block)\n    else\n      super\n    end\n  end\nend\n",
+                    id = id.0.as_str(),
+                );
+                let classes = super::library_class::ingest_library_classes(source.as_bytes(), file)?;
+                methods.extend(classes.into_iter().flat_map(|c| c.methods));
             } else if !statement.as_call_node().is_some_and(|call| {
                 visibility::marker(&call)
                     && call.receiver().is_none()
@@ -185,8 +201,9 @@ pub(super) fn collect(
                 return Err(unsupported());
             }
         }
-        if !unknown_calls.is_empty() && methods.iter().any(|method| method.receiver == crate::dialect::MethodReceiver::Class && method.name.as_str() == "delegate") {
-            return Err(IngestError::Unsupported { file: file.into(), message: "app-defined delegate on a Data class is not modeled".into() });
+        let missing_delegate = combined_delegation(block.body());
+        if !unknown_calls.is_empty() && (missing_delegate || methods.iter().any(|method| method.receiver == crate::dialect::MethodReceiver::Class && method.name.as_str() == "delegate")) {
+            return Err(IngestError::Unsupported { file: file.into(), message: if missing_delegate { "Data.define blocks combining delegate and delegate_missing_to are not modeled" } else { "app-defined delegate on a Data class is not modeled" }.into() });
         }
         factories.push(LibraryClass {
             name: id,
@@ -207,4 +224,19 @@ pub(super) fn collect(
         });
     }
     Ok(factories)
+}
+
+/// `delegate_missing_to :account`: a literal Symbol target and nothing else (no `allow_nil:`).
+fn delegate_missing_target(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    if call.receiver().is_some() || call.block().is_some() || constant_id_str(&call.name()) != "delegate_missing_to" {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let name = String::from_utf8_lossy(arg.as_symbol_node()?.unescaped()).into_owned();
+    (name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.is_empty()).then_some(name)
+}
+
+pub(super) fn combined_delegation(body: Option<Node<'_>>) -> bool {
+    let statements = body.map(flatten_statements).unwrap_or_default(); ["delegate", "delegate_missing_to"].iter().all(|name| statements.iter().any(|stmt| stmt.as_call_node().is_some_and(|call| constant_id_str(&call.name()) == *name)))
 }

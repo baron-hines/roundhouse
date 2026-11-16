@@ -284,3 +284,31 @@ fn app_visibility_macros_are_refused_before_the_builtin_skip() {
         assert!(errors.iter().any(|error| error.contains(&format!("Data visibility macro `{marker}`"))), "{source}: {errors:?}");
     }
 }
+
+#[test]
+fn explicit_and_missing_delegation_stays_refused() {
+    for calls in [
+        "delegate :code, to: :entry\n    delegate_missing_to :entry",
+        "delegate_missing_to :entry\n    delegate :code, to: :entry",
+    ] {
+        for nested in [false, true] {
+            let body = format!("View = Data.define(:entry) do\n    {calls}\n    def label = code\nend\n");
+            let source = format!("class Entry; def code = 'abc'; def detail = 'details'; end\n{}", if nested { format!("class Envelope\n{body}end\n") } else { body });
+            let (_, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
+            assert!(errors.iter().any(|error| error.contains("Data.define blocks combining delegate and delegate_missing_to are not modeled")), "{errors:?}");
+        }
+    }
+}
+
+#[test]
+fn missing_delegation_in_a_data_reopening_stays_refused() {
+    for source in [
+        "class Entry; def code = 'abc'; end\nclass Envelope\n View = Data.define(:entry)\n class View\n  delegate_missing_to :entry\n  def label = code\n end\nend\n",
+        "class Entry; def code = 'abc'; end\nView = Data.define(:entry)\nclass View\n  delegate_missing_to :entry\n  def label = code\nend\n",
+        "class Entry; def code = 'abc'; end\nView = Data.define(:entry) do\n  delegate :code, to: :entry\n  def label = code\nend\nclass View\n  delegate_missing_to :entry\nend\n",
+    ] {
+        let (_, errors) = contract::app(source).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.iter().any(|error| error.contains("delegate_missing_to in a Data reopening is not modeled") || error.contains("Data.define beside another declaration of the same class")
+            || error.contains("Data.define reopening with load-time statements")), "{errors:?}");
+    }
+}

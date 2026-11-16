@@ -241,6 +241,10 @@ enum Walk<'a> {
 /// modules that define methods). A gem's marker modules are read by
 /// name (`Globgem::MarkAY.name`); an app's empty helper modules keep
 /// their treatment, so only the gem-source ingest asks for these.
+///
+/// With no method, constant or include to carry a span, the module's
+/// `parent_span` is its name's, so it is known as this file's (an app
+/// reopening it in an initializer is reopening the gem's module).
 pub(super) fn ingest_empty_modules(source: &[u8], file: &str) -> IngestResult<Vec<LibraryClass>> {
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -249,7 +253,9 @@ pub(super) fn ingest_empty_modules(source: &[u8], file: &str) -> IngestResult<Ve
         if module.body().is_some() {
             continue;
         }
-        out.push(library_class_from_module_node_with_scope(&module, &scope, file)?);
+        let mut lc = library_class_from_module_node_with_scope(&module, &scope, file)?;
+        lc.parent_span = super::util::node_span(&module.constant_path(), file);
+        out.push(lc);
     }
     Ok(out)
 }
@@ -400,7 +406,7 @@ fn ingest_library_classes_impl(
                 }
                 let invalid_reopen = reopenings.iter().any(|(_, node)| {
                     node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
-                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_reopening_statement(stmt)))
+                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt) && stmt.as_constant_write_node().is_none()))
                 });
                 for (scope, node) in &reopenings {
                     if node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| stmt.as_constant_write_node().is_some()))
@@ -480,12 +486,10 @@ fn ingest_library_classes_impl(
                 }
                 // Nothing runs between the block's definitions and the reopenings', so a later
                 // definition replaces an earlier one before any call can reach it, as in Ruby.
-                if class.constants.is_empty() {
-                    let mut seen = HashSet::default();
-                    class.methods.reverse();
-                    class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
-                    class.methods.reverse();
-                }
+                let mut seen = HashSet::default();
+                class.methods.reverse();
+                class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
+                class.methods.reverse();
                 made.push((class.name.0.clone(), class));
             }
         }
@@ -657,10 +661,6 @@ fn data_method_statement(stmt: &Node<'_>) -> bool {
         .is_some_and(|call| call.arguments().is_none_or(|args| args.arguments().iter().all(|arg| super::util::symbol_or_string_value(&arg).is_some())))
 }
 
-fn data_reopening_statement(stmt: &Node<'_>) -> bool {
-    data_method_statement(stmt) || stmt.as_constant_write_node().is_some()
-}
-
 fn data_literal(value: &Expr) -> bool {
     match &*value.node {
         ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
@@ -717,6 +717,7 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
     let owner = ClassId(Symbol::from(name));
     let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
     visibility::validate_data(body(), file, &[], &owner)?;
+    if super::data_factory::combined_delegation(body()) { return Err(IngestError::Unsupported { file: file.into(), message: "Data.define blocks combining delegate and delegate_missing_to are not modeled".into() }); }
     if let Some(body) = body() {
         let statements = flatten_statements(body);
         if statements.iter().any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {

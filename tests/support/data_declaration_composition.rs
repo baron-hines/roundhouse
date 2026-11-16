@@ -166,6 +166,7 @@ p record.respond_to?(:inline_secret)
 p record.respond_to?(:named)
 p record.to_h
 "###, "ok\nfalse\nfalse\nfalse\nfalse\n{value: \"ok\"}\n"),
+
 ];
 pub const PRIVATE_ASSERTIONS: &str = r##"token = Token.issue(7)
 p token

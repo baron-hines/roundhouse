@@ -2537,6 +2537,33 @@ impl<'a> Eval<'a> {
         if c.is_module && m.receiver == MethodReceiver::Instance { ("*".into(), false) } else { (c.name.0.as_str().to_string(), m.receiver == MethodReceiver::Class) }
     }
 
+    /// The core class of a value only a literal or a core conversion gives (`:plain`, `fallback.to_sym`).
+    fn core_value_class(&self, e: &Expr) -> Option<&'static str> {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { .. } } => Some("Symbol"),
+            ExprNode::Lit { value: Literal::Str { .. } } => Some("String"),
+            ExprNode::Lit { value: Literal::Int { .. } } => Some("Integer"),
+            ExprNode::Lit { value: Literal::Float { .. } } => Some("Float"),
+            ExprNode::Send { recv: Some(_), method, args, block: None, .. } if args.is_empty() => {
+                let class = match method.as_str() {
+                    "to_sym" => "Symbol",
+                    "to_s" | "to_str" | "inspect" => "String",
+                    "to_i" => "Integer",
+                    "to_f" => "Float",
+                    _ => return None,
+                };
+                // Not when the program defines the conversion itself: its own may answer anything.
+                let defines = |name: &str| {
+                    self.classes.iter().any(|c| c.methods.iter().any(|m| m.name.as_str() == name))
+                        || self.evaled.values().flatten().any(|m| m.name.as_str() == name)
+                        || self.models.iter().any(|model| model.methods().any(|m| m.name.as_str() == name))
+                };
+                (!defines(method.as_str())).then_some(class)
+            }
+            _ => None,
+        }
+    }
+
     fn all_method_writes(&self) -> Option<HashSet<Tag>> {
         let mut out = HashSet::default();
         for c in self.classes {
@@ -2734,7 +2761,18 @@ impl<'a> Eval<'a> {
                         .take(1)
                         .collect(),
                     // Every method of the program by that name: which one the call reaches is not known here.
-                    None => self.classes.iter().flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c, m))).collect(),
+                    None => {
+                        // Not the class names alone: a module the core class or `Object` includes answers on the value too.
+                        let core: Option<HashSet<String>> = recv.as_ref().and_then(|r| self.core_value_class(r)).map(|k| {
+                            [k, "Object", "Kernel", "BasicObject", "Comparable", "Numeric"].into_iter().flat_map(|c| self.ancestry(c)).collect()
+                        });
+                        self.classes
+                            .iter()
+                            .flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c, m)))
+                            // Not a program class's method on a core value: only what the core class's lookup reaches, reopened or included, answers it.
+                            .filter(|(c, m)| core.as_ref().is_none_or(|owners| m.receiver == MethodReceiver::Instance && owners.contains(c.name.0.as_str())))
+                            .collect()
+                    }
                 };
                 for (c, m) in callees {
                     let key = format!("{}#{}#{:?}#{:?}", c.name.0.as_str(), m.name.as_str(), m.receiver, m.body.span);
@@ -4161,5 +4199,44 @@ mod tests {
         let shadowed = statement("items.each { |config| config.update }\n");
         let writes = eval.may_write_with(&shadowed, "*", false, &mut HashSet::default(), &locals).expect("bounded");
         assert!(writes.iter().any(|(owner, _, name)| owner == "Other" && name == "other"), "{writes:?}");
+    }
+
+    /// `x.to_sym == :plain` compares Symbols: a program `==` is not reached, a module String includes still is, and a program's own `to_sym`, a model's too, keeps every `==`.
+    #[test]
+    fn a_core_value_reaches_only_what_its_core_class_answers() {
+        let writes_with = |extra: &str, model: Option<&str>, source: &str| {
+            let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+                ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+                ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+                ("lib/release_version.rb", "class ReleaseVersion\n  def ==(other)\n    @compared = true\n  end\nend\n"),
+                ("lib/token_ops.rb", "module TokenOps\n  def flip\n    @flipped = true\n  end\nend\n"),
+                ("lib/string_ext.rb", "class String\n  include TokenOps\nend\n"),
+                ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+            ]
+            .into_iter()
+            .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+            .collect();
+            if !extra.is_empty() {
+                tree.insert(std::path::PathBuf::from("lib/converter.rb"), extra.as_bytes().to_vec());
+            }
+            if let Some(model) = model {
+                tree.insert(std::path::PathBuf::from("app/models/token.rb"), model.as_bytes().to_vec());
+            }
+            let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+            let eval = Eval::new(&app);
+            eval.may_write(&statement(source), "*", false, &mut HashSet::default()).expect("bounded")
+        };
+        let writes = |extra: &str, source: &str| writes_with(extra, None, source);
+        let named = |w: &HashSet<Tag>, n: &str| w.iter().any(|(_, _, name)| name == n);
+        let symbols = writes("", "fallback.to_sym == :plain\n");
+        assert!(!named(&symbols, "compared"), "{symbols:?}");
+        let other = writes("", "fallback.version == :plain\n");
+        assert!(named(&other, "compared"), "{other:?}");
+        let included = writes("", "fallback.to_s.flip\n");
+        assert!(named(&included, "flipped"), "{included:?}");
+        let own = writes("class Converter\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n", "fallback.to_sym == :plain\n");
+        assert!(named(&own, "compared"), "{own:?}");
+        let modeled = writes_with("", Some("class Token < ApplicationRecord\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n"), "fallback.to_sym == :plain\n");
+        assert!(named(&modeled, "compared"), "{modeled:?}");
     }
 }

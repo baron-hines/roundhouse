@@ -39,7 +39,9 @@
 # `bind_text` is unblocked at the FFI layer (spinel #576 +
 # matz/spinel#686 doc fix).
 #
-# Module-level state is `@pools`, N independent DbPool shards of M opaque
+# Module-level state is `@slots`: one DbSlot per database (one today),
+# each holding `pools`,
+# N independent DbPool shards of M opaque
 # dbh ptrs each (see `configure` for why it is sharded rather than one
 # opaque dbh ptrs). `Db.current_conn` reads Thread.current[:db_conn] when
 # set (request-scoped checkout) and falls back to the pool's first free
@@ -1278,6 +1280,36 @@ class DbPool
   end
 end
 
+# The write permit of one database file, shared by every pool slot open
+# on that file. See `Db.acquire_permit`.
+class DbPermit
+  attr_reader :lock, :cv
+  attr_accessor :held, :checkpointing
+
+  def initialize
+    @lock = Mutex.new
+    @cv = ConditionVariable.new
+    @held = false
+    @checkpointing = false
+  end
+end
+
+# One pool slot: the connections of one database, with their statement
+# caches and leases, and the write permit of its file. There is one
+# today; the state is here and not on Db so a second database can have
+# its own.
+class DbSlot
+  attr_reader :path, :pools, :permit
+  attr_accessor :closed
+
+  def initialize(path, pools, permit)
+    @path = path
+    @pools = pools
+    @permit = permit
+    @closed = false
+  end
+end
+
 # Temporal intrinsics (`ActiveSupport.parse_db_time` in the synthesized
 # column readers, `db_now` in fill_timestamps) — chained off Db, the one
 # require every persistence-touching bootstrap (main.rb AND the emitted
@@ -1296,7 +1328,8 @@ module Db
   # pool object (DbPool, below) keeps its connections in an INSTANCE-ivar
   # array, which spinel types as a concrete DbConn PtrArray (same shape as
   # DbConn#@entries) — preserving the object tag.
-  @pools = nil
+  # Slot 0 is the database `configure` opened.
+  @slots = nil
   # Query-log capture (issue #27). `nil` ⇒ not capturing; an Array ⇒
   # accumulate the SQL each prepare/exec issues. Kept in parity with the
   # cruby shim (db_cruby.rb); see `capture_sql` below.
@@ -1309,10 +1342,11 @@ module Db
   @sql_trace = false
   # The write permit, the bounded wait for it, and the background
   # checkpointer — see `acquire_permit` and `checkpoint_in_background!`.
-  @permit_lock = Mutex.new
-  @permit_cv = ConditionVariable.new
-  @permit_held = false
   @write_permit_timeout = 5.0
+  # Each file's permit, kept across `close`: a checkpoint loop outlives
+  # the pools it was started for, and must queue with the writers of a
+  # later `configure` on the same file.
+  @permits = {}
   @checkpoint_wanted = false
   @db_path = ""
   CHECKPOINT_INTERVAL = 0.25
@@ -1352,35 +1386,51 @@ module Db
     # Threads are assigned round-robin, so shards carry equal numbers of them;
     # sizing keeps at least 4 handles per shard, since a shard of one is a
     # mutex with extra steps.
+    # One permit per database file, keyed by its expanded path so that
+    # `data.sqlite3` and `./data.sqlite3` share it; the slot opens `path`
+    # as given.
+    key = File.expand_path(path)
+    @permits[key] = DbPermit.new if !@permits.key?(key)
+    @slots = [DbSlot.new(path, open_pools(path, n), @permits[key])]
+    @assign_lock = Mutex.new
+    @next_pool = 0
+  end
+
+  def self.open_pools(path, n)
     stripes = n / 4
     stripes = 1 if stripes < 1
     stripes = 8 if stripes > 8
-    @pools = []
+    pools = []
     per = n / stripes
     per = 1 if per < 1
     i = 0
     while i < stripes
-      @pools.push(DbPool.new(path, per))
+      pools.push(DbPool.new(path, per))
       i += 1
     end
-    @assign_lock = Mutex.new
-    @next_pool = 0
+    pools
+  end
+
+  # The slot this thread's statements run on.
+  def self.slot
+    @slots[0]
   end
 
   # The shard this thread uses, chosen once and remembered. Round-robin
   # under a lock taken ONCE per thread — the thing being avoided is a lock
   # per request, not a lock ever.
   def self.pool_for_thread
+    pools = slot.pools
     pi = Thread.current[:db_pool]
-    return @pools[pi] if pi != nil
+    return pools[pi] if pi != nil
     n = 0
     @assign_lock.synchronize do
       n = @next_pool
       @next_pool = n + 1
     end
-    pi = n % @pools.length
+    pi = n % pools.length
     Thread.current[:db_pool] = pi
-    @pools[pi]
+    pools[pi]
   end
 
   # Replace this database's contents with those of the file at `src_path`,
@@ -1470,7 +1520,7 @@ module Db
   def self.current_conn
     c = Thread.current[:db_conn]
     return c if !c.nil?
-    @pools[0].first
+    slot.pools[0].first
   end
 
   # `ActiveRecord::Base.transaction`'s per-thread nesting depth
@@ -1531,6 +1581,25 @@ module Db
       Thread.current[:ar_unscoped_tables] = tables
     end
     tables
+  end
+
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`). Nil
+  # until the first push, which seeds the list with its element, so the
+  # element type is the relation's without a placeholder relation.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
   end
 
   # Request-scoped connection lease for the thread-per-connection
@@ -1601,6 +1670,7 @@ module Db
       result = yield
       return result
     end
+    home = slot
     pool = pool_for_thread
     idx = pool.lease
     conn = pool.conn(idx)
@@ -1621,19 +1691,11 @@ module Db
       rescue StandardError => e
         cleanup_error = e
       end
-      # `Db.close` inside the lease drops `@pools` and closes `conn`.
+      # `Db.close` inside the lease closes every slot and with it `conn`.
       # Snapshot and rollback cleanup talk to SQLite, so skip them when
       # this pool is no longer the live one. The lease index still goes
       # back to the pool that issued it.
-      pool_live = false
-      if !@pools.nil?
-        pi = 0
-        while pi < @pools.length
-          pool_live = true if @pools[pi].equal?(pool)
-          pi += 1
-        end
-      end
-      if pool_live
+      if !home.closed
         begin
           if conn.snap_depth > 0
             conn.snap_depth = 1
@@ -1674,35 +1736,42 @@ module Db
     # A pin left set would `release(0)` on the pool `configure` opens next.
     Thread.current[:db_txn_pin] = false
     error = nil
-    if !@pools.nil?
+    if !@slots.nil?
+      pools = []
+      @slots.each do |s|
+        s.closed = true
+        s.pools.each { |pool| pools.push(pool) }
+        # Lease cleanup skips `release_abandoned_write` once this pool is
+        # gone. An open BEGIN would otherwise leave the permit held, and
+        # the next write waits out the permit timeout.
+        release_permit(s.permit)
+      end
       begin
         i = 0
-        while i < @pools.length
+        while i < pools.length
           begin
-            @pools[i].close_all
-            @pools[i].dump_stmt_stats("close", i) if DbConn::STMT_STATS
+            pools[i].close_all
+            pools[i].dump_stmt_stats("close", i) if DbConn::STMT_STATS
           rescue StandardError => e
             error = e if error.nil?
           end
           i += 1
         end
       ensure
-        @pools = nil
+        @slots = nil
       end
     end
-    # Lease cleanup skips `release_abandoned_write` once this pool is
-    # gone. An open BEGIN would otherwise leave `@permit_held` set, and
-    # the next write waits out the permit timeout.
-    release_permit
     raise error if !error.nil?
   end
 
   def self.dump_stmt_stats(phase = "snapshot")
-    return nil if !DbConn::STMT_STATS || @pools.nil?
-    i = 0
-    while i < @pools.length
-      @pools[i].dump_stmt_stats(phase, i)
-      i += 1
+    return nil if !DbConn::STMT_STATS || @slots.nil?
+    @slots.each do |s|
+      i = 0
+      while i < s.pools.length
+        s.pools[i].dump_stmt_stats(phase, i)
+        i += 1
+      end
     end
     nil
   end
@@ -1786,31 +1855,33 @@ module Db
     @write_permit_timeout = seconds
   end
 
-  def self.acquire_permit
+  # The permit is the file's (DbPermit): the one of the slot this thread
+  # is on, unless the checkpointer names its own.
+  def self.acquire_permit(permit = slot.permit)
     got = false
-    @permit_lock.synchronize do
+    permit.lock.synchronize do
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @write_permit_timeout
       timed_out = false
-      while @permit_held && !timed_out
+      while permit.held && !timed_out
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if remaining <= 0
           timed_out = true
         else
-          @permit_cv.wait(@permit_lock, remaining)
+          permit.cv.wait(permit.lock, remaining)
         end
       end
       if !timed_out
-        @permit_held = true
+        permit.held = true
         got = true
       end
     end
     got
   end
 
-  def self.release_permit
-    @permit_lock.synchronize do
-      @permit_held = false
-      @permit_cv.signal
+  def self.release_permit(permit = slot.permit)
+    permit.lock.synchronize do
+      permit.held = false
+      permit.cv.signal
     end
     nil
   end
@@ -1840,11 +1911,16 @@ module Db
   # checkpoint.
   def self.checkpoint_in_background!
     return nil if @checkpoint_wanted
-    path = @db_path
-    return nil if path == "" || path == ":memory:" || path.start_with?("file:")
-    @checkpoint_wanted = true
-    Thread.new do
-      Db.checkpoint_loop(path)
+    # One loop per file, whichever slots are open on it.
+    @slots.each do |s|
+      path = s.path
+      permit = s.permit
+      next if permit.checkpointing || path == "" || path == ":memory:" || path.start_with?("file:")
+      permit.checkpointing = true
+      @checkpoint_wanted = true
+      Thread.new do
+        Db.checkpoint_loop(path, permit)
+      end
     end
     nil
   end
@@ -1856,10 +1932,16 @@ module Db
     nil
   end
 
-  def self.checkpoint_loop(path)
-    rc = SQL.sqlite3_open_v2(path, SQL.ckpt_out, SQL::OPEN_URI_RWC, nil)
+  def self.checkpoint_loop(path, permit)
+    rc = 0
+    dbh = nil
+    # Each file's loop opens through the one out-buffer.
+    @prepare_lock.synchronize do
+      rc = SQL.sqlite3_open_v2(path, SQL.ckpt_out, SQL::OPEN_URI_RWC, nil)
+      dbh = SQL.read_ptr(SQL.ckpt_out)
+    end
     return 0 if rc != SQL::OK
-    conn = DbConn.new(SQL.read_ptr(SQL.ckpt_out))
+    conn = DbConn.new(dbh)
     SQL.sqlite3_exec(conn.dbh, "PRAGMA busy_timeout=100", nil, nil, nil)
     while true
       sleep(CHECKPOINT_INTERVAL)
@@ -1875,9 +1957,9 @@ module Db
       rescue StandardError
         nil
       end
-      if frames >= CHECKPOINT_RESTART_FRAMES && acquire_permit
+      if frames >= CHECKPOINT_RESTART_FRAMES && acquire_permit(permit)
         SQL.sqlite3_exec(conn.dbh, "PRAGMA wal_checkpoint(RESTART)", nil, nil, nil)
-        release_permit
+        release_permit(permit)
       end
     end
     0
@@ -1896,11 +1978,11 @@ module Db
     # transaction. A failed BEGIN releases the reservation: no
     # transaction opened, so there is nothing left to protect.
     if sql == "BEGIN" && !conn.in_txn? && !in_lease?
-      @pools[0].reserve(0)
+      slot.pools[0].reserve(0)
       begin
         write(conn, sql, false)
       rescue Exception => e
-        @pools[0].release(0)
+        slot.pools[0].release(0)
         raise e
       end
       Thread.current[:db_conn] = conn
@@ -1943,7 +2025,7 @@ module Db
   #
   # The pin ALSO claims a real lease on the pool (`DbPool#reserve`), not
   # just the thread-local binding: `current_conn`'s unleased fallback is
-  # always `@pools[0].first` (index 0), the exact connection this pins,
+  # always the slot's `pools[0].first` (index 0), the exact connection this pins,
   # so without a real reservation a `with_connection` lease on another
   # thread could check that same connection out from under this open,
   # unleased transaction — with pool_size 1 there is nowhere else for it
@@ -1959,11 +2041,11 @@ module Db
     if !conn.in_txn?
       if Thread.current[:db_txn_pin] == true
         Thread.current[:db_conn] = nil
-        @pools[0].release(0)
+        slot.pools[0].release(0)
       end
       Thread.current[:db_txn_pin] = false
     elsif !in_lease?
-      @pools[0].reserve(0)
+      slot.pools[0].reserve(0)
       Thread.current[:db_conn] = conn
       Thread.current[:db_txn_pin] = true
     end

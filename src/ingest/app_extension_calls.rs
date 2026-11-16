@@ -180,10 +180,12 @@ pub(super) fn mark(app: &mut App) {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
             // A call of its own class method (`custom_strategy :title, with: …`)
             // runs as the class loads, as a library class's does.
-            if let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node
+            // A block only to a class method the model itself has (aasm's `aasm do … end`, its ClassMethods spliced in), as a library class's.
+            if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node
                 && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                 && own.contains(method.as_str())
                 && !expr.span.is_synthetic()
+                && block.as_ref().is_none_or(|b| direct.contains(method.as_str()) && reads_no_local(b) && args.iter().all(reads_no_local))
             {
                 if direct.contains(method.as_str())
                     || (!mixed_body && !redefined.contains(&owner)

@@ -640,13 +640,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_node(classes, "Arel::Nodes::Quoted", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::Not", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::NamedFunction", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
-    for order in ["Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
+    // An ordering's `expr` is what it sorts by: the column's attribute
+    // for a term `relation.order_values` builds from a Symbol or Hash,
+    // or the SQL literal an app ordering wraps
+    // (`Arel::Nodes::Ascending.new(Arel.sql("LOWER(title)"))`), kept as
+    // given as Rails' Arel::Nodes::Unary keeps it. `name` still reads on
+    // the attribute arm.
+    let ordering_expr = Ty::Union { variants: vec![arel_attribute_ty.clone(), sql_literal.clone()].into() };
+    for order in ["Arel::Nodes::Ordering", "Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
         let node = Ty::Class { id: ClassId(Symbol::from(order)), args: vec![].into() };
         register_node(
             classes,
             order,
             &[],
-            &[("nulls_first", node.clone()), ("nulls_last", node), ("to_s", Ty::Str), ("to_sql", Ty::Str)],
+            &[
+                ("expr", ordering_expr.clone()),
+                ("nulls_first", node.clone()),
+                ("nulls_last", node),
+                ("to_s", Ty::Str),
+                ("to_sql", Ty::Str),
+            ],
         );
     }
     register_node(classes, "Arel::Nodes::Predicate", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
@@ -685,6 +698,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ] {
         arel_attribute.instance_methods.insert(Symbol::from(pred), arel_node.clone());
     }
+    arel_attribute.instance_methods.insert(Symbol::from("name"), Ty::Str);
     classes.insert(ClassId(Symbol::from("Arel::Attribute")), arel_attribute);
 
     // `Arel::Node` boolean combinators chain into nodes; `where(node)`

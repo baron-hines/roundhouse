@@ -1154,6 +1154,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let unknown_attribute = classes.entry(ClassId(Symbol::from("ActiveModel::UnknownAttributeError"))).or_default();
     unknown_attribute.parent = Some(ClassId(Symbol::from("NoMethodError")));
     unknown_attribute.instance_methods.insert(Symbol::from("record"), Ty::Untyped);
+    // A partial `select`'s left-out column, raised by its generated reader.
+    register_stdlib_class(classes, "ActiveModel::MissingAttributeError", &[], &exception_surface);
+    classes.entry(ClassId(Symbol::from("ActiveModel::MissingAttributeError"))).or_default().parent =
+        Some(ClassId(Symbol::from("NoMethodError")));
     register_stdlib_class(classes, "ActiveRecord::StaleObjectError", &[], &[("attempted_action", Ty::Untyped)]);
     classes.entry(ClassId(Symbol::from("ActiveRecord::StaleObjectError"))).or_default().parent =
         Some(ClassId(Symbol::from("ActiveRecord::ActiveRecordError")));

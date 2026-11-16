@@ -3779,10 +3779,12 @@ fn target_files_inner(
                 target.as_str()
             ));
         }
-        crate::emit::shared::schema_sql::validate_schema_for_dialect(
-            &app.schema,
-            crate::emit::shared::schema_sql::Dialect::Sqlite,
-        )?;
+        // The Spinel and Ruby trees run the app's own database (`Dialect::for_app`); every other target SQLite.
+        let dialect = match target {
+            BuildTarget::Spinel | BuildTarget::Ruby => crate::emit::shared::schema_sql::Dialect::for_app(app),
+            _ => crate::emit::shared::schema_sql::Dialect::Sqlite,
+        };
+        crate::emit::shared::schema_sql::validate_schema_for_dialect(&app.schema, dialect)?;
         reject_generated_fixture_assignments(app)?;
     }
     // Before the refusals below: a refusal returns early, and a
@@ -4101,7 +4103,11 @@ fn target_files_inner(
     let files = if target == BuildTarget::Blog {
         files
     } else {
-        let files = ensure_seed_sql(files, app)?;
+        // The Spinel and Ruby trees run the app's own database (`Dialect::for_app`): their seed is in its SQL.
+        let files = match target {
+            BuildTarget::Spinel | BuildTarget::Ruby => crate::emit::shared::schema_sql::Dialect::for_app(app).scope(|| ensure_seed_sql(files, app))?,
+            _ => ensure_seed_sql(files, app)?,
+        };
         let files = ensure_storage_keep(files, target);
         let files = ensure_static_assets(files, target, app);
         ensure_e2e(files, target)
@@ -6621,6 +6627,13 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App, target: R
         }
     }
     files.push(("runtime/db.rb".to_string(), db_pg));
+    // A stored array column is a real PostgreSQL array (`text[]`,
+    // `schema_sql`), so its codec is the array literal's, not SQLite's
+    // JSON text: the same `ArrayColumn` API, so the lowering is unchanged.
+    if let Some((_, codec)) = files.iter_mut().find(|(p, _)| p == "runtime/array_column.rb") {
+        *codec = crate::runtime_files::read_to_string("runtime/spinel/array_column_pg.rb")
+            .map_err(|e| format!("read runtime/spinel/array_column_pg.rb: {e}"))?;
+    }
 
     // The gem, and a fresh lock: the committed one is SQLite's.
     let gemfile = files.iter_mut().find(|(p, _)| p == "Gemfile").ok_or("PostgreSQL tree: Gemfile not found")?;
@@ -8481,28 +8494,33 @@ fn apply_app_requires(files: &mut [(String, String)], app: &App, target: Require
 fn apply_rails_version(files: &mut [(String, String)], app: &App) {
     const MARK: &str = "# Rails::VERSION from the app's Gemfile.lock";
     let Some(lock) = &app.gem_lock else { return };
-    let Some(version) = ["rails", "railties"].iter().find_map(|g| {
-        lock.specs.iter().find(|(n, _)| n == g).map(|(_, v)| v.clone())
-    }) else {
-        return;
-    };
-    // A version is digits, letters and dots (`8.1.0.rc1`); anything else
-    // would be spelled into a double-quoted Ruby string as written.
-    if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
-        return;
-    }
+    let locked = |gems: &[&str]| gems.iter().find_map(|g| lock.specs.iter().find(|(n, _)| n == g).map(|(_, v)| v.clone()));
+    let Some(rails) = locked(&["rails", "railties"]) else { return };
     let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else { return };
     if boot.contains(MARK) {
         return;
     }
-    let parts: Vec<&str> = version.split('.').collect();
-    let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
-    let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
-    let block = format!(
-        "{MARK} (see project.rs::apply_rails_version).\n\
-         module Rails\n  module VERSION\n    MAJOR = {}\n    MINOR = {}\n    TINY = {}\n    PRE = {pre}\n    STRING = {version:?}\n  end\nend\n",
-        num(0), num(1), num(2)
-    );
+    let mut block = format!("{MARK} (see project.rs::apply_rails_version).\n");
+    // Also the frameworks' own, which a gem branches on (aasm's `ActiveRecord::VERSION::MAJOR >= 3`).
+    for (namespace, version) in [
+        ("Rails", Some(rails.clone())),
+        ("ActiveRecord", locked(&["activerecord"]).or(Some(rails.clone()))),
+        ("ActiveSupport", locked(&["activesupport"]).or(Some(rails.clone()))),
+    ] {
+        let Some(version) = version else { continue };
+        // A version is digits, letters and dots (`8.1.0.rc1`); anything else
+        // would be spelled into a double-quoted Ruby string as written.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+            continue;
+        }
+        let parts: Vec<&str> = version.split('.').collect();
+        let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+        let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
+        block.push_str(&format!(
+            "module {namespace}\n  module VERSION\n    MAJOR = {}\n    MINOR = {}\n    TINY = {}\n    PRE = {pre}\n    STRING = {version:?}\n  end\nend\n",
+            num(0), num(1), num(2)
+        ));
+    }
     const AFTER: &str = "require_relative \"runtime/rails\"\n";
     match boot.find(AFTER) {
         Some(at) => boot.insert_str(at + AFTER.len(), &block),
@@ -9295,6 +9313,7 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "Arel::Nodes::Not",
     "Arel::Nodes::Case",
     "Arel::Nodes::NamedFunction",
+    "Arel::Nodes::Ordering",
     "Arel::Nodes::Ascending",
     "Arel::Nodes::Descending",
     "Arel::Nodes::Predicate",
@@ -9365,7 +9384,14 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     // Spinel recognizes GeneratorError only as a literal rescue name.
     if target == "spinel" {
         // The Arel ordering and predicate nodes live on the CRuby overlay (`arel_predicates.rb`).
-        if matches!(name, "ActiveSupport::ConfigurationFile" | "Arel::Nodes::Ascending" | "Arel::Nodes::Descending" | "Arel::Nodes::Predicate") {
+        if matches!(
+            name,
+            "ActiveSupport::ConfigurationFile"
+                | "Arel::Nodes::Ordering"
+                | "Arel::Nodes::Ascending"
+                | "Arel::Nodes::Descending"
+                | "Arel::Nodes::Predicate"
+        ) {
             return Some("ruby_family_runtime_constant");
         }
         // `Observable` is `require "observer"`, which `SPINEL_LACKS` keeps
@@ -9512,10 +9538,12 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
     ("ActiveSupport", "errors_attribute_names"),
     ("ActiveSupport", "errors_delete"),
     ("ActiveSupport", "errors_details"),
+    ("ActiveSupport", "errors_group_by_attribute"),
     ("ActiveSupport", "error_detail"),
     ("ActiveSupport", "error_template"),
     ("ActiveSupport", "errors_import"),
     ("ActiveSupport", "errors_merge"),
+    ("ActiveSupport", "errors_copy"),
     ("ActiveJob::Arguments", "serialize"),
     ("ActiveJob::Arguments", "ruby2_keywords_hash"),
 ];
@@ -10355,6 +10383,11 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 if let crate::dialect::ValidationRule::InclusionCall { set } | crate::dialect::ValidationRule::ExclusionCall { set } = rule {
                     visit(set);
                 }
+                if let crate::dialect::ValidationRule::Comparison { checks } = rule {
+                    for (_, bound) in checks {
+                        visit(bound);
+                    }
+                }
             }
         }
     }
@@ -10919,6 +10952,9 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     } else {
         files.retain(|(p, _)| p != "runtime/array_column.rb" && p != "runtime/array_column.rbs");
     }
+    // PostgreSQL's codec, which `apply_postgresql_tree` swaps in; no tree
+    // ships it under its own name.
+    files.retain(|(p, _)| p != "runtime/array_column_pg.rb");
     inject_array_column_require(&mut files, app)?;
 
     // ActiveJob payload codecs. Same reason as the JSON-column sidecar:

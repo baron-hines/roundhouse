@@ -130,6 +130,7 @@ require_relative "runtime/action_view_form_builder"
 require_relative "runtime/action_view_tags"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+require_relative "runtime/active_record_runtime_macros"
 # `ActiveRecord::Base.connection_db_config`, `connection_pool` and
 # `transaction_open?` over the Db shim loaded above.
 require_relative "runtime/active_record_db_config"

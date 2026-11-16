@@ -239,6 +239,11 @@ impl UnreachedGemCode {
         Some(UnreachedGemCode(unreached))
     }
 
+    /// Whether `span` lies in gem code the app does not reach.
+    pub fn covers(&self, span: &crate::span::Span) -> bool {
+        self.0.iter().any(|u| u.file == span.file && u.start <= span.start && span.end <= u.end)
+    }
+
     /// [`demote_unreached_gem_errors`] over this code.
     pub fn demote(&self, diags: &mut [crate::diagnostic::Diagnostic]) {
         use crate::diagnostic::Severity;
