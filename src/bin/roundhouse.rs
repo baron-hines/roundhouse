@@ -361,6 +361,7 @@ fn run_transpile(
         && std::env::var_os("ROUNDHOUSE_DEFER_ACCESSOR_SURFACE").is_none_or(|value| value != "0");
     // Not by ingesting first: a cached observation is checked against the app's files.
     if target == BuildTarget::Spinel
+        && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0")
         && let Some(cached) = input.canonicalize().ok().and_then(|dir| roundhouse::observed_shapes::cached(&dir))
     {
         match cached {
@@ -400,11 +401,14 @@ fn observe_shapes(
     let cached = std::fs::read(&cache)
         .ok()
         .and_then(|b| serde_json::from_slice::<obs::Cached>(&b).ok())
-        .filter(|c| c.key == key);
+        .filter(|c| c.key == key && c.env.as_ref().is_none_or(|env| *env == obs::environment(input)));
     let observation = match cached {
         Some(c) => c.observation,
         None => {
-            let observation = boot_observer(input, gems).unwrap_or_else(|why| obs::Observation {
+            let booted = boot_observer(input, gems);
+            // Not reused once the Ruby or its gems differ: a failed boot may be the machine's, not the app's.
+            let env = booted.is_err().then(|| obs::environment(input));
+            let observation = booted.unwrap_or_else(|why| obs::Observation {
                 effects: Vec::new(),
                 refusals: vec![why],
             });
@@ -417,6 +421,7 @@ fn observe_shapes(
                 serde_json::to_vec_pretty(&obs::Cached {
                     key: key.to_string(),
                     observation: observation.clone(),
+                    env,
                 })
                 .unwrap_or_default(),
             );
@@ -433,8 +438,14 @@ fn boot_observer(
     input: &std::path::Path,
     gems: &[String],
 ) -> Result<roundhouse::observed_shapes::Observation, String> {
-    let tmp = std::env::temp_dir().join(format!("roundhouse-observe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    // Not a name another user can guess and create first: the boot runs the Ruby files in it.
+    let tmp = (0..16)
+        .map(|attempt| {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+            std::env::temp_dir().join(format!("roundhouse-observe-{}-{nanos:x}-{attempt}", std::process::id()))
+        })
+        .find(|dir| std::fs::create_dir(dir).is_ok())
+        .ok_or("no fresh temporary directory for the observed boot")?;
     let observed = boot_observer_in(input, gems, &tmp);
     if std::env::var_os("ROUNDHOUSE_OBSERVE_KEEP").is_none() {
         let _ = std::fs::remove_dir_all(&tmp);

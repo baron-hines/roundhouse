@@ -72,6 +72,21 @@ pub struct Observation {
 pub struct Cached {
     pub key: String,
     pub observation: Observation,
+    /// For a boot that failed: the Ruby and gem paths it failed with, which a later build must share to reuse it.
+    #[serde(default)]
+    pub env: Option<String>,
+}
+
+/// The Ruby and gem paths a boot runs with, read in the app's directory: a failed boot is reused only under the same.
+pub fn environment(dir: &Path) -> String {
+    let out = std::process::Command::new("ruby")
+        .args(["-e", "print RUBY_DESCRIPTION, \"\\n\", Gem.path.join(\":\")"])
+        .current_dir(dir)
+        .output();
+    match out {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned() + &std::env::var("GEM_PATH").unwrap_or_default() + &std::env::var("GEM_HOME").unwrap_or_default(),
+        Err(_) => "no ruby".into(),
+    }
 }
 
 /// The source edits an observation makes: statements written after an app file's offset, and gem statements that read `nil`.
@@ -361,7 +376,10 @@ pub fn key(dir: &Path) -> String {
 /// The cached observation's patches, when nothing it read has changed since.
 pub fn cached(dir: &Path) -> Option<Result<Patches, String>> {
     let cached: Cached = serde_json::from_slice(&std::fs::read(dir.join(CACHE)).ok()?).ok()?;
-    (cached.key == key(dir)).then(|| patches(&cached.observation, dir))
+    if cached.key != key(dir) || cached.env.as_ref().is_some_and(|env| *env != environment(dir)) {
+        return None;
+    }
+    Some(patches(&cached.observation, dir))
 }
 
 fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {

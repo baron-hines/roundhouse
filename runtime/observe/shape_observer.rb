@@ -29,7 +29,7 @@ module RoundhouseShapeObserver
       return nil unless root && stmt
       stmt = widened(stmt, path)
       s, e = stmt.location.start_offset, stmt.location.end_offset
-      { "gem_file" => File.basename(root) + path[root.size..], "range" => [s, e], "text" => File.binread(path).byteslice(s, e - s) }
+      { "gem_file" => File.basename(root) + path[root.size..], "range" => [s, e], "text" => File.binread(path).byteslice(s, e - s).force_encoding(Encoding::UTF_8) }
     end
 
     # The app class's own class-body statement whose run set this off: its file in the tree and its first line.
@@ -295,7 +295,8 @@ TracePoint.new(:call) do |tp|
   next unless RoundhouseShapeObserver.app_class?(tp.self)
   args = []
   ok = tp.parameters.all? do |(kind, pname)|
-    next true unless pname
+    # Not skipped: an anonymous `*`, `**` or `&` holds arguments no local reads back.
+    next RoundhouseShapeObserver.refuse("#{tp.self}.#{tp.method_id}: an anonymous `#{kind}` parameter") unless pname
     value = tp.binding.local_variable_get(pname)
     case kind
     when :req, :opt
