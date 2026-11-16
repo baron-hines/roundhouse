@@ -22439,3 +22439,7 @@ mod emitted_model_methods;
 mod association_load_seats_inverse;
 #[path = "emit_and_run/relation_predicate_blocks.rs"]
 mod relation_predicate_blocks;
+
+// Concern shapes: an `included do` block's class/instance attributes.
+#[path = "emit_and_run/concern_included_cattr.rs"]
+mod concern_included_cattr;

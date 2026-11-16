@@ -6710,6 +6710,12 @@ pub type ConcernModelItems = (
 /// [`crate::app::App::concern_guarded_items`]).
 pub type ConcernGuardedItems = Vec<(ClassId, Vec<crate::app::ConcernGuardedItem>)>;
 
+/// The class-variable seeds a concern's `included do` block sets, keyed by
+/// module: `cattr_accessor :cap, default: 3` there is a `@@cap = 3` on
+/// every includer, which the splice gives it (see
+/// [`crate::app::App::concern_class_attr_defaults`]).
+pub type ConcernClassAttrDefaults = Vec<(ClassId, IndexMap<Symbol, Expr>)>;
+
 /// `X if self == A`, `X unless self == A`, `X if self != A`,
 /// `X if in?([A, B])` (also `self.in?`, `A == self`), or the block form
 /// `if self == A ... end`: the guard and the guarded statements. `None`
@@ -6934,7 +6940,7 @@ pub(in crate::ingest) fn ingest_concern_included_redefs(source: &[u8], file: &st
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
-    let (items, enums, _guarded) =
+    let (items, enums, _guarded, _class_attrs) =
         ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default());
     (items, enums)
 }
@@ -6942,6 +6948,11 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
 /// Same as [`ingest_concern_model_items`], with the app-wide constant
 /// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
 /// resolve the way model-side class-body DSL does.
+///
+/// Third value: the `cattr_*` / `mattr_*` seeds the block sets on each
+/// includer (`included do cattr_accessor :cap, default: 3 end` seeds
+/// `@@cap` there, as Rails runs the block in the includer's class body),
+/// so the splice can hand them to the model that includes the module.
 pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     source: &[u8],
     file: &str,
@@ -6950,6 +6961,7 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
     Vec<(ClassId, Vec<ConcernEnumDecl>)>,
     ConcernGuardedItems,
+    ConcernClassAttrDefaults,
 ) {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
@@ -6959,6 +6971,7 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     let mut out = Vec::new();
     let mut enums_out = Vec::new();
     let mut guarded_out: ConcernGuardedItems = Vec::new();
+    let mut class_attr_out: ConcernClassAttrDefaults = Vec::new();
     for (scope, module) in find_all_modules_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
         let mut full_path: Vec<String> = scope.clone();
@@ -6997,6 +7010,9 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
             })
         });
         let mut guarded: Vec<crate::app::ConcernGuardedItem> = Vec::new();
+        // The class-variable seeds this module's blocks set on each
+        // includer, in declaration order.
+        let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
@@ -7089,14 +7105,44 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                         }
                     }
                 }
+                let is_direct = direct.iter().any(|stmt| {
+                    stmt.location().start_offset() == inner.location().start_offset()
+                });
+                // `included do cattr_accessor :cap, default: 3 end` seeds
+                // the includer's class variable and defines both sides
+                // there, exactly as the same call in a model's body does:
+                // the model-side walk expands it, and the seed travels to
+                // the splice beside the accessors.
+                if is_concern && is_direct && let Some(call) = inner.as_call_node()
+                    && call.receiver().is_none()
+                    && matches!(constant_id_str(&call.name()),
+                        "cattr_accessor" | "cattr_reader" | "cattr_writer"
+                        | "mattr_accessor" | "mattr_reader" | "mattr_writer")
+                {
+                    match super::model::expand_mattr_cattr(
+                        &call,
+                        &id,
+                        file,
+                        Vec::new(),
+                        Some(&mut class_attr_defaults),
+                    ) {
+                        Ok(Some(expanded)) => {
+                            items.extend(expanded);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            super::survey::record(&err);
+                            unclaimed = true;
+                            continue;
+                        }
+                    }
+                }
                 // `_items`, plural: a multi-attribute `validates` (or
                 // its `validates_presence_of` spelling) declares one
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
-                let is_direct = direct.iter().any(|stmt| {
-                    stmt.location().start_offset() == inner.location().start_offset()
-                });
                 // Its methods are the module's class methods (the decl walk).
                 if is_concern
                     && is_direct
@@ -7191,11 +7237,14 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         if !guarded.is_empty() {
             guarded_out.push((id.clone(), guarded));
         }
+        if !class_attr_defaults.is_empty() {
+            class_attr_out.push((id.clone(), class_attr_defaults));
+        }
         if !items.is_empty() {
             out.push((id, items));
         }
     }
-    (out, enums_out, guarded_out)
+    (out, enums_out, guarded_out, class_attr_out)
 }
 
 /// Does this class's ancestry, as a `sig/**/*.rbs` sidecar states it,

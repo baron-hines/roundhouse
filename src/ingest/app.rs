@@ -1086,14 +1086,14 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                                 unwrap_or_record(ingest_nested_library_classes(&source, &path_str, outer.0.as_str()))?
                             {
                                 let nested = nested_under(&outer, classes);
-                                let (concern_items, concern_enum_decls, concern_guarded) =
+                                let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
                                     ingest_concern_model_items_with_constants(
                                         &source, &path_str, &enum_constants,
                                     );
                                 for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                                     app.concern_included_redefs.entry(id).or_default().push(name);
                                 }
-                                append_concern_items(&mut app, concern_items, concern_guarded, |id| {
+                                append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |id| {
                                     nested.iter().any(|class| class.name == *id)
                                 });
                                 concern_enums.extend(concern_enum_decls.into_iter().filter(
@@ -1121,14 +1121,14 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // to every includer: filters (controller-side)
                         // and model DSL (associations/scopes).
                         record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |_| true);
-                        let (concern_items, concern_enum_decls, concern_guarded) =
+                        let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
                             ingest_concern_model_items_with_constants(
                                 &source, &path_str, &enum_constants,
                             );
                         for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                             app.concern_included_redefs.entry(id).or_default().push(name);
                         }
-                        append_concern_items(&mut app, concern_items, concern_guarded, |_| true);
+                        append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |_| true);
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
                         concern_enums.extend(concern_enum_decls);
@@ -1326,7 +1326,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // nested class in the file too.
                         if let Ok(classes) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
                             let nested = nested_under(&outer, classes);
-                            let (concern_items, concern_enum_decls, concern_guarded) =
+                            let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
                                 ingest_concern_model_items_with_constants(
                                     &source, &path_str, &enum_constants,
                                 );
@@ -1336,7 +1336,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             let own = |id: &crate::ident::ClassId| {
                                 nested.iter().any(|class| class.name == *id) || beside_names.contains(id)
                             };
-                            append_concern_items(&mut app, concern_items, concern_guarded, |id| own(id));
+                            append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |id| own(id));
                             concern_enums.extend(concern_enum_decls.into_iter().filter(|(id, _)| own(id)));
                             app.library_classes.extend(nested);
                         }
@@ -1453,12 +1453,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                     // includes it, as one under app/*/concerns does: a
                     // controller gets its filters, a model its DSL.
                     record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |_| true);
-                    let (concern_items, concern_enum_decls, concern_guarded) =
+                    let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
                         ingest_concern_model_items_with_constants(&source, &path_str, &enum_constants);
                     for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                         app.concern_included_redefs.entry(id).or_default().push(name);
                     }
-                    append_concern_items(&mut app, concern_items, concern_guarded, |_| true);
+                    append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |_| true);
                     concern_enums.extend(concern_enum_decls);
                 }
                 Err(err) => record_library_ingest_failure(&mut app, &path_str, &err),
@@ -2284,14 +2284,14 @@ end
                     {
                         app.library_classes.extend(classes);
                         record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |_| true);
-                        let (concern_items, concern_enum_decls, concern_guarded) =
+                        let (concern_items, concern_enum_decls, concern_guarded, concern_class_attrs) =
                             ingest_concern_model_items_with_constants(
                                 &source, &path_str, &enum_constants,
                             );
                         for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
                             app.concern_included_redefs.entry(id).or_default().push(name);
                         }
-                        append_concern_items(&mut app, concern_items, concern_guarded, |_| true);
+                        append_concern_items(&mut app, concern_items, concern_guarded, concern_class_attrs, |_| true);
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
                         concern_enums.extend(concern_enum_decls);
@@ -4396,9 +4396,24 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             let concern_ids: Vec<crate::ident::ClassId> =
                 concern_ids.iter().flat_map(|id| with_dependencies(id, &dependencies, &mut Vec::new())).collect();
             let model_name = model.name.clone();
-            let items: Vec<ModelBodyItem> = concern_ids
+            let fresh: Vec<crate::ident::ClassId> = concern_ids
                 .iter()
                 .filter(|id| spliced.insert((*id).clone()))
+                .cloned()
+                .collect();
+            // The block's `cattr_*` / `mattr_*` seeds are the includer's
+            // class variables, as they are on the concern's own module:
+            // carried beside the accessors the items above declare. The
+            // model's own declaration of a name stands over an included
+            // one, so it always answers first.
+            for id in &fresh {
+                let Some(defaults) = app.concern_class_attr_defaults.get(id) else { continue };
+                for (name, value) in defaults {
+                    model.class_attr_defaults.entry(name.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            let items: Vec<ModelBodyItem> = fresh
+                .iter()
                 .flat_map(|id| {
                     // The module's unconditional items with the guarded
                     // ones that admit this model, in source order (a
@@ -9982,6 +9997,7 @@ fn append_concern_items(
     app: &mut App,
     items: Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>,
     guarded: super::library_class::ConcernGuardedItems,
+    class_attrs: super::library_class::ConcernClassAttrDefaults,
     keep: impl Fn(&crate::ident::ClassId) -> bool,
 ) {
     // A guarded item's `at` counts the unconditional items before it in
@@ -9994,6 +10010,14 @@ fn append_concern_items(
     }
     for (id, items) in items.into_iter().filter(|(id, _)| keep(id)) {
         app.concern_model_items.entry(id).or_default().extend(items);
+    }
+    // A reopened module's second `cattr_accessor` seed for a name the
+    // first already holds is the same declaration; the first stands.
+    for (id, defaults) in class_attrs.into_iter().filter(|(id, _)| keep(id)) {
+        let entry = app.concern_class_attr_defaults.entry(id).or_default();
+        for (name, value) in defaults {
+            entry.entry(name).or_insert(value);
+        }
     }
 }
 

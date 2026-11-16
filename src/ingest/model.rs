@@ -928,7 +928,11 @@ pub(super) fn ingest_model_body_items(
 /// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
 /// parameterless block. Other kwargs (`instance_reader:`, splats, …) stay
 /// unexpanded so a partial reader cannot drop the initializer.
-fn expand_mattr_cattr(
+///
+/// Shared with the concern collector: `included do cattr_accessor :cap,
+/// default: 3 end` runs on each includer exactly as a model's own
+/// declaration does, and needs the seed carried beside the accessors.
+pub(super) fn expand_mattr_cattr(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
     file: &str,
