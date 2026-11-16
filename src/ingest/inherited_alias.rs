@@ -223,9 +223,12 @@ pub(super) fn resolve(app: &mut App) {
                             && c.includes.is_empty()
                             && !c.unknown_calls.iter().any(|call| matches!(&*call.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "prepend" | "extend")))
                     });
+                    // Nor a name every object answers (`to_s`): then Object's is what an alias read ahead of the other file copies.
+                    let everyones = super::library_class::OBJECT_BUILTINS.iter().any(|(name, _, _)| *name == from);
                     if let [original] = elsewhere[..]
                         && !calls_super(&original.body)
                         && alone
+                        && !everyones
                     {
                         let mut copy = original.clone();
                         copy.name = Symbol::from(to);
