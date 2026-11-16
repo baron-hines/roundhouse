@@ -200,7 +200,23 @@ fn rewrite_element_block(expr: &mut Expr, lists: &HelperLists) {
     }
     let ExprNode::Lambda { params, body, .. } = &mut *block.node else { return };
     let Some(item) = params.first().cloned() else { return };
+    // A block that reassigns the name holds another value there (`w = { kind: "old" }`): its keys are not the element's.
+    if assigns_local(body, &item) {
+        return;
+    }
     rewrite_element_calls(body, &item, lists);
+}
+
+/// Whether `expr` writes the local `name` (`name = …`, `name ||= …`, `name, x = …`).
+fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
+    let is_name = |lv: &crate::expr::LValue| matches!(lv, crate::expr::LValue::Var { name: n, .. } if n == name);
+    let mut found = match &*expr.node {
+        ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is_name(target),
+        ExprNode::MultiAssign { targets, .. } => targets.iter().any(is_name),
+        _ => false,
+    };
+    expr.node.for_each_child(&mut |c| found |= assigns_local(c, name));
+    found
 }
 
 fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {

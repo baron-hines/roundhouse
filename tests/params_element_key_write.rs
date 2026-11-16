@@ -73,3 +73,12 @@ fn a_rebound_element_name_is_left_alone() {
         assert!(src.contains(r#"Params.allowed_scalars(w, ["name", "kind"])"#), "{binding}:\n{src}");
     }
 }
+
+/// A block that reassigns the element's name holds another value there: its keys are not the element's.
+#[test]
+fn a_reassigned_element_name_is_left_alone() {
+    let body = "    items = params.require(:widgets).map do |w|\n      w = { kind: \"old\" }\n      w[:kind] = \"new\"\n      w\n    end\n    items.each { |attrs| Widget.create!(attrs) }";
+    let src = controller_for(BuildTarget::Ruby, body);
+    assert!(src.contains("w[:kind] = \"new\""), "{src}");
+    assert!(!src.contains(r#"w["kind"]"#), "{src}");
+}
