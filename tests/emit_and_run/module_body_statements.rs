@@ -2,8 +2,7 @@
 //! constants (a call chain on a constant it just assigned, a constant
 //! built from the class above) keeps those statements and runs them with
 //! the class already defined, as Ruby runs the module body in order.
-//! Ignored as a fork spec until the compiler does; the expected values are
-//! ActiveRecord 8.1.4's answers.
+//! The expected values are ActiveRecord 8.1.4's answers.
 
 use super::emit_and_run;
 
@@ -43,7 +42,6 @@ end
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
 
 #[test]
-#[ignore = "fork spec: ruby semantics"]
 fn a_module_body_runs_its_statements_after_the_class_it_defines() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
@@ -51,7 +49,7 @@ fn a_module_body_runs_its_statements_after_the_class_it_defines() {
 }
 
 #[test]
-#[ignore = "fork spec: ruby semantics"]
+#[ignore = "requires the Spinel toolchain"]
 fn a_module_body_runs_its_statements_after_the_class_it_defines_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
     run.assert_passes();

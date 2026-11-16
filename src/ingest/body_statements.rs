@@ -31,6 +31,12 @@
 //! classes is to a class method the app defines there: nothing it runs
 //! is a framework macro the runtime does not define, which would raise
 //! as the class loads. The rest stay dropped and reported by name.
+//!
+//! A call on a constant the body assigns (`SWATCHES.push(Swatch.new("teal"))`,
+//! `NAMES << "x"`), without a block and with arguments held to the same
+//! rule, is plain Ruby every Ruby-family tree runs, Spinel's too: it is
+//! marked [`crate::expr::CONSTANT_STATEMENT`] instead, and written back
+//! among the constants, in source order.
 
 use crate::det::HashSet;
 
@@ -160,6 +166,8 @@ pub(super) fn mark(app: &mut App) {
             let check = Check { owner: &name, index: &index, constants: &constants, alias_copies: &alias_copies, singleton };
             if check.statement(expr) {
                 expr.decisions |= crate::expr::BODY_STATEMENT;
+            } else if !singleton && check.constant_call(expr) {
+                expr.decisions |= crate::expr::CONSTANT_STATEMENT;
             }
         }
     }
@@ -337,6 +345,13 @@ impl Check<'_> {
         }
     }
 
+    /// `SWATCHES.push(Swatch.new("teal"))`: a block-free call on a constant
+    /// this body assigns, whose arguments make only answered calls.
+    fn constant_call(&self, expr: &Expr) -> bool {
+        let ExprNode::Send { recv: Some(r), args, block: None, .. } = &*expr.node else { return false };
+        matches!(&*r.node, ExprNode::Const { .. }) && self.inert(r) && args.iter().all(|a| self.walk(a))
+    }
+
     /// A literal, a constant of this body, or a core collection method
     /// on one (`%w[a b].each_with_index`).
     fn inert(&self, expr: &Expr) -> bool {
@@ -369,8 +384,17 @@ impl Check<'_> {
                         ExprNode::Const { path } => {
                             let named: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
                             let name = named.join("::");
-                            if self.index.class_side.contains_key(&name) {
-                                self.index.defines(&name, method.as_str())
+                            // As Ruby looks the name up: from the class's nesting outward (`Swatch` in `Palette`).
+                            let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
+                            let class = if absolute {
+                                self.index.class_side.contains_key(&name).then_some(name)
+                            } else {
+                                resolve(self.index.class_side, &name, Some(self.owner))
+                            };
+                            if let Some(class) = class {
+                                // `new` on one of the app's classes (not a module): every class answers it.
+                                self.index.defines(&class, method.as_str())
+                                    || (method.as_str() == "new" && self.index.parents.contains_key(&class))
                             } else {
                                 // A constant of this body (`WRITERS.each`).
                                 self.inert(r)
