@@ -173,6 +173,28 @@ pub(super) fn mark(app: &mut App) {
     }
 }
 
+/// Every local `expr` reads is a parameter of a block inside it
+/// (`%w[a b].map { |n| Swatch.new(n) }`): the call is written back alone,
+/// without the body's other locals (`color = "teal"` above it).
+fn binds_its_locals(expr: &Expr, bound: &mut Vec<String>) -> bool {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => name.as_str().starts_with('$') || bound.iter().any(|b| b == name.as_str()),
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
+            let depth = bound.len();
+            bound.extend(params.iter().chain(rest_param).chain(block_param).map(|p| p.as_str().to_string()));
+            bound.extend(extra_params.iter().map(|p| p.name.as_str().to_string()));
+            let ok = binds_its_locals(body, bound);
+            bound.truncate(depth);
+            ok
+        }
+        _ => {
+            let mut ok = true;
+            expr.node.for_each_child(&mut |child| ok = ok && binds_its_locals(child, bound));
+            ok
+        }
+    }
+}
+
 /// `name` as the app names it, looked up from `scope`'s nesting
 /// outward (`Settings` in `Hooked::Gateway` is `Hooked::Settings`).
 fn resolve(class_side: &std::collections::BTreeMap<String, HashSet<String>>, name: &str, scope: Option<&str>) -> Option<String> {
@@ -349,7 +371,9 @@ impl Check<'_> {
     /// this body assigns, whose arguments make only answered calls.
     fn constant_call(&self, expr: &Expr) -> bool {
         let ExprNode::Send { recv: Some(r), args, block: None, .. } = &*expr.node else { return false };
-        matches!(&*r.node, ExprNode::Const { .. }) && self.inert(r) && args.iter().all(|a| self.walk(a))
+        matches!(&*r.node, ExprNode::Const { .. })
+            && self.inert(r)
+            && args.iter().all(|a| self.walk(a) && binds_its_locals(a, &mut Vec::new()))
     }
 
     /// A literal, a constant of this body, or a core collection method

@@ -85,3 +85,15 @@ fn a_call_on_a_class_from_an_outer_namespace_is_not_written_back() {
     let text = std::fs::read_to_string(tree.join("app/models/palette.rb")).unwrap();
     assert!(text.contains("ITEMS = []") && !text.contains("Swatch.new"), "{text}");
 }
+
+/// A call reading a body local (`color`) is not written back alone: the
+/// emitted body does not keep that local, so it would raise NameError.
+/// One reading only its own block's parameter is (`%w[…].map { |n| … }`).
+#[test]
+fn a_constant_call_reading_a_body_local_is_not_written_back() {
+    let (tree, _errors) = emit_and_run::empty_app()
+        .write("app/models/palette.rb", "module Palette\n  color = \"teal\"\n  ITEMS = []\n  ITEMS.push(color)\n  ITEMS.concat(%w[rust].map { |n| n.upcase })\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let text = std::fs::read_to_string(tree.join("app/models/palette.rb")).unwrap();
+    assert!(!text.contains("ITEMS.push(color)") && text.contains("ITEMS.concat("), "{text}");
+}
