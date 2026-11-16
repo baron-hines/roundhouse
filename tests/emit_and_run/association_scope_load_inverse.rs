@@ -52,6 +52,9 @@ end
     # Rails: every load off the association's relation seats the owner
     check("ordered first", f.ships.order(:tons).first.fleet.equal?(f))
     check("find_by", f.ships.find_by(name: "ketch").fleet.equal?(f))
+    # Rails: a row whose select left the key out is not seated, and loads
+    sel = f.ships.where(tons: 40).select(:name).to_a
+    check("partial select", sel.map(&:name) == ["brig"] && !sel.first.association(:fleet).loaded?)
     # Rails: a class method reached through the association runs on its relation
     check("class method", f.ships.heavy.to_a.map(&:name) == ["brig"] && f.ships.heavy.first.fleet.equal?(f))
     seen = []

@@ -591,13 +591,14 @@ fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
         _ => None,
     };
     crate::lower::for_each_emit_body_ref(app, &mut |body| visit(body, &explicit, &registry, &mut out));
-    // A bare or `self.` join in a model's scope or class method is on
-    // that model (`scope :shady, -> { joins(:shady_trees) }`).
+    // A model's scopes and class methods: a bare or `self.` join there is
+    // on that model (`scope :shady, -> { joins(:shady_trees) }`), and an
+    // explicit receiver resolves as anywhere else.
     for model in &app.models {
         let own = |recv: Option<&Expr>| match recv {
             None => Some(model.name.clone()),
             Some(r) if matches!(&*r.node, ExprNode::SelfRef) => Some(model.name.clone()),
-            _ => None,
+            Some(r) => model_of(r),
         };
         for scope in model.scopes() {
             visit(&scope.body, &own, &registry, &mut out);
@@ -606,6 +607,9 @@ fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
             visit(&method.body, &own, &registry, &mut out);
         }
     }
+    // A body both walks reach reports its join once.
+    let mut seen = crate::det::HashSet::default();
+    out.retain(|d| seen.insert((d.span, d.message.clone())));
     out
 }
 

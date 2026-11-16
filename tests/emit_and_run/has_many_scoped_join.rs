@@ -91,18 +91,18 @@ fn a_join_whose_scope_does_not_render_is_a_check_error() {
         .edit(
             "app/models/orchard.rb",
             "  has_many :trees\n",
-            "  has_many :trees\n  has_many :shady_trees, -> { where(\"tall = ?\", false) }, class_name: \"Tree\"\n  has_one :plain_tree, -> { where.not(featured: true) }, class_name: \"Tree\"\n  scope :shady, -> { joins(:shady_trees) }\n\n  def self.plain\n    self.left_joins(:plain_tree)\n  end\n",
+            "  has_many :trees\n  has_many :shady_trees, -> { where(\"tall = ?\", false) }, class_name: \"Tree\"\n  has_one :plain_tree, -> { where.not(featured: true) }, class_name: \"Tree\"\n  scope :shady, -> { joins(:shady_trees) }\n  scope :shady_north, -> { where(name: \"north\").joins(:shady_trees) }\n\n  def self.plain\n    self.left_joins(:plain_tree)\n  end\n",
         )
         .write(
             "app/models/report.rb",
             "class Report\n  def self.shady\n    Orchard.joins(:shady_trees).count\n  end\n\n  def self.plain\n    Orchard.where(name: \"north\").left_joins(:plain_tree, :tall_trees).count\n  end\n\n  def self.nested\n    Tree.joins(orchard: :shady_trees).count\n  end\nend\n",
         )
         .check_errors();
-    assert_eq!(errors.len(), 5, "{errors:#?}");
+    assert_eq!(errors.len(), 6, "{errors:#?}");
     assert!(errors[0].contains("`joins(:shady_trees)`") || errors[1].contains("`joins(:shady_trees)`"), "{errors:#?}");
     // A bare join in a scope and a `self.` one in a class method are on
     // their model.
     assert_eq!(errors.iter().filter(|e| e.contains("`left_joins(:plain_tree)`")).count(), 2, "{errors:#?}");
     // A nested association is checked on the preceding one's target.
-    assert_eq!(errors.iter().filter(|e| e.contains("`joins(:shady_trees)`")).count(), 3, "{errors:#?}");
+    assert_eq!(errors.iter().filter(|e| e.contains("`joins(:shady_trees)`")).count(), 4, "{errors:#?}");
 }

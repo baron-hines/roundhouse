@@ -153,13 +153,14 @@ fn instance_method<'a>(lc: &'a mut LibraryClass, name: &Symbol) -> Option<&'a mu
 /// A row is seated only when its key names this owner, or the owner is
 /// unsaved, as Rails' `inversed_from_queries` checks `matches_foreign_key?`:
 /// a chain can drop the key's condition (`unscope(where: :fleet_id)`) and
-/// load other owners' rows.
+/// load other owners' rows. A row whose `select` left the key out is not
+/// seated, and its key is not read (which would raise).
 fn set_inverse_from_queries_source(arms: &[&Inverse]) -> String {
     let mut src = String::from("def _set_inverse_from_queries(name, records)\n  case name\n");
     for inv in arms {
         let (name, seat, fk) = (&inv.name, seat_method(&inv.inverse), &inv.foreign_key);
         src.push_str(&format!(
-            "  when :{name}\n    records.each {{ |r| r.{seat}(self) if new_record? || r.{fk} == id }}\n"
+            "  when :{name}\n    records.each {{ |r| r.{seat}(self) if new_record? || (r.has_attribute?(:{fk}) && r.{fk} == id) }}\n"
         ));
     }
     src.push_str("  end\nend\n");
