@@ -3132,8 +3132,14 @@ end
     // `concerning :Topic do … end` is a nested Concern module plus an
     // include of it: desugared before the splices read both. The `enum`s
     // its `included do` declares reach the model the same way a file's
-    // concern does.
-    concern_enums.extend(super::concerning::expand(&mut app, &sources, &mut concern_class_method_spans));
+    // concern does — resolved against the app-wide constant table, since
+    // the block is lexically inside the model's class body.
+    concern_enums.extend(super::concerning::expand(
+        &mut app,
+        &sources,
+        &enum_constants,
+        &mut concern_class_method_spans,
+    ));
     app.plain_mixins = plain_mixins(&app, &concern_class_method_spans);
     // Not a module's own `class << self` defs: Ruby defines those on the module, whatever ingest also copies onto includers.
     app.concern_class_side_spans = concern_class_method_spans

@@ -31,6 +31,7 @@ use super::library_class::ConcernClassMethodSpans;
 pub(super) fn expand(
     app: &mut App,
     sources: &[SourceFile],
+    enum_constants: &super::model::EnumConstants,
     carriers: &mut Vec<ConcernClassMethodSpans>,
 ) -> Vec<(ClassId, Vec<super::library_class::ConcernEnumDecl>)> {
     // (model index, item index): rewritten after the walk, since each
@@ -71,7 +72,7 @@ pub(super) fn expand(
         let scan = super::library_class::ingest_concern_model_items_with_constants(
             source.as_bytes(),
             &file,
-            &super::model::EnumConstants::default(),
+            enum_constants,
         );
         // An `enum` an `included do` block declares reaches the model
         // through the concern fold, exactly as one written in a file's
