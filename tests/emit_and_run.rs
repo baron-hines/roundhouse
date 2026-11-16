@@ -22559,3 +22559,5 @@ mod has_many_inverse_of_foreign_key;
 mod errors_messages_unlowered;
 #[path = "emit_and_run/belongs_to_unsaved_target_valid.rs"]
 mod belongs_to_unsaved_target_valid;
+#[path = "emit_and_run/string_starts_with_alias.rs"]
+mod string_starts_with_alias;
