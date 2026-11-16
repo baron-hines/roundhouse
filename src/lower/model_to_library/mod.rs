@@ -45,7 +45,7 @@ use crate::span::Span;
 use crate::ty::{FnTy, Row, Ty};
 
 use self::associations::{push_association_methods, push_dependent_destroy, ThroughJoins};
-pub(crate) use self::associations::{ThroughWriterJoin, through_writer_join};
+pub(crate) use self::associations::{ThroughWriterJoin, fk_sentinel, through_writer_join};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::block_callback_shape;
