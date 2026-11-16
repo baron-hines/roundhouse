@@ -91,6 +91,47 @@ end
   include Blank
 end
 "##)
+        .write("app/models/concerns/bounded.rb", r##"module Bounded
+  extend ActiveSupport::Concern
+
+  BOUND = 7
+
+  included do
+    cattr_accessor :bound, default: Bounded::BOUND
+  end
+end
+"##)
+        .write("app/models/spool.rb", r##"class Spool < ApplicationRecord
+  cattr_accessor :bound
+  include Bounded
+end
+"##)
+        .write("app/models/concerns/layered.rb", r##"module Layered
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_accessor :ply, default: 0
+  end
+end
+"##)
+        .write("app/models/concerns/single_ply.rb", r##"module SinglePly
+  extend ActiveSupport::Concern
+  include Layered
+end
+"##)
+        .write("app/models/concerns/double_ply.rb", r##"module DoublePly
+  extend ActiveSupport::Concern
+  include Layered
+
+  included do
+    cattr_accessor :ply, default: 2
+  end
+end
+"##)
+        .write("app/models/cord.rb", r##"class Cord < ApplicationRecord
+  include SinglePly, DoublePly
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -134,6 +175,19 @@ end
     Tape.width
   end
 
+  # Rails: 7 — a constant default replaces the nil the model's own
+  # no-default declaration left.
+  def self.constant_default_over_a_nil_seed
+    Spool.bound
+  end
+
+  # Rails: 2 — a dependency two arguments share runs once, before
+  # DoublePly's block (the last argument runs first); SinglePly finds it
+  # already an ancestor.
+  def self.shared_dependency_runs_once
+    Cord.ply
+  end
+
   def self.run
     Rope.delete_all
     check("class_attributes_from_the_block", class_attributes_from_the_block == [3, "cm", true, false, "4cm"])
@@ -142,6 +196,8 @@ end
     check("models_seed_after_two_concerns", models_seed_after_two_concerns == 1)
     check("one_statement_two_concerns", one_statement_two_concerns == 1)
     check("nil_default_keeps_the_models_seed", nil_default_keeps_the_models_seed == 1)
+    check("constant_default_over_a_nil_seed", constant_default_over_a_nil_seed == 7)
+    check("shared_dependency_runs_once", shared_dependency_runs_once == 2)
   end
 end
 "##)

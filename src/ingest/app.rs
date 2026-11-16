@@ -4539,7 +4539,15 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
             let seed_order: Vec<crate::ident::ClassId> = if prepended {
                 Vec::new()
             } else {
-                groups.iter().rev().flatten().filter(|id| fresh.contains(id)).cloned().collect()
+                // A dependency two arguments share runs once, before the
+                // first of them to run: the second finds it an ancestor.
+                let mut order: Vec<crate::ident::ClassId> = Vec::new();
+                for id in groups.iter().rev().flatten().filter(|id| fresh.contains(id)) {
+                    if !order.contains(id) {
+                        order.push(id.clone());
+                    }
+                }
+                order
             };
             let seed_at = match &model.body[i] {
                 ModelBodyItem::Unknown { expr, .. } => Some(expr.span),
@@ -4590,9 +4598,11 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                     };
                     // A default this cannot evaluate might be nil, leaving
                     // the earlier seed in place — so where it would replace
-                    // one, the overlap is refused rather than guessed.
+                    // a non-nil one, the overlap is refused rather than
+                    // guessed. Over no seed, or a `nil` one, it stands
+                    // whatever it evaluates to.
                     if stored
-                        && existing.is_some()
+                        && existing.is_some_and(|e| !matches!(super::model::Seed::of(e), super::model::Seed::Absent | super::model::Seed::Nil))
                         && matches!(seed, super::model::Seed::Computed)
                     {
                         super::prism::push(crate::diagnostic::Diagnostic::unsupported(

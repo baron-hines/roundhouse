@@ -937,9 +937,9 @@ pub(super) enum Seed {
     Absent,
     /// A literal `nil`: never replaces a variable something defined.
     Nil,
-    /// A literal that is not `nil`: always replaces.
+    /// A literal that is not `nil` (a lambda included): always replaces.
     Fixed,
-    /// A constant, a call, a lambda…: it may evaluate to nil, so whether
+    /// A constant, a call…: it may evaluate to nil, so whether
     /// it replaces an earlier seed is only known when nothing is seeded.
     Computed,
 }
@@ -953,7 +953,7 @@ impl Seed {
             ExprNode::Lit { value: Literal::Nil } => Seed::Nil,
             // A literal of any other kind, and a literal collection, are
             // values that cannot be nil.
-            ExprNode::Lit { .. } | ExprNode::Array { .. } | ExprNode::Hash { .. } => Seed::Fixed,
+            ExprNode::Lit { .. } | ExprNode::Array { .. } | ExprNode::Hash { .. } | ExprNode::Lambda { .. } => Seed::Fixed,
             _ => Seed::Computed,
         }
     }
@@ -1091,7 +1091,7 @@ pub(super) fn expand_mattr_cattr(
                             None,
                             "cattr_accessor",
                             format!(
-                                "`{}` is declared twice with defaults this cannot evaluate, so whether the later one replaces the earlier seed cannot be established here",
+                                "`{}` is declared again with a default this cannot evaluate, so whether it replaces the earlier seed cannot be established here",
                                 attr.as_str(),
                             ),
                         ));
