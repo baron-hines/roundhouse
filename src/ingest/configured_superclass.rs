@@ -2553,8 +2553,12 @@ impl<'a> Eval<'a> {
                     _ => return None,
                 };
                 // Not when the program defines the conversion itself: its own may answer anything.
-                let own = self.classes.iter().any(|c| c.methods.iter().any(|m| m.name == *method)) || self.evaled.values().flatten().any(|m| m.name == *method);
-                (!own).then_some(class)
+                let defines = |name: &str| {
+                    self.classes.iter().any(|c| c.methods.iter().any(|m| m.name.as_str() == name))
+                        || self.evaled.values().flatten().any(|m| m.name.as_str() == name)
+                        || self.models.iter().any(|model| model.methods().any(|m| m.name.as_str() == name))
+                };
+                (!defines(method.as_str())).then_some(class)
             }
             _ => None,
         }
@@ -4197,10 +4201,10 @@ mod tests {
         assert!(writes.iter().any(|(owner, _, name)| owner == "Other" && name == "other"), "{writes:?}");
     }
 
-    /// `x.to_sym == :plain` compares Symbols: a program `==` is not reached, a module String includes still is, and a program's own `to_sym` keeps every `==`.
+    /// `x.to_sym == :plain` compares Symbols: a program `==` is not reached, a module String includes still is, and a program's own `to_sym`, a model's too, keeps every `==`.
     #[test]
     fn a_core_value_reaches_only_what_its_core_class_answers() {
-        let writes = |extra: &str, source: &str| {
+        let writes_with = |extra: &str, model: Option<&str>, source: &str| {
             let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
                 ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
                 ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
@@ -4215,10 +4219,14 @@ mod tests {
             if !extra.is_empty() {
                 tree.insert(std::path::PathBuf::from("lib/converter.rb"), extra.as_bytes().to_vec());
             }
+            if let Some(model) = model {
+                tree.insert(std::path::PathBuf::from("app/models/token.rb"), model.as_bytes().to_vec());
+            }
             let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
             let eval = Eval::new(&app);
             eval.may_write(&statement(source), "*", false, &mut HashSet::default()).expect("bounded")
         };
+        let writes = |extra: &str, source: &str| writes_with(extra, None, source);
         let named = |w: &HashSet<Tag>, n: &str| w.iter().any(|(_, _, name)| name == n);
         let symbols = writes("", "fallback.to_sym == :plain\n");
         assert!(!named(&symbols, "compared"), "{symbols:?}");
@@ -4228,5 +4236,7 @@ mod tests {
         assert!(named(&included, "flipped"), "{included:?}");
         let own = writes("class Converter\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n", "fallback.to_sym == :plain\n");
         assert!(named(&own, "compared"), "{own:?}");
+        let modeled = writes_with("", Some("class Token < ApplicationRecord\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n"), "fallback.to_sym == :plain\n");
+        assert!(named(&modeled, "compared"), "{modeled:?}");
     }
 }
