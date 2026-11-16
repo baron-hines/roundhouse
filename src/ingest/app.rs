@@ -4330,9 +4330,21 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
+    // The modules that `extend ActiveSupport::Concern`, and the app's own
+    // modules: a `prepend X` is written back only when X is both (see
+    // `CONCERN_PREPEND`). Read before the skip below, which a Concern with
+    // no block of its own must not take: `prepend M` of a module that
+    // only holds instance methods contributes no items, but the statement
+    // still has to be CLAIMED and written back so the module loads and
+    // sits ahead of the model's own methods.
+    let concerns_named = concern_modules(carriers);
+    let app_modules: crate::det::HashSet<&str> =
+        app.library_classes.iter().filter(|c| c.origin.is_none()).map(|c| c.name.0.as_str()).collect();
+
     if app.concern_model_items.is_empty()
         && app.concern_guarded_items.is_empty()
         && app.concern_prepended_items.is_empty()
+        && concerns_named.is_empty()
     {
         return;
     }
@@ -4363,12 +4375,6 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         .filter(|(_, consts)| !consts.is_empty())
         .collect();
 
-    // The modules that `extend ActiveSupport::Concern`, and the app's own
-    // modules: a `prepend X` is written back only when X is both (see
-    // `CONCERN_PREPEND`).
-    let concerns_named = concern_modules(carriers);
-    let app_modules: crate::det::HashSet<&str> =
-        app.library_classes.iter().filter(|c| c.origin.is_none()).map(|c| c.name.0.as_str()).collect();
     let dependencies = concern_dependencies(app, carriers);
     let facts = super::gem_hooks::Facts::of(app);
 

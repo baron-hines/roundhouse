@@ -174,7 +174,41 @@ end
 "##)
 }
 
+/// The same method-only Concern alone in its app: no other concern
+/// contributes a block, which is the shape the concern splice used to
+/// skip, leaving `prepend Wrapping` unwritten.
+fn method_only_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", r##"class ApplicationRecord < ActiveRecord::Base
+  self.abstract_class = true
+end
+"##)
+        .write("app/models/concerns/wrapping.rb", r##"module Wrapping
+  extend ActiveSupport::Concern
+
+  def wrapped_label
+    "[#{super}]"
+  end
+end
+"##)
+        .write("app/models/gadget.rb", r##"class Gadget < ApplicationRecord
+  prepend Wrapping
+
+  def wrapped_label
+    "gadget"
+  end
+end
+"##)
+        .write("db/schema.rb", r##"ActiveRecord::Schema.define do
+  create_table "gadgets", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"##)
+}
+
 const SCRIPT: &str = "Probe.run\nputs \"probe passed\"\n";
+const METHOD_ONLY_SCRIPT: &str = "raise \"method_only_prepended_concern differs from Rails\" unless Gadget.new.wrapped_label == \"[gadget]\"\nputs \"probe passed\"\n";
 
 #[test]
 fn a_prepended_concern_runs_its_block_and_wraps_the_model() {
@@ -187,6 +221,21 @@ fn a_prepended_concern_runs_its_block_and_wraps_the_model() {
 #[ignore = "requires the Spinel toolchain"]
 fn a_prepended_concern_runs_its_block_and_wraps_the_model_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+fn a_method_only_prepended_concern_still_reaches_its_prepender() {
+    let run = method_only_app().run_ruby(METHOD_ONLY_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_method_only_prepended_concern_still_reaches_its_prepender_on_spinel() {
+    let run = method_only_app().run_spinel_with_db(METHOD_ONLY_SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
