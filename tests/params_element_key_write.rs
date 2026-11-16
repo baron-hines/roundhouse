@@ -61,3 +61,15 @@ fn an_or_assign_on_a_named_element_stores_the_string_key() {
     let src = controller_for(BuildTarget::Spinel, body);
     assert!(src.contains(r#"w["kind"] ||= "plain""#), "{src}");
 }
+
+/// A nested block or lambda that rebinds the element's name, under any parameter kind, holds its own value:
+/// the element lowering does not rewrite its Symbol keys to the element's String keys.
+#[test]
+fn a_rebound_element_name_is_left_alone() {
+    for binding in ["->(w = { kind: \"old\" }) { w[:kind] = \"new\"; w[:kind] }", "->(*w) { w[:kind] }", "->(w: {}) { w[:kind] = \"new\" }", "->(&w) { w[:kind] }"] {
+        let body = format!("    params.require(:widgets).each do |w|\n      relabel = {binding}\n      Widget.create!(w.permit(:name, :kind))\n    end");
+        let src = controller_for(BuildTarget::Ruby, &body);
+        assert!(!src.contains(r#"w["kind"]"#), "{binding}:\n{src}");
+        assert!(src.contains(r#"Params.allowed_scalars(w, ["name", "kind"])"#), "{binding}:\n{src}");
+    }
+}

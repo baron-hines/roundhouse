@@ -165,7 +165,14 @@ fn rewrite_element_block(expr: &mut Expr, lists: &HelperLists) {
 }
 
 fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {
-    if matches!(&*expr.node, ExprNode::Lambda { params, .. } if params.contains(item)) {
+    // A nested block or lambda that binds the element's name under any parameter kind (`|item|`, `item = {}`,
+    // `*item`, `item:`, `&item`) reads its own value there, not the element.
+    if let ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } = &*expr.node
+        && (params.contains(item)
+            || rest_param.as_ref() == Some(item)
+            || block_param.as_ref() == Some(item)
+            || extra_params.iter().any(|p| &p.name == item))
+    {
         return;
     }
     expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item, lists));
