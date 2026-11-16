@@ -22501,3 +22501,6 @@ mod record_toggle;
 mod reload_leaves_clone_cache;
 #[path = "emit_and_run/save_touch_false.rs"]
 mod save_touch_false;
+
+#[path = "emit_and_run/after_initialize_require_class.rs"]
+mod after_initialize_require_class;

@@ -2822,7 +2822,7 @@ end
     // doc). The real drain runs after them, below.
     // after_initialize bodies, and the app files they require, are part of the
     // source walk; their reopens are applied at the end (`after_initialize::apply`).
-    let callbacks = super::after_initialize::read_all(vfs, dir)?;
+    let callbacks = super::after_initialize::read_all(vfs, dir, &app.library_class_files)?;
     let sources = std::sync::Arc::new(super::sources::snapshot());
     let const_resolver =
         crate::analyze::ConstResolverTask::start(std::sync::Arc::clone(&sources));
