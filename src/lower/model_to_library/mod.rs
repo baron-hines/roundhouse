@@ -991,11 +991,11 @@ pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::D
     out
 }
 
-/// A model-body loop that runs `define_method` or `scope` and that
+/// A model-body block that runs `define_method` or `scope` and that
 /// `ingest::define_method_loop` could not unroll (`kinds.each do |kind|
 /// define_method(…) … end` over a value known only when the class
-/// loads): no lowering defines its methods, so the emitted model would
-/// lack them. An error for `check`, as the call sites would raise
+/// loads, or a receiverless block): no lowering defines its methods, so
+/// the emitted model would lack them. An error for `check`, as the call sites would raise
 /// NoMethodError.
 pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut out = Vec::new();
@@ -1003,8 +1003,9 @@ pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnost
     for model in &app.models {
         for item in &model.body {
             let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
-            if !matches!(&*expr.node, ExprNode::Send { recv: Some(_), .. })
-                || !defines_methods_in_block(expr)
+            // A receiverless block too (`each do |size| scope size, … end`):
+            // nothing in a model body claims one that defines methods.
+            if !defines_methods_in_block(expr)
                 || expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
                 || expr.diagnostic().is_some() || !seen.insert(expr.span)
             {
@@ -1013,7 +1014,7 @@ pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnost
             out.push(crate::diagnostic::Diagnostic::unsupported(
                 expr.span, None, "runtime-defined method",
                 format!(
-                    "a loop in the body of `{}` runs `define_method` or `scope` in a shape the compile could not unroll; the methods it defines would be missing from the output",
+                    "a block in the body of `{}` runs `define_method` or `scope` in a shape the compile could not unroll; the methods it defines would be missing from the output",
                     model.name.0.as_str()
                 ),
             ));
@@ -1049,11 +1050,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         };
         let name = method.as_str();
+        // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: `check`'s error (`unrolled_loop_diagnostics`).
+        if defines_methods_in_block(expr) {
+            continue;
+        }
         if let Some(recv) = recv {
-            // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: `check`'s error (`unrolled_loop_diagnostics`).
-            if defines_methods_in_block(expr) {
-                continue;
-            }
             // Class-body writes are sends too, and dropping an unclaimed
             // setting must report just like dropping a receiver-less DSL.
             if !matches!(&*recv.node, ExprNode::SelfRef)

@@ -71,6 +71,23 @@ fn a_loop_over_names_known_only_at_load_is_a_check_error() {
         .check_errors();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].contains("could not unroll") && errors[0].contains("`Parcel`"), "{errors:#?}");
+    // A receiverless block that runs them is not unrolled either.
+    let errors = app()
+        .edit("app/models/parcel.rb", "  %w[small large].each do |size|\n", "  each do |size|\n")
+        .check_errors();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].contains("could not unroll"), "{errors:#?}");
+}
+
+/// `scope :"#{size}_ones"`: an interpolated Symbol name unrolls to each
+/// element's Symbol, as a String name does. Rails: 1, 2.
+#[test]
+fn a_loop_scope_named_by_an_interpolated_symbol_is_defined() {
+    let run = app()
+        .edit("app/models/parcel.rb", "    scope size, -> { where(size: size) }\n", "    scope size, -> { where(size: size) }\n    scope :\"#{size}_ones\", -> { where(size: size) }\n")
+        .run_ruby("Parcel.create!(size: \"small\", weight: 1)\n2.times { Parcel.create!(size: \"large\", weight: 1) }\nraise \"interpolated symbol scope\" unless Parcel.small_ones.count == 1 && Parcel.large_ones.count == 2\nputs \"probe passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
 
 #[test]

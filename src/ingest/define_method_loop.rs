@@ -645,11 +645,21 @@ fn unroll_with(
     Some(out)
 }
 
-/// `"on_#{"finish"}"` once the key is in place: the String it spells, as a macro reads a literal name.
+/// `"on_#{"finish"}"` once the key is in place: the String it spells, as a
+/// macro reads a literal name; `:"#{"small"}_ones"` (ingested as `"…".to_sym`)
+/// the Symbol.
 fn fold_literal_interpolation(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut fold_literal_interpolation);
     if let Some(text) = literal_interpolation(expr) {
         *expr.node = ExprNode::Lit { value: Literal::Str { value: text } };
+    }
+    if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node
+        && method.as_str() == "to_sym"
+        && args.is_empty()
+        && let ExprNode::Lit { value: Literal::Str { value } } = &*recv.node
+    {
+        let value = Literal::Sym { value: Symbol::from(value.as_str()) };
+        *expr.node = ExprNode::Lit { value };
     }
 }
 
