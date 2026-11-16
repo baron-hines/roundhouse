@@ -937,7 +937,8 @@ pub(super) enum Seed {
     Absent,
     /// A literal `nil`: never replaces a variable something defined.
     Nil,
-    /// A literal that is not `nil` (a lambda included): always replaces.
+    /// A value that cannot be nil (a non-nil literal, a collection
+    /// literal, a lambda): always replaces.
     Fixed,
     /// A constant, a call…: it may evaluate to nil, so whether
     /// it replaces an earlier seed is only known when nothing is seeded.
@@ -1064,8 +1065,8 @@ pub(super) fn expand_mattr_cattr(
         // `default: nil` — sets only a variable nothing has defined yet
         // (`cattr_reader :cap, default: 3; cattr_writer :cap` stays 3).
         // Two declarations that both set it are decided by which runs
-        // last; a default this cannot evaluate (a constant, a call, a
-        // lambda) might be nil, so it must not be guessed. `@@` storage
+        // last; a default this cannot evaluate (a constant, a call)
+        // might be nil, so it must not be guessed. `@@` storage
         // still needs a seed for its first read (unlike `@ivar`), so an
         // absent default seeds nil where nothing has.
         match default {
