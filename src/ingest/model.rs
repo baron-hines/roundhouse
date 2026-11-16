@@ -166,6 +166,11 @@ pub(super) fn ingest_model_with_enum_constants(
         );
         class_consts.import(&stmts, enum_constants, &enum_owners);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
+        // A spliced hook statement looks constants up from its initializer's
+        // top level, as a block's lexical scope does under `class_eval`: none
+        // of the class body's own (folded, or keyed by offsets in its file).
+        let hook_consts = ClassConsts::default();
+        let resolve_hook_constant = |node: &Node<'_>| enum_constants.resolve(node, &[]);
         // As the library walk does: a `define_method` loop over a literal list unrolls into the `def`s it makes.
         let _loop_constants = super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::of(&owner, &stmts));
         let loop_visibility = super::define_method_loop::named_visibility(&stmts);
@@ -223,7 +228,6 @@ pub(super) fn ingest_model_with_enum_constants(
             // spliced hook block was written in.
             let WalkStmt { node: statement, file, source, hook } = item;
             let spliced = hook.is_some();
-            class_consts.set_foreign_offsets(spliced);
             // `ActiveSupport.run_load_hooks(:name, self)` itself lowers to
             // nothing: what it runs is in the walk, here.
             if hook.is_none() && super::load_hooks::fired_by(&statement).is_some() {
@@ -290,7 +294,12 @@ pub(super) fn ingest_model_with_enum_constants(
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
             if let Some(call) = stmt.as_call_node() {
-                match expand_class_body_dsl(&call, file, &leading, &class_consts, &resolve_constant) {
+                let expanded = if spliced {
+                    expand_class_body_dsl(&call, file, &leading, &hook_consts, &resolve_hook_constant)
+                } else {
+                    expand_class_body_dsl(&call, file, &leading, &class_consts, &resolve_constant)
+                };
+                match expanded {
                     Ok(Some(ClassBodyExpansion::DelegatedType(expanded))) => {
                         let mut blank = leading_blank;
                         for mut item in expanded {
@@ -421,7 +430,14 @@ pub(super) fn ingest_model_with_enum_constants(
                 });
             }
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_body(&sc, &owner, file, &visibility) {
+                // A hook's `class << self` is outside what the model's `Visibility` read.
+                if spliced && sc.body().is_some_and(|b| flatten_statements(b).iter().any(|s| s.as_call_node().is_some_and(|c| visibility::marker(&c)))) {
+                    let err = IngestError::Unsupported { file: file.into(), message: "visibility in a load hook block is not carried".into() };
+                    report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                    note_end(&mut prev_end, spliced, stmt);
+                    continue;
+                }
+                match ingest_singleton_class_body(&sc, &owner, file, (!spliced).then_some(&visibility)) {
                     Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
@@ -483,6 +499,14 @@ pub(super) fn ingest_model_with_enum_constants(
             // bare `JSON` for `serialize …, coder: JSON` — leave a
             // synthetic Const-assign marker so lower::serialize can see
             // the shadow without treating the namespace as a body item.
+            // In a hook block, the declaration is a constant the library pass
+            // over the model's file never sees: reported, not skipped.
+            if spliced && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
+                let err = IngestError::Unsupported { file: file.into(), message: "a class or module declared in a load hook block is not carried".into() };
+                report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
             if let Some(path) = stmt
                 .as_class_node()
                 .and_then(|c| constant_path_of(&c.constant_path()))
@@ -520,7 +544,8 @@ pub(super) fn ingest_model_with_enum_constants(
             }
             let classified = {
                 let was = CLASSIFYING_MODEL_BODY.with(|c| c.replace(true));
-                let items = ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults), &class_consts);
+                let consts = if spliced { &hook_consts } else { &class_consts };
+                let items = ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults), consts);
                 CLASSIFYING_MODEL_BODY.with(|c| c.set(was));
                 items
             };
@@ -2434,9 +2459,6 @@ pub(super) struct ClassConsts {
     enum_labels: crate::det::HashMap<String, Vec<String>>,
     enum_key_lists: crate::det::HashMap<(usize, usize), Vec<Literal>>,
     enum_key_constants: crate::det::HashSet<String>,
-    /// The statement being read is a spliced load hook's, whose offsets
-    /// index its initializer, not the body `enum_key_lists` is keyed by.
-    foreign_offsets: bool,
 }
 
 /// The operators [`ClassConsts::int_expr`] folds.
@@ -2526,8 +2548,8 @@ impl ClassConsts {
     /// literal (`1.week.seconds`, folded to its Integer seconds), `.freeze`d
     /// or not, or another folded list constant.
     pub(super) fn list(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
-        if let Some(list) = self.key_list_at(node) {
-            return Some(list);
+        if let Some(list) = self.enum_key_lists.get(&(node.location().start_offset(), node.location().end_offset())) {
+            return Some(list.clone());
         }
         if let Some(inner) = single_parenthesized(node) {
             return self.list(&inner);
@@ -2839,20 +2861,7 @@ impl ClassConsts {
         {
             return self.lists.get(&key).cloned();
         }
-        self.key_list_at(node)
-    }
-
-    /// The folded list an imported constant read at `node` holds, for a node of the body's own file.
-    fn key_list_at(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
-        if self.foreign_offsets {
-            return None;
-        }
         self.enum_key_lists.get(&(node.location().start_offset(), node.location().end_offset())).cloned()
-    }
-
-    /// Whether the statements read next come from another file (a spliced load hook's).
-    pub(super) fn set_foreign_offsets(&mut self, foreign: bool) {
-        self.foreign_offsets = foreign;
     }
 
     /// `/pattern#{CONST}pattern/flags` — folds when the embedded part
@@ -3440,11 +3449,13 @@ fn ingest_singleton_class_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
     owner: &ClassId,
     file: &str,
-    visibility: &Visibility,
+    visibility: Option<&Visibility>,
 ) -> IngestResult<super::singleton_class::SingletonBody> {
     super::singleton_class::ingest_singleton_body(sc, owner, file, &|def| {
         let mut method = ingest_method(def, file)?;
-        visibility.apply(&def.as_node(), &mut method);
+        if let Some(visibility) = visibility {
+            visibility.apply(&def.as_node(), &mut method);
+        }
         Ok(method)
     })
 }

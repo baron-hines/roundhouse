@@ -6,9 +6,11 @@
 //! table and runs each block as `base.class_eval(&block)`, so a block
 //! registered in `config/initializers` declares its `class_attribute`, its
 //! `def`s and its scopes on the model, at the point in the class body where
-//! the model fires the hook (a block registered after the class has loaded
-//! runs the same way, at registration — the same class body, so a compile has
-//! one answer for both orders).
+//! the model fires the hook. Initializers run before the app's models load,
+//! so that is where a block from `config/initializers` runs. One registered
+//! after the class has loaded would run at registration instead, after the
+//! whole class body, where a later `def` of the same name in the body would
+//! lose to it; a compile splices it at the `run_load_hooks` call either way.
 //!
 //! None of that was carried: the model's `run_load_hooks` statement was a body
 //! item no target lowers, the block stayed in the initializer, and
@@ -75,20 +77,32 @@ thread_local! {
     static HOOKS: RefCell<Vec<Hook>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The hooks one app ingest registered, cleared when it is dropped, so a
+/// later standalone model ingest on the same thread sees none of them.
+pub(super) struct Registry;
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        HOOKS.with(|hooks| hooks.borrow_mut().clear());
+    }
+}
+
 /// Read every `config/initializers/**/*.rb` and record the load hooks it
 /// registers. Called once per app ingest, before the models: a model's class
-/// body splices the blocks registered for the names it fires.
-pub(super) fn gather<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<()> {
+/// body splices the blocks registered for the names it fires. The hooks stay
+/// registered while the returned [`Registry`] lives.
+pub(super) fn gather<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Registry> {
     HOOKS.with(|hooks| hooks.borrow_mut().clear());
+    let registry = Registry;
     let initializers = dir.join("config").join("initializers");
     if !vfs.is_dir(&initializers) {
-        return Ok(());
+        return Ok(registry);
     }
     for path in super::app::read_rb_files(vfs, &initializers)? {
         let Ok(bytes) = vfs.read(&path) else { continue };
         record_file(&path.display().to_string(), &bytes);
     }
-    Ok(())
+    Ok(registry)
 }
 
 /// Record the top-level `ActiveSupport.on_load` blocks of one initializer.
@@ -145,9 +159,9 @@ fn is_on_load(call: &ruby_prism::CallNode<'_>) -> bool {
         })
 }
 
-/// Why Rails would not run this block as the model's class body, if it would
-/// not: it is called with the base instead when the block takes an argument,
-/// and the options a hook is registered with are not read.
+/// Why this splice would not run the block as the model's class body: a
+/// block parameter it does not bind, or registration options it does not
+/// read.
 fn refusal(call: &ruby_prism::CallNode<'_>, src: &str) -> Option<String> {
     let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
     if args.len() > 1 {

@@ -126,3 +126,18 @@ fn a_hook_block_the_splice_refuses_is_reported_naming_the_hook_and_the_model() {
     assert!(error.contains(":tether"), "{error}");
     assert!(error.contains("Kite"), "{error}");
 }
+
+/// A class declared in a hook block, and an enum whose values a constant
+/// names (which the block reads from the initializer's scope, not the
+/// model's), are not carried: each is a `check` error naming the hook.
+#[test]
+fn a_hook_class_or_constant_enum_is_reported_not_dropped() {
+    for (hook, statement) in [
+        ("ActiveSupport.on_load(:kite) do\n  class Streamer\n  end\nend\n", "class or module"),
+        ("TAILS = %i[short long]\nActiveSupport.on_load(:kite) do\n  enum :tail, TAILS\nend\n", "enum"),
+    ] {
+        let errors = app().write("config/initializers/kite_extensions.rb", hook).check_errors();
+        assert_eq!(errors.len(), 1, "{statement}: {errors:#?}");
+        assert!(errors[0].contains(":kite") && errors[0].contains("Kite"), "{statement}: {errors:#?}");
+    }
+}
