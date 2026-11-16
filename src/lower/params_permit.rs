@@ -260,6 +260,18 @@ fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {
         }
         return;
     }
+    // The same write as one target of a multiple assignment (`item[:kind], other = v, w`).
+    if let ExprNode::MultiAssign { targets, .. } = &mut *expr.node {
+        for target in targets {
+            if let crate::expr::LValue::Index { recv, index } = target
+                && matches!(&*recv.node, ExprNode::Var { name, .. } if name == item)
+                && let Some(name) = sym_name(index)
+            {
+                *index = str_lit(index.span, name);
+            }
+        }
+        return;
+    }
     let ExprNode::Send { recv: Some(r), method, args, block, .. } = &mut *expr.node else { return };
     if !matches!(&*r.node, ExprNode::Var { name, .. } if name == item) {
         return;

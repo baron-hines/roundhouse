@@ -90,3 +90,12 @@ fn a_nested_blocks_own_reassignment_keeps_the_rewrite() {
     let src = controller_for(BuildTarget::Ruby, body);
     assert!(src.contains(r#"w["kind"] = "x""#), "{src}");
 }
+
+/// A Symbol-key write as one target of a multiple assignment stores the String key too.
+#[test]
+fn a_multiple_assignment_index_target_stores_the_string_key() {
+    let body = "    params.require(:widgets).each do |w|\n      w[:kind], other = \"new\", 0\n      Widget.create!(w.permit(:name, :kind))\n    end";
+    let src = controller_for(BuildTarget::Ruby, body);
+    assert!(src.contains(r#"w["kind"]"#), "{src}");
+    assert!(!src.contains("w[:kind]"), "{src}");
+}
