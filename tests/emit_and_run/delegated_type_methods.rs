@@ -35,6 +35,10 @@ end
 "##)
         .write("app/models/tile.rb", r##"class Tile < ApplicationRecord
   delegated_type :shape, types: %w[ Note Photo ], primary_key: :code, foreign_key: :shape_code, foreign_type: :shape_kind, optional: true
+
+  def build_shape(attributes = {})
+    self.shape = Note.new(attributes)
+  end
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -99,7 +103,16 @@ end
     [tile.shape_code, tile.shape_kind, tile.note?, tile.note_code, tile.note.body, tile.photo_code, Tile.notes.count]
   end
 
+  # Rails: ["Note", "drawn"] (the model's own builder, written after)
+  def self.own_builder
+    tile = Tile.new
+    tile.build_shape(body: "drawn")
+    [tile.shape.class.name, tile.shape.body]
+  end
+
   def self.run
+    reset
+    check("own_builder", own_builder == ["Note", "drawn"])
     reset
     check("new_delegate_saves_with_its_owner", new_delegate_saves_with_its_owner == [true, true, "first"])
     reset

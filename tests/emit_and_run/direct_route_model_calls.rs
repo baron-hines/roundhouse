@@ -33,6 +33,15 @@ end
 
   get "/read/:id/:slug", to: "articles#show", constraints: { id: /\d+/ }, as: :slugged_article
   get "/topics/:id", to: "articles#show", as: :forum_thread
+  get "/archive(/:year)", to: "articles#show", as: :yearly_archive
+
+  direct :listing do |kind, options|
+    route_for "#{kind}_archive", options
+  end
+
+  direct :archive_for do |article, options|
+    route_for :yearly_archive, article, options
+  end
 
   direct :topic_page do |topic, options|
     route_for :forum_thread, topic, options
@@ -60,6 +69,18 @@ end
 
   def permalink_for(query)
     Rails.application.routes.url_helpers.article_slug_path(self, q: query)
+  end
+
+  def permalink_keyed(query)
+    Rails.application.routes.url_helpers.article_slug_path(self, "q" => query)
+  end
+
+  def self.archive_link(slug)
+    Rails.application.routes.url_helpers.archive_for_path(Article.find_by(slug: slug))
+  end
+
+  def self.listing
+    Rails.application.routes.url_helpers.listing_path("yearly")
   end
 end
 "##)
@@ -103,7 +124,9 @@ end
 // Rails: "/read/1/hello-world", "/read/1/hello-world#top",
 // "/read/1/hello-world?q=x+y", "/read/1/hello-world" (a nil query value
 // is left out), "/articles/1/comments/1", "/topics/1-ruby" (the model's
-// own `to_param`).
+// own `to_param`), "/read/1/hello-world?q=x+y" (a String key),
+// "/archive" (a nil record leaves the optional segment out),
+// "/archive/1", "/archive" (an interpolated name, no segment).
 const SCRIPT: &str = r##"article = Article.create!(title: "Hello World", slug: "hello-world")
 comment = Comment.create!(article: article)
 path = "/read/#{article.id}/hello-world"
@@ -114,6 +137,10 @@ raise "nil query: #{article.permalink_for(nil)}" unless article.permalink_for(ni
 raise "reply: #{comment.link}" unless comment.link == "/articles/#{article.id}/comments/#{comment.id}"
 topic = Topic.create!(name: "ruby")
 raise "to_param: #{topic.link}" unless topic.link == "/topics/#{topic.id}-ruby"
+raise "string key: #{article.permalink_keyed("x y")}" unless article.permalink_keyed("x y") == path + "?q=x+y"
+raise "nil record: #{Article.archive_link("none")}" unless Article.archive_link("none") == "/archive"
+raise "record: #{Article.archive_link("hello-world")}" unless Article.archive_link("hello-world") == "/archive/#{article.id}"
+raise "listing: #{Article.listing}" unless Article.listing == "/archive"
 puts "probe passed"
 "##;
 

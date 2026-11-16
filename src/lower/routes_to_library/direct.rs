@@ -76,7 +76,7 @@ pub fn lower_direct_helpers(
     let models: crate::det::HashMap<Symbol, bool> = app
         .models
         .iter()
-        .map(|m| (m.name.0.clone(), super::named_model_overrides_to_param(&crate::naming::underscore(m.name.0.as_str()), app)))
+        .map(|m| (m.name.0.clone(), super::model_renders_own_param(m, app)))
         .collect();
     app.routes
         .direct_helpers
@@ -91,11 +91,11 @@ pub fn lower_direct_helpers(
 /// parameter, and a body that forwards it (`route_for :t, a, options`)
 /// renders them on the target's path, which takes each key it can be
 /// given by name ([`options_query`]).
-fn direct_option_keys(app: &App) -> crate::det::HashMap<Symbol, std::collections::BTreeSet<String>> {
+fn direct_option_keys(app: &App) -> crate::det::HashMap<Symbol, std::collections::BTreeSet<OptionKey>> {
     fn walk(
         e: &Expr,
         stems: &[Symbol],
-        out: &mut crate::det::HashMap<Symbol, std::collections::BTreeSet<String>>,
+        out: &mut crate::det::HashMap<Symbol, std::collections::BTreeSet<OptionKey>>,
     ) {
         if let ExprNode::Send { recv, method, args, .. } = &*e.node {
             let bare_or_helpers = match recv {
@@ -114,10 +114,10 @@ fn direct_option_keys(app: &App) -> crate::det::HashMap<Symbol, std::collections
                 for (k, _) in entries {
                     match &*k.node {
                         ExprNode::Lit { value: Literal::Sym { value } } => {
-                            keys.insert(value.as_str().to_string());
+                            keys.insert(OptionKey { name: value.as_str().to_string(), symbol: true });
                         }
                         ExprNode::Lit { value: Literal::Str { value } } => {
-                            keys.insert(value.clone());
+                            keys.insert(OptionKey { name: value.clone(), symbol: false });
                         }
                         _ => {}
                     }
@@ -140,7 +140,7 @@ fn build_direct_helper(
     helper: &DirectHelper,
     flat: &[FlatRoute],
     helper_params: &crate::det::HashMap<String, Vec<crate::ty::Ty>>,
-    option_keys: &std::collections::BTreeSet<String>,
+    option_keys: &std::collections::BTreeSet<OptionKey>,
     models: &crate::det::HashMap<Symbol, bool>,
 ) -> LibraryFunction {
     // The trailing options hash takes a `{}` default — see the header.
@@ -178,8 +178,24 @@ fn build_direct_helper(
     }
 }
 
+/// An option key a caller writes, in the form it writes it: the options
+/// Hash is read back with the same key (`options[:page]`,
+/// `options["page"]`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OptionKey {
+    name: String,
+    symbol: bool,
+}
+
 fn empty_hash() -> Expr {
     Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![], kwargs: false })
+}
+
+/// How many positional segments a route's helper takes: those outside
+/// its optional groups at least, all of them at most
+/// (`/archive(/:period)` takes zero or one).
+fn segment_counts(route: &FlatRoute) -> std::ops::RangeInclusive<usize> {
+    route.required_params.min(route.path_params.len())..=route.path_params.len()
 }
 
 /// The routes a `route_for` call can name, as `as:` names: its first
@@ -196,7 +212,7 @@ pub(crate) fn route_for_targets(name: &Expr, positional: usize, flat: &[FlatRout
         ExprNode::StringInterp { parts } => {
             let mut out: Vec<String> = flat
                 .iter()
-                .filter(|r| r.named && r.path_params.len() == positional && spells(parts, &r.as_name))
+                .filter(|r| r.named && segment_counts(r).contains(&positional) && spells(parts, &r.as_name))
                 .map(|r| r.as_name.clone())
                 .collect();
             out.sort();
@@ -264,7 +280,7 @@ fn rewrite_route_for(
     flat: &[FlatRoute],
     helper_params: &crate::det::HashMap<String, Vec<crate::ty::Ty>>,
     fresh: &FreshLocals,
-    options: Option<(&Symbol, &std::collections::BTreeSet<String>)>,
+    options: Option<(&Symbol, &std::collections::BTreeSet<OptionKey>)>,
     models: &crate::det::HashMap<Symbol, bool>,
 ) {
     expr.node
@@ -376,16 +392,24 @@ fn dispatch_by_name(name: Expr, calls: Vec<(String, Expr)>, fresh: &FreshLocals,
 /// the call site.
 fn options_query(
     options: &Symbol,
-    keys: &std::collections::BTreeSet<String>,
+    keys: &std::collections::BTreeSet<OptionKey>,
     span: Span,
 ) -> (Vec<(Expr, Expr)>, Option<Expr>) {
-    let read = |key: &str| {
+    let literal = |key: &OptionKey| {
+        let value = if key.symbol {
+            Literal::Sym { value: Symbol::from(key.name.as_str()) }
+        } else {
+            Literal::Str { value: key.name.clone() }
+        };
+        Expr::new(span, ExprNode::Lit { value })
+    };
+    let read = |key: &OptionKey| {
         Expr::new(
             span,
             ExprNode::Send {
                 recv: Some(var(options, span)),
                 method: Symbol::from("[]"),
-                args: vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(key) } })],
+                args: vec![literal(key)],
                 block: None,
                 parenthesized: false,
             },
@@ -394,10 +418,15 @@ fn options_query(
     let mut pairs = Vec::new();
     let mut anchor = None;
     for key in keys {
-        if key == "anchor" {
+        // `url_for`'s reserved options are Symbols; a String key is a
+        // query key whatever its name.
+        let reserved = |name: &str| key.symbol && key.name == name;
+        if reserved("anchor") {
             anchor = Some(fragment(read(key), span));
-        } else if key != "format" && !crate::lower::route_url_options::HOST_ONLY_OPTIONS.contains(&key.as_str()) {
-            pairs.push((Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(key.as_str()) } }), read(key)));
+        } else if !reserved("format")
+            && !(key.symbol && crate::lower::route_url_options::HOST_ONLY_OPTIONS.contains(&key.name.as_str()))
+        {
+            pairs.push((literal(key), read(key)));
         }
     }
     (pairs, anchor)
@@ -443,15 +472,13 @@ fn target_call(
         .iter()
         .enumerate()
         .map(|(i, arg)| {
-            match record_param(arg.ty.as_ref(), models) {
-                Some(true) => return to_param(arg.clone(), span),
-                Some(false) => return id_of(arg.clone(), span),
-                None => {}
-            }
             // An optional segment (`/archive(/:period)`) is declared
             // `String | nil`: a String slot too.
             let slot = declared.and_then(|tys| tys.get(i));
             let wants_str = matches!(slot.map(crate::ty::Ty::peel_nilable), Some(crate::ty::Ty::Str));
+            if let Some(string_param) = record_param(arg.ty.as_ref(), models) {
+                return project_record(arg.clone(), string_param, wants_str, fresh, span);
+            }
             let is_int = matches!(arg.ty, Some(crate::ty::Ty::Int))
                 || matches!(&*arg.node, ExprNode::Lit { value: Literal::Int { .. } });
             // An Integer that can be nil, into an optional segment, keeps
@@ -490,6 +517,39 @@ fn record_param(ty: Option<&crate::ty::Ty>, models: &crate::det::HashMap<Symbol,
         Some(t) => model(t),
         None => None,
     }
+}
+
+/// A record's `to_param` for a segment: its own String one, else its id
+/// (as text into a String slot). A record that may be nil is bound once
+/// and keeps its nil, which leaves an optional segment out and fails a
+/// required one, as Rails does.
+fn project_record(record: Expr, string_param: bool, wants_str: bool, fresh: &FreshLocals, span: Span) -> Expr {
+    use crate::ty::Ty;
+    let project = |e: Expr| {
+        if string_param {
+            to_param(e, span)
+        } else if wants_str {
+            to_s(id_of(e, span), span)
+        } else {
+            id_of(e, span)
+        }
+    };
+    let record_ty = record.ty.clone().unwrap_or(Ty::Untyped);
+    if !matches!(&record_ty, Ty::Union { variants } if variants.contains(&Ty::Nil)) {
+        return project(record);
+    }
+    let name = fresh.name();
+    let typed = |node: ExprNode, ty: Ty| Expr { ty: Some(ty), ..Expr::new(span, node) };
+    let read = |ty: Ty| typed(ExprNode::Var { id: VarId(0), name: name.clone() }, ty);
+    let projected = project(read(record_ty.clone().strip_nil()));
+    let result_ty = Ty::Union { variants: vec![projected.ty.clone().unwrap_or(Ty::Untyped), Ty::Nil].into() };
+    let mut is_nil = send0(read(record_ty.clone()), "nil?", span);
+    is_nil.ty = Some(Ty::Bool);
+    let check = typed(
+        ExprNode::If { cond: is_nil, then_branch: typed(ExprNode::Lit { value: Literal::Nil }, Ty::Nil), else_branch: projected },
+        result_ty.clone(),
+    );
+    typed(ExprNode::Let { id: VarId(0), name, value: record, body: check }, result_ty)
 }
 
 fn id_of(record: Expr, span: Span) -> Expr {

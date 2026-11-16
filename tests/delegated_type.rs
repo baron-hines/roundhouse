@@ -400,9 +400,10 @@ fn other_dependent_stays_unexpanded() {
 /// `autosave` would change save/type behavior with no ledger entry.
 #[test]
 fn unmodeled_belongs_to_kwargs_stay_unexpanded() {
-    for extra in ["class_name: \"Thing\"", "autosave: true", "unknown: true"] {
+    // The last, an explicit `self` receiver, is one the expansion does not take.
+    for (receiver, extra) in [("", "class_name: \"Thing\""), ("", "autosave: true"), ("", "unknown: true"), ("self.", "optional: true")] {
         let mut app = entry_app(&format!(
-            "  delegated_type :entryable, types: %w[ Message Comment ], {extra}\n"
+            "  {receiver}delegated_type :entryable, types: %w[ Message Comment ], {extra}\n"
         ));
         let inst = instance_names(&app, "Entry");
         assert!(

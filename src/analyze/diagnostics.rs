@@ -789,7 +789,11 @@ fn unexpanded_delegated_types(app: &App) -> Vec<Diagnostic> {
     for model in &app.models {
         for item in &model.body {
             let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, .. } = &*expr.node else { continue };
+            // `self.delegated_type` too, which the expansion does not take.
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { continue };
+            if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+                continue;
+            }
             if method.as_str() != "delegated_type" || out.iter().any(|d| d.span == expr.span) {
                 continue;
             }
@@ -797,7 +801,7 @@ fn unexpanded_delegated_types(app: &App) -> Vec<Diagnostic> {
                 expr.span,
                 None,
                 "delegated_type",
-                "its options or `types:` list are not ones the expansion models (a literal or constant list of class names; `foreign_key`, `foreign_type`, `primary_key`, `optional`, `touch`, `default`, `dependent: :destroy`), so no target defines the association or its readers",
+                "not a receiverless call whose options and `types:` list the expansion models (a literal or constant list of class names; `foreign_key`, `foreign_type`, `primary_key`, `optional`, `touch`, `default`, `dependent: :destroy`), so no target defines the association or its readers",
             ));
         }
     }

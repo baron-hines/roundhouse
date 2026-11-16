@@ -1319,14 +1319,17 @@ fn model_overrides_to_param(controller: &str, helper_name: &str, app: &App) -> b
 /// String (roundhouse#90).
 fn named_model_overrides_to_param(resource: &str, app: &App) -> bool {
     let model_name = crate::naming::camelize(resource);
-    app.models.iter().any(|m| {
-        m.name.0.as_str() == model_name
-            && (m.body.iter().any(|item| matches!(
-                item,
-                crate::dialect::ModelBodyItem::Method { method, .. }
-                    if method.name.as_str() == "to_param"
-            )) || model_key_is_string(m, app))
-    })
+    app.models.iter().any(|m| m.name.0.as_str() == model_name && model_renders_own_param(m, app))
+}
+
+/// [`named_model_overrides_to_param`] for a model in hand, so a
+/// namespaced one (`Admin::Topic`) is not lost to the name's round trip.
+fn model_renders_own_param(m: &crate::dialect::Model, app: &App) -> bool {
+    m.body.iter().any(|item| matches!(
+        item,
+        crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "to_param"
+    )) || model_key_is_string(m, app)
 }
 
 fn model_key_is_string(model: &crate::dialect::Model, app: &App) -> bool {
@@ -1912,8 +1915,8 @@ fn string_segment_demand(
     let string_keyed: crate::det::HashSet<String> = app
         .models
         .iter()
+        .filter(|m| model_renders_own_param(m, app))
         .map(|m| m.name.0.as_str().to_string())
-        .filter(|name| named_model_overrides_to_param(&crate::naming::underscore(name), app))
         .collect();
     let mut collect = |e: &Expr| {
         fn walk(
@@ -2002,10 +2005,11 @@ fn route_for_string_segments(
                 ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } => {
                     vec![format!("{}_path", target.as_str())]
                 }
+                ExprNode::Lit { value: crate::expr::Literal::Str { value: target } } => vec![format!("{target}_path")],
                 ExprNode::StringInterp { parts } => helpers
                     .iter()
-                    .filter(|(name, (segments, _))| {
-                        segments.len() == positional.len()
+                    .filter(|(name, (segments, required))| {
+                        (*required..=segments.len()).contains(&positional.len())
                             && name.strip_suffix("_path").is_some_and(|n| direct::spells(parts, n))
                     })
                     .map(|(name, _)| name.clone())
