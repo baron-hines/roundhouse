@@ -17,7 +17,7 @@ use roundhouse::project::{target_files, BuildTarget};
 const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :widgets do |t|\n    t.string :name\n    t.string :kind\n    t.integer :size\n  end\nend\n";
 
-/// The emitted `widgets_controller` with `helpers` as its private methods
+/// The emitted `widgets_controller` and `application_controller`, with `helpers` as the former's private methods
 /// and a `create` action that saves each of `widget_list_params`. `base` is
 /// the body of the `ApplicationController` it inherits from.
 fn controller_for(target: BuildTarget, helpers: &str, base: &str) -> String {
@@ -41,7 +41,7 @@ fn controller_for(target: BuildTarget, helpers: &str, base: &str) -> String {
     let files = target_files(&app, Path::new("fixtures/tiny-blog"), target).expect("emit");
     files
         .into_iter()
-        .filter(|(p, _)| p.ends_with("widgets_controller.rb"))
+        .filter(|(p, _)| p.ends_with("widgets_controller.rb") || p.ends_with("application_controller.rb"))
         .map(|(_, c)| c)
         .collect::<Vec<_>>()
         .join("\n")
@@ -79,4 +79,19 @@ fn a_splat_of_a_computed_list_stays() {
     let helpers = format!("  def shared_fields\n    [:name, :kind].reject {{ |f| f == :kind }}\n  end\n\n{LIST_PARAMS}");
     let src = controller_for(BuildTarget::Spinel, &helpers, "");
     assert!(!src.contains("allowed_scalars"), "{src}");
+}
+
+/// A list helper a descendant overrides: the ancestor's body runs on the descendant too, where Rails' `*helper`
+/// answers the descendant's list, so the ancestor's list is not written into it.
+#[test]
+fn a_helper_a_descendant_overrides_is_not_inlined() {
+    let base = format!("  private\n\n  def shared_fields\n    %i[name kind]\n  end\n\n{LIST_PARAMS}");
+    let src = controller_for(BuildTarget::Spinel, "  def shared_fields\n    %i[name]\n  end\n", &base);
+    assert!(!src.contains(ALLOWED), "{src}");
+    assert!(!src.contains(r#"["name", "size"]"#), "{src}");
+    // Overridden with the same list, or not at all: inlined as before.
+    let src = controller_for(BuildTarget::Spinel, "  def shared_fields\n    %w[name kind]\n  end\n", &base);
+    assert!(src.contains(ALLOWED), "{src}");
+    let src = controller_for(BuildTarget::Spinel, "", &base);
+    assert!(src.contains(ALLOWED), "{src}");
 }

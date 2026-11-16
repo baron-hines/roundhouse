@@ -17,7 +17,8 @@ type HelperLists = crate::det::HashMap<Symbol, Vec<Expr>>;
 
 /// Per controller, the methods it has or inherits whose body is a literal list of Symbols or Strings (`%i[a b]`,
 /// `%w[a b]`, `[:a, "b"]`, optionally `.freeze`), so `permit(*helper)` can be read as the list written inline (as
-/// `permit_splat` does for the typed params chain, #858). The nearest definition wins.
+/// `permit_splat` does for the typed params chain, #858). The nearest definition wins, and a list a descendant
+/// overrides with another is left out.
 fn helper_filter_lists(
     controllers: &[crate::dialect::Controller],
 ) -> crate::det::HashMap<crate::ident::ClassId, HelperLists> {
@@ -51,7 +52,45 @@ fn helper_filter_lists(
             out.insert(controller.name.clone(), lists);
         }
     }
+    // An ancestor's body runs on its descendants too, where `*helper` answers the descendant's own list. A list a
+    // descendant overrides with other names, or with a body that is not a literal list, is not the ancestor's to
+    // write inline.
+    let names_of = |list: &Vec<Expr>| filter_names(list);
+    let overridden: Vec<(crate::ident::ClassId, Symbol)> = out
+        .iter()
+        .flat_map(|(owner, lists)| lists.iter().map(move |(name, list)| (owner, name, list)))
+        .filter(|(owner, name, list)| {
+            controllers.iter().any(|d| {
+                d.name != **owner
+                    && descends_from(d, owner, &by_name)
+                    && out.get(&d.name).and_then(|l| l.get(*name)).map(names_of) != Some(names_of(list))
+            })
+        })
+        .map(|(owner, name, _)| (owner.clone(), name.clone()))
+        .collect();
+    for (owner, name) in overridden {
+        if let Some(lists) = out.get_mut(&owner) {
+            lists.remove(&name);
+        }
+    }
     out
+}
+
+/// Whether `ancestor` is on `controller`'s superclass chain.
+fn descends_from(
+    controller: &crate::dialect::Controller,
+    ancestor: &crate::ident::ClassId,
+    by_name: &crate::det::HashMap<&crate::ident::ClassId, &crate::dialect::Controller>,
+) -> bool {
+    let mut parent = controller.parent.as_ref();
+    for _ in 0..32 {
+        let Some(p) = parent else { return false };
+        if p == ancestor {
+            return true;
+        }
+        parent = by_name.get(p).and_then(|c| c.parent.as_ref());
+    }
+    false
 }
 
 /// The elements of a literal list of Symbols or Strings (`%i[a b]`, `["a", :b].freeze`), or `None`.
