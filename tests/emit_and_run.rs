@@ -22444,6 +22444,10 @@ mod relation_predicate_blocks;
 #[path = "emit_and_run/concern_included_cattr.rs"]
 mod concern_included_cattr;
 
+// Concern shapes: model callbacks declared in a concern's included block.
+#[path = "emit_and_run/concern_model_callbacks.rs"]
+mod concern_model_callbacks;
+
 // Concern shapes: a prepended concern.
 #[path = "emit_and_run/concern_prepended.rs"]
 mod concern_prepended;
