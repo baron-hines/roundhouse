@@ -110,3 +110,23 @@ fn a_model_call_the_emitted_ruby_lacks_is_an_error() {
         );
     }
 }
+
+/// A receiver whose type names a model may hold the class itself, and a
+/// class method an extended module's hook defines as it runs is not
+/// listed: the call stays a warning rather than an error, and runs.
+fn class_method_from_a_hook() -> emit_and_run::Overlay {
+    app()
+        .write("app/lib/newest_first.rb", "module NewestFirst\n  def self.extended(base)\n    base.define_singleton_method(:newest_first) { order(id: :desc) }\n  end\nend\n")
+        .write("app/models/note.rb", "class Note < ApplicationRecord\n  extend NewestFirst\nend\n")
+        .write("app/models/note_report.rb", "module NoteReport\n  def self.newest\n    klass = Note\n    klass.newest_first.first\n  end\nend\n")
+}
+
+#[test]
+fn a_class_held_in_a_local_reaching_a_run_time_class_method_is_no_error() {
+    let run = class_method_from_a_hook()
+        .run_ruby("Note.create!(title: \"a\")\nNote.create!(title: \"b\")\nraise \"newest\" unless NoteReport.newest.title == \"b\"\nputs \"newest ok\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("newest ok"), "{}", run.stdout);
+    let (_emitted, errors) = class_method_from_a_hook().emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("newest_first")), "{errors:?}");
+}

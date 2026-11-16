@@ -41,8 +41,8 @@ methods are defined as it runs, a model with subclasses (one of them may
 answer), a class-side call on a model (`ActiveRecord::Base` defines its macros
 at run time), a view parameter typed by convention, or calls the compiler
 synthesized; those stay warnings. A receiver whose type names a model may hold
-the class itself (`klass = Note`), so a method the class side defines answers
-it too.
+the class itself (`klass = Note`), so a method the class side defines, or may
+define as it runs, answers it too.
 `ROUNDHOUSE_AUDIT=1` lists the warnings, the same check on every other app
 class.
 

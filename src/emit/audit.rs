@@ -32,6 +32,9 @@ struct Class {
     module: bool,
     definers: HashSet<String>,
     body_calls: HashSet<String>,
+    /// Constants the class body binds to a literal list of symbols
+    /// (`KINDS = %i[a b].freeze`), for a loop that defines one method per name.
+    symbol_lists: HashMap<String, Vec<String>>,
 }
 
 #[derive(Default)]
@@ -109,7 +112,18 @@ impl Index {
                 let class = self.classes.entry(owner.to_string()).or_default();
                 if singleton { class.singleton.insert(name); } else { class.instance.insert(name); }
             }
+        } else if let Some(write) = stmt.as_constant_write_node() {
+            if let Some(names) = symbol_list(&write.value()) {
+                let name = String::from_utf8_lossy(write.name().as_slice()).to_string();
+                self.classes.entry(owner.to_string()).or_default().symbol_lists.insert(name, names);
+            }
         } else if let Some(call) = stmt.as_call_node() {
+            // `KINDS.each do |kind| define_singleton_method(kind) { … } end`
+            // over a list the body bound: one class method per name.
+            if let Some(names) = self.singleton_methods_per_name(&call, owner) {
+                self.classes.entry(owner.to_string()).or_default().singleton.extend(names);
+                return;
+            }
             if call.block().is_some() && defines_at_runtime(&stmt) {
                 let class = self.classes.entry(owner.to_string()).or_default();
                 class.open_singleton = true;
@@ -165,6 +179,33 @@ impl Index {
         }))
     }
 
+    /// The names `KINDS.each do |kind| define_singleton_method(kind) …`
+    /// defines, when `KINDS` is a symbol list `owner` bound and the block
+    /// defines nothing else.
+    fn singleton_methods_per_name(&self, call: &ruby_prism::CallNode<'_>, owner: &str) -> Option<Vec<String>> {
+        if call.name().as_slice() != b"each" || call.arguments().is_some() {
+            return None;
+        }
+        let list = String::from_utf8_lossy(call.receiver()?.as_constant_read_node()?.name().as_slice()).to_string();
+        let names = self.classes.get(owner)?.symbol_lists.get(&list)?.clone();
+        let block = call.block()?.as_block_node()?;
+        let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
+        let requireds: Vec<_> = params.requireds().iter().collect();
+        let [param] = &requireds[..] else { return None };
+        let param = param.as_required_parameter_node()?.name().as_slice().to_vec();
+        let stmts: Vec<_> = block.body()?.as_statements_node()?.body().iter().collect();
+        let [stmt] = &stmts[..] else { return None };
+        let define = stmt.as_call_node()?;
+        let defines_param = define.name().as_slice() == b"define_singleton_method"
+            && define.receiver().is_none()
+            && define.arguments().is_some_and(|a| {
+                let args: Vec<_> = a.arguments().iter().collect();
+                matches!(&args[..], [arg] if arg.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == param.as_slice()))
+            });
+        let inner_defines = define.block().is_some_and(|b| defines_at_runtime(&b));
+        (defines_param && !inner_defines).then_some(names)
+    }
+
     fn is_module(&self, class: &str) -> bool {
         self.classes.get(class).is_some_and(|c| c.module)
     }
@@ -191,10 +232,13 @@ impl Index {
 
     fn defines(&self, class: &str, name: &str, class_side: bool) -> Lookup {
         let mut seen = HashSet::default();
-        self.lookup(class, "", name, class_side, &mut seen)
+        self.lookup(class, "", name, class_side, &mut seen, &HashSet::default())
     }
 
-    fn lookup(&self, class: &str, namespace: &str, name: &str, class_side: bool, seen: &mut HashSet<String>) -> Lookup {
+    /// `below`: the calls the bodies of the classes below this one make, on
+    /// the way up from where the lookup began. A macro an ancestor's mixin
+    /// supplies runs when a subclass calls it (`property :title`).
+    fn lookup(&self, class: &str, namespace: &str, name: &str, class_side: bool, seen: &mut HashSet<String>, below: &HashSet<String>) -> Lookup {
         let Some((key, info)) = self.resolve(class, namespace) else { return Lookup::Unheld };
         // Not the tree's reopen alone: `class Time` adds to Ruby's own class, whose methods it does not list.
         if !seen.insert(key.to_string()) {
@@ -210,22 +254,26 @@ impl Index {
             return Lookup::Unheld;
         }
         let mods = if class_side { &info.extends } else { &info.includes };
+        let mut calls = below.clone();
+        calls.extend(info.body_calls.iter().cloned());
         // Not any mixin that can define methods: only one whose definer the emitted body calls (`monetize :amount`) has run.
-        let ran = |c: &Class| c.open || c.open_singleton || c.definers.iter().any(|d| info.body_calls.contains(d));
-        if info.definers.iter().any(|d| info.body_calls.contains(d)) || info.includes.iter().chain(info.extends.iter()).any(|m| self.resolve(m, &info.namespace).is_some_and(|(_, c)| ran(c))) {
+        let ran = |c: &Class| c.open || c.open_singleton || c.definers.iter().any(|d| calls.contains(d));
+        if info.definers.iter().any(|d| calls.contains(d)) || info.includes.iter().chain(info.extends.iter()).any(|m| self.resolve(m, &info.namespace).is_some_and(|(_, c)| ran(c))) {
             return Lookup::Unheld;
         }
         // Not only `extend`: a module the tree does not hold may add class methods from its `included` hook (`Singleton#instance`).
         let mut unknown = class_side
-            && info.includes.iter().any(|m| {
+            && (info.includes.iter().any(|m| {
                 let name = m.trim_start_matches("::");
                 match self.resolve(m, &info.namespace) {
                     Some((_, held)) => held.singleton.contains("included") || held.singleton.contains("prepended"),
                     None => name == "Singleton" || !CORE_CONSTANTS.contains(&name),
                 }
-            });
+            })
+            // Nor what an extended module's `extended` hook adds to the class.
+            || info.extends.iter().any(|m| self.resolve(m, &info.namespace).is_some_and(|(_, held)| held.singleton.contains("extended"))));
         for m in mods {
-            match self.lookup(m, &info.namespace, name, false, seen) {
+            match self.lookup(m, &info.namespace, name, false, seen, &calls) {
                 Lookup::Defined => return Lookup::Defined,
                 Lookup::Unheld => unknown = true,
                 Lookup::Missing => {}
@@ -233,7 +281,7 @@ impl Index {
         }
         match info.parent.as_deref() {
             Some("?") => return Lookup::Unheld,
-            Some(parent) => match self.lookup(parent, &info.namespace, name, class_side, seen) {
+            Some(parent) => match self.lookup(parent, &info.namespace, name, class_side, seen, &calls) {
                 Lookup::Defined => return Lookup::Defined,
                 Lookup::Unheld => unknown = true,
                 Lookup::Missing => {}
@@ -250,6 +298,19 @@ impl Index {
         }
         if unknown { Lookup::Unheld } else { Lookup::Missing }
     }
+}
+
+/// The names of a literal list of symbols (`%i[a b]`, `[:a, :b].freeze`).
+fn symbol_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    let node = match node.as_call_node() {
+        Some(call) if call.name().as_slice() == b"freeze" && call.arguments().is_none() => call.receiver()?,
+        _ => node.as_array_node()?.as_node(),
+    };
+    node.as_array_node()?
+        .elements()
+        .iter()
+        .map(|e| e.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).to_string()))
+        .collect()
 }
 
 /// The method a call runs: its own name, or the symbol a `send` names
@@ -456,9 +517,17 @@ fn walk(&mut self, expr: &Expr, owner: Option<(&str, bool)>) {
         };
         if let Some((class, class_side)) = target
             && index.defines(&class, method.as_str(), class_side) == Lookup::Missing
-            && !(either_side && index.defines(&class, method.as_str(), true) == Lookup::Defined)
+            && let alternate = if either_side { index.defines(&class, method.as_str(), true) } else { Lookup::Missing }
+            && alternate != Lookup::Defined
             && self.seen.insert((expr.span, class.clone(), class_side, method.as_str().to_string()))
         {
+            // The class side may answer: what it defines as it runs is not
+            // listed. And a class-side call itself is no error: a model's class
+            // methods come from more than the tree lists (Kernel's conversion
+            // functions, class attributes, a gem's macros).
+            if alternate == Lookup::Unheld || class_side {
+                self.unsure.insert(expr.span);
+            }
             // The parameter is read as a local, or as the bare call the view's ERB spelled.
             let reads_param = recv.as_ref().is_some_and(|r| match &*r.node {
                 ExprNode::Var { name, .. } => self.convention.contains(&name),
@@ -511,6 +580,18 @@ mod tests {
     fn a_class_side_definer_leaves_the_instance_side_checked() {
         let found = findings("class Base\n  [:a].each do |k|\n    define_singleton_method(k) { 1 }\n  end\nend\n\nclass A < Base\n  def x\n    y\n  end\n\n  def self.z\n    w\n  end\nend\n");
         assert_eq!(found, ["`A#y` is called, but the emitted Ruby defines no such method"]);
+    }
+
+    #[test]
+    fn a_macro_an_ancestors_mixin_supplies_runs_when_a_subclass_calls_it() {
+        let found = findings("module Macros\n  def property(name)\n    define_method(name) { 1 }\n  end\nend\n\nclass Base\n  extend Macros\nend\n\nclass Note < Base\n  property :title\n\n  def label\n    title\n  end\nend\n");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_loop_over_a_symbol_list_defines_one_class_method_per_name() {
+        let src = "class Base\n  KINDS = %i[before_save after_save].freeze\n\n  KINDS.each do |kind|\n    define_singleton_method(kind) { |*names| names }\n  end\nend\n\nclass Note < Base\n  def self.x\n    before_save\n    after_create\n  end\nend\n";
+        assert_eq!(findings(src), ["`Note.after_create` is called, but the emitted Ruby defines no such method"]);
     }
 
     #[test]
