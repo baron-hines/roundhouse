@@ -206,6 +206,27 @@ pub(super) fn resolve(app: &mut App) {
                         .flat_map(|c| c.methods.iter())
                         .any(|m| m.name.as_str() == name && m.receiver == receiver)
                 };
+                // `alias_method :state_without_scope, :state` in a reopening (aasm's persistence/base.rb), the original
+                // in another file of the class: the gem loads, so that one ran first, and this body's own `state` is
+                // written below the alias.
+                if !defines(to) && !lc.methods.iter().any(|m| m.name.as_str() == from && m.receiver == receiver && (m.name_span.file != call.span.file || m.name_span.start < call.span.start)) {
+                    let elsewhere: Vec<&MethodDef> = candidates
+                        .iter()
+                        .filter(|c| c.name == lc.name && !std::ptr::eq(**c, lc))
+                        .flat_map(|c| c.methods.iter())
+                        .filter(|m| m.name.as_str() == from && m.receiver == receiver)
+                        .collect();
+                    if let [original] = elsewhere[..]
+                        && !calls_super(&original.body)
+                    {
+                        let mut copy = original.clone();
+                        copy.name = Symbol::from(to);
+                        copy.name_span = call.span;
+                        copy.body.decisions |= crate::expr::INHERITED_ALIAS_COPY;
+                        copies.push((i, copy));
+                        continue;
+                    }
+                }
                 if defines(to) || defines(from) {
                     continue;
                 }
