@@ -955,7 +955,9 @@ fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
 
 /// The call on the class a model-body block runs that is not carried out
 /// of it: `define_method`, `define_singleton_method` or `scope` anywhere
-/// in the block.
+/// in the block, or any class macro among a loop's own statements
+/// (`%i[a b].each { |f| validates f, presence: true }`), which no
+/// model-body recognizer reads out of a loop.
 fn unrolled_block_call(expr: &crate::expr::Expr) -> Option<String> {
     /// The loops a model body runs class calls through.
     const LOOPS: &[&str] = &[
@@ -996,10 +998,26 @@ fn unrolled_block_call(expr: &crate::expr::Expr) -> Option<String> {
         });
         found
     }
+    fn loop_call(body: &crate::expr::Expr) -> Option<String> {
+        let statements = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.as_slice(),
+            _ => std::slice::from_ref(body),
+        };
+        statements.iter().find_map(|s| match &*s.node {
+            ExprNode::Send { recv, method, .. } if on_class(recv) => Some(method.to_string()),
+            _ => None,
+        })
+    }
     match &*expr.node {
-        ExprNode::Send { method, block: Some(block), .. } => walk(block, LOOPS.contains(&method.as_str())),
+        ExprNode::Send { method, block: Some(block), .. } => {
+            let in_loop = LOOPS.contains(&method.as_str());
+            walk(block, in_loop).or_else(|| {
+                let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+                in_loop.then(|| loop_call(body)).flatten()
+            })
+        }
         // `while`/`until` in the body runs its statements as a block does.
-        ExprNode::While { body, .. } => walk(body, true),
+        ExprNode::While { body, .. } => walk(body, true).or_else(|| loop_call(body)),
         _ => None,
     }
 }
@@ -1035,11 +1053,13 @@ pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::D
 }
 
 /// A model-body block that runs `define_method`, `define_singleton_method`
-/// or `scope` and that `ingest::define_method_loop` could not unroll
-/// (`kinds.each do |kind| define_method(…) … end` over a value known only
-/// when the class loads, or a receiverless block): no lowering defines
-/// its methods, so the emitted model would lack them. An error for
-/// `check`, as the call sites would raise NoMethodError.
+/// or `scope`, or a loop that runs any class macro (`validates`,
+/// `attribute`, `before_save`), that `ingest::define_method_loop` could
+/// not unroll (`kinds.each do |kind| define_method(…) … end` over a value
+/// known only when the class loads, or a receiverless block): no lowering
+/// carries what it declares, so the emitted model would lack it. An error
+/// for `check`, as the call sites would raise NoMethodError and the
+/// declarations would not run.
 pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut out = Vec::new();
     let mut seen = HashSet::default();
@@ -1057,7 +1077,7 @@ pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnost
             out.push(crate::diagnostic::Diagnostic::unsupported(
                 expr.span, None, "runtime-defined method",
                 format!(
-                    "a block in the body of `{}` runs `{call}` in a shape the compile could not unroll; the methods it defines would be missing from the output",
+                    "a block in the body of `{}` runs `{call}` in a shape the compile could not unroll; what it declares would be missing from the output",
                     model.name.0.as_str()
                 ),
             ));
