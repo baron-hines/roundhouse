@@ -216,8 +216,10 @@ pub(super) fn resolve(app: &mut App) {
                         .flat_map(|c| c.methods.iter())
                         .filter(|m| m.name.as_str() == from && m.receiver == receiver)
                         .collect();
+                    // Not where an ancestor defines it too: then another file's def may come after the alias, which copied the ancestor's.
                     if let [original] = elsewhere[..]
                         && !calls_super(&original.body)
+                        && ancestor_method(&candidates, lc, from, receiver, call.span).is_none()
                     {
                         let mut copy = original.clone();
                         copy.name = Symbol::from(to);

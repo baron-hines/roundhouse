@@ -80,7 +80,7 @@ pub struct Cached {
 /// The Ruby and gem paths a boot runs with, read in the app's directory: a failed boot is reused only under the same.
 pub fn environment(dir: &Path) -> String {
     let out = std::process::Command::new("ruby")
-        .args(["-e", "print RUBY_DESCRIPTION, \"\\n\", Gem.path.join(\":\")"])
+        .args(["-e", "print RUBY_DESCRIPTION, \"\\n\", Gem.path.join(\":\"), \"\\n\", Gem::Specification.map(&:full_name).sort.join(\" \")"])
         .current_dir(dir)
         .output();
     match out {
