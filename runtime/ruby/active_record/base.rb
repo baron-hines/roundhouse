@@ -854,6 +854,12 @@ module ActiveRecord
       @destroyed = false
     end
 
+    # Seat this record on `records`, loaded by a relation built off its
+    # has_many `name`, through that association's inverse. A model whose
+    # has_many has one answers it (generated); any other seats nothing.
+    def _set_inverse_from_queries(name, records)
+    end
+
     # ---- Class-level CRUD -------------------------------------------
 
     def self.all

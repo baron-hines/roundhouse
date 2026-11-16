@@ -303,8 +303,11 @@ fn seed_argument(value: &Expr, ctx: &Ctx) -> Option<Expr> {
                 ),
             )
         });
+    // Its rows hold the owner through the automatic inverse, as the
+    // association chain's seed does (Ruby family).
+    let inversed = ctx.owner_objects && ctx.assocs.has_many_inverse(owner_model.as_ref(), name).is_some();
     Some(super::build_association_seed(
-        value.span, &target, fk, owner_id, type_entry, owner, name, false,
+        value.span, &target, fk, owner_id, type_entry, owner, name, false, inversed,
     ))
 }
 

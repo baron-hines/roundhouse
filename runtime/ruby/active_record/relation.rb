@@ -218,6 +218,10 @@ module ActiveRecord
       @lock_clause = ""
       @shared_lists = false
       @friendly = false
+      # The record whose has_many this relation was built off, and the
+      # association's name (`_inversed_from`); nil for any other relation.
+      @inverse_owner = nil
+      @inverse_name = nil
       names = @model._sti_type_names
       where!(type: names) unless names.empty?
       @inherited_scope = false
@@ -1799,6 +1803,18 @@ module ActiveRecord
       self
     end
 
+    # A relation built off `owner`'s has_many `name` (`owner.items.where(…)`)
+    # seats `owner` on each row it loads, through the association's inverse,
+    # and leaves the owner's own target alone, as Rails' `AssociationRelation`
+    # sets the inverse from queries. Chains keep it, as they keep an
+    # AssociationRelation. The owner's model answers which inverse that is
+    # (`_set_inverse_from_queries`), so the owner stays its own class there.
+    def _inversed_from(owner, name)
+      @inverse_owner = owner
+      @inverse_name = name
+      self
+    end
+
     # The model class this relation queries — Rails' Relation#klass
     # (lobsters' Search switches on it to pick per-model joins).
     def klass
@@ -2082,6 +2098,9 @@ module ActiveRecord
         @model.preload_associations(records, @includes.dup)
       end
       records.each { |record| record.readonly! } if @readonly
+      owner = @inverse_owner
+      name = @inverse_name
+      owner._set_inverse_from_queries(name, records) unless owner.nil? || name.nil?
       records
     end
 
@@ -2677,7 +2696,14 @@ module ActiveRecord
       limit
     end
 
+    # With a block, the loaded records the block answers truthy for, as
+    # Rails' `count` hands a block to the records.
     def count
+      if block_given?
+        n = 0
+        loaded_records.each { |x| n += 1 if yield x }
+        return n
+      end
       return 0 if @null
       rows = ActiveRecord.adapter.select_rows(bound_count_sql)
       rows.length == 0 ? 0 : rows[0]["n"].to_i
@@ -2898,8 +2924,15 @@ module ActiveRecord
       r.nil? ? !exists? : r.length == 0
     end
 
+    # With a block, whether the block answers truthy for a loaded record,
+    # as Rails' `any?` hands a block to the records.
     def any?
       return false if @null
+      if block_given?
+        found = false
+        loaded_records.each { |x| found = true if !found && yield(x) }
+        return found
+      end
       r = @records
       r.nil? ? exists? : r.length > 0
     end
@@ -2919,19 +2952,39 @@ module ActiveRecord
     end
 
     # Enumerable#none? without a block is empty? (uses the loaded cache).
+    # With one, the block decides over the loaded records, as `any?`.
     def none?
+      if block_given?
+        found = false
+        loaded_records.each { |x| found = true if !found && yield(x) }
+        return !found
+      end
       empty?
     end
 
-    # Exactly one row. Unloaded: SELECT 1 LIMIT 2. No block form.
+    # Exactly one row. Unloaded: SELECT 1 LIMIT 2. With a block, exactly
+    # one loaded record the block answers truthy for; the block is not
+    # asked again after a second one, as Enumerable's `one?` stops.
     def one?
+      if block_given?
+        n = 0
+        loaded_records.each { |x| n += 1 if n < 2 && yield(x) }
+        return n == 1
+      end
       r = @records
       return r.length == 1 unless r.nil?
       probe_existence(2) == 1
     end
 
-    # More than one row. Unloaded: SELECT 1 LIMIT 2.
+    # More than one row. Unloaded: SELECT 1 LIMIT 2. With a block, more
+    # than one loaded record the block answers truthy for, asking no
+    # further once a second one has.
     def many?
+      if block_given?
+        n = 0
+        loaded_records.each { |x| n += 1 if n < 2 && yield(x) }
+        return n > 1
+      end
       r = @records
       return r.length > 1 unless r.nil?
       probe_existence(2) > 1

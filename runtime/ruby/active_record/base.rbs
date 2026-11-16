@@ -255,6 +255,7 @@ module ActiveRecord
     # `void` keeps TS from requiring an explicit `return ...;` for
     # the trailing assignment.
     def mark_persisted!: () -> void
+    def _set_inverse_from_queries: (Symbol name, Array[Base] records) -> void
 
     # cache_key / cache_version / cache_key_with_version — see
     # connection.rb's Base reopen, NOT this file: base.rb is transpiled
