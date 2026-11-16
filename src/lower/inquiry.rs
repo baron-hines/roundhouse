@@ -73,6 +73,10 @@ pub fn apply_inquiry_lowering(app: &mut App) {
     for view in &mut app.views {
         rewrite(&mut view.body, &facts, None);
     }
+    // A test reads the predicate too (`entry.entryable_name.message?`).
+    for module in &mut app.test_modules {
+        super::for_each_test_module_body(module, &mut |body| rewrite(body, &facts, None));
+    }
 }
 
 /// The inquirer-returning methods and the tail test now live in

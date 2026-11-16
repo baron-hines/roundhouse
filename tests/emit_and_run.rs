@@ -22501,3 +22501,5 @@ mod record_toggle;
 mod reload_leaves_clone_cache;
 #[path = "emit_and_run/save_touch_false.rs"]
 mod save_touch_false;
+#[path = "emit_and_run/delegated_type_methods.rs"]
+mod delegated_type_methods;

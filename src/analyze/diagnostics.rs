@@ -779,6 +779,31 @@ fn controller_shadowed_view_helpers(app: &App) -> Vec<Diagnostic> {
 /// `classify_form_builder_method`.
 const FORM_BUILDER_HANDLED_ELSEWHERE: &[&str] = &["object"];
 
+/// A `delegated_type` ingest did not expand (`ingest::delegated_type`
+/// fails closed on an option it does not model, or a `types:` list it
+/// cannot read). The statement survives as an unknown call that no
+/// target emits, so the polymorphic `belongs_to`, its required check
+/// and every generated reader would vanish without a word.
+fn unexpanded_delegated_types(app: &App) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, .. } = &*expr.node else { continue };
+            if method.as_str() != "delegated_type" || out.iter().any(|d| d.span == expr.span) {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "delegated_type",
+                "its options or `types:` list are not ones the expansion models (a literal or constant list of class names; `foreign_key`, `foreign_type`, `primary_key`, `optional`, `touch`, `default`, `dependent: :destroy`), so no target defines the association or its readers",
+            ));
+        }
+    }
+    out
+}
+
 fn devise_refusals(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     if app.gem_lock.as_ref().is_some_and(|lock| lock.is_in_repo("devise") || lock.is_source("devise")) {
@@ -1113,6 +1138,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(controller_shadowed_view_helpers(app));
     out.extend(link_to_if_params_shadowing_nested_locals(app));
     out.extend(devise_refusals(app));
+    out.extend(unexpanded_delegated_types(app));
     out.extend(overridden_synthesized_accessors(app));
     out.extend(runtime_defined_surfaces(app));
     // A filter's return value is Rails' to discard (`around_action
