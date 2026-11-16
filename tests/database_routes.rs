@@ -58,6 +58,19 @@ fn spinel_registers_each_shard_and_role_and_no_other_target_takes_the_app() {
     assert!(ruby.iter().any(|e| e.contains("only the spinel target's runtime opens them")), "{ruby:#?}");
 }
 
+/// A shard whose name starts with a digit is written quoted, as Ruby
+/// reads it: `:2026` does not parse.
+#[test]
+fn a_shard_named_with_a_leading_digit_is_quoted() {
+    let record = contract::SHARDS.replace("left: { writing", "\"2026\": { writing");
+    let (db, errors) = spinel_db(contract::app(&record, "class RouteReport\nend\n"));
+    assert!(errors.is_empty(), "{errors:#?}");
+    let routes = generated(&db);
+    assert!(routes.contains("route(:\"2026\", :writing, \"storage/left.sqlite3\", false, true, n)\n"), "{routes}");
+    assert!(routes.contains("route(:right, :writing, \"storage/right.sqlite3\", false, true, n)\n"), "{routes}");
+    assert!(routes.contains("@default_shard = :\"2026\"\n"), "{routes}");
+}
+
 #[test]
 fn an_app_on_one_database_keeps_an_empty_routes_region() {
     let one = contract::app("class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n", "class RouteReport\nend\n");

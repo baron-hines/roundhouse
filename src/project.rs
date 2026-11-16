@@ -7799,8 +7799,10 @@ fn apply_database_routes(files: &mut [(String, String)], app: &App) {
     let Some(routes) = &app.database_routes else { return };
     let Some((_, content)) = files.iter_mut().find(|(path, content)| path == "runtime/db.rb" && content.contains(MARK)) else { return };
     let lit = |text: &str| crate::emit::ruby::expr::ruby_str_literal(text);
+    // Bare only when Ruby reads it bare: `:2026` does not parse.
     let symbol = |name: &str| {
-        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { format!(":{name}") } else { format!(":{}", lit(name)) }
+        let bare = name.starts_with(|c: char| !c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if bare { format!(":{name}") } else { format!(":{}", lit(name)) }
     };
     let mut envs: Vec<&str> = app.databases.iter().map(|d| d.env.as_str()).collect();
     envs.dedup();
