@@ -527,67 +527,85 @@ fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
         }
     };
     let mut out = Vec::new();
-    crate::lower::for_each_emit_body_ref(app, &mut |body| {
-        fn visit(
-            expr: &Expr,
-            model_of: &dyn Fn(&Expr) -> Option<ClassId>,
-            registry: &crate::lower::scope_chain::AssocRegistry,
-            out: &mut Vec<Diagnostic>,
-        ) {
-            if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node
-                && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
-                && let Some(model) = model_of(recv)
-            {
-                // Each association a join spec names, with the model it is
-                // declared on: a nested hash's associations are the
-                // preceding association target's (`joins(trees: :branches)`).
-                fn names<'e>(
-                    model: &ClassId,
-                    spec: &'e Expr,
-                    registry: &crate::lower::scope_chain::AssocRegistry,
-                    out: &mut Vec<(ClassId, &'e Expr)>,
-                ) {
-                    match &*spec.node {
-                        ExprNode::Array { elements, .. } => {
-                            elements.iter().for_each(|e| names(model, e, registry, out))
-                        }
-                        ExprNode::Hash { entries, .. } => {
-                            for (k, v) in entries {
-                                names(model, k, registry, out);
-                                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node
-                                    && let Some(target) = registry.assoc_target(model, value)
-                                {
-                                    names(target, v, registry, out);
-                                }
+    fn visit(
+        expr: &Expr,
+        model_of: &dyn Fn(Option<&Expr>) -> Option<ClassId>,
+        registry: &crate::lower::scope_chain::AssocRegistry,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        if let ExprNode::Send { recv, method, args, .. } = &*expr.node
+            && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
+            && let Some(model) = model_of(recv.as_ref())
+        {
+            // Each association a join spec names, with the model it is
+            // declared on: a nested hash's associations are the
+            // preceding association target's (`joins(trees: :branches)`).
+            fn names<'e>(
+                model: &ClassId,
+                spec: &'e Expr,
+                registry: &crate::lower::scope_chain::AssocRegistry,
+                out: &mut Vec<(ClassId, &'e Expr)>,
+            ) {
+                match &*spec.node {
+                    ExprNode::Array { elements, .. } => {
+                        elements.iter().for_each(|e| names(model, e, registry, out))
+                    }
+                    ExprNode::Hash { entries, .. } => {
+                        for (k, v) in entries {
+                            names(model, k, registry, out);
+                            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node
+                                && let Some(target) = registry.assoc_target(model, value)
+                            {
+                                names(target, v, registry, out);
                             }
                         }
-                        _ => out.push((model.clone(), spec)),
                     }
-                }
-                let mut named: Vec<(ClassId, &Expr)> = Vec::new();
-                args.iter().for_each(|arg| names(&model, arg, registry, &mut named));
-                for (model, name) in named {
-                    if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
-                        && registry.join_scope_unrenderable(&model, value)
-                    {
-                        out.push(Diagnostic::unsupported(
-                            name.span,
-                            None,
-                            "association join",
-                            format!(
-                                "`{}(:{})`: the association's scope doesn't render as SQL here (only hash `where`s of \
-                                 literals do), so its join can't carry the scope in its ON clause, as Rails' does",
-                                method.as_str(),
-                                value.as_str(),
-                            ),
-                        ));
-                    }
+                    _ => out.push((model.clone(), spec)),
                 }
             }
-            expr.node.for_each_child(&mut |child| visit(child, model_of, registry, out));
+            let mut named: Vec<(ClassId, &Expr)> = Vec::new();
+            args.iter().for_each(|arg| names(&model, arg, registry, &mut named));
+            for (model, name) in named {
+                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
+                    && registry.join_scope_unrenderable(&model, value)
+                {
+                    out.push(Diagnostic::unsupported(
+                        name.span,
+                        None,
+                        "association join",
+                        format!(
+                            "`{}(:{})`: the association's scope doesn't render as SQL here (only hash `where`s of \
+                             literals do), so its join can't carry the scope in its ON clause, as Rails' does",
+                            method.as_str(),
+                            value.as_str(),
+                        ),
+                    ));
+                }
+            }
         }
-        visit(body, &model_of, &registry, &mut out);
-    });
+        expr.node.for_each_child(&mut |child| visit(child, model_of, registry, out));
+    }
+    // An explicit receiver: a model constant or a query chain.
+    let explicit = |recv: Option<&Expr>| match recv {
+        Some(r) if !matches!(&*r.node, ExprNode::SelfRef) => model_of(r),
+        _ => None,
+    };
+    crate::lower::for_each_emit_body_ref(app, &mut |body| visit(body, &explicit, &registry, &mut out));
+    // A bare or `self.` join in a model's scope or class method is on
+    // that model (`scope :shady, -> { joins(:shady_trees) }`).
+    for model in &app.models {
+        let own = |recv: Option<&Expr>| match recv {
+            None => Some(model.name.clone()),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => Some(model.name.clone()),
+            _ => None,
+        };
+        for scope in model.scopes() {
+            visit(&scope.body, &own, &registry, &mut out);
+        }
+        for method in model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class) {
+            visit(&method.body, &own, &registry, &mut out);
+        }
+    }
     out
 }
 
