@@ -376,6 +376,7 @@ pub(super) fn ingest_model_with_enum_constants(
                 file,
                 crate::dialect::MethodReceiver::Instance,
                 &loop_visibility,
+                true,
             ) {
                 let mut leading = Some((leading, leading_blank));
                 for mut method in methods {
@@ -3465,7 +3466,7 @@ fn ingest_singleton_class_body(
             visibility.apply(&def.as_node(), &mut method);
         }
         Ok(method)
-    })
+    }, true)
 }
 
 pub(super) fn ingest_method(

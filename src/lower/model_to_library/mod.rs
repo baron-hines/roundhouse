@@ -950,23 +950,57 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// stay in sync with the claiming passes — each entry names the pass
 /// that consumes the shape.
 fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
-    fn walk(expr: &crate::expr::Expr) -> bool {
-        // On the class: receiverless or `self.scope`.
-        if let ExprNode::Send { recv, method, .. } = &*expr.node
-            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
-            && matches!(method.as_str(), "define_method" | "scope")
-        {
-            return true;
+    unrolled_block_call(expr).is_some()
+}
+
+/// The call on the class a model-body block runs that is not carried out
+/// of it: `define_method`, `define_singleton_method` or `scope` anywhere
+/// in the block.
+fn unrolled_block_call(expr: &crate::expr::Expr) -> Option<String> {
+    /// The loops a model body runs class calls through.
+    const LOOPS: &[&str] = &[
+        "each", "each_with_index", "each_with_object", "each_pair", "each_key", "each_value", "each_slice", "each_cons",
+        "reverse_each", "map", "collect", "times",
+    ];
+    fn on_class(recv: &Option<crate::expr::Expr>) -> bool {
+        recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    }
+    // `define_singleton_method` and `singleton_class` are Object's too: in
+    // a block callback (`after_initialize do … end`) they are the record's,
+    // which the callback lowering carries. Only a loop's are the class's.
+    fn walk(expr: &crate::expr::Expr, in_loop: bool) -> Option<String> {
+        if let ExprNode::Send { recv, method, .. } = &*expr.node {
+            // On the class: receiverless or `self.scope`.
+            if on_class(recv) && matches!(method.as_str(), "define_method" | "scope") {
+                return Some(method.to_string());
+            }
+            if in_loop && on_class(recv) && method.as_str() == "define_singleton_method" {
+                return Some(method.to_string());
+            }
+            if in_loop
+                && method.as_str() == "define_method"
+                && let Some(r) = recv
+                && let ExprNode::Send { recv: sc_recv, method: sc, args, block: None, .. } = &*r.node
+                && sc.as_str() == "singleton_class"
+                && args.is_empty()
+                && on_class(sc_recv)
+            {
+                return Some("singleton_class.define_method".into());
+            }
         }
-        let mut found = false;
-        expr.node.for_each_child(&mut |child| found |= walk(child));
+        let mut found = None;
+        expr.node.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = walk(child, in_loop);
+            }
+        });
         found
     }
     match &*expr.node {
-        ExprNode::Send { block: Some(block), .. } => walk(block),
+        ExprNode::Send { method, block: Some(block), .. } => walk(block, LOOPS.contains(&method.as_str())),
         // `while`/`until` in the body runs its statements as a block does.
-        ExprNode::While { body, .. } => walk(body),
-        _ => false,
+        ExprNode::While { body, .. } => walk(body, true),
+        _ => None,
     }
 }
 
@@ -1000,12 +1034,12 @@ pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::D
     out
 }
 
-/// A model-body block that runs `define_method` or `scope` and that
-/// `ingest::define_method_loop` could not unroll (`kinds.each do |kind|
-/// define_method(…) … end` over a value known only when the class
-/// loads, or a receiverless block): no lowering defines its methods, so
-/// the emitted model would lack them. An error for `check`, as the call sites would raise
-/// NoMethodError.
+/// A model-body block that runs `define_method`, `define_singleton_method`
+/// or `scope` and that `ingest::define_method_loop` could not unroll
+/// (`kinds.each do |kind| define_method(…) … end` over a value known only
+/// when the class loads, or a receiverless block): no lowering defines
+/// its methods, so the emitted model would lack them. An error for
+/// `check`, as the call sites would raise NoMethodError.
 pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut out = Vec::new();
     let mut seen = HashSet::default();
@@ -1014,8 +1048,8 @@ pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnost
             let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
             // A receiverless block too (`each do |size| scope size, … end`):
             // nothing in a model body claims one that defines methods.
-            if !defines_methods_in_block(expr)
-                || expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
+            let Some(call) = unrolled_block_call(expr) else { continue };
+            if expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
                 || expr.diagnostic().is_some() || !seen.insert(expr.span)
             {
                 continue;
@@ -1023,7 +1057,7 @@ pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnost
             out.push(crate::diagnostic::Diagnostic::unsupported(
                 expr.span, None, "runtime-defined method",
                 format!(
-                    "a block in the body of `{}` runs `define_method` or `scope` in a shape the compile could not unroll; the methods it defines would be missing from the output",
+                    "a block in the body of `{}` runs `{call}` in a shape the compile could not unroll; the methods it defines would be missing from the output",
                     model.name.0.as_str()
                 ),
             ));

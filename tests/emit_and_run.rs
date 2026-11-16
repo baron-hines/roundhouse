@@ -22390,6 +22390,8 @@ mod array_as_json_elements;
 mod association_named_ivars;
 #[path = "emit_and_run/class_body_macro_loop.rs"]
 mod class_body_macro_loop;
+#[path = "emit_and_run/class_body_singleton_loop.rs"]
+mod class_body_singleton_loop;
 #[path = "emit_and_run/class_new_self_subclass.rs"]
 mod class_new_self_subclass;
 #[path = "emit_and_run/module_body_statements.rs"]
