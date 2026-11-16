@@ -3171,7 +3171,9 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
             } else if let ExprNode::Seq { exprs } = &mut *else_branch.node {
                 exprs.push(stash);
             }
-            lc.methods.push(autosave_method(&lc.name, &name, &fk, keyed_switch));
+            // A polymorphic writer reads the record's declared key, which
+            // need not be its `id`: the autosave assigns through it again.
+            lc.methods.push(autosave_method(&lc.name, &name, &fk, keyed_switch || sequence));
             fold_autosave_call_into_hook(&mut lc.methods, &lc.name, &name);
             guard_default_on_reader(&mut lc.methods, &name, &fk);
             route_init_through_writer(lc, &name, &fk);
@@ -3393,8 +3395,8 @@ fn autosave_method(
         then_branch: syn(ExprNode::Seq {
             exprs: vec![
                 send(cache(), "save"),
-                // Classes keyed by different columns: the writer reads the
-                // saved record's own key, where `id` is not every class's.
+                // A polymorphic writer reads the saved record's declared
+                // key, which is not every class's `id`.
                 if rekey_through_writer {
                     syn(ExprNode::Assign {
                         target: LValue::Attr { recv: syn(ExprNode::SelfRef), name: name.clone() },

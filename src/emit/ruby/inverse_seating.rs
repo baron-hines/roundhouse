@@ -53,14 +53,18 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         // The relation hook answers for the has_many this model inherits
         // too: it replaces its parent's, and a subclass's own name comes
         // first, as its declaration replaces the parent's.
+        // A name a nearer class declares is that class's, inverse or not
+        // (a scoped redeclaration has none).
         let mut from_queries: Vec<&Inverse> = Vec::new();
+        let mut declared: Vec<&Symbol> = Vec::new();
         let mut at = Some(model);
         while let Some(m) = at {
             for inv in inverses.iter().filter(|i| i.owner == m.name && i.collection) {
-                if !from_queries.iter().any(|seen| seen.name == inv.name) {
+                if !declared.contains(&&inv.name) {
                     from_queries.push(inv);
                 }
             }
+            declared.extend(m.associations().map(|a| a.name()));
             at = m.parent.as_ref().and_then(|p| app.models.iter().find(|pm| &pm.name == p));
         }
         if !from_queries.is_empty() {

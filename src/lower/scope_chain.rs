@@ -3784,24 +3784,25 @@ fn build_association_seed(
                 parenthesized: true,
             },
         );
-        // The rows it loads hold the owner through the association's
-        // automatic inverse, as an `AssociationRelation`'s do
-        // (`Relation#_inversed_from`).
-        if inversed {
-            seed = syn(
-                span,
-                ExprNode::Send {
-                    recv: Some(seed),
-                    method: Symbol::from("_inversed_from"),
-                    args: vec![
-                        owner.clone(),
-                        syn(span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } }),
-                    ],
-                    block: None,
-                    parenthesized: true,
-                },
-            );
-        }
+    }
+    // The rows it loads hold the owner through the association's
+    // automatic inverse, as an `AssociationRelation`'s do
+    // (`Relation#_inversed_from`), the create-scope spelling's too: a
+    // class method reached through the association queries on it.
+    if inversed {
+        seed = syn(
+            span,
+            ExprNode::Send {
+                recv: Some(seed),
+                method: Symbol::from("_inversed_from"),
+                args: vec![
+                    owner.clone(),
+                    syn(span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } }),
+                ],
+                block: None,
+                parenthesized: true,
+            },
+        );
     }
     seed
 }

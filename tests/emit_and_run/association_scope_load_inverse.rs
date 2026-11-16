@@ -26,6 +26,10 @@ end
 "##)
         .write("app/models/ship.rb", r##"class Ship < ApplicationRecord
   belongs_to :fleet
+
+  def self.heavy
+    where("tons > ?", 10)
+  end
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -48,6 +52,8 @@ end
     # Rails: every load off the association's relation seats the owner
     check("ordered first", f.ships.order(:tons).first.fleet.equal?(f))
     check("find_by", f.ships.find_by(name: "ketch").fleet.equal?(f))
+    # Rails: a class method reached through the association runs on its relation
+    check("class method", f.ships.heavy.to_a.map(&:name) == ["brig"] && f.ships.heavy.first.fleet.equal?(f))
     seen = []
     f.ships.where("tons < ?", 100).each { |s| seen << s.fleet }
     check("each", seen.length == 2 && seen.all? { |o| o.equal?(f) })
