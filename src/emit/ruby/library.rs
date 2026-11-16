@@ -3480,11 +3480,12 @@ fn fold_autosave_call_into_hook(
     });
 }
 
-/// Ruby-family pre-emit pass: correct `has_many :through` readers. The
-/// shared lowering synthesizes EVERY has_many reader as a direct
-/// foreign-key query (`Tag.where(story_id: @id)`) — wrong for `through:`,
-/// where the foreign key lives on the join table. Rebuild those readers
-/// as a Relation join through the intermediate:
+/// Ruby-family pre-emit pass: correct `has_many :through` and `has_one
+/// :through` readers. The shared lowering synthesizes EVERY has_many and
+/// has_one reader as a direct foreign-key query (`Tag.where(story_id:
+/// @id)`) — wrong for `through:`, where the foreign key lives on the join
+/// table. Rebuild those readers as a Relation join through the
+/// intermediate:
 ///
 ///   def tags
 ///     return @tags_cache if @tags_loaded
@@ -3501,9 +3502,14 @@ fn fold_autosave_call_into_hook(
 /// `reachable_messages, through: :rooms, source: :messages`). Nested chains — the source association on
 /// the join model is itself `:through` (`Category has_many :stories,
 /// through: :tags` where `Tag#stories` goes through taggings), or the
-/// first hop is — recurse, adding one INNER JOIN per hop. Shapes a hop
-/// can't prove (missing models, no matching source) are left on the
-/// shared reader rather than guessed.
+/// first hop is — recurse, adding one INNER JOIN per hop. A belongs_to
+/// hop is the row the owner's key names (`has_one :venue, through:
+/// :event` reads `events.id = @event_id`), and a has_one reader answers
+/// the relation's `first`. A shape no hop can prove (missing models, no
+/// matching source, a polymorphic or scoped belongs_to hop) is an
+/// `unsupported` error: the shared reader it keeps reads a column the
+/// target does not have. So is a has_one :through over a collection,
+/// which Rails refuses.
 /// The association's own scope lambda is grafted onto the relation
 /// (`through_reader_body`), and the through association's is evaluated on
 /// the through model's relation and merged into it
@@ -3519,21 +3525,13 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        for assoc in model.associations() {
-            let Association::HasMany {
-                name, target, through: Some(_), scope: assoc_scope, ..
-            } = assoc
+        for (span, assoc) in model.spanned_associations() {
+            let (Association::HasMany { name, target, through: Some(_), scope: assoc_scope, .. }
+            | Association::HasOne { name, target, through: Some(_), scope: assoc_scope, .. }) = assoc
             else {
                 continue;
             };
-            let Some((joins, edge_table, edge_fk)) =
-                resolve_through_chain(&app.models, model, assoc, 0)
-            else {
-                continue;
-            };
-            let join_sql = joins.join(" ");
-            let where_sql = format!("{edge_table}.{edge_fk} = ?");
-
+            // A refused association has no reader.
             let Some(m) =
                 lc.methods.iter_mut().find(|m| {
                     m.name == *name && m.receiver == crate::dialect::MethodReceiver::Instance
@@ -3541,12 +3539,52 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
-            m.body = through_reader_body(name, target, &join_sql, &where_sql, assoc_scope);
-            if let Some(regs) = hop_regs.as_ref()
-                && let Some(hop) = through_hop_scope(model, assoc, app, regs)
+            if let Association::HasOne { through: Some(thr_name), .. } = assoc
+                && let Some(Association::HasMany { .. }) = model.associations().filter(|a| a.name() == thr_name).last()
             {
-                graft_through_hop(&mut m.body, hop);
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    span,
+                    None,
+                    "through_chain",
+                    format!(
+                        "`{}.{name}`: a has_one :through whose `through:` association `{thr_name}` is a \
+                         collection, which Rails refuses (HasOneThroughCantAssociateThroughCollection)",
+                        model.name.0
+                    ),
+                ));
+                continue;
             }
+            let Some((joins, edge)) = resolve_through_chain(&app.models, model, assoc, 0) else {
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    span,
+                    None,
+                    "through_chain",
+                    format!(
+                        "`{}.{name}`: no join through its `through:` association reaches `{}` \
+                         (a hop or source that is not an app model, or a polymorphic or scoped \
+                         belongs_to), so its reader would read a column the target does not have",
+                        model.name.0, target.0
+                    ),
+                ));
+                continue;
+            };
+            let relation = through_relation(
+                target,
+                &joins.join(" "),
+                &format!("{}.{} = ?", edge.table, edge.column),
+                &edge.owner_attr,
+                assoc_scope,
+            );
+            let relation = match hop_regs.as_ref().and_then(|regs| through_hop_scope(model, assoc, app, regs)) {
+                Some(hop) => merge_through_hop(relation, hop),
+                None => relation,
+            };
+            m.body = if matches!(assoc, Association::HasOne { .. }) {
+                let unset_key = crate::lower::model_to_library::fk_sentinel(model, &edge.owner_attr);
+                through_one_reader_body(name, &edge.owner_attr, unset_key, relation)
+            } else {
+                through_reader_body(name, relation)
+            };
         }
     }
 }
@@ -3578,7 +3616,11 @@ fn app_has_scoped_through(app: &App) -> bool {
     use crate::dialect::Association;
     app.models.iter().any(|model| {
         model.associations().any(|assoc| {
-            let Association::HasMany { through: Some(thr_name), .. } = assoc else { return false };
+            let (Association::HasMany { through: Some(thr_name), .. } | Association::HasOne { through: Some(thr_name), .. }) =
+                assoc
+            else {
+                return false;
+            };
             model.associations().any(|thr| {
                 thr.name() == thr_name
                     && matches!(
@@ -3609,7 +3651,10 @@ fn through_hop_scope(
     regs: &HopRegistries,
 ) -> Option<Expr> {
     use crate::dialect::Association;
-    let Association::HasMany { through: Some(thr_name), .. } = assoc else { return None };
+    let (Association::HasMany { through: Some(thr_name), .. } | Association::HasOne { through: Some(thr_name), .. }) = assoc
+    else {
+        return None;
+    };
     let (thr_target, scope) = model.associations().filter(|a| a.name() == thr_name).last().and_then(|thr| match thr {
         Association::HasMany { target, through: None, scope: Some(scope), .. }
         | Association::HasOne { target, through: None, scope: Some(scope), .. } => Some((target, scope)),
@@ -3700,32 +3745,35 @@ fn substitute_rel(expr: &mut Expr, rel: &Symbol, seed: &Expr) -> bool {
     found
 }
 
-/// `<relation>.preloaded(…)` becomes
-/// `<relation>.merge_through_scope(<hop>).preloaded(…)`.
-fn graft_through_hop(body: &mut Expr, hop: Expr) {
-    let ExprNode::Send { recv: Some(recv), method, .. } = &mut *body.node else { return };
-    if method.as_str() != "preloaded" {
-        return;
-    }
-    let span = hop.span;
-    let inner = std::mem::replace(recv, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-    *recv = Expr::new(
-        span,
+/// `<relation>.merge_through_scope(<hop>)`.
+fn merge_through_hop(relation: Expr, hop: Expr) -> Expr {
+    Expr::new(
+        hop.span,
         ExprNode::Send {
-            recv: Some(inner),
+            recv: Some(relation),
             method: Symbol::from("merge_through_scope"),
             args: vec![hop],
             block: None,
             parenthesized: true,
         },
-    );
+    )
 }
 
-/// Resolve the SQL join chain for `assoc`, a `has_many :through` on
-/// `model`. Returns the INNER JOIN fragments (target-nearest first, ready
-/// to `join(" ")`) plus the WHERE edge `(table, fk)` that points back at
-/// the owner's id. One recursion per indirection: a first hop that is
-/// itself `:through`, or a join-model source association that is.
+/// Where a through chain meets its owner: `<table>.<column> = ?`, bound
+/// to the owner's `<owner_attr>`. A has_many or has_one hop holds the
+/// owner's id (`memberships.team_id = @id`); a belongs_to hop is the row
+/// the owner's key names (`events.id = @event_id`).
+struct ThroughEdge {
+    table: String,
+    column: Symbol,
+    owner_attr: Symbol,
+}
+
+/// Resolve the SQL join chain for `assoc`, a `has_many :through` or
+/// `has_one :through` on `model`. Returns the INNER JOIN fragments
+/// (target-nearest first, ready to `join(" ")`) plus the WHERE edge that
+/// points back at the owner. One recursion per indirection: a first hop
+/// that is itself `:through`, or a join-model source association that is.
 /// `None` when a hop can't be proven — missing join model, no source
 /// association ([`Model::through_source`](crate::dialect::Model::through_source)),
 /// a source kind with no join here — and for pathological depth (cyclic
@@ -3735,42 +3783,46 @@ fn resolve_through_chain(
     model: &crate::dialect::Model,
     assoc: &crate::dialect::Association,
     depth: usize,
-) -> Option<(Vec<String>, String, Symbol)> {
+) -> Option<(Vec<String>, ThroughEdge)> {
     use crate::dialect::Association;
     use crate::naming::pluralize_snake;
 
     if depth > 4 {
         return None;
     }
-    let Association::HasMany { name, target, through: Some(thr_name), .. } = assoc else {
-        return None;
-    };
-    // The through association on the owner (`:votes`, `:taggings`, `:tags`).
-    let thr = model
-        .associations()
-        .find(|a| matches!(a, Association::HasMany { name, .. } if name == thr_name))?;
-    let Association::HasMany {
-        target: thr_target, foreign_key: thr_fk, through: thr_through, as_interface, ..
-    } = thr
+    let (Association::HasMany { name, target, through: Some(thr_name), .. }
+    | Association::HasOne { name, target, through: Some(thr_name), .. }) = assoc
     else {
         return None;
     };
-    // How the join model's rows tie back to the owner: directly by the
-    // sibling's fk, or through the sibling's own chain.
-    // Owner edge is the sibling's foreign key. `through_writer_join`
-    // copies that same key; asking it again cannot change the edge.
-    let (back_joins, edge_table, edge_fk) = match thr_through {
-        // Not the class name's plural: the owner edge is the join model's own table, as the join below reads it.
-        None => (
-            Vec::new(),
-            models.iter().find(|m| &m.name == thr_target).map_or_else(|| pluralize_snake(thr_target.0.as_str()), |m| m.table.0.as_str().to_string()),
-            thr_fk.clone(),
-        ),
-        Some(_) => resolve_through_chain(models, model, thr, depth + 1)?,
+    // The through association on the owner (`:votes`, `:taggings`,
+    // `:event`); a later declaration of the name replaces an earlier one.
+    let thr = model.associations().filter(|a| a.name() == thr_name).last()?;
+    let (thr_target, thr_through, as_interface) = match thr {
+        Association::HasMany { target, through, as_interface, .. }
+        | Association::HasOne { target, through, as_interface, .. } => (target, through, as_interface),
+        // Not a scoped one: `through_hop_scope` merges a has_many or
+        // has_one hop's scope only.
+        Association::BelongsTo { target, polymorphic: false, scope: None, .. } => (target, &None, &None),
+        _ => return None,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
     // Not the class name's plural: a model's `self.table_name =` names another table.
     let thr_table = thr_model.table.0.as_str().to_string();
+    // How the join model's rows tie back to the owner: directly by the
+    // hop's key, or through the hop's own chain.
+    let (back_joins, edge) = match (thr, thr_through) {
+        (Association::BelongsTo { foreign_key, .. }, _) => (
+            Vec::new(),
+            ThroughEdge { table: thr_table.clone(), column: Symbol::from("id"), owner_attr: foreign_key.clone() },
+        ),
+        (Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. }, None) => (
+            Vec::new(),
+            ThroughEdge { table: thr_table.clone(), column: foreign_key.clone(), owner_attr: Symbol::from("id") },
+        ),
+        (_, Some(_)) => resolve_through_chain(models, model, thr, depth + 1)?,
+        _ => return None,
+    };
     let target_table = models
         .iter()
         .find(|m| &m.name == target)
@@ -3781,14 +3833,6 @@ fn resolve_through_chain(
         // :story`). A polymorphic one needs a type predicate this join
         // does not write, so it stays on the shared reader.
         Association::BelongsTo { foreign_key: src_fk, polymorphic: false, .. } => {
-            let src_fk = if thr_through.is_none() {
-                match crate::lower::model_to_library::through_writer_join(model, models, name) {
-                    crate::lower::model_to_library::ThroughWriterJoin::Resolved(_, _, src_fk, _) => src_fk,
-                    _ => return None,
-                }
-            } else {
-                src_fk.clone()
-            };
             vec![format!(
                 "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
             )]
@@ -3812,25 +3856,31 @@ fn resolve_through_chain(
         // foreign key is on the TARGET table and the join points the
         // other way (campfire: `has_many :reachable_messages, through:
         // :rooms, source: :messages` — Room#messages, `messages.room_id`).
-        Association::HasMany { foreign_key: src_fk, through: None, .. } => vec![format!(
-            "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{owner_type}"
-        )],
+        // A has_one source joins the same way. One declared `as:` holds
+        // the join model's class beside its id.
+        Association::HasMany { foreign_key: src_fk, through: None, as_interface: src_as, .. }
+        | Association::HasOne { foreign_key: src_fk, through: None, as_interface: src_as, .. } => {
+            let src_type = through_owner_type_predicate(&target_table, src_as, &thr_model.name);
+            vec![format!(
+                "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{src_type}{owner_type}"
+            )]
+        }
         // Nested: the join model reaches the target through its own
         // `:through` association. Resolve that chain (phrased from the
         // same target table), then graft the join model onto its owner
         // edge.
-        src @ Association::HasMany { through: Some(_), .. } => {
-            let (mut src_joins, src_edge_table, src_edge_fk) =
-                resolve_through_chain(models, thr_model, src, depth + 1)?;
+        src @ (Association::HasMany { through: Some(_), .. } | Association::HasOne { through: Some(_), .. }) => {
+            let (mut src_joins, src_edge) = resolve_through_chain(models, thr_model, src, depth + 1)?;
             src_joins.push(format!(
-                "INNER JOIN {thr_table} ON {thr_table}.id = {src_edge_table}.{src_edge_fk}{owner_type}"
+                "INNER JOIN {thr_table} ON {thr_table}.{} = {}.{}{owner_type}",
+                src_edge.owner_attr, src_edge.table, src_edge.column
             ));
             src_joins
         }
         _ => return None,
     };
     joins.extend(back_joins);
-    Some((joins, edge_table, edge_fk))
+    Some((joins, edge))
 }
 
 /// Keep the same polymorphic owner restriction on lazy and batched through joins.
@@ -3872,11 +3922,84 @@ fn through_owner_type_predicate(table: &str, as_interface: &Option<Symbol>, owne
 /// and for "never loaded". A caller that chains on further clears that
 /// memo and re-queries, which is what every chain method here does and
 /// what Rails does to a loaded relation.
-fn through_reader_body(
-    name: &Symbol,
+fn through_reader_body(name: &Symbol, relation: Expr) -> Expr {
+    let span = Span::synthetic;
+    // Last in the chain, after any scope graft: the scope's conditions
+    // belong to the QUERY, and this hands the finished relation the
+    // records an eager load already fetched.
+    Expr::new(
+        span(),
+        ExprNode::Send {
+            recv: Some(relation),
+            method: Symbol::from("preloaded"),
+            args: vec![
+                Expr::new(
+                    span(),
+                    ExprNode::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
+                ),
+                Expr::new(
+                    span(),
+                    ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
+                ),
+            ],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// A `has_one :through` reader: the preloaded record when there is one,
+/// nil while the owner's edge key is unset (an unsaved owner, or a
+/// belongs_to hop with no key, which Rails does not query either), and
+/// otherwise the joined relation's `first`. `unset` is the key's "no row"
+/// sentinel, `0` or `""` (`fk_sentinel`).
+fn through_one_reader_body(name: &Symbol, owner_attr: &Symbol, unset_key: Expr, relation: Expr) -> Expr {
+    let span = Span::synthetic;
+    let key = || Expr::new(span(), ExprNode::Ivar { name: owner_attr.clone() });
+    let unset = Expr::new(
+        span(),
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left: Expr::new(
+                span(),
+                ExprNode::Send { recv: Some(key()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false },
+            ),
+            right: Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(key()),
+                    method: Symbol::from("=="),
+                    args: vec![unset_key],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+        },
+    );
+    let nil = || Expr::new(span(), ExprNode::Lit { value: Literal::Nil });
+    let unset_guard = Expr::new(
+        span(),
+        ExprNode::If {
+            cond: unset,
+            then_branch: Expr::new(span(), ExprNode::Return { value: nil() }),
+            else_branch: nil(),
+        },
+    );
+    let first = Expr::new(
+        span(),
+        ExprNode::Send { recv: Some(relation), method: Symbol::from("first"), args: vec![], block: None, parenthesized: false },
+    );
+    Expr::new(span(), ExprNode::Seq { exprs: vec![preload_cache_guard(name), unset_guard, first] })
+}
+
+/// `ActiveRecord::Relation.new(<target>).joins(<join_sql>).where(<where_sql>,
+/// @<owner_attr>)`, with the association's own scope grafted on.
+fn through_relation(
     target: &ClassId,
     join_sql: &str,
     where_sql: &str,
+    owner_attr: &Symbol,
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
@@ -3928,7 +4051,7 @@ fn through_reader_body(
                         value: crate::expr::Literal::Str { value: where_sql.to_string() },
                     },
                 ),
-                Expr::new(span(), ExprNode::Ivar { name: Symbol::from("id") }),
+                Expr::new(span(), ExprNode::Ivar { name: owner_attr.clone() }),
             ],
             block: None,
             parenthesized: true,
@@ -3939,33 +4062,10 @@ fn through_reader_body(
     // graft its receiver-less chain onto the seeded relation so the
     // reader filters the way Rails does (without it /upvoted served
     // every joined row).
-    let chain = match assoc_scope {
+    match assoc_scope {
         Some(scope_body) => graft_chain_root(scope_body, chain),
         None => chain,
-    };
-
-    // Last in the chain, after any scope graft: the scope's conditions
-    // belong to the QUERY, and this hands the finished relation the
-    // records an eager load already fetched.
-    Expr::new(
-        span(),
-        ExprNode::Send {
-            recv: Some(chain),
-            method: Symbol::from("preloaded"),
-            args: vec![
-                Expr::new(
-                    span(),
-                    ExprNode::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
-                ),
-                Expr::new(
-                    span(),
-                    ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
-                ),
-            ],
-            block: None,
-            parenthesized: true,
-        },
-    )
+    }
 }
 
 /// Replace the receiver-less root of a `where(...).order(...)` chain
@@ -12816,9 +12916,10 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
             }
             // Same restriction as has_many: FK-only batch. Scoped or
             // polymorphic has_one stays on the lazy reader until the
-            // batch can preserve those predicates.
+            // batch can preserve those predicates, and so does a
+            // `through:` one, whose key is on the hop.
             Association::HasOne {
-                name, target, foreign_key,
+                name, target, foreign_key, through: None,
                 scope: None, as_interface: None, ..
             } => {
                 if !model_exists(target) {
