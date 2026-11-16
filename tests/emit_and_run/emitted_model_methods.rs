@@ -44,7 +44,7 @@ end
     [note.title, note.changed?, restored]
   end
 
-  # Rails: [false, "plain"]
+  # Rails: [false, "plain", nil]
   def self.restore_attributes_of_a_partial_row
     Note.create!(title: "kept", body: "plain")
     note = Note.select(:id, :title).where(title: "kept").first
@@ -52,11 +52,14 @@ end
     note.restore_attributes
     after = note.changed?
     note.save!
-    [after, Note.find(note.id).body]
+    kept = Note.find(note.id).body
+    note.body = nil
+    note.save!
+    [after, kept, Note.find(note.id).body]
   end
 
   def self.run
-    check("restore_attributes_of_a_partial_row", restore_attributes_of_a_partial_row == [false, "plain"])
+    check("restore_attributes_of_a_partial_row", restore_attributes_of_a_partial_row == [false, "plain", nil])
     check("restore_attributes", restore_attributes == ["draft", "plain", false, ["body", "title"]])
     check("restore_attributes_with_nothing_pending", restore_attributes_with_nothing_pending == ["draft", false, []])
   end

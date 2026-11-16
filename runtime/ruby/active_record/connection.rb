@@ -2751,13 +2751,21 @@ module ActiveRecord
     # `restore_attribute!` writes one, answering the names it restored. A
     # write to a column the row's `select` left out is pending too, though
     # the diff may not show it (nil over the unloaded nil): restoring it
-    # drops the write, so a save leaves the column as the row holds it.
+    # drops the write and leaves the column unloaded again, so a save
+    # leaves it as the row holds it and a later write is noted afresh.
     def restore_attributes
       names = changes_to_save.keys
       names.each { |name| restore_attribute!(name) }
       wrote = @__unloaded_writes
       unless wrote.nil?
-        wrote.each { |name| names.push(name) unless names.include?(name) }
+        unloaded = @__unloaded_columns
+        unloaded = [] if unloaded.nil?
+        wrote.each do |name|
+          names.push(name) unless names.include?(name)
+          column = name.to_sym
+          unloaded.push(column) unless unloaded.include?(column)
+        end
+        @__unloaded_columns = unloaded
         @__unloaded_writes = nil
       end
       names
