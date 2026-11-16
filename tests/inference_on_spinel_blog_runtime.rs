@@ -648,7 +648,11 @@ fn untyped_subexpressions_baseline() {
     // parenthesis or a quote before it splits it, two reads of a var on
     // this RBS-less probe (+2 in active_record/relation.rb); relation.rbs
     // types it for the RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1427;
+    // MEASURED 1428 on restore_attributes (1427): its block reads each
+    // restored `name`, a var on this RBS-less probe (+1 in
+    // active_record/connection.rb); connection.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    const CEILING: usize = 1428;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

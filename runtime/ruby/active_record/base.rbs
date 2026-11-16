@@ -211,6 +211,7 @@ module ActiveRecord
     def attribute_was: (String name) -> untyped
     def clear_attribute_change: (String name) -> nil
     def restore_attribute!: (String name) -> nil
+    def restore_attributes: () -> Array[String]
     def id_previously_changed?: () -> bool
     def previously_new_record?: () -> bool
 

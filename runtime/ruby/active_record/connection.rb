@@ -2747,6 +2747,14 @@ module ActiveRecord
       nil
     end
 
+    # Rails' `restore_attributes`: every pending change written back, as
+    # `restore_attribute!` writes one, answering the names it restored.
+    def restore_attributes
+      names = changes_to_save.keys
+      names.each { |name| restore_attribute!(name) }
+      names
+    end
+
     # ---- cache_key / cache_version / cache_key_with_version ---------
     #
     # Lives HERE, not base.rb, for the same reason as the rest of this
