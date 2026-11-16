@@ -3152,20 +3152,26 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
                 matches!(&*e.node, ExprNode::Assign { target: LValue::Ivar { name: n }, .. } if n == &fk)
             };
             let whole = key_assigned(else_branch);
-            let keyed_seq = matches!(&*else_branch.node,
+            let keyed_seq = |e: &Expr| matches!(&*e.node,
                 ExprNode::Seq { exprs } if exprs.first().is_some_and(key_assigned));
-            if !whole && !keyed_seq {
+            let sequence = keyed_seq(else_branch);
+            // Classes keyed by different columns: a type switch whose every
+            // arm assigns its own key first (`when Ticket then @subject_id =
+            // value.code; …`).
+            let keyed_switch = matches!(&*else_branch.node,
+                ExprNode::Case { arms, .. } if !arms.is_empty() && arms.iter().all(|arm| keyed_seq(&arm.body)));
+            if !whole && !sequence && !keyed_switch {
                 continue;
             }
             let span = else_branch.span;
             let stash = stash_target(&name, span);
-            if whole {
+            if whole || keyed_switch {
                 let assign = else_branch.clone();
                 *else_branch = Expr::new(span, ExprNode::Seq { exprs: vec![assign, stash] });
             } else if let ExprNode::Seq { exprs } = &mut *else_branch.node {
                 exprs.push(stash);
             }
-            lc.methods.push(autosave_method(&lc.name, &name, &fk));
+            lc.methods.push(autosave_method(&lc.name, &name, &fk, keyed_switch));
             fold_autosave_call_into_hook(&mut lc.methods, &lc.name, &name);
             guard_default_on_reader(&mut lc.methods, &name, &fk);
             route_init_through_writer(lc, &name, &fk);
@@ -3346,6 +3352,7 @@ fn autosave_method(
     owner: &ClassId,
     name: &Symbol,
     fk: &Symbol,
+    rekey_through_writer: bool,
 ) -> crate::dialect::MethodDef {
     let span = Span::synthetic();
     let syn = |n| Expr::new(span, n);
@@ -3386,10 +3393,19 @@ fn autosave_method(
         then_branch: syn(ExprNode::Seq {
             exprs: vec![
                 send(cache(), "save"),
-                syn(ExprNode::Assign {
-                    target: LValue::Ivar { name: fk.clone() },
-                    value: send(cache(), "id"),
-                }),
+                // Classes keyed by different columns: the writer reads the
+                // saved record's own key, where `id` is not every class's.
+                if rekey_through_writer {
+                    syn(ExprNode::Assign {
+                        target: LValue::Attr { recv: syn(ExprNode::SelfRef), name: name.clone() },
+                        value: cache(),
+                    })
+                } else {
+                    syn(ExprNode::Assign {
+                        target: LValue::Ivar { name: fk.clone() },
+                        value: send(cache(), "id"),
+                    })
+                },
             ],
         }),
         else_branch: syn(ExprNode::Lit { value: Literal::Nil }),

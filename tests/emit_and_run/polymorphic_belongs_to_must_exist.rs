@@ -16,6 +16,11 @@ end
 end
 "##)
         .write("app/models/museum.rb", r##"class Museum < ApplicationRecord
+  validates :name, presence: true
+end
+"##)
+        .write("app/models/ticket.rb", r##"class Ticket < ApplicationRecord
+  self.primary_key = "code"
 end
 "##)
         .write("app/models/note.rb", r##"class Note < ApplicationRecord
@@ -61,6 +66,17 @@ end
     check("rewritten type invalid", !retyped.valid?)
     # Rails: a key with no type names no record.
     check("key without a type invalid", !Note.new(subject_id: fresh.id).valid?)
+    # Rails: a record keyed by its own column, assigned unsaved with its
+    # key set, is the record the writer was given.
+    ticket = Ticket.new(code: "T-7", title: "leak")
+    keyed = Note.new(body: "k")
+    keyed.subject = ticket
+    check("assigned record with its own key valid", keyed.valid? && keyed.subject.equal?(ticket))
+    # Rails: an assigned record that fails to save leaves the note saved
+    # anyway; the presence check passed on the record before the save.
+    failing = Note.new(body: "f")
+    failing.subject = Museum.new
+    check("failed record save, note still saved", failing.save == true && failing.persisted? && Museum.count == 1)
   end
 end
 "##)
@@ -70,6 +86,10 @@ end
   end
   create_table "museums", force: :cascade do |t|
     t.string "name"
+  end
+  create_table "tickets", id: false, force: :cascade do |t|
+    t.string "code", primary_key: true
+    t.string "title"
   end
   create_table "notes", force: :cascade do |t|
     t.string "body"
