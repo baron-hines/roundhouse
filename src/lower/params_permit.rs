@@ -310,7 +310,9 @@ fn element_filter(e: &Expr) -> Option<Expr> {
 fn stringify_safe_nav_param_reads(expr: &mut Expr) {
     let ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } = &mut *expr.node else { return };
     let ExprNode::Assign { target: crate::expr::LValue::Var { name: temp, .. }, value } = &*left.node else { return };
-    let params_value = is_parameters(value.ty.as_ref())
+    // A value read out of the request's params, which keeps its String keys. Not any Parameters: a `permit` result
+    // (`params.permit(:a)&.dig(:a)`) is lowered to a Symbol-keyed Hash, which its Symbol read finds.
+    let params_value = is_param_value(value.ty.as_ref())
         || matches!(&*value.node, ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "[]" && is_request_params(r));
     if !temp.as_str().starts_with("__safe_nav") || !params_value {
         return;

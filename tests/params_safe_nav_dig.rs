@@ -60,3 +60,12 @@ fn a_safe_nav_index_and_fetch_read_the_string_key() {
     assert!(!src.contains("(:os)") && !src.contains("[:os]"), "{src}");
     assert!(src.contains(r#"fetch("arch", nil)"#), "{src}");
 }
+
+/// Only a value read out of the request's params keeps its String keys: a `permit` result is lowered to a
+/// Symbol-keyed Hash, which its Symbol read finds.
+#[test]
+fn a_safe_nav_read_of_a_permit_result_keeps_its_symbol_key() {
+    let body = "    render json: { a: params.permit(:name)&.dig(:name) }";
+    let src = controller_for(BuildTarget::Spinel, body);
+    assert!(!src.contains(r#"dig("name")"#), "{src}");
+}
