@@ -86,6 +86,14 @@ raise "describe #{got.inspect}" unless got == "box / app box / local"
 puts "reopen passed"
 "##;
 
+/// [`models_app`]: Rails 8.1.4.1 never loads the reopen (Zeitwerk loads
+/// `app/models/shelf/box.rb` only for an undefined `Shelf::Box`, and the gem
+/// defined it), with eager loading or without, so the class is the gem's.
+pub const MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.kind, Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "models #{got.inspect}" unless got == ["box", "shelf box", false]
+puts "models passed"
+"##;
+
 pub const EXTRAS_ASSERTIONS: &str = r##"got = BoxLimits.describe + [Shelf::Box::LIMIT]
 raise "extras #{got.inspect}" unless got == ["box", "tagged", 3]
 puts "extras passed"
@@ -124,6 +132,13 @@ pub fn local_app() -> emit_and_run::Overlay {
         .write("lib/shelf_box_local.rb", LOCAL)
         .write("config/initializers/shelf_box_local.rb", "require Rails.root.join(\"lib/shelf_box_local\").to_s\n")
         .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// [`LOCAL`] at `app/models/shelf/box.rb`, the path Zeitwerk maps to
+/// `Shelf::Box`, with no initializer requiring it (#2093's third form).
+#[allow(dead_code)]
+pub fn models_app() -> emit_and_run::Overlay {
+    with_gem().write("app/models/shelf/box.rb", LOCAL)
 }
 
 /// The reopen that adds only `LIMIT` and `include Tagging`.

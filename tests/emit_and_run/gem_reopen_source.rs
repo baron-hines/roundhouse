@@ -17,6 +17,13 @@ fn a_gem_class_reopened_for_a_constant_and_an_include_answers_all_three() {
     contract::listed(contract::extras_app()).run_ruby(contract::EXTRAS_ASSERTIONS).assert_passes();
 }
 
+/// A reopen at the gem class's autoload path is a file Rails never loads:
+/// the class keeps the gem's methods and gains none of the file's.
+#[test]
+fn a_reopen_at_the_gem_classs_autoload_path_leaves_the_gems_class() {
+    contract::listed(contract::models_app()).run_ruby(contract::MODELS_ASSERTIONS).assert_passes();
+}
+
 /// The emitted `Shelf::Box`: one file holding each opening in load order.
 fn shelf_box(app: super::emit_and_run::Overlay) -> String {
     let (emitted, _errors) = app.emit(BuildTarget::Spinel);
