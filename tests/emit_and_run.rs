@@ -22610,3 +22610,5 @@ mod update_in_argument_position;
 mod indifferent_hash_in_plain_class;
 #[path = "emit_and_run/test_file_class_body.rs"]
 mod test_file_class_body;
+#[path = "emit_and_run/test_class_dropped_statement.rs"]
+mod test_class_dropped_statement;

@@ -14727,9 +14727,12 @@ fn ingest_included_test_helper_files<V: Vfs + ?Sized>(
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         // A test folder's file is a helper only when it holds no test
         // class; the test-file pass below reads the others.
-        if in_test_folder
-            && !ingest_test_files(&source, &entry.display().to_string()).is_ok_and(|tms| tms.is_empty())
-        {
+        // The probe's diagnostics are forgotten: the test-file pass reports them.
+        let mark = super::prism::mark();
+        let holds_tests = in_test_folder
+            && !ingest_test_files(&source, &entry.display().to_string()).is_ok_and(|tms| tms.is_empty());
+        super::prism::rewind(mark);
+        if holds_tests {
             continue;
         }
         let Some(classes) =
