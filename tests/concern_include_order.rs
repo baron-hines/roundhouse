@@ -64,6 +64,10 @@ const CONCERNS: &[(&str, &str)] = &[
     ("class_hook", "module ClassHook\n  extend ActiveSupport::Concern\n\n  included do\n    def self.label\n      \"class hook\"\n    end\n  end\n\n  def label\n    \"class hook instance\"\n  end\nend\n"),
     // A plain module including HookDef: the hook runs on it, not on its includer.
     ("hook_def_wrapper", "module HookDefWrapper\n  include HookDef\n\n  def wrapper_label\n    \"wrapper\"\n  end\nend\n"),
+    // One statement of a concern including two hook-defining concerns.
+    ("hook_one", "module HookOne\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook one\"\n    end\n  end\nend\n"),
+    ("hook_two", "module HookTwo\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook two\"\n    end\n  end\nend\n"),
+    ("hook_bundle", "module HookBundle\n  extend ActiveSupport::Concern\n  include HookOne, HookTwo\nend\n"),
 ];
 
 /// (controller, its include lines, Ruby's `label`).
@@ -100,6 +104,9 @@ const CASES: &[(&str, &str, &str)] = &[
     // [WrappedHook, PlainDef, HookDefWrapper, HookDef]: HookDef's hook
     // defined `label` on HookDefWrapper, below PlainDef.
     ("wrapped_hook", "  include HookDefWrapper\n  include PlainDef\n", "plain"),
+    // [BundledHook, HookBundle, HookOne, HookTwo]: `include HookOne, HookTwo`
+    // records HookTwo first, so HookOne's hook runs last and its `label` stands.
+    ("bundled_hook", "  include HookBundle\n", "hook one"),
 ];
 
 /// Cases that need more than a bare controller: (controller, its source,
@@ -112,6 +119,11 @@ const SPECIAL: &[(&str, &str, &str)] = &[
     ("super_mn", "class SuperMnController < SuperParentController\n  include SuperM\n  include SuperN\n\n  def show\n    render json: { label: label }\n  end\nend\n", "super n"),
     // HookDef's `included do` defines `label` on the controller itself.
     ("hoisted", "class HoistedController < ApplicationController\n  include HookDef\n  include PlainDef\n\n  def show\n    render json: { label: label }\n  end\nend\n", "hook"),
+    // HookDef's hook defines `label` on this parent.
+    ("hook_parent", "class HookParentController < ApplicationController\n  include HookDef\n\n  def show\n    render json: { label: label }\n  end\nend\n", "hook"),
+    // [InheritedHook, PlainDef, HookParent, HookDef]: the parent has HookDef,
+    // so the child's `include HookDef` runs no hook, and PlainDef is found first.
+    ("inherited_hook", "class InheritedHookController < HookParentController\n  include PlainDef\n  include HookDef\n\n  def show\n    render json: { label: label }\n  end\nend\n", "plain"),
     // DelegateTwo's hook runs last, so its `delegate` defines `label`.
     ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
