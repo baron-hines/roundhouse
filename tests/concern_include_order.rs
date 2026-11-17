@@ -60,6 +60,10 @@ const CONCERNS: &[(&str, &str)] = &[
     ("hook_a", "module HookA\n  def label\n    \"hook a\"\n  end\nend\n"),
     ("hook_b", "module HookB\n  def label\n    \"hook b\"\n  end\nend\n"),
     ("hook_wrapper", "module HookWrapper\n  extend ActiveSupport::Concern\n\n  included do\n    include HookA\n  end\nend\n"),
+    // A class-side def in `included do` beside an instance def of the same name.
+    ("class_hook", "module ClassHook\n  extend ActiveSupport::Concern\n\n  included do\n    def self.label\n      \"class hook\"\n    end\n  end\n\n  def label\n    \"class hook instance\"\n  end\nend\n"),
+    // A plain module including HookDef: the hook runs on it, not on its includer.
+    ("hook_def_wrapper", "module HookDefWrapper\n  include HookDef\n\n  def wrapper_label\n    \"wrapper\"\n  end\nend\n"),
 ];
 
 /// (controller, its include lines, Ruby's `label`).
@@ -90,6 +94,12 @@ const CASES: &[(&str, &str, &str)] = &[
     // [HookInclude, HookB, HookA, HookWrapper]: the hook put HookA there,
     // so the last `include HookA` moves nothing.
     ("hook_include", "  include HookWrapper\n  include HookB\n  include HookA\n", "hook b"),
+    // [ClassHookDef, PlainDef, ClassHook]: the hook's `def self.label` is
+    // class-side, so ClassHook's instance `label` is an ancestor's.
+    ("class_hook_def", "  include ClassHook\n  include PlainDef\n", "plain"),
+    // [WrappedHook, PlainDef, HookDefWrapper, HookDef]: HookDef's hook
+    // defined `label` on HookDefWrapper, below PlainDef.
+    ("wrapped_hook", "  include HookDefWrapper\n  include PlainDef\n", "plain"),
 ];
 
 /// Cases that need more than a bare controller: (controller, its source,
