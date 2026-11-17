@@ -174,7 +174,7 @@ fn a_gem_that_shapes_a_held_model_is_observed_and_written_where_the_model_is() {
     assert!(persistence.contains("File.expand_path(\"persistence.rb\", __dir__)"), "{persistence}");
     assert!(out.join("app/models/aasm/persistence/active_record_persistence.rb").exists());
     // Its `class_eval do scope … end` goes with the observed `scope`, and the branch this Rails rules out goes too.
-    let created = model.split("def self.aasm_create_scope").nth(1).unwrap_or_default();
+    let created = model.split("def self.aasm_create_scope").nth(1).expect("aasm_create_scope in the Spinel model");
     let created = &created[..created.find("\n  def ").unwrap_or(created.len())];
     assert!(!created.contains("class_eval") && !created.contains("named_scope"), "{created}");
 

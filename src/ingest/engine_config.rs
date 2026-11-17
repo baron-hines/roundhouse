@@ -352,14 +352,24 @@ pub(super) fn settles(cond: &Expr) -> Option<bool> {
     }
     match &*cond.node {
         ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
-        ExprNode::BoolOp { op, left, right, .. } => match (op, settles(left), settles(right)) {
-            (crate::expr::BoolOpKind::Or, Some(true), _) | (crate::expr::BoolOpKind::Or, _, Some(true)) => Some(true),
-            (crate::expr::BoolOpKind::And, Some(false), _) | (crate::expr::BoolOpKind::And, _, Some(false)) => Some(false),
-            (crate::expr::BoolOpKind::Or, Some(a), Some(b)) => Some(a || b),
-            (crate::expr::BoolOpKind::And, Some(a), Some(b)) => Some(a && b),
-            _ => None,
+        // Not from the right alone: Ruby runs the left operand first, which an unsettled one may raise in.
+        ExprNode::BoolOp { op, left, right, .. } => match (op, settles(left)?) {
+            (crate::expr::BoolOpKind::Or, true) => Some(true),
+            (crate::expr::BoolOpKind::And, false) => Some(false),
+            _ => settles(right),
         },
         ExprNode::Send { recv: Some(l), method, args, block: None, .. } if args.len() == 1 => {
+            // Not through f64 for two Integers: past 2**53 two of them convert to one float.
+            if let (ExprNode::Lit { value: Literal::Int { value: a } }, ExprNode::Lit { value: Literal::Int { value: b } }) = (&*l.node, &*args[0].node) {
+                return match method.as_str() {
+                    ">=" => Some(a >= b),
+                    ">" => Some(a > b),
+                    "<=" => Some(a <= b),
+                    "<" => Some(a < b),
+                    "==" => Some(a == b),
+                    _ => None,
+                };
+            }
             let (Some(a), Some(b)) = (number(l), number(&args[0])) else { return None };
             match method.as_str() {
                 ">=" => Some(a >= b),
@@ -2021,6 +2031,31 @@ fn initializer_block<'pr>(node: &Node<'pr>) -> Option<(Option<String>, Vec<Node<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cmp(l: Expr, op: &str, r: Expr) -> Expr {
+        let node = ExprNode::Send { recv: Some(l), method: Symbol::from(op), args: vec![r], block: None, parenthesized: false };
+        Expr::new(crate::span::Span::synthetic(), node)
+    }
+    fn int(v: i64) -> Expr {
+        Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: v } })
+    }
+    fn and(left: Expr, right: Expr) -> Expr {
+        let node = ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, surface: Default::default(), left, right };
+        Expr::new(crate::span::Span::synthetic(), node)
+    }
+
+    #[test]
+    fn integers_past_two_to_the_53_compare_exactly() {
+        assert_eq!(settles(&cmp(int(9007199254740993), ">", int(9007199254740992))), Some(true));
+    }
+
+    #[test]
+    fn a_false_right_operand_does_not_settle_an_unsettled_left_one() {
+        let float = Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Float { value: 1.0 } });
+        let unsettled = cmp(int(8), "<", Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: "3".into() } }));
+        assert_eq!(settles(&and(unsettled, cmp(int(1), ">", int(2)))), None);
+        assert_eq!(settles(&and(cmp(int(8), ">=", int(3)), cmp(float, "<", int(2)))), Some(true));
+    }
 
     fn dead_after(source: &str) -> usize {
         let parsed = super::super::prism::parse_silent(source.as_bytes());
