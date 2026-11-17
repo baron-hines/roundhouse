@@ -301,19 +301,24 @@ fn key_offset(text: &str, key: &str, from: usize, top_level: bool) -> Option<usi
 /// comment: a `#` at the line's start or after whitespace, outside quotes.
 /// A quote opens a quoted scalar only where a scalar starts (the line's
 /// start, or after `:`, `-`, `[`, `{` or `,` and a space); elsewhere, as in
-/// `don't`, it is a plain scalar's own character. A quote left open reads as
-/// still open, so an unclear line counts as uncommented and refuses.
+/// `don't`, it is a plain scalar's own character. Inside single quotes, `''`
+/// is an escaped quote. A quote left open reads as still open, so an unclear
+/// line counts as uncommented and refuses.
 fn in_yaml_comment(prefix: &str) -> bool {
     let (mut single, mut double, mut escaped, mut prev) = (false, false, false, ' ');
     // The last character outside whitespace and quotes; ' ' at the line's start.
     let mut last = ' ';
-    for c in prefix.chars() {
+    let mut chars = prefix.chars().peekable();
+    while let Some(c) = chars.next() {
         let starts_scalar = (prev.is_whitespace() || "[{,".contains(prev)) && " :-[{,".contains(last);
         match c {
             _ if escaped => escaped = false,
             '\\' if double => escaped = true,
             '\'' if double => {}
             '"' if single => {}
+            '\'' if single && chars.peek() == Some(&'\'') => {
+                chars.next();
+            }
             '\'' if single => single = false,
             '"' if double => double = false,
             '\'' if starts_scalar => single = true,

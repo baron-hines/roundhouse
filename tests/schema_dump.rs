@@ -346,6 +346,7 @@ fn an_unparsed_file_refuses_a_named_file() {
         "  extra: { note: 'a #b', schema_dump: catalog_schema.rb }\n",
         "  extra: { note: \"a \\\" #b\", schema_dump: catalog_schema.rb }\n",
         "  extra: { note: a#b, schema_dump: catalog_schema.rb }\n",
+        "  extra: { note: 'it''s # data', schema_dump: catalog_schema.rb }\n",
     ] {
         let named = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
