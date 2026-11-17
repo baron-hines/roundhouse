@@ -121,6 +121,14 @@ fn source_file_path(e: &Expr) -> Option<String> {
         return None;
     }
     let out = EMITTED_FILE.with(|c| c.borrow().clone())?;
+    // Not resolved from the output root: a gem's mount is not carried there, only its files, each where the tree emits it.
+    if value.starts_with(&format!("{}/", crate::ingest::source_gems::MOUNT)) {
+        if !value.ends_with(".rb") {
+            return Some("__dir__".to_string());
+        }
+        let name = out.file_name()?.to_string_lossy().into_owned();
+        return Some(format!("File.expand_path({}, __dir__)", emit_node(&ExprNode::Lit { value: Literal::Str { value: name } })));
+    }
     let ups = out.parent().map_or(0, |d| d.components().count());
     let rel = format!("{}{}", "../".repeat(ups), value);
     Some(format!(
