@@ -22604,3 +22604,5 @@ mod translation_helper_test_include;
 mod view_url_for_hash;
 #[path = "emit_and_run/duration_name_on_object.rs"]
 mod duration_name_on_object;
+#[path = "emit_and_run/update_in_argument_position.rs"]
+mod update_in_argument_position;
