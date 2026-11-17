@@ -22257,6 +22257,8 @@ mod has_many_writer;
 mod association_scopes;
 #[path = "emit_and_run/association_relation_calls.rs"]
 mod association_relation_calls;
+#[path = "emit_and_run/concern_association_includers.rs"]
+mod concern_association_includers;
 #[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
 mod polymorphic_belongs_to_scope;
 #[path = "emit_and_run/belongs_to_scope_join.rs"]
