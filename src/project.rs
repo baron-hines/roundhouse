@@ -3628,6 +3628,10 @@ fn target_files_inner(
     let app = if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Roda | BuildTarget::Futamura) {
         let mut trimmed = app.clone();
         crate::lower::for_each_hook_body(&mut trimmed, &mut |expr| {
+            // Only the Ruby family writes the `prepend` line back; the
+            // rest have no module to prepend, so the warning their own
+            // lowering gives it stays.
+            expr.decisions &= !crate::expr::CONCERN_PREPEND;
             if expr.decisions & crate::expr::INHERITED_CLASS_BODY != 0 {
                 expr.decisions &= !(crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_CLASS_BODY);
             }

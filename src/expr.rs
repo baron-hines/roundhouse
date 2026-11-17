@@ -102,6 +102,12 @@ pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
 /// replays where the source has it (`ingest::app_extension_calls`).
 pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
 
+/// A model's class-body `prepend Concern`, whose `prepended do` items the
+/// concern splice carried into the body and whose line the Ruby family
+/// writes back (the module's instance methods then sit ahead of the
+/// class's own, reaching them through `super`).
+pub const CONCERN_PREPEND: u64 = 1 << 60;
+
 /// A value-only inherited call: non-Ruby targets retain their previous warning.
 pub const INHERITED_CLASS_BODY: u64 = 1 << 52;
 
