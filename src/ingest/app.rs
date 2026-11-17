@@ -5191,6 +5191,105 @@ fn splice_concern_to_param_into_includers(app: &mut App) {
     }
 }
 
+/// An opening's `include` statements, each the modules it names in the
+/// order written: `include A, B` is one statement of two. The includes of
+/// one statement share its span. An opening without a span per include
+/// (one a lowering built) has each as a statement of its own.
+fn include_statements(lc: &LibraryClass) -> Vec<Vec<crate::ident::ClassId>> {
+    if lc.include_spans.len() != lc.includes.len() {
+        return lc.includes.iter().map(|m| vec![m.clone()]).collect();
+    }
+    let mut out: Vec<Vec<crate::ident::ClassId>> = Vec::new();
+    let mut last: Option<crate::span::Span> = None;
+    for (module, span) in lc.includes.iter().zip(&lc.include_spans) {
+        match out.last_mut() {
+            Some(group) if last == Some(*span) && !span.is_synthetic() => group.push(module.clone()),
+            _ => out.push(vec![module.clone()]),
+        }
+        last = Some(*span);
+    }
+    out
+}
+
+/// Whether an opening runs `extend ActiveSupport::Concern`, which the
+/// ingest keeps as one of its unmodelled calls.
+fn extends_active_support_concern(lc: &LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| {
+        let crate::expr::ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return false };
+        method.as_str() == "extend"
+            && args.iter().any(|arg| {
+                matches!(&*arg.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
+            })
+    })
+}
+
+/// Ruby's ancestor order for the modules an includer reaches, nearest
+/// first, from each module's `include` statements.
+///
+/// `include X` puts X and its ancestors directly above the includer. A
+/// module of those already there stays where it is, and the ones after
+/// it go below it (`[Plain, AB, B, A]` for `include B; include AB` with
+/// `AB` including `A` and then `B`). A statement naming several modules
+/// includes the last first, so `include A, B` keeps `A` ahead of `B`.
+///
+/// A module that extends `ActiveSupport::Concern` does not include the
+/// concerns it names: it records them, and its includer includes them
+/// first, then the concern itself, which it skips when already there
+/// (`[Conc, AB, A, B]` for the same three as concerns).
+struct Ancestry<'a> {
+    statements: &'a HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>>,
+    concerns: &'a crate::det::HashSet<crate::ident::ClassId>,
+}
+
+impl Ancestry<'_> {
+    /// Below an includer whose include statements are `statements`.
+    fn of_statements(&self, statements: &[Vec<crate::ident::ClassId>]) -> Vec<crate::ident::ClassId> {
+        let mut chain = Vec::new();
+        for statement in statements {
+            for module in statement.iter().rev() {
+                self.include(&mut chain, module, 0);
+            }
+        }
+        chain
+    }
+
+    fn include(&self, chain: &mut Vec<crate::ident::ClassId>, module: &crate::ident::ClassId, depth: usize) {
+        // A cycle of includes is a load error in Ruby; it stops here.
+        if depth > 64 {
+            return;
+        }
+        let concern = self.concerns.contains(module);
+        if concern && chain.contains(module) {
+            return;
+        }
+        let mut own = Vec::new();
+        let mut dependencies = Vec::new();
+        for statement in self.statements.get(module).into_iter().flatten() {
+            for nested in statement.iter().rev() {
+                if concern && self.concerns.contains(nested) {
+                    dependencies.push(nested.clone());
+                } else {
+                    self.include(&mut own, nested, depth + 1);
+                }
+            }
+        }
+        for dependency in &dependencies {
+            self.include(chain, dependency, depth + 1);
+        }
+        let mut at = 0;
+        for ancestor in std::iter::once(module).chain(own.iter()) {
+            match chain.iter().position(|c| c == ancestor) {
+                Some(found) => at = found + 1,
+                None => {
+                    chain.insert(at, ancestor.clone());
+                    at += 1;
+                }
+            }
+        }
+    }
+}
+
 fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::ConstResolver) {
     use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::ty::{Row, Ty};
@@ -5238,6 +5337,11 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
     // arm known to run it replaces as any definition does, in one known
     // not to it is left out, and when only running the program answers
     // the earlier definition stays ahead of it.
+    // Each module's `include` statements across its openings, in load
+    // order, and the modules that extend `ActiveSupport::Concern`: what
+    // `Ancestry` needs to put the modules in Ruby's ancestor order.
+    let mut module_statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+    let mut concerns: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
     let settler = super::settled_conditionals::Settler::of(app, resolver);
     for lc in openings_gem_first(&app.library_classes, &app.sources) {
         let conditional = |m: &crate::dialect::MethodDef| settler.defines(lc, m).is_none();
@@ -5260,8 +5364,13 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         methods.extend(opened);
         module_constants.entry(lc.name.clone()).or_default().extend(lc.constants.iter().map(|(n, _)| n.clone()));
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        module_statements.entry(lc.name.clone()).or_default().extend(include_statements(lc));
+        if extends_active_support_concern(lc) {
+            concerns.insert(lc.name.clone());
+        }
     }
     let filter_edges = filter_dependency_edges(app, &module_includes);
+    let ancestry = Ancestry { statements: &module_statements, concerns: &concerns };
 
     // controller -> (spliced method -> the module it came from). Built
     // alongside the splice and stored on the App: the copy is typed
@@ -5291,10 +5400,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             continue;
         }
         // Two orders, because Ruby has two. METHOD precedence follows
-        // the ancestor chain — `include A, B` puts A ahead of B, and a
-        // module ahead of what it includes — so the transitive closure
-        // below walks the list as written, dependencies after, and the
-        // first definition of a name wins. FILTER registration is the
+        // the ancestor chain (`Ancestry`): the first definition of a name
+        // in it wins. FILTER registration is the
         // order the `included` hooks fire, which is the reverse: Ruby
         // processes a multi-argument `include` last-argument-first, and
         // ActiveSupport::Concern includes a concern's dependencies
@@ -5309,20 +5416,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .zip(filter_registration_by_statement(&include_groups, &filter_edges))
             .flat_map(|((at, _), modules)| modules.into_iter().map(move |module| (*at, module)))
             .collect();
-        // Transitive closure, in include order.
-        let mut queue = includes;
-        let mut seen: std::collections::BTreeSet<crate::ident::ClassId> =
-            queue.iter().cloned().collect();
-        let mut qi = 0;
-        while qi < queue.len() {
-            let m = queue[qi].clone();
-            qi += 1;
-            for nested in module_includes.get(&m).into_iter().flatten() {
-                if seen.insert(nested.clone()) {
-                    queue.push(nested.clone());
-                }
-            }
-        }
+        // Every module the controller reaches, nearest ancestor first.
+        let queue = ancestry.of_statements(&include_groups);
 
         let mut defined: crate::det::HashSet<crate::ident::Symbol> = controller
             .body
