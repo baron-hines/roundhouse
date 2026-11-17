@@ -205,6 +205,7 @@ pub fn verify(options: &Options) -> Result<Outcome, String> {
     let temporary = std::env::temp_dir().join(format!("fractal-verify-{}-{number}", std::process::id()));
     let directory = options.keep.clone().unwrap_or_else(|| temporary.clone());
     fs::create_dir_all(&directory).map_err(|error| format!("create {}: {error}", directory.display()))?;
+    let mut temporary = Temporary(options.keep.is_none().then_some(temporary));
     // Ruby runs from the app's root, so every path handed to it is absolute.
     let directory = directory.canonicalize().map_err(|error| format!("resolve {}: {error}", directory.display()))?;
     let script = directory.join("fingerprint.rb");
@@ -221,17 +222,28 @@ pub fn verify(options: &Options) -> Result<Outcome, String> {
         // a process killed outright.
         let _interrupts = HoldInterrupts::new();
         let restore = Restore::save(&app, &report.rewritten, &directory.join("originals"))?;
-        super::apply(&options.overlay, &app)?;
-        let booted = boot(&rewritten_path);
+        // Until the app is restored, the copies of its originals stay.
+        let removable = temporary.0.take();
+        let booted = super::apply(&options.overlay, &app).and_then(|_| boot(&rewritten_path));
         restore.finish()?;
+        temporary.0 = removable;
         booted?;
     }
     let original: Fingerprint = read_json(&original_path)?;
     let rewritten: Fingerprint = read_json(&rewritten_path)?;
-    if options.keep.is_none() {
-        let _ = fs::remove_dir_all(&temporary);
-    }
     Ok(compare(&original, &rewritten, &report.rewrites))
+}
+
+/// The working directory `verify` made itself, removed on every return,
+/// failed or not.
+struct Temporary(Option<PathBuf>);
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.0 {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
 }
 
 fn read_json<Value: for<'json> Deserialize<'json>>(path: &Path) -> Result<Value, String> {
