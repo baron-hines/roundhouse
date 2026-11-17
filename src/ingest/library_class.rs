@@ -3607,6 +3607,7 @@ fn walk_decl_body_with_visibility<'pr>(
                             let mut copy = copy_aliased_method(source, to);
                             copy.name_span = call.span;
                             inner.methods.push(copy);
+                            super::inherited_alias::resolved(call.span);
                         }
                         _ => kept.push(call),
                     }
@@ -3701,7 +3702,13 @@ fn walk_decl_body_with_visibility<'pr>(
                     out.methods.push(method);
                     continue;
                 }
-                if let Some(source) = out.methods.iter().rposition(|method| method.name.as_str() == from && method.receiver == receiver) {
+                // Under `extend self` a def above is kept in its class-method form alone (chunky_png's
+                // `alias from_hsb from_hsv` in `module Color; extend self`), which the alias copies. Not under
+                // `module_function`, whose includer keeps the private instance alias the class form would lose.
+                let promoted = receiver == MethodReceiver::Instance && extend_self_active;
+                if let Some(source) = out.methods.iter().rposition(|method| {
+                    method.name.as_str() == from && (method.receiver == receiver || (promoted && method.receiver == MethodReceiver::Class))
+                }) {
                     let mut copy = copy_aliased_method(&out.methods[source], to.as_str());
                     copy.name_span = Span {
                         file: super::sources::file_id(file),
@@ -3715,14 +3722,14 @@ fn walk_decl_body_with_visibility<'pr>(
                 // One an ancestor may define: the support walk captures
                 // it as the call it is, and `inherited_alias::settle`
                 // looks the original up once every file is walked.
+                let span = Span {
+                    file: super::sources::file_id(file),
+                    start: alias.location().start_offset() as u32,
+                    end: alias.location().end_offset() as u32,
+                };
                 if super::inherited_alias::is_capturing()
                     && matches!(mode, DeclBodyMode::Instance | DeclBodyMode::SingletonClass { included_hook: true, .. })
                 {
-                    let span = Span {
-                        file: super::sources::file_id(file),
-                        start: alias.location().start_offset() as u32,
-                        end: alias.location().end_offset() as u32,
-                    };
                     out.unknown_calls.push(super::inherited_alias::capture(to.as_str(), from.as_str(), span));
                     continue;
                 }
