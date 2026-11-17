@@ -148,9 +148,20 @@ an app's own json renderer, uploads and `deep_munge`), and the `views
 helpers` group what a view's helpers resolve to (without `helper :all`,
 modules a controller declares, `url_for` of a Hash, `capture` arguments,
 TagHelper, NumberHelper and TranslationHelper includes); their Spinel
-variants run the same file with `spin test`. Each probe's `_on_spinel`
-variant carries the same ignore; once it passes, its reason goes back to
-`requires the Spinel toolchain`.
+variants run the same file with `spin test`. The `test framework` group
+runs a test file against what Minitest and `ActiveSupport::TestCase` do
+with it (lifecycle hooks, assertion counts, `assert_difference`'s value,
+a fresh execution context per test, setup blocks and tests a support
+module's Concern declares, a test file's own classes and statements,
+`enqueued_jobs_with` and the deprecation assertions), and the `routes`
+group what a route helper and the router answer (positional and keyword
+path params, `default_url_options`, a trailing options Hash, scope
+requirements named by a constant, `recognized_request_for`).
+`Overlay::run_tests` loads several emitted test files into one process,
+as a suite run does; a probe that needs that has no Spinel variant,
+since Spinel builds each test file as a program of its own. Each probe's
+`_on_spinel` variant carries the same ignore; once it passes, its reason
+goes back to `requires the Spinel toolchain`.
 
 ## Complete local verification
 
