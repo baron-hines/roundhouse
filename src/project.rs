@@ -5303,6 +5303,22 @@ fn ruby_family_runtime_files(
     let _registry = crate::lower::model_to_library::share_request_finder_registry(&app.models, &app.schema);
     let _writers = crate::lower::model_to_library::share_module_writers(app);
     let (mut files, test_stems) = spinel_files(app, fixture, param_binds)?;
+    // Not loaded up front on the CRuby tree: a gem file's stub is there for a path the gem builds, which CRuby loads
+    // when the gem asks, after the file programs and autoloads that load its classes in order.
+    let stub_require = format!("require_relative \"../{}/", crate::ingest::source_gems_mount());
+    if let Some((_, models)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
+        let stubs: Vec<String> = models
+            .lines()
+            .filter_map(|l| l.strip_prefix(&stub_require).map(|rest| format!("{}/{}", crate::ingest::source_gems_mount(), rest.trim_end_matches('"'))))
+            .collect();
+        *models = models.lines().filter(|l| !l.starts_with(&stub_require)).map(|l| format!("{l}\n")).collect();
+        // ...but one the gem requires by a literal name is loaded as Bundler loads the gem: a path built to it
+        // answers false, as CRuby's does.
+        let required = gem_literally_required(app);
+        for stub in stubs.iter().filter(|stub| required.iter().any(|r| r.ends_with(&format!("/{stub}.rb")))) {
+            models.push_str(&format!("$LOADED_FEATURES << File.realpath({:?}, __dir__)\n", format!("../{stub}.rb")));
+        }
+    }
 
     files.retain(|(p, _)| p != "runtime/db.rb" && p != "runtime/faye_websocket.rb");
     // Spinel's stand-ins for rack's Rack::Request and Rack::Response and Ruby's SimpleDelegator: the ruby family's gems load the real ones.
@@ -8797,7 +8813,7 @@ fn apply_gem_file_stubs(files: &mut Vec<(String, String)>, app: &App) {
     use std::fmt::Write;
     let mount = format!("{}/", crate::ingest::source_gems_mount());
     let have: crate::det::HashSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
-    let mut stubs: Vec<(String, String)> = Vec::new();
+    let mut stubs: Vec<(String, String, Vec<String>)> = Vec::new();
     for (source, names) in &app.library_class_files {
         let source = normalize_source(source);
         let Some(at) = source.find(&mount) else { continue };
@@ -8808,10 +8824,12 @@ fn apply_gem_file_stubs(files: &mut Vec<(String, String)>, app: &App) {
         let depth = stub.matches('/').count();
         let mut body = String::new();
         let mut seen = crate::det::HashSet::default();
+        let mut targets: Vec<String> = Vec::new();
         // (the file's own program, where the tree carries one, is what loading the file runs)
         let program = format!("app/models/roundhouse_files/{stub}");
         if have.contains(&program) {
             writeln!(body, "require_relative {:?}", format!("{}{}", "../".repeat(depth), program.trim_end_matches(".rb"))).unwrap();
+            targets.push(program.clone());
         }
         for name in names {
             let owner = crate::emit::ruby::library_file_owner(name.0.as_str(), app);
@@ -8820,21 +8838,40 @@ fn apply_gem_file_stubs(files: &mut Vec<(String, String)>, app: &App) {
                 continue;
             }
             writeln!(body, "require_relative {:?}", format!("{}{}", "../".repeat(depth), target.trim_end_matches(".rb"))).unwrap();
+            targets.push(target);
         }
         if !body.is_empty() {
-            stubs.push((stub, body));
+            stubs.push((stub, body, targets));
         }
     }
     if stubs.is_empty() {
         return;
     }
     stubs.sort();
+    // (so Spinel compiles each, which a path built at run time can then name)
     if let Some((_, models)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
-        for (stub, _) in &stubs {
+        for (stub, _, _) in &stubs {
             writeln!(models, "require_relative {:?}", format!("../{}", stub.trim_end_matches(".rb"))).unwrap();
         }
     }
-    files.extend(stubs);
+    files.extend(stubs.into_iter().map(|(stub, body, _)| (stub, body)));
+}
+
+/// The gem files another gem file requires by a literal name (normalized source paths).
+fn gem_literally_required(app: &App) -> crate::det::HashSet<String> {
+    let known: crate::det::HashSet<String> = app.sources.iter().map(|f| normalize_source(&f.path)).collect();
+    let mut out = crate::det::HashSet::default();
+    for program in &app.file_programs {
+        let from = normalize_source(&program.source);
+        for item in all_program_items(&program.items) {
+            if let crate::app::ProgramItem::Require { feature, relative, .. } = item
+                && let Some(target) = resolve_gem_require(&known, &from, feature, *relative)
+            {
+                out.insert(target);
+            }
+        }
+    }
+    out
 }
 
 fn apply_models_aggregator(files: &mut Vec<(String, String)>, app: &App) {
