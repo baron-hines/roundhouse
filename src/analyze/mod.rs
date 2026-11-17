@@ -2187,7 +2187,11 @@ impl Analyzer {
                     stems: &[Symbol],
                     out: &mut HashMap<Symbol, Vec<Ty>>,
                 ) {
-                    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+                    // Bare, or through `Rails.application.routes.url_helpers`
+                    // (a model's spelling).
+                    if let ExprNode::Send { recv, method, args, .. } = &*e.node
+                        && recv.as_ref().is_none_or(crate::lower::controller_to_library::rewrites::is_rails_url_helpers_chain)
+                    {
                         let m = method.as_str();
                         let stem = m
                             .strip_suffix("_path")
@@ -2234,10 +2238,9 @@ impl Analyzer {
                 }
                 walk(e, &stems, &mut seeds);
             };
-            crate::lower::for_each_hook_body_ref(app, &mut collect);
-            for view in &app.views {
-                collect(&view.body);
-            }
+            // Hook bodies, views and tests: a helper only a test calls
+            // (`reply_path(comments(:one))`) is seeded by that test.
+            crate::lower::for_each_forwarding_body_ref(app, &mut collect);
         }
 
         let mut helpers = std::mem::take(&mut app.routes.direct_helpers);

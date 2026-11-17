@@ -1960,10 +1960,16 @@ fn build_methods_with_finder_inputs(
 ///     an earlier real method, but only when that method was already
 ///     selected from the model body; generated framework methods are not
 ///     reordered by source spans.
+///   * A method a class-body macro synthesized in place in the body
+///     (`delegated_type`'s `build_<role>`, an enum's predicates) yields
+///     to a real `def` written after it, as Ruby's later definition
+///     replaces it. A `def` written before the macro still wins.
 fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &HashSet<crate::ident::Symbol>) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
     let mut selected_source_methods = HashSet::default();
+    // The body's own synthesized methods (a class-body macro's, in place).
+    let mut macro_methods: HashSet<(crate::ident::Symbol, crate::dialect::MethodReceiver)> = HashSet::default();
     for item in &model.body {
         let ModelBodyItem::Method { method, .. } = item else { continue };
         if let Some(idx) = methods
@@ -2032,12 +2038,20 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &Hash
                 selected_source_methods.insert(method.name_span);
                 continue;
             }
-            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate) {
+            // A class-body macro's generated method (`delegated_type`'s
+            // `build_<role>`, synthesized in place) yields to a `def` the
+            // body writes after it, as a later definition replaces it in Ruby.
+            let incoming_replaces_macro_method = !method.name_span.is_synthetic()
+                && macro_methods.contains(&(existing.name.clone(), existing.receiver));
+            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate || incoming_replaces_macro_method) {
                 selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
                 selected_source_methods.insert(method.name_span);
             }
             continue;
+        }
+        if method.name_span.is_synthetic() && matches!(method.kind, AccessorKind::Method) {
+            macro_methods.insert((method.name.clone(), method.receiver));
         }
         methods.push(method.clone());
         selected_source_methods.insert(method.name_span);
