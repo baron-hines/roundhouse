@@ -240,6 +240,27 @@ raise "describe #{got.inspect}" unless got == "box / app box / sourced"
 puts "transitive passed"
 "##;
 
+/// A `class Shelf::Box` reopen in the initializer whose method calls a
+/// helper only the initializer defines. Ruby answers `box / app box /
+/// sourced`.
+#[allow(dead_code)]
+pub fn reopen_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nclass Shelf::Box\n  def self.local_tag\n    TagSource.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper whose parameter default reads another initializer
+/// helper (`def self.tag(value = TagSource.tag)`). Ruby answers the same.
+#[allow(dead_code)]
+pub fn class_eval_default_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nmodule LabelHelper\n  def self.tag(value = TagSource.tag)\n    value\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// [`class_eval_helper_app`] with the helper named from the top level,
 /// `::LabelHelper.tag`. Ruby answers the same.
 #[allow(dead_code)]

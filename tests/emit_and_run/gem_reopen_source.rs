@@ -128,6 +128,18 @@ fn a_helper_a_kept_helper_calls_is_kept() {
     contract::listed(contract::class_eval_transitive_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
 }
 
+/// A helper a gem class's reopen in the initializer calls is kept.
+#[test]
+fn a_helper_an_initializer_reopen_calls_is_kept() {
+    contract::listed(contract::reopen_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper a kept helper's parameter default calls is kept.
+#[test]
+fn a_helper_a_parameter_default_calls_is_kept() {
+    contract::listed(contract::class_eval_default_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
 /// A helper the block names from the top level (`::LabelHelper`) is kept.
 #[test]
 fn a_helper_a_kept_class_eval_names_from_the_top_level_is_kept() {
