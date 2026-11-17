@@ -4230,7 +4230,7 @@ fn walk_decl_body_with_visibility<'pr>(
     // The `def`s a `class_eval` string loop makes, after the body's own: Ruby runs the loop where it stands, and a
     // later `def` of the body replaces one of them only by name, which no target here orders by.
     let mut from_eval: Vec<usize> = Vec::new();
-    for ((start, end), source) in evaled {
+    for ((start, end), (element_start, element_end), source) in evaled {
         let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
         let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
         let mut classes = parsed?;
@@ -4238,7 +4238,7 @@ fn walk_decl_body_with_visibility<'pr>(
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
         for include in &class.includes {
             out.includes.push(include.clone());
-            out.include_spans.push(Span { file: super::sources::file_id(file), start, end });
+            out.include_spans.push(Span { file: super::sources::file_id(file), start: element_start, end: element_end });
         }
         out.unknown_calls.extend(class.unknown_calls.iter().cloned());
         for mut method in class.methods {
@@ -4268,14 +4268,19 @@ fn walk_decl_body_with_visibility<'pr>(
 /// body Ruby evaluates it in. The loop leaves the body; each string's source comes back to be walked as one.
 // Not a loop over anything but a literal of Strings or Symbols, nor a string that reads anything else: the text is
 // known now only then.
-fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), String)>) {
+// Each string comes with the loop's span and its element's: one run of the
+// string is one statement, apart from the next element's.
+#[allow(clippy::type_complexity)]
+fn unroll_class_eval_loops<'pr>(
+    statements: Vec<ruby_prism::Node<'pr>>,
+) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), (u32, u32), String)>) {
     let mut kept = Vec::with_capacity(statements.len());
     let mut evaled = Vec::new();
     for s in statements {
         match class_eval_loop_sources(&s) {
             Some(sources) => {
                 let at = (s.location().start_offset() as u32, s.location().end_offset() as u32);
-                evaled.extend(sources.into_iter().map(|source| (at, source)));
+                evaled.extend(sources.into_iter().map(|(element, source)| (at, element, source)));
             }
             None => kept.push(s),
         }
@@ -4284,8 +4289,8 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
 }
 
 /// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
-fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
-    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<String>> {
+fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<((u32, u32), String)>> {
+    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<((u32, u32), String)>> {
         let call = s.as_call_node()?;
         if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
             return None;
@@ -4301,6 +4306,13 @@ fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
                     .or_else(|| e.as_symbol_node().map(|n| String::from_utf8_lossy(n.unescaped()).into_owned()))
             })
             .collect::<Option<_>>()?;
+        let element_spans: Vec<(u32, u32)> = call
+            .receiver()?
+            .as_array_node()?
+            .elements()
+            .iter()
+            .map(|e| (e.location().start_offset() as u32, e.location().end_offset() as u32))
+            .collect();
         let block = call.block()?.as_block_node()?;
         let params: Vec<_> = block.parameters()?.as_block_parameters_node()?.parameters()?.requireds().iter().collect();
         let [param] = params.as_slice() else { return None };
@@ -4335,7 +4347,13 @@ fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
                 pieces.push(None);
             }
         }
-        Some(elements.iter().map(|el| pieces.iter().map(|p| p.clone().unwrap_or_else(|| el.clone())).collect()).collect())
+        Some(
+            elements
+                .iter()
+                .zip(element_spans)
+                .map(|(el, at)| (at, pieces.iter().map(|p| p.clone().unwrap_or_else(|| el.clone())).collect()))
+                .collect(),
+        )
     };
     unrolled(s)
 }
