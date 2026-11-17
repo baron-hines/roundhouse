@@ -6,21 +6,27 @@
 //! whose constant is already defined the same way. A gem `Bundler.require`
 //! loads defines its constants before the app's autoloaders are set up, so
 //! the app's file at that path is never read, with eager loading or
-//! without. A file a boot file names (`require Rails.root.join("app/…")`)
+//! without. A file the boot loads by path (`require Rails.root.join(…)`,
+//! `require_relative`, from a boot file or from a file one of those loads)
 //! is still loaded by that `require`, so it stays.
 //!
 //! The file is hidden from the ingest's tree ([`HiddenVfs`]) rather than
 //! skipped by each pass, so no pass reads it.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use ruby_prism::Node;
 
 use crate::det::HashSet;
 use crate::vfs::Vfs;
 
 use super::source_gems::SourceGem;
+use super::util::{class_name_path, constant_id_str, constant_path_segments_strs, module_name_path, string_value};
 
 /// The app files under an autoload root whose constant, as Zeitwerk names
-/// it from the file's path, one of `gems`' `lib/` files defines.
+/// it from the file's path with the app's inflections, one of `gems`'
+/// `lib/` files defines. Read before anything is hidden, so `vfs` is the
+/// whole tree.
 pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], gems: &[SourceGem]) -> HashSet<PathBuf> {
     let mut out = HashSet::default();
     if gems.is_empty() {
@@ -40,7 +46,7 @@ pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], 
                 .filter(|f| !f.strip_prefix(&lib).is_ok_and(|rel| rel.starts_with("generators"))),
         );
     }
-    let defined = super::railtie_middleware::defined_constants(vfs, &gem_files);
+    let defined = defined_constants(vfs, &gem_files);
     if defined.is_empty() {
         return out;
     }
@@ -69,7 +75,7 @@ pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], 
     autoload_roots.retain(|root| !in_gem(root) && vfs.is_dir(root));
     autoload_roots.sort();
     autoload_roots.dedup();
-    let boot_text = boot_text(vfs, dir);
+    let mut loaded: Option<HashSet<PathBuf>> = None;
     let mut seen: HashSet<PathBuf> = HashSet::default();
     for root in &autoload_roots {
         for file in super::app::read_rb_files(vfs, root).unwrap_or_default() {
@@ -89,8 +95,8 @@ pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], 
             if !defined.contains(&crate::naming::camelize_path(rel)) {
                 continue;
             }
-            let from_app = file.strip_prefix(dir).ok().and_then(Path::to_str).map(|p| p.trim_end_matches(".rb").to_string());
-            if from_app.is_some_and(|stem| boot_text.iter().any(|text| text.contains(&stem))) {
+            // Only walked when some file is a candidate.
+            if loaded.get_or_insert_with(|| boot_loaded(vfs, dir)).contains(&normalized(&file)) {
                 continue;
             }
             out.insert(file);
@@ -99,18 +105,212 @@ pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], 
     out
 }
 
-/// What the boot reads before the app's constants autoload: a file named
-/// here may be required by path.
-fn boot_text<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Vec<String> {
+/// What `files` define: each `class` and `module` declaration, and each
+/// constant they assign (`Box = Class.new`, `Shelf::Box ||= …`), by its
+/// full name.
+fn defined_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<String> {
+    let mut defined = Defined { scope: Vec::new(), out: HashSet::default() };
+    for file in files {
+        let Ok(bytes) = vfs.read(file) else { continue };
+        let parsed = super::prism::parse_silent(&bytes);
+        ruby_prism::Visit::visit(&mut defined, &parsed.node());
+    }
+    defined.out
+}
+
+struct Defined {
+    /// The `class` and `module` bodies the visit is in, outermost first, as written.
+    scope: Vec<String>,
+    out: HashSet<String>,
+}
+
+impl Defined {
+    fn record(&mut self, path: &[String]) {
+        self.out.insert(self.scope.iter().chain(path).cloned().collect::<Vec<_>>().join("::"));
+    }
+
+    /// `::A::B` names `A::B` wherever it is written.
+    fn record_path(&mut self, target: &Node<'_>) {
+        let Some(path) = constant_path_segments_strs(target) else { return };
+        let rooted = target.as_constant_path_node().is_some_and(|p| {
+            let mut node = p;
+            loop {
+                match node.parent() {
+                    None => return true,
+                    Some(parent) => match parent.as_constant_path_node() {
+                        Some(next) => node = next,
+                        None => return false,
+                    },
+                }
+            }
+        });
+        if rooted {
+            self.out.insert(path.join("::"));
+        } else {
+            self.record(&path);
+        }
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for Defined {
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        let path = class_name_path(node).unwrap_or_default();
+        self.record(&path);
+        let depth = self.scope.len();
+        self.scope.extend(path);
+        ruby_prism::visit_class_node(self, node);
+        self.scope.truncate(depth);
+    }
+
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        let path = module_name_path(node).unwrap_or_default();
+        self.record(&path);
+        let depth = self.scope.len();
+        self.scope.extend(path);
+        ruby_prism::visit_module_node(self, node);
+        self.scope.truncate(depth);
+    }
+
+    fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+        self.record(&[constant_id_str(&node.name()).to_string()]);
+        ruby_prism::visit_constant_write_node(self, node);
+    }
+
+    fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
+        self.record(&[constant_id_str(&node.name()).to_string()]);
+        ruby_prism::visit_constant_or_write_node(self, node);
+    }
+
+    fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        self.record_path(&node.target().as_node());
+        ruby_prism::visit_constant_path_write_node(self, node);
+    }
+
+    fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
+        self.record_path(&node.target().as_node());
+        ruby_prism::visit_constant_path_or_write_node(self, node);
+    }
+}
+
+/// The app files the boot loads by path: what `config/application.rb`,
+/// `environment.rb`, `boot.rb`, the environment files and the initializers
+/// `require`, `require_relative` or `load`, and what those files load in
+/// turn, each normalized. Parsed, so a require in a comment loads nothing.
+fn boot_loaded<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> HashSet<PathBuf> {
     let config = dir.join("config");
-    let mut files: Vec<PathBuf> = ["application.rb", "environment.rb", "boot.rb"].iter().map(|f| config.join(f)).collect();
+    let mut pending: Vec<PathBuf> = ["application.rb", "environment.rb", "boot.rb"].iter().map(|f| config.join(f)).collect();
     for sub in ["environments", "initializers"] {
         let sub = config.join(sub);
         if vfs.is_dir(&sub) {
-            files.extend(super::app::read_rb_files(vfs, &sub).unwrap_or_default());
+            pending.extend(super::app::read_rb_files(vfs, &sub).unwrap_or_default());
         }
     }
-    files.iter().filter_map(|f| vfs.read_to_string(f).ok()).collect()
+    let mut visited: HashSet<PathBuf> = pending.iter().map(|f| normalized(f)).collect();
+    let mut loaded: HashSet<PathBuf> = HashSet::default();
+    while let Some(file) = pending.pop() {
+        let Ok(bytes) = vfs.read(&file) else { continue };
+        let parsed = super::prism::parse_silent(&bytes);
+        let mut requires = Requires { dir, base: file.parent().unwrap_or(dir).to_path_buf(), targets: Vec::new() };
+        ruby_prism::Visit::visit(&mut requires, &parsed.node());
+        for mut target in requires.targets {
+            if target.extension().is_none() {
+                target.set_extension("rb");
+            }
+            let target = normalized(&target);
+            if !vfs.exists(&target) || vfs.is_dir(&target) {
+                continue;
+            }
+            loaded.insert(target.clone());
+            if visited.insert(target.clone()) {
+                pending.push(target);
+            }
+        }
+    }
+    loaded
+}
+
+/// The paths a file's `require`, `require_relative`, `require_dependency`
+/// and `load` calls name, where the argument is a path written out: a
+/// string for `require_relative`, `Rails.root.join(…)`, `"#{Rails.root}/…"`,
+/// `File.expand_path(…, __dir__)` or `File.join(__dir__, …)`, each with or
+/// without `.to_s`.
+struct Requires<'a> {
+    dir: &'a Path,
+    base: PathBuf,
+    targets: Vec<PathBuf>,
+}
+
+impl Requires<'_> {
+    fn path(&self, node: &Node<'_>) -> Option<PathBuf> {
+        if let Some(call) = node.as_call_node() {
+            let name = constant_id_str(&call.name());
+            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let receiver = call.receiver();
+            if name == "to_s" && args.is_empty() {
+                return self.path(&receiver?);
+            }
+            let strings = |nodes: &[Node<'_>]| nodes.iter().map(string_value).collect::<Option<Vec<String>>>();
+            let receiver_is = |text: &[u8]| receiver.as_ref().is_some_and(|r| r.location().as_slice() == text);
+            if name == "join" && receiver_is(b"Rails.root") && !args.is_empty() {
+                return Some(self.dir.join(strings(&args)?.join("/")));
+            }
+            let is_dir = |n: &Node<'_>| n.as_call_node().is_some_and(|c| c.receiver().is_none() && c.arguments().is_none() && constant_id_str(&c.name()) == "__dir__");
+            if name == "expand_path" && receiver_is(b"File") && args.len() == 2 && is_dir(&args[1]) {
+                return Some(self.base.join(string_value(&args[0])?));
+            }
+            if name == "join" && receiver_is(b"File") && args.len() >= 2 && is_dir(&args[0]) {
+                return Some(self.base.join(strings(&args[1..])?.join("/")));
+            }
+            return None;
+        }
+        let interpolated = node.as_interpolated_string_node()?;
+        let parts: Vec<Node<'_>> = interpolated.parts().iter().collect();
+        let [head, tail] = parts.as_slice() else { return None };
+        let statements: Vec<Node<'_>> = head.as_embedded_statements_node()?.statements()?.body().iter().collect();
+        let [only] = statements.as_slice() else { return None };
+        if only.location().as_slice() != b"Rails.root" {
+            return None;
+        }
+        let tail = String::from_utf8_lossy(tail.as_string_node()?.unescaped()).into_owned();
+        Some(self.dir.join(tail.strip_prefix('/')?))
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for Requires<'_> {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let name = constant_id_str(&node.name());
+        if node.receiver().is_none() && matches!(name, "require" | "require_relative" | "require_dependency" | "load") {
+            let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            if let Some(first) = args.first() {
+                let target = match (name, string_value(first)) {
+                    ("require_relative", Some(relative)) => Some(self.base.join(relative)),
+                    (_, Some(written)) if Path::new(&written).is_absolute() => Some(PathBuf::from(written)),
+                    // A bare feature goes through the load path, which this does not follow.
+                    (_, Some(_)) => None,
+                    (_, None) => self.path(first),
+                };
+                self.targets.extend(target);
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+/// `path` with `.` dropped and `..` taken back, without the filesystem.
+fn normalized(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// `inner` without the [`shadowed`] files.
