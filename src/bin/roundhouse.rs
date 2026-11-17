@@ -412,6 +412,7 @@ fn observe_shapes(
             let observation = booted.unwrap_or_else(|why| obs::Observation {
                 effects: Vec::new(),
                 refusals: vec![why],
+                loaded: Vec::new(),
             });
             // Not only a boot that answered: one that failed would otherwise be tried again on every build.
             // Nor one whose Ruby or gems changed while it ran: which of them it saw is not known.

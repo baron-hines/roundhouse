@@ -1931,6 +1931,10 @@ jobs:
           # view_component and method_source, built natively (tests/spinel_toolchain/view_component.rs).
           gem install --no-document --ignore-dependencies view_component -v 3.23.2
           gem install --no-document --ignore-dependencies method_source -v 1.1.0
+          # aasm, built natively, and what the CRuby tree its build boots to observe aasm needs (tests/spinel_toolchain/aasm.rs).
+          gem install --no-document --ignore-dependencies aasm -v 5.5.1
+          gem install --no-document --ignore-dependencies concurrent-ruby -v 1.3.8
+          gem install --no-document sqlite3 -v 2.10.0
       # One process per test, as many as libtest's threads, so each test's seconds are its own.
       - name: run spinel_toolchain ignored suite (${{ matrix.shard }})
         env:
