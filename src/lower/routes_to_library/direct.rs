@@ -626,7 +626,9 @@ fn with_query(base: Expr, query: &[(Expr, Expr)], fresh: &FreshLocals, span: Spa
         return base;
     }
     // Rails' `Hash#to_query` sorts; written order is not emitted order.
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    // It sorts the rendered `key=value` pairs, so an encoded key that
+    // sorts below `=` (`x%26y`) comes before its prefix (`x`).
+    pairs.sort_by_key(|(key, _)| format!("{}=", form_encode(key)));
 
     // Fresh names, so no parameter or local of the helper (its options
     // Hash, say) is overwritten.

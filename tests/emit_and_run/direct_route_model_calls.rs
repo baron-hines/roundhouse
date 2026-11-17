@@ -91,6 +91,10 @@ end
   def permalink_odd_key
     Rails.application.routes.url_helpers.article_slug_path(self, "x&y" => "v")
   end
+
+  def permalink_two_keys
+    Rails.application.routes.url_helpers.article_slug_path(self, q: "1", "q-x" => "2")
+  end
 end
 "##)
         .write("app/models/comment.rb", r##"class Comment < ApplicationRecord
@@ -136,7 +140,8 @@ end
 // own `to_param`), "/read/1/hello-world?q=x+y" (a String key),
 // "/archive" (a nil record leaves the optional segment out),
 // "/archive/1", "/archive" (an interpolated name, no segment),
-// "/dated/2024" (a defaulted segment), "/read/1/hello-world?x%26y=v".
+// "/dated/2024" (a defaulted segment), "/read/1/hello-world?x%26y=v",
+// "/read/1/hello-world?q-x=2&q=1" (the rendered pairs sorted).
 const SCRIPT: &str = r##"article = Article.create!(title: "Hello World", slug: "hello-world")
 comment = Comment.create!(article: article)
 path = "/read/#{article.id}/hello-world"
@@ -153,6 +158,7 @@ raise "record: #{Article.archive_link("hello-world")}" unless Article.archive_li
 raise "listing: #{Article.listing}" unless Article.listing == "/archive"
 raise "dated: #{Article.dated}" unless Article.dated == "/dated/2024"
 raise "odd key: #{article.permalink_odd_key}" unless article.permalink_odd_key == path + "?x%26y=v"
+raise "two keys: #{article.permalink_two_keys}" unless article.permalink_two_keys == path + "?q-x=2&q=1"
 puts "probe passed"
 "##;
 

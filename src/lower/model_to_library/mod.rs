@@ -1960,6 +1960,10 @@ fn build_methods_with_finder_inputs(
 ///     an earlier real method, but only when that method was already
 ///     selected from the model body; generated framework methods are not
 ///     reordered by source spans.
+///   * A method a class-body macro synthesized in place in the body
+///     (`delegated_type`'s `build_<role>`, an enum's predicates) yields
+///     to a real `def` written after it, as Ruby's later definition
+///     replaces it. A `def` written before the macro still wins.
 fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &HashSet<crate::ident::Symbol>) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
