@@ -126,7 +126,7 @@ pub fn apply_runtime_reopens(files: &mut [(String, String)], models: &HashSet<St
     let mut overridden: HashSet<MethodKey> = HashSet::default();
     let mut headers: Vec<(usize, (usize, usize))> = Vec::new();
     for (idx, (path, content)) in files.iter().enumerate() {
-        if !(path.starts_with("app/models/") && path.ends_with(".rb")) {
+        if !(super::class_paths::is_class_file(path) && path.ends_with(".rb")) {
             continue;
         }
         for body in scan(content) {
@@ -210,7 +210,7 @@ pub fn apply_runtime_reopens(files: &mut [(String, String)], models: &HashSet<St
         let rel = path.strip_prefix("sig/").unwrap_or(path);
         if rel.starts_with("runtime/") {
             *content = drop_declarations(content, &overridden);
-        } else if rel.starts_with("app/models/") {
+        } else if super::class_paths::is_class_file(rel) {
             *content = drop_parents(content, &parents);
         }
     }
