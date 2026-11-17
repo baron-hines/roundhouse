@@ -6093,6 +6093,73 @@ pub(super) fn controller_concern_surfaces(app: &App) -> ControllerConcernSurface
 mod controller_concern_surface_tests {
     use super::*;
 
+    /// An app whose `LoopHost` includes through a `class_eval` loop, and
+    /// whose `CarryHost` writes `include CarryA, CarryB` and has
+    /// `CarryExtra` included into it from another module's body.
+    fn include_statements_app() -> crate::App {
+        let tree = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            ("app/controllers/concerns/loop_a.rb", "module LoopA\n  def label\n    \"loop a\"\n  end\nend\n"),
+            ("app/controllers/concerns/loop_b.rb", "module LoopB\n  def label\n    \"loop b\"\n  end\nend\n"),
+            ("lib/loop_host.rb", "module LoopHost\n  %w[LoopA LoopB].each { |m| class_eval \"include #{m}\" }\n\n  def host\n    \"loop\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_a.rb", "module CarryA\n  def label\n    \"carry a\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_b.rb", "module CarryB\n  def label\n    \"carry b\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_extra.rb", "module CarryExtra\n  def extra\n    \"extra\"\n  end\nend\n"),
+            ("lib/carry_host.rb", "module CarryHost\n  include CarryA, CarryB\n\n  def host\n    \"carry\"\n  end\nend\n"),
+            ("lib/carry_wiring.rb", "module CarryWiring\n  CarryHost.include CarryExtra\nend\n"),
+            ("app/controllers/hosts_controller.rb", "class HostsController < ActionController::Base\n  include LoopHost\n  include CarryHost\nend\n"),
+        ]
+        .into_iter()
+        .map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec()))
+        .collect();
+        crate::ingest::ingest_app_from_tree(tree).expect("ingest")
+    }
+
+    fn statements_of(app: &crate::App, name: &str) -> Vec<Vec<String>> {
+        app.library_classes
+            .iter()
+            .filter(|lc| lc.name.0.as_str() == name)
+            .flat_map(include_statements)
+            .map(|group| group.iter().map(|m| m.0.as_str().to_string()).collect())
+            .collect()
+    }
+
+    /// Each run of a `class_eval` loop's string is a statement of its own
+    /// (#2211). Ruby 4.0.7: `[LoopHost, LoopB, LoopA]`.
+    #[test]
+    fn a_class_eval_loop_s_includes_are_separate_statements() {
+        let app = include_statements_app();
+        assert_eq!(statements_of(&app, "LoopHost"), vec![vec!["LoopA".to_string()], vec!["LoopB".to_string()]]);
+    }
+
+    /// An include another body adds is a statement of its own, and the
+    /// module's `include A, B` stays one (#2211). Ruby 4.0.7:
+    /// `[CarryHost, CarryExtra, CarryA, CarryB]`.
+    #[test]
+    fn an_include_another_body_adds_keeps_the_module_s_statements() {
+        let app = include_statements_app();
+        assert_eq!(
+            statements_of(&app, "CarryHost"),
+            vec![vec!["CarryA".to_string(), "CarryB".to_string()], vec!["CarryExtra".to_string()]]
+        );
+    }
+
+    /// A walk that meets modules already in the chain goes on below the
+    /// lowest it has met, never back up (#2211). Ruby 4.0.7: `X` including
+    /// `C`, `B`, `A` (ancestors `[X, A, B, C]`), and a class including
+    /// `A`, `B`, then `X`, has `[X, B, A, C]`.
+    #[test]
+    fn an_include_walk_never_moves_its_cursor_back_up() {
+        let id = |name: &str| crate::ident::ClassId(name.into());
+        let names = |chain: Vec<crate::ident::ClassId>| chain.iter().map(|m| m.0.as_str().to_string()).collect::<Vec<_>>();
+        let mut statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+        statements.insert(id("X"), vec![vec![id("C")], vec![id("B")], vec![id("A")]]);
+        let concerns = crate::det::HashSet::default();
+        let ancestry = Ancestry { statements: &statements, concerns: &concerns };
+        let class = [vec![id("A")], vec![id("B")], vec![id("X")]];
+        assert_eq!(names(ancestry.of_statements(&class)), ["X", "B", "A", "C"]);
+    }
+
     #[test]
     fn reopened_concern_filters_keep_include_statement_order() {
         for (initial, reopened, expected) in [
