@@ -8791,6 +8791,52 @@ fn apply_route_helpers_demand(files: &mut Vec<(String, String)>) {
     ));
 }
 
+// Not left to the class files alone: a gem that builds a path to one of its files from `__FILE__` (aasm's
+// `require_persistence`) names its place under the mount, where the tree carries the gem's data too.
+fn apply_gem_file_stubs(files: &mut Vec<(String, String)>, app: &App) {
+    use std::fmt::Write;
+    let mount = format!("{}/", crate::ingest::source_gems_mount());
+    let have: crate::det::HashSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    let mut stubs: Vec<(String, String)> = Vec::new();
+    for (source, names) in &app.library_class_files {
+        let source = normalize_source(source);
+        let Some(at) = source.find(&mount) else { continue };
+        let stub = source[at..].to_string();
+        if !stub.ends_with(".rb") || have.contains(&stub) {
+            continue;
+        }
+        let depth = stub.matches('/').count();
+        let mut body = String::new();
+        let mut seen = crate::det::HashSet::default();
+        // (the file's own program, where the tree carries one, is what loading the file runs)
+        let program = format!("app/models/roundhouse_files/{stub}");
+        if have.contains(&program) {
+            writeln!(body, "require_relative {:?}", format!("{}{}", "../".repeat(depth), program.trim_end_matches(".rb"))).unwrap();
+        }
+        for name in names {
+            let owner = crate::emit::ruby::library_file_owner(name.0.as_str(), app);
+            let target = crate::emit::ruby::class_paths::class_rb(&owner).to_string_lossy().into_owned();
+            if !have.contains(&target) || !seen.insert(target.clone()) {
+                continue;
+            }
+            writeln!(body, "require_relative {:?}", format!("{}{}", "../".repeat(depth), target.trim_end_matches(".rb"))).unwrap();
+        }
+        if !body.is_empty() {
+            stubs.push((stub, body));
+        }
+    }
+    if stubs.is_empty() {
+        return;
+    }
+    stubs.sort();
+    if let Some((_, models)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
+        for (stub, _) in &stubs {
+            writeln!(models, "require_relative {:?}", format!("../{}", stub.trim_end_matches(".rb"))).unwrap();
+        }
+    }
+    files.extend(stubs);
+}
+
 fn apply_models_aggregator(files: &mut Vec<(String, String)>, app: &App) {
     use std::fmt::Write;
 
@@ -11570,6 +11616,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     apply_job_registry_locate(&mut files, app);
     apply_views_aggregator(&mut files);
     apply_models_aggregator(&mut files, app);
+    apply_gem_file_stubs(&mut files, app);
     apply_route_helpers_demand(&mut files);
     apply_module_mixins(&mut files, app, MixinForm::Reopen);
     apply_boot_program(&mut files, app, RequireTarget::Spinel);
