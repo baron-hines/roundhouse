@@ -34,6 +34,42 @@ const CONCERNS: &[(&str, &str)] = &[
     ("mixed_plain", "module MixedPlain\n  def label\n    \"mixed plain\"\n  end\nend\n"),
     ("mixed_concern", "module MixedConcern\n  extend ActiveSupport::Concern\n\n  def label\n    \"mixed concern\"\n  end\nend\n"),
     ("mixed_both", "module MixedBoth\n  extend ActiveSupport::Concern\n  include MixedConcern\n  include MixedPlain\nend\n"),
+    // X includes C, B, A: its ancestors are [X, A, B, C]. B defines no
+    // `label`.
+    ("cursor_a", "module CursorA\n  def label\n    \"cursor a\"\n  end\nend\n"),
+    ("cursor_b", "module CursorB\nend\n"),
+    ("cursor_c", "module CursorC\n  def label\n    \"cursor c\"\n  end\nend\n"),
+    ("cursor_x", "module CursorX\n  include CursorC\n  include CursorB\n  include CursorA\nend\n"),
+    // A module the superclass includes, and another.
+    ("super_m", "module SuperM\n  def label\n    \"super m\"\n  end\nend\n"),
+    ("super_n", "module SuperN\n  def label\n    \"super n\"\n  end\nend\n"),
+    // A def written in `included do` is the includer's own.
+    ("hook_def", "module HookDef\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+    ("plain_def", "module PlainDef\n  extend ActiveSupport::Concern\n\n  def label\n    \"plain\"\n  end\nend\n"),
+    // `included do` delegates run in hook order: the last defines it.
+    ("delegate_one", "module DelegateOne\n  extend ActiveSupport::Concern\n\n  included do\n    delegate :label, to: :source_one\n  end\nend\n"),
+    ("delegate_two", "module DelegateTwo\n  extend ActiveSupport::Concern\n\n  included do\n    delegate :label, to: :source_two\n  end\nend\n"),
+    // `self.extend ActiveSupport::Concern` is the same concern.
+    ("self_a", "module SelfA\n  self.extend ActiveSupport::Concern\n\n  def label\n    \"self a\"\n  end\nend\n"),
+    ("self_b", "module SelfB\n  self.extend ActiveSupport::Concern\n\n  def label\n    \"self b\"\n  end\nend\n"),
+    ("self_ab", "module SelfAb\n  self.extend ActiveSupport::Concern\n  include SelfA\n  include SelfB\nend\n"),
+    // `prepend` puts its module below the class, ahead of it.
+    ("prepend_a", "module PrependA\n  def label\n    \"prepended\"\n  end\nend\n"),
+    ("prepend_b", "module PrependB\n  def label\n    \"included\"\n  end\nend\n"),
+    // A hook that includes a module.
+    ("hook_a", "module HookA\n  def label\n    \"hook a\"\n  end\nend\n"),
+    ("hook_b", "module HookB\n  def label\n    \"hook b\"\n  end\nend\n"),
+    ("hook_wrapper", "module HookWrapper\n  extend ActiveSupport::Concern\n\n  included do\n    include HookA\n  end\nend\n"),
+    // Modules a loop of `class_eval` strings includes.
+    ("loop_a", "module LoopA\n  def label\n    \"loop a\"\n  end\nend\n"),
+    ("loop_b", "module LoopB\n  def label\n    \"loop b\"\n  end\nend\n"),
+    ("loop_host", "module LoopHost\n  %w[LoopA LoopB].each { |m| class_eval \"include #{m}\" }\nend\n"),
+    // `include CarryA, CarryB`, and an initializer includes CarryExtra
+    // into the same module.
+    ("carry_a", "module CarryA\n  def label\n    \"carry a\"\n  end\nend\n"),
+    ("carry_b", "module CarryB\n  def label\n    \"carry b\"\n  end\nend\n"),
+    ("carry_extra", "module CarryExtra\n  def extra\n    \"extra\"\n  end\nend\n"),
+    ("carry_host", "module CarryHost\n  include CarryA, CarryB\nend\n"),
 ];
 
 /// (controller, its include lines, Ruby's `label`).
@@ -53,6 +89,35 @@ const CASES: &[(&str, &str, &str)] = &[
     ("concern_diamond", "  include ConcernB\n  include ConcernAb\n", "concern a"),
     // [Mixed, MixedBoth, MixedConcern, MixedPlain]
     ("mixed", "  include MixedPlain\n  include MixedBoth\n", "mixed concern"),
+    // [Cursor, CursorX, CursorB, CursorA, CursorC]: CursorX's walk meets
+    // CursorA below CursorB and CursorB above it; CursorC goes below
+    // CursorA, not back up between them.
+    ("cursor", "  include CursorA\n  include CursorB\n  include CursorX\n", "cursor a"),
+    // [SelfDiamond, SelfAb, SelfA, SelfB], as with `extend`.
+    ("self_diamond", "  include SelfB\n  include SelfAb\n", "self a"),
+    // [PrependA, Prepended, PrependB]
+    ("prepended", "  prepend PrependA\n  include PrependB\n", "prepended"),
+    // [HookInclude, HookB, HookA, HookWrapper]: the hook put HookA there,
+    // so the last `include HookA` moves nothing.
+    ("hook_include", "  include HookWrapper\n  include HookB\n  include HookA\n", "hook b"),
+    // [Looped, LoopHost, LoopB, LoopA]: the loop runs two includes.
+    ("looped", "  include LoopHost\n", "loop b"),
+    // [Carried, CarryHost, CarryExtra, CarryA, CarryB]
+    ("carried", "  include CarryHost\n", "carry a"),
+];
+
+/// Cases that need more than a bare controller: (controller, its source,
+/// Ruby's `label`).
+const SPECIAL: &[(&str, &str, &str)] = &[
+    // [SuperNm, SuperN, SuperParent, SuperM]: SuperM is the superclass's
+    // already, so the child's `include SuperM` adds nothing.
+    ("super_nm", "class SuperNmController < SuperParentController\n  include SuperN\n  include SuperM\n\n  def show\n    render json: { label: label }\n  end\nend\n", "super n"),
+    // [SuperMn, SuperN, SuperParent, SuperM]
+    ("super_mn", "class SuperMnController < SuperParentController\n  include SuperM\n  include SuperN\n\n  def show\n    render json: { label: label }\n  end\nend\n", "super n"),
+    // HookDef's `included do` defines `label` on the controller itself.
+    ("hoisted", "class HoistedController < ApplicationController\n  include HookDef\n  include PlainDef\n\n  def show\n    render json: { label: label }\n  end\nend\n", "hook"),
+    // DelegateTwo's hook runs last, so its `delegate` defines `label`.
+    ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
 
 fn camel(snake: &str) -> String {
@@ -65,7 +130,15 @@ fn app() -> emit_and_run::Overlay {
     for (file, source) in CONCERNS {
         app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
     }
+    app = app
+        .write("app/controllers/super_parent_controller.rb", "class SuperParentController < ApplicationController\n  include SuperM\nend\n")
+        .write("config/initializers/carry_extra.rb", "CarryHost.include(CarryExtra)\n")
+        .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
     let mut routes = String::from("Rails.application.routes.draw do\n");
+    for (name, source, _) in SPECIAL {
+        app = app.write(&format!("app/controllers/{name}_controller.rb"), source);
+        routes.push_str(&format!("  get \"/{name}\" => \"{name}#show\"\n"));
+    }
     for (name, includes, _) in CASES {
         app = app.write(
             &format!("app/controllers/{name}_controller.rb"),
@@ -93,8 +166,8 @@ got = {}
 want = {}
 "##,
     );
-    for (name, _, label) in CASES {
-        script.push_str(&format!("got[{name:?}] = probe(\"/{name}\")\nwant[{name:?}] = [200, %({{\"label\":{label:?}}})]\n"));
+    for (name, _, label) in CASES.iter().chain(SPECIAL) {
+        script.push_str(&format!("got[{name:?}] = begin\n  probe(\"/{name}\")\nrescue StandardError => e\n  [e.class.name, e.message[0, 80]]\nend\nwant[{name:?}] = [200, %({{\"label\":{label:?}}})]\n"));
     }
     script.push_str("wrong = got.reject { |k, v| v == want[k] }\nraise \"wrong: #{wrong.inspect}\" unless wrong.empty?\nputs \"include order passed\"\n");
     let run = app().run_ruby(&script);
