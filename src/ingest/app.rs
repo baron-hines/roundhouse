@@ -5278,18 +5278,40 @@ impl Ancestry<'_> {
     }
 
     /// The modules whose `included` hook runs on an includer whose include
-    /// statements are `statements`: the ones they name, and the concerns
-    /// those defer to it. A concern a plain module includes runs its hook
-    /// on that module.
-    fn hooked_on(&self, statements: &[Vec<crate::ident::ClassId>]) -> crate::det::HashSet<crate::ident::ClassId> {
-        let mut hooked = crate::det::HashSet::default();
-        let mut pending: Vec<crate::ident::ClassId> = statements.iter().flatten().cloned().collect();
-        while let Some(module) = pending.pop() {
-            if hooked.insert(module.clone()) {
-                pending.extend(self.expanded(&module, 0).dependencies.iter().cloned());
+    /// statements are `statements`, in the order the hooks run: the ones
+    /// they name, each statement last argument first, and the concerns
+    /// those defer to it, each concern's ahead of it in the order it
+    /// recorded them. A concern a plain module includes runs its hook on
+    /// that module; one the superclass's chain has (`inherited`) runs none.
+    fn hook_order(
+        &self,
+        statements: &[Vec<crate::ident::ClassId>],
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) -> Vec<crate::ident::ClassId> {
+        fn visit(
+            ancestry: &Ancestry<'_>,
+            module: &crate::ident::ClassId,
+            inherited: &crate::det::HashSet<crate::ident::ClassId>,
+            out: &mut Vec<crate::ident::ClassId>,
+            depth: usize,
+        ) {
+            if depth > 64 || inherited.contains(module) || out.contains(module) {
+                return;
+            }
+            for dependency in &ancestry.expanded(module, depth).dependencies {
+                visit(ancestry, dependency, inherited, out, depth + 1);
+            }
+            if !out.contains(module) {
+                out.push(module.clone());
             }
         }
-        hooked
+        let mut out = Vec::new();
+        for statement in statements {
+            for module in statement.iter().rev() {
+                visit(self, module, inherited, &mut out, 0);
+            }
+        }
+        out
     }
 
     fn expanded(&self, module: &crate::ident::ClassId, depth: usize) -> std::rc::Rc<Expanded> {
@@ -5594,12 +5616,12 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 }));
             }
         }
-        // `included do` runs in the includer, in hook order, the order
-        // filters register in: its delegates go in that order, and the
-        // methods it defines are the includer's own, the last hook's
-        // ahead. The rest come in ancestor order.
+        // `included do` runs in the includer, in hook order: its delegates
+        // go in that order, and the methods it defines are the includer's
+        // own, the last hook's ahead. The rest come in ancestor order.
+        let hooks = ancestry.hook_order(&include_groups, &inherited);
         let mut hook_order: Vec<&crate::ident::ClassId> = Vec::new();
-        for module in filter_order.iter().map(|(_, module)| module).chain(&queue) {
+        for module in hooks.iter().chain(&queue) {
             if !hook_order.contains(&module) {
                 hook_order.push(module);
             }
@@ -5610,7 +5632,7 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             }
         }
         // A def a hook made on some module in between is that module's, where the chain has it.
-        let hooked = ancestry.hooked_on(&include_groups);
+        let hooked: crate::det::HashSet<&crate::ident::ClassId> = hooks.iter().collect();
         let passes: Vec<(&crate::ident::ClassId, bool)> =
             hook_order.iter().rev().map(|module| (*module, true)).chain(queue.iter().map(|module| (module, false))).collect();
         for (module, from_hook) in passes {
