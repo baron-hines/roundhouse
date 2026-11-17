@@ -154,6 +154,79 @@ pub fn required_models_app() -> emit_and_run::Overlay {
     models_app().write("config/initializers/shelf_box.rb", "require Rails.root.join(\"app/models/shelf/box\").to_s\n")
 }
 
+/// [`models_app`] with the require split into `Rails.root.join` arguments.
+#[allow(dead_code)]
+pub fn split_required_models_app() -> emit_and_run::Overlay {
+    models_app().write("config/initializers/shelf_box.rb", "require Rails.root.join(\"app\", \"models\", \"shelf\", \"box\").to_s\n")
+}
+
+/// [`models_app`] with an initializer loading `lib/patches.rb`, which loads the reopen: both by `require_relative`.
+#[allow(dead_code)]
+pub fn chain_required_models_app() -> emit_and_run::Overlay {
+    models_app()
+        .write("config/initializers/patches.rb", "require_relative \"../../lib/patches\"\n")
+        .write("lib/patches.rb", "require_relative \"../app/models/shelf/box\"\n")
+}
+
+/// [`models_app`] with the require only in a comment.
+#[allow(dead_code)]
+pub fn commented_required_models_app() -> emit_and_run::Overlay {
+    models_app().write("config/initializers/shelf_box.rb", "# require Rails.root.join(\"app/models/shelf/box\").to_s\n")
+}
+
+/// The gem's `Shelf::Box` assigned (`Box = Class.new(Base)`) rather than declared.
+pub const SHELF_ASSIGNED: &str = r##"module Shelf
+  class Base
+    def self.kind
+      "box"
+    end
+
+    def self.label
+      "shelf box"
+    end
+  end
+
+  Box = Class.new(Base)
+end
+"##;
+
+/// The reopen at `app/models/shelf/box.rb` of a gem class it assigns.
+#[allow(dead_code)]
+pub fn assigned_models_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_ASSIGNED).write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// The gem's class under a namespace the app's acronym inflection names (`API`).
+pub const SHELF_API: &str = r##"module Shelf
+end
+
+module API
+  class Box
+    def self.kind
+      "box"
+    end
+
+    def self.label
+      "shelf box"
+    end
+  end
+end
+"##;
+
+/// The reopen at `app/models/api/box.rb`, which Zeitwerk maps to `API::Box` under `inflect.acronym "API"`.
+#[allow(dead_code)]
+pub fn acronym_models_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_API)
+        .write("config/initializers/inflections.rb", "ActiveSupport::Inflector.inflections(:en) do |inflect|\n  inflect.acronym \"API\"\nend\n")
+        .write("app/models/api/box.rb", &LOCAL.replace("module Shelf", "module API"))
+}
+
+/// [`acronym_models_app`]: Rails 8.1.4.1 never loads the reopen, so the class is the gem's.
+pub const ACRONYM_MODELS_ASSERTIONS: &str = r##"got = [API::Box.kind, API::Box.label, API::Box.respond_to?(:local_tag)]
+raise "acronym models #{got.inspect}" unless got == ["box", "shelf box", false]
+puts "acronym models passed"
+"##;
+
 /// The reopen that adds only `LIMIT` and `include Tagging`.
 #[allow(dead_code)]
 pub fn extras_app() -> emit_and_run::Overlay {
