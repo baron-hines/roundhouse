@@ -283,6 +283,28 @@ impl Overlay {
         compile_and_run_contract(emitted, errors, flags).expecting_completion()
     }
 
+    /// `run_spinel` through the `roundhouse` binary, which boots the app's CRuby tree to observe what a gem does to
+    /// a class it holds in a variable (`observed_shapes`); the library build the other runs take does not. Its
+    /// errors are the diagnostics `--allow-unsupported` lets through as `warning[unsupported]`.
+    #[allow(dead_code)]
+    pub fn run_spinel_observed(self, script: &str) -> Run {
+        let (scratch, source) = self.materialize();
+        let emitted = scratch.join("emitted");
+        let built = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+            .args(["--target", "spinel", "--allow-unsupported"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&emitted)
+            .output()
+            .expect("spawn roundhouse");
+        let log = String::from_utf8_lossy(&built.stderr).into_owned();
+        assert!(built.status.success(), "roundhouse --target spinel failed:\n{log}");
+        let errors = log.lines().filter_map(|l| l.split_once("warning[unsupported]: ").map(|(at, msg)| format!("{at}: {msg}"))).collect();
+        std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{}", to_completion(script)))
+            .expect("write native consumer");
+        compile_and_run_contract(emitted, errors, &[]).expecting_completion()
+    }
+
     /// `run_spinel` for a probe that does not need the app: compile only the
     /// files this overlay `write`s (as emitted, found by their
     /// `#<SPINEL_SOURCE>` markers) and the runtime entries named here, each
