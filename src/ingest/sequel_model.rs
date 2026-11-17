@@ -251,6 +251,7 @@ fn parse_sequel_association(
                 // `one_to_many` takes a dataset block, a different thing.
                 extension: Vec::new(),
                 primary_key: None,
+                inverse_of: None,
             }
         }
         "one_to_one" => Association::HasOne {
@@ -271,6 +272,7 @@ fn parse_sequel_association(
             autosave: false,
             validate: false,
             primary_key: None,
+            inverse_of: None,
         },
         "many_to_one" => Association::BelongsTo {
             name: name.clone(),

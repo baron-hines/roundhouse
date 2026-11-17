@@ -22624,6 +22624,16 @@ mod tag_helper_singleton_include;
 mod translation_helper_test_include;
 #[path = "emit_and_run/view_url_for_hash.rs"]
 mod view_url_for_hash;
+#[path = "emit_and_run/class_side_multi_column_pluck.rs"]
+mod class_side_multi_column_pluck;
+#[path = "emit_and_run/has_many_inverse_of_foreign_key.rs"]
+mod has_many_inverse_of_foreign_key;
+#[path = "emit_and_run/errors_messages_unlowered.rs"]
+mod errors_messages_unlowered;
+#[path = "emit_and_run/belongs_to_unsaved_target_valid.rs"]
+mod belongs_to_unsaved_target_valid;
+#[path = "emit_and_run/string_starts_with_alias.rs"]
+mod string_starts_with_alias;
 #[path = "emit_and_run/duration_name_on_object.rs"]
 mod duration_name_on_object;
 #[path = "emit_and_run/update_in_argument_position.rs"]

@@ -1907,12 +1907,12 @@ module ActiveRecord
       all.order(*parts)
     end
 
-    def self.pick(col)
-      all.pick(col)
+    def self.pick(*cols)
+      all.pick(*cols)
     end
 
-    def self.pluck(col)
-      all.pluck(col)
+    def self.pluck(*cols)
+      all.pluck(*cols)
     end
 
     def self.preload(*names)

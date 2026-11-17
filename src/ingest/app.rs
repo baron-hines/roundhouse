@@ -3471,6 +3471,9 @@ end
     if !late_on_load.is_empty() {
         splice_concerns_into_models_named(&mut app, &late_on_load, &concern_class_method_spans);
     }
+    // After every association splice, the late one above included: the
+    // splice rehomes a defaulted key first.
+    resolve_inverse_foreign_keys(&mut app);
     super::model_delegate::lower_model_delegates(&mut app);
     super::on_load_reopen::drain_pending(&mut app);
     // `numericality:` on an untyped attribute is decided per target
@@ -9512,6 +9515,108 @@ fn resolve_through_targets(app: &mut App) {
             {
                 *target = resolved;
             }
+        }
+    }
+}
+
+/// A `has_many` or `has_one` with `inverse_of:` and no `foreign_key:`
+/// or `as:` takes its key from the inverse association, as Rails'
+/// `derive_foreign_key` does: `has_many :links, inverse_of:
+/// :from_comment` reads `links.from_comment_id`, not `links.comment_id`.
+/// The inverse's key is its own, not inferred from an inverse in turn
+/// (`infer_from_inverse_of: false`), so every key is read before any
+/// changes. Rails looks the inverse up on the target class and its
+/// ancestors, and raises when none declares it, once the association is
+/// used; `check` reports it at the declaration.
+fn resolve_inverse_foreign_keys(app: &mut App) {
+    use crate::dialect::{Association, ModelBodyItem};
+
+    let mut updates = Vec::new();
+    for (i, model) in app.models.iter().enumerate() {
+        for (j, item) in model.body.iter().enumerate() {
+            let ModelBodyItem::Association { assoc, .. } = item else { continue };
+            let (Association::HasMany {
+                name,
+                target,
+                foreign_key,
+                foreign_key_explicit: false,
+                as_interface: None,
+                through: None,
+                inverse_of: Some(inverse),
+                ..
+            }
+            | Association::HasOne {
+                name,
+                target,
+                foreign_key,
+                foreign_key_explicit: false,
+                as_interface: None,
+                through: None,
+                inverse_of: Some(inverse),
+                ..
+            }) = assoc
+            else {
+                continue;
+            };
+            // A later association of the same name replaces this one, as
+            // Rails keeps the last reflection: its inverse is never read.
+            let later = model.body[j + 1..]
+                .iter()
+                .chain(app.models[i + 1..].iter().filter(|m| m.name == model.name).flat_map(|m| m.body.iter()));
+            if later.into_iter().any(|later| matches!(later, ModelBodyItem::Association { assoc, .. } if assoc.name() == name)) {
+                continue;
+            }
+            // Every declaration of a class, its reopenings included, in
+            // order: the last association of that name is the one Rails keeps.
+            fn declared<'a>(
+                models: &'a [crate::dialect::Model],
+                class: &crate::ident::ClassId,
+            ) -> impl Iterator<Item = &'a crate::dialect::Model> {
+                // A rooted name (`::Citation`, a parent written `< ::Base`) is the top-level class.
+                let class = class.0.as_str().trim_start_matches("::").to_string();
+                models.iter().filter(move |m| m.name.0.as_str() == class)
+            }
+            // A target outside the app's models (a gem's) is not read here.
+            if declared(&app.models, target).next().is_none() {
+                continue;
+            }
+            let mut class = target.clone();
+            let mut found = None;
+            for _ in 0..app.models.len() {
+                found = declared(&app.models, &class).flat_map(|m| m.associations()).filter(|a| a.name() == inverse).last();
+                let parent = declared(&app.models, &class).find_map(|m| m.parent.clone());
+                match parent {
+                    Some(parent) if found.is_none() && declared(&app.models, &parent).next().is_some() => class = parent,
+                    _ => break,
+                }
+            }
+            let Some(found) = found else {
+                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                    item.span(),
+                    None,
+                    format!("{} :{name}, inverse_of: :{inverse}", if matches!(assoc, Association::HasMany { .. }) { "has_many" } else { "has_one" }),
+                    format!("`{}` declares no association `{inverse}`, so Rails raises InverseOfAssociationNotFoundError once the association is used", target.0.as_str()),
+                ));
+                continue;
+            };
+            let key = match found {
+                Association::BelongsTo { foreign_key, .. }
+                | Association::HasMany { foreign_key, .. }
+                | Association::HasOne { foreign_key, .. } => foreign_key,
+                Association::HasAndBelongsToMany { .. } => continue,
+            };
+            if key != foreign_key {
+                updates.push((i, j, key.clone()));
+            }
+        }
+    }
+    for (i, j, key) in updates {
+        if let ModelBodyItem::Association {
+            assoc: Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. },
+            ..
+        } = &mut app.models[i].body[j]
+        {
+            *foreign_key = key;
         }
     }
 }

@@ -551,6 +551,12 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `inverse_of: :author` as written (not `false` or `nil`). Rails
+        /// derives a defaulted foreign key from the inverse association
+        /// (`derive_foreign_key`), which app assembly does once every
+        /// model is ingested (`resolve_inverse_foreign_keys`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasOne {
         name: Symbol,
@@ -597,6 +603,9 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// See `HasMany::inverse_of`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasAndBelongsToMany {
         name: Symbol,

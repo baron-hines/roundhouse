@@ -228,9 +228,15 @@ pub(super) fn push_validate_method(
                     // The writer keeps the record only on the Ruby family
                     // (`emit::ruby::library::apply_belongs_to_autosave`), and a
                     // strict target's polymorphic reader may be a stub that
-                    // raises: there the key pair stays the check.
+                    // raises: there the key pair stays the check. A plain
+                    // association's unsaved record leaves its key unset too,
+                    // so there the Ruby family asks the reader alone.
                     let source = if !*polymorphic {
-                        PresenceSource::KeyAndReader
+                        if runtime_relation == super::RuntimeRelation::Present && held.is_none() {
+                            PresenceSource::ReaderOnly
+                        } else {
+                            PresenceSource::KeyAndReader
+                        }
                     } else if polymorphic_targets.is_empty()
                         || runtime_relation != super::RuntimeRelation::Present
                     {
@@ -1013,6 +1019,10 @@ fn inline_uniqueness_check(
 enum PresenceSource {
     /// The key column's unset state, then the association reader.
     KeyAndReader,
+    /// The reader alone, where the writer keeps the record it is given
+    /// (the Ruby family): an unsaved one has no key yet, and the reader
+    /// already answers nil for an unset key.
+    ReaderOnly,
     /// The reader, for a polymorphic association: its writer keeps an
     /// unsaved record under the runtime's 0 key, so the key cannot decide
     /// whether the record is there — the reader can, because it holds
@@ -1029,9 +1039,10 @@ enum PresenceSource {
 
 /// `if @fk.nil? || @fk == 0 || <assoc>.nil?` — a required `belongs_to`'s
 /// presence check, `"<Assoc> must exist"` (type `:blank`, as Rails adds
-/// it for `message: :required`). The reader is what Rails validates, so
-/// assigning the record itself makes the check pass before either side is
-/// saved, and a key pair naming no row makes it fail. For a polymorphic
+/// it for `message: :required`); `if <assoc>.nil?` alone where the writer
+/// keeps the record (`PresenceSource::ReaderOnly`). The reader is what
+/// Rails validates, so assigning the record itself makes the check pass
+/// before either side is saved, and a key pair naming no row makes it fail. For a polymorphic
 /// association the reader is also what picks the class — from the row's
 /// `<assoc>_type` column — so the check never names one.
 fn inline_belongs_to_check(
@@ -1079,6 +1090,7 @@ fn inline_belongs_to_check(
     let missing = send(reader, "nil?", vec![]);
     let cond = match source {
         PresenceSource::KeyAndReader => bool_op(BoolOpKind::Or, unset, missing),
+        PresenceSource::ReaderOnly => missing,
         // `<assoc>.nil? && (<unset> || @<type>.nil? || [<classes>].include?(@<type>))`
         PresenceSource::Reader { type_column, classes } => {
             let names = Expr::new(
