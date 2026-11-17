@@ -5282,33 +5282,39 @@ impl Ancestry<'_> {
     /// they name, each statement last argument first, and the concerns
     /// those defer to it, each concern's ahead of it in the order it
     /// recorded them. A concern a plain module includes runs its hook on
-    /// that module; one the superclass's chain has (`inherited`) runs none.
+    /// that module. One the includer's chain already has runs none: one
+    /// the superclass's chain has (`inherited`), or one an earlier
+    /// statement put there, through a plain module too.
     fn hook_order(
         &self,
         statements: &[Vec<crate::ident::ClassId>],
         inherited: &crate::det::HashSet<crate::ident::ClassId>,
     ) -> Vec<crate::ident::ClassId> {
+        // `chain`: the includer's ancestors so far, which `append_features` checks.
         fn visit(
             ancestry: &Ancestry<'_>,
             module: &crate::ident::ClassId,
             inherited: &crate::det::HashSet<crate::ident::ClassId>,
+            chain: &mut Vec<crate::ident::ClassId>,
             out: &mut Vec<crate::ident::ClassId>,
             depth: usize,
         ) {
-            if depth > 64 || inherited.contains(module) || out.contains(module) {
+            if depth > 64 || inherited.contains(module) || chain.contains(module) {
                 return;
             }
             for dependency in &ancestry.expanded(module, depth).dependencies {
-                visit(ancestry, dependency, inherited, out, depth + 1);
+                visit(ancestry, dependency, inherited, chain, out, depth + 1);
             }
             if !out.contains(module) {
                 out.push(module.clone());
             }
+            ancestry.include(chain, module, inherited, depth);
         }
+        let mut chain = Vec::new();
         let mut out = Vec::new();
         for statement in statements {
             for module in statement.iter().rev() {
-                visit(self, module, inherited, &mut out, 0);
+                visit(self, module, inherited, &mut chain, &mut out, 0);
             }
         }
         out
@@ -5626,8 +5632,9 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 hook_order.push(module);
             }
         }
-        for module in &hook_order {
-            for call in module_delegates.get(*module).into_iter().flatten() {
+        // Only the hooks that ran here: a module the chain has otherwise forwards nothing from the controller.
+        for module in &hooks {
+            for call in module_delegates.get(module).into_iter().flatten() {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
         }
