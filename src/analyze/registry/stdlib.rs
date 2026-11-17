@@ -901,7 +901,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("[]", Ty::Untyped),
         ("[]=", Ty::Untyped),
         ("compute_if_absent", Ty::Untyped),
-        ("clear", concurrent_map),
+        ("clear", concurrent_map.clone()),
+        ("keys", Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }),
+        ("each_pair", concurrent_map),
     ]);
     // `Net::HTTP` — a real client on BOTH lanes: CRuby's own stdlib, and
     // spinel's `packages/net` (HTTPS included, since the openssl package
