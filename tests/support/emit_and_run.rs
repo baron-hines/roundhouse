@@ -285,21 +285,27 @@ impl Overlay {
 
     /// `run_spinel` through the `roundhouse` binary, which boots the app's CRuby tree to observe what a gem does to
     /// a class it holds in a variable (`observed_shapes`); the library build the other runs take does not. Its
-    /// errors are the diagnostics `--allow-unsupported` lets through as `warning[unsupported]`.
+    /// errors are the binary's: a first build without `--allow-unsupported` lists them, as that flag prints them
+    /// as warnings, and the second writes the tree (the observation is cached by then).
     #[allow(dead_code)]
     pub fn run_spinel_observed(self, script: &str) -> Run {
         let (scratch, source) = self.materialize();
+        let build = |allow: bool, out: &Path| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_roundhouse"));
+            command.args(["--target", "spinel"]);
+            if allow {
+                command.arg("--allow-unsupported");
+            }
+            command.arg(&source).arg("-o").arg(out).output().expect("spawn roundhouse")
+        };
+        let checked = build(false, &scratch.join("checked"));
+        let errors = String::from_utf8_lossy(&checked.stderr)
+            .lines()
+            .filter_map(|l| l.split_once(": error[").map(|(at, rest)| format!("{at}: {}", rest.split_once("]: ").map_or(rest, |(_, msg)| msg))))
+            .collect();
         let emitted = scratch.join("emitted");
-        let built = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-            .args(["--target", "spinel", "--allow-unsupported"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&emitted)
-            .output()
-            .expect("spawn roundhouse");
-        let log = String::from_utf8_lossy(&built.stderr).into_owned();
-        assert!(built.status.success(), "roundhouse --target spinel failed:\n{log}");
-        let errors = log.lines().filter_map(|l| l.split_once("warning[unsupported]: ").map(|(at, msg)| format!("{at}: {msg}"))).collect();
+        let built = build(true, &emitted);
+        assert!(built.status.success(), "roundhouse --target spinel failed:\n{}", String::from_utf8_lossy(&built.stderr));
         std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{}", to_completion(script)))
             .expect("write native consumer");
         compile_and_run_contract(emitted, errors, &[]).expecting_completion()

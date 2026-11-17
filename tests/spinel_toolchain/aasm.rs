@@ -1,11 +1,9 @@
 use super::aasm_gem::{app, KNOWN_GAPS, SCRIPT};
 
-/// Beyond the Ruby lane's: the gem's `__send__` of a built name (aasm.rb's `binding_event`, which this app sets on no event)
-/// and the `ruby2_keywords` the boot's observation writes beside each event method. This flow
-/// reaches neither.
-const SPINEL_GAPS: [&str; 2] = [
+/// Beyond the Ruby lane's: the gem's `__send__` of a built name (aasm.rb's `binding_event`, which this app sets
+/// on no event). This flow does not reach it.
+const SPINEL_GAPS: [&str; 1] = [
     "dynamic send not supported (spinel): `__send__` calls a method whose name is built when it runs",
-    "ruby2_keywords not supported (all targets)",
 ];
 
 /// The aasm app of the Ruby lane's test (emit_and_run::aasm_source), built through the binary, which observes
