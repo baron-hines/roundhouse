@@ -364,3 +364,35 @@ impl<V: Vfs + ?Sized> Vfs for HiddenVfs<'_, V> {
         self.inner.canonical(path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::defined_constants;
+    use crate::vfs::MapVfs;
+    use std::path::PathBuf;
+
+    fn defined(source: &str) -> Vec<String> {
+        let file = PathBuf::from("/gem/lib/shelf.rb");
+        let vfs = MapVfs::new([(file.clone(), source.as_bytes().to_vec())].into_iter().collect());
+        let mut names: Vec<String> = defined_constants(&vfs, &[file]).into_iter().collect();
+        names.sort();
+        names
+    }
+
+    /// Ruby: `module Adapter; class ::Shelf::Box; end; end` defines `Shelf::Box`, and no `Adapter::Shelf`.
+    #[test]
+    fn a_rooted_class_inside_a_module_is_defined_at_the_top_level() {
+        assert_eq!(defined("module Shelf\nend\n\nmodule Adapter\n  class ::Shelf::Box\n  end\nend\n"), ["Adapter", "Shelf", "Shelf::Box"]);
+    }
+
+    /// The body of `module ::Shelf` inside `module Adapter` is `Shelf`'s, so a class in it is `Shelf::Box`.
+    #[test]
+    fn a_rooted_module_s_body_is_scoped_at_the_top_level() {
+        assert_eq!(defined("module Adapter\n  module ::Shelf\n    class Box\n    end\n  end\nend\n"), ["Adapter", "Shelf", "Shelf::Box"]);
+    }
+
+    #[test]
+    fn a_nested_class_is_defined_under_its_modules() {
+        assert_eq!(defined("module Adapter\n  class Shelf::Box\n  end\nend\n"), ["Adapter", "Adapter::Shelf::Box"]);
+    }
+}
