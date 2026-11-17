@@ -136,6 +136,8 @@ pub(super) fn ingest_model_with_enum_constants(
     // naturally attach to the first body item below.
     drain_comments_before(&mut comments, class.location().start_offset());
     let mut body: Vec<ModelBodyItem> = Vec::new();
+    // A nested `JSON` class or value class shadows bare `JSON` for `serialize`.
+    let mut body_json_shadow = false;
     let mut enums: IndexMap<Symbol, Vec<(String, Literal)>> = IndexMap::new();
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
@@ -503,9 +505,9 @@ pub(super) fn ingest_model_with_enum_constants(
             // with it aborted the whole file.
             //
             // Exception: a nested `class JSON` / `module JSON` shadows
-            // bare `JSON` for `serialize …, coder: JSON` — leave a
-            // synthetic Const-assign marker so lower::serialize can see
-            // the shadow without treating the namespace as a body item.
+            // bare `JSON` for `serialize …, coder: JSON` — recorded in
+            // `lexical_json_shadow` so lower::serialize can see the
+            // shadow without treating the namespace as a body item.
             // In a hook block, the declaration is a constant the library pass
             // over the model's file never sees: reported, not skipped.
             if spliced && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
@@ -523,29 +525,20 @@ pub(super) fn ingest_model_with_enum_constants(
                 })
             {
                 let path_syms: Vec<Symbol> = path.iter().map(|s| Symbol::from(s.as_str())).collect();
-                if crate::lower::serialize::const_path_shadows_bare_json(
-                    &path_syms,
-                    owner.0.as_str(),
-                ) {
-                    body.push(ModelBodyItem::Unknown {
-                        expr: Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Assign {
-                                target: crate::expr::LValue::Const {
-                                    path: vec![Symbol::from("JSON")],
-                                },
-                                value: Expr::new(
-                                    Span::synthetic(),
-                                    ExprNode::Lit {
-                                        value: crate::expr::Literal::Nil,
-                                    },
-                                ),
-                            },
-                        ),
-                        leading_comments: Vec::new(),
-                        leading_blank_line: false,
-                    });
-                }
+                // Recorded on the model, not as a body item: a constant
+                // write in the body would be emitted (`JSON = nil`) and
+                // collide with the nested class when it loads.
+                body_json_shadow |= crate::lower::serialize::const_path_shadows_bare_json(&path_syms, owner.0.as_str());
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
+            // `X = Data.define(:a) do … end` and its `Struct.new` twin
+            // declare a class, which the same library pass registers. A
+            // `JSON` one shadows bare `JSON`, as a nested `class JSON` does.
+            if !spliced && super::library_class::model_value_class(stmt, &owner, file) {
+                let name = stmt.as_constant_write_node().map(|w| Symbol::from(constant_id_str(&w.name())));
+                body_json_shadow |=
+                    name.is_some_and(|name| crate::lower::serialize::const_path_shadows_bare_json(&[name], owner.0.as_str()));
                 note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
@@ -629,7 +622,7 @@ pub(super) fn ingest_model_with_enum_constants(
         enums,
         enum_defaults,
         class_attr_defaults,
-        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners),
+        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners) || body_json_shadow,
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,
