@@ -47,6 +47,10 @@ pub use expr::emit_expr;
 
 /// The `models/<stem>` anchor of the file a library class is emitted
 /// into: its outermost enclosing app class's (`library::file_owner`).
+pub(crate) fn library_file_owner(name: &str, app: &App) -> String {
+    library::file_owner(name, app, &app.library_classes)
+}
+
 pub(crate) fn library_file_anchor(name: &str, app: &App) -> String {
     format!("models/{}", crate::naming::underscore(&library::file_owner(name, app, &app.library_classes)))
 }
