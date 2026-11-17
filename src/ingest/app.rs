@@ -4579,7 +4579,24 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                             // position decides which declaration runs last.
                             match seed_at.filter(|at| at.file == existing.span.file) {
                                 Some(at) if existing.span.start < at.start => true,
-                                Some(at) if existing.span.start > at.start => false,
+                                // The model's later declaration runs last, but
+                                // a default this cannot evaluate may be nil and
+                                // leave this seed standing: refused, not guessed.
+                                Some(at) if existing.span.start > at.start => {
+                                    if super::model::Seed::of(existing) == super::model::Seed::Computed {
+                                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                                            existing.span,
+                                            None,
+                                            "cattr_accessor",
+                                            format!(
+                                                "`{}` is seeded by `{}`'s `included do` block and again later in the class body with a default this cannot evaluate, so whether it replaces the seed cannot be established here",
+                                                name.as_str(),
+                                                id.0.as_str(),
+                                            ),
+                                        ));
+                                    }
+                                    false
+                                }
                                 _ => {
                                     super::prism::push(crate::diagnostic::Diagnostic::unsupported(
                                         seed_at.unwrap_or_else(crate::span::Span::synthetic),
