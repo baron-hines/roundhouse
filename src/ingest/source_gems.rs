@@ -607,6 +607,7 @@ impl<V: Vfs + ?Sized> MountVfs<'_, V> {
     }
 
     fn as_loaded(&self, text: String) -> String {
+        let text = super::ruby_conditions::settled(&text).unwrap_or(text);
         if !text.contains("LoadError") {
             return text;
         }
