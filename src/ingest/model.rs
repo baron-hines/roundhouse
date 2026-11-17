@@ -71,9 +71,9 @@ pub(super) fn ingest_model_with_enum_constants(
     // must ingest as `Admin::Report` (the compound `class Admin::Report`
     // spelling already carries its path). Falls back to the scopeless
     // finder for shapes the scoped walk doesn't cover.
-    let (scope, class) = match super::util::primary_class_with_scope(&root) {
-        Some((s, c)) => (s, Some(c)),
-        None => (Vec::new(), find_first_class(&root)),
+    let (scope, nesting, class) = match super::util::primary_class_with_nesting(&root) {
+        Some((s, n, c)) => (s, n, Some(c)),
+        None => (Vec::new(), Vec::new(), find_first_class(&root)),
     };
     let Some(class) = class else {
         return Ok(None);
@@ -114,7 +114,7 @@ pub(super) fn ingest_model_with_enum_constants(
         // class attribute its abstract base set.
         if prefix.is_empty()
             && !from_module
-            && let Some(parent) = model_bases.resolve_class_superclass(&scope, &class)
+            && let Some(parent) = model_bases.resolve_class_superclass(&scope, &nesting, &class)
             && let Some(inherited) = base_prefixes.get(&parent)
         {
             prefix = inherited.clone();
@@ -603,7 +603,7 @@ pub(super) fn ingest_model_with_enum_constants(
         .map(|n| super::util::node_span(&n, file))
         .unwrap_or_default();
     let parent = model_bases
-        .resolve_class_superclass(&scope, &class)
+        .resolve_class_superclass(&scope, &nesting, &class)
         .map(|resolved| ClassId(Symbol::from(model_bases.emit_superclass(&resolved))));
 
     let class_loc = class.location();

@@ -1093,7 +1093,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                                 ));
                             }
                             if let Some(classes) = nested {
-                                let nested = nested_under(&outer, classes);
+                                let nested = nested_under(&source, &outer, classes);
                                 let scan =
                                     ingest_concern_model_items_with_constants(
                                         &source, &path_str, &enum_constants,
@@ -1274,7 +1274,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             let mut carried: crate::det::HashSet<String> = Default::default();
                             carried.insert(outer.0.as_str().to_string());
                             if let Ok(nested) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
-                                carried.extend(nested_under(&outer, nested).iter().map(|c| c.name.0.as_str().to_string()));
+                                carried.extend(nested_under(&source, &outer, nested).iter().map(|c| c.name.0.as_str().to_string()));
                             }
                             // A declaration beside the model (`Helpers`
                             // beside `Node` in `module Tessera`) is the
@@ -1343,7 +1343,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             ));
                         }
                         if let Ok(classes) = nested {
-                            let nested = nested_under(&outer, classes);
+                            let nested = nested_under(&source, &outer, classes);
                             let scan =
                                 ingest_concern_model_items_with_constants(
                                     &source, &path_str, &enum_constants,
@@ -2280,7 +2280,7 @@ end
                     if let Some(classes) =
                         unwrap_or_record(ingest_library_classes(&source, &path_str))?
                     {
-                        app.library_classes.extend(nested_under(&outer, classes));
+                        app.library_classes.extend(nested_under(&source, &outer, classes));
                     }
                     // A concern nested in the controller, here or in a
                     // `cache_controller/versioning.rb` opening, declares
@@ -10490,12 +10490,21 @@ fn record_library_ingest_failure(app: &mut App, path: &str, err: &IngestError) {
     }
 }
 
+/// The classes of `classes` the file declares in `outer`'s body: named
+/// under it, or written inside it with a rooted name (`class ::Parser`
+/// in a model is top-level, though only this walk reaches it).
 fn nested_under(
+    source: &[u8],
     outer: &crate::ident::ClassId,
     classes: Vec<crate::dialect::LibraryClass>,
 ) -> Vec<crate::dialect::LibraryClass> {
     let prefix = format!("{}::", outer.0.as_str());
-    classes.into_iter().filter(|c| c.name.0.as_str().starts_with(&prefix)).collect()
+    let parsed = super::prism::parse_silent(source);
+    let inside = super::util::declared_inside(&parsed.node(), outer.0.as_str());
+    classes
+        .into_iter()
+        .filter(|c| c.name.0.as_str().starts_with(&prefix) || inside.contains(c.name.0.as_str()))
+        .collect()
 }
 
 /// The support roots to walk for library classes: every `app/*`

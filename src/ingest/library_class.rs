@@ -117,8 +117,8 @@ fn collect_block_includes(node: &Node<'_>, out: &mut Vec<String>) {
 use super::visibility::{self, Visibility};
 use super::util::{
     class_name_path, constant_id_str, constant_path_is_rooted, constant_path_of,
-    find_all_classes_with_scope,
-    find_all_module_declarations_with_scope, find_all_modules_with_scope, find_first_class,
+    find_all_classes_with_nesting, find_all_classes_with_scope,
+    find_all_module_declarations_with_scope, find_all_modules_with_nesting, find_all_modules_with_scope, find_first_class,
     flatten_statements, module_name_path, symbol_value,
 };
 use super::{IngestError, IngestResult};
@@ -278,9 +278,11 @@ fn ingest_library_classes_impl(
     let outside = |model: &str, name: &str| {
         name != model && !name.strip_prefix(model).is_some_and(|rest| rest.starts_with("::"))
     };
-    let walked = |scope: &[String], path: Option<Vec<String>>| match walk {
+    // Nested is lexical: a rooted `class ::Parser` in a model's body is
+    // named at the top level but still written inside the model.
+    let walked = |scope: &[String], nesting: &[String], path: Option<Vec<String>>| match walk {
         Walk::All | Walk::App => true,
-        Walk::NestedIn(_) if !scope.is_empty() => true,
+        Walk::NestedIn(_) if !nesting.is_empty() => true,
         Walk::NestedIn(outer) => path.is_some_and(|path| {
             path.join("::").strip_prefix(outer).is_some_and(|rest| rest.starts_with("::"))
         }),
@@ -300,14 +302,15 @@ fn ingest_library_classes_impl(
             class_name_path(class).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == outer)
         })
     };
-    for (scope, class) in find_all_classes_with_scope(&root) {
-        if is_outer(&scope, &class) && !walked(&scope, class_name_path(&class)) {
+    for (scope, nesting, class) in find_all_classes_with_nesting(&root) {
+        if is_outer(&scope, &class) && !walked(&scope, &nesting, class_name_path(&class)) {
             out.extend(model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file));
         }
     }
-    for (scope, class) in find_all_classes_with_scope(&root)
+    for (scope, class) in find_all_classes_with_nesting(&root)
         .into_iter()
-        .filter(|(scope, class)| walked(scope, class_name_path(class)))
+        .filter(|(scope, nesting, class)| walked(scope, nesting, class_name_path(class)))
+        .map(|(scope, _, class)| (scope, class))
     {
         let values = match is_outer(&scope, &class) {
             true => model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file),
@@ -335,9 +338,10 @@ fn ingest_library_classes_impl(
         out.extend(made.into_iter().map(|(_, c)| c));
         out.extend(values);
     }
-    for (scope, module) in find_all_modules_with_scope(&root)
+    for (scope, module) in find_all_modules_with_nesting(&root)
         .into_iter()
-        .filter(|(scope, module)| walked(scope, module_name_path(module)))
+        .filter(|(scope, nesting, module)| walked(scope, nesting, module_name_path(module)))
+        .map(|(scope, _, module)| (scope, module))
     {
         // A nested `ClassMethods` is not a namespace of its own — it's
         // ActiveSupport::Concern's class-side carrier, already folded
@@ -5223,6 +5227,7 @@ impl ModelBases {
     pub fn resolve_class_superclass(
         &self,
         scope: &[String],
+        nesting: &[String],
         class: &ruby_prism::ClassNode<'_>,
     ) -> Option<String> {
         let node = class.superclass()?;
@@ -5238,13 +5243,19 @@ impl ModelBases {
                 full.join("::")
             });
             let bare = &parent_path[0];
-            let mut segs = scope.to_vec();
-            while !segs.is_empty() {
-                let candidate = format!("{}::{}", segs.join("::"), bare);
+            // A rooted `class ::Entry < Record` names no scope, but Ruby
+            // reads `Record` where the line is written: its lexical
+            // nesting, innermost first.
+            let enclosing: Vec<String> = if super::util::is_rooted(&class.constant_path()) {
+                nesting.to_vec()
+            } else {
+                (1..=scope.len()).rev().map(|n| scope[..n].join("::")).collect()
+            };
+            for outer in enclosing {
+                let candidate = format!("{outer}::{bare}");
                 if own.as_deref() != Some(candidate.as_str()) && self.contains(&candidate) {
                     return Some(candidate);
                 }
-                segs.pop();
             }
         }
         Some(joined)
@@ -5263,7 +5274,7 @@ impl ModelBases {
     pub fn record(&mut self, source: &[u8], pairs: &mut Vec<(String, String)>) {
         let result = parse(source);
         let root = result.node();
-        for (scope, class) in find_all_classes_with_scope(&root) {
+        for (scope, nesting, class) in find_all_classes_with_nesting(&root) {
             let Some(path) = class_name_path(&class) else { continue };
             let mut full = scope.clone();
             full.extend(path);
@@ -5273,7 +5284,7 @@ impl ModelBases {
             // Resolve bare parents (`Record` under `module ActionText`)
             // before close_over, which matches on the stored parent
             // spelling against seeded qualified bases.
-            let Some(parent) = self.resolve_class_superclass(&scope, &class) else {
+            let Some(parent) = self.resolve_class_superclass(&scope, &nesting, &class) else {
                 continue;
             };
             pairs.push((full.join("::"), parent));
@@ -5432,11 +5443,11 @@ fn superclass_lookup_scope<'a>(
 pub fn has_active_record_base(source: &[u8], bases: &ModelBases) -> bool {
     let result = parse(source);
     let root = result.node();
-    let Some((scope, class)) = super::util::primary_class_with_scope(&root) else {
+    let Some((scope, nesting, class)) = super::util::primary_class_with_nesting(&root) else {
         return false;
     };
     bases
-        .resolve_class_superclass(&scope, &class)
+        .resolve_class_superclass(&scope, &nesting, &class)
         .is_some_and(|p| bases.contains(&p))
 }
 
@@ -5458,7 +5469,7 @@ pub fn is_tableless_active_model(source: &[u8]) -> bool {
 pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKind> {
     let result = parse(source);
     let root = result.node();
-    let Some((scope, class)) = super::util::primary_class_with_scope(&root) else {
+    let Some((scope, nesting, class)) = super::util::primary_class_with_nesting(&root) else {
         // No class node. A bare top-level module under app/models/
         // (`module InactiveUser; def self.x; …; end`) is a namespace of
         // singleton methods, not a model — classify it as a library
@@ -5490,7 +5501,7 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
         });
         return writes_constants.then_some(ClassKind::LibraryClass);
     };
-    let parent_path = bases.resolve_class_superclass(&scope, &class);
+    let parent_path = bases.resolve_class_superclass(&scope, &nesting, &class);
 
     Some(match parent_path.as_deref() {
         // Resolved through the app's own bases, not against two
