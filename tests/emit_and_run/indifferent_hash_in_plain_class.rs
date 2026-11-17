@@ -39,6 +39,10 @@ end
   def coarse?
     given.key?(:coarse)
   end
+
+  def mesh_by_name
+    given["mesh"]
+  end
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -47,23 +51,23 @@ end
   end
 
   def self.sift(sifter)
-    [sifter.labels, sifter.mesh, sifter.coarse?]
+    [sifter.labels, sifter.mesh, sifter.coarse?, sifter.mesh_by_name]
   end
 
-  # Rails: [["medium"], 20, false]
+  # Rails: [["medium"], 20, false, nil]
   def self.defaults
     sift(Sifter.new)
   end
 
-  # Rails: [["fine", "rough"], 40, false]
+  # Rails: [["fine", "rough"], 40, false, 40]
   def self.given
     given = { "grades" => [{ "name" => "fine" }, { "name" => "rough" }], "mesh" => 40 }.with_indifferent_access
     sift(Sifter.new(given))
   end
 
   def self.run
-    check("defaults", defaults == [["medium"], 20, false])
-    check("given", given == [["fine", "rough"], 40, false])
+    check("defaults", defaults == [["medium"], 20, false, nil])
+    check("given", given == [["fine", "rough"], 40, false, 40])
   end
 end
 "##)
@@ -108,11 +112,14 @@ class StrainerTest < ActiveSupport::TestCase
   test "size" do
     assert_equal 3, Strainer.new({ "size" => 3 }.with_indifferent_access).size
   end
+
+  test "size or nothing" do
+    given = [true].first ? { "size" => 4 }.with_indifferent_access : nil
+    assert_equal 4, Strainer.new(given).size
+  end
 end
 "##)
         .lowering_warnings(roundhouse::project::BuildTarget::Ruby);
-    assert!(
-        warnings.iter().any(|d| d.message.contains("an indifferent Hash handed from a test to `Strainer#initialize`")),
-        "{warnings:#?}"
-    );
+    let handed = warnings.iter().filter(|d| d.message.contains("an indifferent Hash handed from a test to `Strainer#initialize`"));
+    assert_eq!(handed.count(), 2, "{warnings:#?}");
 }

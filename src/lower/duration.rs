@@ -592,8 +592,8 @@ fn known_non_numeric(e: &Expr) -> bool {
 
 fn non_numeric(ty: &Ty) -> bool {
     match ty {
-        // Not a `BigDecimal`, `Rational` or `Complex`: ActiveSupport's `Numeric#minutes` is theirs too.
-        Ty::Class { id, .. } => !matches!(id.0.as_str(), "BigDecimal" | "Rational" | "Complex"),
+        // Not a `Numeric`, `BigDecimal`, `Rational` or `Complex`: ActiveSupport's `Numeric#minutes` is theirs.
+        Ty::Class { id, .. } => !matches!(id.0.as_str(), "Numeric" | "BigDecimal" | "Rational" | "Complex"),
         Ty::Str | Ty::Sym | Ty::Array { .. } | Ty::Hash { .. } | Ty::Bool | Ty::Nil => true,
         Ty::Union { variants } => variants.iter().all(non_numeric),
         _ => false,

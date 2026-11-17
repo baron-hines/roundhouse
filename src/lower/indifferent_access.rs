@@ -70,7 +70,7 @@ fn report_handoffs(
     };
     let Some(read_indifferent) = params.get(&callee) else { return };
     for (arg, indifferent) in args.iter().zip(read_indifferent) {
-        if !indifferent && arg.ty.as_ref().is_some_and(|t| indifferent::value_of(t).is_some()) {
+        if !indifferent && arg.ty.as_ref().is_some_and(may_be_indifferent) {
             diags.push(crate::lower::residue_diagnostic(
                 "indifferent_access",
                 "with_indifferent_access",
@@ -194,17 +194,22 @@ fn rewrite_node(span: Span, decisions: u64, node: &mut ExprNode) -> Option<Expr>
     // one on another (`@given = given || DEFAULTS`): the String key read
     // below misses the Symbol-keyed one's, so a read converts it first, as
     // a parameter both reach is converted (`keyed_like_indifferent`). Not a
-    // write, which would go to the copy.
-    if !typed
-        && recv.ty.as_ref().is_some_and(symbol_keyed_on_a_path)
-        && matches!(method.as_str(), "[]" | "fetch" | "key?" | "has_key?" | "dig" | "values_at" | "slice" | "except")
-    {
+    // write, which would go to the copy; not a String key, which only the
+    // indifferent one answers in Ruby too; not a shape the keys below are
+    // left unconverted for.
+    let shape = indifferent::shape(method.as_str(), args, block.is_some())?;
+    let keys = match method.as_str() {
+        "[]" | "fetch" | "key?" | "has_key?" => &args[..1],
+        "dig" | "values_at" | "slice" | "except" => &args[..],
+        _ => &[],
+    };
+    if !typed && recv.ty.as_ref().is_some_and(symbol_keyed_on_a_path) && keys.iter().any(may_be_symbol_key) {
         let mixed = recv.clone();
         let mut converted = support_call(recv.span, "indifferent_param", vec![mixed]);
         converted.ty = recv.ty.clone();
         *recv = converted;
     }
-    match indifferent::shape(method.as_str(), args, block.is_some())? {
+    match shape {
         Shape::FirstKey => convert_key(&mut args[0]),
         Shape::AllKeys => {
             args.iter_mut().for_each(convert_key);
@@ -336,6 +341,10 @@ fn convert_key(key: &mut Expr) {
             *key = support_call(span, "indifferent_key", vec![raw]);
         }
     }
+}
+
+fn may_be_symbol_key(key: &Expr) -> bool {
+    matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } }) || key.ty.as_ref().is_some_and(may_be_symbol)
 }
 
 fn may_be_symbol(ty: &Ty) -> bool {
