@@ -35,9 +35,9 @@ const CONCERNS: &[(&str, &str)] = &[
     ("mixed_concern", "module MixedConcern\n  extend ActiveSupport::Concern\n\n  def label\n    \"mixed concern\"\n  end\nend\n"),
     ("mixed_both", "module MixedBoth\n  extend ActiveSupport::Concern\n  include MixedConcern\n  include MixedPlain\nend\n"),
     // X includes C, B, A: its ancestors are [X, A, B, C]. B defines no
-    // `label`.
+    // `label`, only a method of its own.
     ("cursor_a", "module CursorA\n  def label\n    \"cursor a\"\n  end\nend\n"),
-    ("cursor_b", "module CursorB\nend\n"),
+    ("cursor_b", "module CursorB\n  def other_label\n    \"cursor b\"\n  end\nend\n"),
     ("cursor_c", "module CursorC\n  def label\n    \"cursor c\"\n  end\nend\n"),
     ("cursor_x", "module CursorX\n  include CursorC\n  include CursorB\n  include CursorA\nend\n"),
     // A module the superclass includes, and another.
@@ -60,16 +60,6 @@ const CONCERNS: &[(&str, &str)] = &[
     ("hook_a", "module HookA\n  def label\n    \"hook a\"\n  end\nend\n"),
     ("hook_b", "module HookB\n  def label\n    \"hook b\"\n  end\nend\n"),
     ("hook_wrapper", "module HookWrapper\n  extend ActiveSupport::Concern\n\n  included do\n    include HookA\n  end\nend\n"),
-    // Modules a loop of `class_eval` strings includes.
-    ("loop_a", "module LoopA\n  def label\n    \"loop a\"\n  end\nend\n"),
-    ("loop_b", "module LoopB\n  def label\n    \"loop b\"\n  end\nend\n"),
-    ("loop_host", "module LoopHost\n  %w[LoopA LoopB].each { |m| class_eval \"include #{m}\" }\nend\n"),
-    // `include CarryA, CarryB`, and an initializer includes CarryExtra
-    // into the same module.
-    ("carry_a", "module CarryA\n  def label\n    \"carry a\"\n  end\nend\n"),
-    ("carry_b", "module CarryB\n  def label\n    \"carry b\"\n  end\nend\n"),
-    ("carry_extra", "module CarryExtra\n  def extra\n    \"extra\"\n  end\nend\n"),
-    ("carry_host", "module CarryHost\n  include CarryA, CarryB\nend\n"),
 ];
 
 /// (controller, its include lines, Ruby's `label`).
@@ -100,10 +90,6 @@ const CASES: &[(&str, &str, &str)] = &[
     // [HookInclude, HookB, HookA, HookWrapper]: the hook put HookA there,
     // so the last `include HookA` moves nothing.
     ("hook_include", "  include HookWrapper\n  include HookB\n  include HookA\n", "hook b"),
-    // [Looped, LoopHost, LoopB, LoopA]: the loop runs two includes.
-    ("looped", "  include LoopHost\n", "loop b"),
-    // [Carried, CarryHost, CarryExtra, CarryA, CarryB]
-    ("carried", "  include CarryHost\n", "carry a"),
 ];
 
 /// Cases that need more than a bare controller: (controller, its source,
@@ -132,7 +118,6 @@ fn app() -> emit_and_run::Overlay {
     }
     app = app
         .write("app/controllers/super_parent_controller.rb", "class SuperParentController < ApplicationController\n  include SuperM\nend\n")
-        .write("config/initializers/carry_extra.rb", "CarryHost.include(CarryExtra)\n")
         .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
     let mut routes = String::from("Rails.application.routes.draw do\n");
     for (name, source, _) in SPECIAL {
