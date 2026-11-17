@@ -229,3 +229,137 @@ fn a_concerns_includers_run_their_winning_definitions_on_spinel() {
         assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
     }
 }
+
+/// The second review's cases: two modules of one `include` call that
+/// include the same module, a method a module defines twice, and
+/// definitions behind a load-time `if`.
+fn second_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()        .write("app/models/application_record.rb", r##"class ApplicationRecord < ActiveRecord::Base
+  self.abstract_class = true
+end
+"##)        .write("app/models/token.rb", r##"class Token < ApplicationRecord
+  belongs_to :bearer, polymorphic: true
+end
+"##)        .write("app/models/concerns/shared.rb", r##"module Shared
+  extend ActiveSupport::Concern
+
+  def badge_token!(name)
+    tokens.create!(name: "shared #{name}")
+  end
+end
+"##)        .write("app/models/concerns/plain.rb", r##"module Plain
+  extend ActiveSupport::Concern
+  include Shared
+end
+"##)        .write("app/models/concerns/badged.rb", r##"module Badged
+  extend ActiveSupport::Concern
+  include Shared
+
+  def badge_token!(name)
+    tokens.create!(name: "badged #{name}")
+  end
+end
+"##)        .write("app/models/concerns/redefined.rb", r##"module Redefined
+  extend ActiveSupport::Concern
+
+  def spare_token!(name)
+    tokens.create!(name: name)
+  end
+
+  def spare_token!(name)
+    nil
+  end
+end
+"##)        .write("app/models/concerns/versioned.rb", r##"module Versioned
+  extend ActiveSupport::Concern
+
+  if RUBY_VERSION >= "3.0"
+    def modern_token!(name)
+      tokens.create!(name: "modern #{name}")
+    end
+  end
+
+  if RUBY_VERSION < "3.0"
+    def legacy_token!(name)
+      tokens.create!(name: "legacy #{name}")
+    end
+  end
+end
+"##)        .write("app/models/shop.rb", r##"class Shop < ApplicationRecord
+  has_many :tokens, as: :bearer
+  include Plain, Badged
+  include Redefined
+  include Versioned
+end
+"##)        .write("app/models/stall.rb", r##"class Stall < ApplicationRecord
+  has_many :tokens, as: :bearer
+  include Plain, Badged
+  include Redefined
+  include Versioned
+end
+"##)        .write("db/schema.rb", r##"ActiveRecord::Schema.define do
+  create_table "shops", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "stalls", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "tokens", force: :cascade do |t|
+    t.string "bearer_type"
+    t.integer "bearer_id"
+    t.string "name"
+  end
+end
+"##)
+}
+
+const SHARED_NESTED_INCLUDE: &str = r##"got = [Shop.create!.badge_token!("a").name, Stall.create!.badge_token!("b").name]
+expected = ["badged a", "badged b"]
+raise "shared_nested_include: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn two_modules_of_one_include_keep_their_shared_module_last() {
+    let run = second_app().run_ruby(SHARED_NESTED_INCLUDE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const LAST_DEFINITION: &str = r##"shop = Shop.create!
+got = [shop.spare_token!("a"), Token.count]
+expected = [nil, 0]
+raise "last_definition: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_module_s_last_definition_of_a_method_is_the_one_copied() {
+    let run = second_app().run_ruby(LAST_DEFINITION);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const CONDITIONAL_DEFINITION: &str = r##"shop = Shop.create!
+got = [shop.modern_token!("a").name, shop.respond_to?(:legacy_token!), Stall.new.respond_to?(:legacy_token!)]
+expected = ["modern a", false, false]
+raise "conditional_definition: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_definition_behind_a_load_time_if_keeps_its_condition() {
+    let run = second_app().run_ruby(CONDITIONAL_DEFINITION);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_concerns_includers_run_their_winning_definitions_on_spinel_second_review() {
+    for script in [SHARED_NESTED_INCLUDE, LAST_DEFINITION, CONDITIONAL_DEFINITION] {
+        let run = second_app().run_spinel_with_db(script);
+        run.assert_passes();
+        assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    }
+}
