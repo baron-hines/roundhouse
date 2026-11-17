@@ -196,6 +196,9 @@ fn validate_activation(
     if spans.is_empty() {
         return Ok(());
     }
+    // Taken before the model borrow below: a refusal names the file it
+    // was written in.
+    let sources: &[crate::span::SourceFile] = &app.sources;
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
     let mut modules = HashSet::default();
@@ -307,7 +310,7 @@ fn validate_activation(
                     let supplied = supplied || (model.is_none() && direct.contains(&id) && library_classes.contains(owner) && is_supported(item));
                     if !supplied && reported.insert(expr.span) {
                         unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                            file: app.sources[(expr.span.file.0 - 1) as usize].path.clone(),
+                            file: span_file(sources, expr.span),
                             message: format!("concern attr_accessor on {}: only a direct include by a model or class is supported", owner.0),
                         }))?;
                     }
@@ -407,9 +410,8 @@ pub(super) fn validate(
     for (model_index, refused) in refused {
         let mut rejected = HashSet::default();
         for (span, message) in refused {
-            let file = &app.sources[span.file.0 as usize - 1].path;
             unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                file: file.clone(),
+                file: span_file(&app.sources, span),
                 message,
             }))?;
             rejected.insert(span);
@@ -421,6 +423,17 @@ pub(super) fn validate(
         app.models[index].body.retain(|item| !matches!(item, ModelBodyItem::Unknown { expr, .. } if rejected.contains(&expr.span)));
     }
     Ok(())
+}
+
+/// The file a span was written in, or a marker for a declaration a
+/// desugar synthesized — `concerning :X do … end`'s block has no file of
+/// its own.
+fn span_file(sources: &[crate::span::SourceFile], span: Span) -> String {
+    span.file
+        .0
+        .checked_sub(1)
+        .and_then(|index| sources.get(index as usize))
+        .map_or_else(|| "<generated>".to_string(), |source| source.path.clone())
 }
 
 fn occupied(
