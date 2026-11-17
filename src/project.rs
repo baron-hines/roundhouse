@@ -5916,7 +5916,7 @@ fn rewrite_carried_requires(files: &mut [(String, String)], app: &App, program: 
         .map(|p| normalize_source(&p.source))
         .collect();
     for (path, content) in files.iter_mut() {
-        if !path.starts_with("app/models/") || path.starts_with("app/models/roundhouse_files/") || !path.ends_with(".rb") || !content.contains("require \"") {
+        if !crate::emit::ruby::class_paths::is_class_file(path) || path.starts_with("app/models/roundhouse_files/") || !path.ends_with(".rb") || !content.contains("require \"") {
             continue;
         }
         let mut changed = false;
@@ -8797,7 +8797,7 @@ fn apply_models_aggregator(files: &mut Vec<(String, String)>, app: &App) {
     let mut models: Vec<String> = files
         .iter()
         .map(|(p, _)| p.as_str())
-        .filter(|p| p.starts_with("app/models/") && p.ends_with(".rb"))
+        .filter(|p| crate::emit::ruby::class_paths::is_class_file(p) && p.ends_with(".rb"))
         .map(str::to_string)
         .collect();
     models.sort();
