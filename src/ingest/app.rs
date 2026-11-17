@@ -9230,8 +9230,9 @@ fn resolve_inverse_foreign_keys(app: &mut App) {
                 models: &'a [crate::dialect::Model],
                 class: &crate::ident::ClassId,
             ) -> impl Iterator<Item = &'a crate::dialect::Model> {
-                let class = class.clone();
-                models.iter().filter(move |m| m.name == class)
+                // A rooted name (`::Citation`, a parent written `< ::Base`) is the top-level class.
+                let class = class.0.as_str().trim_start_matches("::").to_string();
+                models.iter().filter(move |m| m.name.0.as_str() == class)
             }
             // A target outside the app's models (a gem's) is not read here.
             if declared(&app.models, target).next().is_none() {
