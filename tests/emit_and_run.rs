@@ -22606,3 +22606,5 @@ mod view_url_for_hash;
 mod duration_name_on_object;
 #[path = "emit_and_run/update_in_argument_position.rs"]
 mod update_in_argument_position;
+#[path = "emit_and_run/indifferent_hash_in_plain_class.rs"]
+mod indifferent_hash_in_plain_class;
