@@ -22608,3 +22608,5 @@ mod duration_name_on_object;
 mod update_in_argument_position;
 #[path = "emit_and_run/indifferent_hash_in_plain_class.rs"]
 mod indifferent_hash_in_plain_class;
+#[path = "emit_and_run/test_file_class_body.rs"]
+mod test_file_class_body;
