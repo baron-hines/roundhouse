@@ -122,6 +122,33 @@ fn a_helper_a_kept_class_eval_calls_is_kept() {
     contract::listed(contract::class_eval_helper_app()).run_ruby(contract::HELPER_ASSERTIONS).assert_passes();
 }
 
+/// A helper that a kept helper calls is kept too.
+#[test]
+fn a_helper_a_kept_helper_calls_is_kept() {
+    contract::listed(contract::class_eval_transitive_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper the block names from the top level (`::LabelHelper`) is kept.
+#[test]
+fn a_helper_a_kept_class_eval_names_from_the_top_level_is_kept() {
+    contract::listed(contract::class_eval_rooted_helper_app()).run_ruby(contract::HELPER_ASSERTIONS).assert_passes();
+}
+
+/// A block with a `def` on another receiver is not taken: that method is
+/// the other object's. It stays reported, and the class is the gem's.
+#[test]
+fn a_class_eval_defining_on_another_receiver_is_left_reported() {
+    let source = shelf_box(contract::class_eval_other_receiver_app());
+    assert!(!source.contains("local_tag") && !source.contains("\"other\""), "{source}");
+    let warned: Vec<String> = contract::class_eval_other_receiver_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
 /// A block whose method reads a bare constant the gem's class defines is
 /// not taken: in Ruby the name is the top level's, and the opening would
 /// put it in the class. It stays reported, and the class is the gem's.

@@ -225,6 +225,41 @@ pub fn class_eval_helper_app() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 
+/// A helper the kept block calls that calls a second helper, both only in
+/// the initializer. Ruby answers `box / app box / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_transitive_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nmodule LabelHelper\n  def self.tag\n    TagSource.tag\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+pub const TRANSITIVE_ASSERTIONS: &str = r##"got = ArticleBox.describe
+raise "describe #{got.inspect}" unless got == "box / app box / sourced"
+puts "transitive passed"
+"##;
+
+/// [`class_eval_helper_app`] with the helper named from the top level,
+/// `::LabelHelper.tag`. Ruby answers the same.
+#[allow(dead_code)]
+pub fn class_eval_rooted_helper_app() -> emit_and_run::Overlay {
+    let source = "module LabelHelper\n  def self.tag\n    \"helped\"\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    ::LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A block with a `def` on another receiver (`def Other.label`). Ruby
+/// defines that one on `Other`, not on `Shelf::Box`.
+#[allow(dead_code)]
+pub fn class_eval_other_receiver_app() -> emit_and_run::Overlay {
+    let source = "module Other\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    \"local\"\n  end\n\n  def Other.label\n    \"other\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 pub const HELPER_ASSERTIONS: &str = r##"got = ArticleBox.describe
 raise "describe #{got.inspect}" unless got == "box / app box / helped"
 puts "helper passed"
