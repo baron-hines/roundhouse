@@ -180,6 +180,20 @@ impl Overlay {
         Run::new(command.join(" "), emitted, errors, output)
     }
 
+    /// Emit, then load several of the emitted test files into one Ruby
+    /// process, in order, as `bin/rails test` loads a suite.
+    pub fn run_tests(self, test_paths: &[&str]) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
+        let load = "ARGV.each { |path| require File.expand_path(path) }";
+        let output = ruby()
+            .args(["-Itest", "-I.", "-e", load])
+            .args(test_paths)
+            .current_dir(&emitted)
+            .output()
+            .expect("spawn ruby");
+        Run::new(format!("ruby -Itest -I. -e '{load}' {}", test_paths.join(" ")), emitted, errors, output)
+    }
+
     /// Emit the Spinel tree, then run one of its test files with
     /// `spin test <path>`. Spinel writes `test/<dir>/x_test.rb` as
     /// `test/x_test.rb`, so `test_path` is the emitted path.

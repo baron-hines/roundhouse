@@ -1083,9 +1083,17 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             // them.
                             let outer = model.name.clone();
                             app.models.push(model);
-                            if let Some(classes) =
-                                unwrap_or_record(ingest_nested_library_classes(&source, &path_str, outer.0.as_str()))?
-                            {
+                            let nested = unwrap_or_record(ingest_nested_library_classes(&source, &path_str, outer.0.as_str()))?;
+                            // A refusal survey mode records: the value classes
+                            // the model walk left to that walk register alone.
+                            if nested.is_none() {
+                                app.library_classes.extend(super::library_class::ingest_model_value_classes(
+                                    &source,
+                                    &path_str,
+                                    outer.0.as_str(),
+                                ));
+                            }
+                            if let Some(classes) = nested {
                                 let nested = nested_under(&outer, classes);
                                 let (concern_items, concern_enum_decls, concern_guarded) =
                                     ingest_concern_model_items_with_constants(
@@ -1324,8 +1332,18 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // none of its synthesized methods in scope, so
                         // an alias naming one (an enum predicate, say)
                         // would hard-fail here and drop every genuinely
-                        // nested class in the file too.
-                        if let Ok(classes) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
+                        // nested class in the file too. The value classes
+                        // the model walk left to it are registered then
+                        // on their own.
+                        let nested = ingest_nested_library_classes(&source, &path_str, outer.0.as_str());
+                        if nested.is_err() {
+                            app.library_classes.extend(super::library_class::ingest_model_value_classes(
+                                &source,
+                                &path_str,
+                                outer.0.as_str(),
+                            ));
+                        }
+                        if let Ok(classes) = nested {
                             let nested = nested_under(&outer, classes);
                             let (concern_items, concern_enum_decls, concern_guarded) =
                                 ingest_concern_model_items_with_constants(
@@ -2831,7 +2849,7 @@ end
     // doc). The real drain runs after them, below.
     // after_initialize bodies, and the app files they require, are part of the
     // source walk; their reopens are applied at the end (`after_initialize::apply`).
-    let callbacks = super::after_initialize::read_all(vfs, dir)?;
+    let callbacks = super::after_initialize::read_all(vfs, dir, &app.library_class_files)?;
     let sources = std::sync::Arc::new(super::sources::snapshot());
     let const_resolver =
         crate::analyze::ConstResolverTask::start(std::sync::Arc::clone(&sources));

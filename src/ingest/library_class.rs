@@ -351,10 +351,29 @@ fn ingest_library_classes_impl(
     let result = super::prism::parse(source, file);
     let root = result.node();
     let mut out = Vec::new();
+    // The outer class is the model walk's, but for the value classes its
+    // body declares, which are classes of their own. One the walk below
+    // reaches anyway (a model nested in a module) takes them there.
+    let is_outer = |scope: &[String], class: &ruby_prism::ClassNode<'_>| {
+        nested_in.is_some_and(|outer| {
+            class_name_path(class).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == outer)
+        })
+    };
+    for (scope, class) in find_all_classes_with_scope(&root) {
+        if is_outer(&scope, &class) && !walked(&scope, class_name_path(&class)) {
+            out.extend(model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file));
+        }
+    }
     for (scope, class) in find_all_classes_with_scope(&root)
         .into_iter()
         .filter(|(scope, class)| walked(scope, class_name_path(class)))
     {
+        let values = match is_outer(&scope, &class) {
+            true => model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file),
+            false => Vec::new(),
+        };
+        // The value classes the model walk left to this one, each once.
+        let fresh = |lc: &LibraryClass| !values.iter().any(|value| value.name == lc.name);
         let (mut lc, struct_base) =
             library_class_and_struct_base(&class, &scope, file).map_err(|err| super::error_site::at(err, &class.as_node()))?;
         // BEFORE the class it serves: a superclass has to be defined
@@ -367,12 +386,13 @@ fn ingest_library_classes_impl(
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         let made = super::class_new_factory::constant_classes(Some(&owner), class.body(), file);
         lc.constants.retain(|(name, _)| !made.iter().any(|(s, _)| s == name));
-        out.extend(super::data_factory::collect(class.body(), &owner, file)?);
+        out.extend(super::data_factory::collect(class.body(), &owner, file)?.into_iter().filter(|c| fresh(c)));
         out.push(lc);
-        out.extend(data_block_classes(class.body(), &owner, file)?);
+        out.extend(data_block_classes(class.body(), &owner, file)?.into_iter().filter(|c| fresh(c)));
         // Not before the owner: the struct is named under it, so the owner has to exist first.
-        out.extend(structs.into_iter().map(|(_, s)| s));
+        out.extend(structs.into_iter().map(|(_, s)| s).filter(|c| fresh(c)));
         out.extend(made.into_iter().map(|(_, c)| c));
+        out.extend(values);
     }
     for (scope, module) in find_all_modules_with_scope(&root)
         .into_iter()
@@ -665,9 +685,19 @@ fn data_method_statement(stmt: &Node<'_>) -> bool {
 /// enclosing scope, which the emitted reopen of `X` cannot express, so
 /// the file is rejected.
 fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult<Option<LibraryClass>> {
+    data_class(statement, None, file)
+}
+
+/// [`file_data_class`] for a declaration written at the top of a file
+/// (`scope` `None`) or in the body of the class `scope`, whose constant
+/// it then names (`Scope::X`).
+fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &str) -> IngestResult<Option<LibraryClass>> {
     let Some((name, call)) = file_data_declaration(statement) else { return Ok(None) };
     let Some(members) = data_members(&call) else { return Ok(None) };
-    let owner = ClassId(Symbol::from(name));
+    let owner = match scope {
+        Some(scope) => ClassId(Symbol::from(format!("{}::{name}", scope.0.as_str()))),
+        None => ClassId(Symbol::from(name)),
+    };
     let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
     if let Some(body) = body() {
         let statements = flatten_statements(body);
@@ -715,6 +745,64 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
         unknown_calls,
         class_ivar_initializers: class_initializers,
     }))
+}
+
+/// `X = Data.define(:a) do … end` or `X = Struct.new(:a) do … end` in a
+/// model's body. Ruby creates the class when the constant is assigned,
+/// running the block as its body, so it is a class of its own,
+/// `Model::X`: the model walk passes over the statement and the nested
+/// walk of the model's file registers the class ([`model_value_classes`]),
+/// as either does for a `class X` nested there.
+///
+/// A `Data.define` block is taken only when it holds nothing but method
+/// definitions and bare visibility markers ([`data_define_block`]), as in
+/// a plain class body: a method reads the model's constants through the
+/// class's name, which the analyzer roots, but an `include` or a constant
+/// the block writes would be looked up from the model, where the emitted
+/// class cannot follow. So is one whose class does not ingest: it stays
+/// the model's statement, and keeps the errors it had there.
+pub(super) fn model_value_class(statement: &ruby_prism::Node<'_>, owner: &ClassId, file: &str) -> bool {
+    model_value_class_of(statement, owner, file).is_some()
+}
+
+/// The class a [`model_value_class`] statement declares.
+fn model_value_class_of(statement: &ruby_prism::Node<'_>, owner: &ClassId, file: &str) -> Option<LibraryClass> {
+    let write = statement.as_constant_write_node()?;
+    let value = write.value();
+    if struct_constant_block(&value) {
+        return struct_constant_class(owner, struct_constant(statement)?, file).ok();
+    }
+    // `def Other.x` in the block defines on `Other`, which the class cannot carry.
+    let block = data_define_block(&value)?;
+    let on_other = |stmt: &Node<'_>| {
+        stmt.as_def_node().and_then(|def| def.receiver()).is_some_and(|recv| recv.as_self_node().is_none())
+    };
+    if block.body().map(flatten_statements).unwrap_or_default().iter().any(on_other) {
+        return None;
+    }
+    data_class(statement, Some(owner), file).ok().flatten()
+}
+
+/// The value classes the model `outer`'s body declares
+/// ([`model_value_class`]), for when the nested walk of its file is
+/// refused: the model walk passed over them either way.
+pub fn ingest_model_value_classes(source: &[u8], file: &str, outer: &str) -> Vec<LibraryClass> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let owner = ClassId(Symbol::from(outer));
+    find_all_classes_with_scope(&root)
+        .into_iter()
+        .filter(|(scope, class)| {
+            class_name_path(class).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == outer)
+        })
+        .flat_map(|(_, class)| model_value_classes(&owner, &class, file))
+        .collect()
+}
+
+/// The classes [`model_value_class`] statements of `owner`'s body declare,
+/// in source order.
+fn model_value_classes(owner: &ClassId, class: &ruby_prism::ClassNode<'_>, file: &str) -> Vec<LibraryClass> {
+    class.body().map(flatten_statements).unwrap_or_default().iter().filter_map(|s| model_value_class_of(s, owner, file)).collect()
 }
 
 /// A file whose only statement is `X = Struct.new(…)` or `A::X = Struct.new(…)`,
@@ -1994,15 +2082,14 @@ fn struct_constants<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<StructConst
     let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) else {
         return Vec::new();
     };
-    statements
-        .body()
-        .iter()
-        .filter_map(|stmt| {
-            let write = stmt.as_constant_write_node()?;
-            let spec = struct_constant_spec(&write.value())?;
-            Some(StructConstant { name: Symbol::from(constant_id_str(&write.name())), ..spec })
-        })
-        .collect()
+    statements.body().iter().filter_map(|stmt| struct_constant(&stmt)).collect()
+}
+
+/// One body statement `X = Struct.new(…)`.
+fn struct_constant<'pr>(stmt: &ruby_prism::Node<'pr>) -> Option<StructConstant<'pr>> {
+    let write = stmt.as_constant_write_node()?;
+    let spec = struct_constant_spec(&write.value())?;
+    Some(StructConstant { name: Symbol::from(constant_id_str(&write.name())), ..spec })
 }
 
 fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructConstant<'pr>> {
@@ -2125,29 +2212,35 @@ fn struct_constant_classes(
 ) -> IngestResult<Vec<(Symbol, LibraryClass)>> {
     let mut out = Vec::new();
     for spec in struct_constants(body) {
-        let id = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), spec.name.as_str())));
-        let mut class = struct_class(
-            id.clone(),
-            &spec.members,
-            spec.keyword_init,
-            crate::dialect::LibraryClassOrigin::StructConstant {
-                members: spec.members.clone(),
-                keyword_init: spec.keyword_init,
-                positional_written: spec.positional_written,
-            },
-        );
-        if spec.body.is_some() {
-            let body = walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?;
-            class.methods.extend(body.methods);
-            class.includes.extend(body.includes);
-            class.include_spans.extend(body.include_spans);
-            class.constants.extend(body.constants);
-            class.unknown_calls.extend(body.unknown_calls);
-            class.class_ivar_initializers.extend(body.class_initializers);
-        }
-        out.push((spec.name, class));
+        let name = spec.name.clone();
+        out.push((name, struct_constant_class(owner, spec, file)?));
     }
     Ok(out)
+}
+
+/// The class `owner`'s body defines through one `X = Struct.new(…)`.
+fn struct_constant_class(owner: &ClassId, spec: StructConstant<'_>, file: &str) -> IngestResult<LibraryClass> {
+    let id = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), spec.name.as_str())));
+    let mut class = struct_class(
+        id.clone(),
+        &spec.members,
+        spec.keyword_init,
+        crate::dialect::LibraryClassOrigin::StructConstant {
+            members: spec.members.clone(),
+            keyword_init: spec.keyword_init,
+            positional_written: spec.positional_written,
+        },
+    );
+    if spec.body.is_some() {
+        let body = walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?;
+        class.methods.extend(body.methods);
+        class.includes.extend(body.includes);
+        class.include_spans.extend(body.include_spans);
+        class.constants.extend(body.constants);
+        class.unknown_calls.extend(body.unknown_calls);
+        class.class_ivar_initializers.extend(body.class_initializers);
+    }
+    Ok(class)
 }
 
 /// Same as `library_class_from_node` but for module-as-namespace
