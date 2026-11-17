@@ -2385,19 +2385,20 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         // association: its own foreign key, its own polymorphic type. The
         // module's one body can't say which, so a method that lowers
         // differently on this model gets a lowered copy here, which Ruby's
-        // lookup finds ahead of the module's. The model's own def of the
-        // name stays, as in Ruby, and a method calling `super` stays in the
-        // module, where `super` means what it says. Concerns go in include
-        // order, so a later one's copy replaces an earlier one's.
+        // lookup finds ahead of the module's. Each name is settled by the
+        // definition Ruby's lookup finds first: the model's own, else the
+        // first module in its ancestors that defines it. Only that one is
+        // copied, and only when it lowers differently here, defaults
+        // included; a winner calling `super` stays in its module, where
+        // `super` means what it says.
         let mut includer_copies: Vec<MethodDef> = Vec::new();
         if is_model {
-            let order = app.models.iter().find(|m| m.name == lc.name).map(crate::app::model_includes).unwrap_or_default();
-            let mut concerns: Vec<&LibraryClass> = app
-                .library_classes
+            let chain = app
+                .models
                 .iter()
-                .filter(|module| shared_concerns.get(&module.name).is_some_and(|models| models.contains(&lc.name)))
-                .collect();
-            concerns.sort_by_key(|module| order.iter().position(|id| *id == module.name).unwrap_or(usize::MAX));
+                .find(|m| m.name == lc.name)
+                .map(|m| crate::app::model_include_ancestors(m, &app.library_classes))
+                .unwrap_or_default();
             let mentions_instance = |e: &Expr| {
                 crate::lower::scope_chain::mentions_scope(e, &names)
                     || crate::lower::scope_chain::mentions_model_chain_start(e, &models)
@@ -2408,25 +2409,46 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                     || crate::lower::scope_chain::mentions_model_insert_all(e, &models)
                     || crate::lower::scope_chain::mentions_assoc_class_method(e, &assocs, &names, &assoc_class_methods)
             };
-            for module in concerns {
+            let lowered = |m: &MethodDef, owner: Option<&ClassId>| {
+                let mut out = m.clone();
+                crate::lower::scope_chain::rewrite_call_site(&mut out.body, &regs, None, owner);
+                for d in out.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                    if mentions_instance(d) {
+                        crate::lower::scope_chain::rewrite_call_site(d, &regs, None, owner);
+                    }
+                }
+                out
+            };
+            let mut settled: std::collections::BTreeSet<Symbol> = lc
+                .methods
+                .iter()
+                .filter(|own| own.receiver == MethodReceiver::Instance)
+                .map(|own| own.name.clone())
+                .collect();
+            for id in &chain {
+                let Some(module) = app.library_classes.iter().find(|l| l.is_module && l.name == *id) else { continue };
+                let shared = shared_concerns.get(&module.name).is_some_and(|models| models.contains(&lc.name));
                 for m in &module.methods {
                     if m.receiver != MethodReceiver::Instance
                         || m.name.as_str().starts_with("__scope_")
-                        || lc.methods.iter().any(|own| own.receiver == MethodReceiver::Instance && own.name == m.name)
-                        || !mentions_instance(&m.body)
-                        || contains_super(&m.body)
+                        || !settled.insert(m.name.clone())
+                        || !shared
                     {
                         continue;
                     }
-                    let mut shared = m.body.clone();
-                    crate::lower::scope_chain::rewrite_call_site(&mut shared, &regs, None, None);
-                    let mut copy = m.clone();
-                    crate::lower::scope_chain::rewrite_call_site(&mut copy.body, &regs, None, Some(&lc.name));
-                    if format!("{:?}", copy.body) == format!("{shared:?}") {
+                    let defaults: Vec<&Expr> = m.params.iter().filter_map(|p| p.default.as_ref()).collect();
+                    if contains_super(&m.body) || defaults.iter().any(|d| contains_super(d)) {
+                        continue;
+                    }
+                    if !mentions_instance(&m.body) && !defaults.iter().any(|d| mentions_instance(d)) {
+                        continue;
+                    }
+                    let module_side = lowered(m, None);
+                    let mut copy = lowered(m, Some(&lc.name));
+                    if format!("{:?}{:?}", copy.body, copy.params) == format!("{:?}{:?}", module_side.body, module_side.params) {
                         continue;
                     }
                     copy.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
-                    includer_copies.retain(|c| c.name != copy.name);
                     includer_copies.push(copy);
                 }
             }

@@ -1682,18 +1682,79 @@ pub struct IngestDrop {
 /// The modules a model's body includes, as `include X` sends it keeps
 /// until the concerns are spliced.
 pub(crate) fn model_includes(model: &Model) -> Vec<crate::ident::ClassId> {
-    let mut ids = Vec::new();
+    model_include_groups(model).into_iter().flatten().collect()
+}
+
+/// [`model_includes`], one group per `include` call: `include A, B` is
+/// one group of two.
+pub(crate) fn model_include_groups(model: &Model) -> Vec<Vec<crate::ident::ClassId>> {
+    let mut groups = Vec::new();
     for item in &model.body {
         if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
             && let crate::expr::ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node
             && method.as_str() == "include"
         {
-            for arg in args {
-                if let crate::expr::ExprNode::Const { path } = &*arg.node {
-                    ids.push(crate::analyze::mixin_path_id(path));
-                }
+            let ids: Vec<_> = args
+                .iter()
+                .filter_map(|arg| match &*arg.node {
+                    crate::expr::ExprNode::Const { path } => Some(crate::analyze::mixin_path_id(path)),
+                    _ => None,
+                })
+                .collect();
+            if !ids.is_empty() {
+                groups.push(ids);
             }
         }
     }
-    ids
+    groups
+}
+
+/// The modules a model includes, directly or through other modules, in
+/// Ruby's method-lookup order: the one whose method a call finds first
+/// comes first. A later `include` goes ahead of earlier ones, the
+/// arguments of one call keep their written order (`include A, B` looks
+/// in `A` first), a module's own includes follow it, and a module
+/// already included keeps its place. A module's includes are taken one
+/// call each.
+pub(crate) fn model_include_ancestors(
+    model: &Model,
+    library_classes: &[crate::dialect::LibraryClass],
+) -> Vec<crate::ident::ClassId> {
+    use crate::ident::ClassId;
+    fn chain(
+        groups: &[Vec<ClassId>],
+        includes: &crate::det::HashMap<&ClassId, &Vec<ClassId>>,
+        visiting: &mut Vec<ClassId>,
+    ) -> Vec<ClassId> {
+        let mut out: Vec<ClassId> = Vec::new();
+        for group in groups {
+            let mut block: Vec<ClassId> = Vec::new();
+            for id in group {
+                if visiting.contains(id) {
+                    continue;
+                }
+                let mut lin = vec![id.clone()];
+                if let Some(nested) = includes.get(id) {
+                    visiting.push(id.clone());
+                    let nested: Vec<Vec<ClassId>> = nested.iter().map(|n| vec![n.clone()]).collect();
+                    lin.extend(chain(&nested, includes, visiting));
+                    visiting.pop();
+                }
+                for m in lin {
+                    if !block.contains(&m) && !out.contains(&m) {
+                        block.push(m);
+                    }
+                }
+            }
+            block.extend(out);
+            out = block;
+        }
+        out
+    }
+    let includes: crate::det::HashMap<&ClassId, &Vec<ClassId>> = library_classes
+        .iter()
+        .filter(|lc| lc.is_module && !lc.includes.is_empty())
+        .map(|lc| (&lc.name, &lc.includes))
+        .collect();
+    chain(&model_include_groups(model), &includes, &mut Vec::new())
 }
