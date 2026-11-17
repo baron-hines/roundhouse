@@ -34,6 +34,7 @@ end
   get "/read/:id/:slug", to: "articles#show", constraints: { id: /\d+/ }, as: :slugged_article
   get "/topics/:id", to: "articles#show", as: :forum_thread
   get "/archive(/:year)", to: "articles#show", as: :yearly_archive
+  get "/dated/:year", to: "articles#show", defaults: { year: "2024" }, as: :dated_archive
 
   direct :listing do |kind, options|
     route_for "#{kind}_archive", options
@@ -82,6 +83,14 @@ end
   def self.listing
     Rails.application.routes.url_helpers.listing_path("yearly")
   end
+
+  def self.dated
+    Rails.application.routes.url_helpers.listing_path("dated")
+  end
+
+  def permalink_odd_key
+    Rails.application.routes.url_helpers.article_slug_path(self, "x&y" => "v")
+  end
 end
 "##)
         .write("app/models/comment.rb", r##"class Comment < ApplicationRecord
@@ -126,7 +135,8 @@ end
 // is left out), "/articles/1/comments/1", "/topics/1-ruby" (the model's
 // own `to_param`), "/read/1/hello-world?q=x+y" (a String key),
 // "/archive" (a nil record leaves the optional segment out),
-// "/archive/1", "/archive" (an interpolated name, no segment).
+// "/archive/1", "/archive" (an interpolated name, no segment),
+// "/dated/2024" (a defaulted segment), "/read/1/hello-world?x%26y=v".
 const SCRIPT: &str = r##"article = Article.create!(title: "Hello World", slug: "hello-world")
 comment = Comment.create!(article: article)
 path = "/read/#{article.id}/hello-world"
@@ -141,6 +151,8 @@ raise "string key: #{article.permalink_keyed("x y")}" unless article.permalink_k
 raise "nil record: #{Article.archive_link("none")}" unless Article.archive_link("none") == "/archive"
 raise "record: #{Article.archive_link("hello-world")}" unless Article.archive_link("hello-world") == "/archive/#{article.id}"
 raise "listing: #{Article.listing}" unless Article.listing == "/archive"
+raise "dated: #{Article.dated}" unless Article.dated == "/dated/2024"
+raise "odd key: #{article.permalink_odd_key}" unless article.permalink_odd_key == path + "?x%26y=v"
 puts "probe passed"
 "##;
 

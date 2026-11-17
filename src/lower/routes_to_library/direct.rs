@@ -195,7 +195,13 @@ fn empty_hash() -> Expr {
 /// its optional groups at least, all of them at most
 /// (`/archive(/:period)` takes zero or one).
 fn segment_counts(route: &FlatRoute) -> std::ops::RangeInclusive<usize> {
-    route.required_params.min(route.path_params.len())..=route.path_params.len()
+    // A required segment with a default (`defaults: { year: "2024" }`)
+    // is one the helper can be called without.
+    let required = route.path_params[..route.required_params.min(route.path_params.len())]
+        .iter()
+        .filter(|p| !route.param_defaults.iter().any(|(name, _)| name == *p))
+        .count();
+    required..=route.path_params.len()
 }
 
 /// The routes a `route_for` call can name, as `as:` names: its first
@@ -316,7 +322,7 @@ fn rewrite_route_for(
         .map(|target| {
             let helper = format!("{target}_path");
             let call = target_call(&helper, positional, helper_params, fresh, models, span);
-            let mut out = with_query(call, &query, span);
+            let mut out = with_query(call, &query, fresh, span);
             if let Some(fragment) = &anchor {
                 out = concat(out, fragment.clone(), span);
             }
@@ -588,13 +594,13 @@ fn route_helpers_call(helper: &str, args: Vec<Expr>, span: Span) -> Expr {
 /// Emits, for keys sorted at COMPILE time:
 ///
 /// ```ruby
-/// __q = []
-/// __q0 = <size expr>
-/// __q.push("size=" + ActionView::ViewHelpers.url_encode(__q0.to_s)) unless __q0.nil?
-/// __q1 = <v expr>
-/// __q.push("v=" + ActionView::ViewHelpers.url_encode(__q1.to_s)) unless __q1.nil?
-/// __qbase = RouteHelpers.account_logo_path
-/// __q.empty? ? __qbase : __qbase + "?" + __q.join("&")
+/// q = []                    # each name a fresh `route_for_arg_<n>`
+/// q0 = <size expr>
+/// q.push("size=" + ActionView::ViewHelpers.url_encode(q0.to_s)) unless q0.nil?
+/// q1 = <v expr>
+/// q.push("v=" + ActionView::ViewHelpers.url_encode(q1.to_s)) unless q1.nil?
+/// base = RouteHelpers.account_logo_path
+/// q.empty? ? base : base + "?" + q.join("&")
 /// ```
 ///
 /// Each value lands in a temporary first so the nil guard and the
@@ -605,7 +611,7 @@ fn route_helpers_call(helper: &str, args: Vec<Expr>, span: Span) -> Expr {
 /// named in both arms of the final conditional.
 ///
 /// Returns `base` untouched when there are no query keys.
-fn with_query(base: Expr, query: &[(Expr, Expr)], span: Span) -> Expr {
+fn with_query(base: Expr, query: &[(Expr, Expr)], fresh: &FreshLocals, span: Span) -> Expr {
     let mut pairs: Vec<(String, Expr)> = query
         .iter()
         .filter_map(|(k, v)| match &*k.node {
@@ -622,18 +628,20 @@ fn with_query(base: Expr, query: &[(Expr, Expr)], span: Span) -> Expr {
     // Rails' `Hash#to_query` sorts; written order is not emitted order.
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let q = Symbol::from("__q");
+    // Fresh names, so no parameter or local of the helper (its options
+    // Hash, say) is overwritten.
+    let q = fresh.name();
     let q_var = || var(&q, span);
     let mut stmts: Vec<Expr> = vec![assign(
         &q,
         Expr::new(span, ExprNode::Array { elements: vec![], style: Default::default() }),
         span,
     )];
-    for (i, (key, value)) in pairs.iter().enumerate() {
-        let tmp = Symbol::from(format!("__q{i}"));
+    for (key, value) in &pairs {
+        let tmp = fresh.name();
         stmts.push(assign(&tmp, value.clone(), span));
         let piece = concat(
-            lit_str(format!("{key}="), span),
+            lit_str(format!("{}=", form_encode(key)), span),
             view_helpers_call("url_encode", vec![to_s(var(&tmp, span), span)], span),
             span,
         );
@@ -657,7 +665,7 @@ fn with_query(base: Expr, query: &[(Expr, Expr)], span: Span) -> Expr {
             },
         ));
     }
-    let base_name = Symbol::from("__qbase");
+    let base_name = fresh.name();
     stmts.push(assign(&base_name, base, span));
     let joined = concat(
         concat(var(&base_name, span), lit_str("?".to_string(), span), span),
@@ -682,6 +690,20 @@ fn with_query(base: Expr, query: &[(Expr, Expr)], span: Span) -> Expr {
         },
     ));
     Expr::new(span, ExprNode::Seq { exprs: stmts })
+}
+
+/// `CGI.escape`, which `Hash#to_query` runs on each key: a key such as
+/// `"x&y"` stays one key (`x%26y`).
+fn form_encode(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for b in key.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn var(name: &Symbol, span: Span) -> Expr {
