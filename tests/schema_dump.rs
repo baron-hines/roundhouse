@@ -351,7 +351,16 @@ fn an_unparsed_file_refuses_a_named_file() {
         let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
         assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump`")), "{named}: {:?}", checked.errors);
     }
-    for dump in ["", "  # schema_dump: catalog_schema.rb\n", "  database: db/test.sqlite3 # schema_dump: catalog_schema.rb\n", "  database: 'db/test.sqlite3'\t# schema_dump\n"] {
+    // A quote inside a plain scalar (`don't`) opens nothing, so the comment after it is still one.
+    for dump in [
+        "",
+        "  # schema_dump: catalog_schema.rb\n",
+        "  database: db/test.sqlite3 # schema_dump: catalog_schema.rb\n",
+        "  database: 'db/test.sqlite3'\t# schema_dump\n",
+        "  note: don't # schema_dump: old.rb\n",
+        "  note: 'it''s' # schema_dump: old.rb\n",
+        "  pool: [ 'a', \"b\" ] # schema_dump: old.rb\n",
+    ] {
         let yml = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
         assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
