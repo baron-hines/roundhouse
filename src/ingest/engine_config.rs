@@ -309,6 +309,11 @@ fn config_hook<'pr>(node: &Node<'pr>, hook: &str) -> Option<Vec<Node<'pr>>> {
 
 /// Whether a condition is true whatever runs: literals compared, and `||` with such a side.
 pub(super) fn folds_true(cond: &Expr) -> bool {
+    settles(cond) == Some(true)
+}
+
+/// Whether `cond` is settled true or false where it is written: literals, number comparisons, `||` and `&&` of them.
+pub(super) fn settles(cond: &Expr) -> Option<bool> {
     fn number(e: &Expr) -> Option<f64> {
         match &*e.node {
             ExprNode::Lit { value: Literal::Int { value } } => Some(*value as f64),
@@ -343,23 +348,29 @@ pub(super) fn folds_true(cond: &Expr) -> bool {
         }
     }
     if !pure(cond) {
-        return false;
+        return None;
     }
     match &*cond.node {
-        ExprNode::Lit { value: Literal::Bool { value } } => *value,
-        ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => folds_true(left) || folds_true(right),
+        ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
+        ExprNode::BoolOp { op, left, right, .. } => match (op, settles(left), settles(right)) {
+            (crate::expr::BoolOpKind::Or, Some(true), _) | (crate::expr::BoolOpKind::Or, _, Some(true)) => Some(true),
+            (crate::expr::BoolOpKind::And, Some(false), _) | (crate::expr::BoolOpKind::And, _, Some(false)) => Some(false),
+            (crate::expr::BoolOpKind::Or, Some(a), Some(b)) => Some(a || b),
+            (crate::expr::BoolOpKind::And, Some(a), Some(b)) => Some(a && b),
+            _ => None,
+        },
         ExprNode::Send { recv: Some(l), method, args, block: None, .. } if args.len() == 1 => {
-            let (Some(a), Some(b)) = (number(l), number(&args[0])) else { return false };
+            let (Some(a), Some(b)) = (number(l), number(&args[0])) else { return None };
             match method.as_str() {
-                ">=" => a >= b,
-                ">" => a > b,
-                "<=" => a <= b,
-                "<" => a < b,
-                "==" => a == b,
-                _ => false,
+                ">=" => Some(a >= b),
+                ">" => Some(a > b),
+                "<=" => Some(a <= b),
+                "<" => Some(a < b),
+                "==" => Some(a == b),
+                _ => None,
             }
         }
-        _ => false,
+        _ => None,
     }
 }
 
