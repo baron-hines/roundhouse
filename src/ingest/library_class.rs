@@ -286,7 +286,9 @@ fn ingest_library_classes_impl(
         Walk::NestedIn(outer) => path.is_some_and(|path| {
             path.join("::").strip_prefix(outer).is_some_and(|rest| rest.starts_with("::"))
         }),
-        Walk::Beside(model) => path.is_some_and(|path| {
+        // Beside is lexical too: a rooted declaration written in the
+        // model's body is the nested walk's, whatever its name.
+        Walk::Beside(model) => nesting.iter().all(|outer| outside(model, outer)) && path.is_some_and(|path| {
             outside(model, &scope.iter().chain(&path).cloned().collect::<Vec<_>>().join("::"))
         }),
     };
@@ -5243,15 +5245,7 @@ impl ModelBases {
                 full.join("::")
             });
             let bare = &parent_path[0];
-            // A rooted `class ::Entry < Record` names no scope, but Ruby
-            // reads `Record` where the line is written: its lexical
-            // nesting, innermost first.
-            let enclosing: Vec<String> = if super::util::is_rooted(&class.constant_path()) {
-                nesting.to_vec()
-            } else {
-                (1..=scope.len()).rev().map(|n| scope[..n].join("::")).collect()
-            };
-            for outer in enclosing {
+            for outer in superclass_enclosing(scope, nesting, class) {
                 let candidate = format!("{outer}::{bare}");
                 if own.as_deref() != Some(candidate.as_str()) && self.contains(&candidate) {
                     return Some(candidate);
@@ -5271,7 +5265,7 @@ impl ModelBases {
     /// concrete parent with a table of its own means STI; an abstract
     /// one means a base chain. The full suite caught the difference
     /// after targeted tests missed it.
-    pub fn record(&mut self, source: &[u8], pairs: &mut Vec<(String, String)>) {
+    pub fn record(&mut self, source: &[u8], pairs: &mut Vec<BasePair>) {
         let result = parse(source);
         let root = result.node();
         for (scope, nesting, class) in find_all_classes_with_nesting(&root) {
@@ -5287,7 +5281,7 @@ impl ModelBases {
             let Some(parent) = self.resolve_class_superclass(&scope, &nesting, &class) else {
                 continue;
             };
-            pairs.push((full.join("::"), parent));
+            pairs.push((full.join("::"), parent, superclass_enclosing(&scope, &nesting, &class)));
         }
     }
 
@@ -5298,13 +5292,13 @@ impl ModelBases {
     /// `record` stores a bare parent (`MidBase`) when that name is not
     /// yet a known base. After a later iteration inserts the qualified
     /// form (`ActionText::MidBase`), match the stored spelling against
-    /// the child's enclosing modules the same way `resolve_superclass`
-    /// does at record time.
-    pub fn close_over(&mut self, pairs: &[(String, String)]) {
+    /// the modules `record` stored with it, the ones
+    /// `resolve_class_superclass` looks through.
+    pub fn close_over(&mut self, pairs: &[BasePair]) {
         loop {
             let before = self.names.len();
-            for (child, parent) in pairs {
-                if self.parent_is_known_base(child, parent) {
+            for (child, parent, enclosing) in pairs {
+                if self.parent_is_known_base(child, parent, enclosing) {
                     self.names.insert(child.clone());
                 }
             }
@@ -5391,28 +5385,43 @@ impl ModelBases {
         self.tableless.contains(name)
     }
 
-    fn parent_is_known_base(&self, child: &str, parent: &str) -> bool {
+    fn parent_is_known_base(&self, child: &str, parent: &str, enclosing: &[String]) -> bool {
         if self.names.contains(parent) {
             return true;
         }
         if parent.contains("::") {
             return false;
         }
-        let mut segs: Vec<&str> = child.split("::").collect();
-        if segs.len() < 2 {
-            return false;
-        }
-        segs.pop();
-        while !segs.is_empty() {
-            let candidate = format!("{}::{}", segs.join("::"), parent);
-            if candidate != child && self.names.contains(&candidate) {
-                return true;
-            }
-            segs.pop();
-        }
-        false
+        enclosing.iter().any(|outer| {
+            let candidate = format!("{outer}::{parent}");
+            candidate != child && self.names.contains(&candidate)
+        })
     }
 
+}
+
+/// One abstract class for `ModelBases::close_over`: its name, its parent
+/// as `record` resolved it, and the modules a bare parent is looked up
+/// through ([`superclass_enclosing`]).
+pub type BasePair = (String, String, Vec<String>);
+
+/// The modules a bare superclass name is looked up through, innermost
+/// first. Ruby reads it where the `class` line is written: a rooted
+/// `class ::Entry < Record` names no scope, so its lexical nesting
+/// alone, and a class whose name is under a rooted module (`module
+/// ::Export` in `module Ledger`) looks through its scope, then the
+/// nesting around the rooted module (`Ledger`).
+pub(super) fn superclass_enclosing(scope: &[String], nesting: &[String], class: &ruby_prism::ClassNode<'_>) -> Vec<String> {
+    if super::util::is_rooted(&class.constant_path()) {
+        return nesting.to_vec();
+    }
+    let mut out: Vec<String> = (1..=scope.len()).rev().map(|n| scope[..n].join("::")).collect();
+    for outer in nesting {
+        if !out.contains(outer) {
+            out.push(outer.clone());
+        }
+    }
+    out
 }
 
 /// The modules a class's superclass is looked up through: none for

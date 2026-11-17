@@ -992,7 +992,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let mut model_bases = super::library_class::ModelBases::new();
     // A model subclass's own validations, placed once every class is read.
     let mut sti_validations = Vec::new();
-    let mut base_pairs: Vec<(String, String)> = Vec::new();
+    let mut base_pairs: Vec<super::library_class::BasePair> = Vec::new();
     for root in &roots {
         let models_dir = dir.join(root).join("models");
         if !vfs.is_dir(&models_dir) {
@@ -2285,10 +2285,13 @@ end
                     // A concern nested in the controller, here or in a
                     // `cache_controller/versioning.rb` opening, declares
                     // its `included do` filters as one in the concerns
-                    // folder does (the branch below).
+                    // folder does (the branch below). Nested is lexical,
+                    // as for its classes: a rooted `module ::AccessRules`
+                    // in the body is one too.
                     let prefix = format!("{}::", outer.0.as_str());
+                    let inside = super::util::declared_inside(&super::prism::parse_silent(&source).node(), outer.0.as_str());
                     record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |id| {
-                        id.0.as_str().starts_with(&prefix)
+                        id.0.as_str().starts_with(&prefix) || inside.contains(id.0.as_str())
                     });
                 } else {
                     // Not a controller file: a module-only concern under
