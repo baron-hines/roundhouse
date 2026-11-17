@@ -22602,3 +22602,5 @@ mod tag_helper_singleton_include;
 mod translation_helper_test_include;
 #[path = "emit_and_run/view_url_for_hash.rs"]
 mod view_url_for_hash;
+#[path = "emit_and_run/duration_name_on_object.rs"]
+mod duration_name_on_object;
