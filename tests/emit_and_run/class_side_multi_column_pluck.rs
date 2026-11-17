@@ -18,7 +18,7 @@ end
   end
 
   def self.first_reading
-    order(:id).pick(:name, :level)
+    pick(:name, :level)
   end
 
   def self.lowest
@@ -33,11 +33,12 @@ end
 
   def self.run
     Gauge.create!(name: "oil", level: 3)
-    Gauge.create!(name: "fuel", level: 7)
-    # Rails: {"oil" => 3, "fuel" => 7}, ["oil", 3], 3
-    check("pluck of two columns", Gauge.levels == { "oil" => 3, "fuel" => 7 })
+    # One row, so `pick` has one row to answer. Rails: ["oil", 3], 3
     check("pick of two columns", Gauge.first_reading == ["oil", 3])
     check("pick of one column", Gauge.lowest == 3)
+    Gauge.create!(name: "fuel", level: 7)
+    # Rails: {"oil" => 3, "fuel" => 7}
+    check("pluck of two columns", Gauge.levels == { "oil" => 3, "fuel" => 7 })
   end
 end
 "##)
