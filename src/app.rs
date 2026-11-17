@@ -1711,11 +1711,11 @@ pub(crate) fn model_include_groups(model: &Model) -> Vec<Vec<crate::ident::Class
 
 /// The modules a model includes, directly or through other modules, in
 /// Ruby's method-lookup order: the one whose method a call finds first
-/// comes first. A later `include` goes ahead of earlier ones, the
-/// arguments of one call keep their written order (`include A, B` looks
-/// in `A` first), a module's own includes follow it, and a module
-/// already included keeps its place. A module's includes are taken one
-/// call each.
+/// comes first. As `Module#include` does, each module goes in directly
+/// above the class with its own includes after it, skipping any already
+/// there, and one call's arguments go in last to first: `include A, B`
+/// looks in `A`, then `B`, and a module both include comes after both.
+/// A module's own includes are taken one call each.
 pub(crate) fn model_include_ancestors(
     model: &Model,
     library_classes: &[crate::dialect::LibraryClass],
@@ -1727,23 +1727,21 @@ pub(crate) fn model_include_ancestors(
         visiting: &mut Vec<ClassId>,
     ) -> Vec<ClassId> {
         let mut out: Vec<ClassId> = Vec::new();
-        for group in groups {
+        for id in groups.iter().flat_map(|group| group.iter().rev()) {
+            if visiting.contains(id) {
+                continue;
+            }
+            let mut lin = vec![id.clone()];
+            if let Some(nested) = includes.get(id) {
+                visiting.push(id.clone());
+                let nested: Vec<Vec<ClassId>> = nested.iter().map(|n| vec![n.clone()]).collect();
+                lin.extend(chain(&nested, includes, visiting));
+                visiting.pop();
+            }
             let mut block: Vec<ClassId> = Vec::new();
-            for id in group {
-                if visiting.contains(id) {
-                    continue;
-                }
-                let mut lin = vec![id.clone()];
-                if let Some(nested) = includes.get(id) {
-                    visiting.push(id.clone());
-                    let nested: Vec<Vec<ClassId>> = nested.iter().map(|n| vec![n.clone()]).collect();
-                    lin.extend(chain(&nested, includes, visiting));
-                    visiting.pop();
-                }
-                for m in lin {
-                    if !block.contains(&m) && !out.contains(&m) {
-                        block.push(m);
-                    }
+            for m in lin {
+                if !block.contains(&m) && !out.contains(&m) {
+                    block.push(m);
                 }
             }
             block.extend(out);

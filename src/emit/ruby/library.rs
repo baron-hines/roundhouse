@@ -2387,11 +2387,14 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         // differently on this model gets a lowered copy here, which Ruby's
         // lookup finds ahead of the module's. Each name is settled by the
         // definition Ruby's lookup finds first: the model's own, else the
-        // first module in its ancestors that defines it. Only that one is
-        // copied, and only when it lowers differently here, defaults
-        // included; a winner calling `super` stays in its module, where
-        // `super` means what it says.
+        // first module in its ancestors that defines it, and that module's
+        // last definition of it. Only that one is copied, and only when it
+        // lowers differently here, defaults included; a winner calling
+        // `super` stays in its module, where `super` means what it says.
+        // A winner behind a load-time `if` goes with its condition, along
+        // with the other branches' definitions of the name.
         let mut includer_copies: Vec<MethodDef> = Vec::new();
+        let mut carried_conditionals: Vec<crate::dialect::ConditionalDefinitions> = Vec::new();
         if is_model {
             let chain = app
                 .models
@@ -2428,7 +2431,24 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             for id in &chain {
                 let Some(module) = app.library_classes.iter().find(|l| l.is_module && l.name == *id) else { continue };
                 let shared = shared_concerns.get(&module.name).is_some_and(|models| models.contains(&lc.name));
-                for m in &module.methods {
+                let copy_of = |m: &MethodDef| -> Option<MethodDef> {
+                    let defaults: Vec<&Expr> = m.params.iter().filter_map(|p| p.default.as_ref()).collect();
+                    if contains_super(&m.body) || defaults.iter().any(|d| contains_super(d)) {
+                        return None;
+                    }
+                    if !mentions_instance(&m.body) && !defaults.iter().any(|d| mentions_instance(d)) {
+                        return None;
+                    }
+                    let module_side = lowered(m, None);
+                    let mut copy = lowered(m, Some(&lc.name));
+                    if format!("{:?}{:?}", copy.body, copy.params) == format!("{:?}{:?}", module_side.body, module_side.params) {
+                        return None;
+                    }
+                    copy.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
+                    Some(copy)
+                };
+                // Last to first: a later `def` of a name replaces an earlier one.
+                for m in module.methods.iter().rev() {
                     if m.receiver != MethodReceiver::Instance
                         || m.name.as_str().starts_with("__scope_")
                         || !settled.insert(m.name.clone())
@@ -2436,20 +2456,22 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                     {
                         continue;
                     }
-                    let defaults: Vec<&Expr> = m.params.iter().filter_map(|p| p.default.as_ref()).collect();
-                    if contains_super(&m.body) || defaults.iter().any(|d| contains_super(d)) {
+                    let Some(conditional) = module.conditional_definitions.iter().find(|c| c.contains(m)) else {
+                        includer_copies.extend(copy_of(m));
                         continue;
+                    };
+                    let copies: Vec<MethodDef> = module
+                        .methods
+                        .iter()
+                        .filter(|other| other.receiver == m.receiver && other.name == m.name && conditional.contains(other))
+                        .filter_map(|other| copy_of(other))
+                        .collect();
+                    if !copies.is_empty() && !carried_conditionals.iter().any(|c| c.span == conditional.span) {
+                        let mut carried = conditional.clone();
+                        strip_declarations(&mut carried);
+                        carried_conditionals.push(carried);
                     }
-                    if !mentions_instance(&m.body) && !defaults.iter().any(|d| mentions_instance(d)) {
-                        continue;
-                    }
-                    let module_side = lowered(m, None);
-                    let mut copy = lowered(m, Some(&lc.name));
-                    if format!("{:?}{:?}", copy.body, copy.params) == format!("{:?}{:?}", module_side.body, module_side.params) {
-                        continue;
-                    }
-                    copy.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
-                    includer_copies.push(copy);
+                    includer_copies.extend(copies);
                 }
             }
         }
@@ -2523,6 +2545,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             }
         }
         lc.methods.extend(includer_copies);
+        lc.conditional_definitions.extend(carried_conditionals);
     }
     drop(_span);
     let _span = crate::timings::begin("scope lowering: variants");
@@ -14067,6 +14090,15 @@ mod insert_rel_param_tests {
         };
         let names: Vec<&str> = fn_ty.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["tags", "__rel", "opts"]);
+    }
+}
+
+/// A module's load-time conditional as an includer carries it with its
+/// copied definitions: the classes its branches declare stay the module's.
+fn strip_declarations(conditional: &mut crate::dialect::ConditionalDefinitions) {
+    for arm in &mut conditional.arms {
+        arm.declarations.clear();
+        arm.nested.iter_mut().for_each(strip_declarations);
     }
 }
 
