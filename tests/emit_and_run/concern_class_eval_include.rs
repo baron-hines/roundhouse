@@ -51,6 +51,32 @@ end
   include Shippable, Stackable
 end
 "##)
+        .write("app/models/concerns/wrapped.rb", r##"module Wrapped
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_accessor :layers, default: 1
+  end
+end
+"##)
+        .write("app/models/concerns/boxed.rb", r##"module Boxed
+  extend ActiveSupport::Concern
+
+  included do
+    cattr_accessor :layers, default: 2
+  end
+end
+"##)
+        .write("app/models/concerns/packable.rb", r##"module Packable
+  def self.included(base)
+    base.include Wrapped, Boxed
+  end
+end
+"##)
+        .write("app/models/pallet.rb", r##"class Pallet < ApplicationRecord
+  include Packable
+end
+"##)
         .write("app/models/probe.rb", r##"module Probe
   def self.check(label, ok)
     raise "#{label} differs from Rails" unless ok
@@ -72,11 +98,18 @@ end
     [Carton.heavy_total, Carton.first.stack_height]
   end
 
+  # Rails: 1 — the hook's `base.include Wrapped, Boxed` runs Boxed's
+  # block first, so Wrapped's seed is the one left.
+  def self.hook_include_with_two_arguments
+    Pallet.layers
+  end
+
   def self.run
     Parcel.delete_all
     Carton.delete_all
     check("class_eval_include", class_eval_include == [2400, 1.5])
     check("hook_in_a_multi_argument_include", hook_in_a_multi_argument_include == [700, 2])
+    check("hook_include_with_two_arguments", hook_include_with_two_arguments == 1)
   end
 end
 "##)
@@ -85,6 +118,9 @@ end
     t.integer "grams"
   end
   create_table "cartons", force: :cascade do |t|
+    t.integer "grams"
+  end
+  create_table "pallets", force: :cascade do |t|
     t.integer "grams"
   end
 end

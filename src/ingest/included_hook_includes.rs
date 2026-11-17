@@ -207,10 +207,11 @@ fn hook_includes(body: &Expr, base: &Symbol, out: &mut Vec<String>) {
                     if method.as_str() != "include" {
                         return;
                     }
-                    out.extend(args.iter().filter_map(written));
+                    // `include A, B` runs B's hook first.
+                    out.extend(args.iter().rev().filter_map(written));
                 }
             }
-            ("include", None) => out.extend(args.iter().filter_map(written)),
+            ("include", None) => out.extend(args.iter().rev().filter_map(written)),
             _ => break,
         }
     }
