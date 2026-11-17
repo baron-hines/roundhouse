@@ -156,7 +156,16 @@ module's Concern declares, a test file's own classes and statements,
 `enqueued_jobs_with` and the deprecation assertions), and the `routes`
 group what a route helper and the router answer (positional and keyword
 path params, `default_url_options`, a trailing options Hash, scope
-requirements named by a constant, `recognized_request_for`).
+requirements named by a constant, `recognized_request_for`). The
+`validations` group covers how a model's validators are built, listed
+and run (`validators` and `validators_on`, `validates_with`'s `class:`,
+an STI subclass's own validators, a reader a validation reads, `on:`
+named by a constant, custom contexts, a message proc's `self`); the
+`nested attributes` group what a nested-attributes or autosave owner
+validates (a built child's own errors, a built child once, a has_one
+under `autosave: true`); and the `attribute types`
+group what an attribute's type answers around a write (the value before
+its cast, changes in place, the value after a save, `update_columns`).
 `Overlay::run_tests` loads several emitted test files into one process,
 as a suite run does; a probe that needs that has no Spinel variant,
 since Spinel builds each test file as a program of its own. Each probe's

@@ -1319,14 +1319,17 @@ fn model_overrides_to_param(controller: &str, helper_name: &str, app: &App) -> b
 /// String (roundhouse#90).
 fn named_model_overrides_to_param(resource: &str, app: &App) -> bool {
     let model_name = crate::naming::camelize(resource);
-    app.models.iter().any(|m| {
-        m.name.0.as_str() == model_name
-            && (m.body.iter().any(|item| matches!(
-                item,
-                crate::dialect::ModelBodyItem::Method { method, .. }
-                    if method.name.as_str() == "to_param"
-            )) || model_key_is_string(m, app))
-    })
+    app.models.iter().any(|m| m.name.0.as_str() == model_name && model_renders_own_param(m, app))
+}
+
+/// [`named_model_overrides_to_param`] for a model in hand, so a
+/// namespaced one (`Admin::Topic`) is not lost to the name's round trip.
+fn model_renders_own_param(m: &crate::dialect::Model, app: &App) -> bool {
+    m.body.iter().any(|item| matches!(
+        item,
+        crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "to_param"
+    )) || model_key_is_string(m, app)
 }
 
 fn model_key_is_string(model: &crate::dialect::Model, app: &App) -> bool {
@@ -1912,8 +1915,8 @@ fn string_segment_demand(
     let string_keyed: crate::det::HashSet<String> = app
         .models
         .iter()
+        .filter(|m| model_renders_own_param(m, app))
         .map(|m| m.name.0.as_str().to_string())
-        .filter(|name| named_model_overrides_to_param(&crate::naming::underscore(name), app))
         .collect();
     let mut collect = |e: &Expr| {
         fn walk(
@@ -1977,42 +1980,64 @@ fn string_segment_demand(
     // helper's own call sites — without it every node here is `ty: None`
     // and this walk finds nothing.
     for helper in &app.routes.direct_helpers {
-        route_for_string_segments(&helper.body, helpers, &mut out);
+        route_for_string_segments(&helper.body, helper.params.last(), helpers, &string_keyed, &mut out);
     }
     out
 }
 
-/// Record the segments a `route_for :target, arg…` fills with a String.
-/// Mirrors `direct::rewrite_route_for`'s reading of the same node — the
-/// symbol names the target, the trailing kwargs hash is the query half
-/// and never a segment.
+/// Record the segments a `route_for :target, arg…` fills with a String
+/// (or a record whose `to_param` is one). Reads the node as
+/// `direct::rewrite_route_for` does: the symbol, or each route an
+/// interpolated name can spell with exactly that many segments, names
+/// the target; the trailing keyword hash or forwarded `options` is
+/// never a segment.
 fn route_for_string_segments(
     e: &Expr,
+    options: Option<&Symbol>,
     helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+    string_keyed: &crate::det::HashSet<String>,
     out: &mut crate::det::HashMap<String, crate::det::HashSet<String>>,
 ) {
     if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
         if method.as_str() == "route_for" && !args.is_empty() {
-            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } =
-                &*args[0].node
-            {
-                let helper = format!("{}_path", target.as_str());
-                if let Some((segments, _)) = helpers.get(&helper) {
-                    for (i, arg) in args[1..]
-                        .iter()
-                        .filter(|a| !matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
-                        .enumerate()
-                    {
-                        let Some(seg) = segments.get(i) else { break };
-                        if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) {
-                            out.entry(helper.clone()).or_default().insert(seg.clone());
-                        }
+            let (positional, _, _) = direct::route_for_arguments(&args[1..], options);
+            let targets: Vec<String> = match &*args[0].node {
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } => {
+                    vec![format!("{}_path", target.as_str())]
+                }
+                ExprNode::Lit { value: crate::expr::Literal::Str { value: target } } => vec![format!("{target}_path")],
+                ExprNode::StringInterp { parts } => helpers
+                    .iter()
+                    .filter(|(name, (segments, required))| {
+                        (*required..=segments.len()).contains(&positional.len())
+                            && name.strip_suffix("_path").is_some_and(|n| direct::spells(parts, n))
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // A record (or a union of them) any of whose models renders a
+            // String `to_param`: the rewrite sends it `to_param`.
+            let string_record = |ty: Option<&Ty>| {
+                let keyed = |t: &Ty| matches!(t, Ty::Class { id, .. } if string_keyed.contains(id.0.as_str()));
+                match ty {
+                    Some(Ty::Union { variants }) => variants.iter().any(keyed),
+                    Some(t) => keyed(t),
+                    None => false,
+                }
+            };
+            for helper in targets {
+                let Some((segments, _)) = helpers.get(&helper) else { continue };
+                for (i, arg) in positional.iter().enumerate() {
+                    let Some(seg) = segments.get(i) else { break };
+                    if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) || string_record(arg.ty.as_ref()) {
+                        out.entry(helper.clone()).or_default().insert(seg.clone());
                     }
                 }
             }
         }
     }
-    e.node.for_each_child(&mut |c| route_for_string_segments(c, helpers, out));
+    e.node.for_each_child(&mut |c| route_for_string_segments(c, options, helpers, string_keyed, out));
 }
 
 fn query_param_demand(

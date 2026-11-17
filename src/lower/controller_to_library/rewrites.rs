@@ -3325,7 +3325,9 @@ fn project_arg(a: &Expr, direct: bool) -> Expr {
         }
         return a.clone();
     }
-    if records_a_model(a) {
+    // A `direct` helper's block is given the record itself; its own
+    // `route_for` takes the id where a segment wants one.
+    if records_a_model(a) && !direct {
         return id_of(a);
     }
     a.clone()
