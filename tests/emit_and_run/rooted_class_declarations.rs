@@ -117,3 +117,86 @@ fn a_rooted_class_finds_its_superclass_in_the_module_around_it() {
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+fn ledger_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/record.rb", "module Ledger\n  class Record < ApplicationRecord\n    self.abstract_class = true\n\n    def ledger_tag\n      \"ledger\"\n    end\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"entries\", force: :cascade do |t|\n    t.string \"name\"\n  end\n\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const UNROOTED_IN_ROOTED: &str = r##"entry = Export::Entry.create!(name: "e")
+got = [Export::Entry.superclass.name, Export::Entry.table_name, entry.ledger_tag, Export::Entry.count, defined?(Ledger::Export)]
+expected = ["Ledger::Record", "entries", "ledger", 1, nil]
+raise "unrooted in rooted: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_class_in_a_rooted_module_finds_its_superclass_where_it_is_written() {
+    let app = ledger_app().write("app/models/export/entry.rb", "module Ledger\n  module ::Export\n    class Entry < Record\n    end\n  end\nend\n");
+    let run = app.run_ruby(UNROOTED_IN_ROOTED);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const ROOTED_ABSTRACT_BASE: &str = r##"thing = Thing.create!(name: "t")
+got = [Thing.superclass.name, RootBase.superclass.name, Thing.table_name, thing.ledger_tag, Thing.count]
+expected = ["RootBase", "Ledger::Record", "things", "ledger", 1]
+raise "rooted abstract base: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_abstract_base_reaches_the_base_in_the_module_around_it() {
+    let app = ledger_app()
+        .write("app/models/root_base.rb", "module Ledger\n  class ::RootBase < Record\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/thing.rb", "class Thing < RootBase\nend\n");
+    let run = app.run_ruby(ROOTED_ABSTRACT_BASE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn controller_concern_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("app/controllers/rules_controller.rb", r##"class RulesController < ApplicationController
+  module ::AccessRules
+    extend ActiveSupport::Concern
+
+    included do
+      before_action :guard
+    end
+
+    private
+
+    def guard
+      @trace = "#{@trace}guard "
+    end
+  end
+
+  include AccessRules
+
+  def show
+    render plain: "trace=#{@trace}"
+  end
+end
+"##)
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"rules\", to: \"rules#show\"\nend\n")
+}
+
+const CONTROLLER_CONCERN: &str = r##"status, _headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/rules", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+text = +""
+body.each { |part| text << part }
+got = [status, text, defined?(RulesController::AccessRules)]
+expected = [200, "trace=guard ", nil]
+raise "controller concern: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_concern_in_a_controller_body_runs_its_included_filters() {
+    let run = controller_concern_app().run_ruby(CONTROLLER_CONCERN);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
