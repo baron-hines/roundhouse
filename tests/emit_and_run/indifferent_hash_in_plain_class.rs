@@ -43,6 +43,10 @@ end
   def mesh_by_name
     given["mesh"]
   end
+
+  def meshes
+    given.values_at(*[:mesh])
+  end
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -69,6 +73,12 @@ end
     check("defaults", defaults == [["medium"], 20, false, nil])
     check("given", given == [["fine", "rough"], 40, false, 40])
   end
+
+  # Rails: [[20], [40]]
+  def self.run_splat
+    given = { "mesh" => 40 }.with_indifferent_access
+    check("splat", [Sifter.new.meshes, Sifter.new(given).meshes] == [[20], [40]])
+  end
 end
 "##)
         .write("db/schema.rb", r##"ActiveRecord::Schema.define do
@@ -89,6 +99,14 @@ fn a_hash_indifferent_on_one_path_answers_symbol_keys() {
 #[ignore = "requires the Spinel toolchain"]
 fn a_hash_indifferent_on_one_path_answers_symbol_keys_on_spinel() {
     let run = app().run_spinel_with_db(SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+// Not on Spinel, whose Hash has no `values_at`.
+#[test]
+fn a_splatted_symbol_key_reads_a_hash_indifferent_on_one_path() {
+    let run = app().run_ruby("Probe.run_splat\nputs \"probe passed\"\n");
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }

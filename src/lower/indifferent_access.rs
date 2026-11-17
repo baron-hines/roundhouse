@@ -344,6 +344,13 @@ fn convert_key(key: &mut Expr) {
 }
 
 fn may_be_symbol_key(key: &Expr) -> bool {
+    // A splat by its elements: `*[:mesh]` is Symbol keys.
+    if let ExprNode::Splat { value } = &*key.node {
+        return match value.ty.as_ref() {
+            Some(Ty::Array { elem }) => may_be_symbol(elem),
+            _ => true,
+        };
+    }
     matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } }) || key.ty.as_ref().is_some_and(may_be_symbol)
 }
 
