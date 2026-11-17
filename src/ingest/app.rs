@@ -5632,7 +5632,18 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 hook_order.push(module);
             }
         }
-        // Only the hooks that ran here: a module the chain has otherwise forwards nothing from the controller.
+        // A hook that ran on a plain module in the chain made its forwarder
+        // there: still found from the controller, below its own hooks'.
+        // Spliced first, farthest first, since the last forwarder stands.
+        // One the superclass's chain has stays the superclass's.
+        let wrapped: Vec<&crate::ident::ClassId> =
+            queue.iter().rev().filter(|module| !hooks.contains(*module) && !inherited.contains(*module)).collect();
+        for module in wrapped {
+            for call in module_delegates.get(module).into_iter().flatten() {
+                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
+            }
+        }
+        // Then the hooks that ran here, in the order they ran.
         for module in &hooks {
             for call in module_delegates.get(module).into_iter().flatten() {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
