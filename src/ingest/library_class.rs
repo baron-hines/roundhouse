@@ -178,7 +178,12 @@ pub fn ingest_library_classes(
 /// `Const`, and a local it reads is the enclosing scope's. The opening is
 /// read as a class's (`is_module: false`); whoever keeps it gives it the
 /// kind of the declaration it reopens.
-pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<(u32, LibraryClass)>> {
+///
+/// A block the ingest refuses is left out on its own: the file's other
+/// blocks are still read. Each opening comes with the bare constants its
+/// block reads (`TOKEN`, the `Helper` of `Helper.call`). Ruby looks those
+/// up in the block's lexical scope, the top level, not in `Const`.
+pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassEvalOpening>> {
     let result = super::prism::parse_silent(source);
     let root = result.node();
     let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
@@ -207,9 +212,21 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<(u32, 
             class_initializers,
             class_attributes: _,
             conditional_definitions,
-        } = walk_decl_body(block.body(), &owner, file, DeclBodyMode::Instance)
-            .map_err(|err| super::error_site::at(err, &node))?;
-        out.push((node.location().start_offset() as u32, LibraryClass {
+        } = match walk_decl_body(block.body(), &owner, file, DeclBodyMode::Instance) {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        struct Reads(Vec<String>);
+        impl<'pr> ruby_prism::Visit<'pr> for Reads {
+            fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+                self.0.push(constant_id_str(&node.name()).to_string());
+            }
+        }
+        let mut reads = Reads(Vec::new());
+        ruby_prism::Visit::visit(&mut reads, &statements.as_node());
+        reads.0.sort();
+        reads.0.dedup();
+        let opening = LibraryClass {
             name: owner,
             is_module: false,
             parent: None,
@@ -223,9 +240,19 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<(u32, 
             conditional_definitions,
             unknown_calls,
             class_ivar_initializers: class_initializers,
-        }));
+        };
+        out.push(ClassEvalOpening { start: node.location().start_offset() as u32, opening, bare_constants: reads.0 });
     }
     Ok(out)
+}
+
+/// One opening [`class_eval_openings`] reads.
+pub struct ClassEvalOpening {
+    /// The statement's start offset in its file.
+    pub start: u32,
+    pub opening: LibraryClass,
+    /// The bare constant names the block reads, sorted.
+    pub bare_constants: Vec<String>,
 }
 
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads

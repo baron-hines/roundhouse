@@ -285,7 +285,7 @@ fn keep_initializer_defined(
     sources: &[crate::span::SourceFile],
     gem_mounts: &[PathBuf],
     candidates: Vec<LibraryClass>,
-    class_evals: Vec<((String, u32), LibraryClass)>,
+    class_evals: Vec<((String, u32), super::library_class::ClassEvalOpening)>,
     callback_constants: &std::collections::HashSet<String>,
 ) -> Vec<(String, u32)> {
     const CORE: &[&str] = &[
@@ -327,27 +327,62 @@ fn keep_initializer_defined(
     };
     let gem_declared: HashMap<String, bool> =
         app.library_classes.iter().filter(|c| from_gem(c)).map(|c| (c.name.0.as_str().to_string(), c.is_module)).collect();
+    // The names a gem's class or module defines in itself: its constants
+    // and its nested classes. A block reading one of them bare reads the
+    // top level's in Ruby, which the kept opening would not.
+    let gem_owned = |owner: &str, name: &str| {
+        let nested = format!("{owner}::{name}");
+        app.library_classes.iter().filter(|c| from_gem(c)).any(|c| {
+            (c.name.0.as_str() == owner && c.constants.iter().any(|(n, _)| n.as_str() == name))
+                || c.name.0.as_str() == nested
+        })
+    };
+    // Where each kept reopen of a gem's name runs: its initializer, which
+    // Rails runs in sorted order, and its place in that file. A later one
+    // stands over an earlier one, a `class_eval` block or not.
+    let at = |lc: &LibraryClass| {
+        lc.source_span().and_then(|span| {
+            let file = sources.get((span.file.0 as usize).checked_sub(1)?)?;
+            Some((super::sources::relative_path(&file.path), span.start))
+        })
+    };
+    let mut gem_reopens: Vec<(Option<(String, u32)>, LibraryClass)> = Vec::new();
     let mut taken = Vec::new();
-    for (statement, mut lc) in class_evals {
-        if let Some(&is_module) = gem_declared.get(lc.name.0.as_str()) {
-            lc.is_module = is_module;
-            app.library_classes.push(lc);
-            taken.push(statement);
-        }
-    }
-    for lc in candidates {
-        let name = lc.name.0.as_str().to_string();
-        if gem_declared.contains_key(&name) {
-            app.library_classes.push(lc);
+    // What the kept blocks' methods read: a helper the initializer defines
+    // for them is live, whether or not the app names it.
+    let mut read_by_kept: crate::det::HashSet<String> = crate::det::HashSet::default();
+    for (statement, eval) in class_evals {
+        let mut lc = eval.opening;
+        let Some(&is_module) = gem_declared.get(lc.name.0.as_str()) else { continue };
+        if eval.bare_constants.iter().any(|name| gem_owned(lc.name.0.as_str(), name)) {
             continue;
         }
+        lc.is_module = is_module;
+        read_by_kept.extend(eval.bare_constants);
+        gem_reopens.push((Some(statement.clone()), lc));
+        taken.push(statement);
+    }
+    let mut rest = Vec::new();
+    for lc in candidates {
+        if gem_declared.contains_key(lc.name.0.as_str()) {
+            gem_reopens.push((at(&lc), lc));
+        } else {
+            rest.push(lc);
+        }
+    }
+    // A reopen whose place is unknown (one holding only nested classes)
+    // goes first, in its order: the sort is stable.
+    gem_reopens.sort_by(|(a, _), (b, _)| a.cmp(b));
+    app.library_classes.extend(gem_reopens.into_iter().map(|(_, lc)| lc));
+    for lc in rest {
+        let name = lc.name.0.as_str().to_string();
         if name.contains("::")
             || FRAMEWORK_ROOTS.contains(&name.as_str())
             || CORE.contains(&name.as_str())
             || app.library_classes.iter().any(|c| c.name == lc.name)
             || app.models.iter().any(|m| m.name == lc.name)
             || app.controllers.iter().any(|c| c.name == lc.name)
-            || !referenced(&name)
+            || !(referenced(&name) || read_by_kept.contains(&name))
         {
             continue;
         }
@@ -2154,7 +2189,7 @@ end
     // An initializer's top-level `Const.class_eval do … end` of `def`s,
     // by the statement it is (path, start): kept or left on the ledger
     // with `initializer_defined` (see `keep_initializer_defined`).
-    let mut class_eval_openings: Vec<((String, u32), LibraryClass)> = Vec::new();
+    let mut class_eval_openings: Vec<((String, u32), super::library_class::ClassEvalOpening)> = Vec::new();
     let mut rate_limit_stores = Vec::new();
     // `ActionController::Base.prepend_view_path …`, applied with the class
     // bodies' own once every class is read (see `view_paths`).
@@ -2214,7 +2249,7 @@ end
                 }
                 if let Ok(openings) = super::library_class::class_eval_openings(&bytes, &path_str) {
                     let relative = super::sources::relative_path(&path_str);
-                    class_eval_openings.extend(openings.into_iter().map(|(start, lc)| ((relative.clone(), start), lc)));
+                    class_eval_openings.extend(openings.into_iter().map(|opening| ((relative.clone(), opening.start), opening)));
                 }
                 rate_limit_stores.extend(super::rate_limit::initializer_stores(&bytes, &path_str));
                 app.module_mixins.extend(mixins);
