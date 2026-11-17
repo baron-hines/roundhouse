@@ -367,7 +367,7 @@ fn keep_initializer_defined(
     for lc in candidates {
         if gem_declared.contains_key(lc.name.0.as_str()) {
             // Kept whatever the app names, so what it reads is live too.
-            read_by_kept.extend(method_constant_reads(&lc, sources));
+            read_by_kept.extend(opening_constant_reads(&lc, sources));
             gem_reopens.push((at(&lc), lc));
         } else {
             rest.push(lc);
@@ -402,7 +402,7 @@ fn keep_initializer_defined(
             }
             kept[at] = true;
             grew = true;
-            read_by_kept.extend(method_constant_reads(lc, sources));
+            read_by_kept.extend(opening_constant_reads(lc, sources));
         }
         if !grew {
             break;
@@ -412,13 +412,18 @@ fn keep_initializer_defined(
     taken
 }
 
-/// The constants an opening's methods read, bare or rooted, from their
-/// source text: their bodies and their parameters' defaults.
-fn method_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
+/// The constants an opening reads, bare or rooted, from their source
+/// text: its methods' bodies and parameter defaults, and its constants'
+/// values.
+fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
     let mut out = Vec::new();
-    let spans = lc.methods.iter().flat_map(|method| {
-        std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
-    });
+    let spans = lc
+        .methods
+        .iter()
+        .flat_map(|method| {
+            std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
+        })
+        .chain(lc.constants.iter().map(|(_, value)| value.span));
     for span in spans {
         if span.is_synthetic() {
             continue;
