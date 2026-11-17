@@ -132,22 +132,39 @@ impl Defined {
     /// `::A::B` names `A::B` wherever it is written.
     fn record_path(&mut self, target: &Node<'_>) {
         let Some(path) = constant_path_segments_strs(target) else { return };
-        let rooted = target.as_constant_path_node().is_some_and(|p| {
-            let mut node = p;
-            loop {
-                match node.parent() {
-                    None => return true,
-                    Some(parent) => match parent.as_constant_path_node() {
-                        Some(next) => node = next,
-                        None => return false,
-                    },
-                }
-            }
-        });
-        if rooted {
+        if rooted(target) {
             self.out.insert(path.join("::"));
         } else {
             self.record(&path);
+        }
+    }
+
+    /// A `class` or `module` body named `path`: recorded, and visited with
+    /// its own name as the scope, which a rooted name (`class ::A::B`)
+    /// starts afresh.
+    fn declare(&mut self, name: &Node<'_>, path: Vec<String>, visit: impl FnOnce(&mut Self)) {
+        let outer = if rooted(name) { std::mem::take(&mut self.scope) } else { self.scope.clone() };
+        let depth = self.scope.len();
+        self.record(&path);
+        self.scope.extend(path);
+        visit(self);
+        self.scope.truncate(depth);
+        if rooted(name) {
+            self.scope = outer;
+        }
+    }
+}
+
+/// Whether a constant path starts at the top level (`::A::B`).
+fn rooted(target: &Node<'_>) -> bool {
+    let Some(mut node) = target.as_constant_path_node() else { return false };
+    loop {
+        match node.parent() {
+            None => return true,
+            Some(parent) => match parent.as_constant_path_node() {
+                Some(next) => node = next,
+                None => return false,
+            },
         }
     }
 }
@@ -155,20 +172,12 @@ impl Defined {
 impl<'pr> ruby_prism::Visit<'pr> for Defined {
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         let path = class_name_path(node).unwrap_or_default();
-        self.record(&path);
-        let depth = self.scope.len();
-        self.scope.extend(path);
-        ruby_prism::visit_class_node(self, node);
-        self.scope.truncate(depth);
+        self.declare(&node.constant_path(), path, |this| ruby_prism::visit_class_node(this, node));
     }
 
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         let path = module_name_path(node).unwrap_or_default();
-        self.record(&path);
-        let depth = self.scope.len();
-        self.scope.extend(path);
-        ruby_prism::visit_module_node(self, node);
-        self.scope.truncate(depth);
+        self.declare(&node.constant_path(), path, |this| ruby_prism::visit_module_node(this, node));
     }
 
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
