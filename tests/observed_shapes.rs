@@ -168,6 +168,16 @@ fn a_gem_that_shapes_a_held_model_is_observed_and_written_where_the_model_is() {
         );
     }
 
+    // A file the gem requires by a path it builds (`require_persistence :active_record`) is one the boot loaded, so it is carried,
+    // and its `__FILE__` names where the tree emits it, which the built path then reaches.
+    let persistence = std::fs::read_to_string(out.join("app/models/aasm/persistence.rb")).unwrap();
+    assert!(persistence.contains("File.expand_path(\"persistence.rb\", __dir__)"), "{persistence}");
+    assert!(out.join("app/models/aasm/persistence/active_record_persistence.rb").exists());
+    // Its `class_eval do scope … end` goes with the observed `scope`, and the branch this Rails rules out goes too.
+    let created = model.split("def self.aasm_create_scope").nth(1).unwrap_or_default();
+    let created = &created[..created.find("\n  def ").unwrap_or(created.len())];
+    assert!(!created.contains("class_eval") && !created.contains("named_scope"), "{created}");
+
     // Nothing it read changed: the second build reuses the observation, without booting the CRuby tree.
     let again = spinel(&app, &root.path().join("spinel-again"));
     assert!(!again.contains("(ruby)"), "{again}");
