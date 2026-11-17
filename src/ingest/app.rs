@@ -3527,9 +3527,14 @@ end
     super::aliased_includes::resolve(&mut app);
     // Between the two: a class body's `respond_to?(:status=)` asks for the writers just made, and the settled branch's writes join the body statements.
     super::settled_conditionals::settle(&mut app);
+    // A test file's own classes run their bodies as the file loads, as
+    // the app's classes do (`stock :birch` in a registry class beside
+    // the test class): their statements are marked with the app's.
+    let lent = lend_test_file_classes(&mut app);
     super::app_extension_calls::mark(&mut app);
     super::model::report_unreplayed_state_machines(&app);
     super::body_statements::mark(&mut app);
+    return_test_file_classes(&mut app, lent);
     report_unmodelled_records(&app);
     super::unreached_gem_modules::drop(&mut app, dir);
     super::gem_load_program::carry(&mut app);
@@ -3663,6 +3668,25 @@ fn reconcile_controller_helper_methods(app: &mut App) {
     }
     app.helper_method_index
         .retain(|name, owner| still_pure.get(owner).is_none_or(|names| names.contains(name)));
+}
+
+/// Each test module's own classes, appended to the app's library classes
+/// for the passes that mark class-body statements; how many each module
+/// lent, for [`return_test_file_classes`].
+fn lend_test_file_classes(app: &mut App) -> Vec<usize> {
+    let mut lent = Vec::new();
+    for tm in &mut app.test_modules {
+        lent.push(tm.inner_classes.len());
+        app.library_classes.append(&mut tm.inner_classes);
+    }
+    lent
+}
+
+fn return_test_file_classes(app: &mut App, lent: Vec<usize>) {
+    let mut tail = app.library_classes.split_off(app.library_classes.len() - lent.iter().sum::<usize>()).into_iter();
+    for (tm, n) in app.test_modules.iter_mut().zip(lent) {
+        tm.inner_classes = tail.by_ref().take(n).collect();
+    }
 }
 
 /// Standard libraries a Ruby program loads by name, the ones an app's
@@ -14703,9 +14727,12 @@ fn ingest_included_test_helper_files<V: Vfs + ?Sized>(
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         // A test folder's file is a helper only when it holds no test
         // class; the test-file pass below reads the others.
-        if in_test_folder
-            && !ingest_test_files(&source, &entry.display().to_string()).is_ok_and(|tms| tms.is_empty())
-        {
+        // The probe's diagnostics are forgotten: the test-file pass reports them.
+        let mark = super::prism::mark();
+        let holds_tests = in_test_folder
+            && !ingest_test_files(&source, &entry.display().to_string()).is_ok_and(|tms| tms.is_empty());
+        super::prism::rewind(mark);
+        if holds_tests {
             continue;
         }
         let Some(classes) =
