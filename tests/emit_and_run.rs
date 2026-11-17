@@ -22502,6 +22502,11 @@ mod reload_leaves_clone_cache;
 #[path = "emit_and_run/save_touch_false.rs"]
 mod save_touch_false;
 
+#[path = "emit_and_run/after_initialize_require_class.rs"]
+mod after_initialize_require_class;
+#[path = "emit_and_run/model_value_class_blocks.rs"]
+mod model_value_class_blocks;
+
 // Fork specs: controller tests.
 #[path = "emit_and_run/app_headers_hash_keys.rs"]
 mod app_headers_hash_keys;
