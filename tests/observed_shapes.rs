@@ -144,6 +144,8 @@ fn a_gem_that_shapes_a_held_model_is_observed_and_written_where_the_model_is() {
         !log.contains("observing the boot did not answer it"),
         "{log}"
     );
+    // aasm's `ruby2_keywords` beside each event method is no statement of the Spinel model's, which has none.
+    assert!(!log.contains("ruby2_keywords not supported"), "{log}");
     let model = std::fs::read_to_string(out.join("app/models/article.rb")).unwrap();
     for written in [
         "include AASM::Persistence::ActiveRecordPersistence",

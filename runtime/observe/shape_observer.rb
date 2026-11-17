@@ -288,10 +288,9 @@ module RoundhouseShapeObserver
       end
     end
 
+    # Not recorded, only its site noted: the observation is the Spinel tree's, which defines no ruby2_keywords and passes keywords as written.
     def ruby2_keywords(*names)
-      site = RoundhouseShapeObserver.gem_site
-      RoundhouseShapeObserver.note_site(site, self)
-      names.each { |n| RoundhouseShapeObserver.record(self, "ruby2_keywords :#{n}", "ruby2_keywords :#{n}", site) }
+      RoundhouseShapeObserver.note_site(RoundhouseShapeObserver.gem_site, self)
       super
     end
 
