@@ -3373,8 +3373,6 @@ end
     // After the splice too: the source association may come from a
     // concern on the through model.
     resolve_through_targets(&mut app);
-    // After the splice, which rehomes a defaulted key first.
-    resolve_inverse_foreign_keys(&mut app);
     // `allow_browser` becomes a filter plus the method it runs, on the
     // concern (before the splice carries both to the includer) or on
     // the controller that called it directly.
@@ -3457,6 +3455,9 @@ end
     if !late_on_load.is_empty() {
         splice_concerns_into_models_named(&mut app, &late_on_load, &concern_class_method_spans);
     }
+    // After every association splice, the late one above included: the
+    // splice rehomes a defaulted key first.
+    resolve_inverse_foreign_keys(&mut app);
     super::model_delegate::lower_model_delegates(&mut app);
     super::on_load_reopen::drain_pending(&mut app);
     // `numericality:` on an untyped attribute is decided per target
