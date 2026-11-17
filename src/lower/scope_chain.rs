@@ -2826,7 +2826,9 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             // `post.comments.load` is a NoMethodError on the
                             // reader's Array too.
                             | "load" | "load_async" | "from" | "extract_associated"
-                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
+                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")))
+                // `owner.items.all`: Array answers no `all` either.
+                || (method.as_str() == "all" && args.is_empty() && block.is_none());
             // `owner.items.update(attrs)` alone in a method body is the
             // proxy's bulk update over the records the association holds
             // (`rewrite_send` lowers it to the generated
@@ -5580,7 +5582,10 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             }
                         }
                         let is_scope = ctx.scope_of(&target, &method);
-                        let is_chain = is_relation_chain_method(method.as_str());
+                        // `all` on the association is its relation, as
+                        // a chain hop with nothing to add.
+                        let is_chain = is_relation_chain_method(method.as_str())
+                            || (method.as_str() == "all" && args.is_empty() && block.is_none());
                         let is_term =
                             is_relation_terminal(method.as_str(), &args, block.as_ref());
                         // A registered class method takes the same

@@ -1161,6 +1161,18 @@ impl App {
     pub fn sole_includer_of_modules(
         &self,
     ) -> crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId> {
+        self.includers_of_modules()
+            .into_iter()
+            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
+            .collect()
+    }
+
+    /// Module → every non-module class that includes it, directly or
+    /// through another module (see `sole_includer_of_modules`, which is
+    /// the one-includer case of this).
+    pub fn includers_of_modules(
+        &self,
+    ) -> crate::det::HashMap<crate::ident::ClassId, std::collections::BTreeSet<crate::ident::ClassId>> {
         use std::collections::{BTreeMap, BTreeSet};
         use crate::det::HashMap;
         let modules: BTreeSet<&crate::ident::ClassId> = self
@@ -1213,9 +1225,6 @@ impl App {
             }
         }
         includers
-            .into_iter()
-            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
-            .collect()
     }
 
     /// A module that no class includes and exactly one class `extend`s
