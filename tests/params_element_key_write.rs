@@ -110,3 +110,29 @@ fn a_pattern_rebinding_the_element_name_is_left_alone() {
         assert!(!src.contains(r#"w["kind"]"#), "{rebind}:\n{src}");
     }
 }
+
+/// The element block with `rebind` before a Symbol-key write: a form that binds the element's name leaves the block
+/// as written, so the write keeps its Symbol key.
+fn assert_rebinding_leaves_the_block(rebind: &str) {
+    let body = format!("    items = params.require(:widgets).map do |w|\n      {rebind}\n      w[:kind] = \"new\"\n      w\n    end\n    items.each {{ |attrs| Widget.create!(attrs) }}");
+    let src = controller_for(BuildTarget::Ruby, &body);
+    assert!(src.contains("w[:kind] = \"new\""), "{rebind}:\n{src}");
+    assert!(!src.contains(r#"w["kind"]"#), "{rebind}:\n{src}");
+}
+
+#[test]
+fn a_rescue_binding_of_the_element_name_is_left_alone() {
+    assert_rebinding_leaves_the_block("begin\n        raise ArgumentError\n      rescue ArgumentError => w\n        nil\n      end");
+}
+
+/// `for w in …` ingests as an assignment to `w`.
+#[test]
+fn a_for_loop_over_the_element_name_is_left_alone() {
+    assert_rebinding_leaves_the_block("for w in [{ kind: \"old\" }]\n        nil\n      end");
+}
+
+/// A named capture ingests as an assignment to `w`.
+#[test]
+fn a_named_capture_of_the_element_name_is_left_alone() {
+    assert_rebinding_leaves_the_block("/(?<w>\\w+)/ =~ \"old\"");
+}

@@ -217,8 +217,11 @@ fn rewrite_element_block(expr: &mut Expr, lists: &HelperLists) {
     rewrite_element_calls(body, &item, lists);
 }
 
-/// Whether `expr` writes the local `name` (`name = …`, `name ||= …`, `name, x = …`). Not inside a nested block or
-/// lambda that binds its own `name`: that write is to its parameter.
+/// Whether `expr` binds the local `name` anywhere, after which it no longer holds the element. Every binding form
+/// a source program can reach here with: an assignment (`=`, `op=`, `||=`, `&&=`, a multiple assignment), a pattern
+/// binding (`=> w`, `in w`, a `case … in` arm) and a `rescue … => w`. `for w in …` and a named capture
+/// (`/(?<w>…)/ =~ s`) arrive as plain assignments, as ingest desugars them. Not inside a nested block or lambda that
+/// binds its own `name`: that write is to its parameter.
 fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
     if binds_name(expr, name) {
         return false;
@@ -227,9 +230,9 @@ fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
     let mut found = match &*expr.node {
         ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is_name(target),
         ExprNode::MultiAssign { targets, .. } => targets.iter().any(is_name),
-        // A pattern binding (`value => w`, `value in w`, `case … in { kind: } => w`) writes the local too.
         ExprNode::MatchRequired { pattern, .. } | ExprNode::MatchPredicate { pattern, .. } => pattern_binds(pattern, name),
         ExprNode::CaseMatch { arms, .. } => arms.iter().any(|arm| pattern_binds(&arm.pattern, name)),
+        ExprNode::BeginRescue { rescues, .. } => rescues.iter().any(|r| r.binding.as_ref() == Some(name)),
         _ => false,
     };
     expr.node.for_each_child(&mut |c| found |= assigns_local(c, name));
