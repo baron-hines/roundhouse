@@ -261,6 +261,16 @@ pub fn class_eval_default_helper_app() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 
+/// A kept helper whose constant's value reads another initializer helper
+/// (`TAG = TagSource.tag`). Ruby answers `box / app box / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_constant_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nmodule LabelHelper\n  TAG = TagSource.tag\n\n  def self.tag\n    TAG\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// [`class_eval_helper_app`] with the helper named from the top level,
 /// `::LabelHelper.tag`. Ruby answers the same.
 #[allow(dead_code)]

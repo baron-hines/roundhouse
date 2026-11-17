@@ -140,6 +140,12 @@ fn a_helper_a_parameter_default_calls_is_kept() {
     contract::listed(contract::class_eval_default_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
 }
 
+/// A helper a kept helper's constant value calls is kept.
+#[test]
+fn a_helper_a_constant_value_calls_is_kept() {
+    contract::listed(contract::class_eval_constant_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
 /// A helper the block names from the top level (`::LabelHelper`) is kept.
 #[test]
 fn a_helper_a_kept_class_eval_names_from_the_top_level_is_kept() {
