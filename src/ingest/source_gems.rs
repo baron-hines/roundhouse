@@ -61,7 +61,13 @@ pub(super) fn resolve<V: Vfs + ?Sized>(
         let mut files = required_files(vfs, &installed, name, lock.gemfile_requires.get(name), &native)?;
         // Not only what the gem requires: the app's own `require "devise/orm/active_record"` loads that file of the gem too.
         let lib = installed.join("lib");
-        let extra: Vec<String> = app_features.iter().filter(|f| vfs.exists(&lib.join(format!("{f}.rb")))).cloned().collect();
+        let mut extra: Vec<String> = app_features.iter().filter(|f| vfs.exists(&lib.join(format!("{f}.rb")))).cloned().collect();
+        // Nor only what a literal require names: the observed boot loads a file whose path the gem builds (aasm's `require_persistence`).
+        if let Some(patches) = crate::observed_shapes::installed() {
+            // Not only `name-version`: the observer names the directory the gem is installed in (`nokogiri-1.16-x86_64-linux`).
+            let dir = installed.file_name().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{name}-{version}"));
+            extra.extend(patches.loaded_features(&dir).iter().filter(|f| vfs.exists(&lib.join(format!("{f}.rb")))).cloned());
+        }
         if !extra.is_empty() {
             files.extend(required_files(vfs, &installed, name, Some(&extra), &native)?);
         }

@@ -5316,12 +5316,7 @@ fn ruby_family_runtime_files(
             .filter_map(|l| l.strip_prefix(&stub_require).map(|rest| format!("{}/{}", crate::ingest::source_gems_mount(), rest.trim_end_matches('"'))))
             .collect();
         *models = models.lines().filter(|l| !l.starts_with(&stub_require)).map(|l| format!("{l}\n")).collect();
-        // ...but one the gem requires by a literal name is loaded as Bundler loads the gem: a path built to it
-        // answers false, as CRuby's does.
-        let required = gem_literally_required(app);
-        for stub in stubs.iter().filter(|stub| required.iter().any(|r| r.ends_with(&format!("/{stub}.rb")))) {
-            models.push_str(&format!("$LOADED_FEATURES << File.realpath({:?}, __dir__)\n", format!("../{stub}.rb")));
-        }
+        GEM_FILE_STUBS.with(|s| *s.borrow_mut() = stubs);
     }
 
     files.retain(|(p, _)| p != "runtime/db.rb" && p != "runtime/faye_websocket.rb");
@@ -5840,6 +5835,7 @@ fn ruby_family_runtime_files(
     }
     apply_conditional_declarations(&mut files, app);
     apply_file_programs(&mut files, app);
+    mark_gem_file_stubs_loaded(&mut files, app);
     // After the file programs: a gem's top-level file may be the only code that calls it.
     drop_unnamed_gzip(&mut files);
     // After every pass that writes app code into a file: the boot
@@ -8859,6 +8855,51 @@ fn apply_gem_file_stubs(files: &mut Vec<(String, String)>, app: &App) {
         }
     }
     files.extend(stubs.into_iter().map(|(stub, body, _)| (stub, body)));
+}
+
+thread_local! {
+    /// The gem file stubs the Ruby family takes out of `app/models.rb`, for `mark_gem_file_stubs_loaded`.
+    static GEM_FILE_STUBS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// On the CRuby tree, a gem file's stub is loaded as CRuby loads the file. A stub whose file has a program
+/// requires it, and the program enters the stub in `$LOADED_FEATURES` as it runs, so a path built to the
+/// file answers false once the file has loaded, whether boot or the built path loaded it.
+fn mark_gem_file_stubs_loaded(files: &mut Vec<(String, String)>, app: &App) {
+    let stubs = GEM_FILE_STUBS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    if stubs.is_empty() {
+        return;
+    }
+    let have: crate::det::HashSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    let mut programless = Vec::new();
+    for stub in &stubs {
+        let stub_rb = format!("{stub}.rb");
+        let program = format!("app/models/roundhouse_files/{stub_rb}");
+        if !have.contains(&program) {
+            programless.push(stub_rb);
+            continue;
+        }
+        let depth = stub_rb.matches('/').count();
+        let require = format!("require_relative {:?}\n", format!("{}{}", "../".repeat(depth), program.trim_end_matches(".rb")));
+        if let Some((_, body)) = files.iter_mut().find(|(p, _)| *p == stub_rb)
+            && !body.contains(require.trim_end())
+        {
+            body.insert_str(0, &require);
+        }
+        let back = format!("{}{stub_rb}", "../".repeat(program.matches('/').count()));
+        if let Some((_, body)) = files.iter_mut().find(|(p, _)| *p == program) {
+            let at = body.lines().take_while(|l| l.starts_with('#')).map(|l| l.len() + 1).sum::<usize>().min(body.len());
+            body.insert_str(at, &format!("$LOADED_FEATURES << File.realpath({back:?}, __dir__)\n"));
+        }
+    }
+    // A stub with no program loads only the classes boot has loaded: one the gem requires by a literal name is
+    // entered as Bundler would have loaded it.
+    let required = gem_literally_required(app);
+    if let Some((_, models)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
+        for stub in programless.iter().filter(|stub| required.iter().any(|r| r.ends_with(&format!("/{stub}")))) {
+            models.push_str(&format!("$LOADED_FEATURES << File.realpath({:?}, __dir__)\n", format!("../{stub}")));
+        }
+    }
 }
 
 /// The gem files another gem file requires by a literal name (normalized source paths).
