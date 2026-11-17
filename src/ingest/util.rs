@@ -287,6 +287,7 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         // Compute the inner scope BEFORE moving `c` — scope for
         // nested classes/modules inside `c`'s body should include
         // `c`'s own name (the bare segment as written in source).
+        let scope = if is_rooted(&c.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = class_name_path(&c) {
             inner.extend(name_path);
@@ -319,6 +320,7 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         // Push the module's name onto the scope before descending —
         // bare class declarations inside qualify with the module
         // path.
+        let scope = if is_rooted(&m.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = module_name_path(&m) {
             inner.extend(name_path);
@@ -377,6 +379,7 @@ fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
     if let Some(m) = node.as_module_node() {
         let body = m.body();
         // Compute inner scope before moving `m`.
+        let scope = if is_rooted(&m.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = module_name_path(&m) {
             inner.extend(name_path);
@@ -388,6 +391,7 @@ fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
         return;
     }
     if let Some(c) = node.as_class_node() {
+        let scope = if is_rooted(&c.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = class_name_path(&c) {
             inner.extend(name_path);
@@ -768,6 +772,21 @@ fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
 pub(super) fn module_name_path(m: &ruby_prism::ModuleNode<'_>) -> Option<Vec<String>> {
     let cp = m.constant_path();
     constant_path_segments_strs(&cp)
+}
+
+/// Whether a declared name starts at the top level, as `::Shelf::Box`
+/// does. Ruby defines such a class or module there wherever the
+/// declaration is written, so the enclosing scope is not part of its
+/// name, nor of the scope its body is read in.
+pub(super) fn is_rooted(path: &Node<'_>) -> bool {
+    let mut node = path.as_constant_path_node();
+    while let Some(p) = node {
+        match p.parent() {
+            None => return true,
+            Some(parent) => node = parent.as_constant_path_node(),
+        }
+    }
+    false
 }
 
 pub(super) fn constant_path_of(node: &Node<'_>) -> Option<Vec<String>> {
