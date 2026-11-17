@@ -643,7 +643,7 @@ fn resolve(u: &Use, defined: &HashSet<String>) -> Option<String> {
         .find(|name| defined.contains(name))
 }
 
-fn defined_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<String> {
+pub(super) fn defined_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<String> {
     let mut defined = HashSet::default();
     for file in files {
         let Ok(bytes) = vfs.read(file) else { continue };

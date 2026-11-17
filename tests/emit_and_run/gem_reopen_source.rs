@@ -24,6 +24,12 @@ fn a_reopen_at_the_gem_classs_autoload_path_leaves_the_gems_class() {
     contract::listed(contract::models_app()).run_ruby(contract::MODELS_ASSERTIONS).assert_passes();
 }
 
+/// A boot file that requires the reopen by path loads it, autoload path or not.
+#[test]
+fn a_reopen_at_the_gem_classs_autoload_path_an_initializer_requires_is_loaded() {
+    contract::listed(contract::required_models_app()).run_ruby(contract::REQUIRED_MODELS_ASSERTIONS).assert_passes();
+}
+
 /// The emitted `Shelf::Box`: one file holding each opening in load order.
 fn shelf_box(app: super::emit_and_run::Overlay) -> String {
     let (emitted, _errors) = app.emit(BuildTarget::Spinel);

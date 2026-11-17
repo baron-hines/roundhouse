@@ -783,6 +783,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     validate_additional_test_paths(vfs, dir, &additional_test_paths)?;
     let mut roots = app_roots(vfs, dir, &path_gems);
     roots.extend(solid_queue_root.clone());
+    // Before any pass reads the app: a file at the autoload path of a constant a source gem defines never loads.
+    let hidden_vfs = super::gem_shadowed_files::HiddenVfs {
+        inner: vfs,
+        hidden: super::gem_shadowed_files::shadowed(vfs, dir, &roots, &source_gems),
+    };
+    let vfs = &hidden_vfs;
     let lib_ignores: Vec<String> = vfs
         .read(&dir.join("config/application.rb"))
         .ok()

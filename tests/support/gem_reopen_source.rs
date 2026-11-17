@@ -94,6 +94,13 @@ raise "models #{got.inspect}" unless got == ["box", "shelf box", false]
 puts "models passed"
 "##;
 
+/// [`required_models_app`]: Rails 8.1.4.1 loads a file an initializer
+/// requires by path, autoload path or not, so the reopen applies.
+pub const REQUIRED_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.kind, Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "required models #{got.inspect}" unless got == ["box", "app box", true]
+puts "required models passed"
+"##;
+
 pub const EXTRAS_ASSERTIONS: &str = r##"got = BoxLimits.describe + [Shelf::Box::LIMIT]
 raise "extras #{got.inspect}" unless got == ["box", "tagged", 3]
 puts "extras passed"
@@ -139,6 +146,12 @@ pub fn local_app() -> emit_and_run::Overlay {
 #[allow(dead_code)]
 pub fn models_app() -> emit_and_run::Overlay {
     with_gem().write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// [`models_app`] with an initializer requiring the file by path.
+#[allow(dead_code)]
+pub fn required_models_app() -> emit_and_run::Overlay {
+    models_app().write("config/initializers/shelf_box.rb", "require Rails.root.join(\"app/models/shelf/box\").to_s\n")
 }
 
 /// The reopen that adds only `LIMIT` and `include Tagging`.
