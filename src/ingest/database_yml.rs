@@ -297,6 +297,26 @@ fn key_offset(text: &str, key: &str, from: usize, top_level: bool) -> Option<usi
     None
 }
 
+/// Whether text after `prefix`, the start of its line, sits in a YAML
+/// comment: a `#` at the line's start or after whitespace, outside quotes.
+/// A quote left open reads as still open, so an unclear line counts as
+/// uncommented and refuses.
+fn in_yaml_comment(prefix: &str) -> bool {
+    let (mut single, mut double, mut escaped, mut prev) = (false, false, false, ' ');
+    for c in prefix.chars() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if double => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && prev.is_whitespace() => return true,
+            _ => {}
+        }
+        prev = c;
+    }
+    false
+}
+
 /// The test environment's `schema_dump:`, read only in the one form this
 /// supports: a plain or quoted YAML string written directly in the
 /// primary configuration, naming a relative `.rb` or `.sql` file under
@@ -349,7 +369,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         // with no such key keeps main's behavior.
         let named = text.match_indices("schema_dump").find(|(at, _)| {
             let line_start = text[..*at].rfind('\n').map_or(0, |n| n + 1);
-            !text[line_start..*at].trim_start().starts_with('#')
+            !in_yaml_comment(&text[line_start..*at])
         });
         if let Some((at, _)) = named {
             out.primary = Some(Err(()));
