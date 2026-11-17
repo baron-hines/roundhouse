@@ -5511,15 +5511,27 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .flat_map(|((at, _), modules)| modules.into_iter().map(move |module| (*at, module)))
             .collect();
         // Every module the controller reaches, nearest ancestor first:
-        // the prepended ones ahead of the class, then the included.
+        // the prepended ones ahead of the class, then the included, then
+        // what the superclass's chain has already.
         let inherited = inherited_of(&controller.name);
         let (prepended, included): (Vec<_>, Vec<_>) = statements.iter().partition(|(at, _)| {
             matches!(&controller.body[*at], ControllerBodyItem::Unknown { expr, .. }
                 if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "prepend"))
         });
         let groups = |of: Vec<&(usize, Vec<crate::ident::ClassId>)>| of.into_iter().map(|(_, group)| group.clone()).collect::<Vec<_>>();
-        let mut queue = ancestry.of_statements(&groups(prepended), &inherited);
-        for module in ancestry.of_statements(&groups(included), &inherited) {
+        let (prepended, included) = (groups(prepended), groups(included));
+        let mut queue = ancestry.of_statements(&prepended, &inherited);
+        for module in ancestry.of_statements(&included, &inherited) {
+            if !queue.contains(&module) {
+                queue.push(module);
+            }
+        }
+        // A module the superclass has is found below everything the child
+        // adds. It still comes last here, not left out: the splice
+        // flattens each controller, and the calls are resolved against
+        // the controller's own methods.
+        let none = crate::det::HashSet::default();
+        for module in ancestry.of_statements(&prepended, &none).into_iter().chain(ancestry.of_statements(&included, &none)) {
             if !queue.contains(&module) {
                 queue.push(module);
             }
