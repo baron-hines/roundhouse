@@ -3035,7 +3035,10 @@ fn rewrite_route_helpers_with(
                 .map(|(i, arg)| {
                     let id_segment =
                         shape.map_or(true, |s| s.get(i).copied().unwrap_or(true));
-                    let needs_id = id_segment && match &*arg.node {
+                    // Not a value typed as a scalar: a call answering a
+                    // String or an Integer is its own `to_param`
+                    // (`shelf_path(Links.locale_for(user), 4)`).
+                    let needs_id = id_segment && !types_to_a_scalar(arg) && match &*arg.node {
                         ExprNode::Ivar { .. } => true,
                         ExprNode::Send { recv: Some(r), method, .. }
                             if method.as_str() != "id" =>
@@ -3263,6 +3266,21 @@ fn project_route_helper_ids_node(e: &Expr, direct_helpers: &crate::det::HashSet<
             parenthesized: *parenthesized,
         },
     ))
+}
+
+/// Is `arg` typed as a String, Symbol, number or boolean (or a union of
+/// them, nil included)? Rails renders such a value with its own
+/// `to_param`; it has no `id`.
+fn types_to_a_scalar(arg: &Expr) -> bool {
+    use crate::ty::Ty;
+    fn scalar(t: &Ty) -> bool {
+        match t {
+            Ty::Str | Ty::Sym | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil => true,
+            Ty::Union { variants } => variants.iter().all(scalar),
+            _ => false,
+        }
+    }
+    arg.ty.as_ref().is_some_and(scalar)
 }
 
 /// A route-helper argument with every model instance in it projected

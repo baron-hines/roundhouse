@@ -22612,3 +22612,5 @@ mod indifferent_hash_in_plain_class;
 mod test_file_class_body;
 #[path = "emit_and_run/test_class_dropped_statement.rs"]
 mod test_class_dropped_statement;
+#[path = "emit_and_run/route_helper_scalar_call.rs"]
+mod route_helper_scalar_call;
