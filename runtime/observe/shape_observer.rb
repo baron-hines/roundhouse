@@ -230,7 +230,16 @@ module RoundhouseShapeObserver
       @effects.each do |e|
         refuse("#{e["site"]} changes a class that is not the app's too") if e["site"] && @sites.fetch(e["site"], []).include?(false)
       end
-      File.write(OUT, JSON.pretty_generate({ "effects" => @effects, "refusals" => @refusals.uniq }))
+      File.write(OUT, JSON.pretty_generate({ "effects" => @effects, "refusals" => @refusals.uniq, "loaded" => loaded }))
+    end
+
+    # Not only the files a gem requires by a literal name: one it builds (aasm's `require_persistence`) loads others.
+    def loaded
+      $LOADED_FEATURES.filter_map do |f|
+        path = File.realpath(f) rescue next
+        root = GEMS.find { |g| path.start_with?("#{g}/") }
+        File.basename(root) + path[root.size..] if root && path.end_with?(".rb")
+      end.uniq.sort
     end
   end
 
