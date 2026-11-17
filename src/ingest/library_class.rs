@@ -199,7 +199,11 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
             continue;
         }
         let Some(statements) = block.body().and_then(|body| body.as_statements_node()) else { continue };
-        if !statements.body().iter().all(|statement| statement.as_def_node().is_some()) {
+        // `def Other.x` in the block defines on `Other`: only a `def` on
+        // the block's `self` is the class's.
+        if !statements.body().iter().all(|statement| {
+            statement.as_def_node().is_some_and(|def| def.receiver().is_none_or(|r| r.as_self_node().is_some()))
+        }) {
             continue;
         }
         let owner = ClassId(Symbol::from(path.join("::")));
@@ -216,16 +220,7 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
             Ok(body) => body,
             Err(_) => continue,
         };
-        struct Reads(Vec<String>);
-        impl<'pr> ruby_prism::Visit<'pr> for Reads {
-            fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
-                self.0.push(constant_id_str(&node.name()).to_string());
-            }
-        }
-        let mut reads = Reads(Vec::new());
-        ruby_prism::Visit::visit(&mut reads, &statements.as_node());
-        reads.0.sort();
-        reads.0.dedup();
+        let (bare_constants, rooted_constants) = constant_reads(&statements.as_node());
         let opening = LibraryClass {
             name: owner,
             is_module: false,
@@ -241,9 +236,36 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
             unknown_calls,
             class_ivar_initializers: class_initializers,
         };
-        out.push(ClassEvalOpening { start: node.location().start_offset() as u32, opening, bare_constants: reads.0 });
+        out.push(ClassEvalOpening { start: node.location().start_offset() as u32, opening, bare_constants, rooted_constants });
     }
     Ok(out)
+}
+
+/// The constants `node` reads: bare (`TOKEN`, the `Helper` of
+/// `Helper.call`), which Ruby looks up lexically, and rooted (`::Helper`),
+/// which name the top level's. Each sorted, without repeats.
+pub(crate) fn constant_reads(node: &ruby_prism::Node<'_>) -> (Vec<String>, Vec<String>) {
+    struct Reads(Vec<String>, Vec<String>);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            self.0.push(constant_id_str(&node.name()).to_string());
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if node.parent().is_none() {
+                if let Some(name) = node.name() {
+                    self.1.push(constant_id_str(&name).to_string());
+                }
+            }
+            ruby_prism::visit_constant_path_node(self, node);
+        }
+    }
+    let mut reads = Reads(Vec::new(), Vec::new());
+    ruby_prism::Visit::visit(&mut reads, node);
+    for list in [&mut reads.0, &mut reads.1] {
+        list.sort();
+        list.dedup();
+    }
+    (reads.0, reads.1)
 }
 
 /// One opening [`class_eval_openings`] reads.
@@ -253,6 +275,8 @@ pub struct ClassEvalOpening {
     pub opening: LibraryClass,
     /// The bare constant names the block reads, sorted.
     pub bare_constants: Vec<String>,
+    /// The top-level names it reads rooted (`::Helper`), sorted.
+    pub rooted_constants: Vec<String>,
 }
 
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads

@@ -359,6 +359,7 @@ fn keep_initializer_defined(
         }
         lc.is_module = is_module;
         read_by_kept.extend(eval.bare_constants);
+        read_by_kept.extend(eval.rooted_constants);
         gem_reopens.push((Some(statement.clone()), lc));
         taken.push(statement);
     }
@@ -374,21 +375,58 @@ fn keep_initializer_defined(
     // goes first, in its order: the sort is stable.
     gem_reopens.sort_by(|(a, _), (b, _)| a.cmp(b));
     app.library_classes.extend(gem_reopens.into_iter().map(|(_, lc)| lc));
-    for lc in rest {
-        let name = lc.name.0.as_str().to_string();
-        if name.contains("::")
-            || FRAMEWORK_ROOTS.contains(&name.as_str())
-            || CORE.contains(&name.as_str())
-            || app.library_classes.iter().any(|c| c.name == lc.name)
-            || app.models.iter().any(|m| m.name == lc.name)
-            || app.controllers.iter().any(|c| c.name == lc.name)
-            || !(referenced(&name) || read_by_kept.contains(&name))
-        {
+    let eligible: Vec<LibraryClass> = rest
+        .into_iter()
+        .filter(|lc| {
+            let name = lc.name.0.as_str();
+            !(name.contains("::")
+                || FRAMEWORK_ROOTS.contains(&name)
+                || CORE.contains(&name)
+                || app.library_classes.iter().any(|c| c.name == lc.name)
+                || app.models.iter().any(|m| m.name == lc.name)
+                || app.controllers.iter().any(|c| c.name == lc.name))
+        })
+        .collect();
+    // A kept definition's methods can call another the initializer
+    // defines (`LabelHelper.tag` calling `TagSource.tag`): what each kept
+    // one reads is live too, until nothing more is.
+    let mut kept = vec![false; eligible.len()];
+    loop {
+        let mut grew = false;
+        for (at, lc) in eligible.iter().enumerate() {
+            let name = lc.name.0.as_str();
+            if kept[at] || !(referenced(name) || read_by_kept.contains(name)) {
+                continue;
+            }
+            kept[at] = true;
+            grew = true;
+            read_by_kept.extend(method_constant_reads(lc, sources));
+        }
+        if !grew {
+            break;
+        }
+    }
+    app.library_classes.extend(eligible.into_iter().zip(kept).filter(|(_, kept)| *kept).map(|(lc, _)| lc));
+    taken
+}
+
+/// The constants an opening's methods read, bare or rooted, from their
+/// source text.
+fn method_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
+    let mut out = Vec::new();
+    for method in &lc.methods {
+        let span = method.body.span;
+        if span.is_synthetic() {
             continue;
         }
-        app.library_classes.push(lc);
+        let Some(file) = (span.file.0 as usize).checked_sub(1).and_then(|at| sources.get(at)) else { continue };
+        let Some(text) = file.text.get(span.start as usize..span.end as usize) else { continue };
+        let parsed = ruby_prism::parse(text.as_bytes());
+        let (bare, rooted) = super::library_class::constant_reads(&parsed.node());
+        out.extend(bare);
+        out.extend(rooted);
     }
-    taken
+    out
 }
 
 /// The file an opening was read from (`LibraryClass::source_span`).
