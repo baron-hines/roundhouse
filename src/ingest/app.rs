@@ -9197,6 +9197,14 @@ fn resolve_inverse_foreign_keys(app: &mut App) {
             else {
                 continue;
             };
+            // A later association of the same name replaces this one, as
+            // Rails keeps the last reflection: its inverse is never read.
+            let later = model.body[j + 1..]
+                .iter()
+                .chain(app.models[i + 1..].iter().filter(|m| m.name == model.name).flat_map(|m| m.body.iter()));
+            if later.into_iter().any(|later| matches!(later, ModelBodyItem::Association { assoc, .. } if assoc.name() == name)) {
+                continue;
+            }
             // Every declaration of a class, its reopenings included, in
             // order: the last association of that name is the one Rails keeps.
             fn declared<'a>(
