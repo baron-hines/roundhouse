@@ -68,6 +68,8 @@ const CONCERNS: &[(&str, &str)] = &[
     ("hook_one", "module HookOne\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook one\"\n    end\n  end\nend\n"),
     ("hook_two", "module HookTwo\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook two\"\n    end\n  end\nend\n"),
     ("hook_bundle", "module HookBundle\n  extend ActiveSupport::Concern\n  include HookOne, HookTwo\nend\n"),
+    // A plain module including DelegateOne: the hook's forwarder is the module's.
+    ("delegate_wrapper", "module DelegateWrapper\n  include DelegateOne\n\n  def wrapper_name\n    \"wrapper\"\n  end\nend\n"),
 ];
 
 /// (controller, its include lines, Ruby's `label`).
@@ -132,6 +134,12 @@ const SPECIAL: &[(&str, &str, &str)] = &[
     // The parent has DelegateOne, so the child's `include DelegateOne` runs
     // no hook: the child's own forwarder is DelegateTwo's.
     ("inherited_delegate", "class InheritedDelegateController < DelegateParentController\n  include DelegateTwo\n  include DelegateOne\n\n  def show\n    render json: { label: label }\n  end\nend\n", "source two"),
+    // [WrappedDelegate, DelegateWrapper, DelegateOne]: DelegateOne's hook
+    // ran on DelegateWrapper, whose forwarder answers `label`.
+    ("wrapped_delegate", "class WrappedDelegateController < ApplicationController\n  include DelegateWrapper\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\nend\n", "source one"),
+    // [RewrappedDelegate, DelegateTwo, DelegateWrapper, DelegateOne]: the
+    // controller's own forwarder, from DelegateTwo's hook, comes first.
+    ("rewrapped_delegate", "class RewrappedDelegateController < ApplicationController\n  include DelegateWrapper\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
     // DelegateTwo's hook runs last, so its `delegate` defines `label`.
     ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
