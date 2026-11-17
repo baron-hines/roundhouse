@@ -99,3 +99,14 @@ fn a_multiple_assignment_index_target_stores_the_string_key() {
     assert!(src.contains(r#"w["kind"]"#), "{src}");
     assert!(!src.contains("w[:kind]"), "{src}");
 }
+
+/// A pattern that binds the element's name (`=> w`, `in w`, `case … in … => w`) reassigns it: the block is left alone.
+#[test]
+fn a_pattern_rebinding_the_element_name_is_left_alone() {
+    for rebind in ["{ kind: \"old\" } => w", "{ kind: \"old\" } in w", "case { kind: \"old\" }\n      in { kind: String } => w then nil\n      end"] {
+        let body = format!("    items = params.require(:widgets).map do |w|\n      {rebind}\n      w[:kind] = \"new\"\n      w\n    end\n    items.each {{ |attrs| Widget.create!(attrs) }}");
+        let src = controller_for(BuildTarget::Ruby, &body);
+        assert!(src.contains("w[:kind] = \"new\""), "{rebind}:\n{src}");
+        assert!(!src.contains(r#"w["kind"]"#), "{rebind}:\n{src}");
+    }
+}

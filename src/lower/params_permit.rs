@@ -227,10 +227,37 @@ fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
     let mut found = match &*expr.node {
         ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is_name(target),
         ExprNode::MultiAssign { targets, .. } => targets.iter().any(is_name),
+        // A pattern binding (`value => w`, `value in w`, `case … in { kind: } => w`) writes the local too.
+        ExprNode::MatchRequired { pattern, .. } | ExprNode::MatchPredicate { pattern, .. } => pattern_binds(pattern, name),
+        ExprNode::CaseMatch { arms, .. } => arms.iter().any(|arm| pattern_binds(&arm.pattern, name)),
         _ => false,
     };
     expr.node.for_each_child(&mut |c| found |= assigns_local(c, name));
     found
+}
+
+/// Whether a match pattern binds the local `name` anywhere in it (`w`, `{ kind: } => w`, `[*w]`, `{ w: }`, `**w`).
+fn pattern_binds(pattern: &crate::expr::MatchPattern, name: &Symbol) -> bool {
+    use crate::expr::{HashRest, MatchPattern};
+    match pattern {
+        MatchPattern::Value { .. } | MatchPattern::Nil => false,
+        MatchPattern::Bind { name: n } => n == name,
+        MatchPattern::Capture { pattern, name: n } => n == name || pattern_binds(pattern, name),
+        MatchPattern::Alt { alternatives } => alternatives.iter().any(|p| pattern_binds(p, name)),
+        MatchPattern::Array { pre, rest, post, .. } => {
+            matches!(rest, Some(Some(n)) if n == name) || pre.iter().chain(post).any(|p| pattern_binds(p, name))
+        }
+        MatchPattern::Find { pre_rest, middle, post_rest, .. } => {
+            pre_rest.as_ref() == Some(name) || post_rest.as_ref() == Some(name) || middle.iter().any(|p| pattern_binds(p, name))
+        }
+        MatchPattern::Hash { pairs, rest, .. } => {
+            matches!(rest, Some(HashRest::Collect { name: n }) if n == name)
+                || pairs.iter().any(|(key, p)| match p {
+                    Some(p) => pattern_binds(p, name),
+                    None => key == name,
+                })
+        }
+    }
 }
 
 /// Whether `expr` is a block or lambda that binds `name` under any parameter kind (`|name|`, `name = {}`, `*name`,
