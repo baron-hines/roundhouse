@@ -28,6 +28,7 @@ pub(crate) mod gem_package_settings;
 mod graphql_ruby;
 mod guarded_include;
 mod lock_versions;
+mod ruby_conditions;
 pub(crate) mod validates_with;
 pub(crate) mod each_validator;
 pub(crate) mod mailer_callbacks;
