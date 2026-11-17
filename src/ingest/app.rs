@@ -366,6 +366,8 @@ fn keep_initializer_defined(
     let mut rest = Vec::new();
     for lc in candidates {
         if gem_declared.contains_key(lc.name.0.as_str()) {
+            // Kept whatever the app names, so what it reads is live too.
+            read_by_kept.extend(method_constant_reads(&lc, sources));
             gem_reopens.push((at(&lc), lc));
         } else {
             rest.push(lc);
@@ -411,11 +413,13 @@ fn keep_initializer_defined(
 }
 
 /// The constants an opening's methods read, bare or rooted, from their
-/// source text.
+/// source text: their bodies and their parameters' defaults.
 fn method_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
     let mut out = Vec::new();
-    for method in &lc.methods {
-        let span = method.body.span;
+    let spans = lc.methods.iter().flat_map(|method| {
+        std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
+    });
+    for span in spans {
         if span.is_synthetic() {
             continue;
         }
