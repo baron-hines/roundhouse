@@ -111,8 +111,9 @@ pub struct Model {
     pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
 
     /// An enclosing module (via EnumConstants nesting) defines a `JSON`
-    /// constant that would shadow bare `JSON` in `serialize` coder
-    /// resolution. Fail closed: claim only `::JSON` when set.
+    /// constant, or the body nests a `JSON` class, module or value class,
+    /// that would shadow bare `JSON` in `serialize` coder resolution.
+    /// Fail closed: claim only `::JSON` when set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lexical_json_shadow: bool,
 
@@ -550,6 +551,12 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `inverse_of: :author` as written (not `false` or `nil`). Rails
+        /// derives a defaulted foreign key from the inverse association
+        /// (`derive_foreign_key`), which app assembly does once every
+        /// model is ingested (`resolve_inverse_foreign_keys`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasOne {
         name: Symbol,
@@ -596,6 +603,9 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// See `HasMany::inverse_of`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasAndBelongsToMany {
         name: Symbol,

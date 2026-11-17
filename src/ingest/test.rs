@@ -139,7 +139,9 @@ fn ingest_test_class(
     }
     if let Some(class_body) = class.body() {
         for stmt in flatten_statements(class_body) {
-            class_body_statement(&stmt, file, &mut acc, &name, 0)?;
+            if !class_body_statement(&stmt, file, &mut acc, &name, 0)? {
+                report_dropped_statement(&stmt, file, &name);
+            }
         }
     }
     let ClassBody { tests, setup, mut inner_classes, mut helpers, constants, includes, teardowns, target, .. } = acc;
@@ -326,6 +328,31 @@ fn ingest_test_class(
         constants,
         includes,
     })
+}
+
+/// A test class body statement the ingest does not model, ledgered by
+/// name: the emitted class goes without it (`INPUT[:accent] = ACCENT`
+/// between two constants, so a later constant built from `INPUT` misses
+/// the key).
+/// A bare `private` is not one: the helpers below it are called from the
+/// class's own tests either way.
+fn report_dropped_statement(stmt: &Node, file: &str, class: &ClassId) {
+    let construct = match stmt.as_call_node() {
+        Some(call) => constant_id_str(&call.name()).to_string(),
+        None => "statement".to_string(),
+    };
+    let bare_marker = stmt.as_call_node().is_some_and(|call| call.receiver().is_none() && call.arguments().is_none());
+    if bare_marker && matches!(construct.as_str(), "private" | "protected" | "public") {
+        return;
+    }
+    let line = String::from_utf8_lossy(stmt.location().as_slice()).lines().next().unwrap_or("").to_string();
+    super::prism::push(crate::lower::residue_diagnostic(
+        "test_class_body",
+        &construct,
+        super::util::node_span(stmt, file),
+        "not modelled",
+        format!("`{line}` in the body of test class `{}` is not modelled and is dropped", class.0.as_str()),
+    ));
 }
 
 /// `self.use_transactional_tests = false` (or `true`) as

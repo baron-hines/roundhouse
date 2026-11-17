@@ -180,6 +180,20 @@ impl Overlay {
         Run::new(command.join(" "), emitted, errors, output)
     }
 
+    /// Emit, then load several of the emitted test files into one Ruby
+    /// process, in order, as `bin/rails test` loads a suite.
+    pub fn run_tests(self, test_paths: &[&str]) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
+        let load = "ARGV.each { |path| require File.expand_path(path) }";
+        let output = ruby()
+            .args(["-Itest", "-I.", "-e", load])
+            .args(test_paths)
+            .current_dir(&emitted)
+            .output()
+            .expect("spawn ruby");
+        Run::new(format!("ruby -Itest -I. -e '{load}' {}", test_paths.join(" ")), emitted, errors, output)
+    }
+
     /// Emit the Spinel tree, then run one of its test files with
     /// `spin test <path>`. Spinel writes `test/<dir>/x_test.rb` as
     /// `test/x_test.rb`, so `test_path` is the emitted path.
@@ -665,7 +679,8 @@ impl Run {
         assert!(
             self.success || !self.exited_zero,
             "the emitted program exited 0 without reaching the end of its script (an early `exit` or \
-             `return`, or a swallowed raise), so its checks did not all run: `{}` in {}\n\
+             `return`, or a swallowed raise), so its checks did not all run: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -674,7 +689,8 @@ impl Run {
         );
         assert!(
             self.success,
-            "analysis and emit are clean but the emitted program failed: `{}` in {}\n\
+            "analysis and emit are clean but the emitted program failed: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -684,10 +700,9 @@ impl Run {
     }
 }
 
-/// A run takes its scratch tree with it, unless its test is failing (the
-/// failure names the tree) or `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one.
-/// A run expected to fail is a passing test and is removed too. Left
-/// behind, a full suite fills `/tmp`'s inodes.
+/// A run takes its scratch tree with it, passed or failed, unless
+/// `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one (a failure names its tree).
+/// Left behind, a full suite fills `/tmp`'s inodes.
 impl Drop for Run {
     fn drop(&mut self) {
         remove_scratch(&self.emitted);
@@ -719,7 +734,7 @@ impl Drop for Emitted {
 }
 
 fn remove_scratch(emitted: &Path) {
-    if !std::thread::panicking() && std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
+    if std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
         if let Some(scratch) = emitted.parent() {
             let _ = std::fs::remove_dir_all(scratch);
         }

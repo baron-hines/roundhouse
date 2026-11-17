@@ -136,6 +136,8 @@ pub(super) fn ingest_model_with_enum_constants(
     // naturally attach to the first body item below.
     drain_comments_before(&mut comments, class.location().start_offset());
     let mut body: Vec<ModelBodyItem> = Vec::new();
+    // A nested `JSON` class or value class shadows bare `JSON` for `serialize`.
+    let mut body_json_shadow = false;
     let mut enums: IndexMap<Symbol, Vec<(String, Literal)>> = IndexMap::new();
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
@@ -503,9 +505,9 @@ pub(super) fn ingest_model_with_enum_constants(
             // with it aborted the whole file.
             //
             // Exception: a nested `class JSON` / `module JSON` shadows
-            // bare `JSON` for `serialize …, coder: JSON` — leave a
-            // synthetic Const-assign marker so lower::serialize can see
-            // the shadow without treating the namespace as a body item.
+            // bare `JSON` for `serialize …, coder: JSON` — recorded in
+            // `lexical_json_shadow` so lower::serialize can see the
+            // shadow without treating the namespace as a body item.
             // In a hook block, the declaration is a constant the library pass
             // over the model's file never sees: reported, not skipped.
             if spliced && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
@@ -523,29 +525,20 @@ pub(super) fn ingest_model_with_enum_constants(
                 })
             {
                 let path_syms: Vec<Symbol> = path.iter().map(|s| Symbol::from(s.as_str())).collect();
-                if crate::lower::serialize::const_path_shadows_bare_json(
-                    &path_syms,
-                    owner.0.as_str(),
-                ) {
-                    body.push(ModelBodyItem::Unknown {
-                        expr: Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Assign {
-                                target: crate::expr::LValue::Const {
-                                    path: vec![Symbol::from("JSON")],
-                                },
-                                value: Expr::new(
-                                    Span::synthetic(),
-                                    ExprNode::Lit {
-                                        value: crate::expr::Literal::Nil,
-                                    },
-                                ),
-                            },
-                        ),
-                        leading_comments: Vec::new(),
-                        leading_blank_line: false,
-                    });
-                }
+                // Recorded on the model, not as a body item: a constant
+                // write in the body would be emitted (`JSON = nil`) and
+                // collide with the nested class when it loads.
+                body_json_shadow |= crate::lower::serialize::const_path_shadows_bare_json(&path_syms, owner.0.as_str());
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
+            // `X = Data.define(:a) do … end` and its `Struct.new` twin
+            // declare a class, which the same library pass registers. A
+            // `JSON` one shadows bare `JSON`, as a nested `class JSON` does.
+            if !spliced && super::library_class::model_value_class(stmt, &owner, file) {
+                let name = stmt.as_constant_write_node().map(|w| Symbol::from(constant_id_str(&w.name())));
+                body_json_shadow |=
+                    name.is_some_and(|name| crate::lower::serialize::const_path_shadows_bare_json(&[name], owner.0.as_str()));
                 note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
@@ -629,7 +622,7 @@ pub(super) fn ingest_model_with_enum_constants(
         enums,
         enum_defaults,
         class_attr_defaults,
-        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners),
+        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners) || body_json_shadow,
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,
@@ -926,10 +919,48 @@ pub(super) fn ingest_model_body_items(
     Ok(items)
 }
 
+/// What a `cattr_*` / `mattr_*` declaration's default does to a class
+/// variable a seed may already hold. Rails' answer is `class_variable_set(sym,
+/// default) unless default.nil? && class_variable_defined?(sym)`: the
+/// VALUE decides, not whether an argument was written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seed {
+    /// No default (`cattr_writer :cap`; the synthetic nil placeholder the
+    /// collectors store): sets the variable only where nothing has.
+    Absent,
+    /// A literal `nil`: never replaces a variable something defined.
+    Nil,
+    /// A value that cannot be nil (a non-nil literal, a collection
+    /// literal, a lambda): always replaces.
+    Fixed,
+    /// A constant, a call…: it may evaluate to nil, so whether
+    /// it replaces an earlier seed is only known when nothing is seeded.
+    Computed,
+}
+
+impl Seed {
+    pub(super) fn of(value: &Expr) -> Self {
+        if value.span.is_synthetic() {
+            return Seed::Absent;
+        }
+        match &*value.node {
+            ExprNode::Lit { value: Literal::Nil } => Seed::Nil,
+            // A literal of any other kind, and a literal collection, are
+            // values that cannot be nil.
+            ExprNode::Lit { .. } | ExprNode::Array { .. } | ExprNode::Hash { .. } | ExprNode::Lambda { .. } => Seed::Fixed,
+            _ => Seed::Computed,
+        }
+    }
+}
+
 /// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
 /// parameterless block. Other kwargs (`instance_reader:`, splats, …) stay
 /// unexpanded so a partial reader cannot drop the initializer.
-fn expand_mattr_cattr(
+///
+/// Shared with the concern collector: `included do cattr_accessor :cap,
+/// default: 3 end` runs on each includer exactly as a model's own
+/// declaration does, and needs the seed carried beside the accessors.
+pub(super) fn expand_mattr_cattr(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
     file: &str,
@@ -1020,18 +1051,63 @@ fn expand_mattr_cattr(
         return Ok(None);
     }
     if let Some(defaults) = class_attr_defaults {
-        // Rails `class_variable_set`: nil when no default, else the value.
-        // `@@` storage requires an explicit seed (unlike `@ivar`).
-        let expr = default.unwrap_or_else(|| {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit {
-                    value: Literal::Nil,
-                },
-            )
-        });
-        for attr in &names {
-            defaults.insert(attr.clone(), expr.clone());
+        // Rails `cattr_*` (`mattr_reader`'s twin) decides a declaration by
+        // the VALUE of its default (`class_variable_set(...) unless
+        // sym_default_value.nil? && class_variable_defined?`): a non-nil
+        // default always sets, while no default — and an explicit
+        // `default: nil` — sets only a variable nothing has defined yet
+        // (`cattr_reader :cap, default: 3; cattr_writer :cap` stays 3).
+        // Two declarations that both set it are decided by which runs
+        // last; a default this cannot evaluate (a constant, a call)
+        // might be nil, so it must not be guessed. `@@` storage
+        // still needs a seed for its first read (unlike `@ivar`), so an
+        // absent default seeds nil where nothing has.
+        match default {
+            Some(default) => {
+                let seed = Seed::of(&default);
+                for attr in &names {
+                    let Some(existing) = defaults.get(attr) else {
+                        defaults.insert(attr.clone(), default.clone());
+                        continue;
+                    };
+                    if seed == Seed::Nil {
+                        // `nil` never replaces a defined class variable.
+                        continue;
+                    }
+                    if matches!(Seed::of(existing), Seed::Absent | Seed::Nil) {
+                        // Nothing has set the variable yet, so this does.
+                        defaults.insert(attr.clone(), default.clone());
+                        continue;
+                    }
+                    if seed == Seed::Computed {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&call.as_node(), file),
+                            None,
+                            "cattr_accessor",
+                            format!(
+                                "`{}` is declared again with a default this cannot evaluate, so whether it replaces the earlier seed cannot be established here",
+                                attr.as_str(),
+                            ),
+                        ));
+                        continue;
+                    }
+                    // Both set the variable: the later declaration, which
+                    // is this one, wins.
+                    defaults.insert(attr.clone(), default.clone());
+                }
+            }
+            None => {
+                for attr in &names {
+                    defaults.entry(attr.clone()).or_insert_with(|| {
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Lit {
+                                value: Literal::Nil,
+                            },
+                        )
+                    });
+                }
+            }
         }
     }
     let want_reader = name.ends_with("_reader") || name.ends_with("_accessor");
@@ -4336,6 +4412,7 @@ fn parse_association(
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
     let mut validate: Option<bool> = None;
+    let mut inverse_of: Option<String> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
@@ -4417,6 +4494,8 @@ fn parse_association(
                     primary_key = string_value(&value).or_else(|| symbol_value(&value))
                 }
                 "through" => through = symbol_value(&value),
+                // A name only: `inverse_of: false` (or `nil`) derives nothing.
+                "inverse_of" => inverse_of = symbol_value(&value).or_else(|| string_value(&value)),
                 "source" => source = symbol_value(&value),
                 "source_type" => source_type = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
                 "dependent" => {
@@ -4575,6 +4654,7 @@ fn parse_association(
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             primary_key: primary_key.as_deref().map(Symbol::from),
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
@@ -4601,6 +4681,7 @@ fn parse_association(
             autosave: autosave.unwrap_or(false),
             validate: validate.unwrap_or(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
         }),
         "belongs_to" => Some(Association::BelongsTo {
             name: name.clone(),
