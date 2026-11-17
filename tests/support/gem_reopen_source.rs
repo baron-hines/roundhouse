@@ -194,6 +194,64 @@ pub fn class_eval_limit_app() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 
+/// An initializer's reopen with its own `label`, then the [`CLASS_EVAL`]
+/// block: Ruby runs the file top to bottom, so the block's `label` stands.
+#[allow(dead_code)]
+pub fn reopen_then_class_eval_app() -> emit_and_run::Overlay {
+    let reopen = "class Shelf::Box\n  def self.label\n    \"first\"\n  end\nend\n\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", &format!("{reopen}{CLASS_EVAL}"))
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// The same across two initializers: Rails runs them in sorted order, so
+/// `b_box.rb`'s block runs after `a_box.rb`'s reopen.
+#[allow(dead_code)]
+pub fn reopen_then_class_eval_across_files_app() -> emit_and_run::Overlay {
+    let reopen = "class Shelf::Box\n  def self.label\n    \"first\"\n  end\n\n  def self.local_tag\n    \"a\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/a_box.rb", reopen)
+        .write("config/initializers/b_box.rb", CLASS_EVAL)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A block whose method calls a helper module the same initializer defines
+/// and nothing in `app/` names. Ruby answers `box / app box / helped`.
+#[allow(dead_code)]
+pub fn class_eval_helper_app() -> emit_and_run::Overlay {
+    let source = "module LabelHelper\n  def self.tag\n    \"helped\"\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+pub const HELPER_ASSERTIONS: &str = r##"got = ArticleBox.describe
+raise "describe #{got.inspect}" unless got == "box / app box / helped"
+puts "helper passed"
+"##;
+
+/// The gem's class with a constant of its own, and a block whose method
+/// reads that name bare. The block's lexical scope is the top level, so
+/// Ruby looks `TOKEN` up there: `uninitialized constant TOKEN`, not the
+/// gem's `Shelf::Box::TOKEN`.
+#[allow(dead_code)]
+pub fn class_eval_bare_constant_app() -> emit_and_run::Overlay {
+    let lib = SHELF.replace("  class Box\n", "  class Box\n    TOKEN = \"gem\"\n\n");
+    with_gem_lib(&lib)
+        .write("config/initializers/shelf_box.rb", "Shelf::Box.class_eval do\n  def self.local_tag\n    TOKEN\n  end\nend\n")
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A block the ingest refuses (`defined?` of a call with arguments), then
+/// [`CLASS_EVAL`]. Ruby runs both; the second is a reopen like any other.
+#[allow(dead_code)]
+pub fn refused_then_class_eval_app() -> emit_and_run::Overlay {
+    let refused = "Shelf::Box.class_eval do\n  def self.probe\n    defined?(String.new(1)) ? 1 : 0\n  end\nend\n\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", &format!("{refused}{CLASS_EVAL}"))
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// A gem module a controller includes.
 pub const SHELF_TAGGING: &str = r##"module Shelf
   module Tagging

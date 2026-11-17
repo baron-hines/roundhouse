@@ -102,6 +102,48 @@ fn the_spinel_emit_keeps_a_gem_class_class_evaled_in_an_initializer() {
     assert!(!warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
 }
 
+/// A block after the initializer's own reopen in the same file is the
+/// later opening: its `label` stands (Ruby: `box / app box / local`).
+#[test]
+fn a_class_eval_after_a_reopen_in_the_same_initializer_stands() {
+    contract::listed(contract::reopen_then_class_eval_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// The same with the reopen in an initializer that sorts first.
+#[test]
+fn a_class_eval_in_a_later_initializer_stands_over_an_earlier_reopen() {
+    contract::listed(contract::reopen_then_class_eval_across_files_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// A helper module the initializer defines, called only from a kept
+/// block's method, is kept with it.
+#[test]
+fn a_helper_a_kept_class_eval_calls_is_kept() {
+    contract::listed(contract::class_eval_helper_app()).run_ruby(contract::HELPER_ASSERTIONS).assert_passes();
+}
+
+/// A block whose method reads a bare constant the gem's class defines is
+/// not taken: in Ruby the name is the top level's, and the opening would
+/// put it in the class. It stays reported, and the class is the gem's.
+#[test]
+fn a_class_eval_reading_a_constant_of_the_gems_class_is_left_reported() {
+    let source = shelf_box(contract::class_eval_bare_constant_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_bare_constant_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block the ingest refuses leaves the file's other blocks taken.
+#[test]
+fn a_refused_class_eval_block_leaves_the_files_others_kept() {
+    contract::listed(contract::refused_then_class_eval_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
 /// A block with any statement besides `def`s is not taken: it stays
 /// reported, and the emitted class is the gem's alone.
 #[test]
