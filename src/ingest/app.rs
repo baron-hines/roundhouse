@@ -5277,6 +5277,21 @@ impl Ancestry<'_> {
         chain
     }
 
+    /// The modules whose `included` hook runs on an includer whose include
+    /// statements are `statements`: the ones they name, and the concerns
+    /// those defer to it. A concern a plain module includes runs its hook
+    /// on that module.
+    fn hooked_on(&self, statements: &[Vec<crate::ident::ClassId>]) -> crate::det::HashSet<crate::ident::ClassId> {
+        let mut hooked = crate::det::HashSet::default();
+        let mut pending: Vec<crate::ident::ClassId> = statements.iter().flatten().cloned().collect();
+        while let Some(module) = pending.pop() {
+            if hooked.insert(module.clone()) {
+                pending.extend(self.expanded(&module, 0).dependencies.iter().cloned());
+            }
+        }
+        hooked
+    }
+
     fn expanded(&self, module: &crate::ident::ClassId, depth: usize) -> std::rc::Rc<Expanded> {
         let cached = self.expanded.borrow().get(module).cloned();
         if let Some(done) = cached {
@@ -5427,7 +5442,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             })
             .map(|call| call.span)
             .collect();
-        for m in &lc.methods {
+        // `def self.x` in the hook is the includer's class-side method: not an instance one.
+        for m in lc.methods.iter().filter(|m| matches!(m.receiver, MethodReceiver::Instance)) {
             let at = m.name_span;
             if hooks.iter().any(|h| !at.is_synthetic() && h.file == at.file && h.start <= at.start && at.end <= h.end) {
                 hook_defined.insert((lc.name.clone(), m.name.clone()));
@@ -5593,10 +5609,14 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
         }
+        // A def a hook made on some module in between is that module's, where the chain has it.
+        let hooked = ancestry.hooked_on(&include_groups);
         let passes: Vec<(&crate::ident::ClassId, bool)> =
             hook_order.iter().rev().map(|module| (*module, true)).chain(queue.iter().map(|module| (module, false))).collect();
         for (module, from_hook) in passes {
-            let own = |method: &&&crate::dialect::MethodDef| hook_defined.contains(&(module.clone(), method.name.clone())) == from_hook;
+            let own = |method: &&&crate::dialect::MethodDef| {
+                (hooked.contains(module) && hook_defined.contains(&(module.clone(), method.name.clone()))) == from_hook
+            };
             for method in module_methods.get(module).into_iter().flatten().filter(own) {
                 let renamed;
                 let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
