@@ -73,6 +73,25 @@ program's half: use it only next to an assertion on `run.errors`, for
 example in a test that expects a refusal, or a control whose wrong
 expectation must fail.
 
+## Scratch directories
+
+Tests write their apps and emitted trees under the system temp directory
+with `scratch::dir(prefix)` from
+[`tests/support/scratch.rs`](../../tests/support/scratch.rs). Each tree
+is removed when its test binary exits (on Unix), whether its tests passed
+or failed; an emit-and-run `Run` or emitted tree goes as soon as the test
+drops it. Left behind, a full suite runs `/tmp` out of inodes.
+`ROUNDHOUSE_KEEP_EMITTED=1` keeps every tree, so a failure's message names
+a path you can still open:
+
+```sh
+ROUNDHOUSE_KEEP_EMITTED=1 cargo test --test emit_and_run -- some_test
+```
+
+A process that is killed, by a timeout or `SIGKILL`, cannot clean up, so
+its trees stay. New helpers that need a temporary directory use
+`scratch::dir` rather than `std::env::temp_dir()` directly.
+
 ## Native probes
 
 A Spinel test that checks one construct rather than the app can compile the
