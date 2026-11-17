@@ -107,6 +107,9 @@ const CASES: &[(&str, &str, &str)] = &[
     // [BundledHook, HookBundle, HookOne, HookTwo]: `include HookOne, HookTwo`
     // records HookTwo first, so HookOne's hook runs last and its `label` stands.
     ("bundled_hook", "  include HookBundle\n", "hook one"),
+    // [RewrappedHook, PlainDef, HookDefWrapper, HookDef]: HookDefWrapper put
+    // HookDef in the chain, so the controller's own `include HookDef` runs no hook.
+    ("rewrapped_hook", "  include HookDefWrapper\n  include HookDef\n  include PlainDef\n", "plain"),
 ];
 
 /// Cases that need more than a bare controller: (controller, its source,
@@ -124,6 +127,11 @@ const SPECIAL: &[(&str, &str, &str)] = &[
     // [InheritedHook, PlainDef, HookParent, HookDef]: the parent has HookDef,
     // so the child's `include HookDef` runs no hook, and PlainDef is found first.
     ("inherited_hook", "class InheritedHookController < HookParentController\n  include PlainDef\n  include HookDef\n\n  def show\n    render json: { label: label }\n  end\nend\n", "plain"),
+    // DelegateOne's hook delegates `label` on this parent.
+    ("delegate_parent", "class DelegateParentController < ApplicationController\n  include DelegateOne\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source one"),
+    // The parent has DelegateOne, so the child's `include DelegateOne` runs
+    // no hook: the child's own forwarder is DelegateTwo's.
+    ("inherited_delegate", "class InheritedDelegateController < DelegateParentController\n  include DelegateTwo\n  include DelegateOne\n\n  def show\n    render json: { label: label }\n  end\nend\n", "source two"),
     // DelegateTwo's hook runs last, so its `delegate` defines `label`.
     ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
