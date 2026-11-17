@@ -9197,17 +9197,29 @@ fn resolve_inverse_foreign_keys(app: &mut App) {
             else {
                 continue;
             };
+            // Every declaration of a class, its reopenings included, in
+            // order: the last association of that name is the one Rails keeps.
+            fn declared<'a>(
+                models: &'a [crate::dialect::Model],
+                class: &crate::ident::ClassId,
+            ) -> impl Iterator<Item = &'a crate::dialect::Model> {
+                let class = class.clone();
+                models.iter().filter(move |m| m.name == class)
+            }
             // A target outside the app's models (a gem's) is not read here.
-            let Some(mut class) = app.models.iter().find(|m| &m.name == target) else { continue };
-            let found = loop {
-                if let Some(found) = class.associations().filter(|a| a.name() == inverse).last() {
-                    break Some(found);
+            if declared(&app.models, target).next().is_none() {
+                continue;
+            }
+            let mut class = target.clone();
+            let mut found = None;
+            for _ in 0..app.models.len() {
+                found = declared(&app.models, &class).flat_map(|m| m.associations()).filter(|a| a.name() == inverse).last();
+                let parent = declared(&app.models, &class).find_map(|m| m.parent.clone());
+                match parent {
+                    Some(parent) if found.is_none() && declared(&app.models, &parent).next().is_some() => class = parent,
+                    _ => break,
                 }
-                match class.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p)) {
-                    Some(parent) => class = parent,
-                    None => break None,
-                }
-            };
+            }
             let Some(found) = found else {
                 super::prism::push(crate::diagnostic::Diagnostic::unsupported(
                     item.span(),
