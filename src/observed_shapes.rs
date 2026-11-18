@@ -66,6 +66,9 @@ pub struct Trigger {
 pub struct Observation {
     pub effects: Vec<Effect>,
     pub refusals: Vec<String>,
+    /// Each gem file the boot loaded, as `<gem dir>/<path in the gem>`.
+    #[serde(default)]
+    pub loaded: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,11 +98,18 @@ pub struct Patches {
     inserts: BTreeMap<PathBuf, Vec<(usize, String)>>,
     /// `<gem dir>/<path in the gem>`, then each range with the text it must hold.
     gem_edits: BTreeMap<String, Vec<(usize, usize, String)>>,
+    /// `<gem dir>`, then the features under its `lib/` the boot loaded.
+    loaded: BTreeMap<String, Vec<String>>,
 }
 
 impl Patches {
     pub fn is_empty(&self) -> bool {
-        self.inserts.is_empty() && self.gem_edits.is_empty()
+        self.inserts.is_empty() && self.gem_edits.is_empty() && self.loaded.is_empty()
+    }
+
+    /// The features (`aasm/persistence/active_record_persistence`) of `gem_dir`'s `lib/` the boot loaded.
+    pub fn loaded_features(&self, gem_dir: &str) -> &[String] {
+        self.loaded.get(gem_dir).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -109,6 +119,11 @@ pub fn patches(observation: &Observation, dir: &Path) -> Result<Patches, String>
         return Err(why.clone());
     }
     let mut out = Patches::default();
+    for file in &observation.loaded {
+        if let Some((gem, feature)) = file.split_once("/lib/") {
+            out.loaded.entry(gem.to_string()).or_default().push(feature.trim_end_matches(".rb").to_string());
+        }
+    }
     let mut by_trigger: BTreeMap<Trigger, Vec<String>> = BTreeMap::new();
     for effect in &observation.effects {
         let edits = out.gem_edits.entry(effect.gem_file.clone()).or_default();

@@ -20861,6 +20861,12 @@ mod ipaddr_include;
 mod pp_require;
 #[path = "emit_and_run/weakref_observable.rs"]
 mod weakref_observable;
+#[path = "emit_and_run/core_exceptions.rs"]
+mod core_exceptions;
+#[path = "emit_and_run/rbconfig_config.rs"]
+mod rbconfig_config;
+#[path = "emit_and_run/process_modules.rs"]
+mod process_modules;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
@@ -22376,6 +22382,8 @@ mod errors_copy;
 
 #[path = "emit_and_run/errors_computed_field.rs"]
 mod errors_computed_field;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
@@ -22624,6 +22632,28 @@ mod tag_helper_singleton_include;
 mod translation_helper_test_include;
 #[path = "emit_and_run/view_url_for_hash.rs"]
 mod view_url_for_hash;
+#[path = "emit_and_run/class_side_multi_column_pluck.rs"]
+mod class_side_multi_column_pluck;
+#[path = "emit_and_run/has_many_inverse_of_foreign_key.rs"]
+mod has_many_inverse_of_foreign_key;
+#[path = "emit_and_run/errors_messages_unlowered.rs"]
+mod errors_messages_unlowered;
+#[path = "emit_and_run/belongs_to_unsaved_target_valid.rs"]
+mod belongs_to_unsaved_target_valid;
+#[path = "emit_and_run/string_starts_with_alias.rs"]
+mod string_starts_with_alias;
+#[path = "emit_and_run/duration_name_on_object.rs"]
+mod duration_name_on_object;
+#[path = "emit_and_run/update_in_argument_position.rs"]
+mod update_in_argument_position;
+#[path = "emit_and_run/indifferent_hash_in_plain_class.rs"]
+mod indifferent_hash_in_plain_class;
+#[path = "emit_and_run/test_file_class_body.rs"]
+mod test_file_class_body;
+#[path = "emit_and_run/test_class_dropped_statement.rs"]
+mod test_class_dropped_statement;
+#[path = "emit_and_run/route_helper_scalar_call.rs"]
+mod route_helper_scalar_call;
 
 // Fork specs: validations.
 #[path = "emit_and_run/key_named_validator_listed.rs"]
@@ -22662,3 +22692,32 @@ mod declared_type_read_after_save;
 mod json_changed_in_place;
 #[path = "emit_and_run/json_update_columns.rs"]
 mod json_update_columns;
+
+// Concern shapes: an `included do` block's class/instance attributes.
+#[path = "emit_and_run/concern_included_cattr.rs"]
+mod concern_included_cattr;
+
+// Concern shapes: model callbacks declared in a concern's included block.
+#[path = "emit_and_run/concern_model_callbacks.rs"]
+mod concern_model_callbacks;
+
+// Concern shapes: a prepended concern.
+#[path = "emit_and_run/concern_prepended.rs"]
+mod concern_prepended;
+
+// Concern shapes: a plain module's included hook class_eval'ing an include.
+#[path = "emit_and_run/concern_class_eval_include.rs"]
+mod concern_class_eval_include;
+
+// Concern shapes: `concerning :Topic do … end` in a model body.
+#[path = "emit_and_run/concerning_block.rs"]
+mod concerning_block;
+
+// Concern shapes: a concern's accessors and validations on a plain
+// Active Model class.
+#[path = "emit_and_run/concern_plain_includer.rs"]
+mod concern_plain_includer;
+
+// Concern shapes: a namespaced prepend by its relative name.
+#[path = "emit_and_run/concern_prepended_namespaced.rs"]
+mod concern_prepended_namespaced;

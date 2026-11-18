@@ -900,7 +900,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("params_permit");
     controller_to_library::params::lower_value_reads(app);
     ran!("params_value_reads");
-    indifferent_access::apply_indifferent_access_lowering(app);
+    diags.extend(indifferent_access::apply_indifferent_access_lowering(app));
     ran!("indifferent_access");
     // Not fused: a local bound to `arel_table` is a whole-body fact, which a per-node rewrite cannot see
     arel_attribute::apply_arel_attribute_lowering(app);

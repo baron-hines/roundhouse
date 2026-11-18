@@ -304,7 +304,7 @@ pub fn shake_tree(
     let rescan: Vec<bool> = files.iter().map(|(path, _)| {
         path.ends_with(".rbs")
             || (path.ends_with(".rb")
-                && (is_framework_runtime(path) || path.starts_with("app/models/")))
+                && (is_framework_runtime(path) || super::class_paths::is_class_file(path)))
     }).collect();
     let mut stable_usage: HashSet<String> = HashSet::default();
     let mut total_runtime = 0usize;
@@ -341,7 +341,7 @@ pub fn shake_tree(
                 continue;
             }
             let runtime = is_framework_runtime(path);
-            let model = path.starts_with("app/models/");
+            let model = super::class_paths::is_class_file(path);
             if !runtime && !model {
                 continue;
             }
