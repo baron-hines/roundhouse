@@ -22737,3 +22737,5 @@ mod concern_prepended_namespaced;
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;
+#[path = "emit_and_run/own_namespace_association.rs"]
+mod own_namespace_association;
