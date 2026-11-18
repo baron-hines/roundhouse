@@ -204,6 +204,22 @@ fn core_rbs() -> &'static str {
     static RBS: OnceLock<String> = OnceLock::new();
     RBS.get_or_init(|| {
         let mut out = String::from(CORE_RBS_BASE);
+        // (the namespace too: a `class OpenSSL::SSL` alone leaves `OpenSSL` undeclared, and a read of
+        // `OpenSSL::SSL::VERIFY_NONE` from inside a nested module found no `OpenSSL` to start the path from)
+        let mut declared: Vec<&str> = Vec::new();
+        for (class, _) in CORE_VALUE_CLASSES {
+            let mut at = 0;
+            while let Some(i) = class[at..].find("::") {
+                let outer = &class[..at + i];
+                if !declared.contains(&outer) && !CORE_VALUE_CLASSES.iter().any(|(c, _)| *c == outer) {
+                    declared.push(outer);
+                    out.push_str("module ");
+                    out.push_str(outer);
+                    out.push_str("\nend\n");
+                }
+                at += i + 2;
+            }
+        }
         for (class, parent) in CORE_VALUE_CLASSES {
             out.push_str("class ");
             out.push_str(class);
