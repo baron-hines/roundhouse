@@ -20869,6 +20869,12 @@ mod rbconfig_config;
 mod process_modules;
 #[path = "emit_and_run/network_constants.rs"]
 mod network_constants;
+#[path = "emit_and_run/logger_severity.rs"]
+mod logger_severity;
+#[path = "emit_and_run/gem_nested_core_constant.rs"]
+mod gem_nested_core_constant;
+#[path = "emit_and_run/bigdecimal_bn_classes.rs"]
+mod bigdecimal_bn_classes;
 #[path = "emit_and_run/module_reflection.rs"]
 mod module_reflection;
 #[path = "emit_and_run/gem_class_eval_mixins.rs"]
@@ -22731,3 +22737,5 @@ mod concern_prepended_namespaced;
 // A module defining `method_missing`: its receiverless reads are the includer's.
 #[path = "emit_and_run/module_method_missing_includer.rs"]
 mod module_method_missing_includer;
+#[path = "emit_and_run/integer_times_enumerator.rs"]
+mod integer_times_enumerator;

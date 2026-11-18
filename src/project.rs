@@ -9582,7 +9582,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Signal" | "FileTest" | "Marshal" | "Fiber"
         | "Socket" | "IO::WaitReadable" | "IO::WaitWritable" | "Zlib::Inflate" | "OpenSSL::Digest::MD5"
         | "OpenSSL::X509::Certificate" | "OpenSSL::PKey::RSA" | "OpenSSL::SSL::SSLSocket" | "OpenSSL::SSL::SSLContext"
-        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data"
+        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data" | "OpenSSL::BN" | "BigDecimal"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
@@ -10180,7 +10180,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
-            && flag.starts_with(|c: char| c.is_ascii_uppercase())
+            && crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
         {
             emit::diagnostics::report_unsupported(
                 expr.span,

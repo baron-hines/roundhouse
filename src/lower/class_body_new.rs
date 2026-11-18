@@ -82,11 +82,18 @@ use crate::ident::Symbol;
 pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let subclassed = subclassed_names(app);
+    // Giving a Data factory's private constructor a constant receiver changes
+    // visibility. Native Data resolves the implicit receiver itself.
+    let data_classes: crate::det::HashSet<String> = app.library_classes.iter()
+        .filter(|lc| lc.data_define().is_some() && (lc.data_constructor_visibility().is_some()
+            || lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "new"
+                && m.visibility != crate::dialect::MethodVisibility::Public)))
+        .map(|lc| lc.name.0.as_str().to_string()).collect();
 
     // Copies FIRST, while every method body still holds its bare `new`:
     // the rewrite below is what binds a receiver, and a copy taken after
     // it would carry the base's name into the subclass.
-    diags.extend(monomorphize_subclassed(app, &subclassed));
+    diags.extend(monomorphize_subclassed(app, &subclassed, &data_classes));
 
     for model in &mut app.models {
         let owner = model.name.0.as_str().to_string();
@@ -120,6 +127,7 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     // receiver bound here name the same class.
     let sole_includer = app.sole_includer_of_modules();
     for lc in &mut app.library_classes {
+        if data_classes.contains(lc.name.0.as_str()) { continue; }
         let owner = if lc.is_module {
             sole_includer.get(&lc.name).unwrap_or(&lc.name).0.as_str().to_string()
         } else {
@@ -149,6 +157,7 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
 fn monomorphize_subclassed(
     app: &mut App,
     subclassed: &crate::det::HashSet<String>,
+    data_classes: &crate::det::HashSet<String>,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -201,7 +210,7 @@ fn monomorphize_subclassed(
     let mut planned: Vec<(usize, crate::dialect::MethodDef)> = Vec::new();
     for lc in &app.library_classes {
         let owner = lc.name.0.as_str().to_string();
-        if !subclassed.contains(owner.as_str()) {
+        if !subclassed.contains(owner.as_str()) || data_classes.contains(owner.as_str()) {
             continue;
         }
         for m in &lc.methods {

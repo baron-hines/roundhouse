@@ -1418,7 +1418,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // A network client's names as it rescues, configures or checks a connection (excon, httpclient,
     // redis-client): the openssl, socket and io/wait libraries' on the ruby family, spinel's packages and
     // runtime there. Their methods are not modeled.
-    for name in ["OpenSSL::X509::Certificate", "OpenSSL::PKey::RSA", "OpenSSL::SSL::SSLSocket", "OpenSSL::SSL::SSLContext", "OpenSSL::ASN1::ASN1Data"] {
+    // `result.is_a?(BigDecimal)` (liquid's number filters) and `OpenSSL::BN` (a signature's integers): the
+    // bigdecimal and openssl libraries' classes on the ruby family, spinel's packages there.
+    for name in ["OpenSSL::X509::Certificate", "OpenSSL::PKey::RSA", "OpenSSL::SSL::SSLSocket", "OpenSSL::SSL::SSLContext", "OpenSSL::ASN1::ASN1Data", "OpenSSL::BN", "BigDecimal"] {
         register_stdlib_class(classes, name, &[], &[]);
     }
     for name in ["OpenSSL::ASN1", "IO::WaitReadable", "IO::WaitWritable"] {

@@ -3101,6 +3101,10 @@ impl<'a> BodyTyper<'a> {
             {
                 bigdecimal()
             }
+            // Not the block form's receiver: without a block `n.times` is the Enumerator over 0...n (`8.times.map { … }`).
+            Some(Ty::Int) if method.as_str() == "times" && block_ret.is_none() && args.is_empty() => {
+                Ty::Array { elem: std::sync::Arc::new(Ty::Int) }
+            }
             Some(Ty::Int) => int_method(method),
             Some(Ty::Float) => float_method(method, args),
             Some(Ty::Bool) => bool_method(method),
