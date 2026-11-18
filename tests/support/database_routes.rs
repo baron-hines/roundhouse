@@ -622,10 +622,11 @@ results = []
 workers = [1, 2].map do |_|
   Thread.new do
     absent = !Dir.exist?(path)
+    raise "parent already exists before the barrier" unless absent
     lock.synchronize { ready << true }
     sleep(0.001) while lock.synchronize { ready.length } < 2
     begin
-      Db.mkdir_parent(path) if absent
+      Db.mkdir_parent(path)
       lock.synchronize { results << "ok" }
     rescue Errno::EEXIST
       lock.synchronize { results << "exists" }
@@ -633,6 +634,7 @@ workers = [1, 2].map do |_|
   end
 end
 workers.each { |worker| worker.join }
+raise "parent was not created" unless Dir.exist?(path)
 puts "directory-creators=" + results.sort.join(",")
 File.write("storage/not-directory", "synthetic")
 begin
