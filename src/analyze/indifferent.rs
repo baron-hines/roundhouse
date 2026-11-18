@@ -39,7 +39,7 @@ pub fn shape(method: &str, args: &[Expr], has_block: bool) -> Option<Shape> {
         "dup" | "with_indifferent_access" | "stringify_keys" | "to_h" if n == 0 && !has_block => Shape::Copy,
         "to_hash" if n == 0 && !has_block => Shape::ToHash,
         "symbolize_keys" | "to_options" if n == 0 && !has_block => Shape::SymbolizeKeys,
-        "freeze" | "deep_dup" | "compact" | "keys" | "values" | "size" | "length" | "empty?" | "to_a"
+        "freeze" | "deep_dup" | "compact" | "compact_blank" | "keys" | "values" | "size" | "length" | "empty?" | "to_a"
         | "to_json" | "as_json" | "to_query" | "to_param" | "invert" | "clear"
             if n == 0 && !has_block =>
         {
@@ -201,7 +201,7 @@ pub fn method_ty(
         Shape::SymbolizeKeys => Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(plain(value)) },
         Shape::Plain => match method {
             "freeze" | "deep_dup" | "select" | "filter" | "reject" | "select!" | "filter!" | "reject!" | "keep_if"
-            | "delete_if" | "clear" | "each" | "each_pair" | "each_key" | "each_value" => same(),
+            | "delete_if" | "clear" | "each" | "each_pair" | "each_key" | "each_value" | "compact_blank" => same(),
             "compact" => of(without_nil(value)),
             "transform_values" => of(block_ret.cloned().unwrap_or(Ty::Untyped)),
             _ => hash_answer(method),

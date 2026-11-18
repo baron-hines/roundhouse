@@ -81,6 +81,18 @@ fn an_unreadable_schema_does_not_admit_routes_in_survey() {
     assert_eq!(generated(&db), "# >>> generated: database-routes\n    ");
 }
 
+/// A primary that names its Ruby schema file admits the routes as
+/// `db/schema.rb` does: the named file is the schema the routes are checked against.
+#[test]
+fn a_named_ruby_schema_admits_the_routes() {
+    let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n");
+    assert!(yml.contains("schema_dump: catalog_schema.rb"));
+    let schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :notes, force: true do |t|\n    t.string :tag, null: false\n  end\nend\n";
+    let (db, errors) = spinel_db(shards().remove("db/schema.rb").write("db/catalog_schema.rb", schema).write("config/database.yml", &yml));
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(generated(&db).contains("@default_shard"), "{}", generated(&db));
+}
+
 /// A model's `prepend Concern` in a routed app stays the concern
 /// splice's statement: the flag that claims it is not the one that marks
 /// a writing block ingest read as its body, so the routes do not put a

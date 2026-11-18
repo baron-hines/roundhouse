@@ -54,7 +54,7 @@
 //! word, or a boolean (`ON`/`OFF`). Any other value (ERB, a quoted
 //! string with spaces, a nested map) is left out rather than guessed at.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::database::{Database, DatabaseAdapter, DatabaseRefusal};
 use crate::span::{FileId, Span};
@@ -295,8 +295,8 @@ fn key_offset(text: &str, key: &str, from: usize, top_level: bool) -> Option<usi
         let start = offset + indent;
         if start >= from && (!top_level || indent == 0) {
             let rest = line.trim_start();
-            let rest = rest.strip_prefix('"').and_then(|r| r.strip_prefix(key)).and_then(|r| r.strip_prefix('"'))
-                .or_else(|| rest.strip_prefix(key));
+            let quoted = |q: char| rest.strip_prefix(q).and_then(|r| r.strip_prefix(key)).and_then(|r| r.strip_prefix(q));
+            let rest = quoted('"').or_else(|| quoted('\'')).or_else(|| rest.strip_prefix(key));
             if rest.is_some_and(|r| r.trim_start().starts_with(':')) {
                 return Some(start);
             }
@@ -304,6 +304,379 @@ fn key_offset(text: &str, key: &str, from: usize, top_level: bool) -> Option<usi
         offset += line.len();
     }
     None
+}
+
+/// Where `schema_dump` first appears as a word (no letter, digit or `_`
+/// beside it) on a line that isn't a comment line. A line starting with `#`
+/// can't hold a key; anything else counts, an inline comment and a value
+/// included, so a file whose `schema_dump` the parser can't read refuses.
+fn mentions_schema_dump(text: &str) -> Option<usize> {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    text.match_indices("schema_dump").map(|(at, _)| at).find(|&at| {
+        let line = &text[text[..at].rfind('\n').map_or(0, |n| n + 1)..at];
+        !line.trim_start().starts_with('#') && !word(text[..at].chars().next_back()) && !word(text[at + "schema_dump".len()..].chars().next())
+    })
+}
+
+/// A file whose test primary the parser can't establish (`reason`): any
+/// mention of `schema_dump` refuses the file it may name, and a file with
+/// none keeps main's behavior.
+fn unresolved(text: &str, reason: &str) -> NamedSchema {
+    let mut out = NamedSchema::default();
+    if let Some(at) = mentions_schema_dump(text) {
+        out.primary = Some(Err(()));
+        let reason: String = shown(reason.lines().next().unwrap_or_default()).chars().take(120).collect();
+        let detail = format!("config/database.yml couldn't be read to check `test.primary`'s `schema_dump` ({reason}), so the file it names isn't read");
+        out.refusals.push(DatabaseRefusal { span: Span { file: FileId(0), start: at as u32, end: at as u32 }, construct: "schema_dump".to_string(), detail, warning: false });
+    }
+    out
+}
+
+/// The test environment's `schema_dump:`, read only in the one form this
+/// supports: a plain or quoted YAML string written directly in the
+/// primary configuration, naming a relative `.rb` or `.sql` file under
+/// `db/` (Rails joins the name to `db/`). `false`, null or an unquoted
+/// YAML 1.1 boolean names no file, and the schema is found as before.
+/// Any other `schema_dump:` there is refused by name, as is a
+/// `schema_dump` or `schema_format` in a literal `url:`'s query, which
+/// Rails merges over the keys beside it.
+#[derive(Default)]
+pub(crate) struct NamedSchema {
+    /// `Some(Ok((path, sql)))` reads that file; `Some(Err(()))` was refused.
+    pub primary: Option<Result<(PathBuf, bool), ()>>,
+    /// At their place in `config/database.yml`, filed by [`NamedSchema::refusals`].
+    refusals: Vec<DatabaseRefusal>,
+}
+
+impl NamedSchema {
+    /// The refusals and warnings, filed in `file`. A file that is `joined`
+    /// (solid_queue's, whose tables ingest adds to the primary's) is not
+    /// reported.
+    pub(crate) fn refusals(&self, file: FileId, joined: Option<&str>) -> Vec<DatabaseRefusal> {
+        let joined = joined.map(|path| format!(" {path} "));
+        self.refusals
+            .iter()
+            .filter(|r| !r.warning || joined.as_deref().is_none_or(|path| !r.detail.contains(path)))
+            .map(|r| DatabaseRefusal { span: Span { file, ..r.span }, ..r.clone() })
+            .collect()
+    }
+}
+
+pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema {
+    use serde_yaml_ng::Value;
+    let mut out = NamedSchema::default();
+    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return out };
+    // Each ERB output tag gets its own placeholder: two computed keys would otherwise be one
+    // duplicate key, the YAML would not parse, and a named file would be dropped unseen.
+    let distinct = erb_as_values(&text).split(ERB_VALUE).enumerate().fold(String::new(), |mut yaml, (i, part)| {
+        if i > 0 {
+            yaml.push_str(&format!("{ERB_VALUE}{i}_"));
+        }
+        yaml.push_str(part);
+        yaml
+    });
+    // Unparsed, or with a merge that doesn't apply: the parser's own reason
+    // ("duplicate entry ...", "unknown anchor ..."), placeholders shown as ERB.
+    let mut doc = match serde_yaml_ng::from_str::<Value>(&distinct) {
+        Ok(doc) => doc,
+        Err(error) => return unresolved(&text, &error.to_string()),
+    };
+    // Rails' YAML merges a root `<<` where it is written, so it can replace `test` whole; checked
+    // with `shared` once the test primary names a file.
+    let root_merge = matches!(&doc, Value::Mapping(m) if m.contains_key("<<"));
+    if let Err(error) = doc.apply_merge() {
+        return unresolved(&text, &error.to_string());
+    }
+    // A key computed by ERB (`<%= "schema_dump" %>:`) could be the setting itself.
+    fn computed_key(value: &Value) -> bool {
+        match value {
+            Value::Mapping(m) => m.iter().any(|(k, v)| k.as_str().is_some_and(|k| k.contains(ERB_VALUE)) || computed_key(v)),
+            Value::Sequence(items) => items.iter().any(computed_key),
+            _ => false,
+        }
+    }
+    // Checked once the test primary's own `schema_dump` names a file.
+    let computed = computed_key(&doc);
+    let Value::Mapping(mut envs) = doc else { return out };
+    // Rails fills each configuration's missing keys from a top-level `shared:` block. A null or
+    // `false` one is skipped, as Rails skips it; so is an unquoted `off` or `no`, which Psych reads
+    // as `false` and this parser as a String. The line's own spelling decides, so `'off'` still counts.
+    let unquoted_false = || text.lines().any(|l| l.strip_prefix("shared:").is_some_and(|v| {
+        let v = v.split(" #").next().unwrap_or_default().trim();
+        ["no", "off", "false"].iter().any(|w| v.eq_ignore_ascii_case(w))
+    }));
+    let shared = match envs.get("shared") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::String(_)) => !unquoted_false(),
+        Some(_) => true,
+    };
+    // Without a literal `test`, a computed environment key may be it.
+    if !envs.contains_key("test") && envs.keys().any(|k| k.as_str().is_some_and(|k| k.contains(ERB_VALUE))) {
+        return unresolved(&text, "an environment's key is computed with ERB, and there is no literal `test`");
+    }
+    // An environment given as a URL string is its one configuration's `url:`.
+    let env = match envs.remove("test") {
+        Some(Value::Mapping(env)) => env,
+        Some(Value::String(url)) => serde_yaml_ng::Mapping::from_iter([(Value::String("url".to_string()), Value::String(url))]),
+        _ => return out,
+    };
+    // Not located in the source: no line is read as written directly, so a named file is refused.
+    let env_at = key_offset(&text, "test", 0, true);
+    let at = |start: usize| Span { file: FileId(0), start: start as u32, end: start as u32 };
+    let three_tier = !env.is_empty() && env.values().all(|v| matches!(v, Value::Mapping(_)));
+    let names: Vec<String> = env.keys().filter_map(|k| k.as_str().map(str::to_string)).collect();
+    // Rails' primary is `primary`, else the first configuration. A configuration named by a non-String key can't be named here.
+    let primary_name = if !three_tier || names.iter().any(|n| n == "primary") {
+        "primary".to_string()
+    } else if let Some(first) = names.first().filter(|_| names.len() == env.len()) {
+        first.clone()
+    } else {
+        if env.values().any(|config| matches!(config, Value::Mapping(c) if c.keys().any(|k| k.as_str().is_some_and(|k| k.trim_start_matches(':') == "schema_dump")))) {
+            out.primary = Some(Err(()));
+            let detail = "`test.primary`'s `schema_dump` is not supported: the test environment names a configuration with a key that isn't a string, so its primary can't be named".to_string();
+            out.refusals.push(DatabaseRefusal { span: at(env_at.unwrap_or(0)), construct: "schema_dump".to_string(), detail, warning: false });
+        }
+        return out;
+    };
+    // The lines written directly in a configuration's block: `(offset, key, value)`.
+    let block = |start: Option<usize>| -> Vec<(usize, String, String)> {
+        let Some(start) = start else { return Vec::new() };
+        let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i + 1);
+        // The key's own indentation, from the physical line start: a sibling ends the block.
+        let own = start - text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let mut lines = Vec::new();
+        let mut child = None;
+        let mut offset = line_end;
+        for line in text[line_end..].split_inclusive('\n') {
+            let indent = line.len() - line.trim_start().len();
+            let body = line.trim();
+            if !body.is_empty() && !body.starts_with('#') {
+                if indent <= own {
+                    break;
+                }
+                // A quoted key keeps its quotes (`':schema_dump'`), so it matches neither spelling.
+                let quote = body.chars().next().filter(|c| *c == '\'' || *c == '"');
+                let pair = match (quote, body.strip_prefix(':')) {
+                    (Some(q), _) => body[1..].find(q).and_then(|end| body[end + 2..].strip_prefix(':').map(|v| (body[..end + 2].to_string(), v))),
+                    (None, Some(rest)) => rest.split_once(':').map(|(k, v)| (format!(":{k}"), v)),
+                    (None, None) => body.split_once(':').map(|(k, v)| (k.to_string(), v)),
+                };
+                if *child.get_or_insert(indent) == indent && let Some((key, value)) = pair {
+                    lines.push((offset + indent, key, value.split(" #").next().unwrap_or_default().trim().to_string()));
+                }
+            }
+            offset += line.len();
+        }
+        lines
+    };
+    // A configuration's key among the environment block's direct children.
+    let child_key = |name: &str| -> Option<usize> {
+        let env_lines = block(env_at);
+        env_lines.iter().find(|(_, key, _)| key.trim_matches(|c| c == '"' || c == '\'') == name).map(|(offset, _, _)| *offset)
+    };
+    let configs: Vec<(String, Value, Option<usize>)> = if three_tier {
+        names.iter().map(|n| (n.clone(), env[n.as_str()].clone(), child_key(n))).collect()
+    } else {
+        vec![(primary_name.clone(), Value::Mapping(env.clone()), env_at)]
+    };
+    for (name, config, start) in configs {
+        let Value::Mapping(config) = config else { continue };
+        let lines = block(start);
+        let start = start.unwrap_or(0);
+        let label = format!("`test.{name}`");
+        // A quoted String key (`'schema_dump':`) is that key; `':schema_dump'` stays apart from the Symbol key.
+        let unquoted = |k: &str| ['\'', '"'].iter().find_map(|q| k.strip_prefix(*q)?.strip_suffix(*q)).map(str::to_string);
+        let line_of = |key: &str| lines.iter().find(|(_, k, _)| k == key || !key.starts_with(':') && unquoted(k).as_deref() == Some(key));
+        let mut refuse = |offset: usize, detail: String, warning: bool| out.refusals.push(DatabaseRefusal { span: at(offset), construct: "schema_dump".to_string(), detail, warning });
+        if name != primary_name {
+            // Not read: the runtime opens only the primary. Reported when the file exists.
+            let skip = matches!(config.get("replica"), Some(Value::Bool(true))) || matches!(config.get("database_tasks"), Some(Value::Bool(false)));
+            let file = match config.get("schema_dump") {
+                Some(Value::String(file)) if !file.contains(ERB_VALUE) => vec![format!("db/{file}")],
+                Some(_) => Vec::new(),
+                // Rails names it by the configuration's format.
+                None => match config.get("schema_format").and_then(Value::as_str).map(|f| f.trim_start_matches(':')) {
+                    Some("sql") => vec![format!("db/{name}_structure.sql")],
+                    Some("ruby") => vec![format!("db/{name}_schema.rb")],
+                    _ => vec![format!("db/{name}_schema.rb"), format!("db/{name}_structure.sql")],
+                },
+            };
+            if let Some(file) = file.into_iter().find(|f| !skip && vfs.exists(&dir.join(f))) {
+                refuse(start, format!("{label}'s schema file {file} is not read: the emitted runtime opens only the primary database, so this database's tables are not carried, and a model routed to it is refused"), true);
+            }
+            continue;
+        }
+        let unsupported = |written: &str, why: &str| format!("{label}'s `schema_dump: {written}` is not supported: schema selection reads only a plain string naming a relative .rb or .sql file under db/ ({why})");
+        // A literal URL's query wins over the keys beside it: the last value of a key, unless blank.
+        // Every key that reads as `url` in some spelling (`:url`, quoted, any case), after merges.
+        // A named file is read only beside one plain literal one; each one's query is checked.
+        let urls: Vec<&Value> = config.iter().filter(|(k, _)| k.as_str().is_some_and(|k| k.trim_start_matches(':').eq_ignore_ascii_case("url"))).map(|(_, v)| v).collect();
+        let url_unread = urls.len() > 1 || urls.iter().any(|url| !matches!(url, Value::String(url) if !url.contains(ERB_VALUE)));
+        for url in urls.iter().filter_map(|url| url.as_str()) {
+            let query = url.split('#').next().unwrap_or_default().split_once('?').map_or("", |(_, q)| q);
+            for key in ["schema_dump", "schema_format"] {
+                let value = query.split('&').filter_map(|pair| { let (k, v) = pair.split_once('=').unwrap_or((pair, "")); (k == key).then_some(v) }).last();
+                if value.is_some_and(|v| !v.is_empty()) {
+                    out.primary = Some(Err(()));
+                    refuse(line_of("url").or(line_of(":url")).map_or(start, |l| l.0), format!("{label}'s `url:` sets `{key}` in its query, which schema selection does not read"), false);
+                }
+            }
+        }
+        if let Some((offset, _, written)) = line_of(":schema_dump") {
+            out.primary = Some(Err(()));
+            refuse(*offset, unsupported(written, "it is written as the Symbol key `:schema_dump:`"), false);
+        } else if config.contains_key(":schema_dump")
+            && (lines.iter().any(|(_, k, _)| k == "<<") || !lines.iter().any(|(_, k, _)| k == "':schema_dump'" || k == "\":schema_dump\""))
+        {
+            // Only a String key written directly, with nothing merged beside it, is the key Rails ignores.
+            out.primary = Some(Err(()));
+            let written = shown(serde_yaml_ng::to_string(&config[":schema_dump"]).unwrap_or_default().trim());
+            refuse(start, unsupported(&written, "it is the Symbol key `:schema_dump:`, here through a merge"), false);
+        }
+        let Some(value) = config.get("schema_dump") else { continue };
+        if out.primary.is_some() {
+            continue;
+        }
+        let direct = line_of("schema_dump");
+        let written = direct.map_or_else(|| shown(serde_yaml_ng::to_string(value).unwrap_or_default().trim()), |l| l.2.replace(ERB_VALUE, "<%= ... %>"));
+        let offset = direct.map_or(start, |l| l.0);
+        let token = direct.map(|l| l.2.as_str()).unwrap_or_default();
+        let plain = token.trim_matches(|c| c == '\'' || c == '"');
+        // `false`, null or an unquoted YAML 1.1 boolean: no file, so the schema is found as before.
+        // On its line, the value's own spelling decides: `off` or `&a off` is a boolean, `'off'` or an
+        // escape a name. Through a flow mapping or an alias its style isn't seen, so it is taken as
+        // Psych takes an unquoted word: no file, and the schema is found as before, as on main.
+        let bare = |name: &str| direct.is_none() || token.starts_with('*') || token == name || token.starts_with('&') && token.ends_with(&format!(" {name}"));
+        let boolean = |name: &str| bare(name) && ["yes", "no", "on", "off", "true", "false"].iter().any(|w| name.eq_ignore_ascii_case(w));
+        if matches!(value, Value::Null | Value::Bool(_)) || matches!(value, Value::String(name) if boolean(name)) {
+            continue;
+        }
+        out.primary = Some(Err(()));
+        // ERB control flow can decide whether this configuration, or this key, exists at all.
+        if control_tag(&text).is_some() {
+            refuse(offset, unsupported(&written, "config/database.yml runs ERB control flow (`<% ... %>`), which can decide whether it applies"), false);
+            continue;
+        }
+        if computed {
+            refuse(offset, unsupported(&written, "config/database.yml computes a key with ERB, which could be the setting itself"), false);
+            continue;
+        }
+        // Psych applies a merge where it is written, over the keys before it, and puts the
+        // configurations it brings first; serde_yaml_ng keeps the written keys and their order.
+        // They agree on a merge written first in the primary's block, not on one between configurations.
+        // A quoted `"<<"` merges too in Psych; only a `!!str` tag makes it an ordinary key.
+        let merge = |key: &String| key == "<<" || unquoted(key).as_deref() == Some("<<");
+        if lines.iter().skip(1).any(|(_, key, _)| merge(key)) || three_tier && block(env_at).iter().any(|(_, key, _)| merge(key)) {
+            refuse(offset, unsupported(&written, "a merge key (`<<:`) comes after other keys or brings configurations, and Rails applies it where it is written"), false);
+            continue;
+        }
+        if root_merge || shared {
+            refuse(offset, unsupported(&written, "config/database.yml has a root-level merge key (`<<:`) or a `shared:` block, which Rails applies to the test configuration"), false);
+            continue;
+        }
+        let why = match value {
+            _ if direct.is_none() => Some("it is not written directly in the configuration: an anchor merge or flow mapping"),
+            Value::String(name) if name.contains(ERB_VALUE) => Some("it is computed with ERB"),
+            Value::String(name) if name != plain || token.starts_with(['&', '*', '!', '|', '>', '{', '[']) => Some("it is an anchor, alias, tag or block value, an escape, or a quoted name holding ` #`"),
+            Value::String(name) if name.starts_with('/') || name.split('/').any(|part| part == "..") => Some("it is not a relative path inside db/"),
+            Value::String(name) if !name.ends_with(".rb") && !name.ends_with(".sql") => Some("it does not end in .rb or .sql"),
+            Value::String(_) => None,
+            _ => Some("it is a value that names no file"),
+        };
+        if let Some(why) = why {
+            refuse(offset, unsupported(&written, why), false);
+            continue;
+        }
+        let name = plain;
+        let path = format!("db/{name}");
+        // The format Rails reads it in: a literal `schema_format:` written directly here,
+        // else `:ruby` unless the app's config mentions `schema_format` at all.
+        let format_lines: Vec<&(usize, String, String)> = lines.iter().filter(|(_, k, _)| k.trim_start_matches(':').trim_matches(|c| c == '"' || c == '\'') == "schema_format").collect();
+        let format = match (format_lines.as_slice(), config.get("schema_format").or(config.get(":schema_format"))) {
+            ([], None) => config_mentions(vfs, dir, |text| text.contains("schema_format")).map_or(Ok(".rb"), |clause| Err(format!("{clause} `schema_format`, which can change the format Rails reads it in"))),
+            ([(_, key, value)], Some(Value::String(parsed))) if key == "schema_format" && value.trim_matches(|c| c == '"' || c == '\'') == parsed => match parsed.trim_start_matches(':') {
+                "ruby" => Ok(".rb"),
+                "sql" => Ok(".sql"),
+                _ => Err(format!("`schema_format: {value}` is not a literal `ruby` or `sql`")),
+            },
+            _ => Err("its `schema_format` is not a literal `ruby` or `sql` written directly in the configuration".to_string()),
+        };
+        if url_unread {
+            refuse(offset, unsupported(&written, "the configuration's `url:` is computed, not a string, or written under more than one spelling, so its query could name another file"), false);
+        } else if let Some(setter) = config_mentions(vfs, dir, |text| mentions_paths(text) || mentions_identifier(text, "db_dir")) {
+            // `DatabaseTasks.db_dir`, which Rails joins the name to, defaults to `paths["db"]` and can be assigned.
+            refuse(offset, format!("{label}'s `schema_dump: {written}` is not supported: {setter} `.paths`, `paths[`, `paths.add` or `db_dir`, which can move the db directory Rails reads it from"), false);
+        } else if let Err(why) = &format {
+            refuse(offset, unsupported(&written, why), false);
+        } else if format.as_deref() != Ok(&name[name.rfind('.').unwrap_or(0)..]) {
+            refuse(offset, unsupported(&written, "its extension is not the schema format Rails reads it in (`.rb` for ruby, `.sql` for sql)"), false);
+        } else if !vfs.exists(&dir.join(&path)) {
+            refuse(offset, format!("{label} names its schema file {path} with `schema_dump: {written}`, which does not exist"), false);
+        } else {
+            out.primary = Some(Ok((dir.join(path), name.ends_with(".sql"))));
+        }
+    }
+    out
+}
+
+/// A value as written, with each numbered ERB placeholder shown as `<%= ... %>`.
+fn shown(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(at) = rest.find(ERB_VALUE) {
+        out.push_str(&rest[..at]);
+        out.push_str("<%= ... %>");
+        let after = rest[at + ERB_VALUE.len()..].trim_start_matches(|c: char| c.is_ascii_digit());
+        rest = after.strip_prefix('_').unwrap_or(after);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The first Ruby file under `config/` whose text matches, as a clause
+/// naming it (`config/application.rb mentions`). Text only, comments
+/// included: a match only ever refuses, and so does a scan that couldn't
+/// list `config/` or read a file there.
+fn config_mentions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, matches: impl Fn(&str) -> bool) -> Option<String> {
+    let config = dir.join("config");
+    if !vfs.is_dir(&config) {
+        return None;
+    }
+    let Ok(files) = super::app::read_rb_files(vfs, &config) else { return Some("config/ couldn't be listed whole, so a file there may mention".to_string()) };
+    files.into_iter().find_map(|file| {
+        let shown = file.strip_prefix(dir).unwrap_or(&file).display().to_string();
+        match vfs.read_to_string(&file) {
+            Ok(text) => matches(&text).then(|| format!("{shown} mentions")),
+            Err(_) => Some(format!("{shown} couldn't be read, so it may mention")),
+        }
+    })
+}
+
+/// `.paths`, `paths[` or `paths.add` anywhere, on any receiver and in
+/// comments too: Rails resolves `schema_dump:` in `paths["db"]`, which
+/// any of them may change, through an alias or a computed key. Only
+/// `.assets.paths`, Sprockets' and Propshaft's load path on the asset
+/// configuration (named in the initializer `rails new` writes), is not
+/// Rails' `paths`; a receiver merely named `..._assets` may be `config`.
+fn mentions_paths(text: &str) -> bool {
+    text.match_indices("paths").any(|(at, _)| {
+        let before = &text[..at];
+        let after = &text[at + "paths".len()..];
+        let dotted = before.ends_with('.');
+        let assets = before.strip_suffix('.').is_some_and(|b| b.ends_with(".assets"));
+        !assets && (dotted || after.starts_with('[') || after.starts_with(".add"))
+    })
+}
+
+/// `name` as a whole identifier: neither neighbouring character may
+/// continue an identifier. Comments included, as in `mentions_paths`.
+fn mentions_identifier(text: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
 }
 
 /// `(environment, ["PRAGMA name = value", ...])`, for each environment
