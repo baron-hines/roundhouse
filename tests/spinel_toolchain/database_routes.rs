@@ -104,3 +104,9 @@ fn writable_routes_create_missing_parent_directories() {
 fn writable_route_parents_tolerate_concurrent_creators() {
     assert_shard_report(contract::DIRECTORY_RACE_SCRIPT, contract::DIRECTORY_RACE_EXPECTED);
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_closed_parked_connection_is_not_reused_after_reconfigure() {
+    assert_shard_report(contract::PARKED_REOPEN_SCRIPT, contract::PARKED_REOPEN_EXPECTED);
+}

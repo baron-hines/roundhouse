@@ -660,3 +660,17 @@ pub fn comparable(text: &str) -> String {
         })
         .collect()
 }
+
+pub const PARKED_REOPEN_SCRIPT: &str = r##"ActiveRecord::Base.with_connection do
+  before = Db.scopes[Db.scopes.length - 1].connection
+  Db.close
+  Db.configure("storage/reopened-primary.sqlite3", pool_size: 1)
+  ActiveRecord::Base.with_connection do |c|
+    current = Db.scopes[Db.scopes.length - 1].connection
+    puts "parked-fresh=" + (current != before).to_s
+    file = c.select_value("SELECT file FROM pragma_database_list WHERE name = 'main'").to_s
+    puts "parked-file=" + (file == File.expand_path("storage/reopened-primary.sqlite3")).to_s
+  end
+end
+"##;
+pub const PARKED_REOPEN_EXPECTED: &str = "parked-fresh=true\nparked-file=true\n";

@@ -1573,8 +1573,10 @@ module Db
   def self.held_connection(index)
     conn = nil
     scopes.each do |frame|
+      home = frame.home
+      next if !home.nil? && home.closed
       conn = frame.held if frame.from == index && !frame.held.nil?
-      conn = frame.connection if frame.parked && frame.slot == index && !frame.connection.nil?
+      conn = frame.connection if frame.parked && frame.slot == index && !frame.connection.nil? && home == @slots[index]
     end
     conn
   end
