@@ -200,3 +200,45 @@ fn a_rooted_concern_in_a_controller_body_runs_its_included_filters() {
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+fn prefixed_ledger_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/record.rb", "class Record < ApplicationRecord\n  self.abstract_class = true\n\n  def tag\n    \"top\"\n  end\nend\n")
+        .write("app/models/ledger/record.rb", "module Ledger\n  class Record < ApplicationRecord\n    self.abstract_class = true\n    self.table_name_prefix = \"ledger_\"\n\n    def tag\n      \"ledger\"\n    end\n  end\nend\n")
+        .write("app/models/export/record.rb", "module Export\n  class Record < ApplicationRecord\n    self.abstract_class = true\n\n    def tag\n      \"export\"\n    end\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n\n  create_table \"ledger_entries\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const ROOTED_SUPERCLASS: &str = r##"thing = Thing.create!(name: "t")
+got = [RootBase.superclass.name, Thing.table_name, thing.tag, Thing.count]
+expected = ["Record", "things", "top", 1]
+raise "rooted superclass: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_superclass_is_not_looked_up_in_the_module_around_it() {
+    let app = prefixed_ledger_app()
+        .write("app/models/root_base.rb", "module Ledger\n  class ::RootBase < ::Record\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/thing.rb", "class Thing < RootBase\nend\n");
+    let run = app.run_ruby(ROOTED_SUPERCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const COMPACT_ROOTED_MODULE: &str = r##"entry = Export::Inner::Entry.create!(name: "e")
+got = [Export::Inner::Entry.superclass.name, Export::Inner::Entry.table_name, entry.tag, Export::Inner::Entry.count]
+expected = ["Ledger::Record", "ledger_entries", "ledger", 1]
+raise "compact rooted module: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_class_in_a_compact_rooted_module_looks_through_its_nesting_only() {
+    let app = prefixed_ledger_app()
+        .write("app/models/export/inner/entry.rb", "module Ledger\n  module ::Export::Inner\n    class Entry < Record\n    end\n  end\nend\n");
+    let run = app.run_ruby(COMPACT_ROOTED_MODULE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
