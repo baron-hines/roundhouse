@@ -465,6 +465,10 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             if ctx.app_helper_names.contains(method.as_str()) && !ctx.reads_local(stmt) {
                 return vec![rewrite_helpers_in_expr(stmt, ctx)];
             }
+            // `<% raise ArgumentError, "…" %>`: Rails raises as the page renders; dropped, the page rendered on.
+            if matches!(method.as_str(), "raise" | "fail") && !ctx.is_local(method.as_str()) {
+                return vec![rewrite_helpers_in_expr(stmt, ctx)];
+            }
             vec![todo_io_append("unknown stmt", stmt.span)]
         }
         // `<% case action_name when "all" %>…<% when … %>…<% end %>` at

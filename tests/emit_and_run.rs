@@ -22741,3 +22741,5 @@ mod integer_times_enumerator;
 mod params_compact_blank;
 #[path = "emit_and_run/computed_partial_render.rs"]
 mod computed_partial_render;
+#[path = "emit_and_run/view_raise_statement.rs"]
+mod view_raise_statement;
