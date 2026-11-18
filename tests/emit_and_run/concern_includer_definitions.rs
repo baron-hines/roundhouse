@@ -384,7 +384,11 @@ fn third_app() -> emit_and_run::Overlay {
         .write("app/models/concerns/wrapper.rb", &module("Wrapper", true, "  include Tail\n  include Shared\n"))
         .write("app/models/concerns/plain_shared.rb", &module("PlainShared", false, "  def plain_token!(name)\n    nil\n  end\n"))
         .write("app/models/concerns/plain_tail.rb", &module("PlainTail", false, "  def plain_token!(name)\n    tokens.create!(name: \"plain tail #{name}\")\n  end\n"))
-        .write("app/models/concerns/plain_wrapper.rb", &module("PlainWrapper", false, "  include PlainTail\n  include PlainShared\n"))
+        // A module of nothing but includes is not ingested; one method keeps it.
+        .write(
+            "app/models/concerns/plain_wrapper.rb",
+            &module("PlainWrapper", false, "  include PlainTail\n  include PlainShared\n\n  def wrapper_tag\n    \"plain wrapper\"\n  end\n"),
+        )
         .write(
             "app/models/concerns/branched.rb",
             &module(
