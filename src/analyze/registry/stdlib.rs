@@ -1470,6 +1470,23 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("join", Ty::Str), ("shelljoin", Ty::Str),
         ("split", str_arr()), ("shellsplit", str_arr()), ("shellwords", str_arr()),
     ], &[]);
+    // Ruby's core modules a gem's process code reaches (a shutdown trap, a
+    // cache's Marshal round trip, a file probe); spinel's runtime answers them too.
+    register_stdlib_class(classes, "Signal", &[
+        ("trap", Ty::Untyped),
+        ("list", Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Int) }),
+    ], &[]);
+    register_stdlib_class(classes, "FileTest", &[
+        ("exist?", Ty::Bool), ("file?", Ty::Bool), ("directory?", Ty::Bool),
+        ("zero?", Ty::Bool), ("empty?", Ty::Bool),
+    ], &[]);
+    register_stdlib_class(classes, "Marshal", &[("dump", Ty::Str), ("load", Ty::Untyped), ("restore", Ty::Untyped)], &[]);
+    for module in ["Signal", "FileTest", "Marshal"] {
+        classes.entry(ClassId(Symbol::from(module))).or_default().is_module = true;
+    }
+    register_stdlib_class(classes, "Fiber", &[
+        ("new", class("Fiber")), ("yield", Ty::Untyped), ("current", class("Fiber")),
+    ], &[("resume", Ty::Untyped), ("alive?", Ty::Bool)]);
     // CRuby's default gem; Spinel ships the same SpellChecker in its
     // did_you_mean package. The dictionary can contain Strings or Symbols.
     register_stdlib_class(classes, "DidYouMean::SpellChecker", &[

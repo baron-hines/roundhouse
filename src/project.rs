@@ -9572,6 +9572,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "NoMemoryError" | "SecurityError" | "SystemStackError"
         | "Encoding::UndefinedConversionError" | "Encoding::InvalidByteSequenceError"
         | "Encoding::ConverterNotFoundError"
+        | "Signal" | "FileTest" | "Marshal" | "Fiber"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
