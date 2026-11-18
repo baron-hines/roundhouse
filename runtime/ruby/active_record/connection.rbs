@@ -235,8 +235,8 @@ module ActiveRecord
     def self.one?: () -> bool
     def self.or: (Relation other) -> Relation
     def self.order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
-    def self.pick: (String | Symbol col) -> untyped
-    def self.pluck: (String | Symbol col) -> Array[untyped]
+    def self.pick: (*(String | Symbol) cols) -> untyped
+    def self.pluck: (*(String | Symbol | Arel::Nodes::SqlLiteral) cols) -> Array[untyped]
     def self.preload: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
     def self.references: (*Symbol names) -> Relation
     def self.reorder: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation

@@ -82,6 +82,10 @@ mod ordered_options;
 mod class_ext_app;
 #[path = "spinel_toolchain/class_ext.rs"]
 mod class_ext;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
+#[path = "spinel_toolchain/aasm.rs"]
+mod aasm;
 #[path = "support/view_component_gem.rs"]
 mod view_component_gem;
 #[path = "spinel_toolchain/view_component.rs"]
@@ -937,3 +941,6 @@ fn full_forwarding_keeps_the_native_argument_contract() {
     run.assert_passes();
     assert_eq!(run.stdout, "full forwarding contract passed\n");
 }
+
+#[path = "spinel_toolchain/data_declaration_composition.rs"]
+mod data_declaration_composition;

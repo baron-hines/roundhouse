@@ -749,9 +749,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // The queue's records: on solid_queue the compiler runs the jobs, but the records Rails keeps of them are
     // solid_queue's own models, read from its installed source over a separate or primary queue schema.
     // Not every app on solid_queue: only one whose code (or a gem it carries) names solid_queue's classes reads its records.
+    // The file the test environment's primary names with `schema_dump:`, resolved once for the
+    // queue check below and the schema read; a form that isn't read is refused.
+    let named_schema = super::database_yml::named_schema(vfs, dir);
     let solid_queue_models = (effective_queue_adapter(vfs, dir).as_deref() == Some("solid_queue")
         && names_solid_queue(vfs, dir, &source_gems)
-        && (vfs.exists(&dir.join("db/queue_schema.rb")) || primary_schema_has_queue(vfs, dir)))
+        && (vfs.exists(&dir.join("db/queue_schema.rb")) || primary_schema_has_queue(vfs, dir, named_schema.primary.as_ref())))
         .then(|| super::source_gems::framework_models(vfs, dir, lock.as_ref(), "solid_queue"))
         .flatten();
     let solid_queue_root = solid_queue_models.as_ref().and_then(|gem| gem.mount.strip_prefix(dir).ok().map(|m| m.join("app")));
@@ -861,7 +864,22 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     let expression_dialect = schema_expression_dialect(vfs, dir);
-    if vfs.exists(&schema_path) {
+    // A refused `schema_dump:` leaves the schema empty.
+    if let Some(named) = &named_schema.primary {
+        if let Ok((path, sql)) = named
+            && let Some(source) = read_or_ledger(vfs, path)?
+        {
+            let file = path.display().to_string();
+            let schema = if *sql {
+                ingest_structure_sql(&source, &file)
+            } else {
+                ingest_schema_with_generated_expression_dialect(&source, &file, expression_dialect)
+            };
+            if let Some(schema) = unwrap_or_record(schema)? {
+                app.schema = schema;
+            }
+        }
+    } else if vfs.exists(&schema_path) {
         if let Some(source) = read_or_ledger(vfs, &schema_path)? {
             if let Some(schema) =
                 unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &schema_path.display().to_string(), expression_dialect))?
@@ -934,10 +952,13 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     }
     app.schema.expression_dialect = expression_dialect;
     // Not its own database: the runtime opens only the primary, so solid_queue's tables join it.
+    // Only a file read and joined here drops its "not carried" warning.
+    let mut queue_joined = false;
     if solid_queue_root.is_some() && vfs.exists(&dir.join("db/queue_schema.rb")) {
         let queue_schema = dir.join("db/queue_schema.rb");
         if let Some(source) = read_or_ledger(vfs, &queue_schema)? {
             if let Some(queue) = unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &queue_schema.display().to_string(), expression_dialect))? {
+                queue_joined = true;
                 for (name, table) in queue.tables {
                     app.schema.tables.entry(name).or_insert(table);
                 }
@@ -1052,6 +1073,28 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     enum_constants.finish();
     model_bases.close_over(&base_pairs);
     model_bases.close_over_tableless();
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if !vfs.is_dir(&models_dir) {
+            continue;
+        }
+        for entry in read_rb_files(vfs, &models_dir)? {
+            let Ok(source) = vfs.read(&entry) else { continue };
+            model_bases.record_concrete(&source, &entry.display().to_string());
+        }
+    }
+    for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
+        let support_dir = dir.join(sub.as_str());
+        if !vfs.is_dir(&support_dir) {
+            continue;
+        }
+        let Ok(entries) = read_rb_files(vfs, &support_dir) else { continue };
+        for entry in entries {
+            let Ok(source) = vfs.read(&entry) else { continue };
+            model_bases.record_concrete(&source, &entry.display().to_string());
+        }
+    }
+    model_bases.close_over_concrete();
     // The `ActiveSupport.on_load` blocks `config/initializers` registers for a
     // name a model fires with `run_load_hooks` run inside that model's class
     // body, so they are read before the models (`ingest::load_hooks`), and
@@ -2236,6 +2279,8 @@ end
         let configurations = super::database_yml::database_configurations(&text, file);
         app.databases = configurations.databases;
         app.database_refusals.extend(configurations.refusals);
+        let joined = queue_joined.then_some("db/queue_schema.rb");
+        app.database_refusals.extend(named_schema.refusals(file, joined));
     }
 
     for root in &roots {
@@ -3221,6 +3266,10 @@ end
     // A module-nested `class XController < BaseController` names
     // `Ns::BaseController`; `include Avatar` inside `class User` names
     // `User::Avatar`. The passes above leave both as written.
+    for (span, err) in super::library_class::cross_file_data_rebindings(&app, &sources, &const_resolver.for_sources(&sources)) {
+        super::error_site::note(&err, span.start as usize, span.end as usize);
+        record_library_ingest_failure(&mut app, &sources[span.file.0 as usize - 1].path, &err);
+    }
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
     // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
     for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {
@@ -3302,7 +3351,7 @@ end
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
     super::forwardable::lower_forwardable(&mut app);
-    super::delegate::lower_delegates(&mut app);
+    super::delegate::lower_delegates(&mut app, &const_resolver.for_sources(&sources));
     // `Other.include(M)` written in another body: `Other`'s include,
     // before the concern splices read the includes.
     super::external_include::carry(&mut app);
@@ -3400,6 +3449,7 @@ end
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
     super::vite::lower_vite_tags(&mut app);
+    super::computed_partials::dispatch(&mut app);
     super::current_page::lower_current_page(&mut app);
     super::time_tag::lower_time_tags(&mut app);
     // The real drain, now that every pass re-ingesting synthesized
@@ -3471,6 +3521,9 @@ end
     if !late_on_load.is_empty() {
         splice_concerns_into_models_named(&mut app, &late_on_load, &concern_class_method_spans);
     }
+    // After every association splice, the late one above included: the
+    // splice rehomes a defaulted key first.
+    resolve_inverse_foreign_keys(&mut app);
     super::model_delegate::lower_model_delegates(&mut app);
     super::on_load_reopen::drain_pending(&mut app);
     // `numericality:` on an untyped attribute is decided per target
@@ -9786,18 +9839,19 @@ fn resolve_polymorphic_targets(app: &mut App) {
 /// The pass repeats so that a source association that is itself a
 /// `through:` gives its resolved class.
 /// An association's class named as Rails' `compute_type` finds it: from
-/// the model's own namespace outward (`belongs_to :job` in
-/// `SolidQueue::ClaimedExecution` is `SolidQueue::Job` when that model
-/// exists, else `Job`). Ingest names the target bare; a rooted
-/// `class_name: "::Job"` stays as written.
+/// the model's own name outward (`has_many :conditions` in `Rule` is
+/// `Rule::Condition` when that model exists; `belongs_to :job` in
+/// `SolidQueue::ClaimedExecution` is `SolidQueue::ClaimedExecution::Job`,
+/// then `SolidQueue::Job`, else `Job`), and one named for its own model
+/// (`belongs_to :article` in `Article`) the top-level class first. Ingest
+/// names the target bare; a rooted `class_name: "::Job"` names `Job`.
 fn resolve_namespaced_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
     let models: crate::det::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
         let owner = model.name.0.as_str().to_string();
-        let Some((namespace, _)) = owner.rsplit_once("::") else { continue };
         let scopes: Vec<String> = {
-            let parts: Vec<&str> = namespace.split("::").collect();
+            let parts: Vec<&str> = owner.split("::").collect();
             (1..=parts.len()).rev().map(|n| parts[..n].join("::")).collect()
         };
         for item in &mut model.body {
@@ -9810,7 +9864,13 @@ fn resolve_namespaced_targets(app: &mut App) {
                 | Association::HasAndBelongsToMany { target, .. } => target,
             };
             let written = target.0.as_str().to_string();
-            if written.starts_with("::") {
+            if let Some(top) = written.strip_prefix("::") {
+                *target = crate::ident::ClassId(crate::ident::Symbol::from(top));
+                continue;
+            }
+            // Rails' `_klass`: an association named for its own model (`belongs_to :article` in `Article`) tries
+            // the top-level class first.
+            if crate::naming::demodulize(&owner) == written && models.contains(&written) {
                 continue;
             }
             if let Some(found) = scopes.iter().map(|scope| format!("{scope}::{written}")).find(|name| models.contains(name)) {
@@ -9867,6 +9927,108 @@ fn resolve_through_targets(app: &mut App) {
             {
                 *target = resolved;
             }
+        }
+    }
+}
+
+/// A `has_many` or `has_one` with `inverse_of:` and no `foreign_key:`
+/// or `as:` takes its key from the inverse association, as Rails'
+/// `derive_foreign_key` does: `has_many :links, inverse_of:
+/// :from_comment` reads `links.from_comment_id`, not `links.comment_id`.
+/// The inverse's key is its own, not inferred from an inverse in turn
+/// (`infer_from_inverse_of: false`), so every key is read before any
+/// changes. Rails looks the inverse up on the target class and its
+/// ancestors, and raises when none declares it, once the association is
+/// used; `check` reports it at the declaration.
+fn resolve_inverse_foreign_keys(app: &mut App) {
+    use crate::dialect::{Association, ModelBodyItem};
+
+    let mut updates = Vec::new();
+    for (i, model) in app.models.iter().enumerate() {
+        for (j, item) in model.body.iter().enumerate() {
+            let ModelBodyItem::Association { assoc, .. } = item else { continue };
+            let (Association::HasMany {
+                name,
+                target,
+                foreign_key,
+                foreign_key_explicit: false,
+                as_interface: None,
+                through: None,
+                inverse_of: Some(inverse),
+                ..
+            }
+            | Association::HasOne {
+                name,
+                target,
+                foreign_key,
+                foreign_key_explicit: false,
+                as_interface: None,
+                through: None,
+                inverse_of: Some(inverse),
+                ..
+            }) = assoc
+            else {
+                continue;
+            };
+            // A later association of the same name replaces this one, as
+            // Rails keeps the last reflection: its inverse is never read.
+            let later = model.body[j + 1..]
+                .iter()
+                .chain(app.models[i + 1..].iter().filter(|m| m.name == model.name).flat_map(|m| m.body.iter()));
+            if later.into_iter().any(|later| matches!(later, ModelBodyItem::Association { assoc, .. } if assoc.name() == name)) {
+                continue;
+            }
+            // Every declaration of a class, its reopenings included, in
+            // order: the last association of that name is the one Rails keeps.
+            fn declared<'a>(
+                models: &'a [crate::dialect::Model],
+                class: &crate::ident::ClassId,
+            ) -> impl Iterator<Item = &'a crate::dialect::Model> {
+                // A rooted name (`::Citation`, a parent written `< ::Base`) is the top-level class.
+                let class = class.0.as_str().trim_start_matches("::").to_string();
+                models.iter().filter(move |m| m.name.0.as_str() == class)
+            }
+            // A target outside the app's models (a gem's) is not read here.
+            if declared(&app.models, target).next().is_none() {
+                continue;
+            }
+            let mut class = target.clone();
+            let mut found = None;
+            for _ in 0..app.models.len() {
+                found = declared(&app.models, &class).flat_map(|m| m.associations()).filter(|a| a.name() == inverse).last();
+                let parent = declared(&app.models, &class).find_map(|m| m.parent.clone());
+                match parent {
+                    Some(parent) if found.is_none() && declared(&app.models, &parent).next().is_some() => class = parent,
+                    _ => break,
+                }
+            }
+            let Some(found) = found else {
+                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                    item.span(),
+                    None,
+                    format!("{} :{name}, inverse_of: :{inverse}", if matches!(assoc, Association::HasMany { .. }) { "has_many" } else { "has_one" }),
+                    format!("`{}` declares no association `{inverse}`, so Rails raises InverseOfAssociationNotFoundError once the association is used", target.0.as_str()),
+                ));
+                continue;
+            };
+            let key = match found {
+                Association::BelongsTo { foreign_key, .. }
+                | Association::HasMany { foreign_key, .. }
+                | Association::HasOne { foreign_key, .. } => foreign_key,
+                Association::HasAndBelongsToMany { .. } => continue,
+            };
+            if key != foreign_key {
+                updates.push((i, j, key.clone()));
+            }
+        }
+    }
+    for (i, j, key) in updates {
+        if let ModelBodyItem::Association {
+            assoc: Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. },
+            ..
+        } = &mut app.models[i].body[j]
+        {
+            *foreign_key = key;
         }
     }
 }
@@ -14688,16 +14850,25 @@ fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::sch
 
 /// Use the ordinary schema readers for selection too. The normal primary schema
 /// pass remains the owner of its facts and diagnostics, including survey gaps.
-fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
-    let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
-        .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
+fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path, named: Option<&Result<(PathBuf, bool), ()>>) -> bool {
+    // A named file is read in the format it was resolved in (`.rb` alone has no extension).
+    let (path, sql) = match named {
+        Some(Ok((path, sql))) => (path.clone(), *sql),
+        Some(Err(())) => return false,
+        None => {
+            let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
+                .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
+            let sql = path.extension().is_none_or(|ext| ext != "rb");
+            (path, sql)
+        }
+    };
     let Ok(source) = vfs.read(&path) else { return false };
     let marks = (super::survey::mark(), super::prism::mark());
     let file = path.display().to_string();
-    let schema = if path.extension().is_some_and(|ext| ext == "rb") {
-        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
-    } else {
+    let schema = if sql {
         ingest_structure_sql(&source, &file)
+    } else {
+        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
     };
     let has_queue = schema.is_ok_and(|schema| schema.tables.contains_key(&Symbol::from("solid_queue_jobs")));
     super::survey::rewind(marks.0);

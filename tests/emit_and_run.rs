@@ -20861,6 +20861,24 @@ mod ipaddr_include;
 mod pp_require;
 #[path = "emit_and_run/weakref_observable.rs"]
 mod weakref_observable;
+#[path = "emit_and_run/core_exceptions.rs"]
+mod core_exceptions;
+#[path = "emit_and_run/rbconfig_config.rs"]
+mod rbconfig_config;
+#[path = "emit_and_run/process_modules.rs"]
+mod process_modules;
+#[path = "emit_and_run/network_constants.rs"]
+mod network_constants;
+#[path = "emit_and_run/logger_severity.rs"]
+mod logger_severity;
+#[path = "emit_and_run/gem_nested_core_constant.rs"]
+mod gem_nested_core_constant;
+#[path = "emit_and_run/bigdecimal_bn_classes.rs"]
+mod bigdecimal_bn_classes;
+#[path = "emit_and_run/module_reflection.rs"]
+mod module_reflection;
+#[path = "emit_and_run/gem_class_eval_mixins.rs"]
+mod gem_class_eval_mixins;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
@@ -22376,6 +22394,8 @@ mod errors_copy;
 
 #[path = "emit_and_run/errors_computed_field.rs"]
 mod errors_computed_field;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
@@ -22624,6 +22644,16 @@ mod tag_helper_singleton_include;
 mod translation_helper_test_include;
 #[path = "emit_and_run/view_url_for_hash.rs"]
 mod view_url_for_hash;
+#[path = "emit_and_run/class_side_multi_column_pluck.rs"]
+mod class_side_multi_column_pluck;
+#[path = "emit_and_run/has_many_inverse_of_foreign_key.rs"]
+mod has_many_inverse_of_foreign_key;
+#[path = "emit_and_run/errors_messages_unlowered.rs"]
+mod errors_messages_unlowered;
+#[path = "emit_and_run/belongs_to_unsaved_target_valid.rs"]
+mod belongs_to_unsaved_target_valid;
+#[path = "emit_and_run/string_starts_with_alias.rs"]
+mod string_starts_with_alias;
 #[path = "emit_and_run/duration_name_on_object.rs"]
 mod duration_name_on_object;
 #[path = "emit_and_run/update_in_argument_position.rs"]
@@ -22703,3 +22733,15 @@ mod concern_plain_includer;
 // Concern shapes: a namespaced prepend by its relative name.
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
+#[path = "emit_and_run/token_for_string_key.rs"]
+mod token_for_string_key;
+#[path = "emit_and_run/integer_times_enumerator.rs"]
+mod integer_times_enumerator;
+#[path = "emit_and_run/own_namespace_association.rs"]
+mod own_namespace_association;
+#[path = "emit_and_run/params_compact_blank.rs"]
+mod params_compact_blank;
+#[path = "emit_and_run/computed_partial_render.rs"]
+mod computed_partial_render;
+#[path = "emit_and_run/view_raise_statement.rs"]
+mod view_raise_statement;

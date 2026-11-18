@@ -283,6 +283,10 @@ pub(super) fn take_delegate_decls_from_calls(
     out
 }
 
+pub(super) fn declares_query_override(call: &Expr) -> bool {
+    parse_declaration(call).is_some_and(|declaration| declaration.names.iter().any(|method| matches!(generated_name(method.as_str(), &declaration.prefix, declaration.target.as_str()).as_str(), "nil?" | "respond_to?")))
+}
+
 fn parse_declaration(call: &Expr) -> Option<ParsedDeclaration> {
     let ExprNode::Send {
         recv: None,
