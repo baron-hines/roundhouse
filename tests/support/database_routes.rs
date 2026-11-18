@@ -244,6 +244,7 @@ pub fn shards_report() -> String {
             sleep(0.01)
             waited += 1
           end
+          raise "shard scopes did not overlap" if lock.synchronize {{ inside.length }} < 2
           tag = Note.find(1).tag
           lock.synchronize {{ seen << "#{{shard}}:#{{tag}}:#{{ApplicationRecord.current_shard}}" }}
         end
