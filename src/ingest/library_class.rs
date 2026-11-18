@@ -411,6 +411,11 @@ fn ingest_library_classes_impl(
     if file_level && let Some(program) = root.as_program_node() {
         let (mut data_constants, mut admitted_data_values) = (HashSet::default(), HashMap::<String, u32>::default());
         for statement in program.statements().body().iter() {
+            let written = statement.as_constant_write_node().map(|write| constant_id_str(&write.name()).to_string())
+                .or_else(|| statement.as_constant_path_write_node().and_then(|write| static_constant_path(&write.target().as_node())).map(|path| path.join("::")));
+            if let Some(name) = written.filter(|name| made.iter().any(|(_, class)| class.data_define().is_some() && class.name.0.as_str() == name.as_str())) {
+                return Err(super::error_site::at(IngestError::Unsupported { file: file.into(), message: format!("reassignment of Data.define constant `{name}` is not modeled") }, &statement));
+            }
             if let Some(mut class) = file_data_class(&statement, file)
                 .map_err(|err| super::error_site::at(err, &statement))?
             {

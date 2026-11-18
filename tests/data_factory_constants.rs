@@ -1305,13 +1305,13 @@ fn unsupported_file_level_data_blocks_keep_source_located_refusals() {
 #[test]
 fn file_level_data_replacements_are_refused() {
     let record = "Artifact = Data.define(:digest) do; def label = digest; end";
-    for source in [
-        format!("class Artifact; def extra = 1; end\n{record}"),
-        format!("{record}\nArtifact = Data.define(:size)"),
+    for (source, expected) in [
+        (format!("class Artifact; def extra = 1; end\n{record}"), "same class"),
+        (format!("{record}\nArtifact = Data.define(:size)"), "reassignment of Data.define constant `Artifact`"),
     ] {
         let error = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "lib/artifact.rb")
             .expect_err("a replacement must not merge unrelated bodies");
-        assert!(format!("{error:?}").contains("same class"), "{error:?}");
+        assert!(format!("{error:?}").contains(expected), "{error:?}");
     }
 }
 

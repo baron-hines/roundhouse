@@ -327,3 +327,30 @@ fn replayed_visibility_keeps_the_data_method_it_observes() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "[2, true]\n", "{marker}");
     }
 }
+
+#[test]
+fn a_reassigned_data_factory_constant_stays_refused() {
+    let source = "A = Data.define(:x)\nA = 7\nB = Data.define(:x)\nB::VALUE = A\n";
+    let (_, errors) = contract::app(source).emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant")), "{errors:?}");
+}
+
+#[test]
+fn data_factory_reassignment_neighbors_keep_their_boundaries() {
+    let (_, errors) = contract::app("A = Data.define(:x)\n::A = 7\n").emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant")), "{errors:?}");
+    let (_, errors) = contract::app("A = Data.define(:x)\nA ||= 7\n").emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|error| error.contains("file-level statements beside Data.define")), "{errors:?}");
+    for (source, observe, expected) in [
+        ("A = 7\nA = Data.define(:x)\n", "p A.new(2).x\n", "2\n"),
+        ("module Outer\n A = Data.define(:x)\n A = 7\nend\n", "p Outer::A\n", "7\n"),
+        ("module Outer\n A = Data.define(:x)\n A ||= 7\nend\n", "p Outer::A.members\n", "[:x]\n"),
+    ] {
+        let (tree, errors) = contract::app(source).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.is_empty(), "{source}: {errors:?}");
+        std::fs::write(tree.join("driver.rb"), format!("require_relative 'app/models'\n{observe}")).unwrap();
+        let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{source}");
+    }
+}
