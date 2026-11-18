@@ -984,6 +984,20 @@ class Routing(unittest.TestCase):
         self.assertNotIn("spinel-framework", plan["jobs"])
         self.assertNotIn("postgresql_spinel_target", ci.SPINEL_TESTS)
 
+    def test_postgresql_array_column_inputs_select_the_pg_gate(self):
+        # tests/spinel_pg_db.rs compiles a test of stored array columns on
+        # PostgreSQL through the PostgreSQL codec.
+        for path in [
+            "runtime/spinel/array_column_pg.rb",
+            "runtime/spinel/array_column.rbs",
+            "src/lower/array_columns.rs",
+            "tests/support/array_widgets.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("spinel-framework", plan["jobs"])
+                self.assertIn("spinel_pg_db", plan["spinel_tests"])
+
     def test_param_binds_owns_lowering_drivers_and_database_runtime(self):
         for path in [
             "src/lower/arel/visitor.rs",

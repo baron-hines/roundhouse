@@ -152,6 +152,16 @@ pub(super) fn collect(
                 // also apply to singleton methods.
                 visibility.apply(&statement, &mut method);
                 methods.push(method);
+            } else if let Some(target) = statement.as_call_node().and_then(|call| delegate_missing_target(&call)) {
+                // Rails' `delegate_missing_to :target` (active_support/core_ext/module/delegation.rb): the two
+                // methods it defines. The target read through `self`, not bare: a target named `block` or `args`
+                // would read the method's own parameter.
+                let source = format!(
+                    "class {id}\n  def respond_to_missing?(name, include_private = false)\n    self.{target}.respond_to?(name, include_private) || super\n  end\n\n  def method_missing(method, *args, &block)\n    if self.{target}.respond_to?(method)\n      self.{target}.public_send(method, *args, &block)\n    else\n      super\n    end\n  end\nend\n",
+                    id = id.0.as_str(),
+                );
+                let classes = super::library_class::ingest_library_classes(source.as_bytes(), file)?;
+                methods.extend(classes.into_iter().flat_map(|c| c.methods));
             } else if !statement.as_call_node().is_some_and(|call| {
                 visibility::marker(&call)
                     && call.receiver().is_none()
@@ -183,4 +193,15 @@ pub(super) fn collect(
         });
     }
     Ok(factories)
+}
+
+/// `delegate_missing_to :account`: a literal Symbol target and nothing else (no `allow_nil:`).
+fn delegate_missing_target(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    if call.receiver().is_some() || call.block().is_some() || constant_id_str(&call.name()) != "delegate_missing_to" {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let name = String::from_utf8_lossy(arg.as_symbol_node()?.unescaped()).into_owned();
+    (name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.is_empty()).then_some(name)
 }

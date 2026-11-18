@@ -290,6 +290,16 @@ PG_APP_INPUTS = {
     "runtime/spinel/test/test_helper.rb",
     "tests/support/emit_and_run.rs",
 }
+# Inputs of the array column gate in tests/spinel_pg_db.rs, which compiles
+# a test of stored array columns on PostgreSQL: the PostgreSQL codec the
+# tree ships as runtime/array_column.rb, its signatures, the storage pass,
+# and the widgets app the gate shares with tests/postgresql_array_columns.rs.
+PG_ARRAY_INPUTS = {
+    "runtime/spinel/array_column_pg.rb",
+    "runtime/spinel/array_column.rbs",
+    "src/lower/array_columns.rs",
+    "tests/support/array_widgets.rs",
+}
 # The Db contract suite (tests/support/db_contract.rs): the Spinel lanes
 # each of its files feeds, and the runtime files its LANES copy beside a
 # shim that nothing above routes to them. cruby_prelude.rb feeds only the
@@ -421,13 +431,60 @@ PROJECT_BUILDERS = {
 # Focus mode is NARROW: BASE + selected focus lanes only.
 CI_FULL = "ci:full"
 CI_SPINEL = "ci:spinel"
+# Not every plan: a gem's own Spinel suite pins that gem's source, not the
+# shared pipeline, and the slowest of them outran the shards' deadlines (#2219).
+# Full validation runs them, and so does a PR labelled `ci:gems`.
+CI_GEMS = "ci:gems"
+GEM_SPINEL_TESTS = {
+    "solid_queue_durability",
+    "pundit_source_spinel",
+    "acts_as_tenant_spinel",
+    "open_telemetry_stub_spinel",
+    "jbuilder_dynamic_partial_spinel",
+    "jbuilder_extract_attributes_spinel",
+    "jbuilder_merge_attributes_override_spinel",
+    "jbuilder_array_value_spinel",
+}
+GEM_TOOLCHAIN_PREFIXES = (
+    "view_component::",
+    "addressable::",
+    "aasm::",
+    "solid_queue_clear::",
+    "haml_class_shortcut_merge_native::",
+    "active_model_serializer::",
+    "representable::",
+    "dry_initializer_",
+    "dry_struct_",
+    "dry_validation_",
+    "dry_monads_",
+    "oj_under_mimic_json_",
+)
+
+
+def is_gem_toolchain_test(name):
+    return name.startswith(GEM_TOOLCHAIN_PREFIXES)
+
+
+def apply_gem_suites(plan, gems):
+    plan["spinel_gems"] = bool(gems)
+    if gems:
+        return
+    kept = [t for t in plan["spinel_tests"] if t not in GEM_SPINEL_TESTS]
+    if len(kept) != len(plan["spinel_tests"]):
+        plan["reasons"].append(f"gem Spinel suites left to Full validation and {CI_GEMS}")
+        # (not an empty shard: the framework loop fails on no suites, as on a plan that lost them)
+        if not kept:
+            for key in ("jobs", "required", "advisory"):
+                if key in plan:
+                    plan[key] = [j for j in plan[key] if j != "spinel-framework"]
+    plan["spinel_tests"] = kept
 CI_JRUBY = "ci:jruby"
 CI_EXTRAS = "ci:extras"
 CI_FOCUS_BY_LABEL = {f"ci:{t}": t for t in EXTRA_COMPARE_TARGETS}
 CI_COMPARE_BY_LABEL = {f"ci:{t}": t for t in COMPARE_TARGETS}
 
 CoverageLabels = namedtuple(
-    "CoverageLabels", "full focus_spinel focus_jruby focus_extras focus_compare"
+    "CoverageLabels", "full focus_spinel focus_jruby focus_extras focus_compare gems"
 )
 
 
@@ -467,10 +524,11 @@ def parse_coverage_labels(names, *, env_full=False):
     )
     return CoverageLabels(
         full=full,
-        focus_spinel=CI_SPINEL in labels,
+        focus_spinel=CI_SPINEL in labels or CI_GEMS in labels,
         focus_jruby=CI_JRUBY in labels,
         focus_extras=focus_extras,
         focus_compare=focus_compare,
+        gems=CI_GEMS in labels,
     )
 
 
@@ -721,7 +779,7 @@ def native_coverage(path):
         "src/lower/view_instrumentation.rs",
     }:
         suites.update(("spinel_active_support_instrumentation", "spinel_mini_profiler"))
-    if path in PG_DB_INPUTS or path in PG_APP_INPUTS:
+    if path in PG_DB_INPUTS or path in PG_APP_INPUTS or path in PG_ARRAY_INPUTS:
         suites.add("spinel_pg_db")
     suites.update(DB_CONTRACT_INPUTS.get(path, ()))
     if path in {
@@ -1090,7 +1148,7 @@ def select(
         if not full:
             raise ValueError("publication requires full validation mode")
         jobs.append("assemble-site")
-    return finish(
+    plan = finish(
         jobs,
         extra,
         floor_smoke,
@@ -1103,6 +1161,9 @@ def select(
         smoke_extra=extra_smoke,
         compare=compare,
     )
+    # (a shared code-generation path promotes the plan to full here, past the caller's labels)
+    plan["full"] = full
+    return plan
 
 
 def positive_seconds(value):
@@ -1619,7 +1680,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["plan", "gate", "compact-gate", "toolchain-shard", "timed", "cpu-of", "run-tests", "merge-timings"],
+        choices=["plan", "gate", "compact-gate", "toolchain-shard", "toolchain-tests", "timed", "cpu-of", "run-tests", "merge-timings"],
     )
     parser.add_argument("--shard", type=int)
     parser.add_argument("--units")
@@ -1640,6 +1701,12 @@ def main():
         units = json.loads(Path(args.units).read_text()) if args.units and Path(args.units).is_file() else None
         for test in spinel_toolchain_shard(tests, args.shard, timings=spinel_timings_from_env(), units=units):
             print(test)
+        return False
+    if args.command == "toolchain-tests":
+        gems = os.environ.get("CI_SPINEL_GEMS") == "true"
+        for line in sys.stdin:
+            if line.strip() and (gems or not is_gem_toolchain_test(line.strip())):
+                print(line.strip())
         return False
     if args.command == "timed":
         # The command's own status: the framework loop tells timeout(1)'s 124 from a failure.
@@ -1753,6 +1820,7 @@ def main():
         plan["reasons"].append(reason)
     if marker is not None and not coverage.full:
         plan["reasons"].append(f"{CI_FULL_MARKER} in commit {marker[:12]}".rstrip())
+    apply_gem_suites(plan, full or plan.get("full", False) or coverage.gems)
     timings = spinel_timings_from_env()
     plan["spinel_framework_shards"] = spinel_framework_shards(plan["spinel_tests"] or [], timings=timings)
     if not any(timings.values()):
@@ -1778,6 +1846,7 @@ def main():
             "extra-compare": plan["extra_compare"],
             "compare": plan["compare"],
             "spinel-tests": plan["spinel_tests"],
+            "spinel-gems": plan["spinel_gems"],
             "spinel-framework-shards": plan["spinel_framework_shards"],
             # Not the two wall kinds alone: each toolchain shard plans from this, on its CPU seconds where recorded.
             "spinel-timings": {

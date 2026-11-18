@@ -52,7 +52,10 @@ fn through_chain_custom_key(
     assoc: &Association,
     depth: usize,
 ) -> Option<String> {
-    let Association::HasMany { through: Some(thr_name), .. } = assoc else { return None };
+    let (Association::HasMany { through: Some(thr_name), .. } | Association::HasOne { through: Some(thr_name), .. }) = assoc
+    else {
+        return None;
+    };
     // The same depth `resolve_through_chain` gives up at. Running out
     // is "cannot prove no hop is keyed", which is refused rather than
     // read as "none is": past this point the direct reader stays.
@@ -63,11 +66,17 @@ fn through_chain_custom_key(
             model.name.0
         ));
     }
-    let hop = model.associations().find(|a| a.name() == thr_name)?;
+    // A later declaration of the name replaces an earlier one, as the
+    // through reader reads it.
+    let hop = model.associations().filter(|a| a.name() == thr_name).last()?;
     if let Some(k) = custom_primary_key(hop) {
         return Some(format!("`{}#{}` declares `primary_key: :{}`", model.name.0, thr_name, k));
     }
-    let Association::HasMany { target: thr_target, through, .. } = hop else { return None };
+    let (thr_target, through) = match hop {
+        Association::HasMany { target, through, .. } | Association::HasOne { target, through, .. } => (target, through),
+        Association::BelongsTo { target, polymorphic: false, .. } => (target, &None),
+        _ => return None,
+    };
     if through.is_some() {
         if let Some(found) = through_chain_custom_key(models, model, hop, depth + 1) {
             return Some(found);
@@ -76,12 +85,16 @@ fn through_chain_custom_key(
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
     let src = thr_model.through_source(assoc)?;
     match src {
-        Association::HasMany { through: None, .. } | Association::HasOne { .. } => {
+        // A belongs_to source's target column too: the join reads the
+        // target's `id` (a polymorphic one's join names its key).
+        Association::HasMany { through: None, .. }
+        | Association::HasOne { through: None, .. }
+        | Association::BelongsTo { polymorphic: false, .. } => {
             custom_primary_key(src).map(|k| {
                 format!("`{}#{}` declares `primary_key: :{}`", thr_model.name.0, src.name(), k)
             })
         }
-        Association::HasMany { through: Some(_), .. } => {
+        Association::HasMany { through: Some(_), .. } | Association::HasOne { through: Some(_), .. } => {
             through_chain_custom_key(models, thr_model, src, depth + 1)
         }
         _ => None,
@@ -105,11 +118,13 @@ pub(crate) fn unsupported_reason(
                     .map(|hop| format!("a `through:` hop keyed on a non-id column ({hop})"))
             }
         }
-        // Ingest carries `through:` on a has_one, but the reader is
-        // still the direct `Target.where(fk: owner_key).first`, which a
-        // keyed has_one :through would silently answer wrongly.
-        Association::HasOne { through: Some(_), .. } => custom_primary_key(assoc)
-            .map(|k| format!("`primary_key: :{k}` on a `has_one … through:` association")),
+        // The through reader joins on `id` at every hop, as the
+        // has_many one does.
+        Association::HasOne { through: Some(_), .. } => match custom_primary_key(assoc) {
+            Some(k) => Some(format!("`primary_key: :{k}` on a `has_one … through:` association")),
+            None => through_chain_custom_key(models, model, assoc, 0)
+                .map(|hop| format!("a `through:` hop keyed on a non-id column ({hop})")),
+        },
         _ => None,
     }
 }

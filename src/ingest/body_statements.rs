@@ -31,6 +31,12 @@
 //! classes is to a class method the app defines there: nothing it runs
 //! is a framework macro the runtime does not define, which would raise
 //! as the class loads. The rest stay dropped and reported by name.
+//!
+//! A call on a constant the body assigns (`SWATCHES.push(Swatch.new("teal"))`,
+//! `NAMES << "x"`), without a block and with arguments held to the same
+//! rule, is plain Ruby every Ruby-family tree runs, Spinel's too: it is
+//! marked [`crate::expr::CONSTANT_STATEMENT`] instead, and written back
+//! among the constants, in source order.
 
 use crate::det::HashSet;
 
@@ -160,7 +166,31 @@ pub(super) fn mark(app: &mut App) {
             let check = Check { owner: &name, index: &index, constants: &constants, alias_copies: &alias_copies, singleton };
             if check.statement(expr) {
                 expr.decisions |= crate::expr::BODY_STATEMENT;
+            } else if !singleton && check.constant_call(expr) {
+                expr.decisions |= crate::expr::CONSTANT_STATEMENT;
             }
+        }
+    }
+}
+
+/// Every local `expr` reads is a parameter of a block inside it
+/// (`%w[a b].map { |n| Swatch.new(n) }`): the call is written back alone,
+/// without the body's other locals (`color = "teal"` above it).
+fn binds_its_locals(expr: &Expr, bound: &mut Vec<String>) -> bool {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => name.as_str().starts_with('$') || bound.iter().any(|b| b == name.as_str()),
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
+            let depth = bound.len();
+            bound.extend(params.iter().chain(rest_param).chain(block_param).map(|p| p.as_str().to_string()));
+            bound.extend(extra_params.iter().map(|p| p.name.as_str().to_string()));
+            let ok = binds_its_locals(body, bound);
+            bound.truncate(depth);
+            ok
+        }
+        _ => {
+            let mut ok = true;
+            expr.node.for_each_child(&mut |child| ok = ok && binds_its_locals(child, bound));
+            ok
         }
     }
 }
@@ -337,6 +367,15 @@ impl Check<'_> {
         }
     }
 
+    /// `SWATCHES.push(Swatch.new("teal"))`: a block-free call on a constant
+    /// this body assigns, whose arguments make only answered calls.
+    fn constant_call(&self, expr: &Expr) -> bool {
+        let ExprNode::Send { recv: Some(r), args, block: None, .. } = &*expr.node else { return false };
+        matches!(&*r.node, ExprNode::Const { .. })
+            && self.inert(r)
+            && args.iter().all(|a| self.walk(a) && binds_its_locals(a, &mut Vec::new()))
+    }
+
     /// A literal, a constant of this body, or a core collection method
     /// on one (`%w[a b].each_with_index`).
     fn inert(&self, expr: &Expr) -> bool {
@@ -369,8 +408,32 @@ impl Check<'_> {
                         ExprNode::Const { path } => {
                             let named: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
                             let name = named.join("::");
-                            if self.index.class_side.contains_key(&name) {
-                                self.index.defines(&name, method.as_str())
+                            // `Swatch` in `Palette` is `Palette::Swatch` when the app has one, as
+                            // Ruby looks it up first. Only when the name is that one class
+                            // alone: the call is written back with the bare name, and the
+                            // emitted body requires its own nested classes and top-level ones,
+                            // so a namespace further out (`Catalog::Swatch` from
+                            // `Catalog::Palette`), or both a nested and a top-level `Swatch`
+                            // (the require could load the other first), is refused.
+                            let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
+                            let mut candidates = self.owner.split("::").scan(String::new(), |prefix, part| {
+                                prefix.push_str(part);
+                                let candidate = format!("{prefix}::{name}");
+                                prefix.push_str("::");
+                                Some(candidate)
+                            }).chain(std::iter::once(name.clone())).filter(|c| self.index.class_side.contains_key(c));
+                            let class = if absolute {
+                                self.index.class_side.contains_key(&name).then_some(name)
+                            } else {
+                                match (candidates.next(), candidates.next()) {
+                                    (Some(only), None) if only == format!("{}::{name}", self.owner) || only == name => Some(only),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(class) = class {
+                                // `new` on one of the app's classes (not a module): every class answers it.
+                                self.index.defines(&class, method.as_str())
+                                    || (method.as_str() == "new" && self.index.parents.contains_key(&class))
                             } else {
                                 // A constant of this body (`WRITERS.each`).
                                 self.inert(r)

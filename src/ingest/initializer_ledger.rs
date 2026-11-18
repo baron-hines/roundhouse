@@ -159,6 +159,9 @@ struct Probe<'a> {
     src: &'a str,
     /// `config.autoload_lib(ignore: …)` directories, before any filtering.
     lib_ignores: &'a [String],
+    /// The file, as it is named for spans and for the passes that answer a
+    /// statement by its place in it.
+    path: &'a str,
 }
 
 /// One existing recognizer, how to ask it about a single statement, and
@@ -433,6 +436,12 @@ const RECOGNIZERS: &[Recognizer] = &[
                 l == "Oj.mimic_JSON" || l.starts_with("Oj.mimic_JSON(") || l == "Oj.optimize_rails"
             })
         },
+    },
+    Recognizer {
+        name: "load_hooks (ActiveSupport.on_load(:name) a model's run_load_hooks(:name, self) runs as its class body)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| super::load_hooks::spliced(p.path, p.node).is_some(),
     },
     Recognizer {
         name: "content_security_policy (config.content_security_policy do |policy|)",
@@ -762,7 +771,7 @@ fn is_not_a_statement(node: &Node<'_>) -> bool {
 }
 
 /// Judge one host statement against the recognizer table.
-fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str) -> Verdict {
+fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str, path: &str) -> Verdict {
     if is_not_a_statement(&st.node) {
         return Verdict::NotAStatement;
     }
@@ -771,6 +780,7 @@ fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str) -> Ve
         node: &st.node,
         src,
         lib_ignores,
+        path,
     };
     if st.level == Level::Inflections {
         // Re-ingesting the statement goes through `ingest_expr`, which in
@@ -951,7 +961,7 @@ fn judge_all(
                 Verdict::Unconsumed
             }
         } else {
-            judge(origin, &st, lib_ignores, src)
+            judge(origin, &st, lib_ignores, src, path)
         };
         if verdict == Verdict::Unconsumed {
             // `Const.configure do |c| … end` is a container: nothing reads

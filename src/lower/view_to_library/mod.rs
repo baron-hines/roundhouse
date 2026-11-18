@@ -1438,6 +1438,19 @@ pub fn insert_db_stub(
         Symbol::from("_unscoped_tables"),
         fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
     );
+    // The relations whose `scoping { }` block runs on this thread
+    // (relation.rb's `Relation.current_scope_for`): nil until the first
+    // push, which answers the list it pushed onto.
+    let relation = Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Relation")), args: vec![].into() };
+    let scopes = Ty::Array { elem: std::sync::Arc::new(relation.clone()) };
+    db_info.class_methods.insert(
+        Symbol::from("_current_scopes"),
+        fn_sig(vec![], Ty::Union { variants: vec![scopes.clone(), Ty::Nil].into() }),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("_push_current_scope"),
+        fn_sig(vec![(Symbol::from("scope"), relation)], scopes),
+    );
     classes.insert(ClassId(Symbol::from("Db")), db_info);
 
     // MessageDigest — the keyed-digest primitive surface, same

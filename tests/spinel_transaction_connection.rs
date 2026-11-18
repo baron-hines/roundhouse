@@ -325,7 +325,8 @@ fn exec_reserves_the_connection_before_running_a_bare_begin() {
     let begin_branch_start =
         exec_body.find("sql == \"BEGIN\"").expect("db.rb's Db.exec no longer special-cases a bare BEGIN");
     let branch = &exec_body[begin_branch_start..];
-    let reserve_pos = branch.find("@pools[0].reserve(0)").expect("the BEGIN branch no longer reserves the connection");
+    // The pool is the slot's the thread is on (one slot for an app on one database).
+    let reserve_pos = branch.find("slot.pools[0].reserve(0)").expect("the BEGIN branch no longer reserves the connection");
     let write_pos = branch.find("write(conn, sql, false)").expect("the BEGIN branch no longer writes the statement");
     assert!(
         reserve_pos < write_pos,

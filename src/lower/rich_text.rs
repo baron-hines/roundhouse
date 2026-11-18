@@ -147,10 +147,11 @@ pub fn synthesize_record_model(app: &mut App) {
     // `belongs_to :record, polymorphic: true` is declared (rather than
     // written out) because the has_one side is what needed the scope.
     //
-    // `polymorphic_targets` stays empty on purpose: it is filled by
-    // `resolve_polymorphic_targets` from the inverse `as:` declarations,
-    // and no model declares `has_one … as: :record` in source — the
-    // owner side is this file's own expansion. With an empty implementor
+    // `polymorphic_targets` stays empty on purpose: this record is
+    // synthesized after `resolve_polymorphic_targets` has filled every
+    // app model's sets (from inverse `as:` declarations, else any
+    // model), and no model declares `has_one … as: :record` in source —
+    // the owner side is this file's own expansion. With an empty implementor
     // set, association lowering skips both the type-switched reader and
     // the monomorphic `Record.find_by` fallback (which would NameError),
     // so `rich_text.record` stays un-synthesized and typed gradual —
@@ -161,6 +162,7 @@ pub fn synthesize_record_model(app: &mut App) {
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),
+            foreign_key_explicit: false,
             optional: false,
             polymorphic: true,
             polymorphic_targets: Vec::new(),

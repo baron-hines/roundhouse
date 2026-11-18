@@ -854,6 +854,12 @@ module ActiveRecord
       @destroyed = false
     end
 
+    # Seat this record on `records`, loaded by a relation built off its
+    # has_many `name`, through that association's inverse. A model whose
+    # has_many has one answers it (generated); any other seats nothing.
+    def _set_inverse_from_queries(name, records)
+    end
+
     # ---- Class-level CRUD -------------------------------------------
 
     def self.all
@@ -1233,6 +1239,12 @@ module ActiveRecord
 
     def restore_attribute!(name)
       nil
+    end
+
+    # Rails' `restore_attributes`: every pending change written back, the
+    # names it restored. None here, for the same reason.
+    def restore_attributes
+      changes_to_save.keys
     end
 
     # `id` never appears in the subclass `attributes` hash, so the
