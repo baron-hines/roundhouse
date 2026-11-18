@@ -5406,22 +5406,24 @@ impl ModelBases {
 pub type BasePair = (String, String, Vec<String>);
 
 /// The modules a bare superclass name is looked up through, innermost
-/// first. Ruby reads it where the `class` line is written: a rooted
-/// `class ::Entry < Record` names no scope, so its lexical nesting
-/// alone, and a class whose name is under a rooted module (`module
-/// ::Export` in `module Ledger`) looks through its scope, then the
-/// nesting around the rooted module (`Ledger`).
+/// first: none for a rooted superclass (`< ::Record`), which names the
+/// top level. A class with no rooted declaration around it looks through
+/// its scope, longest first, as it always has here (`class Admin::User <
+/// Base` finds `Admin::Base`). Under a rooted declaration (`class
+/// ::Entry`, or `module ::Export::Inner` in `module Ledger`), Ruby reads
+/// the name where the `class` line is written: its lexical nesting
+/// alone (`[Export::Inner, Ledger]`, without `Export`). A rooted
+/// declaration is there exactly when the nesting names a module the
+/// scope doesn't.
 pub(super) fn superclass_enclosing(scope: &[String], nesting: &[String], class: &ruby_prism::ClassNode<'_>) -> Vec<String> {
-    if super::util::is_rooted(&class.constant_path()) {
+    if class.superclass().is_some_and(|node| node.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p))) {
+        return Vec::new();
+    }
+    let prefixes: Vec<String> = (1..=scope.len()).rev().map(|n| scope[..n].join("::")).collect();
+    if super::util::is_rooted(&class.constant_path()) || nesting.iter().any(|outer| !prefixes.contains(outer)) {
         return nesting.to_vec();
     }
-    let mut out: Vec<String> = (1..=scope.len()).rev().map(|n| scope[..n].join("::")).collect();
-    for outer in nesting {
-        if !out.contains(outer) {
-            out.push(outer.clone());
-        }
-    }
-    out
+    prefixes
 }
 
 /// The modules a class's superclass is looked up through: none for
