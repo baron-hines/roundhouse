@@ -22,10 +22,11 @@ require "vips"
 if !defined?(VipsExt)
   module VipsExt
     extend FFI::Library
-    # The libraries ruby-vips' FFI.library_name("vips", 42) opens on Linux,
-    # macOS and Windows, as literals Spinel folds at compile time. The ffi
-    # gem loads the first that opens; plain "vips" is the last resort.
-    ffi_lib ["libvips.so.42", "libvips.42.dylib", "libvips-42.dll", "vips"]
+    # What ruby-vips' FFI.library_name("vips", 42) gives on Linux, macOS
+    # and Windows, each ahead of the file name ffi maps it to, as literals
+    # Spinel folds at compile time. The ffi gem loads the first that
+    # opens; plain "vips" is the last resort.
+    ffi_lib ["vips.so.42", "libvips.so.42", "vips.42", "libvips.42.dylib", "libvips-42.dll", "vips"]
     attach_function :sp_vips_find_load, :vips_foreign_find_load, [:string], :string
     attach_function :sp_vips_find_load_buffer, :vips_foreign_find_load_buffer, [:pointer, :size_t], :string
   end
