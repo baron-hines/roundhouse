@@ -22737,5 +22737,15 @@ mod concern_prepended_namespaced;
 // A module defining `method_missing`: its receiverless reads are the includer's.
 #[path = "emit_and_run/module_method_missing_includer.rs"]
 mod module_method_missing_includer;
+#[path = "emit_and_run/token_for_string_key.rs"]
+mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;
+#[path = "emit_and_run/own_namespace_association.rs"]
+mod own_namespace_association;
+#[path = "emit_and_run/params_compact_blank.rs"]
+mod params_compact_blank;
+#[path = "emit_and_run/computed_partial_render.rs"]
+mod computed_partial_render;
+#[path = "emit_and_run/view_raise_statement.rs"]
+mod view_raise_statement;

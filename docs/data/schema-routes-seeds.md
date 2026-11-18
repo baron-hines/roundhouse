@@ -295,6 +295,42 @@ leaves that configuration out with a warning, and a control tag leaves
 them all out. `DATABASE_URL` is not read. The primary's SQLite
 `pragmas:` are read from the same file (`App::database_pragmas`).
 
+The test environment's primary may name its schema file with
+`schema_dump:` (`database_yml::named_schema`). One form is read: a plain
+or quoted YAML string, written directly in that configuration, naming a
+relative `.rb` file under `db/`, read in place of `db/schema.rb`, or a
+`.sql` file when the configuration says `schema_format: sql` itself. The
+guards are conservative: a `.rb` name is refused when a `schema_format`
+other than a direct literal `ruby` is written there, or, when the
+configuration sets no `schema_format` of its own, when any Ruby file under
+`config/` mentions `schema_format` (a literal one in the configuration
+wins over the application's, as in Rails). A name is also refused when
+any Ruby file under `config/` mentions `.paths`, `paths[`, `paths.add` or `db_dir`
+(comments included; `config.assets.paths` aside), or when a directory under `config/`
+can't be listed or a file there can't be read, or when the
+configuration's `url:` is
+computed, not a string, written under more than one spelling (`:url`,
+quoted, any case), or names `schema_dump` or `schema_format` in its
+query, or when the file runs any ERB control flow (`<% ... %>`), or when a
+merge key (`<<:`) comes after other keys in that configuration or merges
+configurations into the test environment, since Rails' YAML applies a
+merge where it is written, or when the file has a root-level merge or a
+top-level `shared:` block, which Rails applies to the test configuration.
+`false`, null or an unquoted YAML 1.1
+boolean names no file, and the schema is found as before. Any other
+`schema_dump:` there (ERB, an anchor, alias, merge or flow value, the
+`:schema_dump:` key, another name, a missing file) is an error naming
+the configuration and the setting. Another test database whose schema
+file exists is a warning, except a replica (`replica: true`), one with
+`database_tasks: false`, and solid_queue's `db/queue_schema.rb` once its
+tables have joined the primary's; no warning doesn't mean no such file.
+The file named is the one its `schema_dump` names, else the default its
+literal `schema_format` names. A file the parser can't settle (it doesn't
+parse once its ERB is set aside, a merge key doesn't merge a mapping, or
+the test environment's key may be computed) refuses a named file when the
+word `schema_dump` appears on any line but a comment line, and otherwise
+builds as before.
+
 Which database a model runs on is read from source, never from the
 file: a literal `connects_to database: { writing:, reading: }` in an
 abstract class, inherited by its subclasses (`App::model_databases`).
