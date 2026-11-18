@@ -7833,7 +7833,7 @@ fn apply_database_routes(files: &mut [(String, String)], app: &App) {
     for env in envs {
         let config = |name: &str| app.databases.iter().find(|d| d.env == env && d.name == name);
         let primary_is_sqlite = app.databases.iter().any(|d| d.env == env && d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3);
-        let opens = |(_, role, name): &(String, String, String)| config(name).is_some_and(|d| d.routable(role == "writing"));
+        let opens = |(_, role, name): &(String, String, String)| config(name).is_some_and(|d| d.routable(role == "writing", &routes.schema_file));
         if !primary_is_sqlite || !routes.routes.iter().all(opens) {
             continue;
         }

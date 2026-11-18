@@ -122,9 +122,12 @@ impl Database {
     /// the pool of a role: a SQLite file named literally, and for the
     /// writing role the primary or one that names the app's own schema
     /// file (Rails' default for another database is a file of its own).
-    pub fn routable(&self, writing: bool) -> bool {
+    pub fn routable(&self, writing: bool, schema: &str) -> bool {
         let file = self.database.as_deref().is_some_and(|f| !f.is_empty() && f != ":memory:" && !f.starts_with("file:"));
-        let own_tables = !self.replica && self.database_tasks && (self.primary || self.schema_dump.as_deref() == Some("schema.rb"));
+        let shared_schema = self.schema_dump.as_ref().is_some_and(|name| {
+            std::path::Path::new("db").join(name) == std::path::Path::new(schema)
+        });
+        let own_tables = !self.replica && self.database_tasks && (self.primary || shared_schema);
         // Not a replica primary: its pool is the one `Db.configure` opened, which carries no replica flag.
         self.adapter == DatabaseAdapter::Sqlite3 && file && (!writing || own_tables) && !(self.primary && self.replica)
     }
@@ -140,6 +143,8 @@ pub struct DatabaseRoutes {
     /// Its default shard: the first `shards:` names, `default` for
     /// `database:`.
     pub default_shard: String,
+    /// The loaded Ruby schema, relative to the app root.
+    pub schema_file: String,
     /// `(shard, role, configuration name)`, in declaration order.
     pub routes: Vec<(String, String, String)>,
 }

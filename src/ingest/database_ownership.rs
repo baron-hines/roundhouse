@@ -334,8 +334,9 @@ fn admitted_routes(
     own: &[Option<Own>],
     deciding: &[Option<usize>],
     environment: &[&Database],
-    schema_rb: bool,
+    schema_rb: Option<&str>,
 ) -> Option<(DatabaseRoutes, Span)> {
+    let schema_rb = schema_rb?;
     let mut declared = own.iter().enumerate().filter_map(|(j, own)| own.as_ref().map(|own| (j, own)));
     let (j, declaration) = declared.next()?;
     let owner = &app.models[j];
@@ -346,7 +347,7 @@ fn admitted_routes(
         m.body.iter().any(|item| matches!(item, ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "primary_abstract_class")))
     };
     let primary = (owner.name.0.as_str() == "ApplicationRecord" || names_primary(owner)) && app.models.iter().filter(|m| names_primary(m)).count() <= usize::from(names_primary(owner));
-    if declared.next().is_some() || !under_base || !primary || !schema_rb || deciding.iter().any(|d| *d != Some(j)) {
+    if declared.next().is_some() || !under_base || !primary || deciding.iter().any(|d| *d != Some(j)) {
         return None;
     }
     let (pools, span) = match declaration {
@@ -363,7 +364,7 @@ fn admitted_routes(
             let Some(name) = name else { continue };
             for env in &envs {
                 let database = environment.iter().find(|d| d.env == *env && d.name == *name)?;
-                if !database.routable(role == "writing") {
+                if !database.routable(role == "writing", schema_rb) {
                     return None;
                 }
                 beyond_primary |= !database.primary;
@@ -375,7 +376,7 @@ fn admitted_routes(
     if !beyond_primary || !envs.iter().all(sqlite_primary) {
         return None;
     }
-    Some((DatabaseRoutes { owner: owner.name.clone(), default_shard: pools[0].0.clone(), routes }, span))
+    Some((DatabaseRoutes { owner: owner.name.clone(), default_shard: pools[0].0.clone(), schema_file: schema_rb.to_string(), routes }, span))
 }
 
 
@@ -610,7 +611,7 @@ fn resolve_parent<'a>(child: &str, parent: &str, by_name: &HashMap<&'a str, usiz
 /// Record `app.model_databases` and the routing refusals. Runs after
 /// every model, concern splice and library class exists, and after
 /// `config/database.yml` is read into `app.databases`.
-pub(super) fn resolve(app: &mut App, schema_rb: bool) {
+pub(super) fn resolve(app: &mut App, schema_rb: Option<&str>) {
     let modules: HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().filter(|c| c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
     let by_name: HashMap<&str, usize> =

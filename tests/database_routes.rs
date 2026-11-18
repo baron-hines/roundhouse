@@ -81,17 +81,30 @@ fn an_unreadable_schema_does_not_admit_routes_in_survey() {
     assert_eq!(generated(&db), "# >>> generated: database-routes\n    ");
 }
 
-/// A primary that names its Ruby schema file admits the routes as
-/// `db/schema.rb` does: the named file is the schema the routes are checked against.
+/// A routed writer must name the Ruby schema actually loaded for the primary.
 #[test]
-fn a_named_ruby_schema_admits_the_routes() {
-    let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n");
-    assert!(yml.contains("schema_dump: catalog_schema.rb"));
-    let schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :notes, force: true do |t|\n    t.string :tag, null: false\n  end\nend\n";
+fn a_named_ruby_schema_admits_routes_with_the_same_schema() {
+    let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n")
+        .replace("schema_dump: schema.rb", "schema_dump: catalog_schema.rb");
+    let schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :notes do |t|\n    t.string :tag\n  end\nend\n";
     let (db, errors) = spinel_db(shards().remove("db/schema.rb").write("db/catalog_schema.rb", schema).write("config/database.yml", &yml));
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(generated(&db).contains("@default_shard"), "{}", generated(&db));
 }
+
+#[test]
+fn routes_refuse_a_schema_file_different_from_the_loaded_primary_schema() {
+    let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n");
+    let schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :notes do |t|\n    t.string :tag\n  end\nend\n";
+    let (db, errors) = spinel_db(shards().write("db/catalog_schema.rb", schema).write("config/database.yml", &yml));
+    assert!(errors.iter().any(|e| e.contains("shard routing is not modeled")), "{errors:#?}");
+    assert!(!generated(&db).lines().any(|line| line.trim_start().starts_with("route(")), "{db}");
+}
+
+/// A model's `prepend Concern` in a routed app stays the concern
+/// splice's statement: the flag that claims it is not the one that marks
+/// a writing block ingest read as its body, so the routes do not put a
+/// `connected_to(role: :writing)` back around it.
 
 /// A model's `prepend Concern` in a routed app stays the concern
 /// splice's statement: the flag that claims it is not the one that marks
