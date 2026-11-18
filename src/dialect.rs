@@ -111,8 +111,9 @@ pub struct Model {
     pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
 
     /// An enclosing module (via EnumConstants nesting) defines a `JSON`
-    /// constant that would shadow bare `JSON` in `serialize` coder
-    /// resolution. Fail closed: claim only `::JSON` when set.
+    /// constant, or the body nests a `JSON` class, module or value class,
+    /// that would shadow bare `JSON` in `serialize` coder resolution.
+    /// Fail closed: claim only `::JSON` when set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lexical_json_shadow: bool,
 
@@ -173,7 +174,9 @@ impl Model {
     /// match the source by class: a model can have two associations to
     /// one class, and each one gives other rows.
     pub fn through_source(&self, through_assoc: &Association) -> Option<&Association> {
-        let Association::HasMany { name, source, .. } = through_assoc else { return None };
+        let (Association::HasMany { name, source, .. } | Association::HasOne { name, source, .. }) = through_assoc else {
+            return None;
+        };
         let mut candidates = match source {
             Some(source) => vec![source.clone()],
             None => vec![Symbol::from(crate::naming::singularize(name.as_str())), name.clone()],
@@ -548,6 +551,12 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `inverse_of: :author` as written (not `false` or `nil`). Rails
+        /// derives a defaulted foreign key from the inverse association
+        /// (`derive_foreign_key`), which app assembly does once every
+        /// model is ingested (`resolve_inverse_foreign_keys`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasOne {
         name: Symbol,
@@ -557,12 +566,18 @@ pub enum Association {
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,
         dependent: Dependent,
-        /// `has_one :x, through: :y`. Recorded so consumers that would
-        /// treat the association as a direct query can see it is not;
-        /// the reader is still direct (a pre-existing gap), so anything
-        /// that cannot be right for it must refuse.
+        /// `has_one :x, through: :y`. The ruby family's reader and
+        /// preload go through the hop (`apply_through_assoc_lowering`);
+        /// anything else that would treat it as a direct query must
+        /// refuse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<Symbol>,
+        /// See `HasMany::source`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Symbol>,
+        /// See `HasMany::class_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        class_explicit: bool,
         /// See `HasMany::as_interface`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_interface: Option<Symbol>,
@@ -588,6 +603,9 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// See `HasMany::inverse_of`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasAndBelongsToMany {
         name: Symbol,
@@ -1271,9 +1289,24 @@ impl LibraryClass {
     /// file-level `X = Data.define(…)` creates.
     pub fn data_define(&self) -> Option<(&[Symbol], Span)> {
         match &self.origin {
-            Some(LibraryClassOrigin::DataDefine { members, span }) => Some((members, *span)),
+            Some(LibraryClassOrigin::DataDefine { members, span, .. }) => Some((members, *span)),
             _ => None,
         }
+    }
+
+    pub(crate) fn data_class_constant(&self, index: usize) -> bool {
+        matches!(&self.origin, Some(LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) if index >= *start)
+    }
+
+    pub(crate) fn data_constructor_visibility(&self) -> Option<Span> {
+        self.data_define()?;
+        self.unknown_calls.iter().find(|call| {
+            let ExprNode::Send { method, args, .. } = &*call.node else { return false };
+            let class_side = method.as_str() == "private_class_method"
+                || (call.decisions & crate::expr::SINGLETON_BODY != 0 && method.as_str() == "private");
+            class_side && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if matches!(value.as_str(), "new" | "[]" | "allocate")))
+        }).map(|call| call.span)
     }
 
     /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
@@ -1405,6 +1438,8 @@ pub enum LibraryClassOrigin {
     DataDefine {
         members: Vec<Symbol>,
         span: Span,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class_constant_start: Option<usize>,
     },
     /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
     Oj,

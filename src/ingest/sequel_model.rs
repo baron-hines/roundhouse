@@ -251,6 +251,7 @@ fn parse_sequel_association(
                 // `one_to_many` takes a dataset block, a different thing.
                 extension: Vec::new(),
                 primary_key: None,
+                inverse_of: None,
             }
         }
         "one_to_one" => Association::HasOne {
@@ -264,11 +265,14 @@ fn parse_sequel_association(
                 .unwrap_or_else(|| Symbol::from(format!("{owner_snake}_id"))),
             dependent: Dependent::None,
             through: None,
+            source: None,
+            class_explicit: false,
             as_interface: None,
             scope: None,
             autosave: false,
             validate: false,
             primary_key: None,
+            inverse_of: None,
         },
         "many_to_one" => Association::BelongsTo {
             name: name.clone(),

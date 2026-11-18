@@ -419,10 +419,11 @@ fn rewrite(expr: &mut Expr, lists: &HelperLists) {
     let nested = is_param_value(r.ty.as_ref());
     let replacement = match (method.as_str(), args.as_slice()) {
         ("permit!" | "to_unsafe_h", []) if nested || is_request_params(r) => Some(r.clone()),
-        ("permit", keys) if nested && !keys.is_empty() => {
-            let Some(names) = filter_names(keys) else { return };
-            Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect()))
-        }
+        ("permit", keys) if nested && !keys.is_empty() => match filter_names(keys) {
+            Some(names) => Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect())),
+            // maybe's `params.fetch(:q, {}).permit(:search, accounts: [])`: the nested filters a request's own permit takes.
+            None => filtered_call(expr),
+        },
         ("require", [key]) if nested => {
             let Some(name) = sym_name(key) else { return };
             let params = Expr::new(expr.span, ExprNode::Const { path: vec![Symbol::from("Params")] });

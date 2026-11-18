@@ -21,7 +21,7 @@
 # `shutdown`, `kill`, `wait_for_termination`, `completed_task_count`
 # and the size readers — plus `CyclicBarrier#wait` for the
 # race-condition test, and `Map`'s `[]` / `[]=` / `compute_if_absent` /
-# `clear` and its default block (Mutex+Hash; not the gem's lock-free table). The gem's tuning
+# `clear` / `keys` / `each_pair` and its default block (Mutex+Hash; not the gem's lock-free table). The gem's tuning
 # knobs (`idletime`, the fallback policies other than `:abort`,
 # `min_threads` pre-spawn) are accepted where a caller passes them and
 # do nothing: a worker here is a green thread parked on a Queue, which
@@ -223,6 +223,20 @@ module Concurrent
 
     def clear
       @lock.synchronize { @hash.clear }
+      self
+    end
+
+    def keys
+      keys = []
+      @lock.synchronize { keys = @hash.keys }
+      keys
+    end
+
+    # Over a copy, not under the lock: the block may write the map (the gem's backend walks a copy too), and the Mutex is not reentrant.
+    def each_pair
+      pairs = []
+      @lock.synchronize { pairs = @hash.to_a }
+      pairs.each { |pair| yield pair[0], pair[1] }
       self
     end
   end

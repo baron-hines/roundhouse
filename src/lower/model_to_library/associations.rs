@@ -90,17 +90,16 @@ pub(crate) fn through_writer_join(
     }) else {
         return ThroughWriterJoin::NoJoin;
     };
-    let Some((join_class, owner_fk, thr_through, thr_as)) = model.associations().find_map(|a| match a {
-        Association::HasMany {
-            name: n,
-            target: jt,
-            foreign_key: jfk,
-            through: jthru,
-            as_interface,
-            ..
-        } if n == &thr_name => Some((jt.clone(), jfk.clone(), jthru.clone(), as_interface.clone())),
-        _ => None,
-    }) else {
+    // The last declaration of the name, which replaces an earlier one, as
+    // the reader reads it.
+    let Some((join_class, owner_fk, thr_through, thr_as)) =
+        model.associations().filter(|a| a.name() == &thr_name).last().and_then(|a| match a {
+            Association::HasMany { target: jt, foreign_key: jfk, through: jthru, as_interface, .. } => {
+                Some((jt.clone(), jfk.clone(), jthru.clone(), as_interface.clone()))
+            }
+            _ => None,
+        })
+    else {
         return ThroughWriterJoin::NoJoin;
     };
     // First hop already indirect (`through:` an association that is
@@ -159,7 +158,7 @@ pub(crate) fn through_writer_join(
 /// unsaved record's own `id` uses, read off the owner's attribute row
 /// so a uuid foreign key is never compared with, or reset to, an
 /// integer it can't hold (#90).
-fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
+pub(crate) fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
     let ty = model.attributes.fields.get(foreign_key);
     let is_str = match ty {
         Some(Ty::Str) => true,
@@ -169,31 +168,39 @@ fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
     if is_str { super::lit_str(String::new()) } else { lit_int(0) }
 }
 
-/// Push an `unsupported` error for a `has_many :through` whose source
-/// association has a scope (`has_many :bo_remarks, -> { where(...) }`).
-/// The through reader, preload and join apply only the scope of the
-/// through association itself, so they would return the rows that the
-/// source scope filters out. Returns true when it refused: the caller
-/// then synthesizes no reader.
+/// Push an `unsupported` error for a `has_many :through` or `has_one
+/// :through` whose source association has a scope (`has_many
+/// :bo_remarks, -> { where(...) }`). The through reader, preload and join
+/// apply only the scopes of the through association and its hop, so they
+/// would return the rows that the source scope filters out. Returns true
+/// when it refused: the caller then synthesizes no reader.
 fn refuse_scoped_through_source(
     model: &Model,
     models: &[Model],
     assoc: &Association,
     span: Span,
 ) -> bool {
-    let Association::HasMany { name, through: Some(thr_name), .. } = assoc else { return false };
+    let (Association::HasMany { name, through: Some(thr_name), .. } | Association::HasOne { name, through: Some(thr_name), .. }) =
+        assoc
+    else {
+        return false;
+    };
     let source = model
         .associations()
-        .find(|a| a.name() == thr_name)
+        .filter(|a| a.name() == thr_name)
+        .last()
         .and_then(|thr| match thr {
-            Association::HasMany { target, .. } | Association::HasOne { target, .. } => Some(target),
+            Association::HasMany { target, .. }
+            | Association::HasOne { target, .. }
+            | Association::BelongsTo { target, polymorphic: false, .. } => Some(target),
             _ => None,
         })
         .and_then(|thr_target| models.iter().find(|m| &m.name == thr_target))
         .and_then(|thr_model| thr_model.through_source(assoc));
     let Some(
         source @ (Association::HasMany { scope: Some(_), .. }
-        | Association::HasOne { scope: Some(_), .. }),
+        | Association::HasOne { scope: Some(_), .. }
+        | Association::BelongsTo { scope: Some(_), .. }),
     ) = source
     else {
         return false;
@@ -538,11 +545,32 @@ pub(super) fn push_association_methods(
                 as_interface,
                 scope,
                 autosave,
+                through,
                 ..
             } => {
                 if crate::lower::assoc_primary_key::refuse(model, models, assoc, span) {
                     continue;
                 }
+                if refuse_scoped_through_source(model, models, assoc, span) {
+                    continue;
+                }
+                // The autosave below writes the owner's key on the target,
+                // where a through association keeps it on the hop.
+                let autosave = if *autosave && through.is_some() {
+                    crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                        span,
+                        None,
+                        "through_autosave",
+                        format!(
+                            "`{}.{name}`: `autosave: true` on a has_one :through is not supported: \
+                             its save would write the owner's key on the target, not on the hop",
+                            model.name.0
+                        ),
+                    ));
+                    &false
+                } else {
+                    autosave
+                };
                 let owner_key = assoc.owner_key();
                 methods.push(synth_has_one_reader(
                     owner,

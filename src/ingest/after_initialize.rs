@@ -60,6 +60,14 @@
 //!   `Rails.root.join("lib/…").to_s`): the file's top-level statements
 //!   are read here, under the same rules, as `require` runs them here,
 //!   and only by the first `require` of that file, as Ruby loads it once.
+//!   A file that declares a class or module is read only when it holds
+//!   declarations alone, the support walk compiled it (an autoloaded
+//!   `lib/` file), and that walk registered each class and module it
+//!   declares (a module that only nests declarations is their namespace):
+//!   they are defined when the callback runs, as they are once `require`
+//!   returns in Rails, and nothing else runs. Any other such
+//!   file is an error, and so is a constant assignment left to run: the
+//!   body runs as a method, where Ruby refuses one.
 //!   Any other `require`, or one whose path leaves the app or passes a
 //!   symlink, is an error: the emitted program loads no files at run time.
 //!
@@ -84,13 +92,16 @@ use ruby_prism::Node;
 
 use crate::app::{App, AFTER_INITIALIZE_RUNNER};
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
-use crate::expr::{Expr, ExprNode, Literal};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::ingest::prism_api::PrismLocation;
 use crate::span::Span;
 use crate::vfs::Vfs;
 
-use super::util::{constant_id_str, constant_path_of, find_all_classes_with_scope, flatten_statements, symbol_value};
+use super::util::{
+    class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope, find_all_module_declarations_with_scope,
+    flatten_statements, module_name_path, symbol_value,
+};
 use super::{survey, IngestError, IngestResult};
 
 /// Where an `after_initialize` call sits, which decides the receivers it
@@ -256,13 +267,26 @@ fn span_of(node: &Node<'_>, file: &str) -> Span {
     Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 }
 }
 
+/// What a callback's `require` meets: the files already read (`require`
+/// loads a file once per process, whichever callback asks first), and
+/// the library files the support walk compiled, each with the classes
+/// and modules it registered.
+struct Loads<'a> {
+    read: HashSet<PathBuf>,
+    compiled: &'a [(String, Vec<ClassId>)],
+}
+
 /// Every carried callback of the app, in the order Rails runs them:
 /// `config/application.rb` first, then the initializers by path. A
 /// callback that fails to read is recorded (survey) or fails the ingest.
-pub(super) fn read_all<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<Callback>> {
+/// `compiled` is `App::library_class_files`.
+pub(super) fn read_all<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    compiled: &[(String, Vec<ClassId>)],
+) -> IngestResult<Vec<Callback>> {
     let mut out = Vec::new();
-    // `require` loads a file once per process, whichever callback asks first.
-    let mut loaded = HashSet::default();
+    let mut loaded = Loads { read: HashSet::default(), compiled };
     let application = dir.join("config/application.rb");
     if let Ok(bytes) = vfs.read(&application) {
         let file = application.display().to_string();
@@ -311,7 +335,7 @@ fn read_statement<V: Vfs + ?Sized>(
     stmt: &Node<'_>,
     file: &str,
     site: Site,
-    loaded: &mut HashSet<PathBuf>,
+    loaded: &mut Loads<'_>,
     out: &mut Vec<Callback>,
 ) -> IngestResult<()> {
     let Some(call) = stmt.as_call_node() else { return Ok(()) };
@@ -338,7 +362,7 @@ fn read_hook<V: Vfs + ?Sized>(
     file: &str,
     site: Site,
     server_only: bool,
-    loaded: &mut HashSet<PathBuf>,
+    loaded: &mut Loads<'_>,
     out: &mut Vec<Callback>,
 ) -> IngestResult<()> {
     let Some(block) = carried_block(call, site) else { return Ok(()) };
@@ -362,7 +386,7 @@ fn read_body<V: Vfs + ?Sized>(
     dir: &Path,
     stmts: Vec<Node<'_>>,
     file: &str,
-    loaded: &mut HashSet<PathBuf>,
+    loaded: &mut Loads<'_>,
     callback: &mut Callback,
     depth: usize,
 ) -> IngestResult<()> {
@@ -374,7 +398,7 @@ fn read_body<V: Vfs + ?Sized>(
         }
         if let Some(required) = required_app_file(vfs, dir, &stmt, file)? {
             // A file already loaded, or still loading (a circular require), is a no-op, as in Ruby.
-            if !loaded.insert(required.clone()) {
+            if !loaded.read.insert(required.clone()) {
                 continue;
             }
             // Its first load is read into this callback only, and a later
@@ -391,11 +415,34 @@ fn read_body<V: Vfs + ?Sized>(
             let root = parsed.node();
             let Some(program) = root.as_program_node() else { continue };
             let inner: Vec<Node<'_>> = program.statements().body().iter().collect();
-            if inner.iter().any(|n| n.as_class_node().is_some() || n.as_module_node().is_some()) {
-                return Err(unsupported(
-                    &path,
-                    "a file required from an after_initialize callback defines a class or module; only its top-level statements are read".into(),
-                ));
+            let defines = |n: &Node<'_>| n.as_class_node().is_some() || n.as_module_node().is_some();
+            if inner.iter().any(defines) {
+                // A file of declarations alone that the support walk
+                // compiled (an autoloaded `lib/` file), registering each
+                // class it declares and each module (a module that only
+                // nests declarations is their namespace), loads nothing
+                // new: they are defined when the callback runs, as they
+                // are once `require` returns.
+                let names = loaded.compiled.iter().find(|(file, _)| *file == path).map(|(_, names)| names);
+                let full = |scope: Vec<String>, last: Option<Vec<String>>| {
+                    last.map(|last| scope.into_iter().chain(last).collect::<Vec<_>>().join("::"))
+                };
+                let has = |name: Option<String>| name.is_some_and(|name| names.is_some_and(|names| names.iter().any(|n| n.0.as_str() == name)));
+                let namespace = |module: &ruby_prism::ModuleNode<'_>| {
+                    module.body().is_some_and(|body| flatten_statements(body).iter().all(defines))
+                };
+                let carried = inner.iter().all(defines)
+                    && find_all_classes_with_scope(&root).into_iter().all(|(scope, class)| has(full(scope, class_name_path(&class))))
+                    && find_all_module_declarations_with_scope(&root)
+                        .into_iter()
+                        .all(|(scope, module)| namespace(&module) || has(full(scope, module_name_path(&module))));
+                if !carried {
+                    return Err(unsupported(
+                        &path,
+                        "a file required from an after_initialize callback defines a class or module; it is read only when it holds nothing else and the compiled program defines each of them (an autoloaded `lib/` file)".into(),
+                    ));
+                }
+                continue;
             }
             read_body(vfs, dir, inner, &path, loaded, callback, depth + 1)?;
             continue;
@@ -406,6 +453,10 @@ fn read_body<V: Vfs + ?Sized>(
                 file,
                 format!("`{name}` inside an after_initialize callback is not modeled except as a top-level statement of the block"),
             ));
+        }
+        // The body runs as a method, where Ruby refuses a constant assignment.
+        if assigns_constant(&expr) {
+            return Err(unsupported(file, "a constant assignment inside an after_initialize callback is not modeled".into()));
         }
         next_to_return(&mut expr);
         callback.body.push(expr);
@@ -447,6 +498,21 @@ fn dynamic_construct(expr: &Expr) -> Option<String> {
             found = dynamic_construct(child);
         }
     });
+    found
+}
+
+/// Whether `expr` assigns a constant anywhere, as `X = …`, `X ||= …` or
+/// `X, y = …`.
+fn assigns_constant(expr: &Expr) -> bool {
+    match &*expr.node {
+        ExprNode::Assign { target: LValue::Const { .. }, .. } | ExprNode::OpAssign { target: LValue::Const { .. }, .. } => {
+            return true;
+        }
+        ExprNode::MultiAssign { targets, .. } if targets.iter().any(|t| matches!(t, LValue::Const { .. })) => return true,
+        _ => {}
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |child| found |= assigns_constant(child));
     found
 }
 

@@ -246,6 +246,9 @@ pub struct ClassInfo {
     pub class_side_hook_methods: crate::det::HashSet<Symbol>,
     /// Explicit extensions contribute instance methods to singleton dispatch.
     pub class_method_extensions: Vec<ClassId>,
+    /// The modules a mixin hook `extend`s this class with (version_gem's `base.extend(Api)`): their methods run
+    /// with this class as self. Not in `class_method_extensions`: what the hook installs is `class_side_hook_methods`.
+    pub hook_extensions: Vec<ClassId>,
     pub primary_key: Option<Symbol>,
     /// The model declares a `default_scope` the runtime Relation applies
     /// (`lower::default_scope`): a query on it must not be folded to SQL
@@ -1323,9 +1326,35 @@ impl<'a> BodyTyper<'a> {
             }
             // `Module.new` / `Class.new(Parent)` answer a fresh module or
             // class, unless the app overrides `new` on them.
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "const_get" => {
+                self.const_get_namespace(r, method, args, ctx).is_some()
+            }
             ExprNode::Send { recv: Some(r), method, .. } => self.class_factory_receiver(r, method, ctx),
             _ => false,
         }
+    }
+
+    /// `Models.const_get("Auth")`: the class or module the literal name nests under a class object. Only one the
+    /// registry has at that full name: a miss in it may still find an ancestor's or Object's constant at run time.
+    fn const_get_namespace(&self, recv: &Expr, method: &Symbol, args: &[Expr], ctx: &Ctx) -> Option<ClassId> {
+        // (not a class's own `const_get`, which answers whatever it returns)
+        if method.as_str() != "const_get" || !self.is_class_object(recv, ctx) || self.owns_operator(recv.ty.as_ref(), method, true) {
+            return None;
+        }
+        let [arg] = args else { return None };
+        let name = match &*arg.node {
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => value.clone(),
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => value.as_str().to_string(),
+            _ => return None,
+        };
+        let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return None };
+        if name.is_empty() || name.starts_with("::") {
+            return None;
+        }
+        // (Object's own constants are the top level's: `Object.const_get("Plugs")` is `::Plugs`)
+        let full = if id.0.as_str() == "Object" { name } else { format!("{}::{name}", id.0.as_str()) };
+        let id = ClassId(Symbol::from(full));
+        self.classes().contains_key(&id).then_some(id)
     }
 
     fn constant_predicate(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
@@ -1674,6 +1703,7 @@ impl<'a> BodyTyper<'a> {
     fn self_is_module_instance(&self, ctx: &Ctx) -> bool {
         if ctx.class_side { return false; }
         let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return false };
+        if self.only_extended(id) { return true; }
         let mut seen = crate::det::HashSet::default();
         let mut current = self.classes().get(id).and_then(|c| c.parent.clone());
         while let Some(id) = current {
@@ -1682,6 +1712,17 @@ impl<'a> BodyTyper<'a> {
             current = self.classes().get(&id).and_then(|c| c.parent.clone());
         }
         false
+    }
+
+    /// A module some class or module `extend`s and none `include`s: its instance methods run with that
+    /// extender as self (version_gem's `self::VERSION`). Not one nothing extends: its self is unknown.
+    fn only_extended(&self, id: &ClassId) -> bool {
+        let classes = self.classes();
+        if !classes.get(id).is_some_and(|c| c.is_module) {
+            return false;
+        }
+        let extended = classes.values().any(|c| c.class_method_extensions.contains(id) || c.hook_extensions.contains(id));
+        extended && !classes.values().any(|c| c.includes.contains(id))
     }
 
     // A value typed `A` may be an instance of a subclass of A, whose own `try`, `respond_to?` or method answers.
@@ -3594,6 +3635,9 @@ impl<'a> BodyTyper<'a> {
                             detail: format!("{} requires a proven class/module object receiver", method),
                         }));
                         return dispatched;
+                    }
+                    if class_object && let Some(r) = recv.as_ref() && let Some(id) = self.const_get_namespace(r, method, args, ctx) {
+                        return Ty::Class { id, args: vec![].into() };
                     }
                     if let Some(t) = send::object_protocol_method(recv_ty.as_ref(), method, block_ret.as_ref(), class_object) {
                         return t;
