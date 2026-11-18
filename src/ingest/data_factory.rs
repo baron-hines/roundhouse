@@ -110,14 +110,21 @@ pub(super) fn collect(
     let Some(body) = body else {
         return Ok(factories);
     };
-    for statement in flatten_statements(body) {
+    let statements = flatten_statements(body);
+    let data_names = statements.iter().filter_map(|stmt| stmt.as_constant_write_node()).filter(|write| write.value().as_call_node().is_some_and(|call| constant_id_str(&call.name()) == "define" && call.receiver().and_then(|recv| constant_path_of(&recv)).is_some_and(|path| path == ["Data"]))).map(|write| constant_id_str(&write.name()).to_string()).collect::<Vec<_>>();
+    for statement in statements {
+        if let Some(class) = statement.as_class_node()
+            && class.constant_path().as_constant_read_node().is_some_and(|name| data_names.iter().any(|data| data == constant_id_str(&name.name())))
+            && class.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| stmt.as_call_node().is_some_and(|call| constant_id_str(&call.name()) == "delegate_missing_to"))) {
+            return Err(IngestError::Unsupported { file: file.into(), message: "delegate_missing_to in a Data reopening is not modeled".into() });
+        }
         let Some(call) = declaration(&statement) else {
             continue;
         };
         let unsupported = || {
             IngestError::Unsupported {
             file: file.into(),
-            message: "Data.define blocks support only instance methods and static visibility declarations".into(),
+            message: "Data.define blocks support only methods, delegates and static visibility declarations".into(),
         }
         };
         let block = call
@@ -136,8 +143,10 @@ pub(super) fn collect(
             owner.0.as_str(),
             constant_id_str(&name)
         )));
+        visibility::validate_data(block.body(), file, &[], &id)?;
         let visibility = Visibility::resolve(Some(&body), file, None)?;
         let mut methods = Vec::new();
+        let mut unknown_calls = Vec::new();
         for statement in flatten_statements(body) {
             if let Some(def) = visibility::definition(&statement) {
                 if def
@@ -152,6 +161,24 @@ pub(super) fn collect(
                 // also apply to singleton methods.
                 visibility.apply(&statement, &mut method);
                 methods.push(method);
+            } else if statement.as_call_node().is_some_and(|call| {
+                call.receiver().is_none() && call.block().is_none()
+                    && constant_id_str(&call.name()) == "delegate"
+            }) {
+                let delegate_call = statement.as_call_node().unwrap();
+                let args = delegate_call.arguments().map(|args| args.arguments().iter().collect::<Vec<_>>()).unwrap_or_default();
+                if args.iter().any(|arg| arg.as_hash_node().is_some()) {
+                    return Err(IngestError::Unsupported { file: file.into(), message: "Data delegate requires keyword options, not a positional Hash".into() });
+                }
+                let target = args.iter().filter_map(|arg| arg.as_keyword_hash_node()).flat_map(|hash| hash.elements().iter().collect::<Vec<_>>())
+                    .filter_map(|arg| arg.as_assoc_node()).find(|arg| super::util::symbol_or_string_value(&arg.key()).as_deref() == Some("to"))
+                    .and_then(|arg| super::util::symbol_or_string_value(&arg.value()));
+                let members = call.arguments().map(|args| args.arguments().iter().filter_map(|arg| super::util::symbol_or_string_value(&arg)).collect::<Vec<_>>()).unwrap_or_default();
+                if !target.as_ref().is_some_and(|target| members.contains(target)) {
+                    return Err(IngestError::Unsupported { file: file.into(), message: "Data delegate constant target or non-member target has unverified lexical lookup".into() });
+                }
+                // The shared delegate pass validates options and expands these forwarders.
+                unknown_calls.push(ingest_expr(&statement, file)?);
             } else if let Some(target) = statement.as_call_node().and_then(|call| delegate_missing_target(&call)) {
                 // Rails' `delegate_missing_to :target` (active_support/core_ext/module/delegation.rb): the two
                 // methods it defines. The target read through `self`, not bare: a target named `block` or `args`
@@ -174,6 +201,10 @@ pub(super) fn collect(
                 return Err(unsupported());
             }
         }
+        let missing_delegate = combined_delegation(block.body());
+        if !unknown_calls.is_empty() && (missing_delegate || methods.iter().any(|method| method.receiver == crate::dialect::MethodReceiver::Class && method.name.as_str() == "delegate")) {
+            return Err(IngestError::Unsupported { file: file.into(), message: if missing_delegate { "Data.define blocks combining delegate and delegate_missing_to are not modeled" } else { "app-defined delegate on a Data class is not modeled" }.into() });
+        }
         factories.push(LibraryClass {
             name: id,
             is_module: false,
@@ -189,7 +220,7 @@ pub(super) fn collect(
             }),
             constants: Vec::new(),
             conditional_definitions: Vec::new(),
-            unknown_calls: Vec::new(),
+            unknown_calls,
         });
     }
     Ok(factories)
@@ -204,4 +235,8 @@ fn delegate_missing_target(call: &ruby_prism::CallNode<'_>) -> Option<String> {
     let [arg] = args.as_slice() else { return None };
     let name = String::from_utf8_lossy(arg.as_symbol_node()?.unescaped()).into_owned();
     (name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.is_empty()).then_some(name)
+}
+
+pub(super) fn combined_delegation(body: Option<Node<'_>>) -> bool {
+    let statements = body.map(flatten_statements).unwrap_or_default(); ["delegate", "delegate_missing_to"].iter().all(|name| statements.iter().any(|stmt| stmt.as_call_node().is_some_and(|call| constant_id_str(&call.name()) == *name)))
 }
