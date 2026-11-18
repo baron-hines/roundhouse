@@ -325,6 +325,13 @@ pub fn helper_id_segments(app: &App) -> crate::det::HashMap<String, Vec<bool>> {
     for m in &app.generated_route_helpers {
         out.entry(m.name.as_str().to_string()).or_insert_with(|| vec![false, false]);
     }
+    // A `direct` helper's block is given its arguments as written, the
+    // record itself (`direct :x do |article, options|`): none is an id
+    // segment. Its body's `route_for` projects each to the target's
+    // segment (`routes_to_library::direct`).
+    for h in &app.routes.direct_helpers {
+        out.entry(format!("{}_path", h.name.as_str())).or_insert_with(|| vec![false; h.params.len()]);
+    }
     out
 }
 

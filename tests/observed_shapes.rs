@@ -144,6 +144,8 @@ fn a_gem_that_shapes_a_held_model_is_observed_and_written_where_the_model_is() {
         !log.contains("observing the boot did not answer it"),
         "{log}"
     );
+    // aasm's `ruby2_keywords` beside each event method is no statement of the Spinel model's, which has none.
+    assert!(!log.contains("ruby2_keywords not supported"), "{log}");
     let model = std::fs::read_to_string(out.join("app/models/article.rb")).unwrap();
     for written in [
         "include AASM::Persistence::ActiveRecordPersistence",
@@ -167,6 +169,13 @@ fn a_gem_that_shapes_a_held_model_is_observed_and_written_where_the_model_is() {
             "aasm's own `{done}` still runs:\n{base}"
         );
     }
+
+    // A file the gem requires by a path it builds (`require_persistence :active_record`) is one the boot loaded, so it is carried.
+    assert!(out.join("app/models/aasm/persistence/active_record_persistence.rb").exists());
+    // Its `class_eval do scope … end` goes with the observed `scope`, and the branch this Rails rules out goes too.
+    let created = model.split("def self.aasm_create_scope").nth(1).expect("aasm_create_scope in the Spinel model");
+    let created = &created[..created.find("\n  def ").unwrap_or(created.len())];
+    assert!(!created.contains("class_eval") && !created.contains("named_scope"), "{created}");
 
     // Nothing it read changed: the second build reuses the observation, without booting the CRuby tree.
     let again = spinel(&app, &root.path().join("spinel-again"));
