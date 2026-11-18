@@ -2522,6 +2522,13 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             ExprNode::Defined { operand }
                 if target == BuildTarget::Spinel && !load_time
                     && matches!(&*operand.node, ExprNode::Send { recv: Some(_), args, block: None, .. } if args.is_empty()) => None,
+            // `defined?(base::VERSION)` in a method (version_gem's hook guard), a constant read on a value: Spinel
+            // answers "constant" where the value's class holds the name, as CRuby does (matz/spinel#12114).
+            ExprNode::Defined { operand }
+                if target == BuildTarget::Spinel && !load_time
+                    && matches!(&*operand.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                        if method.as_str() == "const_get" && !matches!(&*r.node, ExprNode::Const { .. })
+                            && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }))) => None,
             ExprNode::Defined { .. } => Some("runtime defined? query"),
             // A `define_method` block's `&block`, kept by ingest: only the Ruby emitter (Spinel's and Roda's too) binds it.
             ExprNode::Lambda { block_param: Some(_), .. } if !matches!(target, BuildTarget::Spinel | BuildTarget::Roda) => {
@@ -9573,6 +9580,9 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Encoding::UndefinedConversionError" | "Encoding::InvalidByteSequenceError"
         | "Encoding::ConverterNotFoundError"
         | "Signal" | "FileTest" | "Marshal" | "Fiber"
+        | "Socket" | "IO::WaitReadable" | "IO::WaitWritable" | "Zlib::Inflate" | "OpenSSL::Digest::MD5"
+        | "OpenSSL::X509::Certificate" | "OpenSSL::PKey::RSA" | "OpenSSL::SSL::SSLSocket" | "OpenSSL::SSL::SSLContext"
+        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
@@ -10167,6 +10177,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             );
         }
         // These are Integer values, so the class/module gate does not see them.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
+            && flag.starts_with(|c: char| c.is_ascii_uppercase())
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("Socket::{flag} is a socket option constant, which the {target} runtime does not supply"),
+            );
+        }
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Zlib", flag @ ("BEST_COMPRESSION" | "MAX_WBITS" | "FINISH")] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]

@@ -1413,6 +1413,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Zlib::Deflate", &[("new", Ty::SelfInstance)], &[
         ("deflate", Ty::Str), ("close", Ty::Nil),
     ]);
+    // `Zlib::Inflate.inflate(body)`: an HTTP client's deflate-encoded response.
+    register_stdlib_class(classes, "Zlib::Inflate", &[("inflate", Ty::Str)], &[]);
+    // A network client's names as it rescues, configures or checks a connection (excon, httpclient,
+    // redis-client): the openssl, socket and io/wait libraries' on the ruby family, spinel's packages and
+    // runtime there. Their methods are not modeled.
+    for name in ["OpenSSL::X509::Certificate", "OpenSSL::PKey::RSA", "OpenSSL::SSL::SSLSocket", "OpenSSL::SSL::SSLContext", "OpenSSL::ASN1::ASN1Data"] {
+        register_stdlib_class(classes, name, &[], &[]);
+    }
+    for name in ["OpenSSL::ASN1", "IO::WaitReadable", "IO::WaitWritable"] {
+        register_stdlib_class(classes, name, &[], &[]);
+        classes.entry(ClassId(Symbol::from(name))).or_default().is_module = true;
+    }
     register_stdlib_class(classes, "Zlib::GzipReader", &[("new", Ty::SelfInstance)], &[
         // Only argument-free reads are admitted by the body typer.
         ("read", Ty::Str),
@@ -1480,7 +1492,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("exist?", Ty::Bool), ("file?", Ty::Bool), ("directory?", Ty::Bool),
         ("zero?", Ty::Bool), ("empty?", Ty::Bool),
     ], &[]);
-    register_stdlib_class(classes, "Marshal", &[("dump", Ty::Str), ("load", Ty::Untyped), ("restore", Ty::Untyped)], &[]);
+    // (`dump` untyped: given an IO it writes there and answers the IO, not the bytes)
+    register_stdlib_class(classes, "Marshal", &[("dump", Ty::Untyped), ("load", Ty::Untyped), ("restore", Ty::Untyped)], &[]);
     for module in ["Signal", "FileTest", "Marshal"] {
         classes.entry(ClassId(Symbol::from(module))).or_default().is_module = true;
     }
@@ -1530,7 +1543,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ]);
     register_stdlib_class(classes, "OpenSSL::PKey::EC::Group", &[], &[("curve_name", Ty::Str)]);
     // `OpenSSL::HMAC.digest(OpenSSL::Digest.new("sha1"), key, data)`: rotp's one-time codes.
-    for name in ["OpenSSL::Digest", "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256", "OpenSSL::Digest::SHA384", "OpenSSL::Digest::SHA512"] {
+    for name in ["OpenSSL::Digest", "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256", "OpenSSL::Digest::SHA384", "OpenSSL::Digest::SHA512", "OpenSSL::Digest::MD5"] {
         let digest = Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
         register_stdlib_class(classes, name, &[("new", if matches!(name, "OpenSSL::Digest::SHA384" | "OpenSSL::Digest::SHA512") { Ty::Untyped } else { digest })], &[
             ("name", Ty::Str), ("digest", Ty::Str), ("hexdigest", Ty::Str),
