@@ -905,6 +905,10 @@ module Db
     nil
   end
 
+  def self.hold_slot(_slot, _base)
+    nil
+  end
+
   def self.leave_slot
     nil
   end

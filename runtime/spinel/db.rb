@@ -1322,9 +1322,10 @@ end
 # One `connected_to` block running on a thread. A nil role or shard
 # inherits; `global` is a block on ActiveRecord::Base itself; `slot` is
 # -1 when no pool is defined for it; `held` is the lease it set aside.
+# A parked frame holds a handle's lease without selecting its slot for models.
 class DbScope
   attr_reader :global, :role, :shard, :prevent
-  attr_accessor :slot, :held, :from, :lease
+  attr_accessor :slot, :held, :from, :lease, :parked, :connection
 
   def initialize(global, role, shard, prevent)
     @global = global
@@ -1335,6 +1336,8 @@ class DbScope
     @held = nil
     @from = 0
     @lease = -1
+    @parked = false
+    @connection = nil
   end
 end
 
@@ -1528,18 +1531,46 @@ module Db
     stack = scopes
     i = stack.length - 1
     while i >= 0
-      return stack[i].prevent if stack[i].global || !base
+      return stack[i].prevent if !stack[i].parked && (stack[i].global || !base)
       i -= 1
     end
     false
+  end
+
+  # A held handle is available to its statements without changing the models' route.
+  def self.scope_slot
+    stack = scopes
+    i = stack.length - 1
+    while i >= 0
+      return stack[i].slot if !stack[i].parked
+      i -= 1
+    end
+    route_slot(@default_shard, :writing)
+  end
+
+  def self.held_connection(index)
+    conn = nil
+    scopes.each do |frame|
+      conn = frame.held if frame.from == index && !frame.held.nil?
+      conn = frame.connection if frame.parked && frame.slot == index && !frame.connection.nil?
+    end
+    conn
+  end
+
+  def self.hold_slot(index, base)
+    enter_slot(index, base)
+    frame = scopes[scopes.length - 1]
+    frame.connection = Thread.current[:db_conn]
+    frame.parked = true
+    Thread.current[:db_conn] = frame.held if frame.slot != frame.from
+    nil
   end
 
   # The slot the models reach now. No pool for the role and shard
   # raises, as Rails does at the first query; never the primary instead.
   def self.slot
     return @slots[0] if !@routed
-    stack = scopes
-    index = stack.empty? ? route_slot(@default_shard, :writing) : stack[stack.length - 1].slot
+    index = scope_slot
     if index < 0
       shard = scope_shard(false)
       role = scope_role(false)
@@ -1570,7 +1601,7 @@ module Db
   def self.connected_to(global, role, shard, prevent)
     raise ArgumentError, "must provide a `shard` and/or `role`." if role.nil? && shard.nil?
     stack = scopes
-    before = stack.empty? ? route_slot(@default_shard, :writing) : stack[stack.length - 1].slot
+    before = scope_slot
     frame = DbScope.new(global, role, shard, prevent || role == :reading)
     stack.push(frame)
     @routed = true
@@ -1586,7 +1617,7 @@ module Db
       outer = Thread.current[:db_conn]
       frame.held = outer
       frame.from = before
-      stack.each { |f| reuse = f.held if f.from == frame.slot && !f.held.nil? }
+      reuse = held_connection(frame.slot)
       Thread.current[:db_conn] = reuse
     end
     error = nil
@@ -1646,7 +1677,7 @@ module Db
   def self.enter_slot(index, base)
     index = route_slot(base ? :default : @default_shard, :writing) if index < 0
     stack = scopes
-    before = stack.empty? ? route_slot(@default_shard, :writing) : stack[stack.length - 1].slot
+    before = scope_slot
     if index != before && (_txn_depth > 0 || Thread.current[:db_txn_pin] == true)
       raise NotImplementedError, "a connection taken on another database is used inside an open transaction; a transaction across databases is not supported yet"
     end
@@ -1657,7 +1688,7 @@ module Db
     if index != before
       frame.held = Thread.current[:db_conn]
       reuse = nil
-      stack.each { |f| reuse = f.held if f.from == index && !f.held.nil? }
+      reuse = held_connection(index)
       Thread.current[:db_conn] = reuse
     end
     # Leased also on a thread that holds none: the unleased fallback is the
@@ -1677,6 +1708,10 @@ module Db
   def self.leave_slot
     stack = scopes
     frame = stack[stack.length - 1]
+    parked = frame.parked
+    route_connection = Thread.current[:db_conn]
+    frame.parked = false
+    Thread.current[:db_conn] = frame.connection if parked
     begin
       if frame.lease >= 0
         conn = current_conn
@@ -1690,6 +1725,7 @@ module Db
       end
     ensure
       Thread.current[:db_conn] = frame.held if frame.lease >= 0 || frame.slot != frame.from
+      Thread.current[:db_conn] = route_connection if parked && frame.slot != frame.from
       stack.pop
     end
     nil
@@ -2388,6 +2424,8 @@ module Db
       scopes.each do |f|
         held = f.held
         held.qc_clear if !held.nil?
+        parked = f.connection
+        parked.qc_clear if f.parked && !parked.nil?
       end
     end
     end_snapshot(conn)

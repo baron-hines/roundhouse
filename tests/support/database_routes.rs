@@ -512,6 +512,30 @@ puts "later=" + Db.checkpointed_files.join(",")
 "##;
 pub const ONE_CONNECTION_EXPECTED: &str = "back=4:4\nlease=4\ncrossed=2:timeout\nafter-crossed=4\nloops=storage/primary.sqlite3,storage/left.sqlite3\nbefore-call=storage/left.sqlite3\nlater=storage/later.sqlite3,storage/left.sqlite3\n";
 
+pub const HELD_ROUTE_SCRIPT: &str = r##"ApplicationRecord.connected_to(shard: :right) do
+  ActiveRecord::Base.with_connection do |c|
+    Note.create!(tag: "model")
+    c.execute("INSERT INTO notes(tag) VALUES ('handle')")
+  end
+  puts "held-right=" + Note.count.to_s
+  ApplicationRecord.while_preventing_writes do
+    ActiveRecord::Base.with_connection do |c|
+      RouteReport.refused("held-guard") { Note.create!(tag: "guarded") }
+      c.execute("INSERT INTO notes(tag) VALUES ('base-writable')")
+    end
+  end
+end
+puts "held-primary=" + ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM notes").to_s
+begin
+  ApplicationRecord.connected_to(shard: :right) do
+    ActiveRecord::Base.with_connection { raise "restore the route" }
+  end
+rescue RuntimeError
+  puts "held-restored=" + ApplicationRecord.current_shard.to_s
+end
+"##;
+pub const HELD_ROUTE_EXPECTED: &str = "held-right=1\nheld-guard=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: INSERT\nheld-primary=2\nheld-restored=left\n";
+
 /// `text` with each refused statement cut after its first word: Rails'
 /// lines carry its SQL with bind marks, an emitted program's the values.
 pub fn comparable(text: &str) -> String {

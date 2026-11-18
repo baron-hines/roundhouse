@@ -376,7 +376,7 @@ module ActiveRecord
     # Nothing to hold for the shared handle (-1) or one taken before the
     # databases are open (-2): their statements stay as they were.
     def _hold_slot
-      Db.enter_slot(@slot, @base) if @slot >= 0
+      Db.hold_slot(@slot, @base) if @slot >= 0
       nil
     end
 

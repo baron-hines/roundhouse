@@ -26,6 +26,8 @@ module Db
   # The pair a handle with a slot runs each statement between (`ActiveRecord::Connection`). Only a shim whose
   # `connection_slot` answers a slot is called; the Spinel shims define them.
   def self.enter_slot: (Integer, bool) -> nil
+  # Hold a handle's lease without selecting its slot for model queries.
+  def self.hold_slot: (Integer, bool) -> nil
   def self.leave_slot: () -> nil
   def self.transaction_open?: () -> bool
   def self.close: () -> void

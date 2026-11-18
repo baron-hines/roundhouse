@@ -61,3 +61,16 @@ fn roles_guard_writes_natively() {
     let expected = format!("{}custom!\nadmin!\n{}", contract::ROLES_EXPECTED, contract::ONE_CONNECTION_EXPECTED);
     assert_eq!(contract::comparable(&run.stdout), contract::comparable(&expected), "{}", run.stderr);
 }
+
+fn assert_shard_report(script: &str, expected: &str) {
+    let run = contract::app(contract::SHARDS, &contract::shards_report())
+        .run_spinel(&format!("{}{script}", contract::BOOT));
+    run.assert_passes();
+    assert_eq!(contract::comparable(&run.stdout), contract::comparable(expected), "{}", run.stderr);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_held_base_connection_preserves_model_routing() {
+    assert_shard_report(contract::HELD_ROUTE_SCRIPT, contract::HELD_ROUTE_EXPECTED);
+}

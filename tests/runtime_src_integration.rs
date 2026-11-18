@@ -1381,6 +1381,8 @@ fn every_runtime_method_body_concretely_typed() {
     // `_hold_slot`, `_release_slot` and the handle are typed and add none.
     // MEASURED 1006 on merging main 3362ae95e (main: 1003): the same three
     // sites in active_record/connection.rb; every other file equals main's.
+    // MEASURED 1006 after separating handle holds from model routing:
+    // `Db.hold_slot` remains typed; no additional gradual sites.
     // Raise to 1008, preserving the two-site headroom.
     const CEILING: usize = 1008;
     assert!(
