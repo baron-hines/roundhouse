@@ -22715,3 +22715,7 @@ mod concern_plain_includer;
 // Concern shapes: a namespaced prepend by its relative name.
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
+
+// A module defining `method_missing`: its receiverless reads are the includer's.
+#[path = "emit_and_run/module_method_missing_includer.rs"]
+mod module_method_missing_includer;
