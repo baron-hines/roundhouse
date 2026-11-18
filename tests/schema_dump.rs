@@ -19,7 +19,7 @@ use std::process::Command;
 use roundhouse::analyze::{diagnose, Analyzer};
 use roundhouse::diagnostic::Severity;
 use roundhouse::emit::diagnostics::scope;
-use roundhouse::ingest::ingest_app_from_tree;
+use roundhouse::ingest::{ingest_app, ingest_app_from_tree};
 use roundhouse::project::{target_files, BuildTarget};
 use roundhouse::App;
 
@@ -54,7 +54,10 @@ struct Checked {
 
 fn check(files: &[(String, String)]) -> Checked {
     let tree: HashMap<PathBuf, Vec<u8>> = files.iter().map(|(path, content)| (PathBuf::from(path), content.as_bytes().to_vec())).collect();
-    let mut app = ingest_app_from_tree(tree).unwrap_or_else(|error| panic!("ingest failed: {error}"));
+    analyzed(ingest_app_from_tree(tree).unwrap_or_else(|error| panic!("ingest failed: {error}")))
+}
+
+fn analyzed(mut app: App) -> Checked {
     Analyzer::new(&app).analyze(&mut app);
     let diagnostics = diagnose(&app);
     let rendered = |severity: Severity| diagnostics.iter().filter(|d| d.severity == severity).map(|d| d.render(&app.sources)).collect::<Vec<_>>();
@@ -418,6 +421,36 @@ fn a_quoted_schema_dump_key_reads_its_file() {
         let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
         assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
         assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// A scan of config/ that can't list a directory there, or read a file,
+/// can't show that no file moves the db directory, so a named file is refused.
+#[cfg(unix)]
+#[test]
+fn an_incomplete_config_scan_refuses_a_named_file() {
+    use std::os::unix::fs::PermissionsExt;
+    for locked in ["config/locked", "config/locked.rb"] {
+        let dir = scratch::dir("roundhouse-schema-dump-scan");
+        let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
+        for (path, content) in files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("config/locked/settings.rb", "# kept\n"), ("config/locked.rb", "# kept\n")]) {
+            std::fs::create_dir_all(dir.join(&path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(&path), content).unwrap();
+        }
+        let target = dir.join(locked);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that can read past the mode (CAP_DAC_OVERRIDE, root) has nothing unreadable.
+        let readable = if target.is_dir() { std::fs::read_dir(&target).is_ok() } else { std::fs::read(&target).is_ok() };
+        let result = (!readable).then(|| ingest_app(&dir));
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(result) = result else {
+            eprintln!("skipping: this process can read a mode-000 path");
+            return;
+        };
+        let checked = analyzed(result.unwrap_or_else(|error| panic!("{locked}: ingest failed: {error}")));
+        assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("couldn't be")), "{locked}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{locked}");
     }
 }
 

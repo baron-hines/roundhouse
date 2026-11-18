@@ -557,7 +557,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         // else `:ruby` unless the app's config mentions `schema_format` at all.
         let format_lines: Vec<&(usize, String, String)> = lines.iter().filter(|(_, k, _)| k.trim_start_matches(':').trim_matches(|c| c == '"' || c == '\'') == "schema_format").collect();
         let format = match (format_lines.as_slice(), config.get("schema_format").or(config.get(":schema_format"))) {
-            ([], None) => config_mentions(vfs, dir, |text| text.contains("schema_format")).map_or(Ok(".rb"), |file| Err(format!("{file} mentions `schema_format`, which can change the format Rails reads it in"))),
+            ([], None) => config_mentions(vfs, dir, |text| text.contains("schema_format")).map_or(Ok(".rb"), |clause| Err(format!("{clause} `schema_format`, which can change the format Rails reads it in"))),
             ([(_, key, value)], Some(Value::String(parsed))) if key == "schema_format" && value.trim_matches(|c| c == '"' || c == '\'') == parsed => match parsed.trim_start_matches(':') {
                 "ruby" => Ok(".rb"),
                 "sql" => Ok(".sql"),
@@ -568,7 +568,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         if url_unread {
             refuse(offset, unsupported(&written, "the configuration's `url:` is computed, not a string, or written under more than one spelling, so its query could name another file"), false);
         } else if let Some(setter) = config_mentions(vfs, dir, mentions_paths) {
-            refuse(offset, format!("{label}'s `schema_dump: {written}` is not supported: {setter} mentions `.paths`, `paths[` or `paths.add`, which can move the db directory Rails reads it from"), false);
+            refuse(offset, format!("{label}'s `schema_dump: {written}` is not supported: {setter} `.paths`, `paths[` or `paths.add`, which can move the db directory Rails reads it from"), false);
         } else if let Err(why) = &format {
             refuse(offset, unsupported(&written, why), false);
         } else if format.as_deref() != Ok(&name[name.rfind('.').unwrap_or(0)..]) {
@@ -596,12 +596,23 @@ fn shown(value: &str) -> String {
     out
 }
 
-/// The first Ruby file under `config/` whose text matches, as a path from
-/// the app root. Text only, comments included: a match only ever refuses.
+/// The first Ruby file under `config/` whose text matches, as a clause
+/// naming it (`config/application.rb mentions`). Text only, comments
+/// included: a match only ever refuses, and so does a scan that couldn't
+/// list `config/` or read a file there.
 fn config_mentions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, matches: impl Fn(&str) -> bool) -> Option<String> {
     let config = dir.join("config");
-    let files = if vfs.is_dir(&config) { super::app::read_rb_files(vfs, &config).unwrap_or_default() } else { Vec::new() };
-    files.into_iter().find(|file| vfs.read_to_string(file).is_ok_and(|text| matches(&text))).map(|file| file.strip_prefix(dir).unwrap_or(&file).display().to_string())
+    if !vfs.is_dir(&config) {
+        return None;
+    }
+    let Ok(files) = super::app::read_rb_files(vfs, &config) else { return Some("config/ couldn't be listed whole, so a file there may mention".to_string()) };
+    files.into_iter().find_map(|file| {
+        let shown = file.strip_prefix(dir).unwrap_or(&file).display().to_string();
+        match vfs.read_to_string(&file) {
+            Ok(text) => matches(&text).then(|| format!("{shown} mentions")),
+            Err(_) => Some(format!("{shown} couldn't be read, so it may mention")),
+        }
+    })
 }
 
 /// `.paths`, `paths[` or `paths.add` anywhere, on any receiver and in
