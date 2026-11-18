@@ -38,6 +38,12 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
     let names = Names { sources, resolver };
     let declared: crate::det::HashSet<String> =
         app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).chain(app.models.iter().map(|m| m.name.0.as_str().to_string())).collect();
+    // The superclasses first, so the mixin fallback below follows each as Rubydex resolved it (`N::Base`, not `Base`).
+    for class in &mut app.library_classes {
+        if let Some(parent) = &mut class.parent {
+            names.rewrite_parent(&class.name, parent, class.parent_span);
+        }
+    }
     let parents: crate::det::HashMap<String, String> = app
         .library_classes
         .iter()
@@ -48,20 +54,18 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
         // A `Data.define` block's includes are absolute already, and its
         // spans locate the factory call, not a written name.
         let data = class.data_define().is_some();
-        if let Some(parent) = &mut class.parent {
-            names.rewrite_parent(&class.name, parent, class.parent_span);
-        }
         if data {
             continue;
         }
         let owner = class.name.0.as_str().to_string();
         for (included, call) in class.includes.iter_mut().zip(&class.include_spans) {
             if let Some(span) = names.argument_span(*call, included.0.as_str()) {
-                let written = included.clone();
-                names.rewrite_id(included, span);
-                if *included == written && !declared.contains(written.0.as_str()) {
-                    if let Some(found) = ancestor_constant(&owner, written.0.as_str(), &parents, &declared) {
-                        *included = ClassId(Symbol::from(found.as_str()));
+                match names.resolved(span, included.0.as_str()) {
+                    Some(resolved) => *included = resolved,
+                    None => {
+                        if let Some(found) = ancestor_constant(&owner, included.0.as_str(), &parents, &declared) {
+                            *included = ClassId(Symbol::from(found.as_str()));
+                        }
                     }
                 }
             }

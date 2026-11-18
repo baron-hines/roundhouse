@@ -1691,21 +1691,30 @@ impl<'a> BodyTyper<'a> {
     /// A bare constant Rubydex leaves unanswered where the class mixes in more than one module (`LIMIT` from
     /// `include RateConcept` beside `include PriceConcept`; one alone resolves): Ruby's ancestor lookup, the class,
     /// its modules (the last included first), then its superclass and on, among the app's declarations.
-    fn mixed_in_constant(&self, path: &mut Vec<Symbol>, ctx: &Ctx) -> Option<Ty> {
+    fn mixed_in_constant(&self, path: &mut Vec<Symbol>, ctx: &Ctx, decisions: u64) -> Option<Ty> {
+        // Not from `class << self`: Ruby looks a bare name up through the singleton class there, a NameError the
+        // caller keeps.
+        if decisions & crate::expr::SINGLETON_CREF_CONST_REF != 0 {
+            return None;
+        }
         let [name] = path.as_slice() else { return None };
         let Some(Ty::Class { id, .. }) = ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) else { return None };
         let classes = self.classes();
+        // Each module followed by its own modules, the last included first, as Ruby's ancestors list them.
+        fn with_modules(m: &ClassId, classes: &HashMap<ClassId, ClassInfo>, order: &mut Vec<ClassId>) {
+            if order.contains(m) {
+                return;
+            }
+            order.push(m.clone());
+            for inner in classes.get(m).map(|i| i.includes.iter().rev().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+                with_modules(&inner, classes, order);
+            }
+        }
         let mut order: Vec<ClassId> = Vec::new();
         let mut current = Some(id.clone());
         while let Some(c) = current.filter(|c| !order.contains(c)) {
-            order.push(c.clone());
-            let info = classes.get(&c);
-            for m in info.map(|i| i.includes.iter().rev().cloned().collect::<Vec<_>>()).unwrap_or_default() {
-                if !order.contains(&m) {
-                    order.push(m);
-                }
-            }
-            current = info.and_then(|i| i.parent.clone());
+            with_modules(&c, classes, &mut order);
+            current = classes.get(&c).and_then(|i| i.parent.clone());
         }
         for owner in order {
             let full = format!("{}::{}", owner.0.as_str(), name.as_str());
@@ -1963,7 +1972,7 @@ impl<'a> BodyTyper<'a> {
                     }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
-                    Some(None) => self.mixed_in_constant(path, ctx).unwrap_or_else(|| exact_modeled_class(path)),
+                    Some(None) => self.mixed_in_constant(path, ctx, expr.decisions).unwrap_or_else(|| exact_modeled_class(path)),
                     // A borrowed span is not evidence of a written constant
                     // only when the producer marked its generated origin.
                     None if indexed_source
@@ -1971,7 +1980,7 @@ impl<'a> BodyTyper<'a> {
                     {
                         exact_modeled_class(path)
                     }
-                    None if indexed_source => self.mixed_in_constant(path, ctx).unwrap_or_else(unknown),
+                    None if indexed_source => self.mixed_in_constant(path, ctx, expr.decisions).unwrap_or_else(unknown),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A
                     // qualified name `A::B` names its owner, so only the
