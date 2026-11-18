@@ -38,6 +38,13 @@ end
     [a.id, a.association(:account).loaded?]
   end
 
+  def cached_author_with_account
+    a = author
+    a.account
+    a.name = "unsaved"
+    author_with_account.name
+  end
+
   def self.unsaved_author_flags(name)
     a = Author.new(name: name)
     [a.new_record?, a.admin?]
@@ -80,8 +87,8 @@ const SCRIPT: &str = r##"account = Account.create!(name: "a")
 author = Author.create!(name: "w", account_id: account.id)
 post = Post.create!(title: "t", author_id: author.id)
 fresh = Post.find(post.id)
-got = [fresh.author_flags, fresh.loaded_author_with_account, Post.find(post.id).dirty_author_flags, Post.created_author_flags("n"), Post.unsaved_author_flags("u")]
-expected = [[false, false, false, false, false], [author.id, true], [true, false], [true, false, false], [true, false]]
+got = [fresh.author_flags, fresh.loaded_author_with_account, Post.find(post.id).cached_author_with_account, Post.find(post.id).dirty_author_flags, Post.created_author_flags("n"), Post.unsaved_author_flags("u")]
+expected = [[false, false, false, false, false], [author.id, true], "unsaved", [true, false], [true, false, false], [true, false]]
 raise "model active record methods: #{got.inspect}" unless got == expected
 puts "probe passed"
 "##;
