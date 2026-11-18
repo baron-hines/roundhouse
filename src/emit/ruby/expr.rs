@@ -1678,6 +1678,11 @@ fn binop_of(e: &Expr) -> Option<&str> {
         // re-parses as `hrc = (HatRequest.count > 0)`, the local becoming
         // the comparison.
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => Some("="),
+        // A statement sequence at a value site (`lower::update_kwargs`'
+        // `rec.x = v; rec.save` for `rec.update(x: v) == true`): bare, its
+        // newline ends the operator's line, and the operator applies to
+        // the last statement only.
+        ExprNode::Seq { exprs } if exprs.len() > 1 => Some("="),
         // A range binds looser than every infix operator and `||`/`&&`:
         // `out << (start...limit)` written bare is `(out << start)...limit`,
         // which pushes the Integer (and `ruby -w` flags the range as

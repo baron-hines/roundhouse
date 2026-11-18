@@ -125,7 +125,14 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("URI", "DEFAULT_PARSER", uri_rfc3986_parser),
     ("URI", "RFC3986_PARSER", uri_rfc3986_parser),
     ("URI", "RFC2396_PARSER", uri_rfc2396_parser),
+    // `RbConfig::CONFIG["host_os"]` — a gem's platform branch. Ruby's own on the ruby family, spinel's
+    // `builtins/rbconfig.rb` (the machine it compiled for, String values throughout) on spinel.
+    ("RbConfig", "CONFIG", str_str_hash),
 ];
+
+fn str_str_hash() -> Ty {
+    Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }
+}
 
 fn uri_rfc2396_parser() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("URI::RFC2396_Parser")), args: vec![].into() }
@@ -136,7 +143,7 @@ fn uri_rfc3986_parser() -> Ty {
 }
 
 /// Owners of value Consts that Ruby defines as modules, not classes.
-const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib"];
+const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib", "RbConfig"];
 
 /// Ruby's top-level value Consts: `STDERR.puts "…"` (discourse's
 /// warnings) reads the process's own stream, which `$stderr` is only
@@ -172,6 +179,7 @@ fn rbs_type_name(ty: &Ty) -> &'static str {
         Ty::Int => "Integer",
         Ty::Str => "String",
         Ty::Class { id, .. } if id.0.as_str() == "Encoding" => "Encoding",
+        Ty::Hash { key, value } if matches!((&**key, &**value), (Ty::Str, Ty::Str)) => "Hash[String, String]",
         _ => "untyped",
     }
 }
@@ -1386,6 +1394,43 @@ fn answer_file(
                     slot.insert(target);
                 }
             }
+        }
+    }
+    // `extend Plugs::Basic` in a file-level block (`Version.class_eval do … end`): the index records a mixin only in
+    // a namespace's body, so it keeps the path's `Plugs` and drops `Basic`. A name after a resolved namespace is that
+    // namespace's own, as `Plugs::Basic` is anywhere; only a class or module there is taken.
+    let namespaces: Vec<(u32, Arc<ClassId>)> = answers.references.iter()
+        .filter_map(|(key, answer)| match answer {
+            Some(ResolvedConstant::Namespace { class, .. }) => Some((*key, Arc::clone(class))),
+            _ => None,
+        })
+        .collect();
+    let ident_len = |at: usize| source.text.get(at..).map_or(0, |rest| rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count());
+    for (start, class) in namespaces {
+        let mut owner = class.0.to_string();
+        let mut end = start as usize + ident_len(start as usize);
+        while source.text.get(end..end + 2) == Some("::") {
+            let at = end + 2;
+            let len = ident_len(at);
+            let Some(name) = source.text.get(at..at + len).filter(|n| n.starts_with(|c: char| c.is_ascii_uppercase())) else { break };
+            let Ok(key) = u32::try_from(at) else { break };
+            if answers.references.contains_key(&key) {
+                break;
+            }
+            let full = format!("{owner}::{name}");
+            let Some(declaration) = graph.declarations().get(&DeclarationId::from(full.as_str())) else { break };
+            if declaration.as_namespace().is_none() || is_assigned_value(graph, declaration) {
+                break;
+            }
+            if declaration.kind() == "Class" {
+                answers.class_references.insert(key);
+            }
+            answers.references.insert(key, Some(ResolvedConstant::Namespace {
+                class: Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
+                runtime: is_runtime_declaration(graph, declaration),
+            }));
+            owner = full;
+            end = at + len;
         }
     }
     for definition_id in document.definitions() {

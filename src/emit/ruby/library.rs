@@ -239,8 +239,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         // `ShortId::CandidateId`) nests as `active_record/base.rb` —
         // a literal `::` in the filename breaks the emitted
         // Makefile's dependency list.
-        let file_stem = crate::naming::underscore(lc.name.0.as_str());
-        let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+        let out_path = super::class_paths::class_rb(lc.name.0.as_str());
         let mut files = if kids.is_empty() {
             emit_library_class_pair_in(lc, app, classes, &factories, out_path)
         } else {
@@ -585,20 +584,18 @@ fn splice_data_block(
 ) {
     let name = block.name.0.as_str();
     let owner = file_owner(name, app, classes);
-    let owner_stem = crate::naming::underscore(&owner);
-    let owner_rb_path = PathBuf::from(format!("app/models/{owner_stem}.rb"));
-    let owner_rbs_path = PathBuf::from(format!("app/models/{owner_stem}.rbs"));
+    let owner_rb_path = super::class_paths::class_rb(&owner);
+    let owner_rbs_path = super::class_paths::class_rbs(&owner);
     let depth = name.split("::").count();
     let last = name.rsplit("::").next().unwrap_or(name);
     let indent = "  ".repeat(depth - 1);
-    let stem = crate::naming::underscore(name);
-    let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
+    let rb_path = super::class_paths::class_rb(name);
     let rendered = emit_library_class_decl_in(block, app, classes, factories, rb_path.clone(), &[], &[]);
     let lines: Vec<&str> = rendered.content.lines().collect();
     let mut hoisted = Vec::new();
     for line in lines.iter().filter(|line| line.starts_with("require_relative ")) {
         let target = line.trim_start_matches("require_relative ").trim().trim_matches('"');
-        let rebased = rebase_relative(&stem, &owner, target, app);
+        let rebased = rebase_relative(name, &owner, target, app);
         hoisted.push(format!("require_relative {rebased:?}"));
     }
     hoisted.extend(
@@ -683,20 +680,15 @@ fn splice_data_block(
 /// Both files live under `app/models/`, so the arithmetic is on that
 /// tree: resolve the target against the directory the child's file
 /// WOULD have had, then re-express it against the parent's.
-fn rebase_relative(child_stem: &str, parent_name: &str, target: &str, app: &App) -> String {
+fn rebase_relative(child_name: &str, parent_name: &str, target: &str, app: &App) -> String {
     let _ = app;
     // Anchored at the TREE root, not at `app/models`: a require can
     // climb out of the models directory (`../../../runtime/x`), and
     // arithmetic that starts inside it loses those steps silently —
     // the `..` pops an empty stack and the path comes out too short.
-    let mut child_dir: Vec<String> =
-        vec!["app".to_string(), "models".to_string()];
-    child_dir.extend(child_stem.split('/').map(str::to_string));
+    let mut child_dir: Vec<String> = super::class_paths::class_anchor(child_name).split('/').map(str::to_string).collect();
     child_dir.pop();
-    let parent_stem = crate::naming::underscore(parent_name);
-    let mut parent_dir: Vec<String> =
-        vec!["app".to_string(), "models".to_string()];
-    parent_dir.extend(parent_stem.split('/').map(str::to_string));
+    let mut parent_dir: Vec<String> = super::class_paths::class_anchor(parent_name).split('/').map(str::to_string).collect();
     parent_dir.pop();
 
     let mut resolved: Vec<String> = child_dir.clone();
@@ -818,8 +810,7 @@ fn emit_library_class_with_nested(
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
     for kid in kids {
-        let stem = crate::naming::underscore(kid.name.0.as_str());
-        let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
+        let rb_path = super::class_paths::class_rb(kid.name.0.as_str());
         let rendered = emit_library_class_decl_in(kid, app, classes, factories, rb_path.clone(), &[], &[]);
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
@@ -833,7 +824,7 @@ fn emit_library_class_with_nested(
         for line in lines.iter().filter(|l| l.starts_with("require_relative ")) {
             let Some(rest) = line.strip_prefix("require_relative ") else { continue };
             let target = rest.trim().trim_matches('"');
-            let rebased = rebase_relative(&stem, parent.name.0.as_str(), target, app);
+            let rebased = rebase_relative(kid.name.0.as_str(), parent.name.0.as_str(), target, app);
             // A sibling that is now in THIS file needs no require, and
             // naming it would name a path that no longer exists: one
             // child referencing another is the common case in a class
@@ -9428,7 +9419,20 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
-    for inc in &lc.includes {
+    // A model's `prepend Concern` names a module this file must load
+    // before the class body runs, exactly as an `include` does — and one
+    // the concern splice claimed, so there IS a module to load: an
+    // unclaimed `prepend` (`prepend PlainModule`) stays the reported gap
+    // the lowering gives it, and is written nowhere. Every declaration of
+    // the model's name contributes: the file is written once, and the
+    // `prepend` may sit in the reopening file rather than the first one.
+    let prepends: Vec<Vec<crate::ident::ClassId>> = app
+        .models
+        .iter()
+        .filter(|m| m.name == lc.name)
+        .flat_map(|m| crate::analyze::claimed_prepend_statements(m, &app.concern_prepended_items))
+        .collect();
+    for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -9927,6 +9931,20 @@ fn emit_library_class_decl_inner(
         nested.borrow_mut().write_include(&mut s, depth, lc, inc);
         writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
     }
+    // A model's `prepend Concern`: the module's instance methods sit
+    // AHEAD of the class's own there and reach them through `super`,
+    // which an `include` would not give it. What the module's `prepended
+    // do` block declared is already in the body above. ONE statement per
+    // source statement, arguments in written order: Ruby puts the first
+    // argument of `prepend A, B` ahead of the second, while two separate
+    // `prepend` lines would put B ahead of A.
+    for statement in &prepends {
+        for inc in statement {
+            nested.borrow_mut().write_include(&mut s, depth, lc, inc);
+        }
+        let names: Vec<String> = statement.iter().map(|inc| include_name(inc)).collect();
+        writeln!(s, "{body_pad}prepend {}", names.join(", ")).unwrap();
+    }
     if lc.includes.len() > positioned.len() + ordered_includes.len() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -9992,7 +10010,7 @@ fn emit_library_class_decl_inner(
     let written_conditionals: std::cell::RefCell<Vec<usize>> = Default::default();
     // A branch's class or module loads from its own file, here.
     let require_of = |name: &ClassId| -> String {
-        let anchor = format!("app/models/{}", crate::naming::underscore(&file_owner(name.0.as_str(), app, classes)));
+        let anchor = super::class_paths::class_anchor(&file_owner(name.0.as_str(), app, classes));
         format!("require_relative {:?}", relpath(&out_dir, &anchor))
     };
     fn write(
@@ -11430,7 +11448,7 @@ fn require_path_for_parent(parent: &ClassId, app: &App, classes: &[LibraryClass]
     {
         // underscore: namespaced parents nest (see emit_library_class_decls).
         let owner = file_owner(raw, app, classes);
-        return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        return Some(super::class_paths::class_anchor(&owner));
     }
     if is_controller_named(raw, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(raw)));
@@ -11575,7 +11593,7 @@ fn require_path_for_body_const(
         if owner == self_name {
             return None;
         }
-        return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        return Some(super::class_paths::class_anchor(&owner));
     }
     // A bare reference inside a namespace resolves LEXICALLY first:
     // campfire's `module ContentFilters` builds
@@ -11593,12 +11611,12 @@ fn require_path_for_body_const(
         if owner == self_name {
             return None;
         }
-        return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        return Some(super::class_paths::class_anchor(&owner));
     }
     // Any constant of a file of constants alone is that file's, not only
     // the one it is named for: `Labels = DEFAULT` beside `DEFAULT = […]`.
     if let Some(owner) = file_constant_owner(first, app, classes) {
-        return (owner != self_name).then(|| format!("app/models/{}", crate::naming::underscore(&owner)));
+        return (owner != self_name).then(|| super::class_paths::class_anchor(&owner));
     }
     if first == self_name {
         return None;
@@ -11614,7 +11632,7 @@ fn require_path_for_body_const(
     }
     if is_model_or_library_class(first, app, classes)
     {
-        return Some(format!("app/models/{}", crate::naming::underscore(first)));
+        return Some(super::class_paths::class_anchor(first));
     }
     if is_controller_named(first, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(first)));

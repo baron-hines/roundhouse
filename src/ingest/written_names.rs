@@ -1,4 +1,5 @@
-//! Each superclass and `include` target the source writes, and the
+//! Each superclass and `include` target (and a model's `prepend`
+//! target) the source writes, and the
 //! class a job's `X.queue_adapter =` names, resolved once from
 //! Rubydex's answers and stored on the IR in place.
 //!
@@ -82,7 +83,7 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
         }
         for item in &mut model.body {
             if let ModelBodyItem::Unknown { expr, .. } = item {
-                names.rewrite_mixin_call(expr, &["include"]);
+                names.rewrite_mixin_call(expr, &["include", "prepend"]);
             }
         }
     }
@@ -236,7 +237,7 @@ impl Names<'_> {
         found
     }
 
-    /// `include X` in a model or controller body, or (passing
+    /// `include X` in a model or controller body, a model's `prepend X`, or (passing
     /// `&["extend", "prepend"]`) a library class's own `extend`/
     /// `prepend` captured verbatim in its `unknown_calls`. A rooted
     /// `::X` is absolute as written.

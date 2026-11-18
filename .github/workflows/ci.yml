@@ -90,6 +90,7 @@ jobs:
       publish: ${{ steps.plan.outputs.publish }}
       spinel-revision: ${{ steps.plan.outputs.spinel-revision }}
       spinel-tests: ${{ steps.plan.outputs.spinel-tests }}
+      spinel-gems: ${{ steps.plan.outputs.spinel-gems }}
       spinel-framework-shards: ${{ steps.plan.outputs.spinel-framework-shards }}
       spinel-timings: ${{ steps.plan.outputs.spinel-timings }}
     steps:
@@ -1941,6 +1942,10 @@ jobs:
           # view_component and method_source, built natively (tests/spinel_toolchain/view_component.rs).
           gem install --no-document --ignore-dependencies view_component -v 3.23.2
           gem install --no-document --ignore-dependencies method_source -v 1.1.0
+          # aasm, built natively, and what the CRuby tree its build boots to observe aasm needs (tests/spinel_toolchain/aasm.rs).
+          gem install --no-document --ignore-dependencies aasm -v 5.5.1
+          gem install --no-document --ignore-dependencies concurrent-ruby -v 1.3.8
+          gem install --no-document sqlite3 -v 2.10.0
       # One process per test, as many as libtest's threads, so each test's seconds are its own.
       - name: run spinel_toolchain ignored suite (${{ matrix.shard }})
         env:
@@ -2120,12 +2125,13 @@ jobs:
       - name: Collect and plan shared toolchain builds
         env:
           RUST_MIN_STACK: "33554432"
+          CI_SPINEL_GEMS: ${{ needs.plan.outputs.spinel-gems }}
         run: |
           test -x "$SPINEL_TOOLCHAIN_BIN"
           out="$RUNNER_TEMP/bundle-plan"
           mkdir -p "$out/bundle-all"
           "$SPINEL_TOOLCHAIN_BIN" --ignored --list --format terse | sed -n 's/: test$//p' \
-            | grep -vx -e spinel_bundle_build -e spinel_bundle_plan > "$out/tests.txt"
+            | grep -vx -e spinel_bundle_build -e spinel_bundle_plan | python3 scripts/ci-plan.py toolchain-tests > "$out/tests.txt"
           test -s "$out/tests.txt"
           start=$(date +%s)
           # Not checked: a collected test stops by failing, and one that is not collected is killed.
