@@ -363,3 +363,123 @@ fn a_concerns_includers_run_their_winning_definitions_on_spinel_second_review() 
         assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
     }
 }
+
+/// Review 3: a module already in the chain as the insertion point, for
+/// plain modules and for concerns; a name defined twice in one branch; a
+/// query helper given the association; a guard Ruby read at load time.
+fn third_app() -> emit_and_run::Overlay {
+    let module = |name: &str, concern: bool, body: &str| {
+        let extend = if concern { "  extend ActiveSupport::Concern\n\n" } else { "" };
+        format!("module {name}\n{extend}{body}end\n")
+    };
+    let includer = |name: &str| {
+        format!("class {name} < ApplicationRecord\n  has_many :tokens, as: :bearer\n  include Shared\n  include Wrapper\n  include PlainShared\n  include PlainWrapper\n  include Branched\n  include Fallback\n  include Guarded\nend\n")
+    };
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/token.rb", "class Token < ApplicationRecord\n  belongs_to :bearer, polymorphic: true\nend\n")
+        .write("app/models/picker.rb", "class Picker\n  def self.pick(rows)\n    rows.order(:name).first\n  end\nend\n")
+        .write("app/models/concerns/shared.rb", &module("Shared", true, "  def issue_token!(name)\n    nil\n  end\n"))
+        .write("app/models/concerns/tail.rb", &module("Tail", true, "  def issue_token!(name)\n    tokens.create!(name: \"tail #{name}\")\n  end\n"))
+        .write("app/models/concerns/wrapper.rb", &module("Wrapper", true, "  include Tail\n  include Shared\n"))
+        .write("app/models/concerns/plain_shared.rb", &module("PlainShared", false, "  def plain_token!(name)\n    nil\n  end\n"))
+        .write("app/models/concerns/plain_tail.rb", &module("PlainTail", false, "  def plain_token!(name)\n    tokens.create!(name: \"plain tail #{name}\")\n  end\n"))
+        .write("app/models/concerns/plain_wrapper.rb", &module("PlainWrapper", false, "  include PlainTail\n  include PlainShared\n"))
+        .write(
+            "app/models/concerns/branched.rb",
+            &module(
+                "Branched",
+                true,
+                "  if RUBY_VERSION >= \"3.0\"\n    def branch_token!(name)\n      tokens.create!(name: name)\n    end\n\n    def branch_token!(name)\n      nil\n    end\n  end\n\n  def first_token_name\n    Picker.pick(tokens)&.name\n  end\n",
+            ),
+        )
+        .write("app/models/concerns/fallback.rb", &module("Fallback", true, "  def guarded_token!(name)\n    nil\n  end\n"))
+        .write(
+            "app/models/concerns/guarded.rb",
+            &module("Guarded", true, "  if method_defined?(:guarded_token!)\n    def guarded_token!(name)\n      tokens.create!(name: \"guarded #{name}\")\n    end\n  end\n"),
+        )
+        .write("app/models/shop.rb", &includer("Shop"))
+        .write("app/models/stall.rb", &includer("Stall"))
+        .write("db/schema.rb", r##"ActiveRecord::Schema.define do
+  create_table "shops", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "stalls", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "tokens", force: :cascade do |t|
+    t.string "bearer_type"
+    t.integer "bearer_id"
+    t.string "name"
+  end
+end
+"##)
+}
+
+const INSERTION_POINT: &str = r##"shop = Shop.create!
+got = [shop.plain_token!("a"), Token.count, shop.issue_token!("b").name, Token.count]
+expected = [nil, 0, "tail b", 1]
+raise "insertion_point: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_module_already_included_is_where_the_next_ones_go() {
+    let run = third_app().run_ruby(INSERTION_POINT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const SAME_BRANCH: &str = r##"got = [Shop.create!.branch_token!("a"), Stall.create!.branch_token!("b"), Token.count]
+expected = [nil, nil, 0]
+raise "same_branch: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_branch_runs_its_own_last_definition_of_a_name() {
+    let run = third_app().run_ruby(SAME_BRANCH);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const QUERY_ARGUMENT: &str = r##"shop = Shop.create!
+shop.tokens.create!(name: "b")
+shop.tokens.create!(name: "a")
+stall = Stall.create!
+stall.tokens.create!(name: "c")
+got = [shop.first_token_name, stall.first_token_name]
+expected = ["a", "c"]
+raise "query_argument: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_query_helper_gets_each_includers_association() {
+    let run = third_app().run_ruby(QUERY_ARGUMENT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const GUARD_AT_LOAD: &str = r##"got = [Shop.create!.guarded_token!("a"), Stall.create!.guarded_token!("b"), Token.count]
+expected = [nil, nil, 0]
+raise "guard_at_load: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_guard_ruby_read_at_load_time_is_not_read_again_in_the_model() {
+    let run = third_app().run_ruby(GUARD_AT_LOAD);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_concerns_includers_run_their_winning_definitions_on_spinel_third_review() {
+    for script in [INSERTION_POINT, SAME_BRANCH, QUERY_ARGUMENT, GUARD_AT_LOAD] {
+        let run = third_app().run_spinel_with_db(script);
+        run.assert_passes();
+        assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    }
+}
