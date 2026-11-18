@@ -22737,5 +22737,9 @@ mod concern_prepended_namespaced;
 // A model whose include defines `method_missing`: ActiveRecord's own methods still answer.
 #[path = "emit_and_run/model_method_missing_active_record.rs"]
 mod model_method_missing_active_record;
+#[path = "emit_and_run/token_for_string_key.rs"]
+mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;
+#[path = "emit_and_run/params_compact_blank.rs"]
+mod params_compact_blank;
