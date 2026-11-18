@@ -459,3 +459,62 @@ fn a_writing_scope_in_a_scope_parameter_default_is_restored() {
     let text = std::fs::read_to_string(emitted.join("app/models/note.rb")).expect("emitted note");
     assert!(text.contains("ActiveRecord::Base.connected_to(role: :writing)"), "{text}");
 }
+
+fn model_expression_roots() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("has_many scope", "has_many :children, -> { where(tag: BODY) }, class_name: 'Note', foreign_key: :parent_id", "'writing'"),
+        ("has_one scope", "has_one :child, -> { where(tag: BODY) }, class_name: 'Note', foreign_key: :parent_id", "'writing'"),
+        ("belongs_to scope", "belongs_to :parent, -> { where(tag: BODY) }, class_name: 'Note', optional: true", "'writing'"),
+        ("belongs_to default", "belongs_to :parent, class_name: 'Note', optional: true, default: -> { BODY }", "Note.first"),
+        ("extension body", "has_many :children, class_name: 'Note', foreign_key: :parent_id do\n    def probe\n      BODY\n    end\n  end", "1"),
+        ("extension default", "has_many :children, class_name: 'Note', foreign_key: :parent_id do\n    def probe(value = BODY)\n      value\n    end\n  end", "1"),
+        ("validation if", "validates :tag, presence: true, if: -> { BODY }", "true"),
+        ("validation unless", "validates :tag, presence: true, unless: -> { BODY }", "false"),
+        ("inclusion callable", "validates :tag, inclusion: { in: -> { BODY } }", "['writing']"),
+        ("exclusion callable", "validates :tag, exclusion: { in: -> { BODY } }", "['forbidden']"),
+        ("comparison callable", "validates :parent_id, comparison: { greater_than: -> { BODY } }", "0"),
+        ("callback condition", "before_validation :probe, if: -> { BODY }\n  def probe\n    true\n  end", "true"),
+        ("callback block", "before_validation do\n    BODY\n  end", "true"),
+        ("attribute default", "attribute :label, :string, default: -> { BODY }", "ApplicationRecord.current_role.to_s"),
+        ("class scope", "scope :chosen, -> { where(tag: BODY) }", "'writing'"),
+        ("class attribute default", "cattr_accessor :setting, default: -> { BODY }", "1"),
+    ]
+}
+
+fn routed_expression_model(declaration: &str) -> emit_and_run::Overlay {
+    let schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :notes do |t|\n    t.string :tag\n    t.integer :parent_id\n  end\nend\n";
+    shards().write("db/schema.rb", schema).write("app/models/note.rb", &format!("class Note < ApplicationRecord\n  {declaration}\nend\n"))
+}
+
+fn emitted_model_sources(dir: &std::path::Path) -> String {
+    let mut source = String::new();
+    for entry in std::fs::read_dir(dir).expect("emitted model directory") {
+        let path = entry.unwrap().path();
+        if path.is_dir() { source.push_str(&emitted_model_sources(&path)); }
+        else if path.extension().is_some_and(|ext| ext == "rb") { source.push_str(&std::fs::read_to_string(path).unwrap()); }
+    }
+    source
+}
+
+#[test]
+fn writing_scopes_are_restored_in_every_model_expression_root() {
+    let mut missed = Vec::new();
+    for (name, template, value) in model_expression_roots() {
+        let body = format!("ActiveRecord::Base.connected_to(role: :writing) {{ {value} }}");
+        let (emitted, errors) = routed_expression_model(&template.replace("BODY", &body)).emit(BuildTarget::Spinel);
+        let source = emitted_model_sources(&emitted.join("app/models"));
+        if !errors.is_empty() || !source.contains("ActiveRecord::Base.connected_to(role: :writing)") { missed.push(format!("{name}: {errors:?}")); }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
+}
+
+#[test]
+fn switches_in_every_model_expression_root_are_refused_by_name() {
+    let mut missed = Vec::new();
+    for (name, template, value) in model_expression_roots() {
+        let body = format!("Note.connected_to(shard: :right) {{ {value} }}");
+        let (_, errors) = routed_expression_model(&template.replace("BODY", &body)).emit(BuildTarget::Spinel);
+        if !errors.iter().any(|error| error.contains("`connected_to` here is not a scope the routed runtime carries")) { missed.push(format!("{name}: {errors:?}")); }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
+}

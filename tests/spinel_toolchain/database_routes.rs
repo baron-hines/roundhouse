@@ -153,3 +153,14 @@ fn a_shared_named_schema_supports_a_primary_default_writer() {
     run.assert_passes();
     assert_eq!(run.stdout, "secondary\nprimary\n");
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn association_scopes_and_defaults_keep_their_writing_scope() {
+    let schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :notes do |t|\n    t.string :tag, null: false\n    t.integer :parent_id\n  end\nend\n";
+    let note = "class Note < ApplicationRecord\n  has_many :children, -> { where(tag: ActiveRecord::Base.connected_to(role: :writing) { ApplicationRecord.current_role.to_s }) }, class_name: 'Note', foreign_key: :parent_id\n  belongs_to :parent, class_name: 'Note', optional: true, default: -> { ActiveRecord::Base.connected_to(role: :writing) { Note.find_by(tag: ApplicationRecord.current_role.to_s) } }\nend\n";
+    let run = contract::app(contract::SHARDS, "class RouteReport\nend\n").write("db/schema.rb", schema).write("app/models/note.rb", note)
+        .run_spinel(&format!("{}owner = Note.create!(tag: \"owner\")\nNote.create!(tag: \"writing\", parent_id: owner.id)\nApplicationRecord.connected_to(role: :reading) do\n  puts \"association=\" + owner.children.count.to_s\n  fresh = Note.new(tag: \"default\")\n  fresh.valid?\n  puts \"default=\" + fresh.parent_id.to_s\nend\n", contract::BOOT));
+    run.assert_passes();
+    assert_eq!(run.stdout, "association=1\ndefault=2\n");
+}

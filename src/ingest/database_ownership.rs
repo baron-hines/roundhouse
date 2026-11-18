@@ -557,12 +557,14 @@ pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App
 
 /// Every body the switch walk reads.
 fn each_body(app: &mut App, f: &mut dyn FnMut(&mut Expr)) {
+    use crate::dialect::{Association, ValidationRule};
     // A method's body and its parameters' defaults, which a call runs too.
     fn method(m: &mut crate::dialect::MethodDef, f: &mut dyn FnMut(&mut Expr)) {
         f(&mut m.body);
         m.params.iter_mut().filter_map(|p| p.default.as_mut()).for_each(f);
     }
     for model in &mut app.models {
+        model.class_attr_defaults.values_mut().for_each(&mut *f);
         for item in &mut model.body {
             match item {
                 ModelBodyItem::Method { method: m, .. } => method(m, f),
@@ -571,7 +573,30 @@ fn each_body(app: &mut App, f: &mut dyn FnMut(&mut Expr)) {
                     scope.params.iter_mut().filter_map(|p| p.default.as_mut()).for_each(&mut *f);
                     f(&mut scope.body);
                 }
-                _ => {}
+                ModelBodyItem::Association { assoc, .. } => match assoc {
+                    Association::BelongsTo { scope, default, .. } => scope.iter_mut().chain(default.iter_mut()).for_each(&mut *f),
+                    Association::HasMany { scope, extension, .. } => {
+                        scope.iter_mut().for_each(&mut *f);
+                        extension.iter_mut().for_each(|m| method(m, f));
+                    }
+                    Association::HasOne { scope, .. } => scope.iter_mut().for_each(&mut *f),
+                    Association::HasAndBelongsToMany { .. } => {}
+                },
+                ModelBodyItem::Validation { validation, .. } => {
+                    validation.if_cond.iter_mut().chain(validation.unless_cond.iter_mut()).for_each(&mut *f);
+                    for rule in &mut validation.rules {
+                        match rule {
+                            ValidationRule::InclusionCall { set } | ValidationRule::ExclusionCall { set } => f(set),
+                            ValidationRule::Comparison { checks } => checks.iter_mut().for_each(|(_, bound)| f(bound)),
+                            ValidationRule::Presence | ValidationRule::Absence | ValidationRule::Confirmation { .. }
+                            | ValidationRule::Acceptance { .. } | ValidationRule::Uniqueness { .. } | ValidationRule::Length { .. }
+                            | ValidationRule::Format { .. } | ValidationRule::Numericality { .. } | ValidationRule::Inclusion { .. }
+                            | ValidationRule::Exclusion { .. } | ValidationRule::Custom { .. } => {}
+                        }
+                    }
+                }
+                ModelBodyItem::Callback { callback, .. } => callback.condition.iter_mut().for_each(&mut *f),
+                ModelBodyItem::Alias { .. } => {}
             }
         }
     }
