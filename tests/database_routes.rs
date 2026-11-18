@@ -71,6 +71,16 @@ fn a_shard_named_with_a_leading_digit_is_quoted() {
     assert!(routes.contains("@default_shard = :\"2026\"\n"), "{routes}");
 }
 
+#[test]
+fn an_unreadable_schema_does_not_admit_routes_in_survey() {
+    roundhouse::ingest::survey::activate();
+    let (db, errors) = spinel_db(shards().remove("db/schema.rb").write("db/schema.rb/unreadable", ""));
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(gaps.iter().any(|gap| gap.to_string().contains("file not readable")), "{gaps:?}");
+    assert!(errors.iter().any(|error| error.contains("shard routing is not modeled")), "{errors:?}");
+    assert_eq!(generated(&db), "# >>> generated: database-routes\n    ");
+}
+
 /// A model's `prepend Concern` in a routed app stays the concern
 /// splice's statement: the flag that claims it is not the one that marks
 /// a writing block ingest read as its body, so the routes do not put a
