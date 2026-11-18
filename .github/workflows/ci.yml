@@ -68,7 +68,8 @@ env:
   SPINEL_REDIS_REF: v0.3.3
   # The cache key of the recorded Spinel test seconds the plan balances and budgets shards on. Full validation keeps
   # its own: it compiles each contract inside the whole blog's boot (ROUNDHOUSE_SPINEL_SLIM=0), so its seconds are not
-  # a push run's. Neither key is a prefix of the other, so neither run's restore-keys picks up the other's seconds.
+  # a push run's. Full validation falls back to spinel-timings- until it has saved its own. Neither key is a prefix of
+  # the other, so a push or PR run, which restores only spinel-timings-, never starts from Full validation's seconds.
   SPINEL_TIMINGS_KEY: ${{ inputs.full && 'spinel-full-timings' || 'spinel-timings' }}
 
 jobs:
