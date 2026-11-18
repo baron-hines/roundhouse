@@ -1325,7 +1325,7 @@ end
 # A parked frame holds a handle's lease without selecting its slot for models.
 class DbScope
   attr_reader :global, :role, :shard, :prevent
-  attr_accessor :slot, :held, :from, :lease, :parked, :connection
+  attr_accessor :slot, :held, :from, :lease, :parked, :connection, :home, :pool
 
   def initialize(global, role, shard, prevent)
     @global = global
@@ -1338,6 +1338,8 @@ class DbScope
     @lease = -1
     @parked = false
     @connection = nil
+    @home = nil
+    @pool = nil
   end
 end
 
@@ -1711,16 +1713,19 @@ module Db
       reuse = held_connection(index)
       Thread.current[:db_conn] = reuse
     end
+    frame.home = slot
     # Leased also on a thread that holds none: the unleased fallback is the
     # slot's first connection, which threads would share through a handle.
     return nil if !Thread.current[:db_conn].nil? || !@routed
-    frame.lease = pool_for_thread.lease(@checkout_timeout)
+    pool = pool_for_thread
+    frame.pool = pool
+    frame.lease = pool.lease(@checkout_timeout)
     if frame.lease < 0
       Thread.current[:db_conn] = frame.held
       stack.pop
       raise ActiveRecord::ConnectionTimeoutError, checkout_expired
     end
-    Thread.current[:db_conn] = pool_for_thread.conn(frame.lease)
+    Thread.current[:db_conn] = pool.conn(frame.lease)
     nil
   end
 
@@ -1729,23 +1734,29 @@ module Db
     stack = scopes
     frame = stack[stack.length - 1]
     parked = frame.parked
+    home = frame.home
+    closed = home.nil? || home.closed
+    pool = frame.pool
     route_connection = Thread.current[:db_conn]
     frame.parked = false
-    Thread.current[:db_conn] = frame.connection if parked && frame.lease >= 0
+    Thread.current[:db_conn] = frame.connection if parked && frame.lease >= 0 && !closed
     begin
       if frame.lease >= 0
-        conn = current_conn
         begin
-          release_abandoned_write(conn)
-          conn.release_all
-          conn.trim!
+          if !closed
+            conn = current_conn
+            release_abandoned_write(conn)
+            conn.release_all
+            conn.trim!
+          end
         ensure
-          pool_for_thread.release(frame.lease)
+          pool.release(frame.lease) if !pool.nil?
         end
       end
     ensure
-      Thread.current[:db_conn] = frame.held if frame.lease >= 0 || frame.slot != frame.from
-      Thread.current[:db_conn] = route_connection if parked && frame.slot != frame.from
+      Thread.current[:db_conn] = frame.held if !closed && (frame.lease >= 0 || frame.slot != frame.from)
+      Thread.current[:db_conn] = route_connection if !closed && parked && frame.slot != frame.from
+      Thread.current[:db_conn] = nil if closed
       stack.pop
     end
     nil

@@ -579,8 +579,16 @@ Db.exec("BEGIN")
 Note.with_connection { Note.count }
 puts "borrowed-open=" + Db.in_lease?.to_s
 Db.exec("ROLLBACK")
+pool = Db.pool_for_thread
+ActiveRecord::Base.with_connection { Note.with_connection { Db.close } }
+puts "closed-lease=" + Db.in_lease?.to_s
+index = pool.lease(0.01)
+raise "closed pool lost its checkout" unless index == 0
+pool.release(index)
+Db.configure("storage/primary.sqlite3")
+puts "reopened-count=" + Note.count.to_s
 "##;
-pub const RAW_SWITCH_EXPECTED: &str = "raw-same=1\nraw-switch=refused\nraw-handle=refused\nraw-left=0\nraw-right=0\nraw-base-begins=4\nraw-scope=0\nborrowed-ended=false\nborrowed-open=true\n";
+pub const RAW_SWITCH_EXPECTED: &str = "raw-same=1\nraw-switch=refused\nraw-handle=refused\nraw-left=0\nraw-right=0\nraw-base-begins=4\nraw-scope=0\nborrowed-ended=false\nborrowed-open=true\nclosed-lease=false\nreopened-count=0\n";
 
 pub const SNAPSHOT_SCRIPT: &str = r##"Db.with_connection do
   ApplicationRecord.connected_to(role: :reading) do
