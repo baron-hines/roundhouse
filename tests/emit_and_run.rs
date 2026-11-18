@@ -22735,3 +22735,5 @@ mod concern_plain_includer;
 mod concern_prepended_namespaced;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;
+#[path = "emit_and_run/params_compact_blank.rs"]
+mod params_compact_blank;
