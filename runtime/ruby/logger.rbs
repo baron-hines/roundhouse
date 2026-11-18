@@ -4,6 +4,22 @@
 # `STDOUT` in production and a `StringIO` under test, and the only thing
 # either is asked for is `write`.
 class Logger
+  module Severity
+    DEBUG: Integer
+    INFO: Integer
+    WARN: Integer
+    ERROR: Integer
+    FATAL: Integer
+    UNKNOWN: Integer
+  end
+
+  DEBUG: Integer
+  INFO: Integer
+  WARN: Integer
+  ERROR: Integer
+  FATAL: Integer
+  UNKNOWN: Integer
+
   class Formatter
     # `untyped` for the three that Ruby itself leaves open, and it is
     # the accurate contract rather than a concession: `severity` is a
