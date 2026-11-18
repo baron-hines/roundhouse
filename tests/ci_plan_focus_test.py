@@ -116,6 +116,12 @@ class FocusLabels(unittest.TestCase):
         self.assertEqual(kept["spinel_tests"], ["solid_queue_durability"])
         self.assertTrue(kept["spinel_gems"])
 
+    def test_a_shared_path_promoted_to_full_keeps_its_gem_suites(self):
+        plan = ci.select(["src/emit/shared/schema_sql.rs"])
+        self.assertTrue(plan["full"])
+        self.assertTrue(ci.GEM_SPINEL_TESTS <= set(plan["spinel_tests"]))
+        self.assertFalse(ci.select(["src/emit/ruby.rs"]).get("full"))
+
     def test_gem_suite_names_name_real_suites(self):
         root = Path(__file__).parents[1]
         for name in ci.GEM_SPINEL_TESTS:

@@ -1143,7 +1143,7 @@ def select(
         if not full:
             raise ValueError("publication requires full validation mode")
         jobs.append("assemble-site")
-    return finish(
+    plan = finish(
         jobs,
         extra,
         floor_smoke,
@@ -1156,6 +1156,9 @@ def select(
         smoke_extra=extra_smoke,
         compare=compare,
     )
+    # (a shared code-generation path promotes the plan to full here, past the caller's labels)
+    plan["full"] = full
+    return plan
 
 
 def positive_seconds(value):
@@ -1812,7 +1815,7 @@ def main():
         plan["reasons"].append(reason)
     if marker is not None and not coverage.full:
         plan["reasons"].append(f"{CI_FULL_MARKER} in commit {marker[:12]}".rstrip())
-    apply_gem_suites(plan, full or coverage.gems)
+    apply_gem_suites(plan, full or plan.get("full", False) or coverage.gems)
     timings = spinel_timings_from_env()
     plan["spinel_framework_shards"] = spinel_framework_shards(plan["spinel_tests"] or [], timings=timings)
     if not any(timings.values()):
