@@ -487,3 +487,68 @@ fn a_concerns_includers_run_their_winning_definitions_on_spinel_third_review() {
         assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
     }
 }
+
+/// Review 4: a shared concern's literal reflective calls on a model, a
+/// scope (`Token.public_send(:named, name)`) and an association
+/// (`Shop.first.public_send(:tokens)`), which the module's own body
+/// reads as the direct calls.
+fn fourth_app() -> emit_and_run::Overlay {
+    let includer = |name: &str| format!("class {name} < ApplicationRecord\n  has_many :tokens, as: :bearer\n  include TokenHolder\nend\n");
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/token.rb", "class Token < ApplicationRecord\n  belongs_to :bearer, polymorphic: true\n  scope :named, ->(name) { where(name: name) }\nend\n")
+        .write("app/models/concerns/token_holder.rb", r##"module TokenHolder
+  extend ActiveSupport::Concern
+
+  def issue_and_count!(name)
+    tokens.create!(name: name)
+    Token.public_send(:named, name).count
+  end
+
+  def issue_with_first_shop!(name)
+    tokens.create!(name: name)
+    Shop.first.public_send(:tokens).create!(name: "first #{name}")
+  end
+end
+"##)
+        .write("app/models/shop.rb", &includer("Shop"))
+        .write("app/models/stall.rb", &includer("Stall"))
+        .write("db/schema.rb", r##"ActiveRecord::Schema.define do
+  create_table "shops", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "stalls", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "tokens", force: :cascade do |t|
+    t.string "bearer_type"
+    t.integer "bearer_id"
+    t.string "name"
+  end
+end
+"##)
+}
+
+const REFLECTIVE: &str = r##"shop = Shop.create!
+stall = Stall.create!
+first = stall.issue_with_first_shop!("a")
+got = [first.name, first.bearer_type, stall.issue_and_count!("b"), shop.issue_and_count!("b"), Token.where(bearer_type: "Stall").count]
+expected = ["first a", "Shop", 1, 2, 2]
+raise "reflective: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_copy_reads_a_literal_reflective_call_as_the_module_does() {
+    let run = fourth_app().run_ruby(REFLECTIVE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_copy_reads_a_literal_reflective_call_as_the_module_does_on_spinel() {
+    let run = fourth_app().run_spinel_with_db(REFLECTIVE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
