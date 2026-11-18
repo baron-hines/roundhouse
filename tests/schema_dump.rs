@@ -466,15 +466,19 @@ fn a_merge_after_other_keys_refuses_a_named_file() {
         "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  <<: *defaults\n",
         "defaults: &defaults\n  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=other.rb'\ntest:\n  adapter: sqlite3\n  url: 'sqlite3:///tmp/test.sqlite3'\n  <<: *defaults\n  schema_dump: catalog_schema.rb\n",
         "multi: &multi\n  catalog:\n    adapter: sqlite3\n    schema_dump: other.rb\ntest:\n  <<: *multi\n  reporting:\n    adapter: sqlite3\n    schema_dump: catalog_schema.rb\n",
+        "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  \"<<\": *defaults\n",
+        "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  '<<': *defaults\n",
     ] {
         let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
         assert!(checked.errors.iter().any(|e| e.contains("`test.") && e.contains("merge key")), "{yml}: {:?}", checked.errors);
         assert!(tables(&checked.app).is_empty(), "{yml}");
     }
-    let yml = "defaults: &defaults\n  adapter: sqlite3\n  schema_dump: other.rb\ntest:\n  <<: *defaults\n  schema_dump: catalog_schema.rb\n";
-    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
-    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
-    assert_eq!(tables(&checked.app), ["widgets"]);
+    for merge in ["<<", "\"<<\""] {
+        let yml = format!("defaults: &defaults\n  adapter: sqlite3\n  schema_dump: other.rb\ntest:\n  {merge}: *defaults\n  schema_dump: catalog_schema.rb\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
 }
 
 /// A quoted `schema_dump` key is the same String key, so its file is read.

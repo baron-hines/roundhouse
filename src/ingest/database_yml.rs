@@ -540,7 +540,9 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         // Psych applies a merge where it is written, over the keys before it, and puts the
         // configurations it brings first; serde_yaml_ng keeps the written keys and their order.
         // They agree on a merge written first in the primary's block, not on one between configurations.
-        if lines.iter().skip(1).any(|(_, key, _)| key == "<<") || three_tier && block(env_at).iter().any(|(_, key, _)| key == "<<") {
+        // A quoted `"<<"` merges too in Psych; only a `!!str` tag makes it an ordinary key.
+        let merge = |key: &String| key == "<<" || unquoted(key).as_deref() == Some("<<");
+        if lines.iter().skip(1).any(|(_, key, _)| merge(key)) || three_tier && block(env_at).iter().any(|(_, key, _)| merge(key)) {
             refuse(offset, unsupported(&written, "a merge key (`<<:`) comes after other keys or brings configurations, and Rails applies it where it is written"), false);
             continue;
         }
