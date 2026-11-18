@@ -312,3 +312,18 @@ fn missing_delegation_in_a_data_reopening_stays_refused() {
             || error.contains("Data.define reopening with load-time statements")), "{errors:?}");
     }
 }
+
+#[test]
+fn replayed_visibility_keeps_the_data_method_it_observes() {
+    for marker in ["private_class_method", "public_class_method", "private", "protected", "public"] {
+        let receiver = if marker.ends_with("_class_method") { "self." } else { "" };
+        let source = format!("Token = Data.define(:value) do\n  def {receiver}label = 1\nend\nclass Token\n  {marker} :label\nend\nclass Token\n  def {receiver}label = 2\nend\n");
+        let (tree, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.is_empty(), "{marker}: {errors:?}");
+        let target = if receiver.is_empty() { "Token.new(0)" } else { "Token" };
+        std::fs::write(tree.join("driver.rb"), format!("require_relative 'app/models'\nobject = {target}\np [object.send(:label), object.respond_to?(:label)]\n")).unwrap();
+        let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
+        assert!(output.status.success(), "{marker}: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "[2, true]\n", "{marker}");
+    }
+}

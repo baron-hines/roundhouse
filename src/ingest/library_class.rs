@@ -504,11 +504,11 @@ fn ingest_library_classes_impl(
                     }
                     admitted_data_values.insert(format!("{}::{name}", class.name.0), value.span.end);
                 }
-                // Nothing runs between the block's definitions and the reopenings', so a later
-                // definition replaces an earlier one before any call can reach it, as in Ruby.
+                // A replayed visibility declaration needs the definitions present at its source position.
+                let replayed = class.unknown_calls.iter().any(|call| call.decisions & crate::expr::REPLAYED_CLASS_BODY != 0);
                 let mut seen = HashSet::default();
                 class.methods.reverse();
-                class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
+                class.methods.retain(|method| replayed || seen.insert((method.name.clone(), method.receiver)));
                 class.methods.reverse();
                 made.push((class.name.0.clone(), class));
             }

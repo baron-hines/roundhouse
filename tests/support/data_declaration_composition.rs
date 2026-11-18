@@ -167,6 +167,21 @@ p record.respond_to?(:named)
 p record.to_h
 "###, "ok\nfalse\nfalse\nfalse\nfalse\n{value: \"ok\"}\n"),
 
+    ("replayed visibility with later data definitions", r###"Token = Data.define(:value) do
+  def self.label = 1
+  def label = 1
+end
+class Token
+  private_class_method :label
+  protected :label
+end
+class Token
+  def self.label = 'two'
+  def label = 'two'
+end
+"###, r###"token = Token.new(0)
+p [Token.send(:label), Token.respond_to?(:label), token.send(:label), token.respond_to?(:label)]
+"###, "[\"two\", true, \"two\", true]\n"),
 ];
 pub const PRIVATE_ASSERTIONS: &str = r##"token = Token.issue(7)
 p token
