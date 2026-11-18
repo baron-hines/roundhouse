@@ -157,6 +157,23 @@ fn another_databases_schema_file_is_reported_and_not_carried() {
     assert_eq!(reported.len(), 1, "{reported:#?}");
 }
 
+/// Another database's default file follows its own `schema_format`, as
+/// Rails names it: `archive_structure.sql` under `sql`, not a stale
+/// `archive_schema.rb` beside it.
+#[test]
+fn another_databases_default_file_follows_its_format() {
+    let yml = "test:\n  primary:\n    adapter: sqlite3\n  archive:\n    adapter: sqlite3\n    schema_format: sql\n";
+    let checked = check(&files(&[
+        ("config/database.yml", yml),
+        ("db/schema.rb", WIDGETS),
+        ("db/archive_schema.rb", STALE),
+        ("db/archive_structure.sql", "CREATE TABLE archived (id integer PRIMARY KEY);\n"),
+    ]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_at(&checked.warnings, "config/database.yml:4:", &["`test.archive`", "db/archive_structure.sql"]);
+    assert!(checked.warnings.iter().all(|w| !w.contains("archive_schema.rb")), "{:?}", checked.warnings);
+}
+
 #[test]
 fn a_structure_dump_is_read_under_a_literal_sql_format() {
     let structure = "CREATE TABLE public.widgets (\n    id bigint NOT NULL,\n    title character varying NOT NULL\n);\n";

@@ -470,7 +470,12 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
             let file = match config.get("schema_dump") {
                 Some(Value::String(file)) if !file.contains(ERB_VALUE) => vec![format!("db/{file}")],
                 Some(_) => Vec::new(),
-                None => vec![format!("db/{name}_schema.rb"), format!("db/{name}_structure.sql")],
+                // Rails names it by the configuration's format.
+                None => match config.get("schema_format").and_then(Value::as_str).map(|f| f.trim_start_matches(':')) {
+                    Some("sql") => vec![format!("db/{name}_structure.sql")],
+                    Some("ruby") => vec![format!("db/{name}_schema.rb")],
+                    _ => vec![format!("db/{name}_schema.rb"), format!("db/{name}_structure.sql")],
+                },
             };
             if let Some(file) = file.into_iter().find(|f| !skip && vfs.exists(&dir.join(f))) {
                 refuse(start, format!("{label}'s schema file {file} is not read: the emitted runtime opens only the primary database, so this database's tables are not carried, and a model routed to it is refused"), true);
