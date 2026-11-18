@@ -519,9 +519,10 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         let token = direct.map(|l| l.2.as_str()).unwrap_or_default();
         let plain = token.trim_matches(|c| c == '\'' || c == '"');
         // `false`, null or an unquoted YAML 1.1 boolean: no file, so the schema is found as before.
-        // Written plainly on its line, or reached another way (a flow mapping, an anchor, an alias)
-        // with that word quoted nowhere in the file: Psych reads it as a boolean.
-        let bare = |name: &str| name == token || ![format!("'{name}'"), format!("\"{name}\"")].iter().any(|q| text.contains(q.as_str()));
+        // On its line, the value's own spelling decides: `off` or `&a off` is a boolean, `'off'` or an
+        // escape a name. Through a flow mapping or an alias its style isn't seen, so it is taken as
+        // Psych takes an unquoted word: no file, and the schema is found as before, as on main.
+        let bare = |name: &str| direct.is_none() || token.starts_with('*') || token == name || token.starts_with('&') && token.ends_with(&format!(" {name}"));
         let boolean = |name: &str| bare(name) && ["yes", "no", "on", "off", "true", "false"].iter().any(|w| name.eq_ignore_ascii_case(w));
         if matches!(value, Value::Null | Value::Bool(_)) || matches!(value, Value::String(name) if boolean(name)) {
             continue;
@@ -546,7 +547,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         let why = match value {
             _ if direct.is_none() => Some("it is not written directly in the configuration: an anchor merge or flow mapping"),
             Value::String(name) if name.contains(ERB_VALUE) => Some("it is computed with ERB"),
-            Value::String(name) if name != plain || token.starts_with(['&', '*', '!', '|', '>', '{', '[']) => Some("it is an anchor, alias, tag or block value, or a quoted name holding ` #`"),
+            Value::String(name) if name != plain || token.starts_with(['&', '*', '!', '|', '>', '{', '[']) => Some("it is an anchor, alias, tag or block value, an escape, or a quoted name holding ` #`"),
             Value::String(name) if name.starts_with('/') || name.split('/').any(|part| part == "..") => Some("it is not a relative path inside db/"),
             Value::String(name) if !name.ends_with(".rb") && !name.ends_with(".sql") => Some("it does not end in .rb or .sql"),
             Value::String(_) => None,
