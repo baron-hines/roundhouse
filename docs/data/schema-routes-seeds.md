@@ -312,7 +312,9 @@ quoted, any case), or names `schema_dump` or `schema_format` in its
 query, or when the file runs any ERB control flow (`<% ... %>`), or when a
 merge key (`<<:`) comes after other keys in that configuration or merges
 configurations into the test environment, since Rails' YAML applies a
-merge where it is written. `false`, null or an unquoted YAML 1.1
+merge where it is written, or when the file has a root-level merge or a
+top-level `shared:` block, which Rails applies to the test configuration.
+`false`, null or an unquoted YAML 1.1
 boolean names no file, and the schema is found as before. Any other
 `schema_dump:` there (ERB, an anchor, alias, merge or flow value, the
 `:schema_dump:` key, another name, a missing file) is an error naming

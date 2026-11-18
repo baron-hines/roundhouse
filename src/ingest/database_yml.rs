@@ -372,6 +372,9 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         Ok(doc) => doc,
         Err(error) => return unresolved(&text, &error.to_string()),
     };
+    // Rails' YAML merges a root `<<` where it is written, so it can replace `test` whole; checked
+    // with `shared` once the test primary names a file.
+    let root_merge = matches!(&doc, Value::Mapping(m) if m.contains_key("<<"));
     if let Err(error) = doc.apply_merge() {
         return unresolved(&text, &error.to_string());
     }
@@ -386,6 +389,8 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     // Checked once the test primary's own `schema_dump` names a file.
     let computed = computed_key(&doc);
     let Value::Mapping(mut envs) = doc else { return out };
+    // Rails fills each configuration's missing keys from a top-level `shared:` block.
+    let shared = envs.contains_key("shared");
     // Without a literal `test`, a computed environment key may be it.
     if !envs.contains_key("test") && envs.keys().any(|k| k.as_str().is_some_and(|k| k.contains(ERB_VALUE))) {
         return unresolved(&text, "an environment's key is computed with ERB, and there is no literal `test`");
@@ -544,6 +549,10 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         let merge = |key: &String| key == "<<" || unquoted(key).as_deref() == Some("<<");
         if lines.iter().skip(1).any(|(_, key, _)| merge(key)) || three_tier && block(env_at).iter().any(|(_, key, _)| merge(key)) {
             refuse(offset, unsupported(&written, "a merge key (`<<:`) comes after other keys or brings configurations, and Rails applies it where it is written"), false);
+            continue;
+        }
+        if root_merge || shared {
+            refuse(offset, unsupported(&written, "config/database.yml has a root-level merge key (`<<:`) or a `shared:` block, which Rails applies to the test configuration"), false);
             continue;
         }
         let why = match value {

@@ -481,6 +481,28 @@ fn a_merge_after_other_keys_refuses_a_named_file() {
     }
 }
 
+/// Rails fills each configuration from a top-level `shared:` block, and a
+/// root-level `<<` can replace `test` whole: either refuses a named file.
+/// With no file named, the schema is found as before.
+#[test]
+fn a_shared_block_or_root_merge_refuses_a_named_file() {
+    let other = "other: &other\n  test:\n    adapter: sqlite3\n    schema_dump: other.rb\n";
+    for yml in [
+        format!("{other}test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n<<: *other\n"),
+        "shared:\n  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=other.rb'\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n".to_string(),
+        "shared:\n  schema_format: sql\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n".to_string(),
+    ] {
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("`shared:` block")), "{yml}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{yml}");
+    }
+    for yml in [format!("{other}test:\n  adapter: sqlite3\n<<: *other\n"), "shared:\n  pool: 5\ntest:\n  adapter: sqlite3\n  schema_dump: false\n".to_string()] {
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
 /// A quoted `schema_dump` key is the same String key, so its file is read.
 #[test]
 fn a_quoted_schema_dump_key_reads_its_file() {
