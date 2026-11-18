@@ -52,5 +52,5 @@ fn a_read_class_parameter_stays_a_named_refusal() {
     let output = Command::new(env!("CARGO_BIN_EXE_roundhouse")).arg("check").arg("--continue").arg(&root).output().unwrap();
     let _ = std::fs::remove_dir_all(&root);
     let text = String::from_utf8_lossy(&output.stderr);
-    assert!(text.contains("Data.define blocks support only instance methods"), "{text}");
+    assert!(text.contains("Data.define blocks support only methods, delegates and static visibility declarations"), "{text}");
 }
