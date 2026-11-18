@@ -339,7 +339,7 @@ RouteReport.state("after-across")
 begin
   ActiveRecord::Base.connected_to(shard: :right) do
     Db.exec("BEGIN")
-    SQL.sqlite3_exec(Db.current_conn.dbh, "ROLLBACK", nil, nil, nil)
+    raise "manual rollback failed" unless SQL.sqlite3_exec(Db.current_conn.dbh, "ROLLBACK", nil, nil, nil) == SQL::OK
   end
   puts "ended=left"
 rescue StandardError => e
