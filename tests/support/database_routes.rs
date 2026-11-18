@@ -596,6 +596,12 @@ pub const SNAPSHOT_SCRIPT: &str = r##"Db.with_connection do
     before = Note.count
     ApplicationRecord.connected_to(role: :writing) { Note.create!(tag: "fresh") }
     puts "snapshot=" + before.to_s + "," + Note.count.to_s
+    ApplicationRecord.connected_to(role: :writing) do
+      rows = Note.connection.execute("INSERT INTO notes(tag) VALUES ('executed') RETURNING id").rows
+      puts "execute-returning=" + rows[0][0].to_s
+    end
+    puts "execute-uncached=" + Note.where(tag: "executed").count.to_s
+    puts "execute-cached=" + Note.count.to_s
     Db.read_snapshot_end
   end
   ApplicationRecord.connected_to(shard: :right, role: :reading) do
@@ -607,7 +613,7 @@ pub const SNAPSHOT_SCRIPT: &str = r##"Db.with_connection do
   end
 end
 "##;
-pub const SNAPSHOT_EXPECTED: &str = "snapshot=0,1\nunrelated-snapshot=2\n";
+pub const SNAPSHOT_EXPECTED: &str = "snapshot=0,1\nexecute-returning=2\nexecute-uncached=1\nexecute-cached=2\nunrelated-snapshot=2\n";
 
 pub const DIRECTORY_RACE_SCRIPT: &str = r##"path = "storage/shared-parent"
 lock = Mutex.new
