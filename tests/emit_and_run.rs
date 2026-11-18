@@ -22743,3 +22743,7 @@ mod own_namespace_association;
 mod mixed_in_constants;
 #[path = "emit_and_run/params_compact_blank.rs"]
 mod params_compact_blank;
+#[path = "emit_and_run/computed_partial_render.rs"]
+mod computed_partial_render;
+#[path = "emit_and_run/view_raise_statement.rs"]
+mod view_raise_statement;
