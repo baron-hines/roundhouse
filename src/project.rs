@@ -9575,7 +9575,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Signal" | "FileTest" | "Marshal" | "Fiber"
         | "Socket" | "IO::WaitReadable" | "IO::WaitWritable" | "Zlib::Inflate" | "OpenSSL::Digest::MD5"
         | "OpenSSL::X509::Certificate" | "OpenSSL::PKey::RSA" | "OpenSSL::SSL::SSLSocket" | "OpenSSL::SSL::SSLContext"
-        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data"
+        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data" | "OpenSSL::BN" | "BigDecimal"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"

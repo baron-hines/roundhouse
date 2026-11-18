@@ -20873,6 +20873,8 @@ mod network_constants;
 mod logger_severity;
 #[path = "emit_and_run/gem_nested_core_constant.rs"]
 mod gem_nested_core_constant;
+#[path = "emit_and_run/bigdecimal_bn_classes.rs"]
+mod bigdecimal_bn_classes;
 #[path = "emit_and_run/module_reflection.rs"]
 mod module_reflection;
 #[path = "emit_and_run/gem_class_eval_mixins.rs"]
