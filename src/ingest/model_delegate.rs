@@ -133,6 +133,7 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
             &method_targets,
             &app.sources,
             &[],
+            false,
         );
         let mut unexpanded_spans: Vec<_> = unknown_calls
             .iter()
