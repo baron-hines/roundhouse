@@ -340,7 +340,7 @@ fn data_factory_reassignment_neighbors_keep_their_boundaries() {
     let (_, errors) = contract::app("A = Data.define(:x)\n::A = 7\n").emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant")), "{errors:?}");
     let (_, errors) = contract::app("A = Data.define(:x)\nA ||= 7\n").emit(roundhouse::project::BuildTarget::Spinel);
-    assert!(errors.iter().any(|error| error.contains("file-level statements beside Data.define")), "{errors:?}");
+    assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant")), "{errors:?}");
     for (source, observe, expected) in [
         ("A = 7\nA = Data.define(:x)\n", "p A.new(2).x\n", "2\n"),
         ("module Outer\n A = Data.define(:x)\n A = 7\nend\n", "p Outer::A\n", "7\n"),
@@ -353,4 +353,89 @@ fn data_factory_reassignment_neighbors_keep_their_boundaries() {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{source}");
     }
+}
+
+#[test]
+fn scoped_data_factory_rebindings_are_refused_at_every_target() {
+    let prefix = "module Outer; module Inner; end; end\nOuter::A = Data.define(:x)\n";
+    for write in [
+        "module Outer; A = 7; end",
+        "class Holder; ::Outer::A = 7; end",
+        "module Wrapper; module Inner; ::Outer::A = 7; end; end",
+        "module Outer; module Inner; Outer::A = 7; end; end",
+        "class Holder; end\nclass Holder; ::Outer::A = 7; end",
+        "Outer::A ||= 7", "Outer::A &&= 7", "Outer::A += 7",
+        "Outer::A, B = 7, 2", "module Outer; A, B = 7, 2; end",
+        "module Outer; (B, A), C = [1, 7], 2; end",
+        "module Outer; A ||= 7; end", "module Outer; A &&= 7; end",
+        "module Outer::Inner; ::Outer::A = 7; end",
+        "module Wrapper; module ::Outer; A = 7; end; end",
+        "if true; Outer::A = 7; end",
+        "module Outer; *A, B = 7, 2; end",
+        "Object::Outer::A = 7",
+        "AliasOuter = Outer\nmodule AliasOuter; A = 7; end",
+        "class << self; ::Outer::A = 7; end",
+        "module Outer; A += 7; end",
+        "module Outer; A, (B, C) = 7, [1, 2]; end",
+        "module Outer; begin; A = 7; ensure; end; end",
+    ] {
+        let source = format!("{prefix}{write}\nSnapshot = Data.define(:x)\nSnapshot::VALUE = Outer::A\n");
+        let (_, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant `Outer::A`")), "{write}: {errors:?}");
+    }
+}
+
+#[test]
+fn data_factory_rebinding_respects_resolved_owners_and_source_order() {
+    for (prefix, write, name) in [
+        ("module Outer; module Inner; end; end\nOuter::Inner::A = Data.define(:x)\n", "module Outer; module Inner; A = 7; end; end", "Outer::Inner::A"),
+        ("class Outer; end\nOuter::A = Data.define(:x)\n", "class Outer; A = 7; end", "Outer::A"),
+        ("A = Data.define(:x)\n", "class Object; A = 7; end", "A"),
+    ] {
+        let (_, errors) = contract::app(&format!("{prefix}{write}\n")).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.iter().any(|error| error.contains(&format!("reassignment of Data.define constant `{name}`"))), "{prefix}{write}: {errors:?}");
+    }
+    for write in ["module Wrapper; A = 7; end", "module Wrapper; module Outer; end; Outer::A = 7; end"] {
+        let source = format!("module Outer; A = 7; end\nOuter::A = Data.define(:x)\n{write}\nSnapshot = Data.define(:x)\nSnapshot::VALUE = Outer::A\n");
+        let (tree, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
+        assert!(errors.is_empty(), "{write}: {errors:?}");
+        std::fs::write(tree.join("driver.rb"), "require_relative 'app/models'\np Snapshot::VALUE.new(2).x\n").unwrap();
+        let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n");
+    }
+}
+
+#[test]
+fn an_unresolved_data_factory_namespace_stays_refused() {
+    let (_, errors) = contract::app("module Outer; end\nAliasOuter = Outer\nAliasOuter::A = Data.define(:x)\nmodule Outer; A = 7; end\n")
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|error| error.contains("Data.define constant namespace could not be resolved")), "{errors:?}");
+}
+
+#[test]
+fn cross_file_data_factory_rebindings_are_refused_in_both_orders() {
+    for (factory, writer) in [("a", "z"), ("z", "a")] {
+        for write in ["A = 7", "A ||= 7", "A &&= 7", "A, B = 7, 2", "(B, A), C = [1, 7], 2"] {
+            let (_, errors) = emit_and_run::empty_app()
+                .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+                .write("db/schema.rb", "")
+                .write("config/database.yml", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n")
+                .write(&format!("lib/{factory}.rb"), "module Outer; end\nOuter::A = Data.define(:x)\n")
+                .write(&format!("lib/{writer}.rb"), &format!("module Outer; {write}; end\n"))
+                .emit(roundhouse::project::BuildTarget::Spinel);
+            assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant `Outer::A` across files")), "{factory}/{writer} {write}: {errors:?}");
+        }
+    }
+}
+
+#[test]
+fn a_data_member_write_does_not_rebind_an_unrelated_factory() {
+    let (tree, errors) = contract::app("A = Data.define(:x)\nOther = Data.define(:x)\nOther::A = 7\n")
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(tree.join("driver.rb"), "require_relative 'app/models'\np [A.new(2).x, Other::A]\n").unwrap();
+    let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "[2, 7]\n");
 }

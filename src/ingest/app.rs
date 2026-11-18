@@ -3221,6 +3221,10 @@ end
     // A module-nested `class XController < BaseController` names
     // `Ns::BaseController`; `include Avatar` inside `class User` names
     // `User::Avatar`. The passes above leave both as written.
+    for (span, err) in super::library_class::cross_file_data_rebindings(&app, &sources, &const_resolver.for_sources(&sources)) {
+        super::error_site::note(&err, span.start as usize, span.end as usize);
+        record_library_ingest_failure(&mut app, &sources[span.file.0 as usize - 1].path, &err);
+    }
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
     // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
     for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {

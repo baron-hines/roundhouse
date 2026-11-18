@@ -410,15 +410,27 @@ fn ingest_library_classes_impl(
     };
     if file_level && let Some(program) = root.as_program_node() {
         let (mut data_constants, mut admitted_data_values) = (HashSet::default(), HashMap::<String, u32>::default());
+        let mut data_writes = None;
         for statement in program.statements().body().iter() {
-            let written = statement.as_constant_write_node().map(|write| constant_id_str(&write.name()).to_string())
-                .or_else(|| statement.as_constant_path_write_node().and_then(|write| static_constant_path(&write.target().as_node())).map(|path| path.join("::")));
-            if let Some(name) = written.filter(|name| made.iter().any(|(_, class)| class.data_define().is_some() && class.name.0.as_str() == name.as_str())) {
-                return Err(super::error_site::at(IngestError::Unsupported { file: file.into(), message: format!("reassignment of Data.define constant `{name}` is not modeled") }, &statement));
-            }
             if let Some(mut class) = file_data_class(&statement, file)
                 .map_err(|err| super::error_site::at(err, &statement))?
             {
+                let writes = data_writes.get_or_insert_with(|| data_constant_writes(source, &root));
+                let start = statement.location().start_offset() as u32;
+                let end = statement.location().end_offset() as u32;
+                let target_end = file_data_declaration(&statement).unwrap().1.location().start_offset() as u32;
+                let name = writes.iter().find(|(at, _)| start <= *at && *at <= target_end)
+                    .map_or(class.name.0.as_str(), |(_, name)| name.as_str());
+                if name.starts_with("?::") {
+                    return Err(super::error_site::at(IngestError::Unsupported { file: file.into(),
+                        message: format!("Data.define constant namespace could not be resolved: `{}`", class.name.0) }, &statement));
+                }
+                if let Some((at, _)) = writes.iter().find(|(at, written)| *at > end
+                    && (written == name || written.strip_prefix("?::") == name.rsplit("::").next())) {
+                    let err = IngestError::Unsupported { file: file.into(), message: format!("reassignment of Data.define constant `{name}` is not modeled") };
+                    super::error_site::note(&err, *at as usize - name.rsplit("::").next().unwrap().len(), *at as usize);
+                    return Err(err);
+                }
                 let reopenings = find_all_classes_with_scope(&root).into_iter().filter(|(scope, node)| {
                     class_name_path(node).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == class.name.0.as_str())
                 }).collect::<Vec<_>>();
@@ -923,6 +935,121 @@ fn file_data_declaration<'pr>(statement: &ruby_prism::Node<'pr>) -> Option<(Stri
         return None;
     }
     Some((name, call))
+}
+
+// Visit assignment targets, not only statements: destructuring and operator writes
+// also rebind constants. Resolve the namespace rather than concatenating lexical names.
+fn data_constant_writes(source: &[u8], root: &Node<'_>) -> Vec<(u32, String)> {
+    let resolver = crate::analyze::ConstResolver::from_app_sources(&[
+        crate::span::SourceFile { path: "data_rebindings.rb".into(), text: String::from_utf8_lossy(source).into_owned() },
+    ]);
+    let factories = root.as_program_node().into_iter().flat_map(|program| program.statements().body().iter())
+        .filter_map(|statement| file_data_declaration(&statement).map(|(name, _)| name.trim_start_matches("Object::").to_string())).collect();
+    resolved_data_constant_writes(root, &resolver, crate::span::FileId(1), &factories)
+}
+
+fn resolved_data_constant_writes(root: &Node<'_>, resolver: &crate::analyze::ConstResolver, file: crate::span::FileId, factories: &HashSet<String>) -> Vec<(u32, String)> {
+    struct Writes<'a> {
+        resolver: &'a crate::analyze::ConstResolver,
+        file: crate::span::FileId,
+        factories: &'a HashSet<String>,
+        owner: Option<String>,
+        out: Vec<(u32, String)>,
+    }
+    impl Writes<'_> {
+        fn span(&self, node: &Node<'_>) -> Span {
+            Span { file: self.file, start: node.location().start_offset() as u32, end: node.location().end_offset() as u32 }
+        }
+        fn path(&self, node: &Node<'_>) -> Option<String> {
+            let path = static_constant_path(node)?.into_iter().map(Symbol::from).collect::<Vec<_>>();
+            self.resolver.namespace(self.span(node), &path).map(|id| id.0.to_string())
+                .or_else(|| self.resolver.declaration_name(self.span(node), &path)
+                    .filter(|name| self.factories.contains(*name)).map(str::to_string))
+        }
+        fn binding(&mut self, node: &Node<'_>) {
+            let bare = node.as_constant_write_node().map(|n| (n.name(), n.name_loc()))
+                .or_else(|| node.as_constant_or_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_and_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_operator_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_target_node().map(|n| (n.name(), n.location())));
+            if let Some((name, loc)) = bare {
+                if let Some(owner) = &self.owner {
+                    self.record(loc.end_offset() as u32, owner.clone(), constant_id_str(&name).to_string());
+                }
+                return;
+            }
+            let target = node.as_constant_path_write_node().map(|n| n.target())
+                .or_else(|| node.as_constant_path_or_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_and_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_operator_write_node().map(|n| n.target()));
+            let (parent, name, end) = if let Some(target) = target {
+                (target.parent(), target.name(), target.location().end_offset())
+            } else if let Some(target) = node.as_constant_path_target_node() {
+                (target.parent(), target.name(), target.location().end_offset())
+            } else { return };
+            if let Some(name) = name {
+                let owner = parent.map_or_else(String::new, |parent| self.path(&parent).unwrap_or_else(|| "?".into()));
+                self.record(end as u32, owner, constant_id_str(&name).to_string());
+            }
+        }
+        fn record(&mut self, end: u32, owner: String, name: String) {
+            let owner = owner.trim_start_matches("Object::");
+            let name = if owner.is_empty() || owner == "Object" { name } else { format!("{owner}::{name}") };
+            self.out.push((end, name));
+        }
+        fn body(&mut self, path: Node<'_>, body: Option<Node<'_>>) {
+            let outer = self.owner.take();
+            self.owner = Some(self.resolver.namespace_body(self.span(&path)).map_or_else(|| "?".into(), |id| id.0.to_string()));
+            if let Some(body) = body { ruby_prism::Visit::visit(self, &body); }
+            self.owner = outer;
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes<'_> {
+        fn visit_branch_node_enter(&mut self, node: Node<'pr>) { self.binding(&node); }
+        fn visit_leaf_node_enter(&mut self, node: Node<'pr>) { self.binding(&node); }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            if let Some(parent) = node.superclass() { self.visit(&parent); }
+            self.body(node.constant_path(), node.body());
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) { self.body(node.constant_path(), node.body()); }
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            let outer = self.owner.take();
+            if let Some(body) = node.body() { self.visit(&body); }
+            self.owner = outer;
+        }
+        // These bodies execute at runtime, not when their enclosing declaration loads.
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if let Some(receiver) = node.receiver() { self.visit(&receiver); }
+        }
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+    }
+    let mut writes = Writes { resolver, file, factories, owner: Some(String::new()), out: Vec::new() };
+    ruby_prism::Visit::visit(&mut writes, root);
+    writes.out
+}
+
+// Another file has no proven load order relative to the factory: refuse a
+// competing binding in either order instead of moving it around the declaration.
+pub(super) fn cross_file_data_rebindings(app: &crate::App, sources: &[crate::span::SourceFile], resolver: &crate::analyze::ConstResolver) -> Vec<(Span, IngestError)> {
+    let factories = app.library_classes.iter().filter_map(|class| class.data_define()
+        .map(|(_, span)| (span.file, class.name.0.as_str().trim_start_matches("Object::")))).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    if factories.is_empty() { return out; }
+    let names = factories.iter().map(|(_, name)| name.to_string()).collect();
+    for (index, source) in sources.iter().enumerate() {
+        let file = crate::span::FileId(index as u32 + 1);
+        let others = factories.iter().filter(|(owner, _)| *owner != file).collect::<Vec<_>>();
+        if !source.path.ends_with(".rb") || !others.iter().any(|(_, name)| source.text.contains(name.rsplit("::").next().unwrap())) { continue; }
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
+        for (at, written) in resolved_data_constant_writes(&parsed.node(), resolver, file, &names) {
+            if let Some((_, name)) = others.iter().find(|(_, name)| written == *name || written.strip_prefix("?::") == name.rsplit("::").next()) {
+                let span = Span { file, start: at - name.rsplit("::").next().unwrap().len() as u32, end: at };
+                out.push((span, IngestError::Unsupported { file: source.path.clone(), message: format!("reassignment of Data.define constant `{name}` across files is not modeled") }));
+            }
+        }
+    }
+    out
 }
 
 /// The segments of a constant path in which every part is a constant.

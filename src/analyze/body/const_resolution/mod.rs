@@ -824,7 +824,7 @@ impl ConstResolver {
 
     /// A declaration header is not a constant reference. Its body still runs
     /// on the resolved namespace, including qualified reopenings and aliases.
-    pub(in crate::analyze) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
+    pub(crate) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
         self.file(span.file)?.namespace_bodies.get(&span.end)
     }
 
