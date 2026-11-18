@@ -2416,8 +2416,11 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             // The module's query arguments (`Picker.pick(tokens)`, whose
             // `pick` queries its argument) are seeded as the module's own
             // body is, read as `owner`'s when there is one.
+            // Grounded first, as `lcs`' own methods are above: `app.library_classes`
+            // still holds the literal reflective call (`Token.public_send(:named, x)`).
             let lowered = |m: &MethodDef, module: &ClassId, owner: Option<&ClassId>| {
                 let mut out = m.clone();
+                crate::lower::scope_chain::ground_literal_model_dispatch(&mut out.body, app, &assocs);
                 query_arguments.rewrite_method(&mut out, module, owner.unwrap_or(module), &regs);
                 crate::lower::scope_chain::rewrite_call_site(&mut out.body, &regs, None, owner);
                 for d in out.params.iter_mut().filter_map(|p| p.default.as_mut()) {
