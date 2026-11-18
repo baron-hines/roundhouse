@@ -1459,6 +1459,17 @@ module Db
   def self.route(shard, role, path, replica, schema, n)
     index = 0
     if path != ""
+      if schema && !replica
+        directory = File.dirname(path)
+        parent = directory.start_with?("/") ? "/" : ""
+        directory.split("/").each do |part|
+          if !part.empty?
+            parent += "/" if !parent.empty? && parent != "/"
+            parent += part
+            Dir.mkdir(parent) unless Dir.exist?(parent)
+          end
+        end
+      end
       key = File.expand_path(path)
       @permits[key] = DbPermit.new if !@permits.key?(key)
       @slots.push(DbSlot.new(path, open_pools(path, n), @permits[key], replica))
