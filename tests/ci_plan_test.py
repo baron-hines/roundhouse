@@ -921,8 +921,14 @@ class Routing(unittest.TestCase):
     def test_file_level_data_records_select_the_native_toolchain_lane(self):
         for path in [
             "src/analyze/data.rs",
+            "src/dialect.rs",
+            "src/expr.rs",
             "src/analyze/mod.rs",
             "src/ingest/library_class.rs",
+            "src/ingest/data_factory.rs",
+            "src/ingest/delegate.rs",
+            "runtime/ruby/active_support_ext.rb",
+            "src/lower/class_body_new.rs",
             "src/ingest/app.rs",
             "src/ingest/file_program.rs",
             "src/ingest/mod.rs",
@@ -930,6 +936,9 @@ class Routing(unittest.TestCase):
             "src/emit/ruby/library.rs",
             "src/emit/ruby/rbs.rs",
             "tests/data_factory_constants.rs",
+            "tests/data_declaration_composition.rs",
+            "tests/support/data_declaration_composition.rs",
+            "tests/spinel_toolchain/data_declaration_composition.rs",
             "tests/support/data_record_siblings.rs",
             "tests/emit_and_run/data_record_siblings.rs",
             "tests/spinel_toolchain/data_record_siblings.rs",
@@ -2121,8 +2130,96 @@ class Results(unittest.TestCase):
         self.assertLess(max(loads) - min(loads), max(ci.SPINEL_TEST_SECONDS.values()))
         self.assertEqual(
             ci.spinel_framework_shards(["spinel_pg_db"]),
-            [{"shard": 0, "tests": ["spinel_pg_db"]}],
+            [{"shard": 0, "tests": ["spinel_pg_db"], "budget": 1620, "timeout_minutes": 30}],
         )
+
+    def test_a_suite_longer_than_the_fixed_budget_gets_a_budget_that_covers_it(self):
+        # #2201: solid_queue_durability recorded 1810 s against a 1620 s budget, and spinel_pg_db runs alone after it.
+        timings = {"framework": {"solid_queue_durability": 1810, "spinel_pg_db": 438}}
+        shards = ci.spinel_framework_shards(["solid_queue_durability", "spinel_pg_db", "param_binds"], count=1, timings=timings)
+        self.assertEqual(ci.spinel_framework_seconds(shards[0]["tests"], timings), 1810 + 438)
+        self.assertEqual(shards[0]["budget"], ci.math.ceil((1810 + 438) * ci.SPINEL_BUDGET_MARGIN))
+        self.assertEqual(shards[0]["timeout_minutes"], ci.math.ceil(shards[0]["budget"] / 60) + 3)
+        # A toolchain test past the fixed deadline (view_component's native build in Full validation, say).
+        tests = [f"t{i:02}" for i in range(20)]
+        timings = {"toolchain": {"t00": 2000}}
+        shards, seconds = ci.spinel_toolchain_plan(tests, timings=timings)
+        budgets = [ci.spinel_budget(s, ci.SPINEL_TOOLCHAIN_BUDGET, 1) for s in seconds]
+        mine = next(k for k, shard in enumerate(shards) if "t00" in shard)
+        self.assertEqual(seconds[mine], 2000)
+        self.assertEqual(budgets[mine], {"budget": 3000, "timeout_minutes": 51})
+        self.assertTrue(all(b["budget"] == ci.SPINEL_TOOLCHAIN_BUDGET for k, b in enumerate(budgets) if k != mine))
+
+    def test_a_shards_budget_follows_its_planned_total(self):
+        # Many suites none of which passes the fixed budget alone: they run four at a time, so a shard takes their total over four.
+        suites = [f"suite{i}" for i in range(8)]
+        for each in (800, 1000, 1200):
+            with self.subTest(each=each):
+                timings = {"framework": {s: each for s in suites}}
+                (shard,) = ci.spinel_framework_shards(suites, count=1, timings=timings)
+                planned = 8 * each / ci.SPINEL_FRAMEWORK_PARALLEL
+                self.assertEqual(shard["budget"], max(ci.math.ceil(planned * 1.5), ci.SPINEL_FRAMEWORK_BUDGET))
+        # A toolchain shard ends once its CPU seconds are spread over its threads, as the plan places tests.
+        tests = [f"t{i:02}" for i in range(10)]
+        timings = {"toolchain": {t: 600 for t in tests}, "toolchain_cpu": {t: 1000 for t in tests}}
+        shards, seconds = ci.spinel_toolchain_plan(tests, count=2, timings=timings)
+        self.assertEqual([len(s) for s in shards], [5, 5])
+        # (and the last one, tiny_api's gate after them)
+        self.assertEqual(seconds, [5 * 1000 / ci.SPINEL_TOOLCHAIN_THREADS, 5 * 1000 / ci.SPINEL_TOOLCHAIN_THREADS + ci.SPINEL_TOOLCHAIN_TAIL_SECONDS])
+        self.assertEqual(ci.spinel_budget(seconds[0], ci.SPINEL_TOOLCHAIN_BUDGET, 1), {"budget": 1875, "timeout_minutes": 33})
+        # Each shard's own list is the plan's: the budgets are sized on the tests the shard then runs.
+        units = [["t01", "t02", "t03"]]
+        for count in (2, ci.SPINEL_TOOLCHAIN_SHARDS):
+            planned = ci.spinel_toolchain_plan(tests, count=count, timings=timings, units=units)[0]
+            self.assertEqual(planned, [ci.spinel_toolchain_shard(tests, k, count=count, timings=timings, units=units) for k in range(count)])
+        # Never past the cap, inside GitHub's six-hour job limit.
+        self.assertEqual(ci.spinel_budget(10**5, ci.SPINEL_FRAMEWORK_BUDGET, 3), {"budget": 5400, "timeout_minutes": 93})
+        self.assertLess(93, 360)
+
+    def test_a_framework_shards_budget_covers_its_suites_running_in_waves(self):
+        # Five 1200 s suites a shard, four at a time: the fifth starts when one of the first four ends.
+        suites = [f"suite{i:02}" for i in range(25)]
+        timings = {"framework": {s: 1200 for s in suites}}
+        shards = ci.spinel_framework_shards(suites, timings=timings)
+        self.assertEqual([len(s["tests"]) for s in shards], [5] * 5)
+        for shard in shards:
+            self.assertEqual(ci.spinel_framework_seconds(shard["tests"], timings), 2400)
+            self.assertEqual(shard["budget"], 3600)
+        # In the script's order: longest recorded first, so a long suite listed last still starts in the first wave.
+        timings = {"framework": {"a": 1000, **{s: 300 for s in "bcdef"}}}
+        self.assertEqual(ci.spinel_framework_seconds(list("bcdefa"), timings), 1000)
+        # An unrecorded suite starts last there, whatever its table seconds (181 s for param_binds; first, the shard took 200 s).
+        self.assertEqual(ci.spinel_framework_seconds(["param_binds", *"bcdef"], {"framework": {s: 100 for s in "bcdef"}}), 100 + 181)
+
+    def test_a_shards_budget_covers_its_tests_running_in_waves_on_its_threads(self):
+        # Five 2000 s tests a shard, on four threads: the fifth starts when one of the first four ends.
+        tests = [f"t{i:02}" for i in range(25)]
+        timings = {"toolchain": {t: 2000 for t in tests}, "toolchain_cpu": {t: 1000 for t in tests}}
+        shards, seconds = ci.spinel_toolchain_plan(tests, timings=timings)
+        self.assertEqual([len(s) for s in shards], [5] * 5)
+        self.assertEqual(seconds, [4000] * 4 + [4000 + ci.SPINEL_TOOLCHAIN_TAIL_SECONDS])
+        for planned in seconds:
+            budget = ci.spinel_budget(planned, ci.SPINEL_TOOLCHAIN_BUDGET, 1)["budget"]
+            self.assertGreaterEqual(budget, min(4000 * ci.SPINEL_BUDGET_MARGIN, ci.SPINEL_BUDGET_CAP))
+        # Longest first, as the threads start them: a long test listed last would end a wave later.
+        timings = {"toolchain": {"a": 1000, "b": 300, "c": 300, "d": 300, "e": 300, "f": 300}}
+        self.assertEqual(ci.spinel_toolchain_plan(list("abcdef"), count=1, timings=timings)[1], [1000 + ci.SPINEL_TOOLCHAIN_TAIL_SECONDS])
+
+    def test_missing_timings_keep_the_fixed_budgets(self):
+        tests = [f"t{i:02}" for i in range(40)] + list(ci.SPINEL_TOOLCHAIN_SECONDS)
+        for raw in ["", "not json", "[]", '{"framework": [], "toolchain": "slow"}']:
+            with self.subTest(raw=raw):
+                timings = ci.load_spinel_timings(raw)
+                for shard in ci.spinel_framework_shards(ci.SPINEL_TESTS, timings=timings):
+                    self.assertEqual((shard["budget"], shard["timeout_minutes"]), (1620, 30), shard["tests"])
+                out = subprocess.run(
+                    ["python3", spec.origin, "toolchain-budgets"],
+                    input="\n".join(tests), capture_output=True, text=True, check=True,
+                    # Not a CI_SPINEL_TIMINGS_FILE left in the environment: the planner reads it before CI_SPINEL_TIMINGS.
+                    env={k: v for k, v in os.environ.items() if k not in ("GITHUB_OUTPUT", "CI_SPINEL_TIMINGS_FILE")}
+                    | {"CI_SPINEL_TIMINGS": raw},
+                ).stdout
+                self.assertEqual(out, "budgets=" + json.dumps([{"budget": 1440, "timeout_minutes": 25}] * 5, separators=(",", ":")) + "\n")
 
     def test_advisory_ledger_extras_never_claim_complete_under_coe(self):
         # continue-on-error makes needs.*.result=success even when a matrix
@@ -2177,6 +2274,51 @@ class Results(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
+    def job(self, name):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        return re.search(rf"(?ms)^  {name}:\n(.*?)(?=^  [\w-]+:|\Z)", workflow)[1]
+
+    def test_full_validation_reads_and_writes_its_own_timings_key(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        self.assertIn("\n  SPINEL_TIMINGS_KEY: ${{ inputs.full && 'spinel-full-timings' || 'spinel-timings' }}\n", workflow)
+        # Not a prefix of each other: a push run's restore-keys would otherwise take Full validation's seconds.
+        self.assertFalse("spinel-full-timings-".startswith("spinel-timings-"))
+        # The plan and the merge read the run's own key first; Full validation starts from the push runs' until it has its own.
+        restore = (
+            "          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}\n"
+            "          restore-keys: |\n"
+            "            ${{ env.SPINEL_TIMINGS_KEY }}-\n"
+            "            spinel-timings-\n"
+        )
+        self.assertIn(restore, self.job("plan"))
+        merge = self.job("spinel-timings")
+        self.assertIn(restore, merge)
+        self.assertIn("          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}\n", merge)
+        self.assertEqual(len(re.findall(r"key: spinel-timings-", workflow)), 0)
+
+    def test_each_spinel_shard_stops_at_the_budget_the_plan_gave_it(self):
+        framework = self.job("spinel-framework")
+        self.assertIn("    timeout-minutes: ${{ matrix.timeout_minutes }}\n", framework)
+        self.assertIn("          CI_SPINEL_FRAMEWORK_BUDGET: ${{ matrix.budget }}\n        run: scripts/ci-spinel-framework.sh\n", framework)
+        toolchain = self.job("spinel-toolchain")
+        budgets = "fromJSON(needs.spinel-toolchain-plan.outputs.budgets)[matrix.shard]"
+        self.assertIn(f"    timeout-minutes: ${{{{ {budgets}.timeout_minutes }}}}\n", toolchain)
+        self.assertIn(f"          BUDGET: ${{{{ {budgets}.budget }}}}\n", toolchain)
+        self.assertIn('CI_SPINEL_DEADLINE=$(( $(date +%s) + BUDGET ))', toolchain)
+        # Sized from what each shard plans with: the same timings, tests and units.
+        plan = self.job("spinel-toolchain-plan")
+        self.assertIn("      budgets: ${{ steps.budgets.outputs.budgets }}\n", plan)
+        self.assertIn("          CI_SPINEL_TIMINGS: ${{ needs.plan.outputs.spinel-timings }}\n", plan)
+        self.assertIn('toolchain-budgets --units "$RUNNER_TEMP/bundle-plan/bundle-plan.json" < "$RUNNER_TEMP/bundle-plan/tests.txt"', plan)
+        self.assertLess(plan.index("id: budgets"), plan.index("id: upload"))
+        self.assertIn("          CI_SPINEL_TIMINGS: ${{ needs.plan.outputs.spinel-timings }}\n", toolchain)
+        self.assertIn('--units "$RUNNER_TEMP/bundle-plan/bundle-plan.json"', toolchain)
+        # The suites the framework script runs alone are the ones the budget adds whole.
+        script = (Path(__file__).parents[1] / "scripts/ci-spinel-framework.sh").read_text()
+        alone = re.search(r'case "\$suite" in ([\w|]+)\) serial\+=', script)[1]
+        self.assertEqual(tuple(alone.split("|")), ci.SPINEL_FRAMEWORK_SERIAL)
+        self.assertIn('budget=${CI_SPINEL_FRAMEWORK_BUDGET:-1620}', script)
+
     def test_tiny_api_runs_on_the_shard_the_plan_counts_it_on(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
         job = re.search(r"(?ms)^  spinel-toolchain:\n(.*?)(?=^  [\w-]+:|\Z)", workflow)[1]

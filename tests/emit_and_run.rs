@@ -20867,6 +20867,18 @@ mod core_exceptions;
 mod rbconfig_config;
 #[path = "emit_and_run/process_modules.rs"]
 mod process_modules;
+#[path = "emit_and_run/network_constants.rs"]
+mod network_constants;
+#[path = "emit_and_run/logger_severity.rs"]
+mod logger_severity;
+#[path = "emit_and_run/gem_nested_core_constant.rs"]
+mod gem_nested_core_constant;
+#[path = "emit_and_run/bigdecimal_bn_classes.rs"]
+mod bigdecimal_bn_classes;
+#[path = "emit_and_run/module_reflection.rs"]
+mod module_reflection;
+#[path = "emit_and_run/gem_class_eval_mixins.rs"]
+mod gem_class_eval_mixins;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
@@ -22721,3 +22733,7 @@ mod concern_plain_includer;
 // Concern shapes: a namespaced prepend by its relative name.
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
+#[path = "emit_and_run/token_for_string_key.rs"]
+mod token_for_string_key;
+#[path = "emit_and_run/integer_times_enumerator.rs"]
+mod integer_times_enumerator;

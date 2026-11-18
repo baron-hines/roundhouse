@@ -945,3 +945,6 @@ fn full_forwarding_keeps_the_native_argument_contract() {
     run.assert_passes();
     assert_eq!(run.stdout, "full forwarding contract passed\n");
 }
+
+#[path = "spinel_toolchain/data_declaration_composition.rs"]
+mod data_declaration_composition;

@@ -659,6 +659,10 @@ fn untyped_subexpressions_baseline() {
     // them for the RBS-paired gate, which stays at 0.
     // MEASURED 1433 on merging #2176 and #2177 (1427): restore_attributes's
     // +1 and the association relation inverses' +5, which add up.
+    // MEASURED 1448 on uuid-keyed token_for (1433): active_record/token_for.rb's
+    // payload writers take the key already written as JSON, a `key` var where
+    // `id.to_s` read a String (+12), and `str_key` / `data_str_id` (+3), vars
+    // on this RBS-less probe; token_for.rbs types them for the RBS-paired gate.
     // MEASURED 1434 on routed connection handles (main 105a34827: 1433):
     // the Db slot calls a connection handle makes in
     // active_record/connection.rb read the Db contract, which this
@@ -676,7 +680,9 @@ fn untyped_subexpressions_baseline() {
     // handle's statements do (+2 in active_record/connection.rb);
     // `with_connection` itself adds none. db.rbs and connection.rbs type
     // them for the RBS-paired gate.
-    const CEILING: usize = 1436;
+    // MEASURED 1451 on merging main 2d02f862f (1448) with the routed
+    // connection handles' +3, which add up.
+    const CEILING: usize = 1451;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
