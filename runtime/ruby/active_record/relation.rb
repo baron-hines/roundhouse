@@ -4050,10 +4050,67 @@ module ActiveRecord
         stored = @model._enum_where_value(col, val)
         stored.nil? ? "#{qcol} IS NULL" : "#{qcol} = #{bind_literal(stored)}"
       else
+        return uuid_value_predicate(qcol, val) if uuid_query_column?(col)
         limit = integer_query_limit(col)
         return integer_value_predicate(qcol, val, limit) if limit > 0
         "#{qcol} = #{bind_literal(column_bound_value(col, val))}"
       end
+    end
+
+    # ---- uuid query values --------------------------------------------
+    #
+    # A PostgreSQL uuid column casts its value as Rails' OID::Uuid does
+    # (ActiveRecord::UuidCast): a uuid in any form Rails accepts is
+    # bound canonical, and anything else is nil, `= NULL`, which matches
+    # no row and whose negation matches none either. As written, a blank
+    # or malformed String is a literal PostgreSQL rejects. The columns
+    # are the model's emitted `schema_uuid_query_columns`, PostgreSQL
+    # only: SQLite stores the column as text and Rails does not cast it.
+    def uuid_query_column?(col)
+      table_name = @model.table_name.to_s
+      prefix = "#{table_name}."
+      name = col.start_with?(prefix) ? col[prefix.length, col.length].to_s : col
+      return false if name.include?(".")
+      @model.schema_uuid_query_columns.include?(name.to_sym)
+    end
+
+    def uuid_value_predicate(qcol, val)
+      cast = ActiveRecord::UuidCast.cast_text(val)
+      cast.empty? ? "#{qcol} = NULL" : "#{qcol} = #{bind_literal(cast)}"
+    end
+
+    # Rails' ArrayHandler on a uuid column: nil is `IS NULL` and each
+    # Range its own arm; one other value is an Equality (`= NULL` when it
+    # is no uuid), and several a HomogeneousIn, which drops the values
+    # that are no uuid and writes `IN (NULL)` when none is left.
+    def uuid_list_predicate(qcol, vals)
+      scalars = []
+      ranges = []
+      has_nil = false
+      vals.each do |x|
+        if x.nil?
+          has_nil = true
+        elsif x.is_a?(Range)
+          ranges << range_predicate(qcol, x)
+        else
+          scalars << x
+        end
+      end
+      arms = []
+      if scalars.length == 1
+        arms << uuid_value_predicate(qcol, scalars[0])
+      elsif scalars.length > 1
+        kept = []
+        scalars.each do |x|
+          cast = ActiveRecord::UuidCast.cast_text(x)
+          kept << cast unless cast.empty?
+        end
+        arms << "#{qcol} IN (#{kept.empty? ? "NULL" : escape_list(kept)})"
+      end
+      arms << "#{qcol} IS NULL" if has_nil
+      ranges.each { |r| arms << r }
+      return arms[0] if arms.length == 1
+      "(#{arms.join(" OR ")})"
     end
 
     # ---- integer query values -----------------------------------------
@@ -4169,6 +4226,8 @@ module ActiveRecord
       limit = integer_query_limit(col)
       if ids.empty?
         "1=0"
+      elsif uuid_query_column?(col)
+        uuid_list_predicate(qcol, ids)
       elsif limit > 0
         integer_list_predicate(qcol, ids, limit)
       elsif ids.any? { |x| x.nil? || x.is_a?(Range) }
