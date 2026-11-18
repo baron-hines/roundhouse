@@ -1626,7 +1626,9 @@ module Db
     raise ArgumentError, "must provide a `shard` and/or `role`." if role.nil? && shard.nil?
     stack = scopes
     before = scope_slot
+    home = @slots.nil? || before < 0 ? nil : @slots[before]
     frame = DbScope.new(global, role, shard, prevent || role == :reading)
+    frame.home = home
     stack.push(frame)
     @routed = true
     frame.slot = route_slot(scope_shard(false), scope_role(false))
@@ -1667,7 +1669,7 @@ module Db
         # Ignore a rollback failure only when SQLite already ended the transaction.
         error = e if error.nil? && (Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
       ensure
-        Thread.current[:db_conn] = outer if switched
+        Thread.current[:db_conn] = (home.nil? || !home.closed) ? outer : nil if switched
         stack.pop
       end
     end

@@ -674,3 +674,14 @@ pub const PARKED_REOPEN_SCRIPT: &str = r##"ActiveRecord::Base.with_connection do
 end
 "##;
 pub const PARKED_REOPEN_EXPECTED: &str = "parked-fresh=true\nparked-file=true\n";
+
+pub const SCOPED_REOPEN_SCRIPT: &str = r##"Note.create!(tag: "left")
+ApplicationRecord.connected_to(shard: :right) { 2.times { Note.create!(tag: "right") } }
+Db.with_connection do
+  ApplicationRecord.connected_to(shard: :right) { Db.close }
+  puts "scope-cleared=" + (!Db.in_lease?).to_s
+  Db.configure("storage/scoped-primary.sqlite3", pool_size: 1)
+  puts "scope-left=" + Note.count.to_s
+end
+"##;
+pub const SCOPED_REOPEN_EXPECTED: &str = "scope-cleared=true\nscope-left=1\n";

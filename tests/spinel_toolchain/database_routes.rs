@@ -110,3 +110,9 @@ fn writable_route_parents_tolerate_concurrent_creators() {
 fn a_closed_parked_connection_is_not_reused_after_reconfigure() {
     assert_shard_report(contract::PARKED_REOPEN_SCRIPT, contract::PARKED_REOPEN_EXPECTED);
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_shard_scope_does_not_restore_a_closed_outer_connection() {
+    assert_shard_report(contract::SCOPED_REOPEN_SCRIPT, contract::SCOPED_REOPEN_EXPECTED);
+}
