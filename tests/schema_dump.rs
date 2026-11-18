@@ -502,13 +502,24 @@ fn a_shared_block_or_root_merge_refuses_a_named_file() {
         assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
         assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
     }
-    // A null or `false` `shared:` is skipped, as Rails skips it: the named file is read.
-    for shared in ["~", "false"] {
+    // A null or `false` `shared:` is skipped, as Rails skips it: the named file is read. An unquoted
+    // `off` or `No` is `false` to Psych too.
+    for shared in ["~", "false", "off", "No  # none"] {
         let yml = format!("shared: {shared}\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n");
         let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
         assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
         assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
     }
+    // A quoted `'off'` is a String Rails would try to merge, so it still refuses.
+    let yml = "shared: 'off'\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("`shared:` block")), "{yml}: {:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty(), "{yml}");
+    // A longer identifier that only contains `db_dir` moves nothing: the named file is read.
+    let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE), ("config/initializers/labels.rb", "db_directory_label = \"Database directory\"\nmy_db_dir_name = 1\n")]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["widgets"]);
 }
 
 /// A quoted `schema_dump` key is the same String key, so its file is read.

@@ -390,8 +390,17 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     let computed = computed_key(&doc);
     let Value::Mapping(mut envs) = doc else { return out };
     // Rails fills each configuration's missing keys from a top-level `shared:` block. A null or
-    // `false` one is skipped, as Rails skips it.
-    let shared = !matches!(envs.get("shared"), None | Some(Value::Null) | Some(Value::Bool(false)));
+    // `false` one is skipped, as Rails skips it; so is an unquoted `off` or `no`, which Psych reads
+    // as `false` and this parser as a String. The line's own spelling decides, so `'off'` still counts.
+    let unquoted_false = || text.lines().any(|l| l.strip_prefix("shared:").is_some_and(|v| {
+        let v = v.split(" #").next().unwrap_or_default().trim();
+        ["no", "off", "false"].iter().any(|w| v.eq_ignore_ascii_case(w))
+    }));
+    let shared = match envs.get("shared") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::String(_)) => !unquoted_false(),
+        Some(_) => true,
+    };
     // Without a literal `test`, a computed environment key may be it.
     if !envs.contains_key("test") && envs.keys().any(|k| k.as_str().is_some_and(|k| k.contains(ERB_VALUE))) {
         return unresolved(&text, "an environment's key is computed with ERB, and there is no literal `test`");
@@ -585,7 +594,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         };
         if url_unread {
             refuse(offset, unsupported(&written, "the configuration's `url:` is computed, not a string, or written under more than one spelling, so its query could name another file"), false);
-        } else if let Some(setter) = config_mentions(vfs, dir, |text| mentions_paths(text) || text.contains("db_dir")) {
+        } else if let Some(setter) = config_mentions(vfs, dir, |text| mentions_paths(text) || mentions_identifier(text, "db_dir")) {
             // `DatabaseTasks.db_dir`, which Rails joins the name to, defaults to `paths["db"]` and can be assigned.
             refuse(offset, format!("{label}'s `schema_dump: {written}` is not supported: {setter} `.paths`, `paths[`, `paths.add` or `db_dir`, which can move the db directory Rails reads it from"), false);
         } else if let Err(why) = &format {
@@ -647,6 +656,17 @@ fn mentions_paths(text: &str) -> bool {
         let dotted = before.ends_with('.');
         let assets = before.strip_suffix('.').is_some_and(|b| b.ends_with(".assets"));
         !assets && (dotted || after.starts_with('[') || after.starts_with(".add"))
+    })
+}
+
+/// `name` as a whole identifier: neither neighbouring character may
+/// continue an identifier. Comments included, as in `mentions_paths`.
+fn mentions_identifier(text: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
     })
 }
 
