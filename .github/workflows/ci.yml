@@ -66,6 +66,11 @@ env:
   # and tag the emitted spin.toml pins (src/project.rs); bump both together.
   SPINEL_REDIS_REPO: roundhouse-rb/spinel-redis
   SPINEL_REDIS_REF: v0.3.3
+  # The cache key of the recorded Spinel test seconds the plan balances and budgets shards on. Full validation keeps
+  # its own: it compiles each contract inside the whole blog's boot (ROUNDHOUSE_SPINEL_SLIM=0), so its seconds are not
+  # a push run's. Full validation falls back to spinel-timings- until it has saved its own. Neither key is a prefix of
+  # the other, so a push or PR run, which restores only spinel-timings-, never starts from Full validation's seconds.
+  SPINEL_TIMINGS_KEY: ${{ inputs.full && 'spinel-full-timings' || 'spinel-timings' }}
 
 jobs:
   plan:
@@ -97,13 +102,16 @@ jobs:
           # fetched by the planner, not by cloning full history.
           fetch-depth: 2
       # The latest seconds spinel-timings saved; without them the plan falls back to ci-plan.py's tables.
+      # Full validation starts from the push runs' seconds until it has saved its own.
       - name: Restore recorded Spinel test seconds
         continue-on-error: true
         uses: actions/cache/restore@v6
         with:
           path: .ci-timings/spinel-timings.json
-          key: spinel-timings-${{ github.run_id }}
-          restore-keys: spinel-timings-
+          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.SPINEL_TIMINGS_KEY }}-
+            spinel-timings-
       - name: Select required coverage from the event's actual tree
         id: plan
         env:
@@ -1005,11 +1013,10 @@ jobs:
       shard-3: ${{ steps.result.outputs.shard-3 }}
       shard-4: ${{ steps.result.outputs.shard-4 }}
     runs-on: ubuntu-latest
-    # 30m: upstream's shards take 11-14m, but a fork's runners take about
-    # 1.7x that (a 20m bound cut a passing shard 2 there, fork run
-    # 38923600903). Still short of papering over a hung suite. The script
-    # stops its suites at 27m, so this bound only catches a slow setup.
-    timeout-minutes: 30
+    # The plan's, three minutes past the budget the script stops its suites
+    # at (ci-plan.py spinel_budget: 27m and 30m without recorded seconds),
+    # so this bound only catches a slow setup.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
     # spinel_pg_db runs the PostgreSQL Db shim against this server
@@ -1071,6 +1078,7 @@ jobs:
           ROUNDHOUSE_PG_TEST_REQUIRED: "1"
           CI_SPINEL_TIMINGS: ${{ needs.plan.outputs.spinel-timings }}
           CI_SPINEL_TIMINGS_OUT: ${{ runner.temp }}/spinel-timings/framework-${{ matrix.shard }}.jsonl
+          CI_SPINEL_FRAMEWORK_BUDGET: ${{ matrix.budget }}
         run: scripts/ci-spinel-framework.sh
       # Not !cancelled(): a job past its limit reads as cancelled, and its finished suites' seconds still count.
       - name: Upload recorded test seconds
@@ -1852,7 +1860,8 @@ jobs:
       shard-3: ${{ steps.result.outputs.shard-3 }}
       shard-4: ${{ steps.result.outputs.shard-4 }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The plan's, a minute past this shard's deadline (24m and 25m without recorded seconds).
+    timeout-minutes: ${{ fromJSON(needs.spinel-toolchain-plan.outputs.budgets)[matrix.shard].timeout_minutes }}
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
     env:
@@ -1864,7 +1873,9 @@ jobs:
     steps:
       # Not left to timeout-minutes: a job stopped there uploads no seconds, so the planner kept the shard as it was. Not earlier than a minute before it: shards that used to pass near 24 minutes would fail.
       - name: Set this shard's deadline
-        run: echo "CI_SPINEL_DEADLINE=$(( $(date +%s) + 1440 ))" >> "$GITHUB_ENV"
+        env:
+          BUDGET: ${{ fromJSON(needs.spinel-toolchain-plan.outputs.budgets)[matrix.shard].budget }}
+        run: echo "CI_SPINEL_DEADLINE=$(( $(date +%s) + BUDGET ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       # No setup-rust: the producer archive restores the test binaries.
       - uses: actions/download-artifact@v8
@@ -2073,6 +2084,7 @@ jobs:
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-toolchain') && needs.generate-fixture.result == 'success' && needs.spinel-build.outputs.artifact-id != '' && needs.spinel-toolchain-build.outputs.artifact-id != '' }}
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      budgets: ${{ steps.budgets.outputs.budgets }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
@@ -2130,6 +2142,12 @@ jobs:
             "$SPINEL_TOOLCHAIN_BIN" --ignored --exact spinel_bundle_plan
           python3 -c 'import json, sys; units = json.load(open(sys.argv[1])); assert units and all(units), units' "$out/bundle-plan.json"
           echo "collected $(ls "$out/bundle-all" | wc -l) cases into $(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$out/bundle-plan.json") units in $(( $(date +%s) - start ))s"
+      # From the same tests, units and seconds each shard plans its own tests with (`toolchain-shard`).
+      - name: Size each shard's deadline from the seconds it is planned with
+        id: budgets
+        env:
+          CI_SPINEL_TIMINGS: ${{ needs.plan.outputs.spinel-timings }}
+        run: python3 scripts/ci-plan.py toolchain-budgets --units "$RUNNER_TEMP/bundle-plan/bundle-plan.json" < "$RUNNER_TEMP/bundle-plan/tests.txt"
       - name: Upload the toolchain plan
         id: upload
         uses: actions/upload-artifact@v7
@@ -4219,8 +4237,10 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .ci-timings/spinel-timings.json
-          key: spinel-timings-${{ github.run_id }}
-          restore-keys: spinel-timings-
+          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.SPINEL_TIMINGS_KEY }}-
+            spinel-timings-
       - name: Collect this run's test seconds
         continue-on-error: true
         uses: actions/download-artifact@v8
@@ -4234,7 +4254,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .ci-timings/spinel-timings.json
-          key: spinel-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   archive-results:
     needs: [plan, build-site, campfire-archive-build, smoke, spinel-smoke, campfire-smoke, campfire-smoke-docker]
