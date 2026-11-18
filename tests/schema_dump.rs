@@ -265,20 +265,31 @@ fn quoted_environment_and_configuration_keys_are_located() {
     }
 }
 
-/// solid_queue's records are found from the named primary schema too.
-#[test]
-fn queue_tables_in_the_named_schema_select_solid_queue_models() {
-    let checked = check(&files(&[
-        ("config/database.yml", "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n"),
-        ("db/catalog_schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :solid_queue_jobs do |t|\n    t.text :arguments\n  end\nend\n"),
+/// An app on solid_queue that reads its records, with `extra` files.
+fn solid_queue_app(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut pairs = vec![
         ("config/application.rb", "config.active_job.queue_adapter = :solid_queue"),
         ("app/models/queue_stats.rb", "class QueueStats; def self.jobs; SolidQueue::Job.count; end; end"),
         (".bundle/config", "BUNDLE_PATH: vendor/bundle"),
         ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    solid_queue (1.7.0)\n\nDEPENDENCIES\n  solid_queue\n"),
         ("vendor/bundle/ruby/3.4.0/gems/solid_queue-1.7.0/app/models/solid_queue/job.rb", "class SolidQueue::Job < ActiveRecord::Base; self.table_name = 'solid_queue_jobs'; end"),
-    ]));
-    assert_eq!(tables(&checked.app), ["solid_queue_jobs"]);
-    assert!(checked.app.models.iter().any(|m| m.name.0.as_str() == "SolidQueue::Job"), "SolidQueue::Job was not selected");
+    ];
+    pairs.extend_from_slice(extra);
+    files(&pairs)
+}
+
+const QUEUE_JOBS: &str = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :solid_queue_jobs do |t|\n    t.text :arguments\n  end\nend\n";
+
+/// solid_queue's records are found from the named primary schema too, read
+/// in its resolved format: `.rb` alone has no extension but is Ruby.
+#[test]
+fn queue_tables_in_the_named_schema_select_solid_queue_models() {
+    for (dump, path) in [("catalog_schema.rb", "db/catalog_schema.rb"), (".rb", "db/.rb")] {
+        let yml = format!("test:\n  adapter: sqlite3\n  schema_dump: {dump}\n");
+        let checked = check(&solid_queue_app(&[("config/database.yml", &yml), (path, QUEUE_JOBS)]));
+        assert_eq!(tables(&checked.app), ["solid_queue_jobs"], "{dump}");
+        assert!(checked.app.models.iter().any(|m| m.name.0.as_str() == "SolidQueue::Job"), "{dump}: SolidQueue::Job was not selected");
+    }
 }
 
 /// A three-tier test environment whose configurations are named by

@@ -14459,22 +14459,24 @@ fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::sch
 /// Use the ordinary schema readers for selection too. The normal primary schema
 /// pass remains the owner of its facts and diagnostics, including survey gaps.
 fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path, named: Option<&Result<(PathBuf, bool), ()>>) -> bool {
-    let path = match named {
-        Some(Ok((path, _))) => path.clone(),
+    // A named file is read in the format it was resolved in (`.rb` alone has no extension).
+    let (path, sql) = match named {
+        Some(Ok((path, sql))) => (path.clone(), *sql),
         Some(Err(())) => return false,
         None => {
             let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
                 .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
-            path
+            let sql = path.extension().is_none_or(|ext| ext != "rb");
+            (path, sql)
         }
     };
     let Ok(source) = vfs.read(&path) else { return false };
     let marks = (super::survey::mark(), super::prism::mark());
     let file = path.display().to_string();
-    let schema = if path.extension().is_some_and(|ext| ext == "rb") {
-        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
-    } else {
+    let schema = if sql {
         ingest_structure_sql(&source, &file)
+    } else {
+        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
     };
     let has_queue = schema.is_ok_and(|schema| schema.tables.contains_key(&Symbol::from("solid_queue_jobs")));
     super::survey::rewind(marks.0);
