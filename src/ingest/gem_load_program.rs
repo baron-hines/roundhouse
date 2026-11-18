@@ -29,6 +29,49 @@ use crate::det::{HashMap, HashSet};
 use crate::expr::{Expr, ExprNode};
 
 pub(super) fn carry(app: &mut App) {
+    // (not a class's own `class_eval`: it may never run the block)
+    let evaluators: HashSet<String> = app.library_classes.iter()
+        .filter(|c| c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class
+            && matches!(m.name.as_str(), "class_eval" | "module_eval" | "class_exec" | "module_exec")))
+        .map(|c| c.name.0.to_string())
+        .collect();
+    for program in &mut app.file_programs {
+        let items = std::mem::take(&mut program.items);
+        for item in items {
+            match &item {
+                ProgramItem::Statement(e) => match class_eval_mixins(e, &evaluators) {
+                    Some(calls) => program.items.extend(calls.into_iter().map(ProgramItem::Statement)),
+                    None => program.items.push(item),
+                },
+                _ => program.items.push(item),
+            }
+        }
+    }
+    // `Foo::Version.extend(VersionGem::Basic)` where Basic has an `extended` hook: Spinel takes the call as Foo's
+    // extend but does not run the hook there, so what the hook mixes in (version_gem's Api) never reaches Foo.
+    let hooked: HashSet<String> = app.library_classes.iter()
+        .filter(|c| c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "extended"))
+        .map(|c| c.name.0.to_string())
+        .collect();
+    for program in &app.file_programs {
+        for item in &program.items {
+            let ProgramItem::Statement(e) = item else { continue };
+            let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else { continue };
+            if method.as_str() != "extend" || !matches!(&*recv.node, ExprNode::Const { .. }) { continue; }
+            for arg in args {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                if hooked.contains(&name) {
+                    app.gem_route_gaps.push(crate::diagnostic::Diagnostic::unsupported(
+                        e.span,
+                        Some(crate::ident::Symbol::from("spinel")),
+                        "mixin hook",
+                        format!("Spinel does not run `{name}.extended` for a file-level `extend`, so what the hook mixes in is missing there"),
+                    ));
+                }
+            }
+        }
+    }
     let programs: HashMap<String, &FileProgram> =
         app.file_programs.iter().map(|p| (super::normalize_source(&p.source), p)).collect();
     if programs.is_empty() {
@@ -65,6 +108,47 @@ pub(super) fn carry(app: &mut App) {
         gap.severity = crate::diagnostic::Severity::Warning;
         gap
     }));
+}
+
+/// `VersionGem::Version.class_eval do extend VersionGem::Basic end` (version_gem, snaky_hash): a file-level
+/// block of nothing but mixins, as the calls `VersionGem::Version.extend(VersionGem::Basic)` it runs. Both read
+/// their constants from the file's top level, so the calls name what the block's statements named.
+fn class_eval_mixins(e: &Expr, evaluators: &HashSet<String>) -> Option<Vec<Expr>> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*e.node else { return None };
+    let ExprNode::Const { path } = &*recv.node else { return None };
+    let written = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+    if evaluators.contains(&written)
+        || !matches!(method.as_str(), "class_eval" | "module_eval" | "class_exec" | "module_exec")
+        || !args.is_empty()
+    {
+        return None;
+    }
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*block.node else { return None };
+    if !params.is_empty() || !extra_params.is_empty() {
+        return None;
+    }
+    let statements: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    let mut calls = Vec::new();
+    for statement in statements {
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node else { return None };
+        if !matches!(method.as_str(), "extend" | "include" | "prepend")
+            || args.is_empty()
+            || !args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
+        {
+            return None;
+        }
+        calls.push(Expr::new(statement.span, ExprNode::Send {
+            recv: Some(recv.clone()),
+            method: method.clone(),
+            args: args.clone(),
+            block: None,
+            parenthesized: true,
+        }));
+    }
+    (!calls.is_empty()).then_some(calls)
 }
 
 /// The constants the app's own code (any body outside the gem files' programs) and its model macros' includes name.
