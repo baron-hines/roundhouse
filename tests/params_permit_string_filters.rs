@@ -73,3 +73,18 @@ fn a_non_literal_filter_list_stays() {
     let src = controller_for(BuildTarget::Spinel, body);
     assert!(src.contains(".permit(fields)"), "{src}");
 }
+
+/// A nested value's `permit` with a Hash filter (#2240's `Params.filtered_values`) reads its String and
+/// Array-literal scalar filters as the Symbol ones.
+#[test]
+fn a_nested_permit_with_a_hash_filter_takes_string_filters() {
+    const FILTERED: &str = r#"Params.filtered_values(@params.fetch("q", {}), ["name"], { "tags" => [] }"#;
+    for filters in ["\"name\", tags: []", "%w[name], tags: []"] {
+        let body = format!("    @q = params.fetch(:q, {{}}).permit({filters})");
+        for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+            let src = controller_for(target, &body);
+            assert!(src.contains(FILTERED), "{target:?} permit({filters}):\n{src}");
+            assert!(!src.contains(".permit("), "{target:?} permit({filters}):\n{src}");
+        }
+    }
+}
