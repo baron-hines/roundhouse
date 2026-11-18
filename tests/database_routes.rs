@@ -71,6 +71,24 @@ fn a_shard_named_with_a_leading_digit_is_quoted() {
     assert!(routes.contains("@default_shard = :\"2026\"\n"), "{routes}");
 }
 
+/// A model's `prepend Concern` in a routed app stays the concern
+/// splice's statement: the flag that claims it is not the one that marks
+/// a writing block ingest read as its body, so the routes do not put a
+/// `connected_to(role: :writing)` back around it.
+#[test]
+fn a_prepended_concern_in_a_routed_app_stays_a_prepend() {
+    let overlay = shards()
+        .write(
+            "app/models/concerns/trimmed.rb",
+            "module Trimmed\n  extend ActiveSupport::Concern\n\n  prepended do\n    before_save :trim_tag\n  end\n\n  private\n\n  def trim_tag\n    self.tag = tag.strip\n  end\nend\n",
+        )
+        .write("app/models/note.rb", "class Note < ApplicationRecord\n  prepend Trimmed\nend\n");
+    let (emitted, errors) = overlay.emit(BuildTarget::Spinel);
+    let note = std::fs::read_to_string(emitted.join("app/models/note.rb")).unwrap_or_default();
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(note.contains("prepend Trimmed") && !note.contains("connected_to"), "{note}");
+}
+
 #[test]
 fn an_app_on_one_database_keeps_an_empty_routes_region() {
     let one = contract::app("class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n", "class RouteReport\nend\n");
