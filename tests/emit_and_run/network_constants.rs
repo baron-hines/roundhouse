@@ -71,11 +71,27 @@ fn network_constants_are_reported_on_strict_targets() {
     use roundhouse::project::BuildTarget::*;
     for target in [Rust, Typescript, Go, Python, CSharp, Kotlin, Swift, Elixir, Crystal] {
         let (_emitted, errors) = probe_app().emit(target);
-        for name in ["Socket::TCP_NODELAY", "IO::WaitReadable", "OpenSSL::SSL::SSLContext", "Zlib::Inflate"] {
+        for name in [
+            "Socket::IPPROTO_TCP", "Socket::SOL_SOCKET", "Socket::SO_KEEPALIVE", "Socket::TCP_NODELAY", "Socket::AF_INET",
+            "IO::WaitReadable", "IO::WaitWritable", "OpenSSL::SSL::SSLContext", "OpenSSL::SSL::SSLSocket",
+            "OpenSSL::X509::Certificate", "OpenSSL::PKey::RSA", "OpenSSL::Digest::MD5", "Zlib::Inflate",
+        ] {
             assert!(
                 errors.iter().any(|e| e.contains("bundled_constant not supported") && e.contains(&format!(": {name} "))),
                 "{target:?} {name}: {errors:#?}",
             );
         }
     }
+}
+
+/// An app's own constant under Socket is the app's, not a socket option the strict runtime lacks.
+#[test]
+fn an_apps_own_socket_constant_is_not_reported() {
+    use roundhouse::project::BuildTarget::*;
+    let app = emit_and_run::real_blog().write(
+        "app/models/socket_mode.rb",
+        "class Socket\n  APP_MODE = 7\nend\n\nclass SocketMode\n  def self.mode = ::Socket::APP_MODE\nend\n",
+    );
+    let (_emitted, errors) = app.emit(Rust);
+    assert!(!errors.iter().any(|e| e.contains("Socket::APP_MODE is a socket option")), "{errors:#?}");
 }

@@ -10173,7 +10173,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
-            && flag.starts_with(|c: char| c.is_ascii_uppercase())
+            && crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
         {
             emit::diagnostics::report_unsupported(
                 expr.span,

@@ -16,7 +16,7 @@ fn probe_app() -> emit_and_run::Overlay {
 }
 
 const ASSERTIONS: &str = r##"raise LogProbe.levels.inspect unless LogProbe.levels == [0, 1, 2, 3, 4, 5]
-raise "quiet" unless LogProbe.quiet?(Logger::ERROR) && !LogProbe.quiet?(Logger::INFO)
+raise "quiet" unless LogProbe.quiet?(Logger::ERROR) && LogProbe.quiet?(Logger::WARN) && !LogProbe.quiet?(Logger::INFO)
 puts "logger severity passed"
 "##;
 
