@@ -2522,6 +2522,13 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             ExprNode::Defined { operand }
                 if target == BuildTarget::Spinel && !load_time
                     && matches!(&*operand.node, ExprNode::Send { recv: Some(_), args, block: None, .. } if args.is_empty()) => None,
+            // `defined?(base::VERSION)` in a method (version_gem's hook guard), a constant read on a value: Spinel
+            // answers "constant" where the value's class holds the name, as CRuby does (matz/spinel#12114).
+            ExprNode::Defined { operand }
+                if target == BuildTarget::Spinel && !load_time
+                    && matches!(&*operand.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                        if method.as_str() == "const_get" && !matches!(&*r.node, ExprNode::Const { .. })
+                            && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }))) => None,
             ExprNode::Defined { .. } => Some("runtime defined? query"),
             // A `define_method` block's `&block`, kept by ingest: only the Ruby emitter (Spinel's and Roda's too) binds it.
             ExprNode::Lambda { block_param: Some(_), .. } if !matches!(target, BuildTarget::Spinel | BuildTarget::Roda) => {
@@ -5316,12 +5323,7 @@ fn ruby_family_runtime_files(
             .filter_map(|l| l.strip_prefix(&stub_require).map(|rest| format!("{}/{}", crate::ingest::source_gems_mount(), rest.trim_end_matches('"'))))
             .collect();
         *models = models.lines().filter(|l| !l.starts_with(&stub_require)).map(|l| format!("{l}\n")).collect();
-        // ...but one the gem requires by a literal name is loaded as Bundler loads the gem: a path built to it
-        // answers false, as CRuby's does.
-        let required = gem_literally_required(app);
-        for stub in stubs.iter().filter(|stub| required.iter().any(|r| r.ends_with(&format!("/{stub}.rb")))) {
-            models.push_str(&format!("$LOADED_FEATURES << File.realpath({:?}, __dir__)\n", format!("../{stub}.rb")));
-        }
+        GEM_FILE_STUBS.with(|s| *s.borrow_mut() = stubs);
     }
 
     files.retain(|(p, _)| p != "runtime/db.rb" && p != "runtime/faye_websocket.rb");
@@ -5840,6 +5842,7 @@ fn ruby_family_runtime_files(
     }
     apply_conditional_declarations(&mut files, app);
     apply_file_programs(&mut files, app);
+    mark_gem_file_stubs_loaded(&mut files, app);
     // After the file programs: a gem's top-level file may be the only code that calls it.
     drop_unnamed_gzip(&mut files);
     // After every pass that writes app code into a file: the boot
@@ -8861,6 +8864,51 @@ fn apply_gem_file_stubs(files: &mut Vec<(String, String)>, app: &App) {
     files.extend(stubs.into_iter().map(|(stub, body, _)| (stub, body)));
 }
 
+thread_local! {
+    /// The gem file stubs the Ruby family takes out of `app/models.rb`, for `mark_gem_file_stubs_loaded`.
+    static GEM_FILE_STUBS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// On the CRuby tree, a gem file's stub is loaded as CRuby loads the file. A stub whose file has a program
+/// requires it, and the program enters the stub in `$LOADED_FEATURES` as it runs, so a path built to the
+/// file answers false once the file has loaded, whether boot or the built path loaded it.
+fn mark_gem_file_stubs_loaded(files: &mut Vec<(String, String)>, app: &App) {
+    let stubs = GEM_FILE_STUBS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    if stubs.is_empty() {
+        return;
+    }
+    let have: crate::det::HashSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    let mut programless = Vec::new();
+    for stub in &stubs {
+        let stub_rb = format!("{stub}.rb");
+        let program = format!("app/models/roundhouse_files/{stub_rb}");
+        if !have.contains(&program) {
+            programless.push(stub_rb);
+            continue;
+        }
+        let depth = stub_rb.matches('/').count();
+        let require = format!("require_relative {:?}\n", format!("{}{}", "../".repeat(depth), program.trim_end_matches(".rb")));
+        if let Some((_, body)) = files.iter_mut().find(|(p, _)| *p == stub_rb)
+            && !body.contains(require.trim_end())
+        {
+            body.insert_str(0, &require);
+        }
+        let back = format!("{}{stub_rb}", "../".repeat(program.matches('/').count()));
+        if let Some((_, body)) = files.iter_mut().find(|(p, _)| *p == program) {
+            let at = body.lines().take_while(|l| l.starts_with('#')).map(|l| l.len() + 1).sum::<usize>().min(body.len());
+            body.insert_str(at, &format!("$LOADED_FEATURES << File.realpath({back:?}, __dir__)\n"));
+        }
+    }
+    // A stub with no program loads only the classes boot has loaded: one the gem requires by a literal name is
+    // entered as Bundler would have loaded it.
+    let required = gem_literally_required(app);
+    if let Some((_, models)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
+        for stub in programless.iter().filter(|stub| required.iter().any(|r| r.ends_with(&format!("/{stub}")))) {
+            models.push_str(&format!("$LOADED_FEATURES << File.realpath({:?}, __dir__)\n", format!("../{stub}")));
+        }
+    }
+}
+
 /// The gem files another gem file requires by a literal name (normalized source paths).
 fn gem_literally_required(app: &App) -> crate::det::HashSet<String> {
     let known: crate::det::HashSet<String> = app.sources.iter().map(|f| normalize_source(&f.path)).collect();
@@ -9526,6 +9574,15 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "RegexpError" | "Comparable" | "Enumerable"
         | "LoadError" | "Proc" | "Range" | "Method" | "Gem::Version"
+        // Ruby's and spinel's (`lib/sp_exc.c`) own; no strict runtime raises or rescues them.
+        | "ScriptError" | "SyntaxError" | "SystemExit" | "SignalException" | "Interrupt"
+        | "NoMemoryError" | "SecurityError" | "SystemStackError"
+        | "Encoding::UndefinedConversionError" | "Encoding::InvalidByteSequenceError"
+        | "Encoding::ConverterNotFoundError"
+        | "Signal" | "FileTest" | "Marshal" | "Fiber"
+        | "Socket" | "IO::WaitReadable" | "IO::WaitWritable" | "Zlib::Inflate" | "OpenSSL::Digest::MD5"
+        | "OpenSSL::X509::Certificate" | "OpenSSL::PKey::RSA" | "OpenSSL::SSL::SSLSocket" | "OpenSSL::SSL::SSLContext"
+        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data" | "OpenSSL::BN" | "BigDecimal"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
@@ -10122,6 +10179,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         // These are Integer values, so the class/module gate does not see them.
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
+            && crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("Socket::{flag} is a socket option constant, which the {target} runtime does not supply"),
+            );
+        }
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Zlib", flag @ ("BEST_COMPRESSION" | "MAX_WBITS" | "FINISH")] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
         {
             emit::diagnostics::report_unsupported(
@@ -10129,6 +10198,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 target,
                 "bundled_constant",
                 format!("Zlib::{flag} is a bundled zlib constant, which the {target} runtime does not supply"),
+            );
+        }
+        // A Hash value, so the class/module gate does not see it either.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["RbConfig", "CONFIG"])
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("RbConfig::CONFIG is the running Ruby's build configuration, which the {target} runtime does not supply"),
             );
         }
         // A Hash value, so the class/module gate does not see it either.

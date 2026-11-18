@@ -23,6 +23,9 @@ use crate::ty::Ty;
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the
+/// `extend` is that class's, not `Object#extend` (`lower::object_extend`).
+pub const MIXIN_HOOK_BASE: u64 = 1 << 41;
 /// Positive instance provenance for generated model-indexer key lowering.
 /// A nominal `Ty::Class` alone is not instance evidence.
 pub const INDEXER_INSTANCE_VALUE: u64 = 1 << 39;

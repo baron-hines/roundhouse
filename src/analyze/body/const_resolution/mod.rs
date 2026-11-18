@@ -113,6 +113,21 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     // `packages/openssl` (same values) on spinel.
     ("OpenSSL::SSL", "VERIFY_NONE", || Ty::Int),
     ("OpenSSL::SSL", "VERIFY_PEER", || Ty::Int),
+    // `sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)` — a network client's connection options.
+    // The values both CRuby and spinel answer on every platform the trees build on (not SOL_TCP or
+    // TCP_KEEPIDLE, which one of them lacks on macOS).
+    ("Socket", "IPPROTO_TCP", || Ty::Int),
+    ("Socket", "IPPROTO_IPV6", || Ty::Int),
+    ("Socket", "SOL_SOCKET", || Ty::Int),
+    ("Socket", "SO_KEEPALIVE", || Ty::Int),
+    ("Socket", "SO_REUSEADDR", || Ty::Int),
+    ("Socket", "TCP_NODELAY", || Ty::Int),
+    ("Socket", "TCP_KEEPINTVL", || Ty::Int),
+    ("Socket", "TCP_KEEPCNT", || Ty::Int),
+    ("Socket", "AF_INET", || Ty::Int),
+    ("Socket", "AF_INET6", || Ty::Int),
+    ("Socket", "AF_UNSPEC", || Ty::Int),
+    ("Socket", "SOCK_STREAM", || Ty::Int),
     ("Zlib", "BEST_COMPRESSION", || Ty::Int),
     ("Zlib", "MAX_WBITS", || Ty::Int),
     ("Zlib", "FINISH", || Ty::Int),
@@ -125,7 +140,14 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("URI", "DEFAULT_PARSER", uri_rfc3986_parser),
     ("URI", "RFC3986_PARSER", uri_rfc3986_parser),
     ("URI", "RFC2396_PARSER", uri_rfc2396_parser),
+    // `RbConfig::CONFIG["host_os"]` — a gem's platform branch. Ruby's own on the ruby family, spinel's
+    // `builtins/rbconfig.rb` (the machine it compiled for, String values throughout) on spinel.
+    ("RbConfig", "CONFIG", str_str_hash),
 ];
+
+fn str_str_hash() -> Ty {
+    Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }
+}
 
 fn uri_rfc2396_parser() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("URI::RFC2396_Parser")), args: vec![].into() }
@@ -136,7 +158,7 @@ fn uri_rfc3986_parser() -> Ty {
 }
 
 /// Owners of value Consts that Ruby defines as modules, not classes.
-const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib"];
+const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib", "RbConfig"];
 
 /// Ruby's top-level value Consts: `STDERR.puts "…"` (discourse's
 /// warnings) reads the process's own stream, which `$stderr` is only
@@ -158,6 +180,7 @@ const CORE_VALUE_CLASSES: &[(&str, &str)] = &[
     ("File", "IO"),
     ("Encoding", "Object"),
     ("OpenSSL::SSL", "Object"),
+    ("Socket", "IO"),
     ("Regexp", "Object"),
     ("Date", "Object"),
 ];
@@ -172,6 +195,7 @@ fn rbs_type_name(ty: &Ty) -> &'static str {
         Ty::Int => "Integer",
         Ty::Str => "String",
         Ty::Class { id, .. } if id.0.as_str() == "Encoding" => "Encoding",
+        Ty::Hash { key, value } if matches!((&**key, &**value), (Ty::Str, Ty::Str)) => "Hash[String, String]",
         _ => "untyped",
     }
 }
@@ -180,6 +204,22 @@ fn core_rbs() -> &'static str {
     static RBS: OnceLock<String> = OnceLock::new();
     RBS.get_or_init(|| {
         let mut out = String::from(CORE_RBS_BASE);
+        // (the namespace too: a `class OpenSSL::SSL` alone leaves `OpenSSL` undeclared, and a read of
+        // `OpenSSL::SSL::VERIFY_NONE` from inside a nested module found no `OpenSSL` to start the path from)
+        let mut declared: Vec<&str> = Vec::new();
+        for (class, _) in CORE_VALUE_CLASSES {
+            let mut at = 0;
+            while let Some(i) = class[at..].find("::") {
+                let outer = &class[..at + i];
+                if !declared.contains(&outer) && !CORE_VALUE_CLASSES.iter().any(|(c, _)| *c == outer) {
+                    declared.push(outer);
+                    out.push_str("module ");
+                    out.push_str(outer);
+                    out.push_str("\nend\n");
+                }
+                at += i + 2;
+            }
+        }
         for (class, parent) in CORE_VALUE_CLASSES {
             out.push_str("class ");
             out.push_str(class);
@@ -816,7 +856,7 @@ impl ConstResolver {
 
     /// A declaration header is not a constant reference. Its body still runs
     /// on the resolved namespace, including qualified reopenings and aliases.
-    pub(in crate::analyze) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
+    pub(crate) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
         self.file(span.file)?.namespace_bodies.get(&span.end)
     }
 
@@ -1386,6 +1426,43 @@ fn answer_file(
                     slot.insert(target);
                 }
             }
+        }
+    }
+    // `extend Plugs::Basic` in a file-level block (`Version.class_eval do … end`): the index records a mixin only in
+    // a namespace's body, so it keeps the path's `Plugs` and drops `Basic`. A name after a resolved namespace is that
+    // namespace's own, as `Plugs::Basic` is anywhere; only a class or module there is taken.
+    let namespaces: Vec<(u32, Arc<ClassId>)> = answers.references.iter()
+        .filter_map(|(key, answer)| match answer {
+            Some(ResolvedConstant::Namespace { class, .. }) => Some((*key, Arc::clone(class))),
+            _ => None,
+        })
+        .collect();
+    let ident_len = |at: usize| source.text.get(at..).map_or(0, |rest| rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count());
+    for (start, class) in namespaces {
+        let mut owner = class.0.to_string();
+        let mut end = start as usize + ident_len(start as usize);
+        while source.text.get(end..end + 2) == Some("::") {
+            let at = end + 2;
+            let len = ident_len(at);
+            let Some(name) = source.text.get(at..at + len).filter(|n| n.starts_with(|c: char| c.is_ascii_uppercase())) else { break };
+            let Ok(key) = u32::try_from(at) else { break };
+            if answers.references.contains_key(&key) {
+                break;
+            }
+            let full = format!("{owner}::{name}");
+            let Some(declaration) = graph.declarations().get(&DeclarationId::from(full.as_str())) else { break };
+            if declaration.as_namespace().is_none() || is_assigned_value(graph, declaration) {
+                break;
+            }
+            if declaration.kind() == "Class" {
+                answers.class_references.insert(key);
+            }
+            answers.references.insert(key, Some(ResolvedConstant::Namespace {
+                class: Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
+                runtime: is_runtime_declaration(graph, declaration),
+            }));
+            owner = full;
+            end = at + len;
         }
     }
     for definition_id in document.definitions() {

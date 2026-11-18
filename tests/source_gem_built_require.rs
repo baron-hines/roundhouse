@@ -46,3 +46,26 @@ fn a_path_a_source_gem_builds_from_its_file_finds_the_file_it_shipped() {
     assert!(out.status.success(), "{stdout}\n{stderr}");
     assert_eq!(stdout, "[false, :plain]\n", "{stderr}");
 }
+
+/// A file with statements of its own, loaded through a built path: its program runs, as loading the file does.
+/// One a literal require names only in a branch that does not run is not loaded by it, so the built path loads it.
+#[test]
+fn a_built_path_runs_the_files_statements_and_a_skipped_literal_require_loads_nothing() {
+    let entry = "require_relative \"pathy/plain_kind\"\nrequire_relative \"pathy/noted_kind\" if ENV[\"PATHY_EAGER\"]\n\nmodule Pathy\n  NOTES = []\n  def self.load_kind(kind)\n    require File.join(File.dirname(__FILE__), \"pathy\", \"#{kind}_kind\")\n  end\nend\n";
+    let noted = "Pathy::NOTES << :noted_loaded\n\nmodule Pathy\n  module NotedKind\n    def self.hi = :noted\n  end\nend\n";
+    let (dir, errors) = app()
+        .write(&format!("{GEM}/lib/pathy.rb"), entry)
+        .write(&format!("{GEM}/lib/pathy/noted_kind.rb"), noted)
+        .write("app/models/kind_report.rb", "module KindReport\n  def self.lines = [Pathy.load_kind(\"noted\"), Pathy::NOTES, Pathy.load_kind(\"noted\"), Pathy::NotedKind.hi]\nend\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args(["-e", "require_relative 'boot'\np KindReport.lines\n"])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout, "[true, [:noted_loaded], false, :noted]\n", "{stderr}");
+}

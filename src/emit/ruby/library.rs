@@ -9465,7 +9465,8 @@ fn emit_library_class_decl_inner(
         .filter(|call| !call.span.is_synthetic() && constant_defining_class_call(app, classes, lc, call))
         .collect();
     let ordered_body = (lc.origin.is_none() || lc.data_define().is_some())
-        && (lc.has_source_ivar_initializers() || !replayed_in_place.is_empty())
+        && (lc.has_source_ivar_initializers() || !replayed_in_place.is_empty()
+            || (lc.data_define().is_some() && !lc.constants.is_empty()))
         && !app.controllers.iter().any(|controller| controller.name == lc.name);
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
     let load_time_bodies = !deferred.is_empty();
@@ -9687,7 +9688,8 @@ fn emit_library_class_decl_inner(
             ))
         .then_some(init.span.file)
     })).or_else(|| replayed_in_place.first().map(|call| call.span.file))
-        .or_else(|| constant_calls.first().map(|call| call.span.file));
+        .or_else(|| constant_calls.first().map(|call| call.span.file))
+        .or_else(|| lc.data_define().map(|(_, span)| span.file));
     let same_file_method = |m: &MethodDef| {
         !ordered_body
             && !constant_calls.is_empty()
@@ -10005,7 +10007,6 @@ fn emit_library_class_decl_inner(
     // would not do here either: Spinel runs the statements of a block
     // with `self` as `main`, not as the class.
     let data_block = lc.data_define().is_some();
-    let scope = if data_block { "::" } else { "" };
     let top_level = |expr: &Expr| {
         let mut expr = expr.clone();
         if data_block {
@@ -10090,8 +10091,10 @@ fn emit_library_class_decl_inner(
     let render_constants = |s: &mut String, which: &[usize]| {
         for &i in which {
             let (cname, value) = &lc.constants[i];
+            let own = lc.data_class_constant(i);
+            let scope = if data_block && !own { "::" } else { "" };
             nested.borrow_mut().write_expr(s, depth, lc, value);
-            let rendered = super::emit_expr(&top_level(value));
+            let rendered = if own { super::emit_expr(value) } else { super::emit_expr(&top_level(value)) };
             // Not the statements written after `NAME =`: only the first would be the constant's, the rest would run as the body's own.
             let rendered = if matches!(&*value.node, ExprNode::Seq { exprs } if exprs.len() > 1) {
                 let inner: String = rendered.lines().map(|l| format!("  {l}\n")).collect();
@@ -10100,6 +10103,10 @@ fn emit_library_class_decl_inner(
                 rendered
             };
             if let Some(factory) = lifted_data_factory(lc, cname.as_str(), classes, factories) {
+                for call in &factory.unknown_calls {
+                    crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                        call.span, None, "Data.define", "delegate in a Data.define block could not be lowered"));
+                }
                 writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
                 for method in &factory.methods {
                     render_library_method(s, method, &format!("{body_pad}  "));
@@ -10433,7 +10440,8 @@ fn emit_library_class_decl_inner(
 /// carries it there: Ruby runs it with the singleton class as `self`,
 /// definee and lexical scope.
 fn in_singleton_scope(expr: &Expr, text: String) -> String {
-    if expr.decisions & crate::expr::SINGLETON_BODY == 0 || !super::expr::carries_body_statements() {
+    if expr.decisions & crate::expr::SINGLETON_BODY == 0
+        || (!super::expr::carries_body_statements() && expr.decisions & crate::expr::REPLAYED_CLASS_BODY == 0) {
         return text;
     }
     let text = text.trim_end();
@@ -11773,6 +11781,9 @@ fn require_path_for_body_const(
     // reached from the test harness, not from main.rb's require chain.
     if joined == "ActiveSupport::SecurityUtils" {
         return Some("runtime/security_utils".to_string());
+    }
+    if joined == "ActiveSupport::DelegationError" {
+        return Some("runtime/active_support_ext".to_string());
     }
     if joined == "ActiveSupport::Duration" {
         return Some("runtime/active_support_duration".to_string());
