@@ -501,6 +501,13 @@ fn a_shared_block_or_root_merge_refuses_a_named_file() {
         assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
         assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
     }
+    // A null or `false` `shared:` is skipped, as Rails skips it: the named file is read.
+    for shared in ["~", "false"] {
+        let yml = format!("shared: {shared}\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
 }
 
 /// A quoted `schema_dump` key is the same String key, so its file is read.
