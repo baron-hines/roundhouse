@@ -3224,6 +3224,10 @@ end
     // A module-nested `class XController < BaseController` names
     // `Ns::BaseController`; `include Avatar` inside `class User` names
     // `User::Avatar`. The passes above leave both as written.
+    for (span, err) in super::library_class::cross_file_data_rebindings(&app, &sources, &const_resolver.for_sources(&sources)) {
+        super::error_site::note(&err, span.start as usize, span.end as usize);
+        record_library_ingest_failure(&mut app, &sources[span.file.0 as usize - 1].path, &err);
+    }
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
     // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
     for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {
@@ -3305,7 +3309,7 @@ end
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
     super::forwardable::lower_forwardable(&mut app);
-    super::delegate::lower_delegates(&mut app);
+    super::delegate::lower_delegates(&mut app, &const_resolver.for_sources(&sources));
     // `Other.include(M)` written in another body: `Other`'s include,
     // before the concern splices read the includes.
     super::external_include::carry(&mut app);

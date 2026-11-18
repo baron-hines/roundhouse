@@ -225,6 +225,39 @@ pub(super) fn marker(call: &CallNode<'_>) -> bool {
     )
 }
 
+pub(super) fn validate_data(body: Option<Node<'_>>, file: &str, methods: &[MethodDef], owner: &ClassId) -> IngestResult<()> {
+    let inherited = Visibility::resolve_library_carrying(body.as_ref(), file, None, Some(owner)).ok();
+    fn collect<'pr>(body: Option<Node<'pr>>, singleton: bool, names: &mut HashSet<String>, calls: &mut Vec<CallNode<'pr>>, mixin: &mut bool) {
+        for stmt in body.map(flatten_statements).unwrap_or_default() {
+            if let Some(class) = stmt.as_singleton_class_node() {
+                collect(class.body(), true, names, calls, mixin);
+            }
+            if let Some(def) = definition(&stmt) {
+                if singleton || def.receiver().is_some() { names.insert(constant_id_str(&def.name()).to_string()); }
+            }
+            if let Some(call) = stmt.as_call_node() {
+                let name = constant_id_str(&call.name()).to_string();
+                *mixin |= matches!(name.as_str(), "include" | "extend" | "prepend");
+                if marker(&call) || matches!(name.as_str(), "private_constant" | "public_constant" | "module_function") { calls.push(call); }
+            }
+        }
+    }
+    let mut names = methods.iter().filter(|method| method.receiver == crate::dialect::MethodReceiver::Class)
+        .map(|method| method.name.to_string()).collect();
+    let (mut calls, mut mixin) = (Vec::new(), false);
+    collect(body, false, &mut names, &mut calls, &mut mixin);
+    for call in calls {
+        let name = constant_id_str(&call.name()).to_string();
+        if !names.contains(&name) && inherited.as_ref().is_some_and(|visibility| !visibility.inherited.iter().any(|(side, name, at)| *side && matches!(name.as_str(), "new" | "[]" | "allocate") && *at == call.location().start_offset())) { continue; }
+        if mixin || names.contains(&name) || call.receiver().is_some() || call.block().is_some()
+            || !matches!(name.as_str(), "private" | "public" | "protected" | "private_class_method")
+            || call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| arg.as_symbol_node().is_none())) {
+            return Err(super::error_site::at(IngestError::Unsupported { file: file.into(), message: format!("Data visibility macro `{name}` requires a built-in static declaration with literal symbols") }, &call.as_node()));
+        }
+    }
+    Ok(())
+}
+
 /// `private def helper … end` defines a method, not a default for later
 /// definitions. Leave all other forms alone for the resolution/error gate.
 pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'pr>> {
@@ -406,7 +439,8 @@ impl Visibility {
             for statement in flatten_statements(body) {
                 // `X = Struct.new(…) do … end`: the block is that class's body, with defaults of its own.
                 if let Some(cw) = statement.as_constant_write_node()
-                    && super::library_class::struct_constant_block(&cw.value())
+                    && (super::library_class::struct_constant_block(&cw.value())
+                        || super::data_factory::declaration(&statement).is_some())
                 {
                     let block_body = cw.value().as_call_node().and_then(|c| c.block()).and_then(|b| b.as_block_node()).and_then(|b| b.body());
                     if let Ok(visibility) = Self::resolve_carrying_inherited(block_body.as_ref(), file, None) {
@@ -456,6 +490,34 @@ impl Visibility {
             }
             None => Ok(out),
         }
+    }
+
+    /// Data supplies these class methods before evaluating its block. Keep
+    /// their visibility calls for native replay instead of inventing defs.
+    pub(super) fn resolve_data(body: Option<&Node<'_>>, file: &str, owner: &ClassId) -> IngestResult<Self> {
+        let out = Self::resolve_library_carrying(body, file, None, Some(owner))?;
+        fn private_constructors(body: Option<&Node<'_>>, at: usize) -> bool {
+            body.and_then(|body| body.as_statements_node()).is_some_and(|body| body.body().iter().any(|stmt| {
+                if let Some(singleton) = stmt.as_singleton_class_node() {
+                    return private_constructors(singleton.body().as_ref(), at);
+                }
+                let Some(call) = stmt.as_call_node().filter(|_| stmt.location().start_offset() == at) else { return false };
+                if !matches!(constant_id_str(&call.name()), "private_class_method" | "private") { return false; }
+                let names = call.arguments().map(|args| args.arguments().iter()
+                    .filter_map(|arg| symbol_or_string_value(&arg)).collect::<Vec<_>>()).unwrap_or_default();
+                ["new", "[]", "allocate"].iter().all(|name| names.iter().any(|n| n == name))
+                    && names.iter().all(|name| matches!(name.as_str(), "new" | "[]" | "allocate"))
+            }))
+        }
+        if let Some((_, name, at)) = out.inherited.iter().find(|(side, name, at)| {
+            !*side || !matches!(name.as_str(), "new" | "[]" | "allocate")
+                || !private_constructors(body, *at)
+        }) {
+            let err = Self::undefined(file, name);
+            super::error_site::note(&err, *at, *at + 1);
+            return Err(err);
+        }
+        Ok(out)
     }
 
     /// [`Self::resolve_library`] for a class body whose walk carries a marker naming an inherited method as a body

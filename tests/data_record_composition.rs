@@ -36,3 +36,6 @@ fn data_composition_runs_natively_with_generated_signatures() {
         assert_eq!(output.stdout, oracle.stdout, "{source}");
     }
 }
+
+#[path = "spinel_toolchain/data_declaration_composition.rs"]
+mod data_declaration_composition;

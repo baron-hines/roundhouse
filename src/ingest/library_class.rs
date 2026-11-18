@@ -430,10 +430,28 @@ fn ingest_library_classes_impl(
         _ => Vec::new(),
     };
     if file_level && let Some(program) = root.as_program_node() {
+        let (mut data_constants, mut admitted_data_values) = (HashSet::default(), HashMap::<String, u32>::default());
+        let mut data_writes = None;
         for statement in program.statements().body().iter() {
             if let Some(mut class) = file_data_class(&statement, file)
                 .map_err(|err| super::error_site::at(err, &statement))?
             {
+                let writes = data_writes.get_or_insert_with(|| data_constant_writes(source, &root));
+                let start = statement.location().start_offset() as u32;
+                let end = statement.location().end_offset() as u32;
+                let target_end = file_data_declaration(&statement).unwrap().1.location().start_offset() as u32;
+                let name = writes.iter().find(|(at, _)| start <= *at && *at <= target_end)
+                    .map_or(class.name.0.as_str(), |(_, name)| name.as_str());
+                if name.starts_with("?::") {
+                    return Err(super::error_site::at(IngestError::Unsupported { file: file.into(),
+                        message: format!("Data.define constant namespace could not be resolved: `{}`", class.name.0) }, &statement));
+                }
+                if let Some((at, _)) = writes.iter().find(|(at, written)| *at > end
+                    && written == name) {
+                    let err = IngestError::Unsupported { file: file.into(), message: format!("reassignment of Data.define constant `{name}` is not modeled") };
+                    super::error_site::note(&err, *at as usize - name.rsplit("::").next().unwrap().len(), *at as usize);
+                    return Err(err);
+                }
                 let reopenings = find_all_classes_with_scope(&root).into_iter().filter(|(scope, node)| {
                     class_name_path(node).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == class.name.0.as_str())
                 }).collect::<Vec<_>>();
@@ -446,31 +464,89 @@ fn ingest_library_classes_impl(
                 }
                 let invalid_reopen = reopenings.iter().any(|(_, node)| {
                     node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
-                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt)))
+                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt) && stmt.as_constant_write_node().is_none()))
                 });
-                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset()).max().unwrap_or(0);
+                for (scope, node) in &reopenings {
+                    if node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| stmt.as_constant_write_node().is_some()))
+                        && (node.constant_path().as_constant_read_node().is_none()
+                            || scope.join("::") != class.name.0.as_str().rsplit_once("::").map_or("", |(owner, _)| owner)) {
+                        return Err(super::error_site::at(IngestError::Unsupported {
+                            file: file.into(), message: "qualified Data reopening initializers have a different lexical scope".into(),
+                        }, &node.as_node()));
+                    }
+                }
+                let (mut own_constants, mut file_values) = (HashSet::default(), HashSet::default());
+                let first_class_constant = class.constants.len();
+                for stmt in program.statements().body().iter() {
+                    let Some(write) = stmt.as_constant_path_write_node() else { continue };
+                    let Some(mut path) = static_constant_path(&write.target().as_node()) else { continue };
+                    let Some(name) = path.pop() else { continue };
+                    if path.join("::") != class.name.0.as_str()
+                        || stmt.location().start_offset() < statement.location().end_offset() { continue; }
+                    let mut value = ingest_expr(&write.value(), file)?;
+                    file_values.insert(value.span.start);
+                    // The RHS is evaluated at file scope, not in the reopened class.
+                    fn root_constants(expr: &mut Expr) {
+                        if let ExprNode::Const { path } = &mut *expr.node
+                            && path.first().is_some_and(|part| !part.as_str().is_empty()) {
+                            path.insert(0, Symbol::from(""));
+                        }
+                        expr.node.for_each_child_mut(&mut root_constants);
+                    }
+                    root_constants(&mut value);
+                    class.constants.push((Symbol::from(name), value));
+                    data_constants.insert(stmt.location().start_offset());
+                    own_constants.insert(stmt.location().start_offset());
+                }
+                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset())
+                    .chain(own_constants.iter().copied()).max().unwrap_or(0);
                 let separated = program.statements().body().iter().any(|stmt| {
                     let at = stmt.location().start_offset();
                     at >= statement.location().end_offset() && at < last_reopen
                         && !reopenings.iter().any(|(_, node)| node.location().start_offset() == at)
+                        && !own_constants.contains(&at)
                 });
                 if invalid_reopen || separated || out.iter().any(|other| other.name == class.name && other.is_module)
                     || made.iter().any(|(_, other)| other.name == class.name) {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
-                        message: "Data.define beside another declaration of the same class".into(),
+                        message: if separated { "Data.define declaration group is interrupted by another statement" } else { "Data.define beside another declaration of the same class" }.into(),
                     }, &statement));
                 }
-                // Only later, method-only reopenings can join the factory without moving load-time work.
-                for reopening in out.extract_if(.., |other| other.name == class.name) {
+                // The emitter interleaves these declarations by their source spans.
+                for mut reopening in out.extract_if(.., |other| other.name == class.name) {
                     class.methods.extend(reopening.methods);
+                    for call in &mut reopening.unknown_calls {
+                        call.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+                    }
+                    class.constants.extend(reopening.constants);
+                    class.unknown_calls.extend(reopening.unknown_calls);
+                }
+                class.constants.sort_by_key(|(_, value)| value.span.start);
+                if let Some(crate::dialect::LibraryClassOrigin::DataDefine { class_constant_start, .. }) = &mut class.origin {
+                    *class_constant_start = (first_class_constant < class.constants.len()).then_some(first_class_constant);
                 }
                 class.methods.sort_by_key(|method| method.name_span.start);
-                // Nothing runs between the block's definitions and the reopenings', so a later
-                // definition replaces an earlier one before any call can reach it, as in Ruby.
+                let factory_body = file_data_declaration(&statement).and_then(|(_, call)| call.block())
+                    .and_then(|block| block.as_block_node()).and_then(|block| block.body());
+                for body in std::iter::once(factory_body).chain(reopenings.iter().map(|(_, node)| node.body())) {
+                    visibility::validate_data(body, file, &class.methods, &class.name)?;
+                }
+                admitted_data_values.insert(class.name.0.to_string(), statement.location().end_offset() as u32);
+                for (index, (name, value)) in class.constants.iter().enumerate() {
+                    if !class.data_class_constant(index) { continue; }
+                    if !data_constant_value(value, &class, !file_values.contains(&value.span.start), &admitted_data_values) {
+                        let err = IngestError::Unsupported { file: file.into(), message: "Data constant initializer is not a literal or a constructor call".into() };
+                        super::error_site::note(&err, value.span.start as usize, value.span.end as usize);
+                        return Err(err);
+                    }
+                    admitted_data_values.insert(format!("{}::{name}", class.name.0), value.span.end);
+                }
+                // A replayed visibility declaration needs the definitions present at its source position.
+                let replayed = class.unknown_calls.iter().any(|call| call.decisions & crate::expr::REPLAYED_CLASS_BODY != 0);
                 let mut seen = HashSet::default();
                 class.methods.reverse();
-                class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
+                class.methods.retain(|method| replayed || seen.insert((method.name.clone(), method.receiver)));
                 class.methods.reverse();
                 made.push((class.name.0.clone(), class));
             }
@@ -484,6 +560,7 @@ fn ingest_library_classes_impl(
                     .is_some_and(|(feature, relative)| !relative && super::app::APP_REQUIRABLE_STDLIB.contains(&feature.as_str()));
                 if statement.as_constant_write_node().is_none() && statement.as_class_node().is_none()
                     && statement.as_module_node().is_none() && !qualified_factory && !stdlib_require
+                    && !data_constants.contains(&statement.location().start_offset())
                 {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
@@ -531,6 +608,9 @@ fn ingest_library_classes_impl(
         // or call time (invariant 6).
         super::file_constant_hoist::ensure_safe(file, &file_constants, &out, &factories)?;
         if let Some(host) = out.first_mut().or_else(|| factories.first_mut()) {
+            if let Some(crate::dialect::LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) = &mut host.origin {
+                *start += file_constants.len();
+            }
             let mut consts = file_constants;
             consts.extend(std::mem::take(&mut host.constants));
             host.constants = consts;
@@ -628,11 +708,54 @@ fn data_block_classes(
 }
 
 fn data_method_statement(stmt: &Node<'_>) -> bool {
+    if let Some(singleton) = stmt.as_singleton_class_node() {
+        return singleton.expression().as_self_node().is_some()
+            && singleton.body().is_none_or(|body| flatten_statements(body).iter().all(data_method_statement));
+    }
     if let Some(def) = visibility::definition(stmt) {
         return def.receiver().is_none_or(|receiver| receiver.as_self_node().is_some());
     }
     stmt.as_call_node().filter(|call| call.receiver().is_none() && call.block().is_none() && visibility::marker(call))
         .is_some_and(|call| call.arguments().is_none_or(|args| args.arguments().iter().all(|arg| super::util::symbol_or_string_value(&arg).is_some())))
+}
+
+fn data_literal(value: &Expr) -> bool {
+    match &*value.node {
+        ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
+        ExprNode::Array { elements, .. } => elements.iter().all(data_literal),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| data_literal(key) && data_literal(value)),
+        _ => false,
+    }
+}
+
+fn data_constant_value(value: &Expr, class: &LibraryClass, class_scope: bool, known: &HashMap<String, u32>) -> bool {
+    if data_literal(value) { return true; }
+    let earlier = |name: &str| known.get(name).is_some_and(|end| *end <= value.span.start);
+    match &*value.node {
+        ExprNode::Const { path } => {
+            let name = path.iter().filter(|part| !part.as_str().is_empty()).map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            (class_scope && path.len() == 1 && earlier(&format!("{}::{name}", class.name.0))) || earlier(&name)
+        }
+        ExprNode::Send { recv, method, args, block: None, .. } if matches!(method.as_str(), "new" | "[]") => {
+            let own = match recv.as_ref().map(|recv| &*recv.node) {
+                None | Some(ExprNode::SelfRef) => class_scope && method.as_str() == "new",
+                Some(ExprNode::Const { path }) => {
+                    let name = path.iter().filter(|part| !part.as_str().is_empty()).map(Symbol::as_str).collect::<Vec<_>>().join("::");
+                    name == class.name.0.as_str() && (!class_scope || path.first().is_some_and(|part| part.as_str().is_empty())
+                        || !class.constants.iter().any(|(name, _)| name == path.first().unwrap()))
+                }
+                _ => false,
+            };
+            own && class.includes.is_empty() && !class.methods.iter().any(|method|
+                method.receiver == MethodReceiver::Class && matches!(method.name.as_str(), "new" | "[]" | "allocate")
+                    || method.receiver == MethodReceiver::Instance && method.name.as_str() == "initialize")
+                && args.iter().all(|arg| match &*arg.node {
+                    ExprNode::Hash { entries, kwargs: true } => entries.iter().all(|(key, value)| data_literal(key) && data_constant_value(value, class, class_scope, known)),
+                    _ => data_constant_value(arg, class, class_scope, known),
+                })
+        }
+        _ => false,
+    }
 }
 
 /// The class a file-level statement `X = Data.define(:a, :b)` creates.
@@ -661,6 +784,8 @@ fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &
         None => ClassId(Symbol::from(name)),
     };
     let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
+    visibility::validate_data(body(), file, &[], &owner)?;
+    if super::data_factory::combined_delegation(body()) { return Err(IngestError::Unsupported { file: file.into(), message: "Data.define blocks combining delegate and delegate_missing_to are not modeled".into() }); }
     if let Some(body) = body() {
         let statements = flatten_statements(body);
         if statements.iter().any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
@@ -684,11 +809,16 @@ fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &
             }
         }
     }
-    // Not a carried marker: a Data block's `private_class_method :new` names the constructor Data defines.
-    let visibility = Visibility::resolve_library(body().as_ref(), file, None, Some(&owner))?;
+    let visibility = Visibility::resolve_data(body().as_ref(), file, &owner)?;
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
         walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
+    for call in &mut unknown_calls {
+        if matches!(&*call.node, ExprNode::Send { method, .. }
+            if matches!(method.as_str(), "private_class_method" | "public_class_method" | "private" | "public" | "protected")) {
+            call.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+        }
+    }
     Ok(Some(LibraryClass {
         name: owner,
         is_module: false,
@@ -701,6 +831,7 @@ fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &
         origin: Some(crate::dialect::LibraryClassOrigin::DataDefine {
             members,
             span: super::util::node_span(&call.as_node(), file),
+            class_constant_start: None,
         }),
         constants,
         conditional_definitions,
@@ -825,6 +956,121 @@ fn file_data_declaration<'pr>(statement: &ruby_prism::Node<'pr>) -> Option<(Stri
         return None;
     }
     Some((name, call))
+}
+
+// Visit assignment targets, not only statements: destructuring and operator writes
+// also rebind constants. Resolve the namespace rather than concatenating lexical names.
+fn data_constant_writes(source: &[u8], root: &Node<'_>) -> Vec<(u32, String)> {
+    let resolver = crate::analyze::ConstResolver::from_app_sources(&[
+        crate::span::SourceFile { path: "data_rebindings.rb".into(), text: String::from_utf8_lossy(source).into_owned() },
+    ]);
+    let factories = root.as_program_node().into_iter().flat_map(|program| program.statements().body().iter())
+        .filter_map(|statement| file_data_declaration(&statement).map(|(name, _)| name.trim_start_matches("Object::").to_string())).collect();
+    resolved_data_constant_writes(root, &resolver, crate::span::FileId(1), &factories)
+}
+
+fn resolved_data_constant_writes(root: &Node<'_>, resolver: &crate::analyze::ConstResolver, file: crate::span::FileId, factories: &HashSet<String>) -> Vec<(u32, String)> {
+    struct Writes<'a> {
+        resolver: &'a crate::analyze::ConstResolver,
+        file: crate::span::FileId,
+        factories: &'a HashSet<String>,
+        owner: Option<String>,
+        out: Vec<(u32, String)>,
+    }
+    impl Writes<'_> {
+        fn span(&self, node: &Node<'_>) -> Span {
+            Span { file: self.file, start: node.location().start_offset() as u32, end: node.location().end_offset() as u32 }
+        }
+        fn path(&self, node: &Node<'_>) -> Option<String> {
+            let path = static_constant_path(node)?.into_iter().map(Symbol::from).collect::<Vec<_>>();
+            self.resolver.namespace(self.span(node), &path).map(|id| id.0.to_string())
+                .or_else(|| self.resolver.declaration_name(self.span(node), &path)
+                    .filter(|name| self.factories.contains(*name)).map(str::to_string))
+        }
+        fn binding(&mut self, node: &Node<'_>) {
+            let bare = node.as_constant_write_node().map(|n| (n.name(), n.name_loc()))
+                .or_else(|| node.as_constant_or_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_and_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_operator_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_target_node().map(|n| (n.name(), n.location())));
+            if let Some((name, loc)) = bare {
+                if let Some(owner) = &self.owner {
+                    self.record(loc.end_offset() as u32, owner.clone(), constant_id_str(&name).to_string());
+                }
+                return;
+            }
+            let target = node.as_constant_path_write_node().map(|n| n.target())
+                .or_else(|| node.as_constant_path_or_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_and_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_operator_write_node().map(|n| n.target()));
+            let (parent, name, end) = if let Some(target) = target {
+                (target.parent(), target.name(), target.location().end_offset())
+            } else if let Some(target) = node.as_constant_path_target_node() {
+                (target.parent(), target.name(), target.location().end_offset())
+            } else { return };
+            if let Some(name) = name {
+                let owner = parent.map_or_else(String::new, |parent| self.path(&parent).unwrap_or_else(|| "?".into()));
+                self.record(end as u32, owner, constant_id_str(&name).to_string());
+            }
+        }
+        fn record(&mut self, end: u32, owner: String, name: String) {
+            let owner = owner.trim_start_matches("Object::");
+            let name = if owner.is_empty() || owner == "Object" { name } else { format!("{owner}::{name}") };
+            self.out.push((end, name));
+        }
+        fn body(&mut self, path: Node<'_>, body: Option<Node<'_>>) {
+            let outer = self.owner.take();
+            self.owner = Some(self.resolver.namespace_body(self.span(&path)).map_or_else(|| "?".into(), |id| id.0.to_string()));
+            if let Some(body) = body { ruby_prism::Visit::visit(self, &body); }
+            self.owner = outer;
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes<'_> {
+        fn visit_branch_node_enter(&mut self, node: Node<'pr>) { self.binding(&node); }
+        fn visit_leaf_node_enter(&mut self, node: Node<'pr>) { self.binding(&node); }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            if let Some(parent) = node.superclass() { self.visit(&parent); }
+            self.body(node.constant_path(), node.body());
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) { self.body(node.constant_path(), node.body()); }
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            let outer = self.owner.take();
+            if let Some(body) = node.body() { self.visit(&body); }
+            self.owner = outer;
+        }
+        // These bodies execute at runtime, not when their enclosing declaration loads.
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if let Some(receiver) = node.receiver() { self.visit(&receiver); }
+        }
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+    }
+    let mut writes = Writes { resolver, file, factories, owner: Some(String::new()), out: Vec::new() };
+    ruby_prism::Visit::visit(&mut writes, root);
+    writes.out
+}
+
+// Another file has no proven load order relative to the factory: refuse a
+// competing binding in either order instead of moving it around the declaration.
+pub(super) fn cross_file_data_rebindings(app: &crate::App, sources: &[crate::span::SourceFile], resolver: &crate::analyze::ConstResolver) -> Vec<(Span, IngestError)> {
+    let factories = app.library_classes.iter().filter_map(|class| class.data_define()
+        .map(|(_, span)| (span.file, class.name.0.as_str().trim_start_matches("Object::")))).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    if factories.is_empty() { return out; }
+    let names = factories.iter().map(|(_, name)| name.to_string()).collect();
+    for (index, source) in sources.iter().enumerate() {
+        let file = crate::span::FileId(index as u32 + 1);
+        let others = factories.iter().filter(|(owner, _)| *owner != file).collect::<Vec<_>>();
+        if !source.path.ends_with(".rb") || !others.iter().any(|(_, name)| source.text.contains(name.rsplit("::").next().unwrap())) { continue; }
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
+        for (at, written) in resolved_data_constant_writes(&parsed.node(), resolver, file, &names) {
+            if let Some((_, name)) = others.iter().find(|(_, name)| written == *name) {
+                let span = Span { file, start: at - name.rsplit("::").next().unwrap().len() as u32, end: at };
+                out.push((span, IngestError::Unsupported { file: source.path.clone(), message: format!("reassignment of Data.define constant `{name}` across files is not modeled") }));
+            }
+        }
+    }
+    out
 }
 
 /// The segments of a constant path in which every part is a constant.
