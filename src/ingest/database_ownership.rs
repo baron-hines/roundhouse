@@ -523,7 +523,9 @@ pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App
                 if let Some(name) = std::str::from_utf8(name.as_slice()).ok().and_then(|n| n.strip_suffix('='))
                     && let Some(receiver) = node.receiver()
                 {
-                    let target = format!("{}.{name}", String::from_utf8_lossy(receiver.location().as_slice()));
+                    let owner = receiver.as_call_node().map(|call| super::util::constant_id_str(&call.name()).to_string())
+                        .unwrap_or_else(|| String::from_utf8_lossy(receiver.location().as_slice()).into_owned());
+                    let target = format!("{owner}.{name}");
                     let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
                     let thread = matches!(args.as_slice(), [arg] if arg.as_symbol_node().is_some_and(|s| s.unescaped() == b"thread"));
                     self.0.push((target, thread));

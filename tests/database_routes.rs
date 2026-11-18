@@ -375,7 +375,7 @@ fn a_mention_of_a_routing_setting_is_not_a_setting() {
         let (_, errors) = shards().write("config/application.rb", &application(line)).emit(BuildTarget::Spinel);
         assert!(errors.is_empty(), "{line}: {errors:#?}");
     }
-    for line in ["config.active_record.reading_role = :replica", "config.active_record.reading_role = :archive; config.active_support.isolation_level = :thread"] {
+    for line in ["config.active_record().reading_role = :archive", "config.active_record.reading_role = :replica", "config.active_record.reading_role = :archive; config.active_support.isolation_level = :thread"] {
         let (_, errors) = shards().write("config/application.rb", &application(line)).emit(BuildTarget::Spinel);
         assert!(errors.iter().any(|e| e.contains("database_routes_setting") && e.contains("reading_role")), "{errors:#?}");
     }
