@@ -23,7 +23,7 @@ fn shards() -> emit_and_run::Overlay {
 /// The Spinel tree's `runtime/db.rb` and the errors of its emit.
 fn spinel_db(overlay: emit_and_run::Overlay) -> (String, Vec<String>) {
     let (emitted, errors) = overlay.emit(BuildTarget::Spinel);
-    (std::fs::read_to_string(emitted.join("runtime/db.rb")).unwrap_or_default(), errors)
+    (std::fs::read_to_string(emitted.join("runtime/db.rb")).unwrap_or_else(|error| panic!("read emitted runtime: {error}; diagnostics: {errors:#?}")), errors)
 }
 
 fn generated(db: &str) -> &str {
@@ -247,7 +247,7 @@ fn every_other_routing_shape_stays_refused_on_spinel() {
     for (name, overlay, phrase) in cases {
         let (db, errors) = spinel_db(overlay);
         // A refused statement in an otherwise carried app leaves its routes; the error stops the build.
-        if !errors.iter().any(|e| e.contains(phrase)) || (db.contains("      route(") && !phrase.starts_with("changes the default")) {
+        if !errors.iter().any(|e| e.contains(phrase)) || (db.lines().any(|line| line.trim_start().starts_with("route(")) && !phrase.starts_with("changes the default")) {
             missed.push(format!("{name}: {errors:?}"));
         }
     }
