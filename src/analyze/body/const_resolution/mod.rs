@@ -113,6 +113,21 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     // `packages/openssl` (same values) on spinel.
     ("OpenSSL::SSL", "VERIFY_NONE", || Ty::Int),
     ("OpenSSL::SSL", "VERIFY_PEER", || Ty::Int),
+    // `sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)` — a network client's connection options.
+    // The values both CRuby and spinel answer on every platform the trees build on (not SOL_TCP or
+    // TCP_KEEPIDLE, which one of them lacks on macOS).
+    ("Socket", "IPPROTO_TCP", || Ty::Int),
+    ("Socket", "IPPROTO_IPV6", || Ty::Int),
+    ("Socket", "SOL_SOCKET", || Ty::Int),
+    ("Socket", "SO_KEEPALIVE", || Ty::Int),
+    ("Socket", "SO_REUSEADDR", || Ty::Int),
+    ("Socket", "TCP_NODELAY", || Ty::Int),
+    ("Socket", "TCP_KEEPINTVL", || Ty::Int),
+    ("Socket", "TCP_KEEPCNT", || Ty::Int),
+    ("Socket", "AF_INET", || Ty::Int),
+    ("Socket", "AF_INET6", || Ty::Int),
+    ("Socket", "AF_UNSPEC", || Ty::Int),
+    ("Socket", "SOCK_STREAM", || Ty::Int),
     ("Zlib", "BEST_COMPRESSION", || Ty::Int),
     ("Zlib", "MAX_WBITS", || Ty::Int),
     ("Zlib", "FINISH", || Ty::Int),
@@ -165,6 +180,7 @@ const CORE_VALUE_CLASSES: &[(&str, &str)] = &[
     ("File", "IO"),
     ("Encoding", "Object"),
     ("OpenSSL::SSL", "Object"),
+    ("Socket", "IO"),
     ("Regexp", "Object"),
     ("Date", "Object"),
 ];
