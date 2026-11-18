@@ -513,9 +513,11 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         let offset = direct.map_or(start, |l| l.0);
         let token = direct.map(|l| l.2.as_str()).unwrap_or_default();
         let plain = token.trim_matches(|c| c == '\'' || c == '"');
-        let quoted = token.len() >= 2 && (token.starts_with('\'') && token.ends_with('\'') || token.starts_with('"') && token.ends_with('"'));
         // `false`, null or an unquoted YAML 1.1 boolean: no file, so the schema is found as before.
-        let boolean = |name: &str| !quoted && name == token && ["yes", "no", "on", "off", "true", "false"].iter().any(|w| name.eq_ignore_ascii_case(w));
+        // Written plainly on its line, or reached another way (a flow mapping, an anchor, an alias)
+        // with that word quoted nowhere in the file: Psych reads it as a boolean.
+        let bare = |name: &str| name == token || ![format!("'{name}'"), format!("\"{name}\"")].iter().any(|q| text.contains(q.as_str()));
+        let boolean = |name: &str| bare(name) && ["yes", "no", "on", "off", "true", "false"].iter().any(|w| name.eq_ignore_ascii_case(w));
         if matches!(value, Value::Null | Value::Bool(_)) || matches!(value, Value::String(name) if boolean(name)) {
             continue;
         }
