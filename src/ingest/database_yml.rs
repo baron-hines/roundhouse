@@ -460,7 +460,9 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         let lines = block(start);
         let start = start.unwrap_or(0);
         let label = format!("`test.{name}`");
-        let line_of = |key: &str| lines.iter().find(|(_, k, _)| k == key);
+        // A quoted String key (`'schema_dump':`) is that key; `':schema_dump'` stays apart from the Symbol key.
+        let unquoted = |k: &str| ['\'', '"'].iter().find_map(|q| k.strip_prefix(*q)?.strip_suffix(*q)).map(str::to_string);
+        let line_of = |key: &str| lines.iter().find(|(_, k, _)| k == key || !key.starts_with(':') && unquoted(k).as_deref() == Some(key));
         let mut refuse = |offset: usize, detail: String, warning: bool| out.refusals.push(DatabaseRefusal { span: at(offset), construct: "schema_dump".to_string(), detail, warning });
         if name != primary_name {
             // Not read: the runtime opens only the primary. Reported when the file exists.
@@ -537,7 +539,7 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         let why = match value {
             _ if direct.is_none() => Some("it is not written directly in the configuration: an anchor merge or flow mapping"),
             Value::String(name) if name.contains(ERB_VALUE) => Some("it is computed with ERB"),
-            Value::String(name) if name != plain || token.starts_with(['&', '*', '!', '|', '>', '{', '[']) => Some("it is an anchor, alias, tag or block value"),
+            Value::String(name) if name != plain || token.starts_with(['&', '*', '!', '|', '>', '{', '[']) => Some("it is an anchor, alias, tag or block value, or a quoted name holding ` #`"),
             Value::String(name) if name.starts_with('/') || name.split('/').any(|part| part == "..") => Some("it is not a relative path inside db/"),
             Value::String(name) if !name.ends_with(".rb") && !name.ends_with(".sql") => Some("it does not end in .rb or .sql"),
             Value::String(_) => None,

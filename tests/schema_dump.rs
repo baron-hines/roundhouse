@@ -176,6 +176,7 @@ fn every_other_form_is_refused_by_name() {
         ("outside db/", format!("{base}  schema_dump: ../catalog_schema.rb\n"), &[("catalog_schema.rb", WIDGETS)], &["../catalog_schema.rb", "relative path"]),
         ("Symbol key", format!("{base}  :schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS)], &["Symbol key"]),
         ("anchor", format!("{base}  schema_dump: &file catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS)], &["anchor"]),
+        ("` #` in a quoted name", format!("{base}  schema_dump: 'release #1.rb'\n"), &[("db/release #1.rb", WIDGETS)], &["quoted name holding ` #`"]),
         ("merge", format!("default: &default\n  schema_dump: catalog_schema.rb\ntest:\n  <<: *default\n  adapter: sqlite3\n"), &[("db/catalog_schema.rb", WIDGETS)], &["anchor merge or flow"]),
         ("flow", "test: { adapter: sqlite3, schema_dump: catalog_schema.rb }\n".to_string(), &[("db/catalog_schema.rb", WIDGETS)], &["anchor merge or flow"]),
         ("URL schema_dump", format!("{base}  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=catalog_schema.rb'\n"), &[("db/catalog_schema.rb", WIDGETS)], &["`url:`", "`schema_dump`"]),
@@ -406,6 +407,17 @@ fn a_merge_after_other_keys_refuses_a_named_file() {
     let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
     assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
     assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
+/// A quoted `schema_dump` key is the same String key, so its file is read.
+#[test]
+fn a_quoted_schema_dump_key_reads_its_file() {
+    for key in ["'schema_dump'", "\"schema_dump\""] {
+        let yml = format!("test:\n  adapter: sqlite3\n  {key}: catalog_schema.rb\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
 }
 
 /// A blank final value drops the key from Rails' URL options, and a quoted
