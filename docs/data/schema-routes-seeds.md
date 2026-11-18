@@ -304,7 +304,7 @@ guards are conservative: a `.rb` name is refused when a `schema_format`
 other than a direct literal `ruby` is written there, or when any Ruby file
 under `config/` mentions `schema_format`. A name is also refused when any
 of those files mentions `.paths`, `paths[` or `paths.add` (comments
-included; `assets.paths` aside), or when a directory under `config/`
+included; `config.assets.paths` aside), or when a directory under `config/`
 can't be listed or a file there can't be read, or when the
 configuration's `url:` is
 computed, not a string, written under more than one spelling (`:url`,

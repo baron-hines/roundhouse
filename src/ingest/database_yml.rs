@@ -618,14 +618,15 @@ fn config_mentions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, matches: impl Fn(&str) 
 /// `.paths`, `paths[` or `paths.add` anywhere, on any receiver and in
 /// comments too: Rails resolves `schema_dump:` in `paths["db"]`, which
 /// any of them may change, through an alias or a computed key. Only
-/// `assets.paths`, Sprockets' and Propshaft's load path (named in the
-/// initializer `rails new` writes), is not Rails' `paths`.
+/// `.assets.paths`, Sprockets' and Propshaft's load path on the asset
+/// configuration (named in the initializer `rails new` writes), is not
+/// Rails' `paths`; a receiver merely named `..._assets` may be `config`.
 fn mentions_paths(text: &str) -> bool {
     text.match_indices("paths").any(|(at, _)| {
         let before = &text[..at];
         let after = &text[at + "paths".len()..];
         let dotted = before.ends_with('.');
-        let assets = before.strip_suffix('.').is_some_and(|b| b.ends_with("assets"));
+        let assets = before.strip_suffix('.').is_some_and(|b| b.ends_with(".assets"));
         !assets && (dotted || after.starts_with('[') || after.starts_with(".add"))
     })
 }
