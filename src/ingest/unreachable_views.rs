@@ -95,6 +95,7 @@ pub(super) fn mark(app: &mut App) {
             unreachable.push(i);
         }
     }
+    unreachable.extend(unreachable_partials(app));
     for i in unreachable {
         let view = &app.views[i];
         let mut d = crate::diagnostic::Diagnostic::unsupported(
@@ -110,6 +111,163 @@ pub(super) fn mark(app: &mut App) {
         super::prism::push(d);
         app.unreachable_views.insert(view.name.clone());
     }
+}
+
+/// The partials nothing renders (maybe's `accounts/show/_activity`, which a component replaced): no String literal
+/// anywhere in the app names one (a Symbol is no partial's name: `render :x` is a template) (its base name, its path, or a path ending in it), no interpolation's text
+/// spells part of it, it is not a model's `to_partial_path`, and its directory is not a locked gem's (a gem's own
+/// code renders `kaminari/_page` by name).
+fn unreachable_partials(app: &App) -> Vec<usize> {
+    fn collect(e: &Expr, names: &mut HashSet<String>, fragments: &mut Vec<String>) {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Str { value } } => {
+                names.insert(value.trim_start_matches('/').to_string());
+            }
+            ExprNode::StringInterp { parts } => {
+                for part in parts {
+                    if let crate::expr::InterpPart::Text { value } = part {
+                        fragments.push(value.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| collect(c, names, fragments));
+    }
+    // A name the request decides (`render partial: params[:panel]`, `render params[:panel].to_s`, a `partial:`
+    // variable, an interpolation with next to no text) may be any partial's.
+    fn reads_params(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "params" && args.is_empty());
+        e.node.for_each_child(&mut |c| found = found || reads_params(c));
+        found
+    }
+    // The variables a statement assigns a request-read value (`@panel = params[:panel].to_s`): an ivar from any body
+    // (a controller's reaches its views), a local from the body that reads it.
+    fn params_fed(e: &Expr, ivars: &mut HashSet<String>, locals: &mut HashSet<String>) {
+        if let ExprNode::Assign { target, value } = &*e.node
+            && reads_params(value)
+        {
+            match target {
+                crate::expr::LValue::Ivar { name } => {
+                    ivars.insert(name.as_str().to_string());
+                }
+                crate::expr::LValue::Var { name, .. } => {
+                    locals.insert(name.as_str().to_string());
+                }
+                _ => {}
+            }
+        }
+        e.node.for_each_child(&mut |c| params_fed(c, ivars, locals));
+    }
+    let mut fed_ivars: HashSet<String> = HashSet::default();
+    let mut ignored: HashSet<String> = HashSet::default();
+    crate::lower::for_each_hook_body_ref(app, &mut |b| params_fed(b, &mut fed_ivars, &mut ignored));
+    for v in &app.views {
+        params_fed(&v.body, &mut fed_ivars, &mut ignored);
+    }
+    let open_in = |v: &Expr, fed_locals: &HashSet<String>| -> bool {
+        match &*v.node {
+            ExprNode::Lit { .. } => false,
+            // A collection or a pool a controller assigns (`partial: @tags`), unless a request value was assigned it.
+            ExprNode::Ivar { name } => fed_ivars.contains(name.as_str()),
+            ExprNode::Var { name, .. } => fed_locals.contains(name.as_str()),
+            ExprNode::StringInterp { parts } => {
+                parts.iter().map(|p| match p { crate::expr::InterpPart::Text { value } => value.trim_matches('/').len(), _ => 0 }).sum::<usize>() < 2
+            }
+            ExprNode::Send { method, .. } if method.as_str() == "to_partial_path" => false,
+            _ => true,
+        }
+    };
+    let body_computed = |b: &Expr| -> bool {
+        let mut locals: HashSet<String> = HashSet::default();
+        let mut ivars: HashSet<String> = HashSet::default();
+        params_fed(b, &mut ivars, &mut locals);
+        computed_partial(b, &|v: &Expr| open_in(v, &locals))
+    };
+    fn computed_partial(e: &Expr, open_name: &dyn Fn(&Expr) -> bool) -> bool {
+        let mut found = false;
+        if let ExprNode::Send { method, args, .. } = &*e.node
+            && matches!(method.as_str(), "render" | "render_to_string")
+            && let Some(first) = args.first()
+        {
+            found = match &*first.node {
+                ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| {
+                    matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "partial") && open_name(v)
+                }),
+                ExprNode::StringInterp { .. } => open_name(first),
+                // Not an object the render asks to render itself (`render DS::Tabs.new(active_tab: params[:tab])`).
+                ExprNode::Send { method, .. } if method.as_str() == "new" => false,
+                ExprNode::Var { name, .. } | ExprNode::Ivar { name } => open_name(first) && !name.as_str().is_empty(),
+                _ => reads_params(first),
+            };
+        }
+        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open_name));
+        found
+    }
+    let mut computed = false;
+    crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));
+    if computed || app.views.iter().any(|v| body_computed(&v.body)) {
+        return Vec::new();
+    }
+    let mut names: HashSet<String> = HashSet::default();
+    let mut fragments: Vec<String> = Vec::new();
+    crate::lower::for_each_hook_body_ref(app, &mut |b| collect(b, &mut names, &mut fragments));
+    // A view's bare name (`render "activity"`) is relative to its own directory: elsewhere `tab: "activity"` names
+    // no partial of `accounts/show`.
+    let mut view_names: HashSet<(String, String)> = HashSet::default();
+    for v in &app.views {
+        let dir = v.name.as_str().rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+        let mut own: HashSet<String> = HashSet::default();
+        collect(&v.body, &mut own, &mut fragments);
+        for n in own {
+            if n.contains('/') {
+                names.insert(n);
+            } else {
+                view_names.insert((dir.clone(), n));
+            }
+        }
+    }
+    // Not models alone: an STI subclass ingested as a library class (`AssistantMessage < Message`), or any class
+    // answering `to_partial_path`, is rendered by `render @messages` the same way.
+    let model_partials: HashSet<String> = app
+        .models
+        .iter()
+        .map(|m| &m.name)
+        .chain(app.library_classes.iter().map(|c| &c.name))
+        .map(|name| {
+            let path = crate::naming::snake_case(&name.0.as_str().replace("::", "/"));
+            let (dir, leaf) = path.rsplit_once('/').map(|(d, l)| (format!("{d}/"), l.to_string())).unwrap_or((String::new(), path.clone()));
+            format!("{dir}{}/{leaf}", crate::naming::pluralize_snake(&leaf))
+        })
+        .collect();
+    let gem_dir = |dir: &str| {
+        let head = dir.split('/').next().unwrap_or(dir);
+        app.gem_lock.as_ref().is_some_and(|lock| lock.has(head))
+    };
+    let mut out = Vec::new();
+    for (i, view) in app.views.iter().enumerate() {
+        let Some((dir, base)) = view.name.as_str().rsplit_once('/') else { continue };
+        let Some(leaf) = base.strip_prefix('_') else { continue };
+        if dir.starts_with("layouts") || gem_dir(dir) {
+            continue;
+        }
+        let partial = format!("{dir}/{leaf}");
+        let named = names.contains(leaf)
+            || view_names.contains(&(dir.to_string(), leaf.to_string()))
+            || names.contains(&partial)
+            || names.iter().any(|n| n.ends_with(&format!("/{leaf}")))
+            // `"ghost_#{kind}"` may name `_ghost_card`: any piece of an interpolation's text the name carries (one too
+            // short to tell is an open name above).
+            || fragments.iter().any(|f| {
+                let piece = f.trim_matches('/');
+                f.contains(leaf) || (piece.len() >= 2 && partial.contains(piece))
+            })
+            || model_partials.contains(&partial);
+        if !named {
+            out.push(i);
+        }
+    }
+    out
 }
 
 /// Whether the ancestry ends at Rails' own base: a gem's controller
