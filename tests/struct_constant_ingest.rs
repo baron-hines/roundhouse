@@ -29,6 +29,7 @@ fn a_struct_the_synthesis_cannot_write_stays_a_constant() {
     // The positional forms are classes: `Either.new(a: 1, b: 2)` (Ruby 3.2
     // binds it by member name) is refused where it is called instead.
     // An accessor of its own beside the members is the class's (`Extra`); one over a member is not (`Loud`).
-    assert_eq!(names, ["Service", "Service::Strict", "Service::Either", "Service::Extra"]);
-    assert_eq!(constants, ["Asked", "Reserved", "Splat", "Loud", "Aliased"]);
+    // A predicate member (`Asked`) is held under a slot of its own (`struct_slot`), so it is a class too.
+    assert_eq!(names, ["Service", "Service::Asked", "Service::Strict", "Service::Either", "Service::Extra"]);
+    assert_eq!(constants, ["Reserved", "Splat", "Loud", "Aliased"]);
 }
