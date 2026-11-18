@@ -601,6 +601,35 @@ end
 "##;
 pub const SNAPSHOT_EXPECTED: &str = "snapshot=0,1\nunrelated-snapshot=2\n";
 
+pub const DIRECTORY_RACE_SCRIPT: &str = r##"path = "storage/shared-parent"
+lock = Mutex.new
+ready = []
+results = []
+workers = [1, 2].map do |_|
+  Thread.new do
+    absent = !Dir.exist?(path)
+    lock.synchronize { ready << true }
+    sleep(0.001) while lock.synchronize { ready.length } < 2
+    begin
+      Db.mkdir_parent(path) if absent
+      lock.synchronize { results << "ok" }
+    rescue Errno::EEXIST
+      lock.synchronize { results << "exists" }
+    end
+  end
+end
+workers.each { |worker| worker.join }
+puts "directory-creators=" + results.sort.join(",")
+File.write("storage/not-directory", "synthetic")
+begin
+  Db.mkdir_parent("storage/not-directory")
+  puts "file-collision=allowed"
+rescue Errno::EEXIST
+  puts "file-collision=refused"
+end
+"##;
+pub const DIRECTORY_RACE_EXPECTED: &str = "directory-creators=ok,ok\nfile-collision=refused\n";
+
 /// `text` with each refused statement cut after its first word: Rails'
 /// lines carry its SQL with bind marks, an emitted program's the values.
 pub fn comparable(text: &str) -> String {

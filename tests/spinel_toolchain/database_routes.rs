@@ -97,3 +97,9 @@ fn writable_routes_create_missing_parent_directories() {
     run.assert_passes();
     assert_eq!(run.stdout, "0\n");
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn writable_route_parents_tolerate_concurrent_creators() {
+    assert_shard_report(contract::DIRECTORY_RACE_SCRIPT, contract::DIRECTORY_RACE_EXPECTED);
+}

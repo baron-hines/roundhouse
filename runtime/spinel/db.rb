@@ -1452,6 +1452,15 @@ module Db
     pools
   end
 
+  def self.mkdir_parent(path)
+    begin
+      Dir.mkdir(path)
+    rescue Errno::EEXIST
+      raise unless Dir.exist?(path)
+    end
+    nil
+  end
+
   # Register the pool of one shard and role: Rails' `connects_to`,
   # resolved at build time. An empty `path` is the primary, slot 0.
   # `schema` creates the tables, only for a writable configuration that
@@ -1466,7 +1475,7 @@ module Db
           if !part.empty?
             parent += "/" if !parent.empty? && parent != "/"
             parent += part
-            Dir.mkdir(parent) unless Dir.exist?(parent)
+            mkdir_parent(parent) unless Dir.exist?(parent)
           end
         end
       end
