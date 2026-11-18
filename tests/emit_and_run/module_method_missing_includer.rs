@@ -118,3 +118,82 @@ fn a_method_missing_module_reads_a_method_its_includer_includes_at_depth_on_spin
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+/// Review 2: the module's includers found indirectly. `Courier` reaches
+/// `Badged` only through `Carrier`, which no other class includes; `Agent`
+/// inherits it from `BadgedBase`, which defines neither `token` nor `label`.
+/// Ruby 4.0.7 with ActiveSupport 8.1.4.1 gives `"tok-courier"` and `"tok-agent"`.
+fn badged_concern() -> &'static str {
+    r##"module Badged
+  extend ActiveSupport::Concern
+
+  def badge
+    "#{token}-#{label}"
+  end
+
+  def method_missing(name, *args)
+    name.to_s.end_with?("?") ? false : super
+  end
+
+  def respond_to_missing?(name, include_private = false)
+    name.to_s.end_with?("?") || super
+  end
+end
+"##
+}
+
+fn indirect_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/concerns/badged.rb", badged_concern())
+        .write("app/models/provider.rb", "module Provider\n  def token\n    \"tok\"\n  end\nend\n")
+        .write("app/models/carrier.rb", "module Carrier\n  include Badged\n\n  def carried?\n    true\n  end\nend\n")
+        .write("app/models/courier.rb", "class Courier\n  include Carrier\n  include Provider\n\n  def label\n    \"courier\"\n  end\nend\n")
+}
+
+const INDIRECT: &str = r##"got = Courier.new.badge
+raise "indirect includer: #{got.inspect}" unless got == "tok-courier"
+puts "probe passed"
+"##;
+
+#[test]
+fn a_method_missing_module_reads_a_class_that_includes_it_through_another_module() {
+    let run = indirect_app().run_ruby(INDIRECT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_method_missing_module_reads_a_class_that_includes_it_through_another_module_on_spinel() {
+    let run = indirect_app().run_spinel(INDIRECT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn inherited_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/concerns/badged.rb", badged_concern())
+        .write("app/models/provider.rb", "module Provider\n  def token\n    \"tok\"\n  end\nend\n")
+        .write("app/models/badged_base.rb", "class BadgedBase\n  include Badged\nend\n")
+        .write("app/models/agent.rb", "class Agent < BadgedBase\n  include Provider\n\n  def label\n    \"agent\"\n  end\nend\n")
+}
+
+const INHERITED: &str = r##"got = Agent.new.badge
+raise "inherited includer: #{got.inspect}" unless got == "tok-agent"
+puts "probe passed"
+"##;
+
+#[test]
+fn a_method_missing_module_reads_a_subclass_of_its_includer() {
+    let run = inherited_app().run_ruby(INHERITED);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_method_missing_module_reads_a_subclass_of_its_includer_on_spinel() {
+    let run = inherited_app().run_spinel(INHERITED);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
