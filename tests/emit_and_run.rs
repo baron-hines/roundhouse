@@ -20861,6 +20861,12 @@ mod ipaddr_include;
 mod pp_require;
 #[path = "emit_and_run/weakref_observable.rs"]
 mod weakref_observable;
+#[path = "emit_and_run/core_exceptions.rs"]
+mod core_exceptions;
+#[path = "emit_and_run/rbconfig_config.rs"]
+mod rbconfig_config;
+#[path = "emit_and_run/process_modules.rs"]
+mod process_modules;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
@@ -22376,6 +22382,8 @@ mod errors_copy;
 
 #[path = "emit_and_run/errors_computed_field.rs"]
 mod errors_computed_field;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
@@ -22388,10 +22396,24 @@ mod reopened_alias;
 mod array_as_json_elements;
 #[path = "emit_and_run/association_named_ivars.rs"]
 mod association_named_ivars;
+#[path = "emit_and_run/attr_reader_splat_list.rs"]
+mod attr_reader_splat_list;
 #[path = "emit_and_run/class_body_macro_loop.rs"]
 mod class_body_macro_loop;
+#[path = "emit_and_run/class_body_singleton_loop.rs"]
+mod class_body_singleton_loop;
 #[path = "emit_and_run/class_new_self_subclass.rs"]
 mod class_new_self_subclass;
+#[path = "emit_and_run/computed_include_before_extend.rs"]
+mod computed_include_before_extend;
+#[path = "emit_and_run/computed_include_beside_reopen.rs"]
+mod computed_include_beside_reopen;
+#[path = "emit_and_run/model_constant_reads_arel_table.rs"]
+mod model_constant_reads_arel_table;
+#[path = "emit_and_run/model_thread_mattr_accessor.rs"]
+mod model_thread_mattr_accessor;
+#[path = "emit_and_run/module_body_registry_block.rs"]
+mod module_body_registry_block;
 #[path = "emit_and_run/module_body_statements.rs"]
 mod module_body_statements;
 #[path = "emit_and_run/on_load_hook_body.rs"]
@@ -22402,6 +22424,10 @@ mod refinement_scope;
 mod safe_buffer_plus_nil;
 #[path = "emit_and_run/safe_navigation_on_false.rs"]
 mod safe_navigation_on_false;
+#[path = "emit_and_run/singleton_include_only_module.rs"]
+mod singleton_include_only_module;
+#[path = "emit_and_run/superseded_macro_association.rs"]
+mod superseded_macro_association;
 #[path = "emit_and_run/symbol_key_reads.rs"]
 mod symbol_key_reads;
 #[path = "emit_and_run/unsaved_id_present.rs"]
@@ -22429,6 +22455,14 @@ mod where_bound_sql_literal;
 
 #[path = "emit_and_run/through_scope_merge.rs"]
 mod through_scope_merge;
+#[path = "emit_and_run/through_singular_hop_readers.rs"]
+mod through_singular_hop_readers;
+#[path = "emit_and_run/through_preload_hop_first.rs"]
+mod through_preload_hop_first;
+#[path = "emit_and_run/through_preload_distinct.rs"]
+mod through_preload_distinct;
+#[path = "emit_and_run/through_preload_readonly.rs"]
+mod through_preload_readonly;
 
 #[path = "emit_and_run/held_has_many_default_scope_key.rs"]
 mod held_has_many_default_scope_key;
@@ -22439,3 +22473,251 @@ mod emitted_model_methods;
 mod association_load_seats_inverse;
 #[path = "emit_and_run/relation_predicate_blocks.rs"]
 mod relation_predicate_blocks;
+
+// Fork specs: routes.
+#[path = "emit_and_run/route_default_url_options_app.rs"]
+mod route_default_url_options_app;
+#[path = "emit_and_run/route_default_url_options_test_body.rs"]
+mod route_default_url_options_test_body;
+#[path = "emit_and_run/route_fewer_positionals_url_options.rs"]
+mod route_fewer_positionals_url_options;
+#[path = "emit_and_run/route_helper_options_hash.rs"]
+mod route_helper_options_hash;
+#[path = "emit_and_run/route_keyword_params_in_tests.rs"]
+mod route_keyword_params_in_tests;
+#[path = "emit_and_run/route_positional_path_order.rs"]
+mod route_positional_path_order;
+#[path = "emit_and_run/route_scope_requirement_constant.rs"]
+mod route_scope_requirement_constant;
+#[path = "emit_and_run/route_scope_requirement_runtime_constant.rs"]
+mod route_scope_requirement_runtime_constant;
+#[path = "emit_and_run/routing_assertion_recognized_request.rs"]
+mod routing_assertion_recognized_request;
+
+// Fork specs: test framework.
+#[path = "emit_and_run/assert_difference_value.rs"]
+mod assert_difference_value;
+#[path = "emit_and_run/assertion_counts.rs"]
+mod assertion_counts;
+#[path = "emit_and_run/concern_defined_tests.rs"]
+mod concern_defined_tests;
+#[path = "emit_and_run/deprecation_assertions.rs"]
+mod deprecation_assertions;
+#[path = "emit_and_run/enqueued_jobs_with.rs"]
+mod enqueued_jobs_with;
+#[path = "emit_and_run/execution_context_per_test.rs"]
+mod execution_context_per_test;
+#[path = "emit_and_run/included_setup_block_self.rs"]
+mod included_setup_block_self;
+#[path = "emit_and_run/private_lifecycle_hooks.rs"]
+mod private_lifecycle_hooks;
+#[path = "emit_and_run/test_case_load_hooks.rs"]
+mod test_case_load_hooks;
+#[path = "emit_and_run/test_class_statement_between_constants.rs"]
+mod test_class_statement_between_constants;
+#[path = "emit_and_run/test_file_shared_class_once.rs"]
+mod test_file_shared_class_once;
+#[path = "emit_and_run/test_file_struct_constant.rs"]
+mod test_file_struct_constant;
+
+// Fork specs: relation queries.
+#[path = "emit_and_run/connection_to_sql_node.rs"]
+mod connection_to_sql_node;
+#[path = "emit_and_run/eager_load_joined_self_reference.rs"]
+mod eager_load_joined_self_reference;
+#[path = "emit_and_run/eager_load_over_nested_joins.rs"]
+mod eager_load_over_nested_joins;
+#[path = "emit_and_run/eager_load_string_join_order.rs"]
+mod eager_load_string_join_order;
+#[path = "emit_and_run/enumerate_columns_select.rs"]
+mod enumerate_columns_select;
+#[path = "emit_and_run/integer_bind_key_object.rs"]
+mod integer_bind_key_object;
+#[path = "emit_and_run/pluck_enum_labels.rs"]
+mod pluck_enum_labels;
+#[path = "emit_and_run/pluck_sql_string.rs"]
+mod pluck_sql_string;
+#[path = "emit_and_run/relation_rewhere.rs"]
+mod relation_rewhere;
+#[path = "emit_and_run/result_any_block.rs"]
+mod result_any_block;
+#[path = "emit_and_run/select_arel_attribute_array.rs"]
+mod select_arel_attribute_array;
+#[path = "emit_and_run/select_hash_value_no_alias.rs"]
+mod select_hash_value_no_alias;
+#[path = "emit_and_run/select_string_column.rs"]
+mod select_string_column;
+#[path = "emit_and_run/where_association_alias.rs"]
+mod where_association_alias;
+
+// Fork specs: persistence.
+#[path = "emit_and_run/clone_shares_belongs_to_has_many.rs"]
+mod clone_shares_belongs_to_has_many;
+#[path = "emit_and_run/clone_shares_has_one.rs"]
+mod clone_shares_has_one;
+#[path = "emit_and_run/declared_primary_key_reads.rs"]
+mod declared_primary_key_reads;
+#[path = "emit_and_run/dup_after_initialize.rs"]
+mod dup_after_initialize;
+#[path = "emit_and_run/model_update_override.rs"]
+mod model_update_override;
+#[path = "emit_and_run/new_nil_assigns_nothing.rs"]
+mod new_nil_assigns_nothing;
+#[path = "emit_and_run/partial_select_write.rs"]
+mod partial_select_write;
+#[path = "emit_and_run/record_toggle.rs"]
+mod record_toggle;
+#[path = "emit_and_run/reload_leaves_clone_cache.rs"]
+mod reload_leaves_clone_cache;
+#[path = "emit_and_run/save_touch_false.rs"]
+mod save_touch_false;
+#[path = "emit_and_run/delegated_type_methods.rs"]
+mod delegated_type_methods;
+#[path = "emit_and_run/direct_route_records.rs"]
+mod direct_route_records;
+#[path = "emit_and_run/direct_route_model_calls.rs"]
+mod direct_route_model_calls;
+
+#[path = "emit_and_run/after_initialize_require_class.rs"]
+mod after_initialize_require_class;
+#[path = "emit_and_run/model_value_class_blocks.rs"]
+mod model_value_class_blocks;
+
+// Fork specs: controller tests.
+#[path = "emit_and_run/app_headers_hash_keys.rs"]
+mod app_headers_hash_keys;
+#[path = "emit_and_run/app_json_renderer.rs"]
+mod app_json_renderer;
+#[path = "emit_and_run/controller_action_methods.rs"]
+mod controller_action_methods;
+#[path = "emit_and_run/controller_upload_param_io.rs"]
+mod controller_upload_param_io;
+#[path = "emit_and_run/deep_munge_nil_members.rs"]
+mod deep_munge_nil_members;
+#[path = "emit_and_run/fixture_file_upload_multipart.rs"]
+mod fixture_file_upload_multipart;
+#[path = "emit_and_run/functional_test_request_at_setup.rs"]
+mod functional_test_request_at_setup;
+#[path = "emit_and_run/integration_options_request.rs"]
+mod integration_options_request;
+#[path = "emit_and_run/render_json_as_json_options.rs"]
+mod render_json_as_json_options;
+#[path = "emit_and_run/request_media_type_case.rs"]
+mod request_media_type_case;
+#[path = "emit_and_run/request_variant.rs"]
+mod request_variant;
+#[path = "emit_and_run/response_body_writer.rs"]
+mod response_body_writer;
+#[path = "emit_and_run/test_local_controller.rs"]
+mod test_local_controller;
+
+// Fork specs: views helpers.
+#[path = "emit_and_run/declared_helper_includes.rs"]
+mod declared_helper_includes;
+#[path = "emit_and_run/declared_helper_order.rs"]
+mod declared_helper_order;
+#[path = "emit_and_run/declared_helpers_only.rs"]
+mod declared_helpers_only;
+#[path = "emit_and_run/helper_capture_arguments.rs"]
+mod helper_capture_arguments;
+#[path = "emit_and_run/helper_module_singleton_beside_instance.rs"]
+mod helper_module_singleton_beside_instance;
+#[path = "emit_and_run/helper_render_partial_format.rs"]
+mod helper_render_partial_format;
+#[path = "emit_and_run/number_helper_include_called_outside.rs"]
+mod number_helper_include_called_outside;
+#[path = "emit_and_run/tag_helper_singleton_include.rs"]
+mod tag_helper_singleton_include;
+#[path = "emit_and_run/translation_helper_test_include.rs"]
+mod translation_helper_test_include;
+#[path = "emit_and_run/view_url_for_hash.rs"]
+mod view_url_for_hash;
+#[path = "emit_and_run/class_side_multi_column_pluck.rs"]
+mod class_side_multi_column_pluck;
+#[path = "emit_and_run/has_many_inverse_of_foreign_key.rs"]
+mod has_many_inverse_of_foreign_key;
+#[path = "emit_and_run/errors_messages_unlowered.rs"]
+mod errors_messages_unlowered;
+#[path = "emit_and_run/belongs_to_unsaved_target_valid.rs"]
+mod belongs_to_unsaved_target_valid;
+#[path = "emit_and_run/string_starts_with_alias.rs"]
+mod string_starts_with_alias;
+#[path = "emit_and_run/duration_name_on_object.rs"]
+mod duration_name_on_object;
+#[path = "emit_and_run/update_in_argument_position.rs"]
+mod update_in_argument_position;
+#[path = "emit_and_run/indifferent_hash_in_plain_class.rs"]
+mod indifferent_hash_in_plain_class;
+#[path = "emit_and_run/test_file_class_body.rs"]
+mod test_file_class_body;
+#[path = "emit_and_run/test_class_dropped_statement.rs"]
+mod test_class_dropped_statement;
+#[path = "emit_and_run/route_helper_scalar_call.rs"]
+mod route_helper_scalar_call;
+
+// Fork specs: validations.
+#[path = "emit_and_run/key_named_validator_listed.rs"]
+mod key_named_validator_listed;
+#[path = "emit_and_run/presence_reads_delegated_column.rs"]
+mod presence_reads_delegated_column;
+#[path = "emit_and_run/sti_subclass_validators_listed.rs"]
+mod sti_subclass_validators_listed;
+#[path = "emit_and_run/validates_on_context_constant.rs"]
+mod validates_on_context_constant;
+#[path = "emit_and_run/validates_with_built_once_listed.rs"]
+mod validates_with_built_once_listed;
+#[path = "emit_and_run/validates_with_class_option.rs"]
+mod validates_with_class_option;
+#[path = "emit_and_run/validation_custom_context.rs"]
+mod validation_custom_context;
+#[path = "emit_and_run/validation_message_number_helper.rs"]
+mod validation_message_number_helper;
+#[path = "emit_and_run/validation_reads_singleton_reader.rs"]
+mod validation_reads_singleton_reader;
+
+// Fork specs: nested attributes.
+#[path = "emit_and_run/has_one_autosave_validates.rs"]
+mod has_one_autosave_validates;
+#[path = "emit_and_run/nested_built_child_errors.rs"]
+mod nested_built_child_errors;
+#[path = "emit_and_run/nested_validate_new_children.rs"]
+mod nested_validate_new_children;
+
+// Fork specs: attribute types.
+#[path = "emit_and_run/decimal_before_type_cast.rs"]
+mod decimal_before_type_cast;
+#[path = "emit_and_run/declared_type_read_after_save.rs"]
+mod declared_type_read_after_save;
+#[path = "emit_and_run/json_changed_in_place.rs"]
+mod json_changed_in_place;
+#[path = "emit_and_run/json_update_columns.rs"]
+mod json_update_columns;
+
+// Concern shapes: an `included do` block's class/instance attributes.
+#[path = "emit_and_run/concern_included_cattr.rs"]
+mod concern_included_cattr;
+
+// Concern shapes: model callbacks declared in a concern's included block.
+#[path = "emit_and_run/concern_model_callbacks.rs"]
+mod concern_model_callbacks;
+
+// Concern shapes: a prepended concern.
+#[path = "emit_and_run/concern_prepended.rs"]
+mod concern_prepended;
+
+// Concern shapes: a plain module's included hook class_eval'ing an include.
+#[path = "emit_and_run/concern_class_eval_include.rs"]
+mod concern_class_eval_include;
+
+// Concern shapes: `concerning :Topic do … end` in a model body.
+#[path = "emit_and_run/concerning_block.rs"]
+mod concerning_block;
+
+// Concern shapes: a concern's accessors and validations on a plain
+// Active Model class.
+#[path = "emit_and_run/concern_plain_includer.rs"]
+mod concern_plain_includer;
+
+// Concern shapes: a namespaced prepend by its relative name.
+#[path = "emit_and_run/concern_prepended_namespaced.rs"]
+mod concern_prepended_namespaced;

@@ -1379,7 +1379,10 @@ fn every_runtime_method_body_concretely_typed() {
     // `result = yield handle` and the `begin ... ensure` holding it are
     // the block's untyped value (+2 in active_record/connection.rb);
     // `_hold_slot`, `_release_slot` and the handle are typed and add none.
-    const CEILING: usize = 1006;
+    // MEASURED 1006 on merging main 3362ae95e (main: 1003): the same three
+    // sites in active_record/connection.rb; every other file equals main's.
+    // Raise to 1008, preserving the two-site headroom.
+    const CEILING: usize = 1008;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

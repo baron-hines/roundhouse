@@ -239,8 +239,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         // `ShortId::CandidateId`) nests as `active_record/base.rb` —
         // a literal `::` in the filename breaks the emitted
         // Makefile's dependency list.
-        let file_stem = crate::naming::underscore(lc.name.0.as_str());
-        let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+        let out_path = super::class_paths::class_rb(lc.name.0.as_str());
         let mut files = if kids.is_empty() {
             emit_library_class_pair_in(lc, app, classes, &factories, out_path)
         } else {
@@ -585,20 +584,18 @@ fn splice_data_block(
 ) {
     let name = block.name.0.as_str();
     let owner = file_owner(name, app, classes);
-    let owner_stem = crate::naming::underscore(&owner);
-    let owner_rb_path = PathBuf::from(format!("app/models/{owner_stem}.rb"));
-    let owner_rbs_path = PathBuf::from(format!("app/models/{owner_stem}.rbs"));
+    let owner_rb_path = super::class_paths::class_rb(&owner);
+    let owner_rbs_path = super::class_paths::class_rbs(&owner);
     let depth = name.split("::").count();
     let last = name.rsplit("::").next().unwrap_or(name);
     let indent = "  ".repeat(depth - 1);
-    let stem = crate::naming::underscore(name);
-    let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
+    let rb_path = super::class_paths::class_rb(name);
     let rendered = emit_library_class_decl_in(block, app, classes, factories, rb_path.clone(), &[], &[]);
     let lines: Vec<&str> = rendered.content.lines().collect();
     let mut hoisted = Vec::new();
     for line in lines.iter().filter(|line| line.starts_with("require_relative ")) {
         let target = line.trim_start_matches("require_relative ").trim().trim_matches('"');
-        let rebased = rebase_relative(&stem, &owner, target, app);
+        let rebased = rebase_relative(name, &owner, target, app);
         hoisted.push(format!("require_relative {rebased:?}"));
     }
     hoisted.extend(
@@ -683,20 +680,15 @@ fn splice_data_block(
 /// Both files live under `app/models/`, so the arithmetic is on that
 /// tree: resolve the target against the directory the child's file
 /// WOULD have had, then re-express it against the parent's.
-fn rebase_relative(child_stem: &str, parent_name: &str, target: &str, app: &App) -> String {
+fn rebase_relative(child_name: &str, parent_name: &str, target: &str, app: &App) -> String {
     let _ = app;
     // Anchored at the TREE root, not at `app/models`: a require can
     // climb out of the models directory (`../../../runtime/x`), and
     // arithmetic that starts inside it loses those steps silently —
     // the `..` pops an empty stack and the path comes out too short.
-    let mut child_dir: Vec<String> =
-        vec!["app".to_string(), "models".to_string()];
-    child_dir.extend(child_stem.split('/').map(str::to_string));
+    let mut child_dir: Vec<String> = super::class_paths::class_anchor(child_name).split('/').map(str::to_string).collect();
     child_dir.pop();
-    let parent_stem = crate::naming::underscore(parent_name);
-    let mut parent_dir: Vec<String> =
-        vec!["app".to_string(), "models".to_string()];
-    parent_dir.extend(parent_stem.split('/').map(str::to_string));
+    let mut parent_dir: Vec<String> = super::class_paths::class_anchor(parent_name).split('/').map(str::to_string).collect();
     parent_dir.pop();
 
     let mut resolved: Vec<String> = child_dir.clone();
@@ -818,8 +810,7 @@ fn emit_library_class_with_nested(
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
     for kid in kids {
-        let stem = crate::naming::underscore(kid.name.0.as_str());
-        let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
+        let rb_path = super::class_paths::class_rb(kid.name.0.as_str());
         let rendered = emit_library_class_decl_in(kid, app, classes, factories, rb_path.clone(), &[], &[]);
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
@@ -833,7 +824,7 @@ fn emit_library_class_with_nested(
         for line in lines.iter().filter(|l| l.starts_with("require_relative ")) {
             let Some(rest) = line.strip_prefix("require_relative ") else { continue };
             let target = rest.trim().trim_matches('"');
-            let rebased = rebase_relative(&stem, parent.name.0.as_str(), target, app);
+            let rebased = rebase_relative(kid.name.0.as_str(), parent.name.0.as_str(), target, app);
             // A sibling that is now in THIS file needs no require, and
             // naming it would name a path that no longer exists: one
             // child referencing another is the common case in a class
@@ -3480,11 +3471,12 @@ fn fold_autosave_call_into_hook(
     });
 }
 
-/// Ruby-family pre-emit pass: correct `has_many :through` readers. The
-/// shared lowering synthesizes EVERY has_many reader as a direct
-/// foreign-key query (`Tag.where(story_id: @id)`) — wrong for `through:`,
-/// where the foreign key lives on the join table. Rebuild those readers
-/// as a Relation join through the intermediate:
+/// Ruby-family pre-emit pass: correct `has_many :through` and `has_one
+/// :through` readers. The shared lowering synthesizes EVERY has_many and
+/// has_one reader as a direct foreign-key query (`Tag.where(story_id:
+/// @id)`) — wrong for `through:`, where the foreign key lives on the join
+/// table. Rebuild those readers as a Relation join through the
+/// intermediate:
 ///
 ///   def tags
 ///     return @tags_cache if @tags_loaded
@@ -3501,9 +3493,14 @@ fn fold_autosave_call_into_hook(
 /// `reachable_messages, through: :rooms, source: :messages`). Nested chains — the source association on
 /// the join model is itself `:through` (`Category has_many :stories,
 /// through: :tags` where `Tag#stories` goes through taggings), or the
-/// first hop is — recurse, adding one INNER JOIN per hop. Shapes a hop
-/// can't prove (missing models, no matching source) are left on the
-/// shared reader rather than guessed.
+/// first hop is — recurse, adding one INNER JOIN per hop. A belongs_to
+/// hop is the row the owner's key names (`has_one :venue, through:
+/// :event` reads `events.id = @event_id`), and a has_one reader answers
+/// the relation's `first`. A shape no hop can prove (missing models, no
+/// matching source, a polymorphic or scoped belongs_to hop) is an
+/// `unsupported` error: the shared reader it keeps reads a column the
+/// target does not have. So is a has_one :through over a collection,
+/// which Rails refuses.
 /// The association's own scope lambda is grafted onto the relation
 /// (`through_reader_body`), and the through association's is evaluated on
 /// the through model's relation and merged into it
@@ -3519,21 +3516,13 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        for assoc in model.associations() {
-            let Association::HasMany {
-                name, target, through: Some(_), scope: assoc_scope, ..
-            } = assoc
+        for (span, assoc) in model.spanned_associations() {
+            let (Association::HasMany { name, target, through: Some(_), scope: assoc_scope, .. }
+            | Association::HasOne { name, target, through: Some(_), scope: assoc_scope, .. }) = assoc
             else {
                 continue;
             };
-            let Some((joins, edge_table, edge_fk)) =
-                resolve_through_chain(&app.models, model, assoc, 0)
-            else {
-                continue;
-            };
-            let join_sql = joins.join(" ");
-            let where_sql = format!("{edge_table}.{edge_fk} = ?");
-
+            // A refused association has no reader.
             let Some(m) =
                 lc.methods.iter_mut().find(|m| {
                     m.name == *name && m.receiver == crate::dialect::MethodReceiver::Instance
@@ -3541,12 +3530,67 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
-            m.body = through_reader_body(name, target, &join_sql, &where_sql, assoc_scope);
-            if let Some(regs) = hop_regs.as_ref()
-                && let Some(hop) = through_hop_scope(model, assoc, app, regs)
+            if let Association::HasOne { through: Some(thr_name), .. } = assoc
+                && let Some(Association::HasMany { .. }) = model.associations().filter(|a| a.name() == thr_name).last()
             {
-                graft_through_hop(&mut m.body, hop);
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    span,
+                    None,
+                    "through_chain",
+                    format!(
+                        "`{}.{name}`: a has_one :through whose `through:` association `{thr_name}` is a \
+                         collection, which Rails refuses (HasOneThroughCantAssociateThroughCollection)",
+                        model.name.0
+                    ),
+                ));
+                continue;
             }
+            // Every table the chain joins is named bare, so one that
+            // appears twice (a self-referential hop) would be ambiguous.
+            let resolved = resolve_through_chain(&app.models, model, assoc, 0).filter(|(joins, _)| {
+                let target_table = app.models.iter().find(|m| &m.name == target).map(|m| m.table.0.as_str().to_string());
+                let mut tables: Vec<String> = joins
+                    .iter()
+                    .filter_map(|j| j.strip_prefix("INNER JOIN ")?.split(' ').next().map(str::to_string))
+                    .chain(target_table)
+                    .collect();
+                let count = tables.len();
+                tables.sort();
+                tables.dedup();
+                tables.len() == count
+            });
+            let Some((joins, edge)) = resolved else {
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    span,
+                    None,
+                    "through_chain",
+                    format!(
+                        "`{}.{name}`: no join through its `through:` association reaches `{}` \
+                         (a hop or source that is not an app model, a polymorphic or scoped \
+                         belongs_to, a scoped hop below the first, or a table joined twice), so \
+                         its reader would not answer the rows Rails does",
+                        model.name.0, target.0
+                    ),
+                ));
+                continue;
+            };
+            let relation = through_relation(
+                target,
+                &joins.join(" "),
+                &format!("{}.{} = ?", edge.table, edge.column),
+                &edge.owner_attr,
+                assoc_scope,
+            );
+            let relation = match hop_regs.as_ref().and_then(|regs| through_hop_scope(model, assoc, app, regs)) {
+                Some(hop) => merge_through_hop(relation, hop),
+                None => relation,
+            };
+            m.body = if matches!(assoc, Association::HasOne { .. }) {
+                let unset_key = crate::lower::model_to_library::fk_sentinel(model, &edge.owner_attr);
+                through_one_reader_body(name, &edge.owner_attr, unset_key, relation)
+            } else {
+                through_reader_body(name, relation)
+            };
         }
     }
 }
@@ -3578,7 +3622,11 @@ fn app_has_scoped_through(app: &App) -> bool {
     use crate::dialect::Association;
     app.models.iter().any(|model| {
         model.associations().any(|assoc| {
-            let Association::HasMany { through: Some(thr_name), .. } = assoc else { return false };
+            let (Association::HasMany { through: Some(thr_name), .. } | Association::HasOne { through: Some(thr_name), .. }) =
+                assoc
+            else {
+                return false;
+            };
             model.associations().any(|thr| {
                 thr.name() == thr_name
                     && matches!(
@@ -3609,7 +3657,10 @@ fn through_hop_scope(
     regs: &HopRegistries,
 ) -> Option<Expr> {
     use crate::dialect::Association;
-    let Association::HasMany { through: Some(thr_name), .. } = assoc else { return None };
+    let (Association::HasMany { through: Some(thr_name), .. } | Association::HasOne { through: Some(thr_name), .. }) = assoc
+    else {
+        return None;
+    };
     let (thr_target, scope) = model.associations().filter(|a| a.name() == thr_name).last().and_then(|thr| match thr {
         Association::HasMany { target, through: None, scope: Some(scope), .. }
         | Association::HasOne { target, through: None, scope: Some(scope), .. } => Some((target, scope)),
@@ -3700,32 +3751,35 @@ fn substitute_rel(expr: &mut Expr, rel: &Symbol, seed: &Expr) -> bool {
     found
 }
 
-/// `<relation>.preloaded(…)` becomes
-/// `<relation>.merge_through_scope(<hop>).preloaded(…)`.
-fn graft_through_hop(body: &mut Expr, hop: Expr) {
-    let ExprNode::Send { recv: Some(recv), method, .. } = &mut *body.node else { return };
-    if method.as_str() != "preloaded" {
-        return;
-    }
-    let span = hop.span;
-    let inner = std::mem::replace(recv, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-    *recv = Expr::new(
-        span,
+/// `<relation>.merge_through_scope(<hop>)`.
+fn merge_through_hop(relation: Expr, hop: Expr) -> Expr {
+    Expr::new(
+        hop.span,
         ExprNode::Send {
-            recv: Some(inner),
+            recv: Some(relation),
             method: Symbol::from("merge_through_scope"),
             args: vec![hop],
             block: None,
             parenthesized: true,
         },
-    );
+    )
 }
 
-/// Resolve the SQL join chain for `assoc`, a `has_many :through` on
-/// `model`. Returns the INNER JOIN fragments (target-nearest first, ready
-/// to `join(" ")`) plus the WHERE edge `(table, fk)` that points back at
-/// the owner's id. One recursion per indirection: a first hop that is
-/// itself `:through`, or a join-model source association that is.
+/// Where a through chain meets its owner: `<table>.<column> = ?`, bound
+/// to the owner's `<owner_attr>`. A has_many or has_one hop holds the
+/// owner's id (`memberships.team_id = @id`); a belongs_to hop is the row
+/// the owner's key names (`events.id = @event_id`).
+struct ThroughEdge {
+    table: String,
+    column: Symbol,
+    owner_attr: Symbol,
+}
+
+/// Resolve the SQL join chain for `assoc`, a `has_many :through` or
+/// `has_one :through` on `model`. Returns the INNER JOIN fragments
+/// (target-nearest first, ready to `join(" ")`) plus the WHERE edge that
+/// points back at the owner. One recursion per indirection: a first hop
+/// that is itself `:through`, or a join-model source association that is.
 /// `None` when a hop can't be proven — missing join model, no source
 /// association ([`Model::through_source`](crate::dialect::Model::through_source)),
 /// a source kind with no join here — and for pathological depth (cyclic
@@ -3735,42 +3789,55 @@ fn resolve_through_chain(
     model: &crate::dialect::Model,
     assoc: &crate::dialect::Association,
     depth: usize,
-) -> Option<(Vec<String>, String, Symbol)> {
+) -> Option<(Vec<String>, ThroughEdge)> {
     use crate::dialect::Association;
     use crate::naming::pluralize_snake;
 
     if depth > 4 {
         return None;
     }
-    let Association::HasMany { name, target, through: Some(thr_name), .. } = assoc else {
-        return None;
-    };
-    // The through association on the owner (`:votes`, `:taggings`, `:tags`).
-    let thr = model
-        .associations()
-        .find(|a| matches!(a, Association::HasMany { name, .. } if name == thr_name))?;
-    let Association::HasMany {
-        target: thr_target, foreign_key: thr_fk, through: thr_through, as_interface, ..
-    } = thr
+    let (Association::HasMany { name, target, through: Some(thr_name), .. }
+    | Association::HasOne { name, target, through: Some(thr_name), .. }) = assoc
     else {
         return None;
     };
-    // How the join model's rows tie back to the owner: directly by the
-    // sibling's fk, or through the sibling's own chain.
-    // Owner edge is the sibling's foreign key. `through_writer_join`
-    // copies that same key; asking it again cannot change the edge.
-    let (back_joins, edge_table, edge_fk) = match thr_through {
-        // Not the class name's plural: the owner edge is the join model's own table, as the join below reads it.
-        None => (
-            Vec::new(),
-            models.iter().find(|m| &m.name == thr_target).map_or_else(|| pluralize_snake(thr_target.0.as_str()), |m| m.table.0.as_str().to_string()),
-            thr_fk.clone(),
-        ),
-        Some(_) => resolve_through_chain(models, model, thr, depth + 1)?,
+    // The through association on the owner (`:votes`, `:taggings`,
+    // `:event`); a later declaration of the name replaces an earlier one.
+    let thr = model.associations().filter(|a| a.name() == thr_name).last()?;
+    let (thr_target, thr_through, as_interface) = match thr {
+        // Only the owner's own direct hop has its scope merged
+        // (`through_hop_scope`): a scoped hop further down the chain, or
+        // a scoped hop that is itself a through, would be joined without
+        // its scope.
+        Association::HasMany { scope: Some(_), through, .. } | Association::HasOne { scope: Some(_), through, .. }
+            if depth > 0 || through.is_some() =>
+        {
+            return None;
+        }
+        Association::HasMany { target, through, as_interface, .. }
+        | Association::HasOne { target, through, as_interface, .. } => (target, through, as_interface),
+        // Not a scoped one: `through_hop_scope` merges a has_many or
+        // has_one hop's scope only.
+        Association::BelongsTo { target, polymorphic: false, scope: None, .. } => (target, &None, &None),
+        _ => return None,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
     // Not the class name's plural: a model's `self.table_name =` names another table.
     let thr_table = thr_model.table.0.as_str().to_string();
+    // How the join model's rows tie back to the owner: directly by the
+    // hop's key, or through the hop's own chain.
+    let (back_joins, edge) = match (thr, thr_through) {
+        (Association::BelongsTo { foreign_key, .. }, _) => (
+            Vec::new(),
+            ThroughEdge { table: thr_table.clone(), column: Symbol::from("id"), owner_attr: foreign_key.clone() },
+        ),
+        (Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. }, None) => (
+            Vec::new(),
+            ThroughEdge { table: thr_table.clone(), column: foreign_key.clone(), owner_attr: Symbol::from("id") },
+        ),
+        (_, Some(_)) => resolve_through_chain(models, model, thr, depth + 1)?,
+        _ => return None,
+    };
     let target_table = models
         .iter()
         .find(|m| &m.name == target)
@@ -3781,14 +3848,6 @@ fn resolve_through_chain(
         // :story`). A polymorphic one needs a type predicate this join
         // does not write, so it stays on the shared reader.
         Association::BelongsTo { foreign_key: src_fk, polymorphic: false, .. } => {
-            let src_fk = if thr_through.is_none() {
-                match crate::lower::model_to_library::through_writer_join(model, models, name) {
-                    crate::lower::model_to_library::ThroughWriterJoin::Resolved(_, _, src_fk, _) => src_fk,
-                    _ => return None,
-                }
-            } else {
-                src_fk.clone()
-            };
             vec![format!(
                 "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
             )]
@@ -3812,25 +3871,31 @@ fn resolve_through_chain(
         // foreign key is on the TARGET table and the join points the
         // other way (campfire: `has_many :reachable_messages, through:
         // :rooms, source: :messages` — Room#messages, `messages.room_id`).
-        Association::HasMany { foreign_key: src_fk, through: None, .. } => vec![format!(
-            "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{owner_type}"
-        )],
+        // A has_one source joins the same way. One declared `as:` holds
+        // the join model's class beside its id.
+        Association::HasMany { foreign_key: src_fk, through: None, as_interface: src_as, .. }
+        | Association::HasOne { foreign_key: src_fk, through: None, as_interface: src_as, .. } => {
+            let src_type = through_owner_type_predicate(&target_table, src_as, &thr_model.name);
+            vec![format!(
+                "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{src_type}{owner_type}"
+            )]
+        }
         // Nested: the join model reaches the target through its own
         // `:through` association. Resolve that chain (phrased from the
         // same target table), then graft the join model onto its owner
         // edge.
-        src @ Association::HasMany { through: Some(_), .. } => {
-            let (mut src_joins, src_edge_table, src_edge_fk) =
-                resolve_through_chain(models, thr_model, src, depth + 1)?;
+        src @ (Association::HasMany { through: Some(_), .. } | Association::HasOne { through: Some(_), .. }) => {
+            let (mut src_joins, src_edge) = resolve_through_chain(models, thr_model, src, depth + 1)?;
             src_joins.push(format!(
-                "INNER JOIN {thr_table} ON {thr_table}.id = {src_edge_table}.{src_edge_fk}{owner_type}"
+                "INNER JOIN {thr_table} ON {thr_table}.{} = {}.{}{owner_type}",
+                src_edge.owner_attr, src_edge.table, src_edge.column
             ));
             src_joins
         }
         _ => return None,
     };
     joins.extend(back_joins);
-    Some((joins, edge_table, edge_fk))
+    Some((joins, edge))
 }
 
 /// Keep the same polymorphic owner restriction on lazy and batched through joins.
@@ -3872,11 +3937,84 @@ fn through_owner_type_predicate(table: &str, as_interface: &Option<Symbol>, owne
 /// and for "never loaded". A caller that chains on further clears that
 /// memo and re-queries, which is what every chain method here does and
 /// what Rails does to a loaded relation.
-fn through_reader_body(
-    name: &Symbol,
+fn through_reader_body(name: &Symbol, relation: Expr) -> Expr {
+    let span = Span::synthetic;
+    // Last in the chain, after any scope graft: the scope's conditions
+    // belong to the QUERY, and this hands the finished relation the
+    // records an eager load already fetched.
+    Expr::new(
+        span(),
+        ExprNode::Send {
+            recv: Some(relation),
+            method: Symbol::from("preloaded"),
+            args: vec![
+                Expr::new(
+                    span(),
+                    ExprNode::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
+                ),
+                Expr::new(
+                    span(),
+                    ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
+                ),
+            ],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// A `has_one :through` reader: the preloaded record when there is one,
+/// nil while the owner's edge key is unset (an unsaved owner, or a
+/// belongs_to hop with no key, which Rails does not query either), and
+/// otherwise the joined relation's `first`. `unset` is the key's "no row"
+/// sentinel, `0` or `""` (`fk_sentinel`).
+fn through_one_reader_body(name: &Symbol, owner_attr: &Symbol, unset_key: Expr, relation: Expr) -> Expr {
+    let span = Span::synthetic;
+    let key = || Expr::new(span(), ExprNode::Ivar { name: owner_attr.clone() });
+    let unset = Expr::new(
+        span(),
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left: Expr::new(
+                span(),
+                ExprNode::Send { recv: Some(key()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false },
+            ),
+            right: Expr::new(
+                span(),
+                ExprNode::Send {
+                    recv: Some(key()),
+                    method: Symbol::from("=="),
+                    args: vec![unset_key],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+        },
+    );
+    let nil = || Expr::new(span(), ExprNode::Lit { value: Literal::Nil });
+    let unset_guard = Expr::new(
+        span(),
+        ExprNode::If {
+            cond: unset,
+            then_branch: Expr::new(span(), ExprNode::Return { value: nil() }),
+            else_branch: nil(),
+        },
+    );
+    let first = Expr::new(
+        span(),
+        ExprNode::Send { recv: Some(relation), method: Symbol::from("first"), args: vec![], block: None, parenthesized: false },
+    );
+    Expr::new(span(), ExprNode::Seq { exprs: vec![preload_cache_guard(name), unset_guard, first] })
+}
+
+/// `ActiveRecord::Relation.new(<target>).joins(<join_sql>).where(<where_sql>,
+/// @<owner_attr>)`, with the association's own scope grafted on.
+fn through_relation(
     target: &ClassId,
     join_sql: &str,
     where_sql: &str,
+    owner_attr: &Symbol,
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
@@ -3928,7 +4066,7 @@ fn through_reader_body(
                         value: crate::expr::Literal::Str { value: where_sql.to_string() },
                     },
                 ),
-                Expr::new(span(), ExprNode::Ivar { name: Symbol::from("id") }),
+                Expr::new(span(), ExprNode::Ivar { name: owner_attr.clone() }),
             ],
             block: None,
             parenthesized: true,
@@ -3939,33 +4077,10 @@ fn through_reader_body(
     // graft its receiver-less chain onto the seeded relation so the
     // reader filters the way Rails does (without it /upvoted served
     // every joined row).
-    let chain = match assoc_scope {
+    match assoc_scope {
         Some(scope_body) => graft_chain_root(scope_body, chain),
         None => chain,
-    };
-
-    // Last in the chain, after any scope graft: the scope's conditions
-    // belong to the QUERY, and this hands the finished relation the
-    // records an eager load already fetched.
-    Expr::new(
-        span(),
-        ExprNode::Send {
-            recv: Some(chain),
-            method: Symbol::from("preloaded"),
-            args: vec![
-                Expr::new(
-                    span(),
-                    ExprNode::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
-                ),
-                Expr::new(
-                    span(),
-                    ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
-                ),
-            ],
-            block: None,
-            parenthesized: true,
-        },
-    )
+    }
 }
 
 /// Replace the receiver-less root of a `where(...).order(...)` chain
@@ -9304,7 +9419,20 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
-    for inc in &lc.includes {
+    // A model's `prepend Concern` names a module this file must load
+    // before the class body runs, exactly as an `include` does — and one
+    // the concern splice claimed, so there IS a module to load: an
+    // unclaimed `prepend` (`prepend PlainModule`) stays the reported gap
+    // the lowering gives it, and is written nowhere. Every declaration of
+    // the model's name contributes: the file is written once, and the
+    // `prepend` may sit in the reopening file rather than the first one.
+    let prepends: Vec<Vec<crate::ident::ClassId>> = app
+        .models
+        .iter()
+        .filter(|m| m.name == lc.name)
+        .flat_map(|m| crate::analyze::claimed_prepend_statements(m, &app.concern_prepended_items))
+        .collect();
+    for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -9803,6 +9931,20 @@ fn emit_library_class_decl_inner(
         nested.borrow_mut().write_include(&mut s, depth, lc, inc);
         writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
     }
+    // A model's `prepend Concern`: the module's instance methods sit
+    // AHEAD of the class's own there and reach them through `super`,
+    // which an `include` would not give it. What the module's `prepended
+    // do` block declared is already in the body above. ONE statement per
+    // source statement, arguments in written order: Ruby puts the first
+    // argument of `prepend A, B` ahead of the second, while two separate
+    // `prepend` lines would put B ahead of A.
+    for statement in &prepends {
+        for inc in statement {
+            nested.borrow_mut().write_include(&mut s, depth, lc, inc);
+        }
+        let names: Vec<String> = statement.iter().map(|inc| include_name(inc)).collect();
+        writeln!(s, "{body_pad}prepend {}", names.join(", ")).unwrap();
+    }
     if lc.includes.len() > positioned.len() + ordered_includes.len() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -9868,7 +10010,7 @@ fn emit_library_class_decl_inner(
     let written_conditionals: std::cell::RefCell<Vec<usize>> = Default::default();
     // A branch's class or module loads from its own file, here.
     let require_of = |name: &ClassId| -> String {
-        let anchor = format!("app/models/{}", crate::naming::underscore(&file_owner(name.0.as_str(), app, classes)));
+        let anchor = super::class_paths::class_anchor(&file_owner(name.0.as_str(), app, classes));
         format!("require_relative {:?}", relpath(&out_dir, &anchor))
     };
     fn write(
@@ -11306,7 +11448,7 @@ fn require_path_for_parent(parent: &ClassId, app: &App, classes: &[LibraryClass]
     {
         // underscore: namespaced parents nest (see emit_library_class_decls).
         let owner = file_owner(raw, app, classes);
-        return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        return Some(super::class_paths::class_anchor(&owner));
     }
     if is_controller_named(raw, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(raw)));
@@ -11451,7 +11593,7 @@ fn require_path_for_body_const(
         if owner == self_name {
             return None;
         }
-        return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        return Some(super::class_paths::class_anchor(&owner));
     }
     // A bare reference inside a namespace resolves LEXICALLY first:
     // campfire's `module ContentFilters` builds
@@ -11469,12 +11611,12 @@ fn require_path_for_body_const(
         if owner == self_name {
             return None;
         }
-        return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        return Some(super::class_paths::class_anchor(&owner));
     }
     // Any constant of a file of constants alone is that file's, not only
     // the one it is named for: `Labels = DEFAULT` beside `DEFAULT = […]`.
     if let Some(owner) = file_constant_owner(first, app, classes) {
-        return (owner != self_name).then(|| format!("app/models/{}", crate::naming::underscore(&owner)));
+        return (owner != self_name).then(|| super::class_paths::class_anchor(&owner));
     }
     if first == self_name {
         return None;
@@ -11490,7 +11632,7 @@ fn require_path_for_body_const(
     }
     if is_model_or_library_class(first, app, classes)
     {
-        return Some(format!("app/models/{}", crate::naming::underscore(first)));
+        return Some(super::class_paths::class_anchor(first));
     }
     if is_controller_named(first, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(first)));
@@ -12507,9 +12649,15 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
+// A has_one or has_many :through whose hop and source each have a batch
+// loads hop first, as Rails' through preloader does
+// (`through_hop_preload_kind`); a has_many :through over another hop
+// keeps the joined batch.
+//
 // Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
 // with a scope or polymorphic owner, and scope-carrying through-assocs
-// (other than a plain `order("...")`) get no batch arm — the dispatch
+// (other than `distinct`, `readonly` or a plain `order("...")`) get no
+// batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
 // Rails, which also lazy-loads what `includes` doesn't name). Unscoped
 // non-polymorphic has_one uses PreloadKind::HasOne (first-wins). Assigning
@@ -12699,6 +12847,22 @@ enum PreloadKind {
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
     Through { target: String, join: String, group_col: String, order: Option<String>, string_key: bool },
+    /// A through loaded hop first (`through_hop_preload_kind`): the owner's
+    /// `hop` batch, then `hop_model`'s `source` batch over the hop records,
+    /// or, when `apart` is `(target column, hop record's key read)`, one
+    /// query of the target that seats nothing on the hop records.
+    ThroughHop {
+        target: String,
+        hop: String,
+        hop_many: bool,
+        hop_model: String,
+        source: String,
+        source_many: bool,
+        one: bool,
+        apart: Option<(String, String)>,
+        distinct: bool,
+        readonly: bool,
+    },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
     /// `ActiveStorage::Attached` on each record (`attr`, owner class).
@@ -12747,6 +12911,154 @@ fn touches_default_scoped(model: &crate::dialect::Model, assoc: &crate::dialect:
     }
 }
 
+/// The batch of a direct association (`belongs_to`, `has_many`, `has_one`)
+/// whose query keeps every restriction its reader has, or `None` for one
+/// that keeps its lazy reader.
+fn direct_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> Option<PreloadKind> {
+    use crate::dialect::Association;
+    // A refused association (`assoc_primary_key`) has no reader to
+    // preload into.
+    if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some() {
+        return None;
+    }
+    // A belongs_to batch is raw SQL; one that loads a default-scoped
+    // model keeps its lazy reader, whose Relation applies the scope,
+    // rather than load the rows it hides.
+    if touches_default_scoped(model, assoc, app) {
+        return None;
+    }
+    let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
+    match assoc {
+        // A scoped one keeps its lazy reader, which finds through the
+        // scope, as a scoped has_many does below. So does a polymorphic
+        // one, whose class is in each row's type column: `target` is
+        // only the name's class (`belongs_to :post` reads `Post`), which
+        // may be an app model all the same.
+        Association::BelongsTo { target, foreign_key, scope: None, polymorphic: false, .. } => {
+            let target_model = app.models.iter().find(|m| &m.name == target)?;
+            // A uuid / string key is a quoted literal in `IN (...)`;
+            // the integer helper would `to_i` it to its leading
+            // digits and find nothing (cf. #310 for `Relation#ids`).
+            let string_key = string_primary_key(app, target_model);
+            Some(PreloadKind::BelongsTo {
+                fk: foreign_key.as_str().to_string(),
+                target: target.0.as_str().to_string(),
+                table: target_model.table.0.as_str().to_string(),
+                key_list: if string_key { "escape_string_list" } else { "escape_int_list" },
+            })
+        }
+        // This loader only applies the foreign-key predicate. A scope
+        // or polymorphic owner-type restriction must stay on the lazy
+        // reader until the batch query can preserve it as well.
+        Association::HasMany { target, foreign_key, through: None, scope: None, as_interface: None, .. } => {
+            model_exists(target).then(|| PreloadKind::HasMany {
+                fk: foreign_key.as_str().to_string(),
+                owner_key: assoc.owner_key().as_str().to_string(),
+                target: target.0.as_str().to_string(),
+            })
+        }
+        // Same restriction as has_many: FK-only batch. Scoped or
+        // polymorphic has_one stays on the lazy reader until the
+        // batch can preserve those predicates.
+        Association::HasOne { target, foreign_key, through: None, scope: None, as_interface: None, .. } => {
+            model_exists(target).then(|| PreloadKind::HasOne {
+                fk: foreign_key.as_str().to_string(),
+                owner_key: assoc.owner_key().as_str().to_string(),
+                target: target.0.as_str().to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Rails' through preloader (`Preloader::ThroughAssociation`) for a
+/// through whose scope has no `where`: the hop loads on the owners and is
+/// seated on them, its through scope being empty; then the source loads
+/// off the hop records. The source is seated on the hop records only
+/// while the through's own scope is empty: a `distinct` or `readonly` one
+/// loads the source records apart (`associate_by_default: false`), so a
+/// hop's own source still loads when it is read. Each owner holds its
+/// hop records' sources, in hop order (unique for `distinct`), and an
+/// owner already holding its target keeps it.
+///
+/// Taken when the hop and the source each have a direct batch
+/// (`direct_preload_kind`) and the source is the target's class; a
+/// `has_one :through` needs a singular hop and source. Any other scope
+/// (a `where`, an `order`) keeps its lazy reader or the joined batch.
+fn through_hop_preload_kind(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> Option<PreloadKind> {
+    use crate::dialect::Association;
+    let (target, thr_name, scope, one) = match assoc {
+        Association::HasMany { target, through: Some(thr), scope, .. } => (target, thr, scope, false),
+        Association::HasOne { target, through: Some(thr), scope, .. } => (target, thr, scope, true),
+        _ => return None,
+    };
+    if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some()
+        || touches_default_scoped(model, assoc, app)
+    {
+        return None;
+    }
+    let (mut distinct, mut readonly) = (false, false);
+    if let Some(scope) = scope {
+        let mut call = scope;
+        loop {
+            let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+            if !args.is_empty() {
+                return None;
+            }
+            match method.as_str() {
+                "distinct" => distinct = true,
+                "readonly" => readonly = true,
+                _ => return None,
+            }
+            match recv {
+                Some(r) => call = r,
+                None => break,
+            }
+        }
+    }
+    let hop = model.associations().filter(|a| a.name() == thr_name).last()?;
+    let (hop_many, hop_target) = match direct_preload_kind(model, hop, app)? {
+        PreloadKind::HasMany { target, .. } => (true, target),
+        PreloadKind::BelongsTo { target, .. } | PreloadKind::HasOne { target, .. } => (false, target),
+        _ => return None,
+    };
+    let hop_model = app.models.iter().find(|m| m.name.0.as_str() == hop_target)?;
+    let source = hop_model.through_source(assoc)?;
+    let source_kind = direct_preload_kind(hop_model, source, app)?;
+    let source_target = match &source_kind {
+        PreloadKind::BelongsTo { target, .. } | PreloadKind::HasMany { target, .. } | PreloadKind::HasOne { target, .. } => target,
+        _ => return None,
+    };
+    if source_target != target.0.as_str() {
+        return None;
+    }
+    let source_many = matches!(source_kind, PreloadKind::HasMany { .. });
+    if one && (hop_many || source_many) {
+        return None;
+    }
+    // A source loaded apart: the column its rows are keyed by, and how a
+    // hop record reads that key.
+    let apart = (distinct || readonly).then(|| match &source_kind {
+        PreloadKind::BelongsTo { fk, .. } => ("id".to_string(), format!("[:{fk}]")),
+        PreloadKind::HasMany { fk, owner_key, .. } | PreloadKind::HasOne { fk, owner_key, .. } => {
+            (fk.clone(), format!(".{owner_key}"))
+        }
+        _ => unreachable!("source_target matched a direct kind"),
+    });
+    Some(PreloadKind::ThroughHop {
+        target: target.0.as_str().to_string(),
+        hop: thr_name.as_str().to_string(),
+        hop_many,
+        hop_model: hop_model.name.0.as_str().to_string(),
+        source: source.name().as_str().to_string(),
+        source_many,
+        one,
+        apart,
+        distinct,
+        readonly,
+    })
+}
+
 /// Select association shapes whose batch queries preserve the reader's filters,
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
@@ -12760,79 +13072,16 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
     let owner_string_key = string_primary_key(app, model);
     let mut out = Vec::new();
     for assoc in model.associations() {
-        // A refused association (`assoc_primary_key`) has no reader to
-        // preload into.
-        if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some() {
+        if let Some(kind) = direct_preload_kind(model, assoc, app).or_else(|| through_hop_preload_kind(model, assoc, app)) {
+            out.push((assoc.name().as_str().to_string(), kind));
             continue;
         }
-        // A belongs_to or `through:` batch is raw SQL; one that loads a
-        // default-scoped model keeps its lazy reader, whose Relation
-        // applies the scope, rather than load the rows it hides.
-        if touches_default_scoped(model, assoc, app) {
+        if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some()
+            || touches_default_scoped(model, assoc, app)
+        {
             continue;
         }
         match assoc {
-            // A scoped one keeps its lazy reader, which finds through the
-            // scope, as a scoped has_many does below. So does a polymorphic
-            // one, whose class is in each row's type column: `target` is
-            // only the name's class (`belongs_to :post` reads `Post`), which
-            // may be an app model all the same.
-            Association::BelongsTo { name, target, foreign_key, scope: None, polymorphic: false, .. } => {
-                let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
-                    continue;
-                };
-                // A uuid / string key is a quoted literal in `IN (...)`;
-                // the integer helper would `to_i` it to its leading
-                // digits and find nothing (cf. #310 for `Relation#ids`).
-                let string_key = string_primary_key(app, target_model);
-                out.push((
-                    name.as_str().to_string(),
-                    PreloadKind::BelongsTo {
-                        fk: foreign_key.as_str().to_string(),
-                        target: target.0.as_str().to_string(),
-                        table: target_model.table.0.as_str().to_string(),
-                        key_list: if string_key { "escape_string_list" } else { "escape_int_list" },
-                    },
-                ));
-            }
-            // This loader only applies the foreign-key predicate. A scope
-            // or polymorphic owner-type restriction must stay on the lazy
-            // reader until the batch query can preserve it as well.
-            Association::HasMany {
-                name, target, foreign_key, through: None,
-                scope: None, as_interface: None, ..
-            } => {
-                if !model_exists(target) {
-                    continue;
-                }
-                out.push((
-                    name.as_str().to_string(),
-                    PreloadKind::HasMany {
-                        fk: foreign_key.as_str().to_string(),
-                        owner_key: assoc.owner_key().as_str().to_string(),
-                        target: target.0.as_str().to_string(),
-                    },
-                ));
-            }
-            // Same restriction as has_many: FK-only batch. Scoped or
-            // polymorphic has_one stays on the lazy reader until the
-            // batch can preserve those predicates.
-            Association::HasOne {
-                name, target, foreign_key,
-                scope: None, as_interface: None, ..
-            } => {
-                if !model_exists(target) {
-                    continue;
-                }
-                out.push((
-                    name.as_str().to_string(),
-                    PreloadKind::HasOne {
-                        fk: foreign_key.as_str().to_string(),
-                        owner_key: assoc.owner_key().as_str().to_string(),
-                        target: target.0.as_str().to_string(),
-                    },
-                ));
-            }
             // Through: same two-hop resolution as
             // `apply_through_assoc_lowering`; assoc scopes other than a
             // plain `order("...")` (or none) don't batch — the lazy
@@ -12854,9 +13103,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 // merges the hop's conditions and orderings into its query
                 // (`through_hop_scope`) and this batch would not.
                 let Some(Association::HasMany { target: thr_target, as_interface, scope: None, .. }) =
-                    model.associations().find(|a| {
-                        matches!(a, Association::HasMany { name, .. } if name == thr_name)
-                    })
+                    model.associations().filter(|a| a.name() == thr_name).last()
                 else {
                     continue;
                 };
@@ -13074,6 +13321,115 @@ end
 "#
                 );
             }
+            // Hop first (`through_hop_preload_kind`). The hop loads for
+            // every owner that does not hold it, the source over every
+            // owner's hop records, and an owner already holding its target
+            // keeps it; when every owner does, nothing runs.
+            PreloadKind::ThroughHop { target, hop, hop_many, hop_model, source, source_many, one, apart, distinct, readonly } => {
+                let for_hops = |body: &str| {
+                    if *hop_many {
+                        format!("    r.{hop}_target.each do |h|\n{body}\n    end")
+                    } else {
+                        format!("    h = r.{hop}\n    unless h.nil?\n{body}\n    end")
+                    }
+                };
+                let held = if *one {
+                    format!("      held = r.{name}\n      out << held unless held.nil?")
+                } else {
+                    format!("      r.{name}_target.each do |s|\n        out << s\n      end")
+                };
+                // A hop record already holding its source answers it, in
+                // either branch, as Rails' loader reuses a loaded target
+                // (`already_loaded_records_by_key`), scope or not.
+                let held_source = if *source_many {
+                    format!("        h.{source}_target.each do |s|\n          list << s\n        end")
+                } else {
+                    format!("        s = h.{source}\n        list << s unless s.nil?")
+                };
+                let (load, push) = match apart {
+                    None => (
+                        format!(
+                            r#"  unloaded = []
+  middle.each do |h|
+    unloaded << h unless h.{source}_loaded?
+  end
+  {hop_model}._preload_batch_{source}(unloaded) if unloaded.length > 0"#
+                        ),
+                        held_source,
+                    ),
+                    Some((column, key)) => {
+                        let distinct = if *distinct { ".distinct" } else { "" };
+                        let readonly = if *readonly { ".readonly" } else { "" };
+                        let take = if *source_many {
+                            "          got.each do |s|\n            list << s\n          end"
+                        } else {
+                            "          list << got[0]"
+                        };
+                        (
+                            format!(
+                                r#"  keys = []
+  middle.each do |h|
+    unless h.{source}_loaded?
+      v = h{key}
+      keys << v unless v.nil?
+    end
+  end
+  found = {{}}
+  if keys.length > 0
+    ActiveRecord::Relation.new({target}).where({column}: keys){distinct}{readonly}.to_a.each do |rec|
+      k = rec.{column}
+      found[k] = [] if found[k].nil?
+      found[k] << rec
+    end
+  end"#
+                            ),
+                            format!(
+                                "      if h.{source}_loaded?\n{held_source}\n      else\n        got = found[h{key}]\n        unless got.nil?\n{take}\n        end\n      end"
+                            ),
+                        )
+                    }
+                };
+                let unique = if *distinct { "    list = list.uniq\n" } else { "" };
+                let seat = if *one { "list.first" } else { "list" };
+                let collect_middle = for_hops("      middle << h");
+                let collect_list = for_hops(&push);
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  out = []
+  pending = []
+  records.each do |r|
+    if r.{name}_loaded?
+{held}
+    else
+      pending << r
+    end
+  end
+  return out if pending.length == 0
+  unheld = []
+  records.each do |r|
+    unheld << r unless r.{hop}_loaded?
+  end
+  _preload_batch_{hop}(unheld) if unheld.length > 0
+  middle = []
+  records.each do |r|
+{collect_middle}
+  end
+{load}
+  pending.each do |r|
+    list = []
+{collect_list}
+{unique}    r._preload_{name}({seat})
+    list.each do |s|
+      out << s
+    end
+  end
+  out
+end
+"#
+                );
+            }
             PreloadKind::Through { target, join, group_col, order, string_key } => {
                 let (key_list, to_key) = key_helpers(*string_key);
                 let table = crate::naming::pluralize_snake(target.as_str());
@@ -13253,6 +13609,7 @@ end
                 PreloadKind::HasMany { target, .. } => Some(target.as_str()),
                 PreloadKind::HasOne { target, .. } => Some(target.as_str()),
                 PreloadKind::Through { target, .. } => Some(target.as_str()),
+                PreloadKind::ThroughHop { target, .. } => Some(target.as_str()),
                 PreloadKind::RichText { .. } => Some("ActionText::RichText"),
                 PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already

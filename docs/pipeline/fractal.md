@@ -159,7 +159,8 @@ restores the app's files afterwards whether or not the second boot
 succeeds. While the overlay is applied, Ctrl+C stops the Ruby boot but not
 `verify`, which still restores the files (on Unix); copies of the
 originals are also written to `originals/` in the working directory
-(`--keep DIR`, or a temporary directory removed after a successful run).
+(`--keep DIR`, or a temporary directory removed when `verify` returns,
+unless restoring the files failed).
 Each boot requires the `--require` files, then the compiled files, and
 [`fingerprint.rb`](../../src/emit/fractal/verify/fingerprint.rb)
 fingerprints every named module with a method in a compiled file (every
