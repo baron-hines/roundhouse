@@ -129,6 +129,15 @@ fn a_scope_parameter_default_keeps_its_writing_scope() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn the_declared_default_shard_is_available_before_configuration() {
+    let run = contract::app(contract::SHARDS, &contract::shards_report())
+        .run_spinel(&format!("before = ApplicationRecord.default_shard\ncurrent = ApplicationRecord.current_shard\n{}puts before.to_s\nputs current.to_s", contract::BOOT));
+    run.assert_passes();
+    assert_eq!(run.stdout, "left\nleft\n");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn a_shared_named_schema_supports_a_primary_default_writer() {
     let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n")
         .replace("schema_dump: schema.rb", "schema_dump: catalog_schema.rb");

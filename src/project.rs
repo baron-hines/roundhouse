@@ -7860,6 +7860,11 @@ fn apply_database_routes(files: &mut [(String, String)], app: &App) {
         symbol(&routes.default_shard)
     ));
     *content = content.replacen(MARK, &generated, 1);
+    *content = content.replacen(
+        "  @slots = nil\n",
+        &format!("  @slots = nil\n  @default_shard = {}\n", symbol(&routes.default_shard)),
+        1,
+    );
 }
 
 /// Write `JobRegistry` — each payload job's writer and reader, and the
