@@ -9573,6 +9573,9 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Encoding::UndefinedConversionError" | "Encoding::InvalidByteSequenceError"
         | "Encoding::ConverterNotFoundError"
         | "Signal" | "FileTest" | "Marshal" | "Fiber"
+        | "Socket" | "IO::WaitReadable" | "IO::WaitWritable" | "Zlib::Inflate" | "OpenSSL::Digest::MD5"
+        | "OpenSSL::X509::Certificate" | "OpenSSL::PKey::RSA" | "OpenSSL::SSL::SSLSocket" | "OpenSSL::SSL::SSLContext"
+        | "OpenSSL::ASN1" | "OpenSSL::ASN1::ASN1Data"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
@@ -10167,6 +10170,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             );
         }
         // These are Integer values, so the class/module gate does not see them.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
+            && flag.starts_with(|c: char| c.is_ascii_uppercase())
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("Socket::{flag} is a socket option constant, which the {target} runtime does not supply"),
+            );
+        }
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Zlib", flag @ ("BEST_COMPRESSION" | "MAX_WBITS" | "FINISH")] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]

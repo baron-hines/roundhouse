@@ -20867,6 +20867,8 @@ mod core_exceptions;
 mod rbconfig_config;
 #[path = "emit_and_run/process_modules.rs"]
 mod process_modules;
+#[path = "emit_and_run/network_constants.rs"]
+mod network_constants;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
