@@ -2210,10 +2210,11 @@ fn suffixed_struct_methods(base: &ClassId, members: &[Symbol], keyword_init: boo
     if keyword_init {
         let keys = members.iter().map(|m| format!(":{m}")).collect::<Vec<_>>().join(", ");
         src.push_str("def initialize(**attrs)\n");
-        src.push_str(&format!("  unknown = attrs.keys - [{keys}]\n"));
+        src.push_str(&format!("  unknown = attrs.keys.map {{ |k| k.to_sym }} - [{keys}]\n"));
         src.push_str("  raise ArgumentError, \"unknown keywords: #{unknown.join(\", \")}\" unless unknown.empty?\n");
         for m in members {
-            src.push_str(&format!("  @{} = attrs.fetch(:{m}, nil)\n", struct_slot(m)));
+            // A String key names the member too, as Struct's keyword constructor reads it.
+            src.push_str(&format!("  @{} = attrs.fetch(:{m}) {{ attrs.fetch(\"{m}\", nil) }}\n", struct_slot(m)));
         }
         src.push_str("end\n");
     } else {
@@ -2382,8 +2383,10 @@ fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructCons
         }
         members.push(Symbol::from(member));
     }
-    // Not one whose held name is another member's (`:success?` beside `:__q_success`): the two would share a slot.
-    if members.iter().any(|m| { let slot = struct_slot(m); slot != *m && members.contains(&slot) }) {
+    // Not one whose held name is another member's (`:success?` beside `:__q_success`), or one its block names (an
+    // `attr_accessor :__q_success` there): the two would share a slot.
+    let block_text = call.block().map(|b| String::from_utf8_lossy(b.location().as_slice()).into_owned()).unwrap_or_default();
+    if members.iter().any(|m| { let slot = struct_slot(m); slot != *m && (members.contains(&slot) || block_text.contains(slot.as_str())) }) {
         return None;
     }
     // The positional form too: since Ruby 3.2 it also takes keywords, which
