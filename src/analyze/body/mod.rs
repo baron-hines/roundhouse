@@ -1688,6 +1688,42 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    /// A bare constant Rubydex leaves unanswered where the class mixes in more than one module (`LIMIT` from
+    /// `include RateConcept` beside `include PriceConcept`; one alone resolves): Ruby's ancestor lookup, the class,
+    /// its modules (the last included first), then its superclass and on, among the app's declarations.
+    fn mixed_in_constant(&self, path: &mut Vec<Symbol>, ctx: &Ctx) -> Option<Ty> {
+        let [name] = path.as_slice() else { return None };
+        let Some(Ty::Class { id, .. }) = ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) else { return None };
+        let classes = self.classes();
+        let mut order: Vec<ClassId> = Vec::new();
+        let mut current = Some(id.clone());
+        while let Some(c) = current.filter(|c| !order.contains(c)) {
+            order.push(c.clone());
+            let info = classes.get(&c);
+            for m in info.map(|i| i.includes.iter().rev().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+                if !order.contains(&m) {
+                    order.push(m);
+                }
+            }
+            current = info.and_then(|i| i.parent.clone());
+        }
+        for owner in order {
+            let full = format!("{}::{}", owner.0.as_str(), name.as_str());
+            let value = self.typed_constants
+                .and_then(|values| values.get(&rubydex::model::ids::declaration_id_from_lookup_name(&full)))
+                .cloned();
+            // A value keeps its bare spelling, which Ruby's own lookup reads through the same ancestors.
+            if let Some(ty) = value {
+                return Some(ty);
+            }
+            if classes.get(&ClassId(Symbol::from(full.as_str()))).is_some_and(|c| c.app_declared) {
+                qualify_resolved_path(path, &ClassId(Symbol::from(full.as_str())));
+                return Some(Ty::Class { id: ClassId(Symbol::from(full.as_str())), args: vec![].into() });
+            }
+        }
+        None
+    }
+
     // `x.class` is not a class reference to `is_class_object`, yet types as the same flat `Ty::Class` as an instance.
     fn is_instance(&self, expr: &Expr, ctx: &Ctx) -> bool {
         !self.is_class_object(expr, ctx)
@@ -1927,7 +1963,7 @@ impl<'a> BodyTyper<'a> {
                     }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
-                    Some(None) => exact_modeled_class(path),
+                    Some(None) => self.mixed_in_constant(path, ctx).unwrap_or_else(|| exact_modeled_class(path)),
                     // A borrowed span is not evidence of a written constant
                     // only when the producer marked its generated origin.
                     None if indexed_source
@@ -1935,7 +1971,7 @@ impl<'a> BodyTyper<'a> {
                     {
                         exact_modeled_class(path)
                     }
-                    None if indexed_source => unknown(),
+                    None if indexed_source => self.mixed_in_constant(path, ctx).unwrap_or_else(unknown),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A
                     // qualified name `A::B` names its owner, so only the

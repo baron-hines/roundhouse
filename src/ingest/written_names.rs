@@ -36,6 +36,14 @@ use crate::span::{SourceFile, Span};
 /// declaration Rubydex resolved it to.
 pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstResolver) {
     let names = Names { sources, resolver };
+    let declared: crate::det::HashSet<String> =
+        app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).chain(app.models.iter().map(|m| m.name.0.as_str().to_string())).collect();
+    let parents: crate::det::HashMap<String, String> = app
+        .library_classes
+        .iter()
+        .filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str().to_string(), p.0.as_str().to_string())))
+        .chain(app.models.iter().filter_map(|m| m.parent.as_ref().map(|p| (m.name.0.as_str().to_string(), p.0.as_str().to_string()))))
+        .collect();
     for class in &mut app.library_classes {
         // A `Data.define` block's includes are absolute already, and its
         // spans locate the factory call, not a written name.
@@ -46,9 +54,16 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
         if data {
             continue;
         }
+        let owner = class.name.0.as_str().to_string();
         for (included, call) in class.includes.iter_mut().zip(&class.include_spans) {
             if let Some(span) = names.argument_span(*call, included.0.as_str()) {
+                let written = included.clone();
                 names.rewrite_id(included, span);
+                if *included == written && !declared.contains(written.0.as_str()) {
+                    if let Some(found) = ancestor_constant(&owner, written.0.as_str(), &parents, &declared) {
+                        *included = ClassId(Symbol::from(found.as_str()));
+                    }
+                }
             }
         }
         // `extend`/`prepend` a library class's own body does not model
@@ -277,4 +292,32 @@ impl Names<'_> {
             *path = resolved.0.as_str().split("::").map(Symbol::from).collect();
         }
     }
+}
+
+/// Rubydex answers nothing for a bare mixin of a class that includes more than one (`include RateConcept` beside
+/// `include PriceConcept` in `class Provider::Synth < Provider`, where one alone resolves): the name as Ruby finds it in
+/// the class's own constants, then each superclass's, then the top level's, among the app's declarations. Not the
+/// enclosing namespaces, which a compact `class A::B` does not open.
+fn ancestor_constant(
+    owner: &str,
+    written: &str,
+    parents: &crate::det::HashMap<String, String>,
+    declared: &crate::det::HashSet<String>,
+) -> Option<String> {
+    if written.contains("::") {
+        return None;
+    }
+    let mut seen = crate::det::HashSet::default();
+    let mut current = Some(owner.to_string());
+    while let Some(class) = current {
+        if !seen.insert(class.clone()) {
+            break;
+        }
+        let candidate = format!("{class}::{written}");
+        if declared.contains(&candidate) {
+            return Some(candidate);
+        }
+        current = parents.get(&class).cloned();
+    }
+    None
 }
