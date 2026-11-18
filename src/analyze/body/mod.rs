@@ -1334,7 +1334,8 @@ impl<'a> BodyTyper<'a> {
     /// `Models.const_get("Auth")`: the class or module the literal name nests under a class object. Only one the
     /// registry has at that full name: a miss in it may still find an ancestor's or Object's constant at run time.
     fn const_get_namespace(&self, recv: &Expr, method: &Symbol, args: &[Expr], ctx: &Ctx) -> Option<ClassId> {
-        if method.as_str() != "const_get" || !self.is_class_object(recv, ctx) {
+        // (not a class's own `const_get`, which answers whatever it returns)
+        if method.as_str() != "const_get" || !self.is_class_object(recv, ctx) || self.owns_operator(recv.ty.as_ref(), method, true) {
             return None;
         }
         let [arg] = args else { return None };
