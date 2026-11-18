@@ -116,6 +116,16 @@ class FocusLabels(unittest.TestCase):
         self.assertEqual(kept["spinel_tests"], ["solid_queue_durability"])
         self.assertTrue(kept["spinel_gems"])
 
+    def test_a_plan_left_with_no_framework_suite_drops_the_framework_job(self):
+        plan = {"spinel_tests": ["pundit_source_spinel"], "reasons": [],
+                "jobs": ["unit", "spinel-framework"], "required": ["unit", "spinel-framework"], "advisory": ["spinel-framework"]}
+        ci.apply_gem_suites(plan, False)
+        self.assertEqual(plan["spinel_tests"], [])
+        self.assertNotIn("spinel-framework", plan["jobs"] + plan["required"] + plan["advisory"])
+        kept = {"spinel_tests": ["pundit_source_spinel", "route_request_defaults"], "reasons": [], "jobs": ["spinel-framework"]}
+        ci.apply_gem_suites(kept, False)
+        self.assertEqual(kept["jobs"], ["spinel-framework"])
+
     def test_a_shared_path_promoted_to_full_keeps_its_gem_suites(self):
         plan = ci.select(["src/emit/shared/schema_sql.rs"])
         self.assertTrue(plan["full"])

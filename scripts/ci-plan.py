@@ -472,6 +472,11 @@ def apply_gem_suites(plan, gems):
     kept = [t for t in plan["spinel_tests"] if t not in GEM_SPINEL_TESTS]
     if len(kept) != len(plan["spinel_tests"]):
         plan["reasons"].append(f"gem Spinel suites left to Full validation and {CI_GEMS}")
+        # (not an empty shard: the framework loop fails on no suites, as on a plan that lost them)
+        if not kept:
+            for key in ("jobs", "required", "advisory"):
+                if key in plan:
+                    plan[key] = [j for j in plan[key] if j != "spinel-framework"]
     plan["spinel_tests"] = kept
 CI_JRUBY = "ci:jruby"
 CI_EXTRAS = "ci:extras"
