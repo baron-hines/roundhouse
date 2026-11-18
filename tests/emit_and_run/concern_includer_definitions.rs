@@ -448,10 +448,10 @@ fn a_branch_runs_its_own_last_definition_of_a_name() {
 }
 
 const QUERY_ARGUMENT: &str = r##"shop = Shop.create!
-shop.tokens.create!(name: "b")
-shop.tokens.create!(name: "a")
 stall = Stall.create!
-stall.tokens.create!(name: "c")
+Token.create!(bearer_type: "Shop", bearer_id: shop.id, name: "b")
+Token.create!(bearer_type: "Shop", bearer_id: shop.id, name: "a")
+Token.create!(bearer_type: "Stall", bearer_id: stall.id, name: "c")
 got = [shop.first_token_name, stall.first_token_name]
 expected = ["a", "c"]
 raise "query_argument: #{got.inspect}" unless got == expected
