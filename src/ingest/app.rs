@@ -1073,6 +1073,28 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     enum_constants.finish();
     model_bases.close_over(&base_pairs);
     model_bases.close_over_tableless();
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if !vfs.is_dir(&models_dir) {
+            continue;
+        }
+        for entry in read_rb_files(vfs, &models_dir)? {
+            let Ok(source) = vfs.read(&entry) else { continue };
+            model_bases.record_concrete(&source, &entry.display().to_string());
+        }
+    }
+    for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
+        let support_dir = dir.join(sub.as_str());
+        if !vfs.is_dir(&support_dir) {
+            continue;
+        }
+        let Ok(entries) = read_rb_files(vfs, &support_dir) else { continue };
+        for entry in entries {
+            let Ok(source) = vfs.read(&entry) else { continue };
+            model_bases.record_concrete(&source, &entry.display().to_string());
+        }
+    }
+    model_bases.close_over_concrete();
     // The `ActiveSupport.on_load` blocks `config/initializers` registers for a
     // name a model fires with `run_load_hooks` run inside that model's class
     // body, so they are read before the models (`ingest::load_hooks`), and
@@ -9461,18 +9483,19 @@ fn resolve_polymorphic_targets(app: &mut App) {
 /// The pass repeats so that a source association that is itself a
 /// `through:` gives its resolved class.
 /// An association's class named as Rails' `compute_type` finds it: from
-/// the model's own namespace outward (`belongs_to :job` in
-/// `SolidQueue::ClaimedExecution` is `SolidQueue::Job` when that model
-/// exists, else `Job`). Ingest names the target bare; a rooted
-/// `class_name: "::Job"` stays as written.
+/// the model's own name outward (`has_many :conditions` in `Rule` is
+/// `Rule::Condition` when that model exists; `belongs_to :job` in
+/// `SolidQueue::ClaimedExecution` is `SolidQueue::ClaimedExecution::Job`,
+/// then `SolidQueue::Job`, else `Job`), and one named for its own model
+/// (`belongs_to :article` in `Article`) the top-level class first. Ingest
+/// names the target bare; a rooted `class_name: "::Job"` names `Job`.
 fn resolve_namespaced_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
     let models: crate::det::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
         let owner = model.name.0.as_str().to_string();
-        let Some((namespace, _)) = owner.rsplit_once("::") else { continue };
         let scopes: Vec<String> = {
-            let parts: Vec<&str> = namespace.split("::").collect();
+            let parts: Vec<&str> = owner.split("::").collect();
             (1..=parts.len()).rev().map(|n| parts[..n].join("::")).collect()
         };
         for item in &mut model.body {
@@ -9485,7 +9508,13 @@ fn resolve_namespaced_targets(app: &mut App) {
                 | Association::HasAndBelongsToMany { target, .. } => target,
             };
             let written = target.0.as_str().to_string();
-            if written.starts_with("::") {
+            if let Some(top) = written.strip_prefix("::") {
+                *target = crate::ident::ClassId(crate::ident::Symbol::from(top));
+                continue;
+            }
+            // Rails' `_klass`: an association named for its own model (`belongs_to :article` in `Article`) tries
+            // the top-level class first.
+            if crate::naming::demodulize(&owner) == written && models.contains(&written) {
                 continue;
             }
             if let Some(found) = scopes.iter().map(|scope| format!("{scope}::{written}")).find(|name| models.contains(name)) {

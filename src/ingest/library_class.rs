@@ -5418,6 +5418,9 @@ pub struct ModelBases {
     /// scope, the parent as written, and whether the child writes its
     /// own `initialize`.
     tableless_pairs: Vec<(String, Vec<String>, Vec<String>, bool)>,
+    /// Every concrete model under `app/models`, with the table its body declares (`concrete_model_table`).
+    concrete: crate::det::HashMap<String, Option<String>>,
+    concrete_pairs: Vec<(String, Vec<String>, String, Option<String>)>,
 }
 
 impl ModelBases {
@@ -5524,6 +5527,51 @@ impl ModelBases {
             };
             pairs.push((full.join("::"), parent));
         }
+    }
+
+    /// One file's non-abstract `class X < Y` pairs, for `close_over_concrete`.
+    pub fn record_concrete(&mut self, source: &[u8], file: &str) {
+        let result = parse(source);
+        let root = result.node();
+        for (scope, class) in find_all_classes_with_scope(&root) {
+            let Some(path) = class_name_path(&class) else { continue };
+            if declares_abstract_class(&class) {
+                continue;
+            }
+            let Some(parent) = self.resolve_class_superclass(&scope, &class) else { continue };
+            let mut full = scope.clone();
+            full.extend(path);
+            let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
+            // A bare parent is kept with its scope: a concrete `Admin::Base` is found from `module Admin` below.
+            let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { scope.clone() } else { Vec::new() };
+            self.concrete_pairs.push((full.join("::"), lexical, parent, table));
+        }
+    }
+
+    /// The concrete models: a class whose parent is a base, or (single-table inheritance) another concrete model.
+    pub fn close_over_concrete(&mut self) {
+        loop {
+            let before = self.concrete.len();
+            let mut found = Vec::new();
+            for (child, scope, parent, table) in &self.concrete_pairs {
+                if self.concrete.contains_key(child) {
+                    continue;
+                }
+                let lexical = (1..=scope.len()).rev().map(|n| format!("{}::{parent}", scope[..n].join("::"))).find(|c| self.concrete.contains_key(c));
+                if lexical.is_some() || self.names.contains(parent) || self.concrete.contains_key(parent) {
+                    found.push((child.clone(), table.clone()));
+                }
+            }
+            self.concrete.extend(found);
+            if self.concrete.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// `Some(declared)` for a concrete model, the table its own body declares or `None` for Rails' default.
+    pub fn concrete_model_table(&self, name: &str) -> Option<Option<&str>> {
+        self.concrete.get(name).map(|t| t.as_deref())
     }
 
     /// Close the set: anything whose parent is already a base is one.
