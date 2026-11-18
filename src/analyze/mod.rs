@@ -9871,6 +9871,26 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
         (model.name.clone(), model_includes(model), extensions(exprs, resolver))
     }).chain(app.library_classes.iter().map(|class|
         (class.name.clone(), class.includes.clone(), extensions(class.unknown_calls.iter(), resolver))));
+    // `Pinned::Version.extend(Pinned::Basic)` as a gem file loads (version_gem's pinning, its `class_eval` block
+    // as calls): the receiver's own extension, as the statement in its body would be.
+    let mut loaded: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for program in &app.file_programs {
+        for item in &program.items {
+            let crate::app::ProgramItem::Statement(e) = item else { continue };
+            let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { continue };
+            let ExprNode::Const { path } = &*recv.node else { continue };
+            if method.as_str() != "extend" { continue; }
+            let Some(owner) = resolver.namespace(recv.span, path).cloned() else { continue };
+            for arg in args.iter().rev() {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                loaded.entry(owner.clone()).or_default().push(resolver.namespace(arg.span, path).cloned().unwrap_or_else(|| mixin_path_id(path)));
+            }
+        }
+    }
+    let declarations: Vec<_> = declarations.map(|(id, includes, mut extensions)| {
+        if let Some(more) = loaded.get(&id) { extensions.extend(more.iter().cloned()); }
+        (id, includes, extensions)
+    }).collect();
     let by_name = crate::ingest::library_classes_by_name(app);
     for (id, mut includes, extensions) in declarations {
         let mut installed = hook_methods(&includes, "included", app, &by_name, resolver, &mut crate::det::HashSet::default());

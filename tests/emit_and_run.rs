@@ -20869,6 +20869,8 @@ mod rbconfig_config;
 mod process_modules;
 #[path = "emit_and_run/module_reflection.rs"]
 mod module_reflection;
+#[path = "emit_and_run/gem_class_eval_mixins.rs"]
+mod gem_class_eval_mixins;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
