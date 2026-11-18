@@ -335,35 +335,53 @@ fn an_unparsed_file_refuses_a_named_file() {
     for dump in ["  schema_dump: catalog_schema.rb\n", "  schema_dump:\n    catalog_schema.rb\n", "  schema_dump: >-\n    catalog_schema.rb\n"] {
         let named = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
-        assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump` (unknown anchor")), "{named}: {:?}", checked.errors);
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be read to check `test.primary`'s `schema_dump` (unknown anchor")), "{named}: {:?}", checked.errors);
         assert!(tables(&checked.app).is_empty(), "{named}");
     }
-    // An uncommented `schema_dump` of any value refuses, since the parser can't say where it ends.
-    // A `#` inside quotes, or with no space before it, doesn't start a comment.
+    // The word `schema_dump` on any line but a comment line refuses, whatever its value and
+    // wherever it sits: the parser can't say where a value ends, so an inline comment counts too.
     for dump in [
         "  schema_dump: false\n",
         "  schema_dump: false\n    catalog_schema.rb\n",
         "  extra: { note: 'a #b', schema_dump: catalog_schema.rb }\n",
-        "  extra: { note: \"a \\\" #b\", schema_dump: catalog_schema.rb }\n",
         "  extra: { note: a#b, schema_dump: catalog_schema.rb }\n",
-        "  extra: { note: 'it''s # data', schema_dump: catalog_schema.rb }\n",
+        "  database: db/test.sqlite3 # schema_dump: catalog_schema.rb\n",
+        "  note: don't # schema_dump: catalog_schema.rb\n",
+        "  database: storage/schema_dump.sqlite3\n",
     ] {
         let named = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
-        assert!(checked.errors.iter().any(|e| e.contains("couldn't be parsed to check `test.primary`'s `schema_dump`")), "{named}: {:?}", checked.errors);
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be read to check `test.primary`'s `schema_dump`")), "{named}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{named}");
     }
-    // A quote inside a plain scalar (`don't`) opens nothing, so the comment after it is still one.
-    for dump in [
-        "",
-        "  # schema_dump: catalog_schema.rb\n",
-        "  database: db/test.sqlite3 # schema_dump: catalog_schema.rb\n",
-        "  database: 'db/test.sqlite3'\t# schema_dump\n",
-        "  note: don't # schema_dump: old.rb\n",
-        "  note: 'it''s' # schema_dump: old.rb\n",
-        "  pool: [ 'a', \"b\" ] # schema_dump: old.rb\n",
-    ] {
+    // A comment line can't hold a key, and a longer word isn't the setting.
+    for dump in ["", "  # schema_dump: catalog_schema.rb\n", "  database: storage/schema_dump_test.sqlite3\n", "  my_schema_dump: catalog_schema.rb\n"] {
         let yml = anchored(dump);
         let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// A merge that doesn't apply (`<<:` a scalar, which Psych keeps as a key
+/// and serde_yaml_ng rejects), or a computed key where the test
+/// environment would be, leaves the test primary unread: a `schema_dump`
+/// refuses the file it may name, and without one the file builds as on main.
+#[test]
+fn a_test_primary_the_parser_cant_establish_refuses_a_named_file() {
+    for yml in [
+        "development:\n  <<: unused\n  adapter: sqlite3\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n",
+        "<%= \"test\" %>:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be read to check `test.primary`'s `schema_dump`")), "{yml}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{yml}");
+    }
+    for yml in [
+        "development:\n  <<: unused\n  adapter: sqlite3\ntest:\n  adapter: sqlite3\n",
+        "test:\n  adapter: sqlite3\n<%= \"development\" %>:\n  adapter: sqlite3\n  schema_dump: other.rb\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/schema.rb", WIDGETS)]));
         assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
         assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
     }

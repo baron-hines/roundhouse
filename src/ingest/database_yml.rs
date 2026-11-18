@@ -297,41 +297,30 @@ fn key_offset(text: &str, key: &str, from: usize, top_level: bool) -> Option<usi
     None
 }
 
-/// Whether text after `prefix`, the start of its line, sits in a YAML
-/// comment: a `#` at the line's start or after whitespace, outside quotes.
-/// A quote opens a quoted scalar only where a scalar starts (the line's
-/// start, or after `:`, `-`, `[`, `{` or `,` and a space); elsewhere, as in
-/// `don't`, it is a plain scalar's own character. Inside single quotes, `''`
-/// is an escaped quote. A quote left open reads as still open, so an unclear
-/// line counts as uncommented and refuses.
-fn in_yaml_comment(prefix: &str) -> bool {
-    let (mut single, mut double, mut escaped, mut prev) = (false, false, false, ' ');
-    // The last character outside whitespace and quotes; ' ' at the line's start.
-    let mut last = ' ';
-    let mut chars = prefix.chars().peekable();
-    while let Some(c) = chars.next() {
-        let starts_scalar = (prev.is_whitespace() || "[{,".contains(prev)) && " :-[{,".contains(last);
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if double => escaped = true,
-            '\'' if double => {}
-            '"' if single => {}
-            '\'' if single && chars.peek() == Some(&'\'') => {
-                chars.next();
-            }
-            '\'' if single => single = false,
-            '"' if double => double = false,
-            '\'' if starts_scalar => single = true,
-            '"' if starts_scalar => double = true,
-            '#' if !single && !double && prev.is_whitespace() => return true,
-            _ => {}
-        }
-        if !single && !double && !c.is_whitespace() && c != '\'' && c != '"' {
-            last = c;
-        }
-        prev = c;
+/// Where `schema_dump` first appears as a word (no letter, digit or `_`
+/// beside it) on a line that isn't a comment line. A line starting with `#`
+/// can't hold a key; anything else counts, an inline comment and a value
+/// included, so a file whose `schema_dump` the parser can't read refuses.
+fn mentions_schema_dump(text: &str) -> Option<usize> {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    text.match_indices("schema_dump").map(|(at, _)| at).find(|&at| {
+        let line = &text[text[..at].rfind('\n').map_or(0, |n| n + 1)..at];
+        !line.trim_start().starts_with('#') && !word(text[..at].chars().next_back()) && !word(text[at + "schema_dump".len()..].chars().next())
+    })
+}
+
+/// A file whose test primary the parser can't establish (`reason`): any
+/// mention of `schema_dump` refuses the file it may name, and a file with
+/// none keeps main's behavior.
+fn unresolved(text: &str, reason: &str) -> NamedSchema {
+    let mut out = NamedSchema::default();
+    if let Some(at) = mentions_schema_dump(text) {
+        out.primary = Some(Err(()));
+        let reason: String = shown(reason.lines().next().unwrap_or_default()).chars().take(120).collect();
+        let detail = format!("config/database.yml couldn't be read to check `test.primary`'s `schema_dump` ({reason}), so the file it names isn't read");
+        out.refusals.push(DatabaseRefusal { span: Span { file: FileId(0), start: at as u32, end: at as u32 }, construct: "schema_dump".to_string(), detail, warning: false });
     }
-    false
+    out
 }
 
 /// The test environment's `schema_dump:`, read only in the one form this
@@ -377,29 +366,14 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         yaml.push_str(part);
         yaml
     });
+    // Unparsed, or with a merge that doesn't apply: the parser's own reason
+    // ("duplicate entry ...", "unknown anchor ..."), placeholders shown as ERB.
     let mut doc = match serde_yaml_ng::from_str::<Value>(&distinct) {
         Ok(doc) => doc,
-        Err(error) => {
-        // Unparsed: what `schema_dump` holds can't be read without the parser (a value can
-        // continue on later lines, as a block scalar or a folded plain scalar), so any
-        // uncommented `schema_dump` key refuses the named file rather than dropping it. A file
-        // with no such key keeps main's behavior.
-        let named = text.match_indices("schema_dump").find(|(at, _)| {
-            let line_start = text[..*at].rfind('\n').map_or(0, |n| n + 1);
-            !in_yaml_comment(&text[line_start..*at])
-        });
-        if let Some((at, _)) = named {
-            out.primary = Some(Err(()));
-            // The parser's own reason ("duplicate entry ...", "unknown anchor ..."), placeholders shown as ERB.
-            let reason: String = shown(error.to_string().lines().next().unwrap_or_default()).chars().take(120).collect();
-            let detail = format!("config/database.yml couldn't be parsed to check `test.primary`'s `schema_dump` ({reason}), so the file it names isn't read");
-            out.refusals.push(DatabaseRefusal { span: Span { file: FileId(0), start: at as u32, end: at as u32 }, construct: "schema_dump".to_string(), detail, warning: false });
-        }
-        return out;
-        }
+        Err(error) => return unresolved(&text, &error.to_string()),
     };
-    if doc.apply_merge().is_err() {
-        return out;
+    if let Err(error) = doc.apply_merge() {
+        return unresolved(&text, &error.to_string());
     }
     // A key computed by ERB (`<%= "schema_dump" %>:`) could be the setting itself.
     fn computed_key(value: &Value) -> bool {
@@ -412,6 +386,10 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
     // Checked once the test primary's own `schema_dump` names a file.
     let computed = computed_key(&doc);
     let Value::Mapping(mut envs) = doc else { return out };
+    // Without a literal `test`, a computed environment key may be it.
+    if !envs.contains_key("test") && envs.keys().any(|k| k.as_str().is_some_and(|k| k.contains(ERB_VALUE))) {
+        return unresolved(&text, "an environment's key is computed with ERB, and there is no literal `test`");
+    }
     // An environment given as a URL string is its one configuration's `url:`.
     let env = match envs.remove("test") {
         Some(Value::Mapping(env)) => env,

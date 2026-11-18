@@ -312,7 +312,11 @@ boolean names no file, and the schema is found as before. Any other
 `schema_dump:` there (ERB, an anchor, alias, merge or flow value, the
 `:schema_dump:` key, another name, a missing file) is an error naming
 the configuration and the setting. Another test database whose schema
-file exists is a warning.
+file exists is a warning. A file the parser can't settle (it doesn't
+parse once its ERB is set aside, a merge key doesn't merge a mapping, or
+the test environment's key may be computed) refuses a named file when the
+word `schema_dump` appears on any line but a comment line, and otherwise
+builds as before.
 
 Which database a model runs on is read from source, never from the
 file: a literal `connects_to database: { writing:, reading: }` in an
