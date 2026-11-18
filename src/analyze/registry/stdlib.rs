@@ -1043,11 +1043,25 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("Psych::AnchorNotDefined", "Psych::BadAlias"),
         // `rescue WeakRef::RefError` around a read of a collected referent.
         ("WeakRef::RefError", "StandardError"),
+        // (parented: a bare `rescue` must not catch these as it catches a StandardError)
+        ("ScriptError", "Exception"),
+        ("SyntaxError", "ScriptError"),
+        ("SystemExit", "Exception"),
+        ("SignalException", "Exception"),
+        ("Interrupt", "SignalException"),
+        ("NoMemoryError", "Exception"),
+        ("SecurityError", "Exception"),
+        ("SystemStackError", "Exception"),
+        ("Encoding::UndefinedConversionError", "EncodingError"),
+        ("Encoding::InvalidByteSequenceError", "EncodingError"),
+        ("Encoding::ConverterNotFoundError", "EncodingError"),
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
         classes.entry(ClassId(Symbol::from(exc))).or_default().parent =
             Some(ClassId(Symbol::from(parent)));
     }
+    register_stdlib_class(classes, "SystemExit", &[], &[("status", Ty::Int), ("success?", Ty::Bool)]);
+    register_stdlib_class(classes, "SignalException", &[], &[("signo", Ty::Int), ("signm", Ty::Str)]);
     // ECError aliases PKeyError; source may reopen either spelling with different returns.
     let gradual_errors: Vec<_> = exception_surface.iter().map(|(name, _)| (*name, Ty::Untyped)).collect();
     for (exc, parent) in [

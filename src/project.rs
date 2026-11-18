@@ -9567,6 +9567,11 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "RegexpError" | "Comparable" | "Enumerable"
         | "LoadError" | "Proc" | "Range" | "Method" | "Gem::Version"
+        // Ruby's and spinel's (`lib/sp_exc.c`) own; no strict runtime raises or rescues them.
+        | "ScriptError" | "SyntaxError" | "SystemExit" | "SignalException" | "Interrupt"
+        | "NoMemoryError" | "SecurityError" | "SystemStackError"
+        | "Encoding::UndefinedConversionError" | "Encoding::InvalidByteSequenceError"
+        | "Encoding::ConverterNotFoundError"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"

@@ -20861,6 +20861,8 @@ mod ipaddr_include;
 mod pp_require;
 #[path = "emit_and_run/weakref_observable.rs"]
 mod weakref_observable;
+#[path = "emit_and_run/core_exceptions.rs"]
+mod core_exceptions;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
