@@ -1621,7 +1621,7 @@ module Db
     outer = nil
     reuse = nil
     if switched
-      if _txn_depth > 0 || Thread.current[:db_txn_pin] == true
+      if _txn_depth > 0 || Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?)
         stack.pop
         raise NotImplementedError, "connected_to selects another database inside an open transaction; a transaction across databases is not supported yet"
       end
@@ -1649,10 +1649,10 @@ module Db
     ensure
       begin
         # A transaction the block began and never ended goes no further.
-        exec("ROLLBACK") if switched && Thread.current[:db_txn_pin] == true
+        exec("ROLLBACK") if switched && (Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
       rescue StandardError => e
-        # Not an error when SQLite had ended it already: the pin is gone.
-        error = e if error.nil? && Thread.current[:db_txn_pin] == true
+        # Ignore a rollback failure only when SQLite already ended the transaction.
+        error = e if error.nil? && (Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
       ensure
         Thread.current[:db_conn] = outer if switched
         stack.pop
@@ -1689,7 +1689,7 @@ module Db
     index = route_slot(base ? :default : @default_shard, :writing) if index < 0
     stack = scopes
     before = scope_slot
-    if index != before && (_txn_depth > 0 || Thread.current[:db_txn_pin] == true)
+    if index != before && (_txn_depth > 0 || Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
       raise NotImplementedError, "a connection taken on another database is used inside an open transaction; a transaction across databases is not supported yet"
     end
     frame = DbScope.new(false, nil, nil, scope_prevent(base))
@@ -1746,8 +1746,12 @@ module Db
   # adapter's own read pattern: a guard against accidental writes, not a
   # permission (a `WITH ... INSERT` passes, as in Rails).
   READ_QUERY = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:pragma|begin|commit|explain|release|rollback|savepoint|select|with)/i
+  OPEN_TRANSACTION = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:begin|savepoint)\b/i
   def self.refuse_write(sql)
     return nil if !@routed
+    if sql.match?(OPEN_TRANSACTION) && scope_slot != route_slot(scope_shard(false), scope_role(false))
+      raise NotImplementedError, "BEGIN or SAVEPOINT on a connection outside the active model route is not supported yet"
+    end
     return nil if !slot.replica && !scope_prevent(false)
     return nil if sql.match?(READ_QUERY)
     raise ActiveRecord::ReadOnlyError, "Write query attempted while in readonly mode: " + sql

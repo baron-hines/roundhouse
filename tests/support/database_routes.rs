@@ -536,6 +536,45 @@ end
 "##;
 pub const HELD_ROUTE_EXPECTED: &str = "held-right=1\nheld-guard=ActiveRecord::ReadOnlyError: Write query attempted while in readonly mode: INSERT\nheld-primary=2\nheld-restored=left\n";
 
+pub const RAW_SWITCH_SCRIPT: &str = r##"Note.with_connection do |c|
+  c.execute("BEGIN")
+  c.execute("INSERT INTO notes(tag) VALUES ('raw')")
+  puts "raw-same=" + c.select_value("SELECT COUNT(*) FROM notes").to_s
+  begin
+    ApplicationRecord.connected_to(shard: :right) { Note.create!(tag: "escaped") }
+    puts "raw-switch=allowed"
+  rescue NotImplementedError
+    puts "raw-switch=refused"
+  end
+  begin
+    ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM notes")
+    puts "raw-handle=allowed"
+  rescue NotImplementedError
+    puts "raw-handle=refused"
+  end
+  c.execute("ROLLBACK")
+end
+puts "raw-left=" + Note.count.to_s
+ApplicationRecord.connected_to(shard: :right) { puts "raw-right=" + Note.count.to_s }
+refused = 0
+["BEGIN", "begin immediate", "/* synthetic */ BEGIN TRANSACTION", "SAVEPOINT synthetic"].each do |sql|
+  begin
+    ActiveRecord::Base.with_connection { |c| c.execute(sql) }
+  rescue NotImplementedError
+    refused += 1
+  end
+end
+puts "raw-base-begins=" + refused.to_s
+ActiveRecord::Base.with_connection do |c|
+  ActiveRecord::Base.connected_to(shard: :default) do
+    c.execute("BEGIN")
+    c.execute("INSERT INTO notes(tag) VALUES ('scope-raw')")
+  end
+  puts "raw-scope=" + c.select_value("SELECT COUNT(*) FROM notes WHERE tag = 'scope-raw'").to_s
+end
+"##;
+pub const RAW_SWITCH_EXPECTED: &str = "raw-same=1\nraw-switch=refused\nraw-handle=refused\nraw-left=0\nraw-right=0\nraw-base-begins=4\nraw-scope=0\n";
+
 /// `text` with each refused statement cut after its first word: Rails'
 /// lines carry its SQL with bind marks, an emitted program's the values.
 pub fn comparable(text: &str) -> String {

@@ -342,7 +342,8 @@ blocks in a view, a seed or a test helper. A connection handle
 (`connection`, `lease_connection`, `with_connection`) is routed when
 it is taken and stays on that pool, as in Rails. Refused when called,
 with `NotImplementedError`: a block that selects another database
-inside an open transaction, a block that returns a relation,
+inside an open transaction (including a raw transaction on a leased connection),
+a raw transaction on a handle outside the active model route, a block that returns a relation,
 `connection_pool`, `raw_connection`, and `ActiveRecord::Base.transaction`
 when Base's database is not the models'. Every other target keeps one error for the app.
 
