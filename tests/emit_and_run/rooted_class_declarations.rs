@@ -242,3 +242,75 @@ fn a_class_in_a_compact_rooted_module_looks_through_its_nesting_only() {
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+fn enum_alias_app() -> emit_and_run::Overlay {
+    ledger_app()
+        .write("app/models/entry.rb", r##"module Ledger
+  class ::Entry < Record
+    enum :status, { draft: 0, posted: 1 }
+    alias final? posted?
+
+    class ::Stamp
+      def self.kind
+        "stamp"
+      end
+    end
+  end
+end
+"##)
+        .write("app/models/ledger/folio.rb", r##"module Ledger
+  class Folio < Record
+    enum :status, { draft: 0, posted: 1 }
+    alias final? posted?
+
+    class ::Seal
+      def self.kind
+        "seal"
+      end
+    end
+  end
+end
+"##)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"entries\", force: :cascade do |t|\n    t.string \"name\"\n    t.integer \"status\", default: 0\n  end\n\n  create_table \"folios\", force: :cascade do |t|\n    t.string \"name\"\n    t.integer \"status\", default: 0\n  end\nend\n")
+}
+
+const ENUM_ALIAS: &str = r##"e = Entry.create!(name: "e")
+f = Ledger::Folio.create!(name: "f")
+before = [e.final?, f.final?]
+e.posted!
+f.posted!
+got = [
+  [Entry.superclass.name, before[0], e.final?, Stamp.kind, defined?(Entry::Stamp), defined?(Ledger::Stamp)],
+  [Ledger::Folio.superclass.name, before[1], f.final?, Seal.kind, defined?(Ledger::Seal)],
+]
+expected = [
+  ["Ledger::Record", false, true, "stamp", nil, nil],
+  ["Ledger::Record", false, true, "seal", nil],
+]
+raise "enum alias: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_model_in_a_module_aliases_an_enum_predicate_beside_a_rooted_declaration() {
+    let run = enum_alias_app().run_ruby(ENUM_ALIAS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const PLAIN_ROOTED_SUPERCLASS: &str = r##"got = [Tool.superclass.name, Gadget.superclass.name, Gadget.new.tag, Gadget.respond_to?(:create!), Gadget.respond_to?(:table_name)]
+expected = ["Record", "Tool", "plain", false, false]
+raise "plain rooted superclass: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_superclass_that_is_no_model_keeps_its_subclasses_plain() {
+    let app = ledger_app()
+        .write("app/models/record.rb", "class Record\n  def self.abstract_class=(value)\n    @abstract = value\n  end\n\n  def tag\n    \"plain\"\n  end\nend\n")
+        .write("app/models/tool.rb", "module Ledger\n  class ::Tool < ::Record\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/gadget.rb", "class Gadget < Tool\nend\n");
+    let run = app.run_ruby(PLAIN_ROOTED_SUPERCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
