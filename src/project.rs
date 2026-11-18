@@ -2522,6 +2522,13 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             ExprNode::Defined { operand }
                 if target == BuildTarget::Spinel && !load_time
                     && matches!(&*operand.node, ExprNode::Send { recv: Some(_), args, block: None, .. } if args.is_empty()) => None,
+            // `defined?(base::VERSION)` in a method (version_gem's hook guard), a constant read on a value: Spinel
+            // answers "constant" where the value's class holds the name, as CRuby does (matz/spinel#12114).
+            ExprNode::Defined { operand }
+                if target == BuildTarget::Spinel && !load_time
+                    && matches!(&*operand.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                        if method.as_str() == "const_get" && !matches!(&*r.node, ExprNode::Const { .. })
+                            && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }))) => None,
             ExprNode::Defined { .. } => Some("runtime defined? query"),
             // A `define_method` block's `&block`, kept by ingest: only the Ruby emitter (Spinel's and Roda's too) binds it.
             ExprNode::Lambda { block_param: Some(_), .. } if !matches!(target, BuildTarget::Spinel | BuildTarget::Roda) => {

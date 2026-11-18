@@ -172,8 +172,8 @@ pub fn drop_answered_by_target(app: &App, target: crate::build_target::BuildTarg
 }
 
 /// What the Ruby family's runtime answers, which every other target refuses: a custom form builder's own methods
-/// (its overlay carries Rails' FormBuilder), a gem file's statements (`ingest::gem_load_program` runs them in the
-/// file's program) and the `extended` hook a file-level `extend` fires, which Ruby runs.
+/// (its overlay carries Rails' FormBuilder) and a gem file's statements (`ingest::gem_load_program` runs them in the
+/// file's program).
 pub fn drop_runtime_answered(target: crate::build_target::BuildTarget, diags: &mut Vec<Diagnostic>) {
     use crate::build_target::BuildTarget;
     if !matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
@@ -182,7 +182,7 @@ pub fn drop_runtime_answered(target: crate::build_target::BuildTarget, diags: &m
     diags.retain(|diagnostic| match &diagnostic.kind {
         crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "custom form builder method" => false,
         crate::diagnostic::DiagnosticKind::Unsupported { target: Some(only), construct, .. } => {
-            !(only.as_str() == "spinel" && matches!(construct.as_str(), "gem file statement" | "mixin hook"))
+            !(only.as_str() == "spinel" && construct.as_str() == "gem file statement")
         }
         _ => true,
     });

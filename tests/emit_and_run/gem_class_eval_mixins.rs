@@ -4,11 +4,9 @@
 //! module's `self::VERSION` is the receiver's.
 //!
 //! version_gem's own Basic goes one step further: its `extended` hook, written
-//! in `class << self`, extends the receiver with Api. The ruby family runs it.
-//! Spinel takes the file-level `extend` as the receiver's but does not run the
-//! hook there, so that shape is reported on Spinel. So is version_gem's guard,
-//! `raise … unless defined?(base::VERSION)`: Spinel answers nil for
-//! `defined?(param::C)` whose constant is assigned after the method.
+//! in `class << self`, guards with `raise … unless defined?(base::VERSION)` and
+//! extends the receiver with Api. Spinel runs it since matz/spinel#12113
+//! (the file-level `extend`'s hook) and #12114 (`defined?(base::VERSION)`).
 
 use super::emit_and_run;
 
@@ -43,6 +41,8 @@ const HOOKED: &str = r#"module Pinned
   module Basic
     class << self
       def extended(base)
+        raise ArgumentError, "VERSION must be defined before 'extend #{name}'" unless defined?(base::VERSION)
+
         base.extend(Api)
       end
     end
@@ -103,14 +103,9 @@ fn an_extended_hook_the_mixin_fires_runs() {
 }
 
 #[test]
-fn an_extended_hook_and_its_guard_are_reported_on_spinel() {
-    let (_emitted, errors) = pinned_app(HOOKED).emit(roundhouse::project::BuildTarget::Spinel);
-    assert!(errors.iter().any(|e| e.contains("does not run `Pinned::Basic.extended`")), "{errors:#?}");
-    let guarded = pinned_app(HOOKED).edit(
-        &format!("{GEM_DIR}/lib/pinned.rb"),
-        "      def extended(base)\n",
-        "      def extended(base)\n        raise ArgumentError, \"VERSION must be defined\" unless defined?(base::VERSION)\n\n",
-    );
-    let (_emitted, errors) = guarded.emit(roundhouse::project::BuildTarget::Spinel);
-    assert!(errors.iter().any(|e| e.contains("runtime defined? query")), "{errors:#?}");
+#[ignore = "requires the Spinel toolchain"]
+fn an_extended_hook_the_mixin_fires_runs_on_spinel() {
+    let run = pinned_app(HOOKED).run_spinel(ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("class_eval mixins passed"), "{}", run.stdout);
 }
