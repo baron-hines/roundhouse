@@ -4640,12 +4640,11 @@ fn store_shapes_type_without_errors() {
     assert_eq!(errors_of(&app), Vec::<String>::new());
 }
 
-/// A uuid-keyed model's tokens are not modeled: Rails writes the key into
-/// the payload as a JSON string, which the token runtime does not read
-/// back. So `find_by_token_for` stays an error there rather than typing
-/// a method nothing defines; the Integer-keyed store model still types.
+/// A uuid-keyed model's tokens type as an Integer-keyed one's do: Rails
+/// writes the key into the payload as a JSON string, which the token
+/// runtime writes and reads back (tests/emit_and_run/token_for_string_key.rs).
 #[test]
-fn a_string_keyed_models_token_finder_stays_unsupported() {
+fn a_string_keyed_models_token_finder_types() {
     let app = app_from_files(&[
         (
             "app/controllers/application_controller.rb",
@@ -4670,9 +4669,7 @@ end
 "#,
         ),
     ]);
-    let errors = errors_of(&app);
-    assert_eq!(errors.len(), 1, "only the uuid model's finder errors; got {errors:?}");
-    assert!(errors[0].contains("find_by_token_for") && errors[0].contains("Invite"), "got {errors:?}");
+    assert_eq!(errors_of(&app), Vec::<String>::new());
 }
 
 /// A model's token methods are all or nothing, since they dispatch on a
