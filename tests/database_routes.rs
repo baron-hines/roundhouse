@@ -450,3 +450,12 @@ fn the_carried_scope_checks_clean_in_each_spelling() {
     let (_, errors) = contract::app(contract::SHARDS, report).emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
 }
+
+#[test]
+fn a_writing_scope_in_a_scope_parameter_default_is_restored() {
+    let note = "class Note < ApplicationRecord\n  scope :chosen, ->(row = ActiveRecord::Base.connected_to(role: :writing) { Note.create!(tag: 'default').id }) { where(id: row) }\nend\n";
+    let (emitted, errors) = shards().write("app/models/note.rb", note).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let text = std::fs::read_to_string(emitted.join("app/models/note.rb")).expect("emitted note");
+    assert!(text.contains("ActiveRecord::Base.connected_to(role: :writing)"), "{text}");
+}

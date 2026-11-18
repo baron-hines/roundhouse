@@ -567,7 +567,10 @@ fn each_body(app: &mut App, f: &mut dyn FnMut(&mut Expr)) {
             match item {
                 ModelBodyItem::Method { method: m, .. } => method(m, f),
                 ModelBodyItem::Unknown { expr, .. } => f(expr),
-                ModelBodyItem::Scope { scope, .. } => f(&mut scope.body),
+                ModelBodyItem::Scope { scope, .. } => {
+                    scope.params.iter_mut().filter_map(|p| p.default.as_mut()).for_each(&mut *f);
+                    f(&mut scope.body);
+                }
                 _ => {}
             }
         }

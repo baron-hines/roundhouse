@@ -119,6 +119,16 @@ fn a_shard_scope_does_not_restore_a_closed_outer_connection() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_scope_parameter_default_keeps_its_writing_scope() {
+    let note = "class Note < ApplicationRecord\n  scope :chosen, ->(row = ActiveRecord::Base.connected_to(role: :writing) { Note.create!(tag: 'default').id }) { where(id: row) }\nend\n";
+    let run = contract::app(contract::SHARDS, &contract::shards_report()).write("app/models/note.rb", note)
+        .run_spinel(&format!("{}ApplicationRecord.connected_to(role: :reading) {{ puts Note.chosen.first.tag }}", contract::BOOT));
+    run.assert_passes();
+    assert_eq!(run.stdout, "default\n");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn a_shared_named_schema_supports_a_primary_default_writer() {
     let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n")
         .replace("schema_dump: schema.rb", "schema_dump: catalog_schema.rb");
