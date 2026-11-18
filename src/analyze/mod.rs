@@ -9824,16 +9824,27 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
         }
         out
     }
-    fn hook_methods(includes: &[ClassId], hook: &str, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>) -> crate::det::HashSet<Symbol> {
-        fn body(expr: &Expr, target: &Symbol, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>) -> Option<crate::det::HashSet<Symbol>> {
+    // `extended` gathers the modules a hook `extend`s its argument with (version_gem's `base.extend(Api)`).
+    fn hook_methods(includes: &[ClassId], hook: &str, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>, extended: &mut Vec<ClassId>) -> crate::det::HashSet<Symbol> {
+        fn body(expr: &Expr, target: &Symbol, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>, extended: &mut Vec<ClassId>) -> Option<crate::det::HashSet<Symbol>> {
+            fn raises_or_nothing(e: &Expr) -> bool {
+                match &*e.node {
+                    ExprNode::Raise { .. } | ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+                    ExprNode::Send { recv: None, method, .. } => method.as_str() == "raise",
+                    ExprNode::Seq { exprs } => exprs.iter().all(raises_or_nothing),
+                    _ => false,
+                }
+            }
             let mut methods = crate::det::HashSet::default();
             match &*expr.node {
                 ExprNode::Seq { exprs } => for expr in exprs {
-                    methods.extend(body(expr, target, app, by_name, resolver, seen)?);
+                    methods.extend(body(expr, target, app, by_name, resolver, seen, extended)?);
                     if matches!(&*expr.node, ExprNode::Return { .. }) { break; }
                 },
-                ExprNode::Return { value } => return body(value, target, app, by_name, resolver, seen),
+                ExprNode::Return { value } => return body(value, target, app, by_name, resolver, seen, extended),
                 ExprNode::Lit { .. } => {},
+                // `raise Error, "…" unless defined?(base::VERSION)`: a guard installs nothing on the paths that go on.
+                ExprNode::If { then_branch, else_branch, .. } if raises_or_nothing(then_branch) && raises_or_nothing(else_branch) => {},
                 ExprNode::Send { recv: Some(recv), method, args, block, .. }
                     if matches!(&*recv.node, ExprNode::Var { name, .. } if name == target) => {
                     if method.as_str() == "define_singleton_method" && block.is_some() && args.len() == 1 {
@@ -9845,7 +9856,8 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
                             let ExprNode::Const { path } = &*arg.node else { return None };
                             modules.push(resolver.namespace(arg.span, path).cloned().unwrap_or_else(|| mixin_path_id(path)));
                         }
-                        methods.extend(hook_methods(&modules, if method.as_str() == "include" { "included" } else { "extended" }, app, by_name, resolver, seen));
+                        if method.as_str() == "extend" { extended.extend(modules.iter().cloned()); }
+                        methods.extend(hook_methods(&modules, if method.as_str() == "include" { "included" } else { "extended" }, app, by_name, resolver, seen, extended));
                     } else { return None; }
                 },
                 _ => return None,
@@ -9861,7 +9873,11 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
                 .flat_map(|class| class.methods.iter().rev())
                 .find(|method| method.receiver == MethodReceiver::Class && method.name.as_str() == hook && method.params.len() == 1)
             {
-                if let Some(installed) = body(&method.body, &method.params[0].name, app, by_name, resolver, seen) { methods.extend(installed); }
+                let mut found = Vec::new();
+                if let Some(installed) = body(&method.body, &method.params[0].name, app, by_name, resolver, seen, &mut found) {
+                    methods.extend(installed);
+                    extended.extend(found);
+                }
             }
         }
         methods
@@ -9871,13 +9887,37 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
         (model.name.clone(), model_includes(model), extensions(exprs, resolver))
     }).chain(app.library_classes.iter().map(|class|
         (class.name.clone(), class.includes.clone(), extensions(class.unknown_calls.iter(), resolver))));
+    // `Pinned::Version.extend(Pinned::Basic)` as a gem file loads (version_gem's pinning, its `class_eval` block
+    // as calls): the receiver's own extension, as the statement in its body would be.
+    let mut loaded: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for program in &app.file_programs {
+        for item in &program.items {
+            let crate::app::ProgramItem::Statement(e) = item else { continue };
+            let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { continue };
+            let ExprNode::Const { path } = &*recv.node else { continue };
+            if method.as_str() != "extend" { continue; }
+            let Some(owner) = resolver.namespace(recv.span, path).cloned() else { continue };
+            for arg in args.iter().rev() {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                loaded.entry(owner.clone()).or_default().push(resolver.namespace(arg.span, path).cloned().unwrap_or_else(|| mixin_path_id(path)));
+            }
+        }
+    }
+    let declarations: Vec<_> = declarations.map(|(id, includes, mut extensions)| {
+        if let Some(more) = loaded.get(&id) { extensions.extend(more.iter().cloned()); }
+        (id, includes, extensions)
+    }).collect();
     let by_name = crate::ingest::library_classes_by_name(app);
     for (id, mut includes, extensions) in declarations {
-        let mut installed = hook_methods(&includes, "included", app, &by_name, resolver, &mut crate::det::HashSet::default());
-        installed.extend(hook_methods(&extensions, "extended", app, &by_name, resolver, &mut crate::det::HashSet::default()));
+        let mut hooked = Vec::new();
+        let mut installed = hook_methods(&includes, "included", app, &by_name, resolver, &mut crate::det::HashSet::default(), &mut hooked);
+        installed.extend(hook_methods(&extensions, "extended", app, &by_name, resolver, &mut crate::det::HashSet::default(), &mut hooked));
         includes.extend(extensions.iter().cloned());
         let info = classes.entry(id).or_default();
         info.class_method_extensions.extend(extensions);
+        for module in hooked {
+            if !info.hook_extensions.contains(&module) { info.hook_extensions.push(module); }
+        }
         info.class_side_hook_methods.extend(installed);
         info.unknown_class_side_hook |= crate::ingest::unconsumed_class_side_hook(&includes, app, &by_name).is_some();
     }
