@@ -47,6 +47,31 @@ pub(super) fn carry(app: &mut App) {
             }
         }
     }
+    // `Foo::Version.extend(VersionGem::Basic)` where Basic has an `extended` hook: Spinel takes the call as Foo's
+    // extend but does not run the hook there, so what the hook mixes in (version_gem's Api) never reaches Foo.
+    let hooked: HashSet<String> = app.library_classes.iter()
+        .filter(|c| c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "extended"))
+        .map(|c| c.name.0.to_string())
+        .collect();
+    for program in &app.file_programs {
+        for item in &program.items {
+            let ProgramItem::Statement(e) = item else { continue };
+            let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else { continue };
+            if method.as_str() != "extend" || !matches!(&*recv.node, ExprNode::Const { .. }) { continue; }
+            for arg in args {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                if hooked.contains(&name) {
+                    app.gem_route_gaps.push(crate::diagnostic::Diagnostic::unsupported(
+                        e.span,
+                        Some(crate::ident::Symbol::from("spinel")),
+                        "mixin hook",
+                        format!("Spinel does not run `{name}.extended` for a file-level `extend`, so what the hook mixes in is missing there"),
+                    ));
+                }
+            }
+        }
+    }
     let programs: HashMap<String, &FileProgram> =
         app.file_programs.iter().map(|p| (super::normalize_source(&p.source), p)).collect();
     if programs.is_empty() {
