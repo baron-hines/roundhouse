@@ -2190,7 +2190,9 @@ class Results(unittest.TestCase):
                 out = subprocess.run(
                     ["python3", spec.origin, "toolchain-budgets"],
                     input="\n".join(tests), capture_output=True, text=True, check=True,
-                    env={k: v for k, v in os.environ.items() if k != "GITHUB_OUTPUT"} | {"CI_SPINEL_TIMINGS": raw},
+                    # Not a CI_SPINEL_TIMINGS_FILE left in the environment: the planner reads it before CI_SPINEL_TIMINGS.
+                    env={k: v for k, v in os.environ.items() if k not in ("GITHUB_OUTPUT", "CI_SPINEL_TIMINGS_FILE")}
+                    | {"CI_SPINEL_TIMINGS": raw},
                 ).stdout
                 self.assertEqual(out, "budgets=" + json.dumps([{"budget": 1440, "timeout_minutes": 25}] * 5, separators=(",", ":")) + "\n")
 
