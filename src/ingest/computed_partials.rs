@@ -55,15 +55,25 @@ pub(super) fn dispatch(app: &mut App) {
 }
 
 fn rewrite(e: &mut Expr, dir: &str, partials: &[String], helpers: &crate::det::HashMap<Symbol, Expr>) {
-    if let Some(case) = dispatched(e, dir, partials, helpers) {
-        *e = case;
+    if let ExprNode::Seq { exprs } = &mut *e.node {
+        let mut out = Vec::with_capacity(exprs.len());
+        for mut stmt in std::mem::take(exprs) {
+            match dispatched(&stmt, dir, partials, helpers) {
+                Some(stmts) => out.extend(stmts),
+                None => {
+                    rewrite(&mut stmt, dir, partials, helpers);
+                    out.push(stmt);
+                }
+            }
+        }
+        *exprs = out;
         return;
     }
     e.node.for_each_child_mut(&mut |c| rewrite(c, dir, partials, helpers));
 }
 
-/// `_buf = _buf + (render(partial: <computed>, …)).to_s` as the `case` over its pool.
-fn dispatched(e: &Expr, dir: &str, partials: &[String], helpers: &crate::det::HashMap<Symbol, Expr>) -> Option<Expr> {
+/// `_buf = _buf + (render(partial: <computed>, …)).to_s` as the name bound once, then the `case` over its pool.
+fn dispatched(e: &Expr, dir: &str, partials: &[String], helpers: &crate::det::HashMap<Symbol, Expr>) -> Option<Vec<Expr>> {
     let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node else { return None };
     if name.as_str() != "_buf" {
         return None;
@@ -79,23 +89,27 @@ fn dispatched(e: &Expr, dir: &str, partials: &[String], helpers: &crate::det::Ha
     let computed = computed_partial(rendered)?;
     let pool = pool(computed, dir, partials, helpers)?;
     let span = e.span;
+    // Not the computed call again in the error: a helper with an effect would run twice.
+    let local = Symbol::from(format!("__partial_name_{}", span.start));
+    let read = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: local.clone() });
+    let bind = Expr::new(span, ExprNode::Assign { target: LValue::Var { id: crate::ident::VarId(0), name: local }, value: computed.clone() });
     let mut arms: Vec<Arm> = pool
         .iter()
-        .map(|name| {
+        .map(|(spelled, resolved)| {
             let mut body = e.clone();
-            name_partial(&mut body, name);
-            Arm { pattern: Pattern::Lit { value: Literal::Str { value: name.clone() } }, guard: None, body }
+            name_partial(&mut body, resolved);
+            Arm { pattern: Pattern::Lit { value: Literal::Str { value: spelled.clone() } }, guard: None, body }
         })
         .collect();
     let mut error = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("MissingTemplate")] });
     error.decisions |= crate::expr::GENERATED_CONST_REF;
     let message = Expr::new(span, ExprNode::StringInterp { parts: vec![
         InterpPart::Text { value: "Missing partial ".into() },
-        InterpPart::Expr { expr: computed.clone() },
+        InterpPart::Expr { expr: read.clone() },
     ] });
     let raised = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("raise"), args: vec![error, message], block: None, parenthesized: false });
     arms.push(Arm { pattern: Pattern::Wildcard, guard: None, body: raised });
-    Some(Expr::new(span, ExprNode::Case { scrutinee: computed.clone(), arms }))
+    Some(vec![bind, Expr::new(span, ExprNode::Case { scrutinee: read, arms })])
 }
 
 /// The `partial:` value of a block-less `render(partial: …)` whose name is neither a literal nor a variable (the forms
@@ -133,23 +147,26 @@ fn name_partial(e: &mut Expr, name: &str) {
     e.node.for_each_child_mut(&mut |c| name_partial(c, name));
 }
 
-/// The partials `computed` can name, or `None` when some value it may take is not a spelling read here.
-fn pool(computed: &Expr, dir: &str, partials: &[String], helpers: &crate::det::HashMap<Symbol, Expr>) -> Option<Vec<String>> {
+/// The partials `computed` can name, each as the helper spells it and as the render resolves it, or `None` when
+/// some value it may take is not a spelling read here.
+fn pool(computed: &Expr, dir: &str, partials: &[String], helpers: &crate::det::HashMap<Symbol, Expr>) -> Option<Vec<(String, String)>> {
     let values = match &*computed.node {
         ExprNode::StringInterp { .. } => vec![computed],
         ExprNode::Send { recv: None, method, block: None, .. } => {
+            let body = helpers.get(method)?;
             let mut out = Vec::new();
-            returned(helpers.get(method)?, &mut out)?;
+            early_returns(body, &mut out)?;
+            returned(body, &mut out)?;
             out
         }
         _ => return None,
     };
-    let mut pool: Vec<String> = Vec::new();
+    let mut pool: Vec<(String, String)> = Vec::new();
     for value in values {
-        let names: Vec<String> = match &*value.node {
+        let names: Vec<(String, String)> = match &*value.node {
             ExprNode::Lit { value: Literal::Str { value } } => {
-                let name = if value.contains('/') { value.clone() } else { format!("{dir}/{value}") };
-                partials.iter().filter(|p| **p == name).cloned().collect()
+                let resolved = if value.contains('/') { value.clone() } else { format!("{dir}/{value}") };
+                partials.iter().filter(|p| **p == resolved).map(|p| (value.clone(), p.clone())).collect()
             }
             ExprNode::StringInterp { parts } => {
                 let InterpPart::Text { value: head } = parts.first()? else { return None };
@@ -160,7 +177,11 @@ fn pool(computed: &Expr, dir: &str, partials: &[String], helpers: &crate::det::H
                     Some(InterpPart::Text { value }) if parts.len() > 1 => value.as_str(),
                     _ => "",
                 };
-                partials.iter().filter(|p| p.len() > head.len() + tail.len() && p.starts_with(head.as_str()) && p.ends_with(tail)).cloned().collect()
+                partials
+                    .iter()
+                    .filter(|p| p.len() > head.len() + tail.len() && p.starts_with(head.as_str()) && p.ends_with(tail))
+                    .map(|p| (p.clone(), p.clone()))
+                    .collect()
             }
             _ => return None,
         };
@@ -171,6 +192,25 @@ fn pool(computed: &Expr, dir: &str, partials: &[String], helpers: &crate::det::H
         }
     }
     (!pool.is_empty()).then_some(pool)
+}
+
+/// The values of `return`s before the body's last statement; `None` past a `return` whose value is not read here.
+fn early_returns<'a>(body: &'a Expr, out: &mut Vec<&'a Expr>) -> Option<()> {
+    let mut ok = true;
+    fn visit<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>, ok: &mut bool) {
+        match &*e.node {
+            ExprNode::Return { value } => {
+                if returned(value, out).is_none() {
+                    *ok = false;
+                }
+            }
+            // Not a block's or a lambda's: their `return` or `next` is not the helper's value.
+            ExprNode::Lambda { .. } => {}
+            _ => e.node.for_each_child(&mut |c| visit(c, out, ok)),
+        }
+    }
+    visit(body, out, &mut ok);
+    ok.then_some(())
 }
 
 /// Every value `body` may answer, leaving out what raises; `None` past a shape whose value is not read here.

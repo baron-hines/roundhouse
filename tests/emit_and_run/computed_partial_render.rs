@@ -2,7 +2,8 @@
 //! partial whose name an app helper computes as the page renders. Ingest turns
 //! it into a `case` over the partials the helper's values can name, each arm
 //! an ordinary render, so the chosen partial reads the caller's ivars and its
-//! locals; a name outside them raises `ActionView::MissingTemplate`, as Rails'
+//! locals (an early `return` of a name relative to the view's directory
+//! counts, matched as the helper spells it); a name outside them raises `ActionView::MissingTemplate`, as Rails'
 //! lookup does. A name computed any other way stays reported.
 
 use super::emit_and_run;
@@ -11,10 +12,11 @@ fn app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .write(
             "app/helpers/kinds_helper.rb",
-            "module KindsHelper\n  def kind_partial(article)\n    if article.title.start_with?(\"x\")\n      raise \"unknown kind\"\n    else\n      \"articles/kinds/#{article.title.downcase}\"\n    end\n  end\nend\n",
+            "module KindsHelper\n  def kind_partial(article)\n    return \"pinned\" if article.title == \"Pinned\"\n    if article.title.start_with?(\"x\")\n      raise \"unknown kind\"\n    else\n      \"articles/kinds/#{article.title.downcase}\"\n    end\n  end\nend\n",
         )
         .write("app/views/articles/kinds/_hello.html.erb", "<p>hello <%= @article.title %> <%= article.body %></p>\n")
         .write("app/views/articles/kinds/_bye.html.erb", "<p>bye <%= article.title %></p>\n")
+        .write("app/views/articles/_pinned.html.erb", "<p>pinned <%= article.title %></p>\n")
         .edit(
             "app/views/articles/show.html.erb",
             "    <p class=\"text-gray-700\">",
@@ -32,6 +34,9 @@ end
 hello = Article.create!(title: "Hello", body: "Body text here")
 bye = Article.create!(title: "Bye", body: "Another body text")
 other = Article.create!(title: "Other", body: "Third body text")
+pinned = Article.create!(title: "Pinned", body: "Fourth body text")
+got = page(pinned.id)
+raise "pinned #{got[0]}" unless got[0] == 200 && got[1].include?("<p>pinned Pinned</p>")
 got = page(hello.id)
 raise "hello #{got[0]} #{got[1][0, 300]}" unless got[0] == 200 && got[1].include?("<p>hello Hello Body text here</p>")
 got = page(bye.id)
