@@ -2505,7 +2505,11 @@ the copier is not used.
 A `belongs_to` checks its record where it is declared, among the
 `validates`, so its error lists in Rails' order, and its type is
 `:blank`: Rails validates the association's presence with `message:
-:required`, which picks the text and leaves the type.
+:required`, which picks the text and leaves the type. The check reads
+the association, as Rails does, so a record assigned in memory counts
+once the writer has kept it; a polymorphic one is checked through its
+reader alone, since the class to query is the row's `<assoc>_type` and
+the runtime's unsaved key is 0 rather than nil.
 
 Every one of these rewrites matches an `errors` send as its receiver,
 which `&.` hides behind a local (`(t = record.errors) && t.m`).

@@ -1351,6 +1351,11 @@ pub struct AssocRegistry {
     /// so their `joins(:sym)` is left untouched (visible at runtime
     /// rather than silently mis-joined).
     join_tails: HashMap<(ClassId, Symbol), String>,
+    /// (model, association) whose own scope, over its target's default
+    /// scope, renders no ON clause here (`scope_join_tails`), so its
+    /// `joins(:assoc)` keeps no tail: `analyze` refuses such a join
+    /// rather than leave it to the runtime's raise.
+    unrenderable_join_scopes: HashSet<(ClassId, Symbol)>,
     /// (model, belongs_to name) -> foreign-key column, for
     /// `where(user: user)` -> `where(user_id: user && user.id)`.
     belongs_to_fk: HashMap<(ClassId, Symbol), Symbol>,
@@ -1591,6 +1596,12 @@ impl AssocRegistry {
             None => crate::naming::rails_table_name(model.0.as_str()),
         }
     }
+    /// Does `model`'s `assoc` keep no join tail because its scope
+    /// doesn't render as SQL (see the field)?
+    pub fn join_scope_unrenderable(&self, model: &ClassId, assoc: &Symbol) -> bool {
+        self.unrenderable_join_scopes.contains(&(model.clone(), assoc.clone()))
+    }
+
     fn join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<&String> {
         self.join_tails.get(&(model.clone(), assoc.clone()))
     }
@@ -1606,7 +1617,7 @@ impl AssocRegistry {
     fn assoc_table(&self, model: &ClassId, assoc: &Symbol) -> Option<&Symbol> {
         self.assoc_table.get(&(model.clone(), assoc.clone()))
     }
-    fn assoc_target(&self, model: &ClassId, assoc: &Symbol) -> Option<&ClassId> {
+    pub(crate) fn assoc_target(&self, model: &ClassId, assoc: &Symbol) -> Option<&ClassId> {
         self.assoc_target.get(&(model.clone(), assoc.clone()))
     }
     fn aliased_join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<&String> {
@@ -1806,6 +1817,7 @@ impl AssocRegistry {
         let Self {
             finder_classes: _,
             join_tails,
+            unrenderable_join_scopes,
             belongs_to_fk,
             polymorphic_belongs_to,
             assoc_target,
@@ -1826,6 +1838,7 @@ impl AssocRegistry {
         } = self;
         let key = (model.clone(), name.clone());
         join_tails.remove(&key);
+        unrenderable_join_scopes.remove(&key);
         belongs_to_fk.remove(&key);
         polymorphic_belongs_to.remove(&key);
         assoc_target.remove(&key);
@@ -1958,9 +1971,10 @@ pub(crate) fn association_primary_key(
 /// named after the declaring model, on the same foreign key, pointing
 /// back at it. Rails' conditions, as far as the declarations show them:
 /// no `through:`, no `as:`, no scope, no explicit `foreign_key:` on
-/// either side, and an `id` owner key.
+/// either side, and an `id` owner key. A `has_one` finds its inverse the
+/// same way.
 pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -> Option<Symbol> {
-    let Association::HasMany {
+    let (Association::HasMany {
         target,
         foreign_key,
         foreign_key_explicit: false,
@@ -1968,7 +1982,16 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         as_interface: None,
         scope: None,
         ..
-    } = assoc
+    }
+    | Association::HasOne {
+        target,
+        foreign_key,
+        foreign_key_explicit: false,
+        through: None,
+        as_interface: None,
+        scope: None,
+        ..
+    }) = assoc
     else {
         return None;
     };
@@ -1976,13 +1999,17 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
         return None;
     }
     let inverse = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
-    models.iter().find(|tm| &tm.name == target)?.associations().find_map(|ta| match ta {
+    // The target's last declaration of the name, as Rails keeps it.
+    let declared = models.iter().find(|tm| &tm.name == target)?.associations().filter(|ta| ta.name().as_str() == inverse).last()?;
+    match declared {
         Association::BelongsTo {
             name: bt,
             target: bt_target,
             foreign_key: bt_fk,
+            foreign_key_explicit: false,
             polymorphic: false,
             primary_key: None,
+            scope: None,
             ..
         } if bt.as_str() == inverse
             && bt_target == &owner.name
@@ -1992,7 +2019,46 @@ pub fn automatic_inverse(models: &[Model], owner: &Model, assoc: &Association) -
             Some(bt.clone())
         }
         _ => None,
-    })
+    }
+}
+
+/// The `has_one` on the target that Rails finds as `owner`'s `belongs_to`
+/// automatic inverse: named after the declaring model (`Captain
+/// belongs_to :fleet` -> `Fleet has_one :captain`), on the same foreign
+/// key, pointing back at it, with neither side scoped, keyed by an
+/// explicit `foreign_key:`, `as:` or `through:`. A has_many is never one:
+/// Rails looks the singular name up, and inverts plural associations only
+/// when `automatically_invert_plural_associations` is set.
+pub fn belongs_to_inverse(models: &[Model], owner: &Model, assoc: &Association) -> Option<Symbol> {
+    let Association::BelongsTo {
+        target,
+        foreign_key,
+        foreign_key_explicit: false,
+        polymorphic: false,
+        primary_key: None,
+        scope: None,
+        ..
+    } = assoc
+    else {
+        return None;
+    };
+    let inverse = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
+    let target_model = models.iter().find(|tm| &tm.name == target)?;
+    match target_model.associations().filter(|a| a.name().as_str() == inverse).last()? {
+        found @ Association::HasOne {
+            name: ho,
+            target: ho_target,
+            foreign_key: ho_fk,
+            foreign_key_explicit: false,
+            through: None,
+            as_interface: None,
+            scope: None,
+            ..
+        } if ho_target == &owner.name && ho_fk == foreign_key && found.owner_key().as_str() == "id" => {
+            Some(ho.clone())
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {
@@ -2243,7 +2309,11 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
 /// default scope there too (`default_scope::join_scope_conditions`), so
 /// `belongs_to :shelf, -> { unscope(where: :archived) }` joins archived
 /// shelves, as Rails' association join does, and a scope it cannot
-/// render keeps no tail either.
+/// render keeps no tail either. A `has_many` / `has_one` with a scope
+/// lambda puts that lambda's conditions in the ON clause the same way
+/// (`has_many :flagged_ships, -> { where(flag: true) }` joins only
+/// flagged ships); a `through:` association is composed two hops down
+/// and keeps no tail, scoped or not.
 fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
     use super::default_scope::{default_scope, join_scope_conditions, sql_predicate, DefaultScope};
     let scoped: HashMap<ClassId, Vec<(Symbol, Literal)>> = models
@@ -2258,10 +2328,12 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
         })
         .collect();
     // The last declaration of the name, as the registry keeps it.
-    let belongs_to_scope = |owner: &ClassId, name: &Symbol| {
+    let declared_scope = |owner: &ClassId, name: &Symbol| {
         models.iter().find(|m| &m.name == owner).and_then(|m| {
             match m.associations().filter(|a| a.name() == name).last()? {
                 Association::BelongsTo { polymorphic: false, scope: Some(scope), .. } => Some(scope),
+                Association::HasMany { through: None, scope: Some(scope), .. }
+                | Association::HasOne { through: None, scope: Some(scope), .. } => Some(scope),
                 _ => None,
             }
         })
@@ -2269,7 +2341,7 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
     let keys: Vec<((ClassId, Symbol), ClassId)> =
         reg.assoc_target.iter().map(|(k, t)| (k.clone(), t.clone())).collect();
     for ((owner, name), target) in keys {
-        let own_scope = belongs_to_scope(&owner, &name);
+        let own_scope = declared_scope(&owner, &name);
         if scoped.is_empty() && own_scope.is_none() {
             continue;
         }
@@ -2277,15 +2349,16 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             .iter()
             .find(|m| m.name == owner)
             .and_then(|m| {
-                m.associations().find_map(|a| match a {
-                    Association::HasMany { name: n, through: Some(thr), .. } if *n == name => {
-                        m.associations().find_map(|t| match t {
-                            Association::HasMany { name: tn, target: tt, .. } if tn == thr => Some(tt.clone()),
+                // The last declaration of each name, as the registry keeps it.
+                match m.associations().filter(|a| a.name() == &name).last()? {
+                    Association::HasMany { through: Some(thr), .. } => {
+                        match m.associations().filter(|t| t.name() == thr).last()? {
+                            Association::HasMany { target: tt, .. } => Some(tt.clone()),
                             _ => None,
-                        })
+                        }
                     }
                     _ => None,
-                })
+                }
             });
         let key = (owner.clone(), name.clone());
         let through_scoped = through.as_ref().is_some_and(|t| scoped.contains_key(t));
@@ -2331,6 +2404,9 @@ fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
             _ => {
                 reg.join_tails.remove(&key);
                 reg.aliased_join_tails.remove(&key);
+                if own_scope.is_some() {
+                    reg.unrenderable_join_scopes.insert(key);
+                }
             }
         }
     }
@@ -3061,7 +3137,7 @@ fn is_relation_expr(e: &Expr, ctx: &Ctx, locals: &Locals) -> bool {
             }
             let hop = is_relation_chain_method(name)
                 || crate::catalog::is_relation_context_builder(name)
-                || matches!(name, "where_scope" | "preloaded" | "skip_preloading!" | "page" | "per");
+                || matches!(name, "where_scope" | "preloaded" | "_inversed_from" | "skip_preloading!" | "page" | "per");
             hop && is_relation_expr(r, ctx, locals)
         }
         _ => false,
@@ -3609,6 +3685,7 @@ fn build_association_seed(
     owner: &Expr,
     name: &Symbol,
     scope_attributes: bool,
+    inversed: bool,
 ) -> Expr {
     // An owner key other than `id` can be NULL, and
     // `where(fk: nil)` would match the child rows
@@ -3702,6 +3779,25 @@ fn build_association_seed(
                 args: vec![
                     owner_send(format!("{}_target", name.as_str())),
                     owner_send(format!("{}_loaded?", name.as_str())),
+                ],
+                block: None,
+                parenthesized: true,
+            },
+        );
+    }
+    // The rows it loads hold the owner through the association's
+    // automatic inverse, as an `AssociationRelation`'s do
+    // (`Relation#_inversed_from`), the create-scope spelling's too: a
+    // class method reached through the association queries on it.
+    if inversed {
+        seed = syn(
+            span,
+            ExprNode::Send {
+                recv: Some(seed),
+                method: Symbol::from("_inversed_from"),
+                args: vec![
+                    owner.clone(),
+                    syn(span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } }),
                 ],
                 block: None,
                 parenthesized: true,
@@ -5509,7 +5605,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         if is_scope || is_chain || is_term || assoc_cm.is_some() || extracted.is_some() {
                             let seed = build_association_seed(
                                 span, &target, fk, owner_id, type_entry.clone(), ir, aname,
-                                assoc_cm.is_some(),
+                                assoc_cm.is_some(), inverse.is_some(),
                             );
                             if let Some(leading) = assoc_cm {
                                 let new_args = thread_rel(args, seed, Some(leading), span);
@@ -7448,6 +7544,73 @@ mod tests {
             panic!("expected Send, got {:?}", built_on_call.node)
         };
         assert_eq!(method.as_str(), "__hold_books", "a built record is held whatever its owner: {:?}", built_on_call.node);
+    }
+
+    #[test]
+    fn registry_scoped_has_many_and_has_one_join_carries_the_scope() {
+        // `has_many :tall_trees, -> { where(tall: true) }` joins only the
+        // tall trees, as Rails' association join does: the scope's
+        // condition lands in the ON clause, against the table alias when
+        // the association's name is not the table's.
+        let orchard = ingest(
+            "class Orchard < ApplicationRecord\n  has_many :trees\n  \
+             has_many :tall_trees, -> { where(tall: true) }, class_name: \"Tree\"\n  \
+             has_one :featured_tree, -> { where(featured: true) }, class_name: \"Tree\"\nend\n",
+            "app/models/orchard.rb",
+        );
+        let mut tree = ingest(
+            "class Tree < ApplicationRecord\n  belongs_to :orchard\nend\n",
+            "app/models/tree.rb",
+        );
+        tree.attributes.fields.insert(Symbol::from("tall"), crate::ty::Ty::Bool);
+        tree.attributes.fields.insert(Symbol::from("featured"), crate::ty::Ty::Bool);
+        let reg = build_assoc_registry(&[orchard, tree]);
+        let orchard = ClassId(Symbol::from("Orchard"));
+        let tall = Symbol::from("tall_trees");
+        assert_eq!(
+            reg.join_tail(&orchard, &tall),
+            Some(&"trees ON trees.orchard_id = orchards.id AND trees.tall = TRUE".to_string())
+        );
+        assert_eq!(
+            reg.aliased_join_tail(&orchard, &tall),
+            Some(&"trees tall_trees ON tall_trees.orchard_id = orchards.id AND tall_trees.tall = TRUE".to_string())
+        );
+        let featured = Symbol::from("featured_tree");
+        assert_eq!(
+            reg.join_tail(&orchard, &featured),
+            Some(&"trees ON trees.orchard_id = orchards.id AND trees.featured = TRUE".to_string())
+        );
+        assert_eq!(
+            reg.aliased_join_tail(&orchard, &featured),
+            Some(&"trees featured_tree ON featured_tree.orchard_id = orchards.id AND featured_tree.featured = TRUE".to_string())
+        );
+        // An unscoped association keeps the bare tail.
+        assert_eq!(
+            reg.join_tail(&orchard, &Symbol::from("trees")),
+            Some(&"trees ON trees.orchard_id = orchards.id".to_string())
+        );
+    }
+
+    #[test]
+    fn registry_scoped_has_many_join_a_scope_cannot_render_keeps_no_tail() {
+        // A scope no SQL here can read (`where("…")`) is not composed
+        // without the scope: the join is left to raise, not to answer
+        // rows the scope would exclude.
+        let orchard = ingest(
+            "class Orchard < ApplicationRecord\n  \
+             has_many :shady_trees, -> { where(\"tall = 0\") }, class_name: \"Tree\"\nend\n",
+            "app/models/orchard.rb",
+        );
+        let mut tree = ingest(
+            "class Tree < ApplicationRecord\n  belongs_to :orchard\nend\n",
+            "app/models/tree.rb",
+        );
+        tree.attributes.fields.insert(Symbol::from("tall"), crate::ty::Ty::Bool);
+        let reg = build_assoc_registry(&[orchard, tree]);
+        let orchard = ClassId(Symbol::from("Orchard"));
+        let shady = Symbol::from("shady_trees");
+        assert!(reg.join_tail(&orchard, &shady).is_none());
+        assert!(reg.aliased_join_tail(&orchard, &shady).is_none());
     }
 
     #[test]

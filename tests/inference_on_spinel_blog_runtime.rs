@@ -648,7 +648,18 @@ fn untyped_subexpressions_baseline() {
     // parenthesis or a quote before it splits it, two reads of a var on
     // this RBS-less probe (+2 in active_record/relation.rb); relation.rbs
     // types it for the RBS-paired gate, which stays at 0.
-    const CEILING: usize = 1427;
+    // MEASURED 1428 on restore_attributes (1427): its block reads each
+    // restored `name`, a var on this RBS-less probe (+1 in
+    // active_record/connection.rb); connection.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    // MEASURED 1432 on association relation inverses (main e942cef18:
+    // 1427): `_inversed_from` stores its owner and association name (+4)
+    // and `load_records` hands the stored owner its rows (+1), vars on
+    // this RBS-less probe (active_record/relation.rb); relation.rbs types
+    // them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1433 on merging #2176 and #2177 (1427): restore_attributes's
+    // +1 and the association relation inverses' +5, which add up.
+    const CEILING: usize = 1433;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

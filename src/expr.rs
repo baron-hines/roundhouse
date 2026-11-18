@@ -102,6 +102,12 @@ pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
 /// replays where the source has it (`ingest::app_extension_calls`).
 pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
 
+/// A model's class-body `prepend Concern`, whose `prepended do` items the
+/// concern splice carried into the body and whose line the Ruby family
+/// writes back (the module's instance methods then sit ahead of the
+/// class's own, reaching them through `super`).
+pub const CONCERN_PREPEND: u64 = 1 << 60;
+
 /// A value-only inherited call: non-Ruby targets retain their previous warning.
 pub const INHERITED_CLASS_BODY: u64 = 1 << 52;
 
@@ -154,6 +160,13 @@ pub const CONST_PATH: u64 = 1 << 25;
 /// and JRuby trees write it back where the source has it, among the
 /// class's methods; every other target drops it and reports it.
 pub const BODY_STATEMENT: u64 = 1 << 27;
+
+/// A library class or module body statement that calls a method on a
+/// constant the same body assigns (`SWATCHES.push(Swatch.new("teal"))`),
+/// making only calls the app answers (`ingest::body_statements`). Plain
+/// Ruby every Ruby-family tree runs, Spinel's too, so each writes it back
+/// where the source has it, among the constants it reads and writes.
+pub const CONSTANT_STATEMENT: u64 = 1 << 40;
 
 /// On a body statement or a constant's value: the source wrote it inside
 /// the class's own `class << self`, where Ruby runs it with the singleton

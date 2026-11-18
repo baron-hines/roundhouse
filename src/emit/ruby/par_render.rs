@@ -21,8 +21,9 @@ use crate::App;
 use super::{expr, library, source_markers};
 
 /// `render` over `items`, one result per item in item order, on as many
-/// threads as `par::workers_for` gives. One worker, or a caller recording
-/// the classes it renders, is a plain loop on the calling thread.
+/// threads as `par::workers_for` gives. One worker is a plain loop on the
+/// calling thread. A caller recording the classes it renders gets each
+/// worker's record, in item order.
 pub(super) fn map<T: Sync, R: Send>(
     app: &App,
     classes: &[LibraryClass],
@@ -35,9 +36,10 @@ pub(super) fn map<T: Sync, R: Send>(
     if library::lookups_uncached() {
         return items.iter().map(render).collect();
     }
-    if crate::par::workers_for(items.len()) == 1 || library::recording_rendered() {
+    if crate::par::workers_for(items.len()) == 1 {
         return items.iter().map(render).collect();
     }
+    let recording = library::recording_rendered();
     let settings = expr::Settings::capture();
     let sources = source_markers::snapshot();
     let inflections = crate::naming::app_inflections();
@@ -54,15 +56,17 @@ pub(super) fn map<T: Sync, R: Send>(
             (crate::lower::i18n_translate::install_plan_cache(plans.clone()), library::install_worker_lookup_indexes(app, classes))
         },
         |_, item| {
-            let rendered = crate::emit::diagnostics::scope(|| dialect.scope(|| render(item)));
+            let render = || crate::emit::diagnostics::scope(|| dialect.scope(|| render(item)));
+            let (rendered, classes) = if recording { library::record_rendered(render) } else { (render(), Vec::new()) };
             assert_eq!(crate::lower::arel::visitor::read_ids_drawn_here(), 0, "a parallel render drew a read id");
             assert_eq!(crate::lower::arel::hoisted_temporaries(), 0, "a parallel render hoisted a temporary");
-            rendered
+            (rendered, classes)
         },
     );
     done.into_iter()
-        .map(|(result, diagnostics)| {
+        .map(|((result, diagnostics), classes)| {
             diagnostics.into_iter().for_each(crate::emit::diagnostics::push);
+            library::extend_rendered(classes);
             result
         })
         .collect()

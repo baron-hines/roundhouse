@@ -1907,12 +1907,12 @@ module ActiveRecord
       all.order(*parts)
     end
 
-    def self.pick(col)
-      all.pick(col)
+    def self.pick(*cols)
+      all.pick(*cols)
     end
 
-    def self.pluck(col)
-      all.pluck(col)
+    def self.pluck(*cols)
+      all.pluck(*cols)
     end
 
     def self.preload(*names)
@@ -2745,6 +2745,30 @@ module ActiveRecord
         clear_attribute_change(name)
       end
       nil
+    end
+
+    # Rails' `restore_attributes`: every pending change written back, as
+    # `restore_attribute!` writes one, answering the names it restored. A
+    # write to a column the row's `select` left out is pending too, though
+    # the diff may not show it (nil over the unloaded nil): restoring it
+    # drops the write and leaves the column unloaded again, so a save
+    # leaves it as the row holds it and a later write is noted afresh.
+    def restore_attributes
+      names = changes_to_save.keys
+      names.each { |name| restore_attribute!(name) }
+      wrote = @__unloaded_writes
+      unless wrote.nil?
+        unloaded = @__unloaded_columns
+        unloaded = [] if unloaded.nil?
+        wrote.each do |name|
+          names.push(name) unless names.include?(name)
+          column = name.to_sym
+          unloaded.push(column) unless unloaded.include?(column)
+        end
+        @__unloaded_columns = unloaded
+        @__unloaded_writes = nil
+      end
+      names
     end
 
     # ---- cache_key / cache_version / cache_key_with_version ---------

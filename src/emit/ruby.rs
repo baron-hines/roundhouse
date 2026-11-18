@@ -21,7 +21,9 @@ use crate::lower::controller::body::FormatBreadth;
 const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
+pub(crate) mod class_paths;
 pub(crate) mod expr;
+mod inverse_seating;
 mod library;
 mod par_render;
 pub(crate) use library::install_lookup_indexes;
@@ -45,6 +47,10 @@ pub use expr::emit_expr;
 
 /// The `models/<stem>` anchor of the file a library class is emitted
 /// into: its outermost enclosing app class's (`library::file_owner`).
+pub(crate) fn library_file_owner(name: &str, app: &App) -> String {
+    library::file_owner(name, app, &app.library_classes)
+}
+
 pub(crate) fn library_file_anchor(name: &str, app: &App) -> String {
     format!("models/{}", crate::naming::underscore(&library::file_owner(name, app, &app.library_classes)))
 }
@@ -411,6 +417,10 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
+    // An association's loaded records hold their owner through its
+    // inverse. AFTER the memoization above, whose cache the seat fills,
+    // and the preload pass, whose setters it extends.
+    inverse_seating::apply(&mut lcs, app);
     // A partial `select`'s left-out column raises from its generated
     // reader. After every pass that rewrites a reader body by its shape.
     crate::lower::missing_attribute::apply(&mut lcs, app);
@@ -437,20 +447,19 @@ fn emit_model_classes(
         .filter(|lc| lc.origin.is_some())
         .map(|lc| {
             let name = lc.name.0.as_str().to_string();
-            let stem = crate::naming::underscore(&name);
-            (name, format!("app/models/{stem}"))
+            let anchor = class_paths::class_anchor(&name);
+            (name, anchor)
         })
         .collect();
     for spec in params_specs.iter() {
         let name = spec.class_id.0.as_str().to_string();
-        let stem = crate::naming::underscore(&name);
-        synthesized.push((name, format!("app/models/{stem}")));
+        let anchor = class_paths::class_anchor(&name);
+        synthesized.push((name, anchor));
     }
 
     lcs.iter()
         .flat_map(|lc| {
-            let stem = crate::naming::underscore(lc.name.0.as_str());
-            let out_path = PathBuf::from(format!("app/models/{stem}.rb"));
+            let out_path = class_paths::class_rb(lc.name.0.as_str());
             library::emit_library_class_pair_with_synthesized(
                 lc,
                 app,
@@ -726,8 +735,8 @@ fn emit_lowered_controllers_from_lcs(
         .filter(|lc| lc.origin.is_some())
         .map(|lc| {
             let name = lc.name.0.as_str().to_string();
-            let stem = crate::naming::underscore(&name);
-            (name, format!("app/models/{stem}"))
+            let anchor = class_paths::class_anchor(&name);
+            (name, anchor)
         })
         .collect();
 
@@ -735,7 +744,7 @@ fn emit_lowered_controllers_from_lcs(
         .flat_map(|lc| {
             let file_stem = crate::naming::underscore(lc.name.0.as_str());
             let out_path = if lc.origin.is_some() {
-                PathBuf::from(format!("app/models/{file_stem}.rb"))
+                class_paths::class_rb(lc.name.0.as_str())
             } else {
                 PathBuf::from(format!("app/controllers/{file_stem}.rb"))
             };

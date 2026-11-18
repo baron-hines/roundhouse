@@ -498,6 +498,121 @@ fn unlowered_time_tags(app: &App) -> Vec<Diagnostic> {
     out
 }
 
+/// `joins(:assoc)` (or a left join) of an association whose scope renders
+/// no ON clause here (`AssocRegistry::join_scope_unrenderable`: an enum
+/// Symbol, `where.not`, a SQL string, an Array or a Range): the lowering
+/// can't write its join, and the runtime would raise on it. Rails puts the
+/// scope in the ON clause, so joining without it would answer rows the
+/// scope excludes. Refused where it is written instead.
+fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
+    let registry = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    if !app.models.iter().any(|m| {
+        m.associations().any(|a| registry.join_scope_unrenderable(&m.name, a.name()))
+    }) {
+        return Vec::new();
+    }
+    let model_of = |recv: &Expr| -> Option<ClassId> {
+        match (&*recv.node, recv.ty.as_ref()) {
+            (_, Some(Ty::Relation { of })) => Some(of.clone()),
+            // A query chain types as an Array of its model (`ty.rs`).
+            (_, Some(Ty::Array { elem })) => match &**elem {
+                Ty::Class { id, .. } if app.models.iter().any(|m| &m.name == id) => Some(id.clone()),
+                _ => None,
+            },
+            (ExprNode::Const { path }, _) => {
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                app.models.iter().find(|m| m.name.0.as_str() == name).map(|m| m.name.clone())
+            }
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    fn visit(
+        expr: &Expr,
+        model_of: &dyn Fn(Option<&Expr>) -> Option<ClassId>,
+        registry: &crate::lower::scope_chain::AssocRegistry,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        if let ExprNode::Send { recv, method, args, .. } = &*expr.node
+            && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
+            && let Some(model) = model_of(recv.as_ref())
+        {
+            // Each association a join spec names, with the model it is
+            // declared on: a nested hash's associations are the
+            // preceding association target's (`joins(trees: :branches)`).
+            fn names<'e>(
+                model: &ClassId,
+                spec: &'e Expr,
+                registry: &crate::lower::scope_chain::AssocRegistry,
+                out: &mut Vec<(ClassId, &'e Expr)>,
+            ) {
+                match &*spec.node {
+                    ExprNode::Array { elements, .. } => {
+                        elements.iter().for_each(|e| names(model, e, registry, out))
+                    }
+                    ExprNode::Hash { entries, .. } => {
+                        for (k, v) in entries {
+                            names(model, k, registry, out);
+                            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node
+                                && let Some(target) = registry.assoc_target(model, value)
+                            {
+                                names(target, v, registry, out);
+                            }
+                        }
+                    }
+                    _ => out.push((model.clone(), spec)),
+                }
+            }
+            let mut named: Vec<(ClassId, &Expr)> = Vec::new();
+            args.iter().for_each(|arg| names(&model, arg, registry, &mut named));
+            for (model, name) in named {
+                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
+                    && registry.join_scope_unrenderable(&model, value)
+                {
+                    out.push(Diagnostic::unsupported(
+                        name.span,
+                        None,
+                        "association join",
+                        format!(
+                            "`{}(:{})`: the association's scope doesn't render as SQL here (only hash `where`s of \
+                             literals do), so its join can't carry the scope in its ON clause, as Rails' does",
+                            method.as_str(),
+                            value.as_str(),
+                        ),
+                    ));
+                }
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, model_of, registry, out));
+    }
+    // An explicit receiver: a model constant or a query chain.
+    let explicit = |recv: Option<&Expr>| match recv {
+        Some(r) if !matches!(&*r.node, ExprNode::SelfRef) => model_of(r),
+        _ => None,
+    };
+    crate::lower::for_each_emit_body_ref(app, &mut |body| visit(body, &explicit, &registry, &mut out));
+    // A model's scopes and class methods: a bare or `self.` join there is
+    // on that model (`scope :shady, -> { joins(:shady_trees) }`), and an
+    // explicit receiver resolves as anywhere else.
+    for model in &app.models {
+        let own = |recv: Option<&Expr>| match recv {
+            None => Some(model.name.clone()),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => Some(model.name.clone()),
+            Some(r) => model_of(r),
+        };
+        for scope in model.scopes() {
+            visit(&scope.body, &own, &registry, &mut out);
+        }
+        for method in model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class) {
+            visit(&method.body, &own, &registry, &mut out);
+        }
+    }
+    // A body both walks reach reports its join once.
+    let mut seen = crate::det::HashSet::default();
+    out.retain(|d| seen.insert((d.span, d.message.clone())));
+    out
+}
+
 /// A `simple_format` the view lowering leaves as written: any form but
 /// `sanitize: false` in a template (`lower::view::simple_format_form`
 /// gives the reason), and every call in a library class, which nothing
@@ -663,6 +778,35 @@ fn controller_shadowed_view_helpers(app: &App) -> Vec<Diagnostic> {
 /// Builder methods the view lowering serves outside
 /// `classify_form_builder_method`.
 const FORM_BUILDER_HANDLED_ELSEWHERE: &[&str] = &["object"];
+
+/// A `delegated_type` ingest did not expand (`ingest::delegated_type`
+/// fails closed on an option it does not model, or a `types:` list it
+/// cannot read). The statement survives as an unknown call that no
+/// target emits, so the polymorphic `belongs_to`, its required check
+/// and every generated reader would vanish without a word.
+fn unexpanded_delegated_types(app: &App) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            // `self.delegated_type` too, which the expansion does not take.
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { continue };
+            if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+                continue;
+            }
+            if method.as_str() != "delegated_type" || out.iter().any(|d| d.span == expr.span) {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "delegated_type",
+                "not a receiverless call whose options and `types:` list the expansion models (a literal or constant list of class names; `foreign_key`, `foreign_type`, `primary_key`, `optional`, `touch`, `default`, `dependent: :destroy`), so no target defines the association or its readers",
+            ));
+        }
+    }
+    out
+}
 
 fn devise_refusals(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -893,6 +1037,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(super::data::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
     out.extend(crate::lower::model_to_library::encrypts_diagnostics(app));
+    out.extend(crate::lower::model_to_library::unrolled_loop_diagnostics(app));
     out.extend(route_guard_untyped_sends(app));
     // A support file the class ingest left out, at what failed it.
     out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));
@@ -992,10 +1137,22 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(unlowered_current_page(app));
     out.extend(helper_stylesheet_link_tags(app));
     out.extend(unlowered_time_tags(app));
+    out.extend(unrenderable_association_joins(app));
     out.extend(unlowered_simple_format(app));
     out.extend(controller_shadowed_view_helpers(app));
     out.extend(link_to_if_params_shadowing_nested_locals(app));
     out.extend(devise_refusals(app));
+    out.extend(unexpanded_delegated_types(app));
+    // A `direct` helper's `route_for` that names no route stays a call
+    // to a method nothing defines.
+    out.extend(crate::lower::routes_to_library::direct::unresolved_route_for_calls(app).into_iter().map(|span| {
+        Diagnostic::unsupported(
+            span,
+            None,
+            "route_for",
+            "in a `direct` helper, a name that is not a literal, or an interpolation spelling no named route that takes these arguments, so no target can call it",
+        )
+    }));
     out.extend(overridden_synthesized_accessors(app));
     out.extend(runtime_defined_surfaces(app));
     // A filter's return value is Rails' to discard (`around_action
