@@ -387,6 +387,27 @@ fn a_test_primary_the_parser_cant_establish_refuses_a_named_file() {
     }
 }
 
+/// Rails' YAML applies a merge where it is written: over the keys before
+/// it, and with the configurations it brings ahead of those after it. A
+/// merge after other keys in the primary's block, or one that brings
+/// configurations, refuses a named file; `<<: *default` written first reads it.
+#[test]
+fn a_merge_after_other_keys_refuses_a_named_file() {
+    for yml in [
+        "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  <<: *defaults\n",
+        "defaults: &defaults\n  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=other.rb'\ntest:\n  adapter: sqlite3\n  url: 'sqlite3:///tmp/test.sqlite3'\n  <<: *defaults\n  schema_dump: catalog_schema.rb\n",
+        "multi: &multi\n  catalog:\n    adapter: sqlite3\n    schema_dump: other.rb\ntest:\n  <<: *multi\n  reporting:\n    adapter: sqlite3\n    schema_dump: catalog_schema.rb\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("`test.") && e.contains("merge key")), "{yml}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{yml}");
+    }
+    let yml = "defaults: &defaults\n  adapter: sqlite3\n  schema_dump: other.rb\ntest:\n  <<: *defaults\n  schema_dump: catalog_schema.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
 /// A blank final value drops the key from Rails' URL options, and a quoted
 /// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
 /// null or an unquoted YAML 1.1 boolean names no file. All build as before.

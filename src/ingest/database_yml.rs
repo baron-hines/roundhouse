@@ -527,6 +527,13 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
             refuse(offset, unsupported(&written, "config/database.yml computes a key with ERB, which could be the setting itself"), false);
             continue;
         }
+        // Psych applies a merge where it is written, over the keys before it, and puts the
+        // configurations it brings first; serde_yaml_ng keeps the written keys and their order.
+        // They agree on a merge written first in the primary's block, not on one between configurations.
+        if lines.iter().skip(1).any(|(_, key, _)| key == "<<") || three_tier && block(env_at).iter().any(|(_, key, _)| key == "<<") {
+            refuse(offset, unsupported(&written, "a merge key (`<<:`) comes after other keys or brings configurations, and Rails applies it where it is written"), false);
+            continue;
+        }
         let why = match value {
             _ if direct.is_none() => Some("it is not written directly in the configuration: an anchor merge or flow mapping"),
             Value::String(name) if name.contains(ERB_VALUE) => Some("it is computed with ERB"),
