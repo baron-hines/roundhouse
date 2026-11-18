@@ -575,6 +575,25 @@ end
 "##;
 pub const RAW_SWITCH_EXPECTED: &str = "raw-same=1\nraw-switch=refused\nraw-handle=refused\nraw-left=0\nraw-right=0\nraw-base-begins=4\nraw-scope=0\n";
 
+pub const SNAPSHOT_SCRIPT: &str = r##"Db.with_connection do
+  ApplicationRecord.connected_to(role: :reading) do
+    Db.read_snapshot_begin
+    before = Note.count
+    ApplicationRecord.connected_to(role: :writing) { Note.create!(tag: "fresh") }
+    puts "snapshot=" + before.to_s + "," + Note.count.to_s
+    Db.read_snapshot_end
+  end
+  ApplicationRecord.connected_to(shard: :right, role: :reading) do
+    Db.read_snapshot_begin
+    Note.count
+    ApplicationRecord.connected_to(shard: :left, role: :writing) { Note.create!(tag: "other-file") }
+    puts "unrelated-snapshot=" + Db.current_conn.snap.to_s
+    Db.read_snapshot_end
+  end
+end
+"##;
+pub const SNAPSHOT_EXPECTED: &str = "snapshot=0,1\nunrelated-snapshot=2\n";
+
 /// `text` with each refused statement cut after its first word: Rails'
 /// lines carry its SQL with bind marks, an emitted program's the values.
 pub fn comparable(text: &str) -> String {

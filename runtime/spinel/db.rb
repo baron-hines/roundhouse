@@ -2439,8 +2439,10 @@ module Db
       scopes.each do |f|
         held = f.held
         held.qc_clear if !held.nil?
+        end_snapshot(held) if !held.nil? && @slots[f.from].permit == slot.permit
         parked = f.connection
         parked.qc_clear if f.parked && !parked.nil?
+        end_snapshot(parked) if f.parked && !parked.nil? && @slots[f.slot].permit == slot.permit
       end
     end
     end_snapshot(conn)

@@ -83,6 +83,12 @@ fn raw_transactions_refuse_cross_slot_switches() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_same_file_write_refreshes_the_held_reader_snapshot() {
+    assert_shard_report(contract::SNAPSHOT_SCRIPT, contract::SNAPSHOT_EXPECTED);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn writable_routes_create_missing_parent_directories() {
     let yml = contract::database_yml().replace("storage/right.sqlite3", "storage/missing/deep/right.sqlite3");
     let run = contract::app(contract::SHARDS, &contract::shards_report())
