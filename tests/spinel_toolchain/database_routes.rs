@@ -90,12 +90,13 @@ fn a_same_file_write_refreshes_the_held_reader_snapshot() {
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn writable_routes_create_missing_parent_directories() {
-    let yml = contract::database_yml().replace("storage/right.sqlite3", "storage/missing/deep/right.sqlite3");
+    let yml = contract::database_yml().replace("storage/right.sqlite3", "storage/missing/deep/right.sqlite3")
+        .replace("left_reader:\n    adapter: sqlite3\n    database: storage/left.sqlite3", "left_reader:\n    adapter: sqlite3\n    database: storage/missing/deep/right.sqlite3");
     let run = contract::app(contract::SHARDS, &contract::shards_report())
         .write("config/database.yml", &yml)
-        .run_spinel(&format!("{}ApplicationRecord.connected_to(shard: :right) {{ puts Note.count }}", contract::BOOT));
+        .run_spinel(&format!("{}ApplicationRecord.connected_to(shard: :right) {{ puts Note.count }}\nputs File.exist?(\"storage/missing/deep/right.sqlite3\")", contract::BOOT));
     run.assert_passes();
-    assert_eq!(run.stdout, "0\n");
+    assert_eq!(run.stdout, "0\ntrue\n");
 }
 
 #[test]

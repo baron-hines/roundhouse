@@ -7832,7 +7832,9 @@ fn apply_database_routes(files: &mut [(String, String)], app: &App) {
         }
         let names = if env == "development" { format!("{}, \"\"", lit(env)) } else { lit(env) };
         generated.push_str(&format!("    when {names}\n"));
-        for (shard, role, name) in &routes.routes {
+        let writers = routes.routes.iter().filter(|(_, role, _)| role == "writing");
+        let readers = routes.routes.iter().filter(|(_, role, _)| role != "writing");
+        for (shard, role, name) in writers.chain(readers) {
             let Some(database) = config(name) else { continue };
             let file = if database.primary { "" } else { database.database.as_deref().unwrap_or("") };
             generated.push_str(&format!(
