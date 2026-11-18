@@ -2210,11 +2210,12 @@ fn suffixed_struct_methods(base: &ClassId, members: &[Symbol], keyword_init: boo
     if keyword_init {
         let keys = members.iter().map(|m| format!(":{m}")).collect::<Vec<_>>().join(", ");
         src.push_str("def initialize(**attrs)\n");
-        src.push_str(&format!("  unknown = attrs.keys.map {{ |k| k.to_sym }} - [{keys}]\n"));
+        // In the hash's order, a String key read as its Symbol: the later of `:success?` and `"success?"` wins, as in Struct.
+        src.push_str("  given = {}\n  attrs.each { |k, v| given[k.is_a?(String) ? k.to_sym : k] = v }\n");
+        src.push_str(&format!("  unknown = given.keys - [{keys}]\n"));
         src.push_str("  raise ArgumentError, \"unknown keywords: #{unknown.join(\", \")}\" unless unknown.empty?\n");
         for m in members {
-            // A String key names the member too, as Struct's keyword constructor reads it.
-            src.push_str(&format!("  @{} = attrs.fetch(:{m}) {{ attrs.fetch(\"{m}\", nil) }}\n", struct_slot(m)));
+            src.push_str(&format!("  @{} = given.fetch(:{m}, nil)\n", struct_slot(m)));
         }
         src.push_str("end\n");
     } else {

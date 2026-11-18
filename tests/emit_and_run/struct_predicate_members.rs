@@ -21,13 +21,21 @@ fn app() -> emit_and_run::Overlay {
     f = failed("too late")
     p = pair
     keyed = Result.new(**{ "success?" => true, "error" => "s" })
+    later_string = Result.new(**{ success?: false, "success?" => true })
+    later_symbol = Result.new(**{ "success?" => true, success?: false })
+    odd = begin
+      Result.new(**{ 100 => true })
+      "accepted"
+    rescue ArgumentError
+      "argument error"
+    end
     unknown = begin
       Result.new(success?: true, typo: 1)
       "accepted"
     rescue ArgumentError => e
       e.message
     end
-    [r.success?, r.changes_made?, r.error, f.success?, f.error, p.valid?, p.count, unknown, keyed.success?, keyed.error]
+    [r.success?, r.changes_made?, r.error, f.success?, f.error, p.valid?, p.count, unknown, keyed.success?, keyed.error, later_string.success?, later_symbol.success?, odd]
   end
 end
 "#,
@@ -35,7 +43,7 @@ end
 }
 
 const ASSERTIONS: &str = r#"got = BalanceResult.describe
-want = [true, false, nil, false, "too late", true, 3, "unknown keywords: typo", true, "s"]
+want = [true, false, nil, false, "too late", true, 3, "unknown keywords: typo", true, "s", true, false, "argument error"]
 raise got.inspect unless got == want
 puts "struct predicate members passed"
 "#;
