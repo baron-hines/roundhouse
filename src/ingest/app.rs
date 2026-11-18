@@ -749,9 +749,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // The queue's records: on solid_queue the compiler runs the jobs, but the records Rails keeps of them are
     // solid_queue's own models, read from its installed source over a separate or primary queue schema.
     // Not every app on solid_queue: only one whose code (or a gem it carries) names solid_queue's classes reads its records.
+    // The file the test environment's primary names with `schema_dump:`, resolved once for the
+    // queue check below and the schema read; a form that isn't read is refused.
+    let named_schema = super::database_yml::named_schema(vfs, dir);
     let solid_queue_models = (effective_queue_adapter(vfs, dir).as_deref() == Some("solid_queue")
         && names_solid_queue(vfs, dir, &source_gems)
-        && (vfs.exists(&dir.join("db/queue_schema.rb")) || primary_schema_has_queue(vfs, dir)))
+        && (vfs.exists(&dir.join("db/queue_schema.rb")) || primary_schema_has_queue(vfs, dir, named_schema.primary.as_ref())))
         .then(|| super::source_gems::framework_models(vfs, dir, lock.as_ref(), "solid_queue"))
         .flatten();
     let solid_queue_root = solid_queue_models.as_ref().and_then(|gem| gem.mount.strip_prefix(dir).ok().map(|m| m.join("app")));
@@ -861,7 +864,22 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     let expression_dialect = schema_expression_dialect(vfs, dir);
-    if vfs.exists(&schema_path) {
+    // A refused `schema_dump:` leaves the schema empty.
+    if let Some(named) = &named_schema.primary {
+        if let Ok((path, sql)) = named
+            && let Some(source) = read_or_ledger(vfs, path)?
+        {
+            let file = path.display().to_string();
+            let schema = if *sql {
+                ingest_structure_sql(&source, &file)
+            } else {
+                ingest_schema_with_generated_expression_dialect(&source, &file, expression_dialect)
+            };
+            if let Some(schema) = unwrap_or_record(schema)? {
+                app.schema = schema;
+            }
+        }
+    } else if vfs.exists(&schema_path) {
         if let Some(source) = read_or_ledger(vfs, &schema_path)? {
             if let Some(schema) =
                 unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &schema_path.display().to_string(), expression_dialect))?
@@ -934,10 +952,13 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     }
     app.schema.expression_dialect = expression_dialect;
     // Not its own database: the runtime opens only the primary, so solid_queue's tables join it.
+    // Only a file read and joined here drops its "not carried" warning.
+    let mut queue_joined = false;
     if solid_queue_root.is_some() && vfs.exists(&dir.join("db/queue_schema.rb")) {
         let queue_schema = dir.join("db/queue_schema.rb");
         if let Some(source) = read_or_ledger(vfs, &queue_schema)? {
             if let Some(queue) = unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &queue_schema.display().to_string(), expression_dialect))? {
+                queue_joined = true;
                 for (name, table) in queue.tables {
                     app.schema.tables.entry(name).or_insert(table);
                 }
@@ -1052,6 +1073,28 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     enum_constants.finish();
     model_bases.close_over(&base_pairs);
     model_bases.close_over_tableless();
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if !vfs.is_dir(&models_dir) {
+            continue;
+        }
+        for entry in read_rb_files(vfs, &models_dir)? {
+            let Ok(source) = vfs.read(&entry) else { continue };
+            model_bases.record_concrete(&source, &entry.display().to_string());
+        }
+    }
+    for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
+        let support_dir = dir.join(sub.as_str());
+        if !vfs.is_dir(&support_dir) {
+            continue;
+        }
+        let Ok(entries) = read_rb_files(vfs, &support_dir) else { continue };
+        for entry in entries {
+            let Ok(source) = vfs.read(&entry) else { continue };
+            model_bases.record_concrete(&source, &entry.display().to_string());
+        }
+    }
+    model_bases.close_over_concrete();
     // The `ActiveSupport.on_load` blocks `config/initializers` registers for a
     // name a model fires with `run_load_hooks` run inside that model's class
     // body, so they are read before the models (`ingest::load_hooks`), and
@@ -2236,6 +2279,8 @@ end
         let configurations = super::database_yml::database_configurations(&text, file);
         app.databases = configurations.databases;
         app.database_refusals.extend(configurations.refusals);
+        let joined = queue_joined.then_some("db/queue_schema.rb");
+        app.database_refusals.extend(named_schema.refusals(file, joined));
     }
 
     for root in &roots {
@@ -9439,18 +9484,19 @@ fn resolve_polymorphic_targets(app: &mut App) {
 /// The pass repeats so that a source association that is itself a
 /// `through:` gives its resolved class.
 /// An association's class named as Rails' `compute_type` finds it: from
-/// the model's own namespace outward (`belongs_to :job` in
-/// `SolidQueue::ClaimedExecution` is `SolidQueue::Job` when that model
-/// exists, else `Job`). Ingest names the target bare; a rooted
-/// `class_name: "::Job"` stays as written.
+/// the model's own name outward (`has_many :conditions` in `Rule` is
+/// `Rule::Condition` when that model exists; `belongs_to :job` in
+/// `SolidQueue::ClaimedExecution` is `SolidQueue::ClaimedExecution::Job`,
+/// then `SolidQueue::Job`, else `Job`), and one named for its own model
+/// (`belongs_to :article` in `Article`) the top-level class first. Ingest
+/// names the target bare; a rooted `class_name: "::Job"` names `Job`.
 fn resolve_namespaced_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
     let models: crate::det::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
         let owner = model.name.0.as_str().to_string();
-        let Some((namespace, _)) = owner.rsplit_once("::") else { continue };
         let scopes: Vec<String> = {
-            let parts: Vec<&str> = namespace.split("::").collect();
+            let parts: Vec<&str> = owner.split("::").collect();
             (1..=parts.len()).rev().map(|n| parts[..n].join("::")).collect()
         };
         for item in &mut model.body {
@@ -9463,7 +9509,13 @@ fn resolve_namespaced_targets(app: &mut App) {
                 | Association::HasAndBelongsToMany { target, .. } => target,
             };
             let written = target.0.as_str().to_string();
-            if written.starts_with("::") {
+            if let Some(top) = written.strip_prefix("::") {
+                *target = crate::ident::ClassId(crate::ident::Symbol::from(top));
+                continue;
+            }
+            // Rails' `_klass`: an association named for its own model (`belongs_to :article` in `Article`) tries
+            // the top-level class first.
+            if crate::naming::demodulize(&owner) == written && models.contains(&written) {
                 continue;
             }
             if let Some(found) = scopes.iter().map(|scope| format!("{scope}::{written}")).find(|name| models.contains(name)) {
@@ -14443,16 +14495,25 @@ fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::sch
 
 /// Use the ordinary schema readers for selection too. The normal primary schema
 /// pass remains the owner of its facts and diagnostics, including survey gaps.
-fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
-    let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
-        .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
+fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path, named: Option<&Result<(PathBuf, bool), ()>>) -> bool {
+    // A named file is read in the format it was resolved in (`.rb` alone has no extension).
+    let (path, sql) = match named {
+        Some(Ok((path, sql))) => (path.clone(), *sql),
+        Some(Err(())) => return false,
+        None => {
+            let Some(path) = ["db/schema.rb", "db/structure.sql"].iter()
+                .map(|name| dir.join(name)).find(|path| vfs.exists(path)) else { return false };
+            let sql = path.extension().is_none_or(|ext| ext != "rb");
+            (path, sql)
+        }
+    };
     let Ok(source) = vfs.read(&path) else { return false };
     let marks = (super::survey::mark(), super::prism::mark());
     let file = path.display().to_string();
-    let schema = if path.extension().is_some_and(|ext| ext == "rb") {
-        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
-    } else {
+    let schema = if sql {
         ingest_structure_sql(&source, &file)
+    } else {
+        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
     };
     let has_queue = schema.is_ok_and(|schema| schema.tables.contains_key(&Symbol::from("solid_queue_jobs")));
     super::survey::rewind(marks.0);

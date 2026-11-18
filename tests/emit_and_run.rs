@@ -22737,6 +22737,8 @@ mod concern_prepended_namespaced;
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;
+#[path = "emit_and_run/own_namespace_association.rs"]
+mod own_namespace_association;
 #[path = "emit_and_run/params_compact_blank.rs"]
 mod params_compact_blank;
 #[path = "emit_and_run/computed_partial_render.rs"]
