@@ -4,10 +4,6 @@
 
 use super::database_routes_contract as contract;
 
-fn section<'a>(stdout: &'a str, index: usize) -> &'a str {
-    stdout.split("--\n").nth(index).unwrap_or("")
-}
-
 /// `connects_to shards:`: the two-file reduction, nested shard and role
 /// blocks, restoration after a raise, a `return` and a `break`, the
 /// write guard on every mutation, lazy missing pools, two threads on
@@ -28,9 +24,11 @@ fn shards_route_to_their_own_files_natively() {
         contract::HANDLES_EXPECTED,
         contract::LEASE_EXPECTED,
     ];
+    let sections: Vec<_> = run.stdout.split("--\n").collect();
+    assert_eq!(sections.len(), expected.len(), "{}", run.stdout);
     for (index, expected) in expected.iter().enumerate() {
         assert_eq!(
-            contract::comparable(section(&run.stdout, index)),
+            contract::comparable(sections[index]),
             contract::comparable(expected),
             "section {index}\n{}\n{}",
             run.stdout,
