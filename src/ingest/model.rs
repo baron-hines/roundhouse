@@ -119,7 +119,10 @@ pub(super) fn ingest_model_with_enum_constants(
         {
             prefix = inherited.clone();
         }
-        format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))
+        // Rails' `compute_table_name`: a class nested in a concrete model takes that model's singular table first
+        // (`Rule::Condition` is `rule_conditions`; under `self.table_name = "entries"`, `entry_notes`). Not where the
+        // schema lacks the nested table: the bare name is what the tree held before.
+        nested_table(class_name.as_str(), &prefix, schema, model_bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str())))
     };
 
     let attributes = if let Some(table) = schema.tables.get(&Symbol::from(table_name.as_str())) {
@@ -4472,9 +4475,9 @@ fn parse_association(
             let Some(key) = symbol_value(&assoc.key()) else { continue };
             let value = assoc.value();
             match key.as_str() {
-                // `"::Portal"` names the top-level class `Portal`; kept as written it is a class no one defines.
+                // `"::Portal"` keeps its root until `resolve_namespaced_targets`, which looks nowhere else for it.
                 "class_name" => {
-                    class_name = string_value(&value).map(|s| s.trim_start_matches("::").to_string());
+                    class_name = string_value(&value);
                     // `class_name: Doorkeeper.config.access_token_class.to_s`: what the initializers leave it naming, once known.
                     if class_name.is_none()
                         && let Ok(expr) = ingest_expr(&value, file)
@@ -4737,6 +4740,24 @@ fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
 /// or subsequent write must not leave a plausible but incorrect row bound.
 /// Method and nested namespace bodies are separate scopes; their headers
 /// still execute in the enclosing scope and must not hide table writes.
+/// `name`'s table as Rails' `compute_table_name` gives a class nested in a concrete model, its parent's effective
+/// table singular in front (`Rule::Condition::Note` is `rule_condition_notes`), or `None` for the bare default.
+fn nested_table(name: &str, prefix: &str, schema: &Schema, bases: &super::library_class::ModelBases) -> Option<String> {
+    let (parent, _) = name.rsplit_once("::")?;
+    let parent_table = match bases.concrete_model_table(parent)? {
+        Some(declared) => declared.to_string(),
+        None => nested_table(parent, prefix, schema, bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(parent))),
+    };
+    let parent_table = parent_table.strip_prefix(prefix).unwrap_or(&parent_table);
+    let table = format!("{prefix}{}_{}", crate::naming::singularize(parent_table), crate::naming::rails_table_name(name));
+    schema.tables.contains_key(&Symbol::from(table.as_str())).then_some(table)
+}
+
+/// The table a class body declares (`self.table_name = "entries"`), read leniently for the model prepass.
+pub(super) fn table_name_decl(body: Node<'_>, file: &str) -> Option<String> {
+    parse_table_name_decl(body, file).ok().flatten().map(|(name, _)| name)
+}
+
 fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(String, usize)>> {
     struct Collector {
         direct: Vec<(usize, usize)>,
