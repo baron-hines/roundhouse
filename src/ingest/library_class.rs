@@ -2183,12 +2183,77 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
     )
 }
 
+/// The ivar and the parameter a member is held in: a predicate or bang member (`success?`) is not a name either can
+/// take.
+fn struct_slot(member: &Symbol) -> Symbol {
+    let name = member.as_str();
+    match (name.strip_suffix('?'), name.strip_suffix('!')) {
+        (Some(stem), _) => Symbol::from(format!("__q_{stem}")),
+        (_, Some(stem)) => Symbol::from(format!("__b_{stem}")),
+        _ => member.clone(),
+    }
+}
+
+/// A struct with a predicate or bang member (maybe's `Struct.new(:success?, :changes_made?, :error, keyword_init:
+/// true)`), its methods written as Ruby and read back: Struct's reader of each member; its writer, which Ruby spells
+/// `success?=` and only `send` can call, for the plain ones alone; and its constructor. A keyword one takes
+/// `**attrs`, since `success?:` is no parameter's name, and refuses an unknown keyword as Struct does.
+fn suffixed_struct_methods(base: &ClassId, members: &[Symbol], keyword_init: bool) -> Option<Vec<MethodDef>> {
+    let mut src = String::new();
+    for m in members {
+        let slot = struct_slot(m);
+        src.push_str(&format!("def {m}\n  @{slot}\nend\n"));
+        if slot == *m {
+            src.push_str(&format!("def {m}=(value)\n  @{slot} = value\nend\n"));
+        }
+    }
+    if keyword_init {
+        let keys = members.iter().map(|m| format!(":{m}")).collect::<Vec<_>>().join(", ");
+        src.push_str("def initialize(**attrs)\n");
+        src.push_str(&format!("  unknown = attrs.keys - [{keys}]\n"));
+        src.push_str("  raise ArgumentError, \"unknown keywords: #{unknown.join(\", \")}\" unless unknown.empty?\n");
+        for m in members {
+            src.push_str(&format!("  @{} = attrs.fetch(:{m}, nil)\n", struct_slot(m)));
+        }
+        src.push_str("end\n");
+    } else {
+        let params = members.iter().map(|m| format!("{} = nil", struct_slot(m))).collect::<Vec<_>>().join(", ");
+        src.push_str(&format!("def initialize({params})\n"));
+        for m in members {
+            let slot = struct_slot(m);
+            src.push_str(&format!("  @{slot} = {slot}\n"));
+        }
+        src.push_str("end\n");
+    }
+    let file = "(roundhouse)/struct_members.rb";
+    let result = super::prism::parse_silent(src.as_bytes());
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let mut methods = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let def = stmt.as_def_node()?;
+        let mut method = super::model::ingest_method(&def, file).ok()?;
+        method.enclosing_class = Some(base.0.clone());
+        if method.name.as_str() == "initialize" {
+            method.visibility = crate::dialect::MethodVisibility::Private;
+            method.mutates_self = true;
+        }
+        methods.push(method);
+    }
+    Some(methods)
+}
+
 fn struct_class(
     base: ClassId,
     members: &[Symbol],
     keyword_init: bool,
     origin: crate::dialect::LibraryClassOrigin,
 ) -> LibraryClass {
+    if members.iter().any(|m| struct_slot(m) != *m)
+        && let Some(methods) = suffixed_struct_methods(&base, members, keyword_init)
+    {
+        return struct_library_class(base, methods, origin);
+    }
     let mut methods = Vec::new();
     for m in members {
         methods.push(synth_attr_reader(&base, m, MethodReceiver::Instance));
@@ -2237,6 +2302,10 @@ fn struct_class(
         mutates_self: true,
         block_param: None,
     });
+    struct_library_class(base, methods, origin)
+}
+
+fn struct_library_class(base: ClassId, methods: Vec<MethodDef>, origin: crate::dialect::LibraryClassOrigin) -> LibraryClass {
     LibraryClass {
         name: base,
         is_module: false,
@@ -2303,14 +2372,19 @@ fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructCons
             continue;
         }
         let member = symbol_value(&arg)?;
-        // Not `success?` / `valid!`: the member is also the ivar and the constructor's parameter, which cannot carry the suffix.
-        if !member.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-            || !member.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || crate::emit::ruby::expr::is_ruby_keyword(&member)
+        // A trailing `?` / `!` is held under another name (`struct_slot`); any other character is no method's name.
+        let stem = member.strip_suffix(['?', '!']).unwrap_or(&member);
+        if !stem.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            || !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || crate::emit::ruby::expr::is_ruby_keyword(stem)
         {
             return None;
         }
         members.push(Symbol::from(member));
+    }
+    // Not one whose held name is another member's (`:success?` beside `:__q_success`): the two would share a slot.
+    if members.iter().any(|m| { let slot = struct_slot(m); slot != *m && members.contains(&slot) }) {
+        return None;
     }
     // The positional form too: since Ruby 3.2 it also takes keywords, which
     // the positional constructor would bind to its first member, so analysis
