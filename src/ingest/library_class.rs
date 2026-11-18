@@ -298,7 +298,8 @@ fn ingest_library_classes_impl(
     let mut out = Vec::new();
     // The outer class is the model walk's, but for the value classes its
     // body declares, which are classes of their own. One the walk below
-    // reaches anyway (a model nested in a module) takes them there.
+    // reaches anyway (a model nested in a module) takes them there,
+    // without walking the model's class itself.
     let is_outer = |scope: &[String], class: &ruby_prism::ClassNode<'_>| {
         nested_in.is_some_and(|outer| {
             class_name_path(class).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == outer)
@@ -314,26 +315,40 @@ fn ingest_library_classes_impl(
         .filter(|(scope, nesting, class)| walked(scope, nesting, class_name_path(class)))
         .map(|(scope, _, class)| (scope, class))
     {
-        let values = match is_outer(&scope, &class) {
+        let outer = is_outer(&scope, &class);
+        let values = match outer {
             true => model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file),
             false => Vec::new(),
         };
         // The value classes the model walk left to this one, each once.
         let fresh = |lc: &LibraryClass| !values.iter().any(|value| value.name == lc.name);
-        let (mut lc, struct_base) =
-            library_class_and_struct_base(&class, &scope, file).map_err(|err| super::error_site::at(err, &class.as_node()))?;
+        // The model's own class, which the model walk takes, isn't walked
+        // as a library class: with none of its synthesized methods in
+        // scope, an alias of one (`alias final? posted?` of an enum
+        // predicate) would refuse the file before the declarations its
+        // body nests register. What its body declares still is.
+        let (mut lc, struct_base) = match outer {
+            true => (None, None),
+            false => {
+                let (lc, base) = library_class_and_struct_base(&class, &scope, file)
+                    .map_err(|err| super::error_site::at(err, &class.as_node()))?;
+                (Some(lc), base)
+            }
+        };
         // BEFORE the class it serves: a superclass has to be defined
         // when the `class X < Y` line runs, and these two share a file.
         if let Some(base) = struct_base {
             out.push(base);
         }
-        let owner = lc.name.clone();
+        let owner = lc.as_ref().map_or_else(|| ClassId(Symbol::from(nested_in.unwrap_or_default())), |lc| lc.name.clone());
         let structs = struct_constant_classes(&owner, class.body(), file)?;
-        lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         let made = super::class_new_factory::constant_classes(Some(&owner), class.body(), file);
-        lc.constants.retain(|(name, _)| !made.iter().any(|(s, _)| s == name));
+        if let Some(lc) = lc.as_mut() {
+            lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
+            lc.constants.retain(|(name, _)| !made.iter().any(|(s, _)| s == name));
+        }
         out.extend(super::data_factory::collect(class.body(), &owner, file)?.into_iter().filter(|c| fresh(c)));
-        out.push(lc);
+        out.extend(lc);
         out.extend(data_block_classes(class.body(), &owner, file)?.into_iter().filter(|c| fresh(c)));
         // Not before the owner: the struct is named under it, so the owner has to exist first.
         out.extend(structs.into_iter().map(|(_, s)| s).filter(|c| fresh(c)));
