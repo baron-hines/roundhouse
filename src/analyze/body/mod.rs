@@ -1710,11 +1710,26 @@ impl<'a> BodyTyper<'a> {
                 with_modules(&inner, classes, order);
             }
         }
-        let mut order: Vec<ClassId> = Vec::new();
+        let mut chain: Vec<ClassId> = Vec::new();
         let mut current = Some(id.clone());
-        while let Some(c) = current.filter(|c| !order.contains(c)) {
-            with_modules(&c, classes, &mut order);
+        while let Some(c) = current.filter(|c| !chain.contains(c)) {
+            chain.push(c.clone());
             current = classes.get(&c).and_then(|i| i.parent.clone());
+        }
+        // A module a superclass also includes sits at that superclass's position, as Ruby's ancestors skip it below.
+        let mut order: Vec<ClassId> = Vec::new();
+        for (i, c) in chain.iter().enumerate() {
+            let mut below: Vec<ClassId> = Vec::new();
+            for above in &chain[i + 1..] {
+                with_modules(above, classes, &mut below);
+            }
+            let mut own: Vec<ClassId> = Vec::new();
+            with_modules(c, classes, &mut own);
+            for m in own {
+                if (m == *c || !below.contains(&m)) && !order.contains(&m) {
+                    order.push(m);
+                }
+            }
         }
         for owner in order {
             let full = format!("{}::{}", owner.0.as_str(), name.as_str());

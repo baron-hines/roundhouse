@@ -44,6 +44,11 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
             names.rewrite_parent(&class.name, parent, class.parent_span);
         }
     }
+    for model in &mut app.models {
+        if let Some(parent) = &mut model.parent {
+            names.rewrite_parent(&model.name, parent, model.parent_span);
+        }
+    }
     let parents: crate::det::HashMap<String, String> = app
         .library_classes
         .iter()
@@ -311,17 +316,31 @@ fn ancestor_constant(
     if written.contains("::") {
         return None;
     }
+
     let mut seen = crate::det::HashSet::default();
     let mut current = Some(owner.to_string());
+    let mut found = None;
     while let Some(class) = current {
         if !seen.insert(class.clone()) {
             break;
         }
         let candidate = format!("{class}::{written}");
         if declared.contains(&candidate) {
-            return Some(candidate);
+            found = Some(candidate);
+            break;
         }
         current = parents.get(&class).cloned();
     }
-    None
+    // Not where an enclosing namespace declares another of the name: `module N; class C` reads `N::M` first and a
+    // compact `class N::C` does not, which the class's name alone cannot tell.
+    let found = found?;
+    let mut prefix = owner;
+    while let Some((outer, _)) = prefix.rsplit_once("::") {
+        let lexical = format!("{outer}::{written}");
+        if declared.contains(&lexical) && lexical != found {
+            return None;
+        }
+        prefix = outer;
+    }
+    Some(found)
 }
