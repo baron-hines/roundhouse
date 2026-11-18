@@ -22,7 +22,9 @@ require "vips"
 if !defined?(VipsExt)
   module VipsExt
     extend FFI::Library
-    ffi_lib FFI.library_name("vips", 42)
+    # Literal candidates: Spinel folds them at compile time, and the ffi
+    # gem loads the first that opens.
+    ffi_lib ["libvips.so.42", "libvips.42.dylib", "vips"]
     attach_function :sp_vips_find_load, :vips_foreign_find_load, [:string], :string
     attach_function :sp_vips_find_load_buffer, :vips_foreign_find_load_buffer, [:pointer, :size_t], :string
   end
