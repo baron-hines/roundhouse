@@ -265,7 +265,7 @@ fn unmodeled_computed_partial_renders(app: &App) -> Vec<Diagnostic> {
                 && !matches!(&*v.node, ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. })
         })
     }
-    fn visit(e: &Expr, out: &mut Vec<Diagnostic>) {
+    fn visit(e: &Expr, unreachable: bool, out: &mut Vec<Diagnostic>) {
         if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
             && method.as_str() == "render"
             && !e.span.is_synthetic()
@@ -273,13 +273,18 @@ fn unmodeled_computed_partial_renders(app: &App) -> Vec<Diagnostic> {
             && classify_render_partial(None, method.as_str(), args, None, &|_| true, &|_| true).is_none()
         {
             let why = "the partial's name is computed when the page renders, and the lowering dispatches a runtime name only over the partials a controller assigns an ivar";
-            out.push(Diagnostic::unsupported(e.span, None, "render of a computed partial", why));
+            let mut d = Diagnostic::unsupported(e.span, None, "render of a computed partial", why);
+            // A template no request reaches keeps it as a warning, as the other render reports do.
+            if unreachable {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
         }
-        e.node.for_each_child(&mut |c| visit(c, out));
+        e.node.for_each_child(&mut |c| visit(c, unreachable, out));
     }
     let mut out = Vec::new();
     for view in &app.views {
-        visit(&view.body, &mut out);
+        visit(&view.body, app.unreachable_views.contains(&view.name), &mut out);
     }
     out
 }

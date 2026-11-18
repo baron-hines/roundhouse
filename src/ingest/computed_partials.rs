@@ -179,7 +179,7 @@ fn pool(computed: &Expr, dir: &str, partials: &[String], helpers: &crate::det::H
                 };
                 partials
                     .iter()
-                    .filter(|p| p.len() > head.len() + tail.len() && p.starts_with(head.as_str()) && p.ends_with(tail))
+                    .filter(|p| p.len() >= head.len() + tail.len() && p.starts_with(head.as_str()) && p.ends_with(tail))
                     .map(|p| (p.clone(), p.clone()))
                     .collect()
             }
@@ -204,13 +204,23 @@ fn early_returns<'a>(body: &'a Expr, out: &mut Vec<&'a Expr>) -> Option<()> {
                     *ok = false;
                 }
             }
-            // Not a block's or a lambda's: their `return` or `next` is not the helper's value.
-            ExprNode::Lambda { .. } => {}
+            // A block's `return` leaves the helper, a lambda's only the lambda, and the IR spells both alike: neither is read.
+            ExprNode::Lambda { body, .. } => {
+                if contains_return(body) {
+                    *ok = false;
+                }
+            }
             _ => e.node.for_each_child(&mut |c| visit(c, out, ok)),
         }
     }
     visit(body, out, &mut ok);
     ok.then_some(())
+}
+
+fn contains_return(e: &Expr) -> bool {
+    let mut found = matches!(&*e.node, ExprNode::Return { .. });
+    e.node.for_each_child(&mut |c| found = found || contains_return(c));
+    found
 }
 
 /// Every value `body` may answer, leaving out what raises; `None` past a shape whose value is not read here.
