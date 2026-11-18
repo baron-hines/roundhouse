@@ -1480,7 +1480,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("exist?", Ty::Bool), ("file?", Ty::Bool), ("directory?", Ty::Bool),
         ("zero?", Ty::Bool), ("empty?", Ty::Bool),
     ], &[]);
-    register_stdlib_class(classes, "Marshal", &[("dump", Ty::Str), ("load", Ty::Untyped), ("restore", Ty::Untyped)], &[]);
+    // (`dump` untyped: given an IO it writes there and answers the IO, not the bytes)
+    register_stdlib_class(classes, "Marshal", &[("dump", Ty::Untyped), ("load", Ty::Untyped), ("restore", Ty::Untyped)], &[]);
     for module in ["Signal", "FileTest", "Marshal"] {
         classes.entry(ClassId(Symbol::from(module))).or_default().is_module = true;
     }

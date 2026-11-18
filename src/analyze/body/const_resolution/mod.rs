@@ -1396,6 +1396,43 @@ fn answer_file(
             }
         }
     }
+    // `extend Plugs::Basic` in a file-level block (`Version.class_eval do … end`): the index records a mixin only in
+    // a namespace's body, so it keeps the path's `Plugs` and drops `Basic`. A name after a resolved namespace is that
+    // namespace's own, as `Plugs::Basic` is anywhere; only a class or module there is taken.
+    let namespaces: Vec<(u32, Arc<ClassId>)> = answers.references.iter()
+        .filter_map(|(key, answer)| match answer {
+            Some(ResolvedConstant::Namespace { class, .. }) => Some((*key, Arc::clone(class))),
+            _ => None,
+        })
+        .collect();
+    let ident_len = |at: usize| source.text.get(at..).map_or(0, |rest| rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count());
+    for (start, class) in namespaces {
+        let mut owner = class.0.to_string();
+        let mut end = start as usize + ident_len(start as usize);
+        while source.text.get(end..end + 2) == Some("::") {
+            let at = end + 2;
+            let len = ident_len(at);
+            let Some(name) = source.text.get(at..at + len).filter(|n| n.starts_with(|c: char| c.is_ascii_uppercase())) else { break };
+            let Ok(key) = u32::try_from(at) else { break };
+            if answers.references.contains_key(&key) {
+                break;
+            }
+            let full = format!("{owner}::{name}");
+            let Some(declaration) = graph.declarations().get(&DeclarationId::from(full.as_str())) else { break };
+            if declaration.as_namespace().is_none() || is_assigned_value(graph, declaration) {
+                break;
+            }
+            if declaration.kind() == "Class" {
+                answers.class_references.insert(key);
+            }
+            answers.references.insert(key, Some(ResolvedConstant::Namespace {
+                class: Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
+                runtime: is_runtime_declaration(graph, declaration),
+            }));
+            owner = full;
+            end = at + len;
+        }
+    }
     for definition_id in document.definitions() {
         let definition = graph.definitions().get(definition_id);
         if let Some(definition @ (Definition::Class(_) | Definition::Module(_))) = definition
