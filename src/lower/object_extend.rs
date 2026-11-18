@@ -100,15 +100,15 @@ pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     diags
 }
 
-/// `def self.extended(base); base.extend(Api); end` (version_gem's Basic): Ruby hands a mixin hook the class or
-/// module it mixes into, so its parameter's `extend` is that class's, as `Foo.extend Api` is.
+/// `def self.extended(base); base.extend(Api); end` (version_gem's Basic): Ruby hands the hook the class or module
+/// that extends it, so its parameter's `extend` is that class's, as `Foo.extend Api` is.
 fn mark_hook_bases(app: &mut App) {
     fn mark(e: &mut Expr, base: &Symbol) {
         if let ExprNode::Send { recv: Some(recv), method, .. } = &mut *e.node
             && method.as_str() == "extend"
             && var_is(recv, base)
         {
-            recv.decisions |= crate::expr::CLASS_OBJECT_VALUE;
+            recv.decisions |= crate::expr::MIXIN_HOOK_BASE;
         }
         e.node.for_each_child_mut(&mut |c| mark(c, base));
     }
@@ -117,8 +117,9 @@ fn mark_hook_bases(app: &mut App) {
             continue;
         }
         for m in &mut lc.methods {
+            // (not `included`: ingest carries an included hook's `base.extend(ClassMethods)` as the includer's class methods)
             if m.receiver != MethodReceiver::Class
-                || !matches!(m.name.as_str(), "included" | "extended" | "prepended")
+                || m.name.as_str() != "extended"
                 || m.params.len() != 1
             {
                 continue;
@@ -791,7 +792,7 @@ fn instance_extend(expr: &Expr) -> Option<(&Expr, ())> {
     if method.as_str() != "extend" {
         return None;
     }
-    if matches!(&*recv.node, ExprNode::Const { .. } | ExprNode::SelfRef) || recv.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 {
+    if matches!(&*recv.node, ExprNode::Const { .. } | ExprNode::SelfRef) || recv.decisions & crate::expr::MIXIN_HOOK_BASE != 0 {
         return None;
     }
     Some((recv, ()))

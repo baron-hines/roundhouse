@@ -9916,7 +9916,7 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
         let info = classes.entry(id).or_default();
         info.class_method_extensions.extend(extensions);
         for module in hooked {
-            if !info.class_method_extensions.contains(&module) { info.class_method_extensions.push(module); }
+            if !info.hook_extensions.contains(&module) { info.hook_extensions.push(module); }
         }
         info.class_side_hook_methods.extend(installed);
         info.unknown_class_side_hook |= crate::ingest::unconsumed_class_side_hook(&includes, app, &by_name).is_some();

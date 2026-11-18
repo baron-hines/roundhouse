@@ -246,6 +246,9 @@ pub struct ClassInfo {
     pub class_side_hook_methods: crate::det::HashSet<Symbol>,
     /// Explicit extensions contribute instance methods to singleton dispatch.
     pub class_method_extensions: Vec<ClassId>,
+    /// The modules a mixin hook `extend`s this class with (version_gem's `base.extend(Api)`): their methods run
+    /// with this class as self. Not in `class_method_extensions`: what the hook installs is `class_side_hook_methods`.
+    pub hook_extensions: Vec<ClassId>,
     pub primary_key: Option<Symbol>,
     /// The model declares a `default_scope` the runtime Relation applies
     /// (`lower::default_scope`): a query on it must not be folded to SQL
@@ -1718,7 +1721,7 @@ impl<'a> BodyTyper<'a> {
         if !classes.get(id).is_some_and(|c| c.is_module) {
             return false;
         }
-        let extended = classes.values().any(|c| c.class_method_extensions.contains(id));
+        let extended = classes.values().any(|c| c.class_method_extensions.contains(id) || c.hook_extensions.contains(id));
         extended && !classes.values().any(|c| c.includes.contains(id))
     }
 
