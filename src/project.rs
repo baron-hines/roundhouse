@@ -9567,6 +9567,12 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "RegexpError" | "Comparable" | "Enumerable"
         | "LoadError" | "Proc" | "Range" | "Method" | "Gem::Version"
+        // Ruby's and spinel's (`lib/sp_exc.c`) own; no strict runtime raises or rescues them.
+        | "ScriptError" | "SyntaxError" | "SystemExit" | "SignalException" | "Interrupt"
+        | "NoMemoryError" | "SecurityError" | "SystemStackError"
+        | "Encoding::UndefinedConversionError" | "Encoding::InvalidByteSequenceError"
+        | "Encoding::ConverterNotFoundError"
+        | "Signal" | "FileTest" | "Marshal" | "Fiber"
         // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
         | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
@@ -10170,6 +10176,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 target,
                 "bundled_constant",
                 format!("Zlib::{flag} is a bundled zlib constant, which the {target} runtime does not supply"),
+            );
+        }
+        // A Hash value, so the class/module gate does not see it either.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["RbConfig", "CONFIG"])
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("RbConfig::CONFIG is the running Ruby's build configuration, which the {target} runtime does not supply"),
             );
         }
         // A Hash value, so the class/module gate does not see it either.
