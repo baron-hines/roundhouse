@@ -5039,10 +5039,12 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         "key?" | "has_key?" | "include?" | "member?" | "present?" | "blank?" | "empty?" | "any?"
         | "all?" | "none?" | "nil?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "=="
         | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
+        // Rails' `to_h` answers a Hash with indifferent access whatever the Parameters held.
+        "to_h" | "to_unsafe_h" if block_ret.is_none() => crate::analyze::indifferent::of(pv()),
         "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
         | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
-        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require"
-        | "with_defaults" | "with_defaults!" | "reverse_merge" | "reverse_merge!" => pv(),
+        | "merge" | "except" | "slice" | "permit" | "permit!" | "require"
+        | "with_defaults" | "with_defaults!" | "reverse_merge" | "reverse_merge!" | "to_h" | "to_unsafe_h" => pv(),
         "map" | "collect" | "flat_map" | "filter_map" => {
             Ty::Array { elem: std::sync::Arc::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
         }
