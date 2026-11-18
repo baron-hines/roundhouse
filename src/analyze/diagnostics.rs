@@ -253,6 +253,42 @@ pub(crate) fn datetime_local_time_reads(app: &App) -> Vec<crate::span::Span> {
 /// reading (or passed) its dir-convention record local, would see the
 /// body there. Those are refused, as is any other block-form render
 /// (`render partial: "x", locals: … do` raises in Rails).
+/// A view's `render partial: <computed>` (maybe's `render partial: permitted_import_configuration_path(@import)`): the
+/// lowering dispatches a runtime name only over the pool a controller assigns an ivar, so this one was emitted as a bare
+/// `render(…)` in the view's module, which has no such method, and the page raised.
+fn unmodeled_computed_partial_renders(app: &App) -> Vec<Diagnostic> {
+    use crate::lower::view::classify_render_partial;
+    fn computed(args: &[Expr]) -> bool {
+        let Some(ExprNode::Hash { entries, .. }) = args.first().map(|a| &*a.node) else { return false };
+        entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "partial")
+                && !matches!(&*v.node, ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. })
+        })
+    }
+    fn visit(e: &Expr, unreachable: bool, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+            && method.as_str() == "render"
+            && !e.span.is_synthetic()
+            && computed(args)
+            && classify_render_partial(None, method.as_str(), args, None, &|_| true, &|_| true).is_none()
+        {
+            let why = "the partial's name is computed when the page renders, and the lowering dispatches a runtime name only over the partials a controller assigns an ivar";
+            let mut d = Diagnostic::unsupported(e.span, None, "render of a computed partial", why);
+            // A template no request reaches keeps it as a warning, as the other render reports do.
+            if unreachable {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
+        }
+        e.node.for_each_child(&mut |c| visit(c, unreachable, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(&view.body, app.unreachable_views.contains(&view.name), &mut out);
+    }
+    out
+}
+
 /// A view's `render` of an object (`render(Widget.new)`) that is not known to render itself: Rails asks the object to
 /// (`render_in(view_context)`), which only `lower::renderable` models, for an object typed as answering it. Left alone it was emitted as a bare `render(…)` in the
 /// view's module, which has no such method, so it raised when the page rendered.
@@ -1030,6 +1066,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(super::alba::diagnose(app));
     out.extend(unmodeled_block_renders(app));
     out.extend(unmodeled_object_renders(app));
+    out.extend(unmodeled_computed_partial_renders(app));
     out.extend(crate::gems::extension_gem_refusals(app, None));
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.

@@ -9735,7 +9735,9 @@ pub(crate) fn source_finder_classes(app: &App, resolver: &ConstResolver) -> Hash
         let mut info = crate::analyze::ClassInfo::default();
         info.parent = model.parent.clone();
         info.attributes = model.attributes.clone();
-        info.includes = model_includes(model);
+        // A prepended module's methods answer on the model too, ahead of
+        // its own; a callback it registers names them.
+        info.includes = model_mixins(model);
         info.source_instance_methods = model.methods().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name.clone()).collect();
         info.unresolved_include = model.body.iter().any(|item| matches!(item,
             ModelBodyItem::Unknown { expr, .. } if matches!(expr.diagnostic(),
@@ -9822,16 +9824,27 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
         }
         out
     }
-    fn hook_methods(includes: &[ClassId], hook: &str, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>) -> crate::det::HashSet<Symbol> {
-        fn body(expr: &Expr, target: &Symbol, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>) -> Option<crate::det::HashSet<Symbol>> {
+    // `extended` gathers the modules a hook `extend`s its argument with (version_gem's `base.extend(Api)`).
+    fn hook_methods(includes: &[ClassId], hook: &str, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>, extended: &mut Vec<ClassId>) -> crate::det::HashSet<Symbol> {
+        fn body(expr: &Expr, target: &Symbol, app: &App, by_name: &crate::ingest::LibraryClassesByName, resolver: &ConstResolver, seen: &mut crate::det::HashSet<(ClassId, String)>, extended: &mut Vec<ClassId>) -> Option<crate::det::HashSet<Symbol>> {
+            fn raises_or_nothing(e: &Expr) -> bool {
+                match &*e.node {
+                    ExprNode::Raise { .. } | ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+                    ExprNode::Send { recv: None, method, .. } => method.as_str() == "raise",
+                    ExprNode::Seq { exprs } => exprs.iter().all(raises_or_nothing),
+                    _ => false,
+                }
+            }
             let mut methods = crate::det::HashSet::default();
             match &*expr.node {
                 ExprNode::Seq { exprs } => for expr in exprs {
-                    methods.extend(body(expr, target, app, by_name, resolver, seen)?);
+                    methods.extend(body(expr, target, app, by_name, resolver, seen, extended)?);
                     if matches!(&*expr.node, ExprNode::Return { .. }) { break; }
                 },
-                ExprNode::Return { value } => return body(value, target, app, by_name, resolver, seen),
+                ExprNode::Return { value } => return body(value, target, app, by_name, resolver, seen, extended),
                 ExprNode::Lit { .. } => {},
+                // `raise Error, "…" unless defined?(base::VERSION)`: a guard installs nothing on the paths that go on.
+                ExprNode::If { then_branch, else_branch, .. } if raises_or_nothing(then_branch) && raises_or_nothing(else_branch) => {},
                 ExprNode::Send { recv: Some(recv), method, args, block, .. }
                     if matches!(&*recv.node, ExprNode::Var { name, .. } if name == target) => {
                     if method.as_str() == "define_singleton_method" && block.is_some() && args.len() == 1 {
@@ -9843,7 +9856,8 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
                             let ExprNode::Const { path } = &*arg.node else { return None };
                             modules.push(resolver.namespace(arg.span, path).cloned().unwrap_or_else(|| mixin_path_id(path)));
                         }
-                        methods.extend(hook_methods(&modules, if method.as_str() == "include" { "included" } else { "extended" }, app, by_name, resolver, seen));
+                        if method.as_str() == "extend" { extended.extend(modules.iter().cloned()); }
+                        methods.extend(hook_methods(&modules, if method.as_str() == "include" { "included" } else { "extended" }, app, by_name, resolver, seen, extended));
                     } else { return None; }
                 },
                 _ => return None,
@@ -9859,7 +9873,11 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
                 .flat_map(|class| class.methods.iter().rev())
                 .find(|method| method.receiver == MethodReceiver::Class && method.name.as_str() == hook && method.params.len() == 1)
             {
-                if let Some(installed) = body(&method.body, &method.params[0].name, app, by_name, resolver, seen) { methods.extend(installed); }
+                let mut found = Vec::new();
+                if let Some(installed) = body(&method.body, &method.params[0].name, app, by_name, resolver, seen, &mut found) {
+                    methods.extend(installed);
+                    extended.extend(found);
+                }
             }
         }
         methods
@@ -9869,13 +9887,37 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
         (model.name.clone(), model_includes(model), extensions(exprs, resolver))
     }).chain(app.library_classes.iter().map(|class|
         (class.name.clone(), class.includes.clone(), extensions(class.unknown_calls.iter(), resolver))));
+    // `Pinned::Version.extend(Pinned::Basic)` as a gem file loads (version_gem's pinning, its `class_eval` block
+    // as calls): the receiver's own extension, as the statement in its body would be.
+    let mut loaded: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for program in &app.file_programs {
+        for item in &program.items {
+            let crate::app::ProgramItem::Statement(e) = item else { continue };
+            let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { continue };
+            let ExprNode::Const { path } = &*recv.node else { continue };
+            if method.as_str() != "extend" { continue; }
+            let Some(owner) = resolver.namespace(recv.span, path).cloned() else { continue };
+            for arg in args.iter().rev() {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                loaded.entry(owner.clone()).or_default().push(resolver.namespace(arg.span, path).cloned().unwrap_or_else(|| mixin_path_id(path)));
+            }
+        }
+    }
+    let declarations: Vec<_> = declarations.map(|(id, includes, mut extensions)| {
+        if let Some(more) = loaded.get(&id) { extensions.extend(more.iter().cloned()); }
+        (id, includes, extensions)
+    }).collect();
     let by_name = crate::ingest::library_classes_by_name(app);
     for (id, mut includes, extensions) in declarations {
-        let mut installed = hook_methods(&includes, "included", app, &by_name, resolver, &mut crate::det::HashSet::default());
-        installed.extend(hook_methods(&extensions, "extended", app, &by_name, resolver, &mut crate::det::HashSet::default()));
+        let mut hooked = Vec::new();
+        let mut installed = hook_methods(&includes, "included", app, &by_name, resolver, &mut crate::det::HashSet::default(), &mut hooked);
+        installed.extend(hook_methods(&extensions, "extended", app, &by_name, resolver, &mut crate::det::HashSet::default(), &mut hooked));
         includes.extend(extensions.iter().cloned());
         let info = classes.entry(id).or_default();
         info.class_method_extensions.extend(extensions);
+        for module in hooked {
+            if !info.hook_extensions.contains(&module) { info.hook_extensions.push(module); }
+        }
         info.class_side_hook_methods.extend(installed);
         info.unknown_class_side_hook |= crate::ingest::unconsumed_class_side_hook(&includes, app, &by_name).is_some();
     }
@@ -9883,6 +9925,94 @@ pub(crate) fn record_class_side_ownership(classes: &mut HashMap<ClassId, ClassIn
 
 pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
     body_includes(&model.body)
+}
+
+/// The modules a model's body `prepend`s, in lookup order: their instance
+/// methods sit AHEAD of the model's own (reaching them through `super`),
+/// where an `include`d module's sit behind. Ruby prepends each statement's
+/// modules ahead of everything already there, so the statements are read
+/// oldest-first with each one's modules moved to the front, while a
+/// multi-argument statement keeps its arguments in written order
+/// (`prepend A, B` gives `[A, B, K]`).
+///
+/// A module already prepended by an earlier statement — or by an earlier
+/// argument of the same one — is a no-op, as Ruby's `prepend_features`
+/// leaves a module the ancestors already hold where it is: `prepend A;
+/// prepend B; prepend A` is `[B, A, K]`, NOT `[A, B, K]` and not
+/// `[A, B, A, K]`. Reading the statements newest-first cannot express
+/// that (it would put the repeated A ahead of B), so the list is built in
+/// source order.
+pub(crate) fn model_prepends(model: &crate::dialect::Model) -> Vec<ClassId> {
+    let mut out: Vec<ClassId> = Vec::new();
+    for item in &model.body {
+        let mut ahead: Vec<ClassId> = Vec::new();
+        for id in mixes_in(std::slice::from_ref(item), "prepend", None) {
+            if out.contains(&id) || ahead.contains(&id) {
+                continue;
+            }
+            ahead.push(id);
+        }
+        ahead.extend(out);
+        out = ahead;
+    }
+    out
+}
+
+/// The prepends this program WRITES back: a `prepend Concern` statement
+/// the concern splice claimed and carried the module's `prepended do`
+/// items from ([`crate::expr::CONCERN_PREPEND`]), so the emitted class
+/// loads the module and says `prepend` in its body. A `prepend` the
+/// splice did not claim names no module this program defines, and stays
+/// the reported gap the lowering gives it.
+///
+/// One entry per source statement, arguments in written order: the emit
+/// writes each entry as ONE statement: a multi-argument `prepend A, B`
+/// split into two `prepend`s would give `[B, A, K]` instead of
+/// `[A, B, K]`.
+///
+/// `concerns` is the set the splice resolved the statement against
+/// ([`crate::App::concern_prepended_items`]), so a path written relative
+/// to the model (`module Ns; class Post < ApplicationRecord; prepend
+/// Audit`) names the module it resolved to there (`Ns::Audit`) rather
+/// than the bare `Audit` its file does not define: the emitted `require`
+/// loads the file that actually holds the module.
+pub(crate) fn claimed_prepend_statements<V>(
+    model: &crate::dialect::Model,
+    concerns: &HashMap<ClassId, V>,
+) -> Vec<Vec<ClassId>> {
+    let mut out = Vec::new();
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if expr.decisions & crate::expr::CONCERN_PREPEND == 0 {
+            continue;
+        }
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        if method.as_str() != "prepend" {
+            continue;
+        }
+        let ids: Vec<ClassId> = args
+            .iter()
+            .filter_map(|arg| match &*arg.node {
+                ExprNode::Const { path } => {
+                    Some(crate::ingest::app::concern_named(model.name.0.as_str(), path, concerns))
+                }
+                _ => None,
+            })
+            .collect();
+        if !ids.is_empty() {
+            out.push(ids);
+        }
+    }
+    out
+}
+
+/// The modules a model's body mixes in, in lookup order: the ones it
+/// prepends, then the ones it includes. What an instance of the model
+/// answers through a mixin, in the order Ruby asks them.
+pub(crate) fn model_mixins(model: &crate::dialect::Model) -> Vec<ClassId> {
+    let mut out = model_prepends(model);
+    out.extend(model_includes(model));
+    out
 }
 
 /// `model_includes` with relative mixin paths resolved from the model.
@@ -9912,11 +10042,21 @@ fn includes_from_body(
     body: &[ModelBodyItem],
     resolve: Option<(&ClassId, &HashMap<ClassId, ()>)>,
 ) -> Vec<ClassId> {
+    mixes_in(body, "include", resolve)
+}
+
+/// The `method X` mixins a class body names, with the framework marker
+/// mixins dropped (see [`includes_from_body`]).
+fn mixes_in(
+    body: &[ModelBodyItem],
+    method_wanted: &str,
+    resolve: Option<(&ClassId, &HashMap<ClassId, ()>)>,
+) -> Vec<ClassId> {
     let mut out = Vec::new();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-        if method.as_str() != "include" {
+        if method.as_str() != method_wanted {
             continue;
         }
         for arg in args {

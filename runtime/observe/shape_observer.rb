@@ -60,12 +60,29 @@ module RoundhouseShapeObserver
 
     # The statement, or the conditional around it when that holds it alone, has no `else` and only asks the class (`unless klass.const_defined?(c)`).
     def widened(stmt, path)
+      # Not only the statement: the `class_eval do end` left around it still runs a block on a class held in self.
+      stmt = enclosing_eval(parse(path).value, stmt) || stmt
       parent = enclosing_conditional(parse(path).value, stmt)
       return stmt unless parent
       only = parent.statements&.body&.size == 1
       bare = parent.respond_to?(:subsequent) ? parent.subsequent.nil? : parent.else_clause.nil?
       pure = parent.predicate.is_a?(Prism::CallNode) && PURE.include?(parent.predicate.name)
       only && bare && pure ? parent : stmt
+    end
+
+    EVALS = %i[class_eval module_eval class_exec module_exec].freeze
+
+    def enclosing_eval(node, stmt)
+      node.compact_child_nodes.each do |child|
+        if child.is_a?(Prism::CallNode) && EVALS.include?(child.name) && (child.receiver.nil? || child.receiver.is_a?(Prism::SelfNode)) &&
+           child.arguments.nil? && child.block.is_a?(Prism::BlockNode) && child.block.body.is_a?(Prism::StatementsNode) &&
+           child.block.body.body.size == 1 && child.block.body.body[0].location.start_offset == stmt.location.start_offset
+          return child
+        end
+        found = enclosing_eval(child, stmt)
+        return found if found
+      end
+      nil
     end
 
     def enclosing_conditional(node, stmt)
@@ -230,7 +247,16 @@ module RoundhouseShapeObserver
       @effects.each do |e|
         refuse("#{e["site"]} changes a class that is not the app's too") if e["site"] && @sites.fetch(e["site"], []).include?(false)
       end
-      File.write(OUT, JSON.pretty_generate({ "effects" => @effects, "refusals" => @refusals.uniq }))
+      File.write(OUT, JSON.pretty_generate({ "effects" => @effects, "refusals" => @refusals.uniq, "loaded" => loaded }))
+    end
+
+    # Not only the files a gem requires by a literal name: one it builds (aasm's `require_persistence`) loads others.
+    def loaded
+      $LOADED_FEATURES.filter_map do |f|
+        path = File.realpath(f) rescue next
+        root = GEMS.find { |g| path.start_with?("#{g}/") }
+        File.basename(root) + path[root.size..] if root && path.end_with?(".rb")
+      end.uniq.sort
     end
   end
 
@@ -262,10 +288,9 @@ module RoundhouseShapeObserver
       end
     end
 
+    # Not recorded, only its site noted: the observation is the Spinel tree's, which defines no ruby2_keywords and passes keywords as written.
     def ruby2_keywords(*names)
-      site = RoundhouseShapeObserver.gem_site
-      RoundhouseShapeObserver.note_site(site, self)
-      names.each { |n| RoundhouseShapeObserver.record(self, "ruby2_keywords :#{n}", "ruby2_keywords :#{n}", site) }
+      RoundhouseShapeObserver.note_site(RoundhouseShapeObserver.gem_site, self)
       super
     end
 

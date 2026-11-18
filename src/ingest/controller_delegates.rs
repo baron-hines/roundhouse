@@ -54,6 +54,7 @@ pub(super) fn expand(app: &mut App) {
             &crate::det::HashSet::default(),
             sources,
             &[],
+            false,
         );
         if forwarders.is_empty() {
             continue;

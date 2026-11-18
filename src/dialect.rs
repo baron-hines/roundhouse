@@ -551,6 +551,12 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `inverse_of: :author` as written (not `false` or `nil`). Rails
+        /// derives a defaulted foreign key from the inverse association
+        /// (`derive_foreign_key`), which app assembly does once every
+        /// model is ingested (`resolve_inverse_foreign_keys`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasOne {
         name: Symbol,
@@ -597,6 +603,9 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// See `HasMany::inverse_of`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasAndBelongsToMany {
         name: Symbol,
@@ -1280,9 +1289,24 @@ impl LibraryClass {
     /// file-level `X = Data.define(…)` creates.
     pub fn data_define(&self) -> Option<(&[Symbol], Span)> {
         match &self.origin {
-            Some(LibraryClassOrigin::DataDefine { members, span }) => Some((members, *span)),
+            Some(LibraryClassOrigin::DataDefine { members, span, .. }) => Some((members, *span)),
             _ => None,
         }
+    }
+
+    pub(crate) fn data_class_constant(&self, index: usize) -> bool {
+        matches!(&self.origin, Some(LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) if index >= *start)
+    }
+
+    pub(crate) fn data_constructor_visibility(&self) -> Option<Span> {
+        self.data_define()?;
+        self.unknown_calls.iter().find(|call| {
+            let ExprNode::Send { method, args, .. } = &*call.node else { return false };
+            let class_side = method.as_str() == "private_class_method"
+                || (call.decisions & crate::expr::SINGLETON_BODY != 0 && method.as_str() == "private");
+            class_side && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if matches!(value.as_str(), "new" | "[]" | "allocate")))
+        }).map(|call| call.span)
     }
 
     /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
@@ -1414,6 +1438,8 @@ pub enum LibraryClassOrigin {
     DataDefine {
         members: Vec<Symbol>,
         span: Span,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class_constant_start: Option<usize>,
     },
     /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
     Oj,

@@ -1096,6 +1096,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 {
             continue;
         }
+        // `prepend Concern`: the concern splice carried the module's
+        // `prepended do` items here and the Ruby emit writes the line.
+        if expr.decisions & crate::expr::CONCERN_PREPEND != 0 {
+            continue;
+        }
         // `connects_to` / `establish_connection`: the model's database,
         // decided (or refused) by `ingest::database_ownership`.
         if crate::ingest::database_ownership::claims_model_statement(expr) {

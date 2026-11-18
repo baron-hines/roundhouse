@@ -1042,6 +1042,9 @@ RailsOracle.activate('railties', 'activerecord', sqlite3: '>= 2.9')
 require 'rails'
 require 'active_record/railtie'
 require 'tmpdir'
+require 'fileutils'
+ORACLE_ROOT = Dir.mktmpdir('validation-oracle')
+at_exit {{ FileUtils.remove_entry(ORACLE_ROOT) unless ENV['ROUNDHOUSE_KEEP_EMITTED'] }}
 ENV['RAILS_ENV'] = 'test'
 ENV['DATABASE_URL'] = 'sqlite3::memory:'
 class ValidationOracle < Rails::Application
@@ -1049,7 +1052,7 @@ class ValidationOracle < Rails::Application
   config.eager_load = false
   config.secret_key_base = 'validation-oracle-key'
   config.logger = Logger.new(File::NULL)
-  config.root = Dir.mktmpdir('validation-oracle')
+  config.root = ORACLE_ROOT
 end
 ValidationOracle.initialize!
 ActiveRecord::Base.establish_connection(adapter: 'sqlite3', database: ':memory:')
