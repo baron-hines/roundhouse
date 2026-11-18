@@ -334,6 +334,10 @@ fn ancestor_constant(
     // Not where an enclosing namespace declares another of the name: `module N; class C` reads `N::M` first and a
     // compact `class N::C` does not, which the class's name alone cannot tell.
     let found = found?;
+    // The class's own constant is its innermost lexical scope, read first whether the class is nested or compact.
+    if found == format!("{owner}::{written}") {
+        return Some(found);
+    }
     let mut prefix = owner;
     while let Some((outer, _)) = prefix.rsplit_once("::") {
         let lexical = format!("{outer}::{written}");
