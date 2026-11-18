@@ -22733,5 +22733,7 @@ mod concern_plain_includer;
 // Concern shapes: a namespaced prepend by its relative name.
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
+#[path = "emit_and_run/token_for_string_key.rs"]
+mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;

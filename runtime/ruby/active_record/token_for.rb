@@ -67,37 +67,45 @@ module ActiveRecord
     def self.secure_password_data(id, digest)
       tail = nil
       tail = digest[19, 10] if !digest.nil? && digest.length >= 29
-      value_data(id, tail)
+      value_data(id.to_s, tail)
     end
 
     # A `generates_token_for` block's payload: `[id, value]` as JSON,
-    # nil being `null`, for a String value. The lowering picks this or
-    # one of the two below by the block's type, and hands any other
-    # value over as its String form (src/lower/generates_token_for.rs).
-    def self.value_data(id, value)
+    # nil being `null`, for a String value. `key` is the id already
+    # written as JSON: an Integer id's digits, or a String key (a uuid)
+    # quoted by `str_key`, as Rails' `as_json` writes each. The lowering
+    # picks this or one of the two below by the block's type, and hands
+    # any other value over as its String form
+    # (src/lower/generates_token_for.rs).
+    def self.value_data(key, value)
       json = "null"
       json = ActionController::MessageVerifier.json_string(value) unless value.nil?
-      "[" + id.to_s + "," + json + "]"
+      "[" + key + "," + json + "]"
     end
 
     # The same for a block whose value is an Integer: a JSON number,
     # `[id, 5]`, which is what Rails' `as_json` writes.
-    def self.int_value_data(id, value)
+    def self.int_value_data(key, value)
       json = "null"
       json = value.to_s unless value.nil?
-      "[" + id.to_s + "," + json + "]"
+      "[" + key + "," + json + "]"
     end
 
     # And for a true/false value: `[id, true]`.
-    def self.bool_value_data(id, value)
+    def self.bool_value_data(key, value)
       json = "null"
       json = value ? "true" : "false" unless value.nil?
-      "[" + id.to_s + "," + json + "]"
+      "[" + key + "," + json + "]"
     end
 
     # A declaration without a block signs the id alone: `[id]`.
-    def self.id_data(id)
-      "[" + id.to_s + "]"
+    def self.id_data(key)
+      "[" + key + "]"
+    end
+
+    # A String primary key as the payload writes it: `["0b6d…"]`.
+    def self.str_key(id)
+      ActionController::MessageVerifier.json_string(id)
     end
 
     # The record id at the head of a `[id, …]` payload, or 0 (no row)
@@ -105,6 +113,15 @@ module ActiveRecord
     def self.data_id(data)
       return 0 if data.length < 2
       data[1, data.length - 1].to_i
+    end
+
+    # The String key at the head of a `["…", …]` payload, or "" (no row)
+    # for "" or a payload whose head is not a JSON string.
+    def self.data_str_id(data)
+      return "" if data.length < 3 || data[1, 1] != "\""
+      close = ActionController::MessageVerifier.value_end(data, 1)
+      return "" if close < 0
+      ActionController::MessageVerifier.json_value(data[1, close - 1])
     end
   end
 end
