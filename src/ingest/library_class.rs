@@ -426,7 +426,7 @@ fn ingest_library_classes_impl(
                         message: format!("Data.define constant namespace could not be resolved: `{}`", class.name.0) }, &statement));
                 }
                 if let Some((at, _)) = writes.iter().find(|(at, written)| *at > end
-                    && (written == name || written.strip_prefix("?::") == name.rsplit("::").next())) {
+                    && written == name) {
                     let err = IngestError::Unsupported { file: file.into(), message: format!("reassignment of Data.define constant `{name}` is not modeled") };
                     super::error_site::note(&err, *at as usize - name.rsplit("::").next().unwrap().len(), *at as usize);
                     return Err(err);
@@ -1043,7 +1043,7 @@ pub(super) fn cross_file_data_rebindings(app: &crate::App, sources: &[crate::spa
         if !source.path.ends_with(".rb") || !others.iter().any(|(_, name)| source.text.contains(name.rsplit("::").next().unwrap())) { continue; }
         let parsed = super::prism::parse_silent(source.text.as_bytes());
         for (at, written) in resolved_data_constant_writes(&parsed.node(), resolver, file, &names) {
-            if let Some((_, name)) = others.iter().find(|(_, name)| written == *name || written.strip_prefix("?::") == name.rsplit("::").next()) {
+            if let Some((_, name)) = others.iter().find(|(_, name)| written == *name) {
                 let span = Span { file, start: at - name.rsplit("::").next().unwrap().len() as u32, end: at };
                 out.push((span, IngestError::Unsupported { file: source.path.clone(), message: format!("reassignment of Data.define constant `{name}` across files is not modeled") }));
             }

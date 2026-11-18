@@ -381,7 +381,8 @@ fn scoped_data_factory_rebindings_are_refused_at_every_target() {
     ] {
         let source = format!("{prefix}{write}\nSnapshot = Data.define(:x)\nSnapshot::VALUE = Outer::A\n");
         let (_, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
-        assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant `Outer::A`")), "{write}: {errors:?}");
+        assert!(errors.iter().any(|error| error.contains("reassignment of Data.define constant `Outer::A`")
+            || (write.starts_with("class << self") && error.contains("file-level statements beside Data.define"))), "{write}: {errors:?}");
     }
 }
 
@@ -395,14 +396,18 @@ fn data_factory_rebinding_respects_resolved_owners_and_source_order() {
         let (_, errors) = contract::app(&format!("{prefix}{write}\n")).emit(roundhouse::project::BuildTarget::Spinel);
         assert!(errors.iter().any(|error| error.contains(&format!("reassignment of Data.define constant `{name}`"))), "{prefix}{write}: {errors:?}");
     }
-    for write in ["module Wrapper; A = 7; end", "module Wrapper; module Outer; end; Outer::A = 7; end"] {
+    // The qualified spelling drops its namespace on main too; it checks only the factory boundary here.
+    for (write, read_unrelated, expected) in [
+        ("module Wrapper; A = 7; end", "p Wrapper::A\n", "2\n7\n"),
+        ("module Wrapper; module Outer; end; Outer::A = 7; end", "", "2\n"),
+    ] {
         let source = format!("module Outer; A = 7; end\nOuter::A = Data.define(:x)\n{write}\nSnapshot = Data.define(:x)\nSnapshot::VALUE = Outer::A\n");
         let (tree, errors) = contract::app(&source).emit(roundhouse::project::BuildTarget::Spinel);
         assert!(errors.is_empty(), "{write}: {errors:?}");
-        std::fs::write(tree.join("driver.rb"), "require_relative 'app/models'\np Snapshot::VALUE.new(2).x\n").unwrap();
+        std::fs::write(tree.join("driver.rb"), format!("require_relative 'app/models'\np Snapshot::VALUE.new(2).x\n{read_unrelated}")).unwrap();
         let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     }
 }
 
@@ -438,4 +443,30 @@ fn a_data_member_write_does_not_rebind_an_unrelated_factory() {
     let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "[2, 7]\n");
+}
+
+#[test]
+fn unresolved_unrelated_owners_do_not_refuse_data_factories() {
+    for (setup, write, owner) in [
+        ("module Other; end\n", "module (::Object)::Other; Point = 7; end\n", "Other"),
+        ("module Other; end\n", "module ::Object.const_get(:Object)::Other; Point = 7; end\n", "Other"),
+        ("module Container; module Other; end; end\n", "module Container; module self::Other; Point = 7; end; end\n", "Container::Other"),
+    ] {
+        for separate in [false, true] {
+            let factory = "module Outer; end\nOuter::Point = Data.define(:value)\n";
+            let (tree, errors) = emit_and_run::empty_app()
+                .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+                .write("db/schema.rb", "")
+                .write("config/database.yml", "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n")
+                .write("lib/a_other.rb", setup)
+                .write("lib/m_factory.rb", &format!("{factory}{}", if separate { "" } else { write }))
+                .write("lib/z_writer.rb", if separate { write } else { "" })
+                .emit(roundhouse::project::BuildTarget::Spinel);
+            assert!(errors.is_empty(), "{write} separate={separate}: {errors:?}");
+            std::fs::write(tree.join("driver.rb"), format!("require_relative 'app/models'\np [Outer::Point.new(2).value, {owner}::Point]\n")).unwrap();
+            let output = std::process::Command::new("ruby").arg("driver.rb").current_dir(&tree).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "[2, 7]\n");
+        }
+    }
 }
