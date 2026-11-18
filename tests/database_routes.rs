@@ -371,12 +371,14 @@ fn a_writing_block_in_a_rebuilt_block_body_is_restored() {
 #[test]
 fn a_mention_of_a_routing_setting_is_not_a_setting() {
     let application = |line: &str| format!("require_relative \"boot\"\nrequire \"rails/all\"\n\nmodule Routed\n  class Application < Rails::Application\n    config.load_defaults 8.1\n    {line}\n  end\nend\n");
-    for line in ["config.x.banner = \"reading_role\"", "config.x.primary = ActiveRecord.reading_role == :reading", "config.x.database_resolver = \"mine\""] {
+    for line in ["message = \"config.active_record.reading_role = :archive\"", "config.x.banner = \"reading_role\"", "config.x.primary = ActiveRecord.reading_role == :reading", "config.x.database_resolver = \"mine\""] {
         let (_, errors) = shards().write("config/application.rb", &application(line)).emit(BuildTarget::Spinel);
         assert!(errors.is_empty(), "{line}: {errors:#?}");
     }
-    let (_, errors) = shards().write("config/application.rb", &application("config.active_record.reading_role = :replica")).emit(BuildTarget::Spinel);
-    assert!(errors.iter().any(|e| e.contains("reading_role")), "{errors:#?}");
+    for line in ["config.active_record.reading_role = :replica", "config.active_record.reading_role = :archive; config.active_support.isolation_level = :thread"] {
+        let (_, errors) = shards().write("config/application.rb", &application(line)).emit(BuildTarget::Spinel);
+        assert!(errors.iter().any(|e| e.contains("database_routes_setting") && e.contains("reading_role")), "{errors:#?}");
+    }
 }
 
 /// A controller action's parameter default is read like its body.

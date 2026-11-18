@@ -496,7 +496,7 @@ fn own_decision(
 
 /// A routed app whose configuration changes what a role or shard block
 /// means keeps an error on every target: the runtime reads Rails'
-/// defaults. Read as text; a line that sets one is enough.
+/// defaults. Inspect each setter call independently.
 pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V, dir: &std::path::Path) {
     const SETTINGS: &[(&str, &str)] = &[
         ("active_record.writing_role", "a configured role name"),
@@ -516,15 +516,27 @@ pub(super) fn refuse_routing_settings<V: crate::vfs::Vfs + ?Sized>(app: &mut App
     }
     for file in files {
         let Ok(text) = vfs.read_to_string(&file) else { continue };
-        let set = |line: &&str| !line.starts_with('#') && !line.ends_with("isolation_level = :thread");
-        // An assignment to Rails' own setting (not `config.x.reading_role`),
-        // not a mention or a comparison;
-        // without a trailing comment.
-        let assigns = |line: &str, key: &str| {
-            line.split_once(key).is_some_and(|(_, rest)| rest.trim_start().starts_with('=') && !rest.trim_start().starts_with("=="))
-        };
-        for line in text.lines().map(|line| line.split(" #").next().unwrap_or(line).trim()).filter(set) {
-            if let Some((key, what)) = SETTINGS.iter().find(|(key, _)| assigns(line, key)) {
+        struct Assignments(Vec<(String, bool)>);
+        impl<'pr> ruby_prism::Visit<'pr> for Assignments {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                let name = node.name();
+                if let Some(name) = std::str::from_utf8(name.as_slice()).ok().and_then(|n| n.strip_suffix('='))
+                    && let Some(receiver) = node.receiver()
+                {
+                    let target = format!("{}.{name}", String::from_utf8_lossy(receiver.location().as_slice()));
+                    let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                    let thread = matches!(args.as_slice(), [arg] if arg.as_symbol_node().is_some_and(|s| s.unescaped() == b"thread"));
+                    self.0.push((target, thread));
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let parsed = super::prism::parse_silent(text.as_bytes());
+        let mut assignments = Assignments(Vec::new());
+        ruby_prism::Visit::visit(&mut assignments, &parsed.node());
+        for (target, thread) in assignments.0 {
+            if thread && target.ends_with("active_support.isolation_level") { continue; }
+            if let Some((key, what)) = SETTINGS.iter().find(|(key, _)| target.ends_with(*key)) {
                 app.database_refusals.push(DatabaseRefusal {
                     span,
                     construct: "database_routes_setting".to_string(),
