@@ -364,6 +364,9 @@ fn admitted_routes(
             let Some(name) = name else { continue };
             for env in &envs {
                 let database = environment.iter().find(|d| d.env == *env && d.name == *name)?;
+                if role == "writing" && database.primary && writing != &pools[0].1 {
+                    return None;
+                }
                 if !database.routable(role == "writing", schema_rb) {
                     return None;
                 }

@@ -233,6 +233,11 @@ fn every_other_routing_shape_stays_refused_on_spinel() {
             "shard routing is not modeled",
         ),
         (
+            "a primary writer outside the default shard",
+            contract::app(&contract::SHARDS.replace("right: { writing: :right, reading: :right_reader }", "right: { writing: :primary }"), "class RouteReport\nend\n"),
+            "shard routing is not modeled",
+        ),
+        (
             "another adapter",
             shards().write("config/database.yml", &yml.replace("adapter: sqlite3\n    database: storage/right.sqlite3\n    schema_dump", "adapter: postgresql\n    database: storage/right.sqlite3\n    schema_dump")),
             "shard routing is not modeled",
