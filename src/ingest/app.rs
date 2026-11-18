@@ -952,10 +952,13 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     }
     app.schema.expression_dialect = expression_dialect;
     // Not its own database: the runtime opens only the primary, so solid_queue's tables join it.
+    // Only a file read and joined here drops its "not carried" warning.
+    let mut queue_joined = false;
     if solid_queue_root.is_some() && vfs.exists(&dir.join("db/queue_schema.rb")) {
         let queue_schema = dir.join("db/queue_schema.rb");
         if let Some(source) = read_or_ledger(vfs, &queue_schema)? {
             if let Some(queue) = unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &queue_schema.display().to_string(), expression_dialect))? {
+                queue_joined = true;
                 for (name, table) in queue.tables {
                     app.schema.tables.entry(name).or_insert(table);
                 }
@@ -2254,7 +2257,7 @@ end
         let configurations = super::database_yml::database_configurations(&text, file);
         app.databases = configurations.databases;
         app.database_refusals.extend(configurations.refusals);
-        let joined = solid_queue_root.is_some().then_some("db/queue_schema.rb");
+        let joined = queue_joined.then_some("db/queue_schema.rb");
         app.database_refusals.extend(named_schema.refusals(file, joined));
     }
 

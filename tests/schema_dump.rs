@@ -292,6 +292,40 @@ fn queue_tables_in_the_named_schema_select_solid_queue_models() {
     }
 }
 
+/// The queue database's file drops its warning only once its tables join
+/// the primary's: in survey mode, a queue schema that can't be read keeps it.
+#[cfg(unix)]
+#[test]
+fn a_queue_schema_that_isnt_joined_keeps_its_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let yml = "test:\n  primary:\n    adapter: sqlite3\n  queue:\n    adapter: sqlite3\n";
+    for readable in [true, false] {
+        let dir = scratch::dir("roundhouse-schema-dump-queue");
+        for (path, content) in solid_queue_app(&[("config/database.yml", yml), ("db/schema.rb", WIDGETS), ("db/queue_schema.rb", QUEUE_JOBS)]) {
+            std::fs::create_dir_all(dir.join(&path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(&path), content).unwrap();
+        }
+        let queue = dir.join("db/queue_schema.rb");
+        if !readable {
+            std::fs::set_permissions(&queue, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // A process that can read past the mode (CAP_DAC_OVERRIDE, root) has nothing unreadable.
+        let skip = !readable && std::fs::read(&queue).is_ok();
+        roundhouse::ingest::survey::activate();
+        let result = (!skip).then(|| ingest_app(&dir));
+        std::fs::set_permissions(&queue, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(result) = result else {
+            eprintln!("skipping: this process can read a mode-000 file");
+            return;
+        };
+        let checked = analyzed(result.unwrap_or_else(|error| panic!("ingest failed: {error}")));
+        let warning = checked.warnings.iter().any(|w| w.contains("`test.queue`") && w.contains("db/queue_schema.rb"));
+        assert_eq!(warning, !readable, "readable {readable}: {:?}", checked.warnings);
+        assert_eq!(tables(&checked.app).contains(&"solid_queue_jobs".to_string()), readable, "readable {readable}");
+    }
+}
+
 /// A three-tier test environment whose configurations are named by
 /// non-String keys has no primary this can name: a named file there is
 /// refused, and ingestion doesn't panic.
