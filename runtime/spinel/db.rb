@@ -2461,6 +2461,8 @@ module Db
     # would otherwise replay a read from before this write.
     if @routed
       scopes.each do |f|
+        home = f.home
+        next if !home.nil? && home.closed
         held = f.held
         held.qc_clear if !held.nil?
         end_snapshot(held) if !held.nil? && @slots[f.from].permit == slot.permit

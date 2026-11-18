@@ -685,3 +685,32 @@ Db.with_connection do
 end
 "##;
 pub const SCOPED_REOPEN_EXPECTED: &str = "scope-cleared=true\nscope-left=1\n";
+
+pub const REFRESH_REOPEN_SCRIPT: &str = r##"[1, 2, 4, 8, 16].each do |initial|
+  [1, 4].each do |reopened|
+    Db.close
+    Db.configure("storage/primary.sqlite3", pool_size: initial)
+    Db.exec("DELETE FROM notes")
+    ApplicationRecord.connected_to(role: :reading) do
+      Db.with_connection do
+        Db.read_snapshot_begin
+        Note.count
+        raise "reader snapshot did not open" unless Db.current_conn.snap == 2
+        ApplicationRecord.connected_to(role: :writing) do
+          Db.close
+          Db.configure("storage/refreshed-primary.sqlite3", pool_size: reopened)
+          Db.with_connection do
+            c = Note.connection
+            c.execute("BEGIN")
+            c.execute("INSERT INTO notes(tag) VALUES ('fresh')")
+            c.execute("ROLLBACK")
+            raise "fresh transaction did not roll back" unless Note.count == 0
+          end
+        end
+      end
+    end
+  end
+end
+puts "refresh-count=0"
+"##;
+pub const REFRESH_REOPEN_EXPECTED: &str = "refresh-count=0\n";

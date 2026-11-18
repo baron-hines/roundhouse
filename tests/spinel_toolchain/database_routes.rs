@@ -138,6 +138,12 @@ fn the_declared_default_shard_is_available_before_configuration() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_write_skips_closed_held_snapshots_after_reconfigure() {
+    assert_shard_report(contract::REFRESH_REOPEN_SCRIPT, contract::REFRESH_REOPEN_EXPECTED);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn a_shared_named_schema_supports_a_primary_default_writer() {
     let yml = contract::database_yml().replace("database: storage/primary.sqlite3\n", "database: storage/primary.sqlite3\n    schema_dump: catalog_schema.rb\n")
         .replace("schema_dump: schema.rb", "schema_dump: catalog_schema.rb");
