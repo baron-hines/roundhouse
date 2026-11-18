@@ -233,7 +233,7 @@ fn calls_outside_the_carried_scope_are_refused_by_name() {
         ("ApplicationRecord.connected_to(role: :archive) { 1 }", "`connected_to` here is not a scope the routed runtime carries"),
         ("Note.connected_to(shard: :left) { 1 }", "`connected_to` here is not a scope the routed runtime carries"),
         ("connected_to(shard: :left) { 1 }", "`connected_to` here is not a scope the routed runtime carries"),
-        ("ApplicationRecord.connected_to(**options) { 1 }", "ApplicationRecord"),
+        ("ApplicationRecord.connected_to(**options) { 1 }", "`connected_to` here is not a scope the routed runtime carries"),
         ("ApplicationRecord.connected_to(shard: :left, prevent_writes: flag) { 1 }", "`connected_to` here is not a scope the routed runtime carries"),
         ("ApplicationRecord.connected_to(shard: \"left\") { 1 }", "`connected_to` here is not a scope the routed runtime carries"),
         ("ApplicationRecord.connected_to(shard: :left, &block)", "`connected_to` here is not a scope the routed runtime carries"),
