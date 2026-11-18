@@ -585,8 +585,9 @@ pub(crate) fn named_schema<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> NamedSchema 
         };
         if url_unread {
             refuse(offset, unsupported(&written, "the configuration's `url:` is computed, not a string, or written under more than one spelling, so its query could name another file"), false);
-        } else if let Some(setter) = config_mentions(vfs, dir, mentions_paths) {
-            refuse(offset, format!("{label}'s `schema_dump: {written}` is not supported: {setter} `.paths`, `paths[` or `paths.add`, which can move the db directory Rails reads it from"), false);
+        } else if let Some(setter) = config_mentions(vfs, dir, |text| mentions_paths(text) || text.contains("db_dir")) {
+            // `DatabaseTasks.db_dir`, which Rails joins the name to, defaults to `paths["db"]` and can be assigned.
+            refuse(offset, format!("{label}'s `schema_dump: {written}` is not supported: {setter} `.paths`, `paths[`, `paths.add` or `db_dir`, which can move the db directory Rails reads it from"), false);
         } else if let Err(why) = &format {
             refuse(offset, unsupported(&written, why), false);
         } else if format.as_deref() != Ok(&name[name.rfind('.').unwrap_or(0)..]) {
