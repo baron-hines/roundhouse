@@ -319,7 +319,11 @@ boolean names no file, and the schema is found as before. Any other
 `schema_dump:` there (ERB, an anchor, alias, merge or flow value, the
 `:schema_dump:` key, another name, a missing file) is an error naming
 the configuration and the setting. Another test database whose schema
-file exists is a warning. A file the parser can't settle (it doesn't
+file exists is a warning, except a replica (`replica: true`), one with
+`database_tasks: false`, and solid_queue's `db/queue_schema.rb` once its
+tables have joined the primary's; no warning doesn't mean no such file.
+The file named is the one its `schema_dump` names, else the default its
+literal `schema_format` names. A file the parser can't settle (it doesn't
 parse once its ERB is set aside, a merge key doesn't merge a mapping, or
 the test environment's key may be computed) refuses a named file when the
 word `schema_dump` appears on any line but a comment line, and otherwise

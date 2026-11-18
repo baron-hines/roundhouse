@@ -523,7 +523,7 @@ fn an_incomplete_config_scan_refuses_a_named_file() {
     for locked in ["config/locked", "config/locked.rb"] {
         let dir = scratch::dir("roundhouse-schema-dump-scan");
         let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
-        for (path, content) in files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("config/locked/settings.rb", "# kept\n"), ("config/locked.rb", "# kept\n")]) {
+        for (path, content) in files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE), ("config/locked/settings.rb", "# kept\n"), ("config/locked.rb", "# kept\n")]) {
             std::fs::create_dir_all(dir.join(&path).parent().unwrap()).unwrap();
             std::fs::write(dir.join(&path), content).unwrap();
         }
