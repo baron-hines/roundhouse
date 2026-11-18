@@ -301,9 +301,11 @@ or quoted YAML string, written directly in that configuration, naming a
 relative `.rb` file under `db/`, read in place of `db/schema.rb`, or a
 `.sql` file when the configuration says `schema_format: sql` itself. The
 guards are conservative: a `.rb` name is refused when a `schema_format`
-other than a direct literal `ruby` is written there, or when any Ruby file
-under `config/` mentions `schema_format`. A name is also refused when any
-of those files mentions `.paths`, `paths[`, `paths.add` or `db_dir`
+other than a direct literal `ruby` is written there, or, when the
+configuration sets no `schema_format` of its own, when any Ruby file under
+`config/` mentions `schema_format` (a literal one in the configuration
+wins over the application's, as in Rails). A name is also refused when
+any Ruby file under `config/` mentions `.paths`, `paths[`, `paths.add` or `db_dir`
 (comments included; `config.assets.paths` aside), or when a directory under `config/`
 can't be listed or a file there can't be read, or when the
 configuration's `url:` is
