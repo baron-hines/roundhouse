@@ -23,6 +23,7 @@ advisory jobs and the scheduled Full cycle for the multi-target ledger.
 |---|---|
 | **Draft or ready**, no special label | Path-selected coverage on the Ruby floor |
 | **Draft or ready** + `ci:spinel` | Ruby floor plus the **CORE** Spinel lane (required for that run) |
+| **Draft or ready** + `ci:gems` | As `ci:spinel`, plus the gem-specific Spinel suites the other plans leave to Full validation |
 | **Draft or ready** + focus label(s) | Ruby floor plus **only** the selected focus lanes (required) |
 | **Draft or ready** + `ci:full` | Full validation (all targets, WASM, Spinel); extras stay advisory |
 | **Push to canonical `main`** | Ruby floor plus **path-owned** lanes (Spinel when the diff owns it); no always-on full Spinel suite. Extra-language SDKs and broad Spinel wait for Full |
@@ -138,6 +139,7 @@ so fix rounds only queue the lanes under repair — and those lanes are
 | `ci:extras` | All seven of the above |
 | `ci:jruby` | `compare-jruby` + floor `smoke` jruby (+ site/archives) |
 | `ci:spinel` | CORE Spinel (`spinel-build`, `spinel-toolchain`, `spinel-compare`) + `spinel-framework` (+ site/archives). Not the heavy Campfire Spinel suite (`campfire-spinel-*`); not folded into `ci:extras`. |
+| `ci:gems` | `ci:spinel`, with the gem-specific Spinel suites (`GEM_SPINEL_TESTS` / `GEM_TOOLCHAIN_PREFIXES` in `scripts/ci-plan.py`: solid_queue, view_component, pundit, jbuilder, addressable, aasm, dry-*, …). Only Full validation and this label run them. The source-gem mechanism's own suites (`gem_reopen_source`, `auto_source_gem`, …) run in every Spinel plan. |
 
 **Narrow semantics:** with any focus label set and `ci:full` **not** set, the
 plan is the Ruby floor (`BASE`) plus only the selected focus lanes. Path
@@ -192,6 +194,9 @@ publication path.
   only those `compare-extra` and `smoke-extra` lanes as **required**. Prefer
   this over `ci:full` when repairing a few red extras after Full validation.
 - **JRuby fix rounds:** `ci:jruby` — `compare-jruby` + smoke jruby, required.
+- **Gem support:** a PR that changes how a gem runs (its runtime port, a
+  hook, the gem's test) adds `ci:gems`. Without it, the gem's own Spinel
+  suite waits for the next Full validation (every three hours).
 - **Spinel-focused CI:** apply `ci:spinel` on a draft or ready PR. Runs the
   Ruby floor plus the CORE Spinel lane as **required**; skips Crystal/Go/… SDKs,
   WASM and the heavy Campfire Spinel suite. Prefer this over

@@ -125,7 +125,14 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("URI", "DEFAULT_PARSER", uri_rfc3986_parser),
     ("URI", "RFC3986_PARSER", uri_rfc3986_parser),
     ("URI", "RFC2396_PARSER", uri_rfc2396_parser),
+    // `RbConfig::CONFIG["host_os"]` — a gem's platform branch. Ruby's own on the ruby family, spinel's
+    // `builtins/rbconfig.rb` (the machine it compiled for, String values throughout) on spinel.
+    ("RbConfig", "CONFIG", str_str_hash),
 ];
+
+fn str_str_hash() -> Ty {
+    Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }
+}
 
 fn uri_rfc2396_parser() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("URI::RFC2396_Parser")), args: vec![].into() }
@@ -136,7 +143,7 @@ fn uri_rfc3986_parser() -> Ty {
 }
 
 /// Owners of value Consts that Ruby defines as modules, not classes.
-const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib"];
+const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib", "RbConfig"];
 
 /// Ruby's top-level value Consts: `STDERR.puts "…"` (discourse's
 /// warnings) reads the process's own stream, which `$stderr` is only
@@ -172,6 +179,7 @@ fn rbs_type_name(ty: &Ty) -> &'static str {
         Ty::Int => "Integer",
         Ty::Str => "String",
         Ty::Class { id, .. } if id.0.as_str() == "Encoding" => "Encoding",
+        Ty::Hash { key, value } if matches!((&**key, &**value), (Ty::Str, Ty::Str)) => "Hash[String, String]",
         _ => "untyped",
     }
 }
