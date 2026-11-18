@@ -572,8 +572,15 @@ ActiveRecord::Base.with_connection do |c|
   end
   puts "raw-scope=" + c.select_value("SELECT COUNT(*) FROM notes WHERE tag = 'scope-raw'").to_s
 end
+Db.exec("BEGIN")
+Note.with_connection { Db.exec("COMMIT") }
+puts "borrowed-ended=" + Db.in_lease?.to_s
+Db.exec("BEGIN")
+Note.with_connection { Note.count }
+puts "borrowed-open=" + Db.in_lease?.to_s
+Db.exec("ROLLBACK")
 "##;
-pub const RAW_SWITCH_EXPECTED: &str = "raw-same=1\nraw-switch=refused\nraw-handle=refused\nraw-left=0\nraw-right=0\nraw-base-begins=4\nraw-scope=0\n";
+pub const RAW_SWITCH_EXPECTED: &str = "raw-same=1\nraw-switch=refused\nraw-handle=refused\nraw-left=0\nraw-right=0\nraw-base-begins=4\nraw-scope=0\nborrowed-ended=false\nborrowed-open=true\n";
 
 pub const SNAPSHOT_SCRIPT: &str = r##"Db.with_connection do
   ApplicationRecord.connected_to(role: :reading) do

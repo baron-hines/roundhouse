@@ -1722,7 +1722,7 @@ module Db
     parked = frame.parked
     route_connection = Thread.current[:db_conn]
     frame.parked = false
-    Thread.current[:db_conn] = frame.connection if parked
+    Thread.current[:db_conn] = frame.connection if parked && frame.lease >= 0
     begin
       if frame.lease >= 0
         conn = current_conn
