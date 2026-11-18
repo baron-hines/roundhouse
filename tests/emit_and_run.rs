@@ -20863,6 +20863,8 @@ mod pp_require;
 mod weakref_observable;
 #[path = "emit_and_run/core_exceptions.rs"]
 mod core_exceptions;
+#[path = "emit_and_run/rbconfig_config.rs"]
+mod rbconfig_config;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]

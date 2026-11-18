@@ -10178,6 +10178,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             );
         }
         // A Hash value, so the class/module gate does not see it either.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["RbConfig", "CONFIG"])
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("RbConfig::CONFIG is the running Ruby's build configuration, which the {target} runtime does not supply"),
+            );
+        }
+        // A Hash value, so the class/module gate does not see it either.
         if !matches!(target, "jruby" | "spinel" | "futamura")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport", "TimeZone", "MAPPING"])
