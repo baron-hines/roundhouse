@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,49 @@ class FocusLabels(unittest.TestCase):
         self.assertEqual(parsed.focus_extras, ("swift", "go"))
         extras = ci.parse_coverage_labels(["ci:extras"])
         self.assertEqual(extras.focus_extras, tuple(ci.EXTRA_COMPARE_TARGETS))
+
+    def test_gems_label_runs_spinel_with_the_gem_suites(self):
+        parsed = ci.parse_coverage_labels(["ci:gems"])
+        self.assertTrue(parsed.gems)
+        self.assertTrue(parsed.focus_spinel)
+        self.assertFalse(ci.parse_coverage_labels(["ci:spinel"]).gems)
+
+    def test_gem_suites_leave_plans_without_full_or_gems(self):
+        plan = {"spinel_tests": ["solid_queue_durability", "route_request_defaults"], "reasons": []}
+        ci.apply_gem_suites(plan, False)
+        self.assertEqual(plan["spinel_tests"], ["route_request_defaults"])
+        self.assertFalse(plan["spinel_gems"])
+        self.assertTrue(any("ci:gems" in r for r in plan["reasons"]))
+        kept = {"spinel_tests": ["solid_queue_durability"], "reasons": []}
+        ci.apply_gem_suites(kept, True)
+        self.assertEqual(kept["spinel_tests"], ["solid_queue_durability"])
+        self.assertTrue(kept["spinel_gems"])
+
+    def test_gem_suite_names_name_real_suites(self):
+        root = Path(__file__).parents[1]
+        for name in ci.GEM_SPINEL_TESTS:
+            with self.subTest(name=name):
+                self.assertIn(name, ci.SPINEL_TESTS)
+                self.assertTrue((root / "tests" / f"{name}.rs").is_file())
+        toolchain = (root / "tests/spinel_toolchain.rs").read_text()
+        sources = toolchain + "".join(p.read_text() for p in (root / "tests/spinel_toolchain").glob("*.rs"))
+        for prefix in ci.GEM_TOOLCHAIN_PREFIXES:
+            with self.subTest(prefix=prefix):
+                if prefix.endswith("::"):
+                    self.assertIn(f"mod {prefix[:-2]};", toolchain)
+                else:
+                    self.assertRegex(sources, rf"fn {prefix}\w+\(")
+
+    def test_toolchain_tests_drop_gem_suites_unless_asked(self):
+        names = "view_component::a_component_renders_its_template_natively\ndry_struct_classes_run_lowered_natively\ngem_reopen_source::a_reopened_gem_class_runs_natively\ntiny_api\n"
+        script = Path(__file__).parents[1] / "scripts/ci-plan.py"
+        for gems, expected in (("false", ["gem_reopen_source::a_reopened_gem_class_runs_natively", "tiny_api"]), ("true", names.split())):
+            with self.subTest(gems=gems):
+                out = subprocess.run(
+                    ["python3", str(script), "toolchain-tests"], input=names, text=True, capture_output=True,
+                    env={**os.environ, "CI_SPINEL_GEMS": gems}, check=True,
+                )
+                self.assertEqual(out.stdout.split(), expected)
 
     def test_single_lang_and_extras_focus_are_required(self):
         for lang in ci.EXTRA_COMPARE_TARGETS:
