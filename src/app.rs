@@ -644,6 +644,10 @@ pub struct App {
     /// `analyze::database_identity`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub database_refusals: Vec<crate::database::DatabaseRefusal>,
+    /// The shard and role pools of an app whose one connection class
+    /// routes every model; none for any other app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_routes: Option<crate::database::DatabaseRoutes>,
     /// Support files (`lib/`, a gem's source, …) whose class ingest
     /// failed, each at the construct that failed it: the walk goes on
     /// without the file, and `analyze` reports it there
@@ -1423,6 +1427,7 @@ impl App {
             databases: Vec::new(),
             model_databases: indexmap::IndexMap::new(),
             database_refusals: Vec::new(),
+            database_routes: None,
             ingest_drops: Vec::new(),
             library_class_files: Vec::new(),
             rails_application: None,
