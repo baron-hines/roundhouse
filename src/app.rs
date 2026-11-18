@@ -1711,48 +1711,117 @@ pub(crate) fn model_include_groups(model: &Model) -> Vec<Vec<crate::ident::Class
 
 /// The modules a model includes, directly or through other modules, in
 /// Ruby's method-lookup order: the one whose method a call finds first
-/// comes first. As `Module#include` does, each module goes in directly
-/// above the class with its own includes after it, skipping any already
-/// there, and one call's arguments go in last to first: `include A, B`
-/// looks in `A`, then `B`, and a module both include comes after both.
-/// A module's own includes are taken one call each.
+/// comes first.
+///
+/// Built as `Module#include` builds it: the included module's ancestors
+/// are walked in order with an insertion point that starts right above
+/// the class. One not in the chain goes in at the point, which then moves
+/// below it. One already there below the point moves the point below
+/// itself, once a module has gone in (`include_modules_at`'s `c_seen`).
+/// One call's arguments go in last to first, so `include A, B` looks in
+/// `A`, then `B`. A module's own includes are taken one call each.
+///
+/// An `ActiveSupport::Concern` defers the concerns it includes: its
+/// includer includes them first, in the order it named them, then the
+/// concern itself, which it skips when it is already there. So with a
+/// model including `Shared` and then `Wrapper`, a concern including
+/// `Tail` and then `Shared`, Rails gives `[Wrapper, Tail, Shared]`, where
+/// plain modules give `[Wrapper, Shared, Tail]`.
 pub(crate) fn model_include_ancestors(
     model: &Model,
     library_classes: &[crate::dialect::LibraryClass],
 ) -> Vec<crate::ident::ClassId> {
     use crate::ident::ClassId;
-    fn chain(
-        groups: &[Vec<ClassId>],
-        includes: &crate::det::HashMap<&ClassId, &Vec<ClassId>>,
-        visiting: &mut Vec<ClassId>,
-    ) -> Vec<ClassId> {
-        let mut out: Vec<ClassId> = Vec::new();
-        for id in groups.iter().flat_map(|group| group.iter().rev()) {
-            if visiting.contains(id) {
-                continue;
+    struct Modules<'a> {
+        includes: crate::det::HashMap<&'a ClassId, &'a Vec<ClassId>>,
+        concerns: crate::det::HashSet<&'a ClassId>,
+    }
+    impl Modules<'_> {
+        /// A module's ancestors below it, and, for a concern, the concerns
+        /// it defers to its includer.
+        fn own(&self, id: &ClassId, depth: usize) -> (Vec<ClassId>, Vec<ClassId>) {
+            let (mut chain, mut deferred) = (Vec::new(), Vec::new());
+            if depth > 32 {
+                return (chain, deferred);
             }
-            let mut lin = vec![id.clone()];
-            if let Some(nested) = includes.get(id) {
-                visiting.push(id.clone());
-                let nested: Vec<Vec<ClassId>> = nested.iter().map(|n| vec![n.clone()]).collect();
-                lin.extend(chain(&nested, includes, visiting));
-                visiting.pop();
-            }
-            let mut block: Vec<ClassId> = Vec::new();
-            for m in lin {
-                if !block.contains(&m) && !out.contains(&m) {
-                    block.push(m);
+            let concern = self.concerns.contains(id);
+            for n in self.includes.get(id).into_iter().flat_map(|v| v.iter()) {
+                if n == id {
+                    continue;
+                }
+                if concern && self.concerns.contains(n) {
+                    deferred.push(n.clone());
+                } else {
+                    self.include(&mut chain, n, depth + 1);
                 }
             }
-            block.extend(out);
-            out = block;
+            (chain, deferred)
         }
-        out
+
+        /// `Module#include` of `m` into a chain whose own entry (the class,
+        /// or the including module) sits just above index 0.
+        fn include(&self, chain: &mut Vec<ClassId>, m: &ClassId, depth: usize) {
+            if depth > 32 {
+                return;
+            }
+            let (below, deferred) = self.own(m, depth);
+            if self.concerns.contains(m) {
+                if chain.contains(m) {
+                    return;
+                }
+                for dep in &deferred {
+                    self.include(chain, dep, depth + 1);
+                }
+            }
+            let mut point = 0;
+            for a in std::iter::once(m.clone()).chain(below) {
+                match chain.iter().position(|present| *present == a) {
+                    Some(at) => {
+                        if point > 0 && at >= point {
+                            point = at + 1;
+                        }
+                    }
+                    None => {
+                        chain.insert(point, a);
+                        point += 1;
+                    }
+                }
+            }
+        }
     }
-    let includes: crate::det::HashMap<&ClassId, &Vec<ClassId>> = library_classes
-        .iter()
-        .filter(|lc| lc.is_module && !lc.includes.is_empty())
-        .map(|lc| (&lc.name, &lc.includes))
-        .collect();
-    chain(&model_include_groups(model), &includes, &mut Vec::new())
+    let modules = Modules {
+        includes: library_classes
+            .iter()
+            .filter(|lc| lc.is_module && !lc.includes.is_empty())
+            .map(|lc| (&lc.name, &lc.includes))
+            .collect(),
+        concerns: library_classes
+            .iter()
+            .filter(|lc| lc.is_module && extends_active_support_concern(lc))
+            .map(|lc| &lc.name)
+            .collect(),
+    };
+    let mut chain: Vec<ClassId> = Vec::new();
+    for group in model_include_groups(model) {
+        for id in group.iter().rev() {
+            modules.include(&mut chain, id, 0);
+        }
+    }
+    chain
+}
+
+/// Whether a module runs `extend ActiveSupport::Concern` (or
+/// `self.extend`), which the ingest keeps as one of its unmodelled calls.
+fn extends_active_support_concern(lc: &crate::dialect::LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| {
+        let crate::expr::ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)) {
+            return false;
+        }
+        method.as_str() == "extend"
+            && args.iter().any(|arg| {
+                matches!(&*arg.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
+            })
+    })
 }

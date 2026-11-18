@@ -2392,7 +2392,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         // lowers differently here, defaults included; a winner calling
         // `super` stays in its module, where `super` means what it says.
         // A winner behind a load-time `if` goes with its condition, along
-        // with the other branches' definitions of the name.
+        // with every definition of the name in it, when the condition is
+        // one that answers the same in the model (`load_time_stable`).
         let mut includer_copies: Vec<MethodDef> = Vec::new();
         let mut carried_conditionals: Vec<crate::dialect::ConditionalDefinitions> = Vec::new();
         if is_model {
@@ -2412,8 +2413,12 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                     || crate::lower::scope_chain::mentions_model_insert_all(e, &models)
                     || crate::lower::scope_chain::mentions_assoc_class_method(e, &assocs, &names, &assoc_class_methods)
             };
-            let lowered = |m: &MethodDef, owner: Option<&ClassId>| {
+            // The module's query arguments (`Picker.pick(tokens)`, whose
+            // `pick` queries its argument) are seeded as the module's own
+            // body is, read as `owner`'s when there is one.
+            let lowered = |m: &MethodDef, module: &ClassId, owner: Option<&ClassId>| {
                 let mut out = m.clone();
+                query_arguments.rewrite_method(&mut out, module, owner.unwrap_or(module), &regs);
                 crate::lower::scope_chain::rewrite_call_site(&mut out.body, &regs, None, owner);
                 for d in out.params.iter_mut().filter_map(|p| p.default.as_mut()) {
                     if mentions_instance(d) {
@@ -2431,21 +2436,19 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             for id in &chain {
                 let Some(module) = app.library_classes.iter().find(|l| l.is_module && l.name == *id) else { continue };
                 let shared = shared_concerns.get(&module.name).is_some_and(|models| models.contains(&lc.name));
-                let copy_of = |m: &MethodDef| -> Option<MethodDef> {
-                    let defaults: Vec<&Expr> = m.params.iter().filter_map(|p| p.default.as_ref()).collect();
-                    if contains_super(&m.body) || defaults.iter().any(|d| contains_super(d)) {
-                        return None;
-                    }
-                    if !mentions_instance(&m.body) && !defaults.iter().any(|d| mentions_instance(d)) {
-                        return None;
-                    }
-                    let module_side = lowered(m, None);
-                    let mut copy = lowered(m, Some(&lc.name));
-                    if format!("{:?}{:?}", copy.body, copy.params) == format!("{:?}{:?}", module_side.body, module_side.params) {
-                        return None;
-                    }
+                let has_super = |m: &MethodDef| {
+                    contains_super(&m.body) || m.params.iter().filter_map(|p| p.default.as_ref()).any(contains_super)
+                };
+                let copy = |m: &MethodDef| {
+                    let mut copy = lowered(m, &module.name, Some(&lc.name));
                     copy.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
-                    Some(copy)
+                    copy
+                };
+                // Whether `m`, defaults included, lowers differently here.
+                let needs_copy = |m: &MethodDef| {
+                    let module_side = lowered(m, &module.name, None);
+                    let here = lowered(m, &module.name, Some(&lc.name));
+                    format!("{:?}{:?}", here.body, here.params) != format!("{:?}{:?}", module_side.body, module_side.params)
                 };
                 // Last to first: a later `def` of a name replaces an earlier one.
                 for m in module.methods.iter().rev() {
@@ -2457,21 +2460,35 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                         continue;
                     }
                     let Some(conditional) = module.conditional_definitions.iter().find(|c| c.contains(m)) else {
-                        includer_copies.extend(copy_of(m));
+                        if !has_super(m) && needs_copy(m) {
+                            includer_copies.push(copy(m));
+                        }
                         continue;
                     };
-                    let copies: Vec<MethodDef> = module
+                    // Ruby took its branch once, as the module loaded; the
+                    // model evaluates the carried condition again, so only
+                    // a condition that answers the same then (`RUBY_VERSION
+                    // >= "3.0"`) is carried. Under any other the name stays
+                    // the module's.
+                    if !load_time_stable(conditional) {
+                        continue;
+                    }
+                    // Every definition of the name in it goes, so each
+                    // branch runs its own last one, as in the module.
+                    let members: Vec<&MethodDef> = module
                         .methods
                         .iter()
                         .filter(|other| other.receiver == m.receiver && other.name == m.name && conditional.contains(other))
-                        .filter_map(|other| copy_of(other))
                         .collect();
-                    if !copies.is_empty() && !carried_conditionals.iter().any(|c| c.span == conditional.span) {
+                    if members.iter().any(|other| has_super(other)) || !members.iter().any(|other| needs_copy(other)) {
+                        continue;
+                    }
+                    includer_copies.extend(members.into_iter().map(|other| copy(other)));
+                    if !carried_conditionals.iter().any(|c| c.span == conditional.span) {
                         let mut carried = conditional.clone();
                         strip_declarations(&mut carried);
                         carried_conditionals.push(carried);
                     }
-                    includer_copies.extend(copies);
                 }
             }
         }
@@ -14100,6 +14117,30 @@ fn strip_declarations(conditional: &mut crate::dialect::ConditionalDefinitions) 
         arm.declarations.clear();
         arm.nested.iter_mut().for_each(strip_declarations);
     }
+}
+
+/// Whether every condition of `conditional`, nested ones included, gives
+/// the same answer whenever it is evaluated: literals and constants
+/// compared with each other (`RUBY_VERSION >= "3.0"`,
+/// `Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")`), joined
+/// with `&&`, `||` and `!`. A call such as `method_defined?(:x)` answers
+/// differently once other modules are in.
+fn load_time_stable(conditional: &crate::dialect::ConditionalDefinitions) -> bool {
+    fn stable(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { .. } | ExprNode::Const { .. } => true,
+            ExprNode::BoolOp { left, right, .. } => stable(left) && stable(right),
+            ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+                let compares = matches!(method.as_str(), "==" | "!=" | ">=" | "<=" | ">" | "<" | "<=>" | "!");
+                let version = method.as_str() == "new" && matches!(&*recv.node, ExprNode::Const { .. });
+                (compares || version) && stable(recv) && args.iter().all(stable)
+            }
+            _ => false,
+        }
+    }
+    conditional.arms.iter().all(|arm| {
+        arm.condition.as_ref().is_none_or(stable) && arm.nested.iter().all(load_time_stable)
+    })
 }
 
 /// Any `super` in `expr`, at any depth.
