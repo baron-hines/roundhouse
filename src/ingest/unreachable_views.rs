@@ -134,57 +134,85 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         }
         e.node.for_each_child(&mut |c| collect(c, names, fragments));
     }
-    // A name the request decides (`render partial: params[:panel]`, `render params[:panel].to_s`, a `partial:`
-    // variable, an interpolation with next to no text) may be any partial's.
-    fn reads_params(e: &Expr) -> bool {
-        let mut found = matches!(&*e.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "params" && args.is_empty());
-        e.node.for_each_child(&mut |c| found = found || reads_params(c));
-        found
+    // A name the request decides (`render partial: params[:panel]`, `render session[:panel].to_s`, a `partial:`
+    // local not every assignment of which is a literal, an interpolation with no fragment to match) may be any
+    // partial's.
+    // A request value carried as a name: `params[:panel]`, `session[:p].to_s`, a name a request value was assigned,
+    // an interpolation or a branch of one. Not a record a request selects (`Article.find(params[:id])`), which is an
+    // object the render asks for its own partial.
+    fn reads_request(e: &Expr, fed: &HashSet<String>) -> bool {
+        const CARRIES: &[&str] = &["[]", "to_s", "to_sym", "presence", "strip", "downcase", "upcase", "fetch", "dig", "underscore", "pluralize", "singularize"];
+        match &*e.node {
+            ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
+            ExprNode::Send { recv: Some(r), method, .. } => CARRIES.contains(&method.as_str()) && reads_request(r, fed),
+            ExprNode::Var { name, .. } | ExprNode::Ivar { name } => fed.contains(name.as_str()),
+            ExprNode::StringInterp { parts } => parts.iter().any(|p| matches!(p, crate::expr::InterpPart::Expr { expr } if reads_request(expr, fed))),
+            ExprNode::If { then_branch, else_branch, .. } => reads_request(then_branch, fed) || reads_request(else_branch, fed),
+            ExprNode::BoolOp { left, right, .. } => reads_request(left, fed) || reads_request(right, fed),
+            _ => false,
+        }
     }
-    // The variables a statement assigns a request-read value (`@panel = params[:panel].to_s`): an ivar from any body
-    // (a controller's reaches its views), a local from the body that reads it.
-    fn params_fed(e: &Expr, ivars: &mut HashSet<String>, locals: &mut HashSet<String>) {
-        if let ExprNode::Assign { target, value } = &*e.node
-            && reads_params(value)
-        {
+    // Every local and ivar assignment of a body, by name.
+    fn assignments<'a>(e: &'a Expr, out: &mut Vec<(String, bool, &'a Expr)>) {
+        if let ExprNode::Assign { target, value } = &*e.node {
             match target {
-                crate::expr::LValue::Ivar { name } => {
-                    ivars.insert(name.as_str().to_string());
-                }
-                crate::expr::LValue::Var { name, .. } => {
-                    locals.insert(name.as_str().to_string());
-                }
+                crate::expr::LValue::Var { name, .. } => out.push((name.as_str().to_string(), false, value)),
+                crate::expr::LValue::Ivar { name } => out.push((name.as_str().to_string(), true, value)),
                 _ => {}
             }
         }
-        e.node.for_each_child(&mut |c| params_fed(c, ivars, locals));
+        e.node.for_each_child(&mut |c| assignments(c, out));
     }
+    // The names a request value reaches, through aliases too (`source = params[:p]; panel = source`).
+    fn request_fed(assigns: &[(String, bool, &Expr)], fed: &mut HashSet<String>) {
+        loop {
+            let before = fed.len();
+            for (name, _, value) in assigns {
+                if !fed.contains(name) && reads_request(value, fed) {
+                    fed.insert(name.clone());
+                }
+            }
+            if fed.len() == before {
+                break;
+            }
+        }
+    }
+    // The ivars a request value reaches, from any body (a controller's reaches its views), to a fixed point.
     let mut fed_ivars: HashSet<String> = HashSet::default();
-    let mut ignored: HashSet<String> = HashSet::default();
-    crate::lower::for_each_hook_body_ref(app, &mut |b| params_fed(b, &mut fed_ivars, &mut ignored));
-    for v in &app.views {
-        params_fed(&v.body, &mut fed_ivars, &mut ignored);
+    loop {
+        let before = fed_ivars.len();
+        let mut grow = |b: &Expr| {
+            let mut here = Vec::new();
+            assignments(b, &mut here);
+            let ivars: Vec<_> = here.into_iter().filter(|(_, ivar, _)| *ivar).collect();
+            request_fed(&ivars, &mut fed_ivars);
+        };
+        crate::lower::for_each_hook_body_ref(app, &mut |b| grow(b));
+        for v in &app.views {
+            grow(&v.body);
+        }
+        if fed_ivars.len() == before {
+            break;
+        }
     }
-    let open_in = |v: &Expr, fed_locals: &HashSet<String>| -> bool {
+    let open_in = |v: &Expr, locals: &[(String, bool, &Expr)], fed: &HashSet<String>| -> bool {
         match &*v.node {
             ExprNode::Lit { .. } => false,
-            // A collection or a pool a controller assigns (`partial: @tags`), unless a request value was assigned it.
-            ExprNode::Ivar { name } => fed_ivars.contains(name.as_str()),
-            ExprNode::Var { name, .. } => fed_locals.contains(name.as_str()),
-            ExprNode::StringInterp { parts } => {
-                parts.iter().map(|p| match p { crate::expr::InterpPart::Text { value } => value.trim_matches('/').len(), _ => 0 }).sum::<usize>() < 2
+            // A collection or a pool a controller assigns (`partial: @tags`), unless a request value reaches it.
+            ExprNode::Ivar { name } => fed.contains(name.as_str()),
+            // A local is a known name only where each assignment of it is a literal.
+            ExprNode::Var { name, .. } => {
+                let mine: Vec<_> = locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).collect();
+                mine.is_empty() || mine.iter().any(|(_, _, value)| !matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } }))
             }
+            ExprNode::StringInterp { parts } => !parts
+                .iter()
+                .any(|p| matches!(p, crate::expr::InterpPart::Text { value } if value.trim_matches('/').len() >= 2)),
             ExprNode::Send { method, .. } if method.as_str() == "to_partial_path" => false,
             _ => true,
         }
     };
-    let body_computed = |b: &Expr| -> bool {
-        let mut locals: HashSet<String> = HashSet::default();
-        let mut ivars: HashSet<String> = HashSet::default();
-        params_fed(b, &mut ivars, &mut locals);
-        computed_partial(b, &|v: &Expr| open_in(v, &locals))
-    };
-    fn computed_partial(e: &Expr, open_name: &dyn Fn(&Expr) -> bool) -> bool {
+    fn computed_partial(e: &Expr, open: &dyn Fn(&Expr) -> bool, request: &dyn Fn(&Expr) -> bool) -> bool {
         let mut found = false;
         if let ExprNode::Send { method, args, .. } = &*e.node
             && matches!(method.as_str(), "render" | "render_to_string")
@@ -192,18 +220,25 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         {
             found = match &*first.node {
                 ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| {
-                    matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "partial") && open_name(v)
+                    matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "partial") && open(v)
                 }),
-                ExprNode::StringInterp { .. } => open_name(first),
+                ExprNode::StringInterp { .. } => open(first),
                 // Not an object the render asks to render itself (`render DS::Tabs.new(active_tab: params[:tab])`).
                 ExprNode::Send { method, .. } if method.as_str() == "new" => false,
-                ExprNode::Var { name, .. } | ExprNode::Ivar { name } => open_name(first) && !name.as_str().is_empty(),
-                _ => reads_params(first),
+                // An object render (`render post.comments`) unless a request value reaches the argument.
+                _ => request(first),
             };
         }
-        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open_name));
+        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request));
         found
     }
+    let body_computed = |b: &Expr| -> bool {
+        let mut here = Vec::new();
+        assignments(b, &mut here);
+        let mut fed = fed_ivars.clone();
+        request_fed(&here, &mut fed);
+        computed_partial(b, &|v: &Expr| open_in(v, &here, &fed), &|v: &Expr| reads_request(v, &fed))
+    };
     let mut computed = false;
     crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));
     if computed || app.views.iter().any(|v| body_computed(&v.body)) {

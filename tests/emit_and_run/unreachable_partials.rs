@@ -42,7 +42,14 @@ fn a_partial_a_request_may_name_keeps_its_errors() {
 
 #[test]
 fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
-    for reads in ["<% panel = params[:panel].to_s %><%= render partial: panel %>", "<%= render params[:panel].to_s %>", "<%= render partial: \"#{params[:panel]}t\" %>"] {
+    for reads in [
+        "<% panel = params[:panel].to_s %><%= render partial: panel %>",
+        "<% source = params[:panel].to_s %><% panel = source %><%= render partial: panel %>",
+        "<%= render params[:panel].to_s %>",
+        "<%= render session[:panel].to_s %>",
+        "<%= render partial: \"#{params[:panel]}t\" %>",
+        "<%= render partial: \"#{params[:a]}o#{params[:b]}t\" %>",
+    ] {
         let errors = errors_with(reads, "");
         assert!(errors.iter().any(|e| e.contains("@ghost")), "{reads}: {errors:#?}");
     }
