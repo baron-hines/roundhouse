@@ -315,7 +315,10 @@ fn push_schema_integer_query_limits(methods: &mut Vec<MethodDef>, model: &Model,
 /// Left out where Rails does not cast through the uuid type: on SQLite,
 /// whose uuid column is text, and for a `uuid[]`, enum, `attribute` or
 /// `normalizes` column, as `schema_integer_query_limits` leaves them out.
-/// A model with no such column keeps the base's empty list.
+/// A model with no such column still lists none of its own: a model
+/// whose parent has a table (an abstract parent whose conventional table
+/// exists) would otherwise inherit the parent's list and cast its own
+/// keys as uuids.
 fn push_schema_uuid_query_columns(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
     use crate::emit::shared::schema_sql::Dialect;
     if Dialect::current() != Dialect::Postgres {
@@ -328,9 +331,7 @@ fn push_schema_uuid_query_columns(methods: &mut Vec<MethodDef>, model: &Model, t
             && !model.enums.contains_key(&c.name)
             && decorated.as_ref().is_some_and(|names| !names.contains(&c.name))
     };
-    if table.columns.iter().any(keep) {
-        push_schema_symbol_list(methods, &model.name, "schema_uuid_query_columns", table, keep);
-    }
+    push_schema_symbol_list(methods, &model.name, "schema_uuid_query_columns", table, keep);
 }
 
 pub(super) fn push_schema_methods(
