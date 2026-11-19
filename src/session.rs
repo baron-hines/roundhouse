@@ -176,6 +176,11 @@ pub fn drop_answered_by_target(app: &App, target: crate::build_target::BuildTarg
 /// file's program).
 pub fn drop_runtime_answered(target: crate::build_target::BuildTarget, diags: &mut Vec<Diagnostic>) {
     use crate::build_target::BuildTarget;
+    // Spinel's SQLite Db opens the pools of an app that routes by role and shard (`ingest::database_ownership`); no
+    // other target's does, and they keep the refusal.
+    if target == BuildTarget::Spinel {
+        diags.retain(|diagnostic| !matches!(&diagnostic.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "database_routes"));
+    }
     if !matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }
