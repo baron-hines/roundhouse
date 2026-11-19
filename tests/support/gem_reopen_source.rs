@@ -234,6 +234,15 @@ pub fn unrequired_gem_box_models_app() -> emit_and_run::Overlay {
     with_unrequired_gem_box().write("app/models/shelf/box.rb", LOCAL)
 }
 
+/// [`models_app`] with the gem's `Shelf::Box` in `lib/shelf/box.rb`, which
+/// the gem autoloads by feature name (`autoload :Box, "shelf/box"`).
+#[allow(dead_code)]
+pub fn feature_autoloaded_gem_box_models_app() -> emit_and_run::Overlay {
+    with_gem_lib("module Shelf\n  autoload :Box, \"shelf/box\"\nend\n")
+        .write(&format!("{GEM_DIR}/lib/shelf/box.rb"), SHELF)
+        .write("app/models/shelf/box.rb", LOCAL)
+}
+
 /// [`unrequired_gem_box_models_app`]: the gem has not defined `Shelf::Box`
 /// when Zeitwerk scans `app/models`, so Rails 8.1.4.1 loads the app's file,
 /// with eager loading or without, and never the gem's.
@@ -241,6 +250,18 @@ pub fn unrequired_gem_box_models_app() -> emit_and_run::Overlay {
 pub const APP_FILE_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.respond_to?(:kind), Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
 raise "app file models #{got.inspect}" unless got == [false, "app box", true]
 puts "app file models passed"
+"##;
+
+/// [`feature_autoloaded_gem_box_models_app`]: an autoload to a feature name
+/// doesn't count (Zeitwerk 2.8.3 skips a file only for a defined constant
+/// or an autoload to a `.rb` path), so Rails 8.1.4.1 loads the app's file,
+/// with eager loading or without. It never reads the gem's either, so
+/// `kind` is undefined there, but roundhouse compiles every file the gem's
+/// requires and autoloads reach, as main does, and that half isn't asserted.
+#[allow(dead_code)]
+pub const AUTOLOADED_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "autoloaded models #{got.inspect}" unless got == ["app box", true]
+puts "autoloaded models passed"
 "##;
 
 /// [`acronym_models_app`]: Rails 8.1.4.1 never loads the reopen, so the class is the gem's.

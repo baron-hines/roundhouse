@@ -68,6 +68,13 @@ fn a_reopen_at_the_autoload_path_of_a_gem_class_in_an_unrequired_file_is_loaded(
     contract::listed(contract::unrequired_gem_box_models_app()).run_ruby(contract::APP_FILE_MODELS_ASSERTIONS).assert_passes();
 }
 
+/// Nor does a gem file the gem autoloads by feature name: Zeitwerk sets
+/// its own autoload over that one, from the app's file.
+#[test]
+fn a_reopen_at_the_autoload_path_of_a_gem_class_autoloaded_by_feature_is_loaded() {
+    contract::listed(contract::feature_autoloaded_gem_box_models_app()).run_ruby(contract::AUTOLOADED_MODELS_ASSERTIONS).assert_passes();
+}
+
 /// The emitted `Shelf::Box`: one file holding each opening in load order.
 fn shelf_box(app: super::emit_and_run::Overlay) -> String {
     let (emitted, _errors) = app.emit(BuildTarget::Spinel);
