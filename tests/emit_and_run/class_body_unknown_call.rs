@@ -30,6 +30,8 @@ fn other_class_body_calls_stay_unreported() {
         "module ProbeConcern\n  def self.mappings = {}\n  BY = mappings\nend\n",
         // a parentless class, whose `class << self` the lookup does not read
         "class ProbePlain\n  class << self\n    def defaults = {}\n  end\n  D = defaults\nend\n",
+        // a lambda's default, which runs when it is called
+        "class ProbeLambda < ActionView::Helpers::FormBuilder\n  HANDLER = ->(value = unresolved_default) { value }\nend\n",
         // a name another class defines
         "class ProbeHelper < ActionView::Helpers::FormBuilder\n  class_attribute :x, default: shared_list\nend\n",
     ] {

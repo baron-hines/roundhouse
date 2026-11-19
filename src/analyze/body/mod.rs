@@ -2492,6 +2492,8 @@ impl<'a> BodyTyper<'a> {
                 // untyped until a `.call` site names it. A default is typed
                 // in the lambda's own scope as filled so far, so it reads an
                 // earlier extra parameter (`c = b`) rather than an outer local.
+                // A default runs when the block is called, not where it is written.
+                self.block_depth.set(self.block_depth.get() + 1);
                 for param in extra_params.iter_mut() {
                     let ty = match (&mut param.default, param.keyword && param.rest) {
                         (_, true) => Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
@@ -2508,7 +2510,6 @@ impl<'a> BodyTyper<'a> {
                 if let Some(seeds) = &seeds {
                     seeds.bind_keywords(&mut inner, extra_params);
                 }
-                self.block_depth.set(self.block_depth.get() + 1);
                 let body_ty = self.analyze_expr(body, &inner);
                 self.block_depth.set(self.block_depth.get() - 1);
                 // A block's parameter types were seeded into `ctx` and are

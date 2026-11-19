@@ -4553,7 +4553,12 @@ impl Analyzer {
                 // Class side: an initializer runs in the class body, where `self` is the class (`class_attribute
                 // :x, default: field_helpers` calls `FormBuilder.field_helpers`), and an unknown method there raises
                 // when the class loads.
-                let body_ctx = Ctx { class_side: true, ..class_ctx.clone() };
+                // Not the sole includer a module's methods are typed against: its own body is the module's.
+                let body_ctx = Ctx {
+                    class_side: true,
+                    self_ty: Some(Ty::Class { id: lc.name.clone(), args: vec![].into() }),
+                    ..class_ctx.clone()
+                };
                 for initializer in &mut lc.class_ivar_initializers {
                     self.body_typer().analyze_expr(initializer, &body_ctx);
                 }
