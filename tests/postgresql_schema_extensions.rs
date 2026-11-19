@@ -215,13 +215,38 @@ fn a_cascading_disable_is_refused() {
     assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string()]));
 }
 
-/// `drop_schema` is `DROP SCHEMA ... CASCADE`: ActiveRecord 8.1.4.1
-/// drops the extension created in that schema with it, and keeps one in
-/// another schema.
+/// `drop_schema` is `DROP SCHEMA ... CASCADE`. On ActiveRecord 8.1.4.1
+/// that drops the extensions created in that schema, and what depends on
+/// them in other schemas too: `public.earthdistance` when `cube` was in
+/// the dropped schema, and a `public` table's `citext` column. The fold
+/// can't tell what depends on an extension, so dropping a schema that
+/// holds one is refused, like `disable_extension ..., force: :cascade`.
+/// A schema with no recorded extension still drops.
 #[test]
-fn drop_schema_drops_the_extensions_created_in_it() {
-    let ddl = folded_database_objects("    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"\n    enable_extension \"cube\"\n    drop_schema \"extensions\"");
-    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "cube""#.to_string()]));
+fn drop_schema_with_an_extension_in_it_is_refused() {
+    for body in [
+        "    create_schema \"extensions\"\n    enable_extension \"extensions.cube\"\n    enable_extension \"public.earthdistance\"\n    drop_schema \"extensions\"",
+        "    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"\n    enable_extension \"cube\"\n    drop_schema \"extensions\"",
+    ] {
+        let error = folded_database_objects(body).expect_err("dropping a schema that holds an extension is refused");
+        assert!(error.contains("drop_schema \"extensions\""), "{error}");
+    }
+    let ddl = folded_database_objects("    create_schema \"reports\"\n    enable_extension \"pgcrypto\"\n    drop_schema \"reports\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string()]));
+}
+
+/// `create_schema "x", force: true` is `drop_schema "x", if_exists: true`
+/// and then `CREATE SCHEMA` (ActiveRecord 8.1.4.1), so the extensions
+/// created in it go too. The fold applies the drop first: a schema with
+/// no recorded extension is recreated, and one that holds an extension
+/// is refused, as `drop_schema` is.
+#[test]
+fn create_schema_with_force_drops_the_schema_first() {
+    let ddl = folded_database_objects("    create_schema \"reports\"\n    create_schema \"reports\", force: true");
+    assert_eq!(ddl, Ok(vec![r#"CREATE SCHEMA IF NOT EXISTS "reports""#.to_string()]));
+    let error = folded_database_objects("    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"\n    create_schema \"extensions\", force: true\n    enable_extension \"public.pgcrypto\"")
+        .expect_err("recreating a schema that holds an extension is refused");
+    assert!(error.contains("create_schema \"extensions\"") && error.contains("force:"), "{error}");
 }
 
 /// A keyword splat hides `force:` from the fold
