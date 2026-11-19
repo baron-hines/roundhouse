@@ -55,11 +55,67 @@ raise "includer reads: #{got.inspect}" unless got == expected
 puts "probe passed"
 "##;
 
+/// The body of `def <name>` in an emitted Ruby file, up to its `end`.
+fn emitted_method(emitted: &std::path::Path, file: &str, name: &str) -> String {
+    let source = std::fs::read_to_string(emitted.join(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+    let start = source.find(&format!("  def {name}")).unwrap_or_else(|| panic!("no `def {name}` in {file}:\n{source}"));
+    let end = source[start..].find("\n  end\n").map_or(source.len(), |at| start + at);
+    source[start..end].to_string()
+}
+
 #[test]
 fn a_method_missing_module_reads_its_includers_methods() {
     let run = app().run_ruby(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    // CRuby gives "plain gizmo" whether `shiny?` stays a plain call or
+    // becomes `method_missing(:shiny?)`, so the lowering is read from the
+    // emitted module: no includer answers `shiny?`, and both answer `name`.
+    let shiny_label = emitted_method(&run.emitted, "app/models/describable.rb", "shiny_label");
+    assert!(shiny_label.contains("if method_missing(:shiny?)"), "{shiny_label}");
+    assert!(shiny_label.contains("\"shiny #{name}\"") && shiny_label.contains("\"plain #{name}\""), "{shiny_label}");
+    assert!(!shiny_label.contains("method_missing(:name)"), "{shiny_label}");
+}
+
+/// Review 4: a column reader only the model answers. `Widget` is the
+/// module's one includer, and `sku` is a `widgets` column with no method
+/// of that name anywhere, so only the column check keeps it a plain read.
+/// ActiveRecord 8.1.4.1 gives `"W-1-Sprocket"`.
+fn column_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/concerns/stocked.rb", r##"module Stocked
+  extend ActiveSupport::Concern
+
+  def stock_code
+    "#{sku}-#{name}"
+  end
+
+  def method_missing(name, *args)
+    name.to_s.end_with?("?") ? false : super
+  end
+
+  def respond_to_missing?(method_name, include_private = false)
+    method_name.to_s.end_with?("?") || super
+  end
+end
+"##)
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\n  include Stocked\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"sku\"\n  end\nend\n")
+}
+
+const COLUMN: &str = r##"got = Widget.create!(name: "Sprocket", sku: "W-1").stock_code
+raise "column reader: #{got.inspect}" unless got == "W-1-Sprocket"
+puts "probe passed"
+"##;
+
+#[test]
+fn a_method_missing_module_reads_a_column_only_its_model_has() {
+    let run = column_app().run_ruby(COLUMN);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    let stock_code = emitted_method(&run.emitted, "app/models/stocked.rb", "stock_code");
+    assert!(stock_code.contains("\"#{sku}-#{name}\""), "{stock_code}");
 }
 
 #[test]
@@ -117,6 +173,34 @@ fn a_method_missing_module_reads_a_method_its_includer_includes_at_depth_on_spin
     let run = nested_app().run_spinel(NESTED);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+/// Review 4: `ChildHost` alone, so its parent `BaseHost` is the only place
+/// `token` comes from (through `Wrapper`, `Middle`, `Provider`). With
+/// `Host` beside it, `Host`'s own lookup kept `token` plain for both.
+/// Ruby 4.0.7 gives `"tok-child"`.
+fn child_only_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/concerns/badged.rb", badged_concern())
+        .write("app/models/provider.rb", "module Provider\n  def token\n    \"tok\"\n  end\nend\n")
+        .write("app/models/middle.rb", "module Middle\n  include Provider\n\n  def middle?\n    true\n  end\nend\n")
+        .write("app/models/wrapper.rb", "module Wrapper\n  include Middle\n\n  def wrapped?\n    true\n  end\nend\n")
+        .write("app/models/base_host.rb", "class BaseHost\n  include Wrapper\nend\n")
+        .write("app/models/child_host.rb", "class ChildHost < BaseHost\n  include Badged\n\n  def label\n    \"child\"\n  end\nend\n")
+}
+
+const CHILD_ONLY: &str = r##"got = ChildHost.new.badge
+raise "parent's nested include: #{got.inspect}" unless got == "tok-child"
+puts "probe passed"
+"##;
+
+#[test]
+fn a_method_missing_module_reads_a_method_its_includers_parent_includes_at_depth() {
+    let run = child_only_app().run_ruby(CHILD_ONLY);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    let badge = emitted_method(&run.emitted, "app/models/badged.rb", "badge");
+    assert!(badge.contains("\"#{token}-#{label}\""), "{badge}");
 }
 
 /// Review 2: the module's includers found indirectly. `Courier` reaches
