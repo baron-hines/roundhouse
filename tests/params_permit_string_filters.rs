@@ -88,3 +88,21 @@ fn a_nested_permit_with_a_hash_filter_takes_string_filters() {
         }
     }
 }
+
+/// A nested value's scalar filters spelled as Strings or an Array literal keep only scalar values, as Rails'
+/// `permit` does: `Params.allowed_scalars`, the scalar filter an element's `permit` lowers to, not `slice`, which
+/// would keep a Hash or an Array. The all-Symbol spelling is left as it lowers on main.
+#[test]
+fn a_nested_permit_with_string_filters_keeps_only_scalars() {
+    const ALLOWED: &str = r#"@q = Params.allowed_scalars(@params.fetch("q", {}), ["name", "settings"])"#;
+    for filters in ["\"name\", \"settings\"", "%w[name settings]", ":name, \"settings\""] {
+        let body = format!("    @q = params.fetch(:q, {{}}).permit({filters})");
+        for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+            let src = controller_for(target, &body);
+            assert!(src.contains(ALLOWED), "{target:?} permit({filters}):\n{src}");
+            assert!(!src.contains(".slice("), "{target:?} permit({filters}):\n{src}");
+        }
+    }
+    let src = controller_for(BuildTarget::Spinel, "    @q = params.fetch(:q, {}).permit(:name, :settings)");
+    assert!(src.contains(r#"@q = @params.fetch("q", {}).slice("name", "settings")"#), "{src}");
+}

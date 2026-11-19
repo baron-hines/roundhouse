@@ -342,14 +342,7 @@ fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {
 fn element_filter(e: &Expr) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return None };
     let params_const = || Expr::new(e.span, ExprNode::Const { path: vec![Symbol::from("Params")] });
-    let allowed = |names: Vec<String>| {
-        let mut list = Expr::new(e.span, ExprNode::Array {
-            elements: names.into_iter().map(|n| str_lit(e.span, n)).collect(),
-            style: Default::default(),
-        });
-        list.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
-        send(e.span, Some(params_const()), "allowed_scalars", vec![r.clone(), list])
-    };
+    let allowed = |names: Vec<String>| allowed_scalars(e.span, r, names);
     if method.as_str() == "expect" {
         let [key] = args.as_slice() else { return None };
         let name = sym_name(key)?;
@@ -420,7 +413,13 @@ fn rewrite(expr: &mut Expr, lists: &HelperLists) {
     let replacement = match (method.as_str(), args.as_slice()) {
         ("permit!" | "to_unsafe_h", []) if nested || is_request_params(r) => Some(r.clone()),
         ("permit", keys) if nested && !keys.is_empty() => match filter_names(keys) {
-            Some(names) => Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect())),
+            // The all-Symbol spelling, as main lowers it.
+            Some(names) if keys.iter().all(|k| sym_name(k).is_some()) => {
+                Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect()))
+            }
+            // A String or Array-literal filter (`permit("a")`, `permit(%w[a b])`) keeps only scalar values, as Rails'
+            // scalar filter does, with the scalar filter an element's `permit` lowers to: a Hash or an Array is dropped.
+            Some(names) => Some(allowed_scalars(expr.span, r, names)),
             // maybe's `params.fetch(:q, {}).permit(:search, accounts: [])`: the nested filters a request's own permit takes.
             None => filtered_call(expr),
         },
@@ -594,6 +593,17 @@ fn filter_name(e: &Expr) -> Option<String> {
         ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
         _ => sym_name(e),
     }
+}
+
+/// `Params.allowed_scalars(recv, ["a", "b"])`: the named keys of `recv` whose values are not a Hash or an Array.
+fn allowed_scalars(span: crate::span::Span, recv: &Expr, names: Vec<String>) -> Expr {
+    let mut list = Expr::new(span, ExprNode::Array {
+        elements: names.into_iter().map(|n| str_lit(span, n)).collect(),
+        style: Default::default(),
+    });
+    list.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+    let params_const = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] });
+    send(span, Some(params_const), "allowed_scalars", vec![recv.clone(), list])
 }
 
 fn sym_name(e: &Expr) -> Option<String> {

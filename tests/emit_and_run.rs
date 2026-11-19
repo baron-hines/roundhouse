@@ -22747,3 +22747,5 @@ mod params_compact_blank;
 mod computed_partial_render;
 #[path = "emit_and_run/view_raise_statement.rs"]
 mod view_raise_statement;
+#[path = "emit_and_run/params_string_filter_scalars.rs"]
+mod params_string_filter_scalars;
