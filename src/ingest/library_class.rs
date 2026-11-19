@@ -29,6 +29,12 @@ struct IncludedHoist {
 
 thread_local! {
     static INCLUDED_HOISTS: std::cell::RefCell<Vec<IncludedHoist>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The app's actionview major version from its `Gemfile.lock`, which `field_helpers`' spelling follows.
+    static ACTIONVIEW_MAJOR: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn set_actionview_major(major: Option<u32>) {
+    ACTIONVIEW_MAJOR.with(|m| m.set(major));
 }
 
 /// The hoisted defs a module the same `included do` includes also defines: Ruby defines the block's
@@ -4623,8 +4629,9 @@ fn walk_decl_body_with_visibility<'pr>(
 fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), String)>) {
     let mut kept = Vec::with_capacity(statements.len());
     let mut evaled = Vec::new();
+    let lists = class_attribute_lists(&statements);
     for s in statements {
-        match class_eval_loop_sources(&s) {
+        match class_eval_loop_sources(&s, &lists) {
             Some(sources) => {
                 let at = (s.location().start_offset() as u32, s.location().end_offset() as u32);
                 evaled.extend(sources.into_iter().map(|source| (at, source)));
@@ -4635,24 +4642,155 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
     (kept, evaled)
 }
 
+/// Rails 8's `FormBuilder.field_helpers`, also the list without a lockfile; Rails 7 spells two of them
+/// `text_area`/`check_box`, which 8 keeps as aliases of `textarea`/`checkbox`.
+pub(crate) const FORM_BUILDER_FIELD_HELPERS: [&str; 24] = [
+    "fields_for", "fields", "label", "text_field", "password_field", "hidden_field", "file_field", "textarea", "checkbox",
+    "radio_button", "color_field", "search_field", "telephone_field", "phone_field", "date_field", "time_field",
+    "datetime_field", "datetime_local_field", "month_field", "week_field", "url_field", "email_field", "number_field",
+    "range_field",
+];
+
+fn form_builder_field_helpers() -> Vec<String> {
+    let rails7 = ACTIONVIEW_MAJOR.with(|m| m.get()).is_some_and(|major| major < 8);
+    FORM_BUILDER_FIELD_HELPERS
+        .iter()
+        .map(|h| match *h {
+            "textarea" if rails7 => "text_area".to_string(),
+            "checkbox" if rails7 => "check_box".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// The literal list a node names: an Array of Strings or Symbols, a FormBuilder's `field_helpers` (unless the class
+/// defines its own), or one list less another (`field_helpers - [:label]`, maybe's `StyledFormBuilder`). Each name
+/// keeps whether it was a Symbol, as `Array#-` compares by `eql?`.
+fn static_name_list(node: &ruby_prism::Node<'_>, framework_helpers: bool) -> Option<Vec<(bool, String)>> {
+    if let Some(array) = node.as_array_node() {
+        return array
+            .elements()
+            .iter()
+            .map(|e| {
+                e.as_string_node()
+                    .map(|n| (false, String::from_utf8_lossy(n.unescaped()).into_owned()))
+                    .or_else(|| e.as_symbol_node().map(|n| (true, String::from_utf8_lossy(n.unescaped()).into_owned())))
+            })
+            .collect();
+    }
+    let call = node.as_call_node()?;
+    let name = constant_id_str(&call.name());
+    if name == "field_helpers" && framework_helpers && call.receiver().is_none() && call.arguments().is_none() && call.block().is_none() {
+        return Some(form_builder_field_helpers().into_iter().map(|s| (true, s)).collect());
+    }
+    if name == "-" {
+        let left = static_name_list(&call.receiver()?, framework_helpers)?;
+        let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+        let [right] = args.as_slice() else { return None };
+        let right = static_name_list(right, framework_helpers)?;
+        return Some(left.into_iter().filter(|n| !right.contains(n)).collect());
+    }
+    None
+}
+
+/// `class_attribute :text_field_helpers, default: field_helpers - [...]`: the attributes whose default is a literal
+/// list, which a loop over the reader (`text_field_helpers.each`) walks as the body loads.
+// Not an attribute declared twice, written (`self.x =`), handed to any call but `each`, or given a reader of the
+// class's own: the loop would then read another list than the default.
+fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String, Vec<String>> {
+    let mut declared: HashMap<String, Option<Vec<(bool, String)>>> = HashMap::default();
+    let mut redefined: HashSet<String> = HashSet::default();
+    let writes_field_helpers = |s: &ruby_prism::Node<'_>| {
+        s.as_call_node().is_some_and(|c| constant_id_str(&c.name()) == "field_helpers=")
+            || s.as_call_operator_write_node().is_some_and(|w| constant_id_str(&w.read_name()) == "field_helpers")
+            || s.as_call_or_write_node().is_some_and(|w| constant_id_str(&w.read_name()) == "field_helpers")
+    };
+    let framework_helpers = !statements.iter().any(|s| {
+        s.as_def_node().is_some_and(|d| constant_id_str(&d.name()) == "field_helpers")
+            || writes_field_helpers(s)
+            || s.as_call_node().is_some_and(|c| {
+                c.receiver().is_none()
+                    && matches!(constant_id_str(&c.name()).as_ref(), "class_attribute" | "cattr_accessor" | "cattr_reader")
+                    && c.arguments().is_some_and(|a| a.arguments().iter().any(|a| a.as_symbol_node().is_some_and(|n| n.unescaped() == b"field_helpers")))
+            })
+    });
+    fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
+        let Some(call) = node.as_call_node() else { return };
+        let name = constant_id_str(&call.name()).to_string();
+        if let Some(attr) = name.strip_suffix('=')
+            && call.receiver().is_some_and(|r| r.as_self_node().is_some())
+        {
+            redefined.insert(attr.to_string());
+        }
+        if let Some(reader) = call.receiver().and_then(|r| r.as_call_node())
+            && reader.receiver().is_none_or(|r| r.as_self_node().is_some())
+            && reader.arguments().is_none()
+            && (name != "each" || reader.receiver().is_some())
+        {
+            redefined.insert(constant_id_str(&reader.name()).to_string());
+        }
+    }
+    for s in statements {
+        if let Some(def) = s.as_def_node() {
+            redefined.insert(constant_id_str(&def.name()).trim_end_matches('=').to_string());
+            continue;
+        }
+        note_uses(s, &mut redefined);
+        let Some(call) = s.as_call_node() else { continue };
+        if call.receiver().is_some() {
+            continue;
+        }
+        let Some(args) = call.arguments() else { continue };
+        let args: Vec<_> = args.arguments().iter().collect();
+        if constant_id_str(&call.name()) != "class_attribute" {
+            for a in &args {
+                if let Some(name) = a.as_symbol_node() {
+                    redefined.insert(String::from_utf8_lossy(name.unescaped()).into_owned());
+                }
+            }
+            continue;
+        }
+        let default = args.iter().find_map(|a| a.as_keyword_hash_node()).and_then(|options| {
+            options.elements().iter().find_map(|e| {
+                let pair = e.as_assoc_node()?;
+                let key = pair.key().as_symbol_node()?;
+                (key.unescaped() == b"default").then(|| pair.value())
+            })
+        });
+        let list = default.as_ref().and_then(|d| static_name_list(d, framework_helpers));
+        for name in args.iter().filter_map(|a| a.as_symbol_node()) {
+            let name = String::from_utf8_lossy(name.unescaped()).into_owned();
+            if declared.insert(name.clone(), list.clone()).is_some() {
+                redefined.insert(name);
+            }
+        }
+    }
+    declared
+        .into_iter()
+        .filter(|(name, _)| !redefined.contains(name))
+        .filter_map(|(name, list)| Some((name, list?.into_iter().map(|(_, n)| n).collect())))
+        .collect()
+}
+
 /// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
-fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+fn class_eval_loop_sources(s: &ruby_prism::Node<'_>, lists: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
     let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<String>> {
         let call = s.as_call_node()?;
         if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
             return None;
         }
-        let elements: Vec<String> = call
-            .receiver()?
-            .as_array_node()?
-            .elements()
-            .iter()
-            .map(|e| {
-                e.as_string_node()
-                    .map(|n| String::from_utf8_lossy(n.unescaped()).into_owned())
-                    .or_else(|| e.as_symbol_node().map(|n| String::from_utf8_lossy(n.unescaped()).into_owned()))
-            })
-            .collect::<Option<_>>()?;
+        let receiver = call.receiver()?;
+        let elements: Vec<String> = match receiver.as_call_node() {
+            Some(reader) if reader.receiver().is_none() && reader.arguments().is_none() && reader.block().is_none() => {
+                lists.get(&*constant_id_str(&reader.name()))?.clone()
+            }
+            _ => receiver
+                .as_array_node()
+                .and_then(|_| static_name_list(&receiver, false))?
+                .into_iter()
+                .map(|(_, n)| n)
+                .collect(),
+        };
         let block = call.block()?.as_block_node()?;
         let params: Vec<_> = block.parameters()?.as_block_parameters_node()?.parameters()?.requireds().iter().collect();
         let [param] = params.as_slice() else { return None };
@@ -6121,11 +6259,13 @@ pub fn ingest_concern_class_method_spans(
 ) -> (Vec<ConcernClassMethodSpans>, HashSet<ClassId>) {
     fn defs_in(body: Option<ruby_prism::Node<'_>>, file: &str, out: &mut Vec<Span>) {
         let Some(body) = body else { return };
-        for stmt in flatten_statements(body) {
+        let statements = flatten_statements(body);
+        let lists = class_attribute_lists(&statements);
+        for stmt in statements {
             // A `define_method` loop's methods carry its name argument's span.
             out.extend(super::define_method_loop::name_spans(&stmt, file));
             // A `class_eval` string loop's, the loop's (`unroll_class_eval_loops`).
-            if class_eval_loop_sources(&stmt).is_some() {
+            if class_eval_loop_sources(&stmt, &lists).is_some() {
                 out.push(Span { file: super::sources::file_id(file), start: stmt.location().start_offset() as u32, end: stmt.location().end_offset() as u32 });
             }
             if let Some(def) = visibility::definition(&stmt) {

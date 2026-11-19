@@ -22767,5 +22767,7 @@ mod params_compact_blank;
 mod computed_partial_render;
 #[path = "emit_and_run/view_raise_statement.rs"]
 mod view_raise_statement;
+#[path = "emit_and_run/hidden_field_autocomplete.rs"]
+mod hidden_field_autocomplete;
 #[path = "emit_and_run/record_as_json_in_literal.rs"]
 mod record_as_json_in_literal;

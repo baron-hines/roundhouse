@@ -1,8 +1,7 @@
-//! maybe's `StyledFormBuilder < ActionView::Helpers::FormBuilder` opens
-//! with `class_attribute :text_field_helpers, default: field_helpers - […]`.
-//! The runtime's FormBuilder has no `field_helpers`, so the emitted class
-//! raises `NameError` as it loads, where `check` only warned of an
-//! unresolved type. A receiverless call in a class body that no class here
+//! A builder subclass's body reading a class method its FormBuilder does not
+//! have (`default: field_names - […]`, beside maybe's real `field_helpers`)
+//! raises `NameError` as the emitted class loads, where `check` only warned
+//! of an unresolved type. A receiverless call in a class body that no class here
 //! answers, under a known superclass, is now the error it is. Left alone:
 //! a block's call (its `self` may be another object), a module's, a
 //! parentless class's, and a name some class defines.
@@ -17,8 +16,8 @@ fn errors(body: &str) -> Vec<String> {
 
 #[test]
 fn an_unknown_class_body_call_under_a_known_superclass_is_an_error() {
-    let errors = errors("class ProbeBuilder < ActionView::Helpers::FormBuilder\n  class_attribute :listed, default: field_helpers - [:label]\nend\n");
-    assert!(errors.iter().any(|e| e.contains("no known method `field_helpers` on ProbeBuilder")), "{errors:#?}");
+    let errors = errors("class ProbeBuilder < ActionView::Helpers::FormBuilder\n  class_attribute :listed, default: field_names - [:label]\nend\n");
+    assert!(errors.iter().any(|e| e.contains("no known method `field_names` on ProbeBuilder")), "{errors:#?}");
 }
 
 #[test]
@@ -43,4 +42,18 @@ fn other_class_body_calls_stay_unreported() {
             .check_errors();
         assert!(!errors.iter().any(|e| e.contains("no known method") && e.contains("Probe")), "{body}: {errors:#?}");
     }
+}
+
+/// Rails' `FormBuilder.field_helpers` is the builder's own, which the Ruby family's overlay answers.
+#[test]
+fn field_helpers_in_a_builder_body_is_known() {
+    let errors = errors("class ProbeBuilder < ActionView::Helpers::FormBuilder\n  class_attribute :listed, default: field_helpers - [:label]\nend\n");
+    assert!(!errors.iter().any(|e| e.contains("field_helpers")), "{errors:#?}");
+}
+
+/// A rescue of another class (`rescue ArgumentError`) does not catch the `NameError`, so the class still fails to load.
+#[test]
+fn a_rescue_that_does_not_catch_name_error_keeps_the_error() {
+    let errors = errors("class ProbeBuilder < ActionView::Helpers::FormBuilder\n  LIST = begin\n    absent_probe_hook\n  rescue ArgumentError\n    []\n  end\nend\n");
+    assert!(errors.iter().any(|e| e.contains("no known method `absent_probe_hook`")), "{errors:#?}");
 }

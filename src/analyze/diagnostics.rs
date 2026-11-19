@@ -71,7 +71,9 @@ fn descends_from_form_builder(app: &App, id: &crate::ident::ClassId) -> bool {
 }
 
 fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
-    fn visit(app: &App, expr: &Expr, out: &mut Vec<Diagnostic>) {
+    type Overrides = crate::det::HashMap<String, crate::det::HashSet<String>>;
+    fn visit(app: &App, overrides: &Overrides, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        let overridden = |id: &crate::ident::ClassId, m: &str| overrides.get(id.0.as_str()).is_some_and(|o| o.contains(m));
         // A builder class of the app's or a gem's own (`builder: MoneyFormBuilder`): a method the lowering does not
         // expand runs on Rails' builder at request time, which the Ruby family's overlay carries and no other tree.
         if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
@@ -80,7 +82,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             && id.0.as_str() != "ActionView::Helpers::FormBuilder"
             && descends_from_form_builder(app, id)
             && method.as_str() != "object"
-            && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+            && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden(id, method.as_str()))
         {
             out.push(Diagnostic::unsupported(
                 expr.span,
@@ -98,9 +100,9 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         {
             let base = id.0.as_str() == "ActionView::Helpers::FormBuilder";
             let m = method.as_str();
-            if crate::lower::classify_form_builder_method(m).is_none() {
+            if crate::lower::classify_form_builder_method(m).is_none() || overridden(id, m) {
                 if !base {
-                    expr.node.for_each_child(&mut |child| visit(app, child, out));
+                    expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
                     return;
                 }
                 out.push(Diagnostic::unsupported(
@@ -131,7 +133,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                 ));
             }
         }
-        expr.node.for_each_child(&mut |child| visit(app, child, out));
+        expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
     }
     /// The option of `method`'s call that Rails' `Tags::*#render`
     /// rewrites: `NumberField` (and `RangeField`) turn `in:`/`within:`
@@ -155,9 +157,148 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             rewritten.iter().find(|o| **o == key).copied()
         })
     }
+    // A `fields_for` block's builder is the outer form's class in Rails, though the analysis types one inside another as
+    // the base: carry the class in, and report an override called on it as the outer level's is.
+    fn nested(expr: &Expr, overrides: &Overrides, scope: &[(Symbol, crate::ident::ClassId)], out: &mut Vec<Diagnostic>) {
+        // A block that binds a name again (`others.each do |child|`) hides the builder of that name inside it.
+        if let ExprNode::Lambda { params, body, .. } = &*expr.node
+            && scope.iter().any(|(n, _)| params.contains(n))
+        {
+            let inner: Vec<_> = scope.iter().filter(|(n, _)| !params.contains(n)).cloned().collect();
+            nested(body, overrides, &inner, out);
+            return;
+        }
+        let class_of = |r: &Expr| -> Option<crate::ident::ClassId> {
+            match &*r.node {
+                ExprNode::Var { name, .. } => scope.iter().rev().find(|(n, _)| n == name).map(|(_, c)| c.clone()),
+                _ => None,
+            }
+            .or_else(|| match &r.ty {
+                Some(Ty::Class { id, .. }) if overrides.contains_key(id.0.as_str()) => Some(id.clone()),
+                _ => None,
+            })
+        };
+        if let ExprNode::Send { recv: Some(r), method, block, .. } = &*expr.node
+            && let Some(class) = class_of(r)
+        {
+            let typed_as_it = matches!(&r.ty, Some(Ty::Class { id, .. }) if *id == class);
+            if !typed_as_it && !expr.span.is_synthetic() && overrides.get(class.0.as_str()).is_some_and(|o| o.contains(method.as_str())) {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    format!("`form.{}` is {}'s own method, which runs on Rails' FormBuilder at request time, carried by the Ruby family's runtime only", method.as_str(), class.0.as_str()),
+                ));
+            }
+            if method.as_str() == "fields_for"
+                && let Some(b) = block
+                && let ExprNode::Lambda { params, body, .. } = &*b.node
+                && let Some(param) = params.first()
+            {
+                let mut inner = scope.to_vec();
+                inner.push((param.clone(), class));
+                nested(body, overrides, &inner, out);
+                if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                    for e in recv.iter().chain(args.iter()) {
+                        nested(e, overrides, scope, out);
+                    }
+                }
+                return;
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested(c, overrides, scope, out));
+    }
+    // Rails adds the persisted child's hidden id unless the body wrote it at render; one written only under a
+    // condition is known then, and the lowering decides at compile time.
+    fn conditional_hidden_id(e: &Expr, param: &Symbol, under: bool) -> bool {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && under
+            && method.as_str() == "hidden_field"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name == param)
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) if value.as_str() == "id")
+        {
+            return true;
+        }
+        let branch = under || matches!(&*e.node, ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } | ExprNode::BoolOp { .. } | ExprNode::Lambda { .. });
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found |= conditional_hidden_id(c, param, branch));
+        found
+    }
+    fn nested_attributes_fields(nested: &crate::det::HashMap<(String, String), bool>, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: Some(r), method, args, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let Some(Ty::Class { args: tyargs, .. }) = &r.ty
+            && let [Ty::Class { id: model, .. }] = tyargs.as_slice()
+            && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: assoc } }) = args.first().map(|a| &*a.node)
+            && nested.contains_key(&(model.0.as_str().to_string(), assoc.as_str().to_string()))
+            && let ExprNode::Lambda { params, body, .. } = &*b.node
+            && let Some(param) = params.first()
+            && conditional_hidden_id(body, param, false)
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "fields_for nested attributes",
+                format!("`fields_for :{}` writes the record's hidden id only under a condition: Rails adds it unless the body wrote it at render, which the lowering decides at compile time", assoc.as_str()),
+            ));
+        }
+        expr.node.for_each_child(&mut |c| nested_attributes_fields(nested, c, out));
+    }
+    // A `fields_for` builder handed to a partial: the partial calls the object, which only the Ruby family's overlay builds.
+    fn nested_builder_renders(expr: &Expr, params: &[Symbol], out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Lambda { params: own, body, .. } = &*expr.node
+            && params.iter().any(|p| own.contains(p))
+        {
+            let inner: Vec<_> = params.iter().filter(|p| !own.contains(p)).cloned().collect();
+            nested_builder_renders(body, &inner, out);
+            return;
+        }
+        if let ExprNode::Send { method, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let ExprNode::Lambda { params: own, body, .. } = &*b.node
+            && let Some(param) = own.first()
+        {
+            let mut inner = params.to_vec();
+            inner.push(param.clone());
+            nested_builder_renders(body, &inner, out);
+            if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                for e in recv.iter().chain(args.iter()) {
+                    nested_builder_renders(e, params, out);
+                }
+            }
+            return;
+        }
+        if let ExprNode::Send { recv: None, method, args, .. } = &*expr.node
+            && method.as_str() == "render"
+            && !expr.span.is_synthetic()
+        {
+            fn hands(e: &Expr, params: &[Symbol]) -> bool {
+                match &*e.node {
+                    ExprNode::Var { name, .. } => params.contains(name),
+                    ExprNode::Hash { entries, .. } => entries.iter().any(|(_, v)| hands(v, params)),
+                    _ => false,
+                }
+            }
+            if args.iter().any(|a| hands(a, params)) {
+                // The Ruby family builds Rails' FormBuilder for it, which no other tree carries.
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    "a `fields_for` builder handed to a partial is Rails' FormBuilder object at request time, carried by the Ruby family's runtime only".to_string(),
+                ));
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested_builder_renders(c, params, out));
+    }
     let mut out = Vec::new();
+    let overrides = crate::lower::view::form_builder_overrides(app);
+    let nested_attributes = crate::lower::view::nested_attribute_associations(app);
     for view in &app.views {
-        visit(app, &view.body, &mut out);
+        visit(app, &overrides, &view.body, &mut out);
+        nested(&view.body, &overrides, &[], &mut out);
+        nested_builder_renders(&view.body, &[], &mut out);
+        nested_attributes_fields(&nested_attributes, &view.body, &mut out);
     }
     out
 }
