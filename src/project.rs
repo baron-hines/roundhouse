@@ -10495,6 +10495,10 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         // method; ledger it rather than emit it.
         if let crate::expr::ExprNode::Send { recv, method, .. } = &*expr.node
             && (method.as_str() == "pagy" || method.as_str() == "pagy_array" || method.as_str() == "pagy_url_for")
+            // Not an app's own `pagy_array`/`pagy_url_for`, which needs no pagy runtime; an app's `pagy` is a wrapper whose `super` does.
+            && (method.as_str() == "pagy"
+                || (!app.library_classes.iter().any(|c| c.methods.iter().any(|m| m.name == *method))
+                    && !app.controllers.iter().any(|c| c.actions().any(|a| a.name == *method))))
             && target != "spinel"
             && target != "jruby"
             && !expr.span.is_synthetic()

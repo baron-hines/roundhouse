@@ -279,3 +279,29 @@ puts "PASS"
     assert!(errors.iter().any(|e| e.contains("pagy/extras/bootstrap")), "{errors:#?}");
     assert!(errors.iter().any(|e| e.contains("Pagy::DEFAULT[:size]")), "{errors:#?}");
 }
+
+/// A repeated `require` keeps a later `:last_page` (Ruby loads the extra
+/// once); an overflow mode the gem rejects, and a pagy before 9, are reported.
+#[test]
+fn the_initializer_order_and_the_unmodeled_versions() {
+    let run = app(
+        "pagy(scope)",
+        Some("require \"pagy/extras/overflow\"\nPagy::DEFAULT[:overflow] = :last_page\nrequire \"pagy/extras/overflow\"\n"),
+    )
+    .run_ruby(&script(
+        r##"
+seed(45)
+status, body = get("/articles", "page=9")
+raise "page=9 answered #{status}" unless status == 200 && titles(body) == (41..45).map { |i| "Post #{i}" }
+puts "PASS"
+"##,
+    ));
+    run.assert_passes();
+    let (_emitted, errors) = app("pagy(scope)", Some("require \"pagy/extras/overflow\"\nPagy::DEFAULT[:overflow] = :\"bad mode\"\n"))
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("Pagy::DEFAULT[:overflow]")), "{errors:#?}");
+    let (_emitted, errors) = app("pagy(scope)", None)
+        .edit("Gemfile.lock", "    pagy (9.3.5)\n", "    pagy (8.6.3)\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("pagy 8.6.3")), "{errors:#?}");
+}

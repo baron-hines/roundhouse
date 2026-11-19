@@ -1237,6 +1237,17 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     }
     out.extend(app.unknown_association_targets.iter().cloned());
     // A pagy before 43's initializer settings pagy9.rb does not carry: the emitted app would paginate without them.
+    if let Some(major) = crate::ingest::pagy_locked_major(app).filter(|m| *m < 9)
+        && let Some(lock) = app.gem_lock.as_ref()
+    {
+        let version = lock.version_of("pagy").unwrap_or_default();
+        out.push(Diagnostic::unsupported(
+            crate::span::Span::synthetic(),
+            None,
+            "pagy",
+            format!("pagy {version} (major {major}) is not modeled: only 9 (runtime pagy9.rb) and 43 (pagy.rb) are"),
+        ));
+    }
     if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) && crate::ingest::pagy_locked_before_43(app) {
         for (span, what) in &app.pagy.unmodeled {
             out.push(Diagnostic::unsupported(*span, None, "pagy", format!("{what} is not modeled; the emitted app paginates without it")));

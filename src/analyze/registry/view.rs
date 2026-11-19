@@ -313,7 +313,11 @@ pub(in crate::analyze) fn register(
     // pagy9.rb's `Pagy::Frontend#pagy_url_for`, for an app whose helper includes the module, as Rails' views see it.
     if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy"))
         && crate::ingest::pagy_locked_before_43(app)
-        && app.library_classes.iter().any(|c| c.includes.iter().any(|m| m.0.as_str().trim_start_matches("::") == "Pagy::Frontend"))
+        && app
+            .library_classes
+            .iter()
+            .filter(|c| app.helper_modules.contains(&c.name) || c.name.0.as_str() == "ActionView::Base")
+            .any(|c| c.includes.iter().any(|m| m.0.as_str().trim_start_matches("::") == "Pagy::Frontend"))
     {
         action_view.instance_methods.insert(Symbol::from("pagy_url_for"), Ty::Str);
     }

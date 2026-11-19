@@ -215,28 +215,30 @@ pub(super) fn lower_pagy(app: &mut crate::App) -> super::IngestResult<()> {
         }
     }
     let prepended: Vec<String> = found.iter().flat_map(|(_, _, w, _)| w.iter().cloned()).collect();
-    let mut refusals: Vec<(String, String)> = Vec::new();
+    // `pagy_array` too: the analysis types a call to it as the gem's pair whatever the app's own returns.
+    let gem_method = |name: &str| matches!(name, "pagy" | "pagy_array");
+    let mut refusals: Vec<(String, String, String)> = Vec::new();
     for controller in &app.controllers {
-        for action in controller.actions().filter(|a| a.name.as_str() == "pagy") {
+        for action in controller.actions().filter(|a| gem_method(a.name.as_str())) {
             if !passes_through(&action.body) {
-                refusals.push((controller.name.0.as_str().to_string(), controller.name.0.as_str().to_string()));
+                refusals.push((controller.name.0.as_str().to_string(), controller.name.0.as_str().to_string(), action.name.as_str().to_string()));
             }
         }
     }
     for lc in &app.library_classes {
-        let defines = lc.methods.iter().filter(|m| m.name.as_str() == "pagy" && m.receiver == MethodReceiver::Instance);
+        let defines = lc.methods.iter().filter(|m| gem_method(m.name.as_str()) && m.receiver == MethodReceiver::Instance);
         for method in defines {
             let wrapped = included.contains(&lc.name) || prepended.contains(&lc.name.0.as_str().to_string());
             if wrapped && !passes_through(&method.body) {
-                refusals.push((lc.name.0.as_str().to_string(), lc.name.0.as_str().to_string()));
+                refusals.push((lc.name.0.as_str().to_string(), lc.name.0.as_str().to_string(), method.name.as_str().to_string()));
             }
         }
     }
-    for (file, owner) in refusals {
+    for (file, owner, method) in refusals {
         super::survey::continue_or_fail(super::IngestError::Unsupported {
             file,
             message: format!(
-                "`{owner}#pagy` overrides the pagy gem's `pagy` without handing back the `[pagy, records]` pair \
+                "`{owner}#{method}` overrides the pagy gem's `{method}` without handing back the `[pagy, records]` pair \
                  `super` returned (`pagy, records = super` ... `[pagy, records]`): not modeled"
             ),
         })?;
@@ -315,14 +317,15 @@ pub(super) fn lower_pagy(app: &mut crate::App) -> super::IngestResult<()> {
     Ok(())
 }
 
-/// Whether the app locks a pagy before 43, whose API
-/// (`runtime/ruby/action_controller/pagy9.rb`) is another one.
+/// Whether the app locks a pagy 9, whose API (`runtime/ruby/action_controller/pagy9.rb`) is another one than 43's.
+/// Not every major before 43: 8 and earlier read `items:` as the page size, which pagy9.rb does not.
 pub fn locked_before_43(app: &crate::App) -> bool {
-    app.gem_lock
-        .as_ref()
-        .and_then(|lock| lock.version_of("pagy"))
-        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
-        .is_some_and(|major| major < 43)
+    locked_major(app) == Some(9)
+}
+
+/// The locked pagy's major version.
+pub fn locked_major(app: &crate::App) -> Option<u32> {
+    app.gem_lock.as_ref().and_then(|lock| lock.version_of("pagy")).and_then(|v| v.split('.').next()?.parse::<u32>().ok())
 }
 
 /// The initializers' pagy extras and `Pagy::DEFAULT[...] =` settings (`:overflow` and `:limit`), in
@@ -380,10 +383,12 @@ pub(super) fn read_settings(source: &[u8], file: &str, state: &mut Settings) {
             let path = String::from_utf8_lossy(path.unescaped()).into_owned();
             let Some(extra) = path.strip_prefix("pagy/extras/") else { continue };
             match extra {
-                "overflow" => {
+                // Not on a second `require`: Ruby loads a feature once, so its `DEFAULT[:overflow] = :empty_page` runs once.
+                "overflow" if !state.overflow_extra => {
                     state.overflow_extra = true;
                     state.overflow = Some("empty_page".into());
                 }
+                "overflow" => {}
                 "array" => state.array = true,
                 _ => state.unmodeled.push((span(&stmt), format!("the `pagy/extras/{extra}` extra"))),
             }
@@ -403,7 +408,7 @@ pub(super) fn read_settings(source: &[u8], file: &str, state: &mut Settings) {
         let value = args.get(1).and_then(|v| v.as_symbol_node()).map(|v| String::from_utf8_lossy(v.unescaped()).into_owned());
         let limit = args.get(1).and_then(|v| v.as_integer_node()).and_then(|i| super::util::integer_i64(&i.value())).filter(|n| *n >= 1);
         match (key.as_deref(), value) {
-            (Some("overflow"), Some(mode)) => state.overflow = Some(mode),
+            (Some("overflow"), Some(mode)) if matches!(mode.as_str(), "last_page" | "empty_page" | "exception") => state.overflow = Some(mode),
             (Some("limit"), _) if limit.is_some() => state.limit = limit,
             (Some(key), _) => state.unmodeled.push((span(&stmt), format!("`Pagy::DEFAULT[:{key}] =` with this value"))),
             (None, _) => state.unmodeled.push((span(&stmt), "`Pagy::DEFAULT[...] =` with a key that is not a Symbol".into())),
