@@ -68,7 +68,12 @@ module ActiveRecord
 
   class Connection
     self.@shared: Connection?
+    @slot: Integer
+    @base: bool
     def self.shared: () -> Connection
+    def initialize: (?Integer slot, ?bool base) -> void
+    def _hold_slot: () -> nil
+    def _release_slot: () -> nil
     def adapter_name: () -> String
     def quote: (String | Symbol | Integer | Float | bool | nil value) -> String
     def quote_string: (String str) -> String
@@ -142,6 +147,8 @@ module ActiveRecord
     def self._find_primary_key_input: (Integer | Float | String | nil id) -> Base?
     def self._cast_primary_key: (Integer | Float | String | nil id) -> (Integer | String | nil)
     def self.connection: () -> Connection
+    def self.lease_connection: () -> Connection
+    def self.with_connection: () { (Connection) -> untyped } -> untyped
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
     def self.sanitize_sql_for_order: (String condition) -> String
@@ -237,8 +244,8 @@ module ActiveRecord
     def self.one?: () -> bool
     def self.or: (Relation other) -> Relation
     def self.order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
-    def self.pick: (String | Symbol col) -> untyped
-    def self.pluck: (String | Symbol col) -> Array[untyped]
+    def self.pick: (*(String | Symbol) cols) -> untyped
+    def self.pluck: (*(String | Symbol | Arel::Nodes::SqlLiteral) cols) -> Array[untyped]
     def self.preload: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
     def self.references: (*Symbol names) -> Relation
     def self.reorder: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation

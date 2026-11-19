@@ -383,6 +383,11 @@ module Db
     "sqlite3"
   end
 
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
+  end
+
   def self.transaction_open?
     conn = current_dbh
     conn.transaction_active? && conn.instance_variable_get(:@rh_snapshot) != :open

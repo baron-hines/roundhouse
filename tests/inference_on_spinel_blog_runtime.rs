@@ -659,6 +659,29 @@ fn untyped_subexpressions_baseline() {
     // them for the RBS-paired gate, which stays at 0.
     // MEASURED 1433 on merging #2176 and #2177 (1427): restore_attributes's
     // +1 and the association relation inverses' +5, which add up.
+    // MEASURED 1448 on uuid-keyed token_for (1433): active_record/token_for.rb's
+    // payload writers take the key already written as JSON, a `key` var where
+    // `id.to_s` read a String (+12), and `str_key` / `data_str_id` (+3), vars
+    // on this RBS-less probe; token_for.rbs types them for the RBS-paired gate.
+    // MEASURED 1434 on routed connection handles (main 105a34827: 1433):
+    // the Db slot calls a connection handle makes in
+    // active_record/connection.rb read the Db contract, which this
+    // RBS-less probe does not model, as `self.transaction`'s `Db.exec`
+    // calls do: `Base.connection`'s `Db.connection_slot` and the `slot` it
+    // answers (+4), `transaction`'s guard (+2), and `enter_slot` /
+    // `leave_slot` in `execute`, `select_rows` and `exec_update` with
+    // `raw_connection`'s guard (+8). `Base.connection` now answers a
+    // `Connection.new` on one arm, so its callers' chains in
+    // migration_runner.rb, schema_reader.rb and tasks.rb type (-13).
+    // db.rbs and connection.rbs type them for the RBS-paired gate.
+    // MEASURED 1436 on a held `with_connection` (1434): the handle's
+    // `_hold_slot` and `_release_slot` call `Db.enter_slot` and
+    // `Db.leave_slot`, the Db contract this probe does not model, as the
+    // handle's statements do (+2 in active_record/connection.rb);
+    // `with_connection` itself adds none. db.rbs and connection.rbs type
+    // them for the RBS-paired gate.
+    // MEASURED 1451 on merging main 2d02f862f (1448) with the routed
+    // connection handles' +3, which add up.
     // MEASURED 1439 on PostgreSQL row locking (main 1a54a7397: 1433):
     // the ruby family's `lock!` / `_lock_row` (active_record/connection.rb)
     // add 6. Four read the `lock` argument, typed only by connection.rbs,
@@ -668,7 +691,9 @@ fn untyped_subexpressions_baseline() {
     // the lock's row through `Db.exec_returning` / `Db.step?` /
     // `Db.finalize` (+7). The `stmt` local, its begin/ensure and the three
     // `Db` results read as untyped on this RBS-less probe, as `Db.exec` did.
-    const CEILING: usize = 1446;
+    // MEASURED 1464 on merging main 7d9513597 (1451) with the row locking's
+    // +13 (1446 less main 1a54a7397's 1433), which add up.
+    const CEILING: usize = 1464;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

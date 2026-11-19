@@ -306,6 +306,7 @@ mod tests {
             scope: None,
             extension: Vec::new(),
             primary_key: None,
+            inverse_of: None,
         }
     }
 

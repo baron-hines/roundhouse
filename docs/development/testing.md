@@ -73,6 +73,25 @@ program's half: use it only next to an assertion on `run.errors`, for
 example in a test that expects a refusal, or a control whose wrong
 expectation must fail.
 
+## Scratch directories
+
+Tests write their apps and emitted trees under the system temp directory
+with `scratch::dir(prefix)` from
+[`tests/support/scratch.rs`](../../tests/support/scratch.rs). Each tree
+is removed when its test binary exits (on Unix), whether its tests passed
+or failed; an emit-and-run `Run` or emitted tree goes as soon as the test
+drops it. Left behind, a full suite runs `/tmp` out of inodes.
+`ROUNDHOUSE_KEEP_EMITTED=1` keeps every tree, so a failure's message names
+a path you can still open:
+
+```sh
+ROUNDHOUSE_KEEP_EMITTED=1 cargo test --test emit_and_run -- some_test
+```
+
+A process that is killed, by a timeout or `SIGKILL`, cannot clean up, so
+its trees stay. New helpers that need a temporary directory use
+`scratch::dir` rather than `std::env::temp_dir()` directly.
+
 ## Native probes
 
 A Spinel test that checks one construct rather than the app can compile the
@@ -141,8 +160,36 @@ selects of hashes, Strings and Arel attributes, plucks of Strings and
 enums, eager loads beside joins, a connection's `to_sql` of an Arel node), and the
 `persistence` group how a record is built, copied and saved (`toggle`,
 `save(touch: false)`, `dup`, `clone` and `reload`, a model's own
-`update`). Each probe's `_on_spinel` variant carries the same ignore;
-once it passes, its reason goes back to `requires the Spinel toolchain`.
+`update`). The `controller tests` group runs a test file in the real-blog
+fixture against what Rails' controllers and their tests answer
+(`action_methods`, OPTIONS requests, `response.body=`, `request.variant`,
+an app's own json renderer, uploads and `deep_munge`), and the `views
+helpers` group what a view's helpers resolve to (without `helper :all`,
+modules a controller declares, `url_for` of a Hash, `capture` arguments,
+TagHelper, NumberHelper and TranslationHelper includes); their Spinel
+variants run the same file with `spin test`. The `test framework` group
+runs a test file against what Minitest and `ActiveSupport::TestCase` do
+with it (lifecycle hooks, assertion counts, `assert_difference`'s value,
+a fresh execution context per test, setup blocks and tests a support
+module's Concern declares, a test file's own classes and statements,
+`enqueued_jobs_with` and the deprecation assertions), and the `routes`
+group what a route helper and the router answer (positional and keyword
+path params, `default_url_options`, a trailing options Hash, scope
+requirements named by a constant, `recognized_request_for`). The
+`validations` group covers how a model's validators are built, listed
+and run (`validators` and `validators_on`, `validates_with`'s `class:`,
+an STI subclass's own validators, a reader a validation reads, `on:`
+named by a constant, custom contexts, a message proc's `self`); the
+`nested attributes` group what a nested-attributes or autosave owner
+validates (a built child's own errors, a built child once, a has_one
+under `autosave: true`); and the `attribute types`
+group what an attribute's type answers around a write (the value before
+its cast, changes in place, the value after a save, `update_columns`).
+`Overlay::run_tests` loads several emitted test files into one process,
+as a suite run does; a probe that needs that has no Spinel variant,
+since Spinel builds each test file as a program of its own. Each probe's
+`_on_spinel` variant carries the same ignore; once it passes, its reason
+goes back to `requires the Spinel toolchain`.
 
 ## Complete local verification
 

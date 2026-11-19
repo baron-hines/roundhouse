@@ -23,6 +23,9 @@ use crate::ty::Ty;
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the
+/// `extend` is that class's, not `Object#extend` (`lower::object_extend`).
+pub const MIXIN_HOOK_BASE: u64 = 1 << 41;
 /// Positive instance provenance for generated model-indexer key lowering.
 /// A nominal `Ty::Class` alone is not instance evidence.
 pub const INDEXER_INSTANCE_VALUE: u64 = 1 << 39;
@@ -101,6 +104,12 @@ pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
 /// module's own method (`load_settings(…)`): app code the Ruby family
 /// replays where the source has it (`ingest::app_extension_calls`).
 pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
+
+/// A model's class-body `prepend Concern`, whose `prepended do` items the
+/// concern splice carried into the body and whose line the Ruby family
+/// writes back (the module's instance methods then sit ahead of the
+/// class's own, reaching them through `super`).
+pub const CONCERN_PREPEND: u64 = 1 << 60;
 
 /// A value-only inherited call: non-Ruby targets retain their previous warning.
 pub const INHERITED_CLASS_BODY: u64 = 1 << 52;
@@ -216,6 +225,9 @@ pub const GUARDED_NAME_ERROR: u64 = 1 << 55;
 pub const UNCALLED_DEFINER: u64 = 1 << 56;
 /// An integer literal wider than 64 bits, built from 32-bit limbs: the ruby family's Integer holds it, a fixed-width one does not.
 pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
+/// The body ingest read an `ActiveRecord::Base.connected_to(role: :writing)` block as, the call dropped. An app that
+/// switches roles gets the call back (`ingest::database_ownership`): inside a reading block it is what lifts the guard.
+pub const ERASED_WRITING_SCOPE: u64 = 1 << 61;
 /// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 

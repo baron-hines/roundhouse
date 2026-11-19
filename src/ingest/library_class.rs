@@ -292,10 +292,29 @@ fn ingest_library_classes_impl(
     let result = super::prism::parse(source, file);
     let root = result.node();
     let mut out = Vec::new();
+    // The outer class is the model walk's, but for the value classes its
+    // body declares, which are classes of their own. One the walk below
+    // reaches anyway (a model nested in a module) takes them there.
+    let is_outer = |scope: &[String], class: &ruby_prism::ClassNode<'_>| {
+        nested_in.is_some_and(|outer| {
+            class_name_path(class).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == outer)
+        })
+    };
+    for (scope, class) in find_all_classes_with_scope(&root) {
+        if is_outer(&scope, &class) && !walked(&scope, class_name_path(&class)) {
+            out.extend(model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file));
+        }
+    }
     for (scope, class) in find_all_classes_with_scope(&root)
         .into_iter()
         .filter(|(scope, class)| walked(scope, class_name_path(class)))
     {
+        let values = match is_outer(&scope, &class) {
+            true => model_value_classes(&ClassId(Symbol::from(nested_in.unwrap_or_default())), &class, file),
+            false => Vec::new(),
+        };
+        // The value classes the model walk left to this one, each once.
+        let fresh = |lc: &LibraryClass| !values.iter().any(|value| value.name == lc.name);
         let (mut lc, struct_base) =
             library_class_and_struct_base(&class, &scope, file).map_err(|err| super::error_site::at(err, &class.as_node()))?;
         // BEFORE the class it serves: a superclass has to be defined
@@ -308,12 +327,13 @@ fn ingest_library_classes_impl(
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         let made = super::class_new_factory::constant_classes(Some(&owner), class.body(), file);
         lc.constants.retain(|(name, _)| !made.iter().any(|(s, _)| s == name));
-        out.extend(super::data_factory::collect(class.body(), &owner, file)?);
+        out.extend(super::data_factory::collect(class.body(), &owner, file)?.into_iter().filter(|c| fresh(c)));
         out.push(lc);
-        out.extend(data_block_classes(class.body(), &owner, file)?);
+        out.extend(data_block_classes(class.body(), &owner, file)?.into_iter().filter(|c| fresh(c)));
         // Not before the owner: the struct is named under it, so the owner has to exist first.
-        out.extend(structs.into_iter().map(|(_, s)| s));
+        out.extend(structs.into_iter().map(|(_, s)| s).filter(|c| fresh(c)));
         out.extend(made.into_iter().map(|(_, c)| c));
+        out.extend(values);
     }
     for (scope, module) in find_all_modules_with_scope(&root)
         .into_iter()
@@ -389,10 +409,28 @@ fn ingest_library_classes_impl(
         _ => Vec::new(),
     };
     if file_level && let Some(program) = root.as_program_node() {
+        let (mut data_constants, mut admitted_data_values) = (HashSet::default(), HashMap::<String, u32>::default());
+        let mut data_writes = None;
         for statement in program.statements().body().iter() {
             if let Some(mut class) = file_data_class(&statement, file)
                 .map_err(|err| super::error_site::at(err, &statement))?
             {
+                let writes = data_writes.get_or_insert_with(|| data_constant_writes(source, &root));
+                let start = statement.location().start_offset() as u32;
+                let end = statement.location().end_offset() as u32;
+                let target_end = file_data_declaration(&statement).unwrap().1.location().start_offset() as u32;
+                let name = writes.iter().find(|(at, _)| start <= *at && *at <= target_end)
+                    .map_or(class.name.0.as_str(), |(_, name)| name.as_str());
+                if name.starts_with("?::") {
+                    return Err(super::error_site::at(IngestError::Unsupported { file: file.into(),
+                        message: format!("Data.define constant namespace could not be resolved: `{}`", class.name.0) }, &statement));
+                }
+                if let Some((at, _)) = writes.iter().find(|(at, written)| *at > end
+                    && written == name) {
+                    let err = IngestError::Unsupported { file: file.into(), message: format!("reassignment of Data.define constant `{name}` is not modeled") };
+                    super::error_site::note(&err, *at as usize - name.rsplit("::").next().unwrap().len(), *at as usize);
+                    return Err(err);
+                }
                 let reopenings = find_all_classes_with_scope(&root).into_iter().filter(|(scope, node)| {
                     class_name_path(node).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == class.name.0.as_str())
                 }).collect::<Vec<_>>();
@@ -405,31 +443,89 @@ fn ingest_library_classes_impl(
                 }
                 let invalid_reopen = reopenings.iter().any(|(_, node)| {
                     node.location().start_offset() < statement.location().end_offset() || node.superclass().is_some()
-                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt)))
+                        || node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| !data_method_statement(stmt) && stmt.as_constant_write_node().is_none()))
                 });
-                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset()).max().unwrap_or(0);
+                for (scope, node) in &reopenings {
+                    if node.body().is_some_and(|body| flatten_statements(body).iter().any(|stmt| stmt.as_constant_write_node().is_some()))
+                        && (node.constant_path().as_constant_read_node().is_none()
+                            || scope.join("::") != class.name.0.as_str().rsplit_once("::").map_or("", |(owner, _)| owner)) {
+                        return Err(super::error_site::at(IngestError::Unsupported {
+                            file: file.into(), message: "qualified Data reopening initializers have a different lexical scope".into(),
+                        }, &node.as_node()));
+                    }
+                }
+                let (mut own_constants, mut file_values) = (HashSet::default(), HashSet::default());
+                let first_class_constant = class.constants.len();
+                for stmt in program.statements().body().iter() {
+                    let Some(write) = stmt.as_constant_path_write_node() else { continue };
+                    let Some(mut path) = static_constant_path(&write.target().as_node()) else { continue };
+                    let Some(name) = path.pop() else { continue };
+                    if path.join("::") != class.name.0.as_str()
+                        || stmt.location().start_offset() < statement.location().end_offset() { continue; }
+                    let mut value = ingest_expr(&write.value(), file)?;
+                    file_values.insert(value.span.start);
+                    // The RHS is evaluated at file scope, not in the reopened class.
+                    fn root_constants(expr: &mut Expr) {
+                        if let ExprNode::Const { path } = &mut *expr.node
+                            && path.first().is_some_and(|part| !part.as_str().is_empty()) {
+                            path.insert(0, Symbol::from(""));
+                        }
+                        expr.node.for_each_child_mut(&mut root_constants);
+                    }
+                    root_constants(&mut value);
+                    class.constants.push((Symbol::from(name), value));
+                    data_constants.insert(stmt.location().start_offset());
+                    own_constants.insert(stmt.location().start_offset());
+                }
+                let last_reopen = reopenings.iter().map(|(_, node)| node.location().start_offset())
+                    .chain(own_constants.iter().copied()).max().unwrap_or(0);
                 let separated = program.statements().body().iter().any(|stmt| {
                     let at = stmt.location().start_offset();
                     at >= statement.location().end_offset() && at < last_reopen
                         && !reopenings.iter().any(|(_, node)| node.location().start_offset() == at)
+                        && !own_constants.contains(&at)
                 });
                 if invalid_reopen || separated || out.iter().any(|other| other.name == class.name && other.is_module)
                     || made.iter().any(|(_, other)| other.name == class.name) {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
-                        message: "Data.define beside another declaration of the same class".into(),
+                        message: if separated { "Data.define declaration group is interrupted by another statement" } else { "Data.define beside another declaration of the same class" }.into(),
                     }, &statement));
                 }
-                // Only later, method-only reopenings can join the factory without moving load-time work.
-                for reopening in out.extract_if(.., |other| other.name == class.name) {
+                // The emitter interleaves these declarations by their source spans.
+                for mut reopening in out.extract_if(.., |other| other.name == class.name) {
                     class.methods.extend(reopening.methods);
+                    for call in &mut reopening.unknown_calls {
+                        call.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+                    }
+                    class.constants.extend(reopening.constants);
+                    class.unknown_calls.extend(reopening.unknown_calls);
+                }
+                class.constants.sort_by_key(|(_, value)| value.span.start);
+                if let Some(crate::dialect::LibraryClassOrigin::DataDefine { class_constant_start, .. }) = &mut class.origin {
+                    *class_constant_start = (first_class_constant < class.constants.len()).then_some(first_class_constant);
                 }
                 class.methods.sort_by_key(|method| method.name_span.start);
-                // Nothing runs between the block's definitions and the reopenings', so a later
-                // definition replaces an earlier one before any call can reach it, as in Ruby.
+                let factory_body = file_data_declaration(&statement).and_then(|(_, call)| call.block())
+                    .and_then(|block| block.as_block_node()).and_then(|block| block.body());
+                for body in std::iter::once(factory_body).chain(reopenings.iter().map(|(_, node)| node.body())) {
+                    visibility::validate_data(body, file, &class.methods, &class.name)?;
+                }
+                admitted_data_values.insert(class.name.0.to_string(), statement.location().end_offset() as u32);
+                for (index, (name, value)) in class.constants.iter().enumerate() {
+                    if !class.data_class_constant(index) { continue; }
+                    if !data_constant_value(value, &class, !file_values.contains(&value.span.start), &admitted_data_values) {
+                        let err = IngestError::Unsupported { file: file.into(), message: "Data constant initializer is not a literal or a constructor call".into() };
+                        super::error_site::note(&err, value.span.start as usize, value.span.end as usize);
+                        return Err(err);
+                    }
+                    admitted_data_values.insert(format!("{}::{name}", class.name.0), value.span.end);
+                }
+                // A replayed visibility declaration needs the definitions present at its source position.
+                let replayed = class.unknown_calls.iter().any(|call| call.decisions & crate::expr::REPLAYED_CLASS_BODY != 0);
                 let mut seen = HashSet::default();
                 class.methods.reverse();
-                class.methods.retain(|method| seen.insert((method.name.clone(), method.receiver)));
+                class.methods.retain(|method| replayed || seen.insert((method.name.clone(), method.receiver)));
                 class.methods.reverse();
                 made.push((class.name.0.clone(), class));
             }
@@ -443,6 +539,7 @@ fn ingest_library_classes_impl(
                     .is_some_and(|(feature, relative)| !relative && super::app::APP_REQUIRABLE_STDLIB.contains(&feature.as_str()));
                 if statement.as_constant_write_node().is_none() && statement.as_class_node().is_none()
                     && statement.as_module_node().is_none() && !qualified_factory && !stdlib_require
+                    && !data_constants.contains(&statement.location().start_offset())
                 {
                     return Err(super::error_site::at(IngestError::Unsupported {
                         file: file.into(),
@@ -490,6 +587,9 @@ fn ingest_library_classes_impl(
         // or call time (invariant 6).
         super::file_constant_hoist::ensure_safe(file, &file_constants, &out, &factories)?;
         if let Some(host) = out.first_mut().or_else(|| factories.first_mut()) {
+            if let Some(crate::dialect::LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) = &mut host.origin {
+                *start += file_constants.len();
+            }
             let mut consts = file_constants;
             consts.extend(std::mem::take(&mut host.constants));
             host.constants = consts;
@@ -587,11 +687,54 @@ fn data_block_classes(
 }
 
 fn data_method_statement(stmt: &Node<'_>) -> bool {
+    if let Some(singleton) = stmt.as_singleton_class_node() {
+        return singleton.expression().as_self_node().is_some()
+            && singleton.body().is_none_or(|body| flatten_statements(body).iter().all(data_method_statement));
+    }
     if let Some(def) = visibility::definition(stmt) {
         return def.receiver().is_none_or(|receiver| receiver.as_self_node().is_some());
     }
     stmt.as_call_node().filter(|call| call.receiver().is_none() && call.block().is_none() && visibility::marker(call))
         .is_some_and(|call| call.arguments().is_none_or(|args| args.arguments().iter().all(|arg| super::util::symbol_or_string_value(&arg).is_some())))
+}
+
+fn data_literal(value: &Expr) -> bool {
+    match &*value.node {
+        ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
+        ExprNode::Array { elements, .. } => elements.iter().all(data_literal),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| data_literal(key) && data_literal(value)),
+        _ => false,
+    }
+}
+
+fn data_constant_value(value: &Expr, class: &LibraryClass, class_scope: bool, known: &HashMap<String, u32>) -> bool {
+    if data_literal(value) { return true; }
+    let earlier = |name: &str| known.get(name).is_some_and(|end| *end <= value.span.start);
+    match &*value.node {
+        ExprNode::Const { path } => {
+            let name = path.iter().filter(|part| !part.as_str().is_empty()).map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            (class_scope && path.len() == 1 && earlier(&format!("{}::{name}", class.name.0))) || earlier(&name)
+        }
+        ExprNode::Send { recv, method, args, block: None, .. } if matches!(method.as_str(), "new" | "[]") => {
+            let own = match recv.as_ref().map(|recv| &*recv.node) {
+                None | Some(ExprNode::SelfRef) => class_scope && method.as_str() == "new",
+                Some(ExprNode::Const { path }) => {
+                    let name = path.iter().filter(|part| !part.as_str().is_empty()).map(Symbol::as_str).collect::<Vec<_>>().join("::");
+                    name == class.name.0.as_str() && (!class_scope || path.first().is_some_and(|part| part.as_str().is_empty())
+                        || !class.constants.iter().any(|(name, _)| name == path.first().unwrap()))
+                }
+                _ => false,
+            };
+            own && class.includes.is_empty() && !class.methods.iter().any(|method|
+                method.receiver == MethodReceiver::Class && matches!(method.name.as_str(), "new" | "[]" | "allocate")
+                    || method.receiver == MethodReceiver::Instance && method.name.as_str() == "initialize")
+                && args.iter().all(|arg| match &*arg.node {
+                    ExprNode::Hash { entries, kwargs: true } => entries.iter().all(|(key, value)| data_literal(key) && data_constant_value(value, class, class_scope, known)),
+                    _ => data_constant_value(arg, class, class_scope, known),
+                })
+        }
+        _ => false,
+    }
 }
 
 /// The class a file-level statement `X = Data.define(:a, :b)` creates.
@@ -606,10 +749,22 @@ fn data_method_statement(stmt: &Node<'_>) -> bool {
 /// enclosing scope, which the emitted reopen of `X` cannot express, so
 /// the file is rejected.
 fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult<Option<LibraryClass>> {
+    data_class(statement, None, file)
+}
+
+/// [`file_data_class`] for a declaration written at the top of a file
+/// (`scope` `None`) or in the body of the class `scope`, whose constant
+/// it then names (`Scope::X`).
+fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &str) -> IngestResult<Option<LibraryClass>> {
     let Some((name, call)) = file_data_declaration(statement) else { return Ok(None) };
     let Some(members) = data_members(&call) else { return Ok(None) };
-    let owner = ClassId(Symbol::from(name));
+    let owner = match scope {
+        Some(scope) => ClassId(Symbol::from(format!("{}::{name}", scope.0.as_str()))),
+        None => ClassId(Symbol::from(name)),
+    };
     let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
+    visibility::validate_data(body(), file, &[], &owner)?;
+    if super::data_factory::combined_delegation(body()) { return Err(IngestError::Unsupported { file: file.into(), message: "Data.define blocks combining delegate and delegate_missing_to are not modeled".into() }); }
     if let Some(body) = body() {
         let statements = flatten_statements(body);
         if statements.iter().any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
@@ -633,11 +788,16 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
             }
         }
     }
-    // Not a carried marker: a Data block's `private_class_method :new` names the constructor Data defines.
-    let visibility = Visibility::resolve_library(body().as_ref(), file, None, Some(&owner))?;
+    let visibility = Visibility::resolve_data(body().as_ref(), file, &owner)?;
     let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
         walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
+    for call in &mut unknown_calls {
+        if matches!(&*call.node, ExprNode::Send { method, .. }
+            if matches!(method.as_str(), "private_class_method" | "public_class_method" | "private" | "public" | "protected")) {
+            call.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+        }
+    }
     Ok(Some(LibraryClass {
         name: owner,
         is_module: false,
@@ -650,12 +810,71 @@ fn file_data_class(statement: &ruby_prism::Node<'_>, file: &str) -> IngestResult
         origin: Some(crate::dialect::LibraryClassOrigin::DataDefine {
             members,
             span: super::util::node_span(&call.as_node(), file),
+            class_constant_start: None,
         }),
         constants,
         conditional_definitions,
         unknown_calls,
         class_ivar_initializers: class_initializers,
     }))
+}
+
+/// `X = Data.define(:a) do … end` or `X = Struct.new(:a) do … end` in a
+/// model's body. Ruby creates the class when the constant is assigned,
+/// running the block as its body, so it is a class of its own,
+/// `Model::X`: the model walk passes over the statement and the nested
+/// walk of the model's file registers the class ([`model_value_classes`]),
+/// as either does for a `class X` nested there.
+///
+/// A `Data.define` block is taken only when it holds nothing but method
+/// definitions and bare visibility markers ([`data_define_block`]), as in
+/// a plain class body: a method reads the model's constants through the
+/// class's name, which the analyzer roots, but an `include` or a constant
+/// the block writes would be looked up from the model, where the emitted
+/// class cannot follow. So is one whose class does not ingest: it stays
+/// the model's statement, and keeps the errors it had there.
+pub(super) fn model_value_class(statement: &ruby_prism::Node<'_>, owner: &ClassId, file: &str) -> bool {
+    model_value_class_of(statement, owner, file).is_some()
+}
+
+/// The class a [`model_value_class`] statement declares.
+fn model_value_class_of(statement: &ruby_prism::Node<'_>, owner: &ClassId, file: &str) -> Option<LibraryClass> {
+    let write = statement.as_constant_write_node()?;
+    let value = write.value();
+    if struct_constant_block(&value) {
+        return struct_constant_class(owner, struct_constant(statement)?, file).ok();
+    }
+    // `def Other.x` in the block defines on `Other`, which the class cannot carry.
+    let block = data_define_block(&value)?;
+    let on_other = |stmt: &Node<'_>| {
+        stmt.as_def_node().and_then(|def| def.receiver()).is_some_and(|recv| recv.as_self_node().is_none())
+    };
+    if block.body().map(flatten_statements).unwrap_or_default().iter().any(on_other) {
+        return None;
+    }
+    data_class(statement, Some(owner), file).ok().flatten()
+}
+
+/// The value classes the model `outer`'s body declares
+/// ([`model_value_class`]), for when the nested walk of its file is
+/// refused: the model walk passed over them either way.
+pub fn ingest_model_value_classes(source: &[u8], file: &str, outer: &str) -> Vec<LibraryClass> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let owner = ClassId(Symbol::from(outer));
+    find_all_classes_with_scope(&root)
+        .into_iter()
+        .filter(|(scope, class)| {
+            class_name_path(class).is_some_and(|path| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::") == outer)
+        })
+        .flat_map(|(_, class)| model_value_classes(&owner, &class, file))
+        .collect()
+}
+
+/// The classes [`model_value_class`] statements of `owner`'s body declare,
+/// in source order.
+fn model_value_classes(owner: &ClassId, class: &ruby_prism::ClassNode<'_>, file: &str) -> Vec<LibraryClass> {
+    class.body().map(flatten_statements).unwrap_or_default().iter().filter_map(|s| model_value_class_of(s, owner, file)).collect()
 }
 
 /// A file whose only statement is `X = Struct.new(…)` or `A::X = Struct.new(…)`,
@@ -716,6 +935,121 @@ fn file_data_declaration<'pr>(statement: &ruby_prism::Node<'pr>) -> Option<(Stri
         return None;
     }
     Some((name, call))
+}
+
+// Visit assignment targets, not only statements: destructuring and operator writes
+// also rebind constants. Resolve the namespace rather than concatenating lexical names.
+fn data_constant_writes(source: &[u8], root: &Node<'_>) -> Vec<(u32, String)> {
+    let resolver = crate::analyze::ConstResolver::from_app_sources(&[
+        crate::span::SourceFile { path: "data_rebindings.rb".into(), text: String::from_utf8_lossy(source).into_owned() },
+    ]);
+    let factories = root.as_program_node().into_iter().flat_map(|program| program.statements().body().iter())
+        .filter_map(|statement| file_data_declaration(&statement).map(|(name, _)| name.trim_start_matches("Object::").to_string())).collect();
+    resolved_data_constant_writes(root, &resolver, crate::span::FileId(1), &factories)
+}
+
+fn resolved_data_constant_writes(root: &Node<'_>, resolver: &crate::analyze::ConstResolver, file: crate::span::FileId, factories: &HashSet<String>) -> Vec<(u32, String)> {
+    struct Writes<'a> {
+        resolver: &'a crate::analyze::ConstResolver,
+        file: crate::span::FileId,
+        factories: &'a HashSet<String>,
+        owner: Option<String>,
+        out: Vec<(u32, String)>,
+    }
+    impl Writes<'_> {
+        fn span(&self, node: &Node<'_>) -> Span {
+            Span { file: self.file, start: node.location().start_offset() as u32, end: node.location().end_offset() as u32 }
+        }
+        fn path(&self, node: &Node<'_>) -> Option<String> {
+            let path = static_constant_path(node)?.into_iter().map(Symbol::from).collect::<Vec<_>>();
+            self.resolver.namespace(self.span(node), &path).map(|id| id.0.to_string())
+                .or_else(|| self.resolver.declaration_name(self.span(node), &path)
+                    .filter(|name| self.factories.contains(*name)).map(str::to_string))
+        }
+        fn binding(&mut self, node: &Node<'_>) {
+            let bare = node.as_constant_write_node().map(|n| (n.name(), n.name_loc()))
+                .or_else(|| node.as_constant_or_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_and_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_operator_write_node().map(|n| (n.name(), n.name_loc())))
+                .or_else(|| node.as_constant_target_node().map(|n| (n.name(), n.location())));
+            if let Some((name, loc)) = bare {
+                if let Some(owner) = &self.owner {
+                    self.record(loc.end_offset() as u32, owner.clone(), constant_id_str(&name).to_string());
+                }
+                return;
+            }
+            let target = node.as_constant_path_write_node().map(|n| n.target())
+                .or_else(|| node.as_constant_path_or_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_and_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_operator_write_node().map(|n| n.target()));
+            let (parent, name, end) = if let Some(target) = target {
+                (target.parent(), target.name(), target.location().end_offset())
+            } else if let Some(target) = node.as_constant_path_target_node() {
+                (target.parent(), target.name(), target.location().end_offset())
+            } else { return };
+            if let Some(name) = name {
+                let owner = parent.map_or_else(String::new, |parent| self.path(&parent).unwrap_or_else(|| "?".into()));
+                self.record(end as u32, owner, constant_id_str(&name).to_string());
+            }
+        }
+        fn record(&mut self, end: u32, owner: String, name: String) {
+            let owner = owner.trim_start_matches("Object::");
+            let name = if owner.is_empty() || owner == "Object" { name } else { format!("{owner}::{name}") };
+            self.out.push((end, name));
+        }
+        fn body(&mut self, path: Node<'_>, body: Option<Node<'_>>) {
+            let outer = self.owner.take();
+            self.owner = Some(self.resolver.namespace_body(self.span(&path)).map_or_else(|| "?".into(), |id| id.0.to_string()));
+            if let Some(body) = body { ruby_prism::Visit::visit(self, &body); }
+            self.owner = outer;
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes<'_> {
+        fn visit_branch_node_enter(&mut self, node: Node<'pr>) { self.binding(&node); }
+        fn visit_leaf_node_enter(&mut self, node: Node<'pr>) { self.binding(&node); }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            if let Some(parent) = node.superclass() { self.visit(&parent); }
+            self.body(node.constant_path(), node.body());
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) { self.body(node.constant_path(), node.body()); }
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            let outer = self.owner.take();
+            if let Some(body) = node.body() { self.visit(&body); }
+            self.owner = outer;
+        }
+        // These bodies execute at runtime, not when their enclosing declaration loads.
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if let Some(receiver) = node.receiver() { self.visit(&receiver); }
+        }
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+    }
+    let mut writes = Writes { resolver, file, factories, owner: Some(String::new()), out: Vec::new() };
+    ruby_prism::Visit::visit(&mut writes, root);
+    writes.out
+}
+
+// Another file has no proven load order relative to the factory: refuse a
+// competing binding in either order instead of moving it around the declaration.
+pub(super) fn cross_file_data_rebindings(app: &crate::App, sources: &[crate::span::SourceFile], resolver: &crate::analyze::ConstResolver) -> Vec<(Span, IngestError)> {
+    let factories = app.library_classes.iter().filter_map(|class| class.data_define()
+        .map(|(_, span)| (span.file, class.name.0.as_str().trim_start_matches("Object::")))).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    if factories.is_empty() { return out; }
+    let names = factories.iter().map(|(_, name)| name.to_string()).collect();
+    for (index, source) in sources.iter().enumerate() {
+        let file = crate::span::FileId(index as u32 + 1);
+        let others = factories.iter().filter(|(owner, _)| *owner != file).collect::<Vec<_>>();
+        if !source.path.ends_with(".rb") || !others.iter().any(|(_, name)| source.text.contains(name.rsplit("::").next().unwrap())) { continue; }
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
+        for (at, written) in resolved_data_constant_writes(&parsed.node(), resolver, file, &names) {
+            if let Some((_, name)) = others.iter().find(|(_, name)| written == *name) {
+                let span = Span { file, start: at - name.rsplit("::").next().unwrap().len() as u32, end: at };
+                out.push((span, IngestError::Unsupported { file: source.path.clone(), message: format!("reassignment of Data.define constant `{name}` across files is not modeled") }));
+            }
+        }
+    }
+    out
 }
 
 /// The segments of a constant path in which every part is a constant.
@@ -1849,12 +2183,79 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
     )
 }
 
+/// The ivar and the parameter a member is held in: a predicate or bang member (`success?`) is not a name either can
+/// take.
+fn struct_slot(member: &Symbol) -> Symbol {
+    let name = member.as_str();
+    match (name.strip_suffix('?'), name.strip_suffix('!')) {
+        (Some(stem), _) => Symbol::from(format!("__q_{stem}")),
+        (_, Some(stem)) => Symbol::from(format!("__b_{stem}")),
+        _ => member.clone(),
+    }
+}
+
+/// A struct with a predicate or bang member (maybe's `Struct.new(:success?, :changes_made?, :error, keyword_init:
+/// true)`), its methods written as Ruby and read back: Struct's reader of each member; its writer, which Ruby spells
+/// `success?=` and only `send` can call, for the plain ones alone; and its constructor. A keyword one takes
+/// `**attrs`, since `success?:` is no parameter's name, and refuses an unknown keyword as Struct does.
+fn suffixed_struct_methods(base: &ClassId, members: &[Symbol], keyword_init: bool) -> Option<Vec<MethodDef>> {
+    let mut src = String::new();
+    for m in members {
+        let slot = struct_slot(m);
+        src.push_str(&format!("def {m}\n  @{slot}\nend\n"));
+        if slot == *m {
+            src.push_str(&format!("def {m}=(value)\n  @{slot} = value\nend\n"));
+        }
+    }
+    if keyword_init {
+        let keys = members.iter().map(|m| format!(":{m}")).collect::<Vec<_>>().join(", ");
+        src.push_str("def initialize(**attrs)\n");
+        // In the hash's order, a String key read as its Symbol: the later of `:success?` and `"success?"` wins, as in Struct.
+        src.push_str("  given = {}\n  attrs.each { |k, v| given[k.is_a?(String) ? k.to_sym : k] = v }\n");
+        src.push_str(&format!("  unknown = given.keys - [{keys}]\n"));
+        src.push_str("  raise ArgumentError, \"unknown keywords: #{unknown.join(\", \")}\" unless unknown.empty?\n");
+        for m in members {
+            src.push_str(&format!("  @{} = given.fetch(:{m}, nil)\n", struct_slot(m)));
+        }
+        src.push_str("end\n");
+    } else {
+        let params = members.iter().map(|m| format!("{} = nil", struct_slot(m))).collect::<Vec<_>>().join(", ");
+        src.push_str(&format!("def initialize({params})\n"));
+        for m in members {
+            let slot = struct_slot(m);
+            src.push_str(&format!("  @{slot} = {slot}\n"));
+        }
+        src.push_str("end\n");
+    }
+    let file = "(roundhouse)/struct_members.rb";
+    let result = super::prism::parse_silent(src.as_bytes());
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let mut methods = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let def = stmt.as_def_node()?;
+        let mut method = super::model::ingest_method(&def, file).ok()?;
+        method.enclosing_class = Some(base.0.clone());
+        if method.name.as_str() == "initialize" {
+            method.visibility = crate::dialect::MethodVisibility::Private;
+            method.mutates_self = true;
+        }
+        methods.push(method);
+    }
+    Some(methods)
+}
+
 fn struct_class(
     base: ClassId,
     members: &[Symbol],
     keyword_init: bool,
     origin: crate::dialect::LibraryClassOrigin,
 ) -> LibraryClass {
+    if members.iter().any(|m| struct_slot(m) != *m)
+        && let Some(methods) = suffixed_struct_methods(&base, members, keyword_init)
+    {
+        return struct_library_class(base, methods, origin);
+    }
     let mut methods = Vec::new();
     for m in members {
         methods.push(synth_attr_reader(&base, m, MethodReceiver::Instance));
@@ -1903,6 +2304,10 @@ fn struct_class(
         mutates_self: true,
         block_param: None,
     });
+    struct_library_class(base, methods, origin)
+}
+
+fn struct_library_class(base: ClassId, methods: Vec<MethodDef>, origin: crate::dialect::LibraryClassOrigin) -> LibraryClass {
     LibraryClass {
         name: base,
         is_module: false,
@@ -1935,15 +2340,14 @@ fn struct_constants<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<StructConst
     let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) else {
         return Vec::new();
     };
-    statements
-        .body()
-        .iter()
-        .filter_map(|stmt| {
-            let write = stmt.as_constant_write_node()?;
-            let spec = struct_constant_spec(&write.value())?;
-            Some(StructConstant { name: Symbol::from(constant_id_str(&write.name())), ..spec })
-        })
-        .collect()
+    statements.body().iter().filter_map(|stmt| struct_constant(&stmt)).collect()
+}
+
+/// One body statement `X = Struct.new(…)`.
+fn struct_constant<'pr>(stmt: &ruby_prism::Node<'pr>) -> Option<StructConstant<'pr>> {
+    let write = stmt.as_constant_write_node()?;
+    let spec = struct_constant_spec(&write.value())?;
+    Some(StructConstant { name: Symbol::from(constant_id_str(&write.name())), ..spec })
 }
 
 fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructConstant<'pr>> {
@@ -1970,14 +2374,21 @@ fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructCons
             continue;
         }
         let member = symbol_value(&arg)?;
-        // Not `success?` / `valid!`: the member is also the ivar and the constructor's parameter, which cannot carry the suffix.
-        if !member.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-            || !member.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || crate::emit::ruby::expr::is_ruby_keyword(&member)
+        // A trailing `?` / `!` is held under another name (`struct_slot`); any other character is no method's name.
+        let stem = member.strip_suffix(['?', '!']).unwrap_or(&member);
+        if !stem.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            || !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || crate::emit::ruby::expr::is_ruby_keyword(stem)
         {
             return None;
         }
         members.push(Symbol::from(member));
+    }
+    // Not one whose held name is another member's (`:success?` beside `:__q_success`), or one its block names (an
+    // `attr_accessor :__q_success` there): the two would share a slot.
+    let block_text = call.block().map(|b| String::from_utf8_lossy(b.location().as_slice()).into_owned()).unwrap_or_default();
+    if members.iter().any(|m| { let slot = struct_slot(m); slot != *m && (members.contains(&slot) || block_text.contains(slot.as_str())) }) {
+        return None;
     }
     // The positional form too: since Ruby 3.2 it also takes keywords, which
     // the positional constructor would bind to its first member, so analysis
@@ -2066,29 +2477,35 @@ fn struct_constant_classes(
 ) -> IngestResult<Vec<(Symbol, LibraryClass)>> {
     let mut out = Vec::new();
     for spec in struct_constants(body) {
-        let id = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), spec.name.as_str())));
-        let mut class = struct_class(
-            id.clone(),
-            &spec.members,
-            spec.keyword_init,
-            crate::dialect::LibraryClassOrigin::StructConstant {
-                members: spec.members.clone(),
-                keyword_init: spec.keyword_init,
-                positional_written: spec.positional_written,
-            },
-        );
-        if spec.body.is_some() {
-            let body = walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?;
-            class.methods.extend(body.methods);
-            class.includes.extend(body.includes);
-            class.include_spans.extend(body.include_spans);
-            class.constants.extend(body.constants);
-            class.unknown_calls.extend(body.unknown_calls);
-            class.class_ivar_initializers.extend(body.class_initializers);
-        }
-        out.push((spec.name, class));
+        let name = spec.name.clone();
+        out.push((name, struct_constant_class(owner, spec, file)?));
     }
     Ok(out)
+}
+
+/// The class `owner`'s body defines through one `X = Struct.new(…)`.
+fn struct_constant_class(owner: &ClassId, spec: StructConstant<'_>, file: &str) -> IngestResult<LibraryClass> {
+    let id = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), spec.name.as_str())));
+    let mut class = struct_class(
+        id.clone(),
+        &spec.members,
+        spec.keyword_init,
+        crate::dialect::LibraryClassOrigin::StructConstant {
+            members: spec.members.clone(),
+            keyword_init: spec.keyword_init,
+            positional_written: spec.positional_written,
+        },
+    );
+    if spec.body.is_some() {
+        let body = walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?;
+        class.methods.extend(body.methods);
+        class.includes.extend(body.includes);
+        class.include_spans.extend(body.include_spans);
+        class.constants.extend(body.constants);
+        class.unknown_calls.extend(body.unknown_calls);
+        class.class_ivar_initializers.extend(body.class_initializers);
+    }
+    Ok(class)
 }
 
 /// Same as `library_class_from_node` but for module-as-namespace
@@ -3514,6 +3931,7 @@ fn walk_decl_body_with_visibility<'pr>(
                             let mut copy = copy_aliased_method(source, to);
                             copy.name_span = call.span;
                             inner.methods.push(copy);
+                            super::inherited_alias::resolved(call.span);
                         }
                         _ => kept.push(call),
                     }
@@ -3608,7 +4026,13 @@ fn walk_decl_body_with_visibility<'pr>(
                     out.methods.push(method);
                     continue;
                 }
-                if let Some(source) = out.methods.iter().rposition(|method| method.name.as_str() == from && method.receiver == receiver) {
+                // Under `extend self` a def above is kept in its class-method form alone (chunky_png's
+                // `alias from_hsb from_hsv` in `module Color; extend self`), which the alias copies. Not under
+                // `module_function`, whose includer keeps the private instance alias the class form would lose.
+                let promoted = receiver == MethodReceiver::Instance && extend_self_active;
+                if let Some(source) = out.methods.iter().rposition(|method| {
+                    method.name.as_str() == from && (method.receiver == receiver || (promoted && method.receiver == MethodReceiver::Class))
+                }) {
                     let mut copy = copy_aliased_method(&out.methods[source], to.as_str());
                     copy.name_span = Span {
                         file: super::sources::file_id(file),
@@ -3622,14 +4046,14 @@ fn walk_decl_body_with_visibility<'pr>(
                 // One an ancestor may define: the support walk captures
                 // it as the call it is, and `inherited_alias::settle`
                 // looks the original up once every file is walked.
+                let span = Span {
+                    file: super::sources::file_id(file),
+                    start: alias.location().start_offset() as u32,
+                    end: alias.location().end_offset() as u32,
+                };
                 if super::inherited_alias::is_capturing()
                     && matches!(mode, DeclBodyMode::Instance | DeclBodyMode::SingletonClass { included_hook: true, .. })
                 {
-                    let span = Span {
-                        file: super::sources::file_id(file),
-                        start: alias.location().start_offset() as u32,
-                        end: alias.location().end_offset() as u32,
-                    };
                     out.unknown_calls.push(super::inherited_alias::capture(to.as_str(), from.as_str(), span));
                     continue;
                 }
@@ -5072,6 +5496,9 @@ pub struct ModelBases {
     /// scope, the parent as written, and whether the child writes its
     /// own `initialize`.
     tableless_pairs: Vec<(String, Vec<String>, Vec<String>, bool)>,
+    /// Every concrete model under `app/models`, with the table its body declares (`concrete_model_table`).
+    concrete: crate::det::HashMap<String, Option<String>>,
+    concrete_pairs: Vec<(String, Vec<String>, String, Option<String>)>,
 }
 
 impl ModelBases {
@@ -5178,6 +5605,51 @@ impl ModelBases {
             };
             pairs.push((full.join("::"), parent));
         }
+    }
+
+    /// One file's non-abstract `class X < Y` pairs, for `close_over_concrete`.
+    pub fn record_concrete(&mut self, source: &[u8], file: &str) {
+        let result = parse(source);
+        let root = result.node();
+        for (scope, class) in find_all_classes_with_scope(&root) {
+            let Some(path) = class_name_path(&class) else { continue };
+            if declares_abstract_class(&class) {
+                continue;
+            }
+            let Some(parent) = self.resolve_class_superclass(&scope, &class) else { continue };
+            let mut full = scope.clone();
+            full.extend(path);
+            let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
+            // A bare parent is kept with its scope: a concrete `Admin::Base` is found from `module Admin` below.
+            let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { scope.clone() } else { Vec::new() };
+            self.concrete_pairs.push((full.join("::"), lexical, parent, table));
+        }
+    }
+
+    /// The concrete models: a class whose parent is a base, or (single-table inheritance) another concrete model.
+    pub fn close_over_concrete(&mut self) {
+        loop {
+            let before = self.concrete.len();
+            let mut found = Vec::new();
+            for (child, scope, parent, table) in &self.concrete_pairs {
+                if self.concrete.contains_key(child) {
+                    continue;
+                }
+                let lexical = (1..=scope.len()).rev().map(|n| format!("{}::{parent}", scope[..n].join("::"))).find(|c| self.concrete.contains_key(c));
+                if lexical.is_some() || self.names.contains(parent) || self.concrete.contains_key(parent) {
+                    found.push((child.clone(), table.clone()));
+                }
+            }
+            self.concrete.extend(found);
+            if self.concrete.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// `Some(declared)` for a concrete model, the table its own body declares or `None` for Rails' default.
+    pub fn concrete_model_table(&self, name: &str) -> Option<Option<&str>> {
+        self.concrete.get(name).map(|t| t.as_deref())
     }
 
     /// Close the set: anything whose parent is already a base is one.
@@ -6711,6 +7183,12 @@ pub type ConcernModelItems = (
 /// [`crate::app::App::concern_guarded_items`]).
 pub type ConcernGuardedItems = Vec<(ClassId, Vec<crate::app::ConcernGuardedItem>)>;
 
+/// The class-variable seeds a concern's `included do` block sets, keyed by
+/// module: `cattr_accessor :cap, default: 3` there is a `@@cap = 3` on
+/// every includer, which the splice gives it (see
+/// [`crate::app::App::concern_class_attr_defaults`]).
+pub type ConcernClassAttrDefaults = Vec<(ClassId, IndexMap<Symbol, Expr>)>;
+
 /// `X if self == A`, `X unless self == A`, `X if self != A`,
 /// `X if in?([A, B])` (also `self.in?`, `A == self`), or the block form
 /// `if self == A ... end`: the guard and the guarded statements. `None`
@@ -6935,23 +7413,35 @@ pub(in crate::ingest) fn ingest_concern_included_redefs(source: &[u8], file: &st
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
-    let (items, enums, _guarded) =
-        ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default());
-    (items, enums)
+    let scan = ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default());
+    (scan.items, scan.enums)
+}
+
+/// What one source file's concern blocks contribute to the classes that
+/// mix their modules in.
+pub(in crate::ingest) struct ConcernModelScan {
+    /// `included do` items, keyed by module.
+    pub items: Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
+    pub enums: Vec<(ClassId, Vec<ConcernEnumDecl>)>,
+    pub guarded: ConcernGuardedItems,
+    pub class_attrs: ConcernClassAttrDefaults,
+    /// `prepended do` items, keyed by module: the same model DSL, run on
+    /// the classes that `prepend` the module instead of including it.
+    pub prepended: Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
 }
 
 /// Same as [`ingest_concern_model_items`], with the app-wide constant
 /// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
 /// resolve the way model-side class-body DSL does.
+///
+/// The `cattr_*` / `mattr_*` seeds the blocks set are reported too:
+/// `included do cattr_accessor :cap, default: 3 end` seeds `@@cap` on
+/// every includer, as Rails runs the block in the includer's class body.
 pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     source: &[u8],
     file: &str,
     enum_constants: &super::model::EnumConstants,
-) -> (
-    Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
-    Vec<(ClassId, Vec<ConcernEnumDecl>)>,
-    ConcernGuardedItems,
-) {
+) -> ConcernModelScan {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -6960,6 +7450,8 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     let mut out = Vec::new();
     let mut enums_out = Vec::new();
     let mut guarded_out: ConcernGuardedItems = Vec::new();
+    let mut class_attr_out: ConcernClassAttrDefaults = Vec::new();
+    let mut prepended_out: Vec<(ClassId, Vec<ModelBodyItem>)> = Vec::new();
     for (scope, module) in find_all_modules_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
         let mut full_path: Vec<String> = scope.clone();
@@ -6998,11 +7490,24 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
             })
         });
         let mut guarded: Vec<crate::app::ConcernGuardedItem> = Vec::new();
+        // The class-variable seeds this module's blocks set on each
+        // includer, in declaration order.
+        let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
+        let mut prepended_items: Vec<ModelBodyItem> = Vec::new();
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
-            if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+            if call.receiver().is_some() {
                 continue;
             }
+            // `prepended do` is the same `class_eval` on a class that
+            // `prepend`s the module, so its DSL runs there — carried into
+            // the prependers' bodies by their own splice.
+            let prepended = match constant_id_str(&call.name()) {
+                "included" => false,
+                "prepended" if is_concern => true,
+                _ => continue,
+            };
+            let items: &mut Vec<ModelBodyItem> = if prepended { &mut prepended_items } else { &mut items };
             let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
             let Some(block_body) = block.body() else { continue };
             let direct = flatten_statements(block_body);
@@ -7027,6 +7532,21 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 // must be one of those items, or the guard is left to
                 // today's handling as a whole.
                 if let Some(groups) = includer_guarded_stmts(&inner, file) {
+                    // The guard is a question each INCLUDER answers, at
+                    // the splice that carries the item into its body. A
+                    // prepended block has no such splice, so its guarded
+                    // statement is refused rather than handed to every
+                    // class that prepends the module.
+                    if prepended {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&inner, file),
+                            None,
+                            "prepended do",
+                            format!("a guarded statement inside `{}` is not carried to the classes that prepend it: the guard is not answered per prepender, so it would run there unconditionally", id.0.as_str()),
+                        ));
+                        unclaimed = true;
+                        continue;
+                    }
                     let parsed: Option<Vec<(crate::app::IncluderGuard, Vec<ModelBodyItem>)>> = groups
                         .into_iter()
                         .map(|(guard, stmts)| {
@@ -7072,6 +7592,19 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                             continue;
                         }
                         Ok(Some(super::model::ClassBodyExpansion::Enum(expanded))) => {
+                            if prepended {
+                                // Folded into includers by
+                                // `fold_concern_enums_into_models`; a
+                                // prepender has no such fold.
+                                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                                    super::util::node_span(&inner, file),
+                                    None,
+                                    "prepended do",
+                                    format!("`enum` inside `{}` is not carried to the classes that prepend it", id.0.as_str()),
+                                ));
+                                unclaimed = true;
+                                continue;
+                            }
                             if let Some(mapping) = expanded.mapping {
                                 enums.push(ConcernEnumDecl {
                                     column: expanded.column,
@@ -7090,14 +7623,58 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                         }
                     }
                 }
+                let is_direct = direct.iter().any(|stmt| {
+                    stmt.location().start_offset() == inner.location().start_offset()
+                });
+                // `included do cattr_accessor :cap, default: 3 end` seeds
+                // the includer's class variable and defines both sides
+                // there, exactly as the same call in a model's body does:
+                // the model-side walk expands it, and the seed travels to
+                // the splice beside the accessors. One per module and per
+                // block kind: a `prepended do` block's seed is the
+                // PREPENDER's class variable, which no map below holds —
+                // so a prepended one is refused rather than carried into
+                // every includer.
+                if is_concern && is_direct && let Some(call) = inner.as_call_node()
+                    && call.receiver().is_none()
+                    && matches!(constant_id_str(&call.name()),
+                        "cattr_accessor" | "cattr_reader" | "cattr_writer"
+                        | "mattr_accessor" | "mattr_reader" | "mattr_writer")
+                {
+                    if prepended {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&inner, file),
+                            None,
+                            "prepended do",
+                            format!("`{}` inside `{}` is not carried to the classes that prepend it", constant_id_str(&call.name()), id.0.as_str()),
+                        ));
+                        unclaimed = true;
+                        continue;
+                    }
+                    match super::model::expand_mattr_cattr(
+                        &call,
+                        &id,
+                        file,
+                        Vec::new(),
+                        Some(&mut class_attr_defaults),
+                    ) {
+                        Ok(Some(expanded)) => {
+                            items.extend(expanded);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            super::survey::record(&err);
+                            unclaimed = true;
+                            continue;
+                        }
+                    }
+                }
                 // `_items`, plural: a multi-attribute `validates` (or
                 // its `validates_presence_of` spelling) declares one
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
-                let is_direct = direct.iter().any(|stmt| {
-                    stmt.location().start_offset() == inner.location().start_offset()
-                });
                 // Its methods are the module's class methods (the decl walk).
                 if is_concern
                     && is_direct
@@ -7192,11 +7769,23 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         if !guarded.is_empty() {
             guarded_out.push((id.clone(), guarded));
         }
+        if !class_attr_defaults.is_empty() {
+            class_attr_out.push((id.clone(), class_attr_defaults));
+        }
+        if !prepended_items.is_empty() {
+            prepended_out.push((id.clone(), prepended_items));
+        }
         if !items.is_empty() {
             out.push((id, items));
         }
     }
-    (out, enums_out, guarded_out)
+    ConcernModelScan {
+        items: out,
+        enums: enums_out,
+        guarded: guarded_out,
+        class_attrs: class_attr_out,
+        prepended: prepended_out,
+    }
 }
 
 /// Does this class's ancestry, as a `sig/**/*.rbs` sidecar states it,

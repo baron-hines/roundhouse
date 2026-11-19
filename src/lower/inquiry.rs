@@ -73,6 +73,13 @@ pub fn apply_inquiry_lowering(app: &mut App) {
     for view in &mut app.views {
         rewrite(&mut view.body, &facts, None);
     }
+    // A test reads the predicate too (`entry.entryable_name.message?`).
+    // Owned by its test class, so a receiverless call reaches only that
+    // class's methods, never an app inquirer of the same name.
+    for module in &mut app.test_modules {
+        let owner = module.name.clone();
+        super::for_each_test_module_body(module, &mut |body| rewrite(body, &facts, Some(&owner)));
+    }
 }
 
 /// The inquirer-returning methods and the tail test now live in

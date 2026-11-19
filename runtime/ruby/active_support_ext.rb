@@ -46,6 +46,9 @@ require_relative "active_support_number_helper"
 require_relative "json_builder"
 
 module ActiveSupport
+  class DelegationError < ::NoMethodError
+  end
+
   # `ActiveSupport::JSON` — Rails' JSON coder over the json library.
   #
   # `encode` is `value.as_json.to_json` with Rails' default HTML-entity

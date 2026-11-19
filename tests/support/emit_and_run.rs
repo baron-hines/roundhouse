@@ -180,6 +180,30 @@ impl Overlay {
         Run::new(command.join(" "), emitted, errors, output)
     }
 
+    /// Emit, then load several of the emitted test files into one Ruby
+    /// process, in order, as `bin/rails test` loads a suite.
+    pub fn run_tests(self, test_paths: &[&str]) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
+        let load = "ARGV.each { |path| require File.expand_path(path) }";
+        let output = ruby()
+            .args(["-Itest", "-I.", "-e", load])
+            .args(test_paths)
+            .current_dir(&emitted)
+            .output()
+            .expect("spawn ruby");
+        Run::new(format!("ruby -Itest -I. -e '{load}' {}", test_paths.join(" ")), emitted, errors, output)
+    }
+
+    /// Emit the Spinel tree, then run one of its test files with
+    /// `spin test <path>`. Spinel writes `test/<dir>/x_test.rb` as
+    /// `test/x_test.rb`, so `test_path` is the emitted path.
+    pub fn run_spin_test(self, test_path: &str) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Spinel);
+        let output =
+            Command::new("spin").args(["test", test_path]).current_dir(&emitted).output().expect("spawn spin");
+        Run::new(format!("spin test {test_path}"), emitted, errors, output)
+    }
+
     /// Emit, then run `script` against the booted app: `main.rb` is
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
@@ -257,6 +281,34 @@ impl Overlay {
         std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{script}"))
             .expect("write native consumer");
         compile_and_run_contract(emitted, errors, flags).expecting_completion()
+    }
+
+    /// `run_spinel` through the `roundhouse` binary, which boots the app's CRuby tree to observe what a gem does to
+    /// a class it holds in a variable (`observed_shapes`); the library build the other runs take does not. Its
+    /// errors are the binary's: a first build without `--allow-unsupported` lists them, as that flag prints them
+    /// as warnings, and the second writes the tree (the observation is cached by then).
+    #[allow(dead_code)]
+    pub fn run_spinel_observed(self, script: &str) -> Run {
+        let (scratch, source) = self.materialize();
+        let build = |allow: bool, out: &Path| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_roundhouse"));
+            command.args(["--target", "spinel"]);
+            if allow {
+                command.arg("--allow-unsupported");
+            }
+            command.arg(&source).arg("-o").arg(out).output().expect("spawn roundhouse")
+        };
+        let checked = build(false, &scratch.join("checked"));
+        let errors = String::from_utf8_lossy(&checked.stderr)
+            .lines()
+            .filter_map(|l| l.split_once(": error[").map(|(at, rest)| format!("{at}: {}", rest.split_once("]: ").map_or(rest, |(_, msg)| msg))))
+            .collect();
+        let emitted = scratch.join("emitted");
+        let built = build(true, &emitted);
+        assert!(built.status.success(), "roundhouse --target spinel failed:\n{}", String::from_utf8_lossy(&built.stderr));
+        std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{}", to_completion(script)))
+            .expect("write native consumer");
+        compile_and_run_contract(emitted, errors, &[]).expecting_completion()
     }
 
     /// `run_spinel` for a probe that does not need the app: compile only the
@@ -655,7 +707,8 @@ impl Run {
         assert!(
             self.success || !self.exited_zero,
             "the emitted program exited 0 without reaching the end of its script (an early `exit` or \
-             `return`, or a swallowed raise), so its checks did not all run: `{}` in {}\n\
+             `return`, or a swallowed raise), so its checks did not all run: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -664,7 +717,8 @@ impl Run {
         );
         assert!(
             self.success,
-            "analysis and emit are clean but the emitted program failed: `{}` in {}\n\
+            "analysis and emit are clean but the emitted program failed: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -674,10 +728,9 @@ impl Run {
     }
 }
 
-/// A run takes its scratch tree with it, unless its test is failing (the
-/// failure names the tree) or `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one.
-/// A run expected to fail is a passing test and is removed too. Left
-/// behind, a full suite fills `/tmp`'s inodes.
+/// A run takes its scratch tree with it, passed or failed, unless
+/// `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one (a failure names its tree).
+/// Left behind, a full suite fills `/tmp`'s inodes.
 impl Drop for Run {
     fn drop(&mut self) {
         remove_scratch(&self.emitted);
@@ -709,7 +762,7 @@ impl Drop for Emitted {
 }
 
 fn remove_scratch(emitted: &Path) {
-    if !std::thread::panicking() && std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
+    if std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
         if let Some(scratch) = emitted.parent() {
             let _ = std::fs::remove_dir_all(scratch);
         }

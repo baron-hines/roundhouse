@@ -644,6 +644,10 @@ pub struct App {
     /// `analyze::database_identity`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub database_refusals: Vec<crate::database::DatabaseRefusal>,
+    /// The shard and role pools of an app whose one connection class
+    /// routes every model; none for any other app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_routes: Option<crate::database::DatabaseRoutes>,
     /// Support files (`lib/`, a gem's source, …) whose class ingest
     /// failed, each at the construct that failed it: the walk goes on
     /// without the file, and `analyze` reports it there
@@ -792,6 +796,19 @@ pub struct App {
     /// so the splice keeps source order.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_guarded_items: HashMap<ClassId, Vec<ConcernGuardedItem>>,
+    /// The class-variable seeds a concern's `included do` block sets on
+    /// each includer, keyed by module. `included do cattr_accessor :cap,
+    /// default: 3 end` runs in the includer's class body there, so the
+    /// block's expansion is the includer's accessors AND its `@@cap =
+    /// 3`; the splice hands both to the model that includes the module.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_class_attr_defaults: HashMap<ClassId, indexmap::IndexMap<Symbol, Expr>>,
+    /// Model DSL declared inside a concern module's `prepended do`, keyed
+    /// by the module, exactly as [`App::concern_model_items`] holds an
+    /// `included do` block's. Rails runs the block in the class that
+    /// `prepend`s the module, so the splice gives these to that class.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_prepended_items: HashMap<ClassId, Vec<ModelBodyItem>>,
     /// Instance-method names a concern's `included do` block (re)defines
     /// (`def x`, `alias_method :x, ...`, `define_method`, `attr_*`), keyed by
     /// module. Those statements are not carried as `concern_model_items`, so
@@ -1410,6 +1427,7 @@ impl App {
             databases: Vec::new(),
             model_databases: indexmap::IndexMap::new(),
             database_refusals: Vec::new(),
+            database_routes: None,
             ingest_drops: Vec::new(),
             library_class_files: Vec::new(),
             rails_application: None,
@@ -1430,6 +1448,8 @@ impl App {
             concern_class_side_spans: crate::det::HashSet::default(),
             concern_model_items: HashMap::default(),
             concern_guarded_items: HashMap::default(),
+            concern_class_attr_defaults: HashMap::default(),
+            concern_prepended_items: HashMap::default(),
             concern_included_redefs: HashMap::default(),
             validates_with_guards: Vec::new(),
             current_attribute_classes: Vec::new(),
