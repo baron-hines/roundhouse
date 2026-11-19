@@ -70,6 +70,10 @@ const CONCERNS: &[(&str, &str)] = &[
     ("hook_bundle", "module HookBundle\n  extend ActiveSupport::Concern\n  include HookOne, HookTwo\nend\n"),
     // A plain module including DelegateOne: the hook's forwarder is the module's.
     ("delegate_wrapper", "module DelegateWrapper\n  include DelegateOne\n\n  def wrapper_name\n    \"wrapper\"\n  end\nend\n"),
+    // A loop's string includes LoopLabelB, then an ordinary `include LoopLabelC`.
+    ("loop_label_b", "module LoopLabelB\n  def label\n    \"loop b\"\n  end\nend\n"),
+    ("loop_label_c", "module LoopLabelC\n  def label\n    \"loop c\"\n  end\nend\n"),
+    ("loop_then_include", "module LoopThenInclude\n  %w[LoopLabelB].each { |m| class_eval \"include #{m}\" }\n  include LoopLabelC\n\n  def host\n    \"host\"\n  end\nend\n"),
 ];
 
 /// (controller, its include lines, Ruby's `label`).
@@ -140,6 +144,15 @@ const SPECIAL: &[(&str, &str, &str)] = &[
     // [RewrappedDelegate, DelegateTwo, DelegateWrapper, DelegateOne]: the
     // controller's own forwarder, from DelegateTwo's hook, comes first.
     ("rewrapped_delegate", "class RewrappedDelegateController < ApplicationController\n  include DelegateWrapper\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
+    // [SuperM, PrependInherited, SuperN, SuperParent, SuperM]: the superclass's
+    // SuperM doesn't keep `prepend SuperM` from putting it ahead of the class.
+    ("prepend_inherited", "class PrependInheritedController < SuperParentController\n  prepend SuperM\n  include SuperN\n\n  def show\n    render json: { label: label }\n  end\nend\n", "super m"),
+    // [ReorderedInherited, SuperPairParent, SuperN, SuperM]: the child's
+    // includes of both add nothing, so the superclass's order stands.
+    ("reordered_inherited", "class ReorderedInheritedController < SuperPairParentController\n  include SuperN\n  include SuperM\n\n  def show\n    render json: { label: label }\n  end\nend\n", "super n"),
+    // [LoopInclude, LoopThenInclude, LoopLabelC, LoopLabelB]: the loop runs
+    // where it stands, so the later `include LoopLabelC` is nearer.
+    ("loop_include", "class LoopIncludeController < ApplicationController\n  include LoopThenInclude\n\n  def show\n    render json: { label: label }\n  end\nend\n", "loop c"),
     // DelegateTwo's hook runs last, so its `delegate` defines `label`.
     ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
@@ -156,6 +169,7 @@ fn app() -> emit_and_run::Overlay {
     }
     app = app
         .write("app/controllers/super_parent_controller.rb", "class SuperParentController < ApplicationController\n  include SuperM\nend\n")
+        .write("app/controllers/super_pair_parent_controller.rb", "class SuperPairParentController < ApplicationController\n  include SuperM\n  include SuperN\nend\n")
         .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
     let mut routes = String::from("Rails.application.routes.draw do\n");
     for (name, source, _) in SPECIAL {
