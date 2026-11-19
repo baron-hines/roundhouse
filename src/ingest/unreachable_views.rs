@@ -142,6 +142,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
     // object the render asks for its own partial.
     fn reads_request(e: &Expr, fed: &HashSet<String>) -> bool {
         match &*e.node {
+            ExprNode::Send { recv: None, method, args, .. } if matches!(method.as_str(), "sprintf" | "format") => args.iter().any(|a| reads_request(a, fed)),
             ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
             // A name built from one (`"articles/" + params[:panel]`), apart from a record a request selects.
             ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "+" => {
@@ -255,6 +256,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         entries.iter().any(|(k, v)| {
             (key(k, "partial") && open(v))
                 || (partial && key(k, "layout") && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil }) && open(v))
+                || (partial && key(k, "spacer_template") && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil }) && open(v))
         })
     }
     fn computed_partial(
@@ -262,6 +264,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         open: &dyn Fn(&Expr) -> bool,
         request: &dyn Fn(&Expr) -> bool,
         locals: &[(String, bool, &Expr)],
+        mutated: &HashSet<String>,
     ) -> bool {
         let mut found = false;
         if let ExprNode::Send { method, args, .. } = &*e.node
@@ -271,10 +274,18 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             found = match &*first.node {
                 ExprNode::Hash { entries, .. } => options_open(entries, open),
                 // Options passed through a local (`opts = { partial: … }; render opts`).
+                // Or a name built in place (`panel += "ost"`); not a local holding a record, which renders itself.
                 ExprNode::Var { name, .. } => {
-                    request(first)
+                    // A String mutated in place (directly or through an alias), as a record collection is not.
+                    let built = mutated.contains(name.as_str())
+                        && locals.iter().any(|(n, ivar, h)| !*ivar && n == name.as_str() && matches!(&*h.node, ExprNode::Lit { value: Literal::Str { .. } }));
+                    built || request(first)
                         || locals.iter().any(|(n, ivar, h)| {
-                            !*ivar && n == name.as_str() && matches!(&*h.node, ExprNode::Hash { entries, .. } if options_open(entries, open))
+                            !*ivar
+                                && n == name.as_str()
+                                && (matches!(&*h.node, ExprNode::Hash { entries, .. } if options_open(entries, open))
+                                    || matches!(&*h.node, ExprNode::OpAssign { op: crate::expr::OpAssignOp::Add, value, .. }
+                                        if matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })))
                         })
                 }
                 ExprNode::StringInterp { .. } => open(first),
@@ -284,7 +295,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 _ => request(first),
             };
         }
-        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request, locals));
+        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request, locals, mutated));
         found
     }
     let body_computed = |b: &Expr| -> bool {
@@ -296,7 +307,23 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         block_params(b, &mut shadowed);
         let mut mutated = HashSet::default();
         mutated_locals(b, &mut mutated);
-        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here)
+        // An alias shares the String (`alias_name = panel; alias_name.concat(…)`): a mutation of either is of both.
+        loop {
+            let before = mutated.len();
+            for (name, ivar, value) in &here {
+                if let ExprNode::Var { name: other, .. } = &*value.node
+                    && !*ivar
+                    && (mutated.contains(name) || mutated.contains(other.as_str()))
+                {
+                    mutated.insert(name.clone());
+                    mutated.insert(other.as_str().to_string());
+                }
+            }
+            if mutated.len() == before {
+                break;
+            }
+        }
+        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here, &mutated)
     };
     let mut computed = false;
     crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));
@@ -323,22 +350,39 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
     }
     // A bare render target resolves through the rendering controller's lookup prefixes, not the view's own
     // directory (`shared/_card`'s `render "ghost"` may be `articles/_ghost`), so its leaf names any directory's.
-    fn bare_render_targets(e: &Expr, out: &mut HashSet<String>) {
+    // A local read there names what its literal assignments hold (`panel = "ghost"; render partial: panel`).
+    fn bare_render_targets(e: &Expr, locals: &[(String, bool, &Expr)], out: &mut HashSet<String>) {
         if let ExprNode::Send { method, args, .. } = &*e.node
             && matches!(method.as_str(), "render" | "render_to_string")
             && let Some(first) = args.first()
         {
             let mut take = |v: &Expr| {
-                if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node
-                    && !value.contains('/')
-                {
-                    out.insert(value.clone());
+                // Through aliases too (`source = "ghost"; panel = source`), each local followed once.
+                let mut values: Vec<&Expr> = Vec::new();
+                let mut pending: Vec<&Expr> = vec![v];
+                let mut seen: HashSet<String> = HashSet::default();
+                while let Some(e) = pending.pop() {
+                    match &*e.node {
+                        ExprNode::Var { name, .. } => {
+                            if seen.insert(name.as_str().to_string()) {
+                                pending.extend(locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).map(|(_, _, value)| *value));
+                            }
+                        }
+                        _ => values.push(e),
+                    }
+                }
+                for v in values {
+                    if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node
+                        && !value.contains('/')
+                    {
+                        out.insert(value.clone());
+                    }
                 }
             };
             match &*first.node {
                 ExprNode::Hash { entries, .. } => {
                     for (k, v) in entries {
-                        if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout")) {
+                        if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout" | "spacer_template")) {
                             take(v);
                         }
                     }
@@ -346,7 +390,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 _ => take(first),
             }
         }
-        e.node.for_each_child(&mut |c| bare_render_targets(c, out));
+        e.node.for_each_child(&mut |c| bare_render_targets(c, locals, out));
     }
     // The text pieces of a render's own interpolated name (`render "ghost_#{kind}"`), apart from any other string's.
     fn render_name_fragments(e: &Expr, out: &mut Vec<String>) {
@@ -382,10 +426,15 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
     }
     crate::lower::for_each_hook_body_ref(app, &mut |b| render_name_fragments(b, &mut render_fragments));
     let mut bare_targets: HashSet<String> = HashSet::default();
+    let mut bare_in = |b: &Expr, out: &mut HashSet<String>| {
+        let mut here = Vec::new();
+        assignments(b, &mut here);
+        bare_render_targets(b, &here, out);
+    };
     for v in &app.views {
-        bare_render_targets(&v.body, &mut bare_targets);
+        bare_in(&v.body, &mut bare_targets);
     }
-    crate::lower::for_each_hook_body_ref(app, &mut |b| bare_render_targets(b, &mut bare_targets));
+    crate::lower::for_each_hook_body_ref(app, &mut |b| bare_in(b, &mut bare_targets));
     // Not models alone: an STI subclass ingested as a library class (`AssistantMessage < Message`), or any class
     // answering `to_partial_path`, is rendered by `render @messages` the same way.
     let model_partials: HashSet<String> = app
