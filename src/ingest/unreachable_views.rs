@@ -141,14 +141,14 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
     // an interpolation or a branch of one. Not a record a request selects (`Article.find(params[:id])`), which is an
     // object the render asks for its own partial.
     fn reads_request(e: &Expr, fed: &HashSet<String>) -> bool {
-        const CARRIES: &[&str] = &["[]", "to_s", "to_sym", "presence", "strip", "downcase", "upcase", "fetch", "dig", "underscore", "pluralize", "singularize"];
         match &*e.node {
             ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
             // A name built from one (`"articles/" + params[:panel]`), apart from a record a request selects.
             ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "+" => {
                 reads_request(r, fed) || args.iter().any(|a| reads_request(a, fed))
             }
-            ExprNode::Send { recv: Some(r), method, .. } => CARRIES.contains(&method.as_str()) && reads_request(r, fed),
+            // Any method on one (`gsub`, `cookies.signed[...]`); a record a request selects has it as an argument instead.
+            ExprNode::Send { recv: Some(r), .. } => reads_request(r, fed),
             ExprNode::OpAssign { value, .. } => reads_request(value, fed),
             ExprNode::Var { name, .. } => fed.contains(name.as_str()),
             ExprNode::Ivar { name } => fed.contains(&format!("@{name}")),
@@ -217,7 +217,18 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         }
         e.node.for_each_child(&mut |c| block_params(c, out));
     }
-    let open_in = |v: &Expr, locals: &[(String, bool, &Expr)], shadowed: &HashSet<String>, fed: &HashSet<String>| -> bool {
+    // A local a String mutator changes in place (`panel.concat("ost")`): its literal assignments no longer name it.
+    fn mutated_locals(e: &Expr, out: &mut HashSet<String>) {
+        const MUTATORS: &[&str] = &["concat", "<<", "replace", "insert", "prepend", "sub!", "gsub!", "tr!", "squeeze!", "delete!", "slice!", "chomp!", "chop!", "strip!", "lstrip!", "rstrip!", "downcase!", "upcase!", "capitalize!", "swapcase!", "succ!", "next!", "reverse!", "[]=", "clear", "force_encoding", "unicode_normalize!", "squish!"];
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+            && let ExprNode::Var { name, .. } = &*r.node
+            && MUTATORS.contains(&method.as_str())
+        {
+            out.insert(name.as_str().to_string());
+        }
+        e.node.for_each_child(&mut |c| mutated_locals(c, out));
+    }
+    let open_in = |v: &Expr, locals: &[(String, bool, &Expr)], shadowed: &HashSet<String>, mutated: &HashSet<String>, fed: &HashSet<String>| -> bool {
         match &*v.node {
             // Not `partial: true` (the action's own name, read per controller) or any other non-String literal.
             ExprNode::Lit { value: Literal::Str { .. } } => false,
@@ -225,7 +236,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             // A collection or a pool a controller assigns (`partial: @tags`), unless a request value reaches it.
             ExprNode::Ivar { name } => fed.contains(&format!("@{name}")),
             // A local is a known name only where each assignment of it is a literal.
-            ExprNode::Var { name, .. } if shadowed.contains(name.as_str()) => true,
+            ExprNode::Var { name, .. } if shadowed.contains(name.as_str()) || mutated.contains(name.as_str()) => true,
             ExprNode::Var { name, .. } => {
                 let mine: Vec<_> = locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).collect();
                 mine.is_empty() || mine.iter().any(|(_, _, value)| !matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } }))
@@ -283,7 +294,9 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         request_fed(&here, &mut fed);
         let mut shadowed = HashSet::default();
         block_params(b, &mut shadowed);
-        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &fed), &|v: &Expr| reads_request(v, &fed), &here)
+        let mut mutated = HashSet::default();
+        mutated_locals(b, &mut mutated);
+        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here)
     };
     let mut computed = false;
     crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));

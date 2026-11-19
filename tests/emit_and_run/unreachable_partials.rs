@@ -55,6 +55,9 @@ fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
         "<% panel = \"articles/gh\" %><% panel += \"ost\" %><%= render partial: panel %>",
         "<%= render partial: \"articles/card\", layout: params[:wrapper].to_s %>",
         "<% opts = { partial: params[:panel].to_s } %><%= render opts %>",
+        "<%= render params[:panel].to_s.gsub(\"-\", \"_\") %>",
+        "<% @panel = cookies.signed[:panel] %><%= render partial: @panel %>",
+        "<% panel = \"articles/gh\" %><% panel.concat(\"ost\") %><%= render partial: panel %>",
     ] {
         let errors = errors_with(reads, "");
         assert!(errors.iter().any(|e| e.contains("@ghost")), "{reads}: {errors:#?}");
