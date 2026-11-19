@@ -412,11 +412,12 @@ fn keep_initializer_defined(
     taken
 }
 
-/// The constants an opening reads, bare or rooted, from their source
-/// text: its methods' bodies and parameter defaults, and its constants'
-/// values.
+/// The constants an opening reads, bare or rooted: its superclass and the
+/// modules it includes, which Ruby resolves when the opening runs, and,
+/// from their source text, its methods' bodies and parameter defaults and
+/// its constants' values.
 fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = lc.parent.iter().chain(&lc.includes).map(|named| named.0.as_str().trim_start_matches("::").to_string()).collect();
     let spans = lc
         .methods
         .iter()
