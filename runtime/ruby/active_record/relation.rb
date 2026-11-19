@@ -3532,16 +3532,24 @@ module ActiveRecord
       raise RecordNotFound.new("Couldn't find #{@model.name} without an ID", @model.name, @model.primary_key) if id.nil?
       return find_ids(id) if id.is_a?(Array)
       key = @model._cast_primary_key(id)
-      prior_limit = @limit
-      own_lists
-      push_where("#{@table}.#{@model.primary_key} = #{bind_literal(key)}")
-      begin
-        @limit = 1
-        rows = load_records
-        record = rows.length == 0 ? nil : rows[0]
-      ensure
-        @limit = prior_limit
-        pop_where
+      # A PostgreSQL uuid key casts as `find_by` and `exists?` cast it
+      # (Rails' OID::Uuid, ActiveRecord::UuidCast): canonical, or "" for
+      # a value that is no uuid, which finds no row without a query.
+      uuid_key = uuid_query_column?(@model.primary_key.to_s)
+      key = ActiveRecord::UuidCast.cast_text(id) if uuid_key
+      record = nil
+      unless uuid_key && key == ""
+        prior_limit = @limit
+        own_lists
+        push_where("#{@table}.#{@model.primary_key} = #{bind_literal(key)}")
+        begin
+          @limit = 1
+          rows = load_records
+          record = rows.length == 0 ? nil : rows[0]
+        ensure
+          @limit = prior_limit
+          pop_where
+        end
       end
       if record.nil?
         raise RecordNotFound.new("Couldn't find #{@model.name} with '#{@model.primary_key}'=#{id.inspect}", @model.name, @model.primary_key, id)
