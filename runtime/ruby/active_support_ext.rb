@@ -1804,19 +1804,24 @@ module ActiveSupport
 
   # bigdecimal/util's `String#to_d` (`BigDecimal.interpret_loosely`): leading whitespace skipped, a sign, then the
   # longest decimal it can read (`_` only between digits, an exponent only with digits); none reads as a signed zero.
-  def self.loose_decimal_text(text)
+  def self.loose_decimal_text(raw)
+    # Not by character: the grammar is single-byte ASCII, and a byte string indexes in constant time.
+    text = raw.b
     i = 0
     n = text.length
     i = i + 1 while i < n && " \t\n\v\f\r".include?(text[i].to_s)
     sign = ""
+    signed = false
     if i < n && (text[i] == "+" || text[i] == "-")
       sign = text[i] == "-" ? "-" : ""
+      signed = true
       i = i + 1
     end
     # A special value only as the whole rest (trailing whitespace allowed): `"Infinityjunk"` reads as a zero.
     rest = text[i, n].to_s.rstrip
     return sign + "Infinity" if rest == "Infinity"
-    return "NaN" if sign.empty? && rest == "NaN"
+    # Not a signed one: bigdecimal reads `NaN` before any sign, so `+NaN` is a zero.
+    return "NaN" if !signed && rest == "NaN"
     int_part = loose_digits(text, i)
     i = loose_digits_end(text, i)
     frac_part = ""

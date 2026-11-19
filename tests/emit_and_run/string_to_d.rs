@@ -21,7 +21,7 @@ def expect(label, got, want)
   raise "#{label}: got #{got.inspect}, want #{want.inspect}" unless got == want
 end
 expect("title", Article.new(title: "12.3abc", body: "a body long enough").title_d.to_s, "0.123e2")
-{ "12.3" => "0.123e2", "abc" => "0.0", "" => "0.0", "1_000.5" => "0.10005e4", "-0.5" => "-0.5e0", "1e3" => "0.1e4", ".5" => "0.5e0", "1__0" => "0.1e1", "1e" => "0.1e1" }.each do |text, want|
+{ "12.3" => "0.123e2", "abc" => "0.0", "" => "0.0", "1_000.5" => "0.10005e4", "-0.5" => "-0.5e0", "1e3" => "0.1e4", ".5" => "0.5e0", "1__0" => "0.1e1", "1e" => "0.1e1", "+NaN" => "0.0", "12é" => "0.12e2" }.each do |text, want|
   expect(text, Article.loose(text).to_s, want)
 end
 expect("present", Article.maybe(true).to_s, "0.725e1")
