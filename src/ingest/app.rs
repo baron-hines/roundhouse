@@ -327,15 +327,49 @@ fn keep_initializer_defined(
     };
     let gem_declared: HashMap<String, bool> =
         app.library_classes.iter().filter(|c| from_gem(c)).map(|c| (c.name.0.as_str().to_string(), c.is_module)).collect();
-    // The names a gem's class or module defines in itself: its constants
-    // and its nested classes. A block reading one of them bare reads the
-    // top level's in Ruby, which the kept opening would not.
-    let gem_owned = |owner: &str, name: &str| {
+    // The names a gem's class or module defines in itself or in a gem
+    // superclass or included module: their constants and nested classes.
+    // A block reading one of them bare reads the top level's in Ruby,
+    // which the kept opening, looking through its ancestors, would not.
+    let gem_owns_itself = |owner: &str, name: &str| {
         let nested = format!("{owner}::{name}");
         app.library_classes.iter().filter(|c| from_gem(c)).any(|c| {
             (c.name.0.as_str() == owner && c.constants.iter().any(|(n, _)| n.as_str() == name))
                 || c.name.0.as_str() == nested
         })
+    };
+    // Every name the gem declares, with the namespaces its nested names
+    // open: a class holding only a nested module is no opening of its own.
+    let gem_namespaces: crate::det::HashSet<String> = gem_declared
+        .keys()
+        .flat_map(|name| name.match_indices("::").map(|(at, _)| name[..at].to_string()).chain([name.clone()]))
+        .collect();
+    let gem_owned = |owner: &str, name: &str| {
+        let mut pending = vec![owner.to_string()];
+        let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if gem_owns_itself(&current, name) {
+                return true;
+            }
+            for opening in app.library_classes.iter().filter(|c| from_gem(c) && c.name.0.as_str() == current) {
+                for ancestor in opening.parent.iter().chain(&opening.includes) {
+                    // A bare ancestor is looked up from the opening's namespaces outward.
+                    let written = ancestor.0.as_str().trim_start_matches("::");
+                    let mut scopes: Vec<&str> = current.match_indices("::").map(|(at, _)| &current[..at]).collect();
+                    scopes.reverse();
+                    let found = if ancestor.0.as_str().starts_with("::") {
+                        None
+                    } else {
+                        scopes.iter().map(|scope| format!("{scope}::{written}")).find(|n| gem_namespaces.contains(n))
+                    };
+                    pending.push(found.unwrap_or_else(|| written.to_string()));
+                }
+            }
+        }
+        false
     };
     // Where each kept reopen of a gem's name runs: its initializer, which
     // Rails runs in sorted order, and its place in that file. A later one
@@ -414,8 +448,8 @@ fn keep_initializer_defined(
 
 /// The constants an opening reads, bare or rooted: its superclass and the
 /// modules it includes, which Ruby resolves when the opening runs, and,
-/// from their source text, its methods' bodies and parameter defaults and
-/// its constants' values.
+/// from their source text, its methods' bodies and parameter defaults,
+/// its constants' values and its class ivars' initializers.
 fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
     let mut out: Vec<String> = lc.parent.iter().chain(&lc.includes).map(|named| named.0.as_str().trim_start_matches("::").to_string()).collect();
     let spans = lc
@@ -424,7 +458,8 @@ fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]
         .flat_map(|method| {
             std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
         })
-        .chain(lc.constants.iter().map(|(_, value)| value.span));
+        .chain(lc.constants.iter().map(|(_, value)| value.span))
+        .chain(lc.class_ivar_initializers.iter().map(|value| value.span));
     for span in spans {
         if span.is_synthetic() {
             continue;
