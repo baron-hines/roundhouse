@@ -206,13 +206,18 @@ fn a_method_missing_module_reads_a_method_its_includers_parent_includes_at_depth
 /// Review 2: the module's includers found indirectly. `Courier` reaches
 /// `Badged` only through `Carrier`, which no other class includes; `Agent`
 /// inherits it from `BadgedBase`, which defines neither `token` nor `label`.
-/// Ruby 4.0.7 with ActiveSupport 8.1.4.1 gives `"tok-courier"` and `"tok-agent"`.
+/// Ruby 4.0.7 with ActiveSupport 8.1.4.1 gives `["tok-courier", "idle courier"]`
+/// and `["tok-agent", "idle agent"]`.
 fn badged_concern() -> &'static str {
     r##"module Badged
   extend ActiveSupport::Concern
 
   def badge
     "#{token}-#{label}"
+  end
+
+  def badge_state
+    ready? ? "ready #{label}" : "idle #{label}"
   end
 
   def method_missing(name, *args)
@@ -226,6 +231,18 @@ end
 "##
 }
 
+/// A module whose includers are not found has nothing to check names
+/// against and leaves every call plain, which CRuby runs the same way, so
+/// the indirect probes read the lowering too: `ready?`, which no includer
+/// answers, reaches `method_missing`, while `token` and `label` stay plain.
+fn assert_badged_lowering(emitted: &std::path::Path) {
+    let badge = emitted_method(emitted, "app/models/badged.rb", "badge");
+    assert!(badge.contains("\"#{token}-#{label}\"") && !badge.contains("method_missing("), "{badge}");
+    let state = emitted_method(emitted, "app/models/badged.rb", "badge_state");
+    assert!(state.contains("method_missing(:ready?)"), "{state}");
+    assert!(!state.contains("method_missing(:label)"), "{state}");
+}
+
 fn indirect_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("app/models/concerns/badged.rb", badged_concern())
@@ -234,8 +251,8 @@ fn indirect_app() -> emit_and_run::Overlay {
         .write("app/models/courier.rb", "class Courier\n  include Carrier\n  include Provider\n\n  def label\n    \"courier\"\n  end\nend\n")
 }
 
-const INDIRECT: &str = r##"got = Courier.new.badge
-raise "indirect includer: #{got.inspect}" unless got == "tok-courier"
+const INDIRECT: &str = r##"got = [Courier.new.badge, Courier.new.badge_state]
+raise "indirect includer: #{got.inspect}" unless got == ["tok-courier", "idle courier"]
 puts "probe passed"
 "##;
 
@@ -244,6 +261,7 @@ fn a_method_missing_module_reads_a_class_that_includes_it_through_another_module
     let run = indirect_app().run_ruby(INDIRECT);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    assert_badged_lowering(&run.emitted);
 }
 
 #[test]
@@ -262,8 +280,8 @@ fn inherited_app() -> emit_and_run::Overlay {
         .write("app/models/agent.rb", "class Agent < BadgedBase\n  include Provider\n\n  def label\n    \"agent\"\n  end\nend\n")
 }
 
-const INHERITED: &str = r##"got = Agent.new.badge
-raise "inherited includer: #{got.inspect}" unless got == "tok-agent"
+const INHERITED: &str = r##"got = [Agent.new.badge, Agent.new.badge_state]
+raise "inherited includer: #{got.inspect}" unless got == ["tok-agent", "idle agent"]
 puts "probe passed"
 "##;
 
@@ -272,6 +290,7 @@ fn a_method_missing_module_reads_a_subclass_of_its_includer() {
     let run = inherited_app().run_ruby(INHERITED);
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+    assert_badged_lowering(&run.emitted);
 }
 
 #[test]
