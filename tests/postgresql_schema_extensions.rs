@@ -274,9 +274,10 @@ fn an_extension_schema_is_matched_as_postgresql_reads_it() {
 /// default search path, `enable_extension "pgcrypto"`, `create_schema
 /// "public", force: true`, `create_schema "extensions"`, `enable_extension
 /// "extensions.pgcrypto"` leaves pgcrypto in `extensions` only. The fold
-/// reads no search path, so it takes the default's, where that schema is
-/// `public`: dropping `public` while an unqualified extension is recorded
-/// is refused, and dropping another schema still folds.
+/// reads no search path, so it takes the extension to be in `public`, where
+/// the default puts it unless a schema named after the user exists (#2260):
+/// dropping `public` while an unqualified extension is recorded is refused,
+/// and dropping another schema still folds.
 #[test]
 fn dropping_public_with_an_unqualified_extension_recorded_is_refused() {
     let error = folded_database_objects("    enable_extension \"pgcrypto\"\n    create_schema \"public\", force: true\n    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"")

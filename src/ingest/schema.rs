@@ -952,7 +952,8 @@ fn extension_schema(qualifier: &str) -> String {
 /// can't tell. An extension enabled without a schema is in the first
 /// schema on the search path. The fold reads no search path (neither
 /// `schema_search_path` nor a role's or database's setting), so it takes
-/// PostgreSQL's default, `"$user", public`, where that schema is `public`.
+/// the extension to be in `public`: PostgreSQL's default, `"$user", public`,
+/// puts it there unless a schema named after the user exists (#2260).
 fn drop_folded_schema(name: &str, call: &str, file: &str, schema: &mut Schema) -> Result<(), IngestError> {
     let held: Vec<&str> = schema
         .extensions
@@ -965,7 +966,7 @@ fn drop_folded_schema(name: &str, call: &str, file: &str, schema: &mut Schema) -
         .collect();
     if !held.is_empty() {
         let unqualified = name == "public" && schema.extensions.iter().any(|e| e.schema.is_none());
-        let note = if unqualified { " (an extension enabled without a schema goes into public on the default search path)" } else { "" };
+        let note = if unqualified { " (an extension enabled without a schema is taken to be in public, where PostgreSQL's default search path puts it unless a schema named after the user exists)" } else { "" };
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: format!("{call} drops the schema with CASCADE, taking extension {}{note} and what depends on it in other schemas (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result", held.join(", ")),
