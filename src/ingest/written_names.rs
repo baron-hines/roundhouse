@@ -55,32 +55,21 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
         .filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str().to_string(), p.0.as_str().to_string())))
         .chain(app.models.iter().filter_map(|m| m.parent.as_ref().map(|p| (m.name.0.as_str().to_string(), p.0.as_str().to_string()))))
         .collect();
-    let mixins: crate::det::HashMap<String, Vec<String>> = app
-        .library_classes
-        .iter()
-        .map(|c| (c.name.0.as_str().to_string(), c.includes.iter().map(|i| i.0.as_str().to_string()).collect()))
-        .chain(app.models.iter().map(|m| (m.name.0.as_str().to_string(), model_includes(&m.body))))
-        .collect();
-    for class in &mut app.library_classes {
+    // Rubydex's misses, for the ancestor fallback once every include it answers is rewritten.
+    let mut missed: Vec<(usize, usize, String)> = Vec::new();
+    for (ci, class) in app.library_classes.iter_mut().enumerate() {
         // A `Data.define` block's includes are absolute already, and its
         // spans locate the factory call, not a written name.
         let data = class.data_define().is_some();
         if data {
             continue;
         }
-        let owner = class.name.0.as_str().to_string();
         for at in 0..class.includes.len() {
             let written = class.includes[at].0.as_str().to_string();
             if let Some(span) = names.argument_span(class.include_spans[at], &written) {
                 match names.resolved(span, &written) {
                     Some(resolved) => class.includes[at] = resolved,
-                    None => {
-                        let earlier: Vec<String> = class.includes[..at].iter().map(|i| i.0.as_str().to_string()).collect();
-                        let lookup = Lookup { parents: &parents, mixins: &mixins, declared: &declared };
-                        if let Some(found) = ancestor_constant(&owner, &written, &earlier, &lookup) {
-                            class.includes[at] = ClassId(Symbol::from(found.as_str()));
-                        }
-                    }
+                    None => missed.push((ci, at, written)),
                 }
             }
         }
@@ -119,6 +108,28 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
                 names.rewrite_mixin_call(expr, &["include", "prepend"]);
             }
         }
+    }
+    // Not the written spellings: a superclass's bare include reads the module Rubydex resolved it to.
+    let mixins: crate::det::HashMap<String, Vec<Vec<String>>> = app
+        .library_classes
+        .iter()
+        .map(|c| (c.name.0.as_str().to_string(), include_calls(&c.includes, &c.include_spans)))
+        .chain(app.models.iter().map(|m| (m.name.0.as_str().to_string(), model_includes(&m.body))))
+        .collect();
+    let mut found: Vec<(usize, usize, ClassId)> = Vec::new();
+    for (ci, at, written) in &missed {
+        let class = &app.library_classes[*ci];
+        // Only the calls before this one: Ruby evaluates a call's arguments before the include changes the ancestry.
+        let this_call = class.include_spans[*at];
+        let first = class.include_spans.iter().position(|s| *s == this_call).unwrap_or(*at);
+        let earlier = include_calls(&class.includes[..first], &class.include_spans[..first]);
+        let lookup = Lookup { parents: &parents, mixins: &mixins, declared: &declared };
+        if let Some(hit) = ancestor_constant(class.name.0.as_str(), written, &earlier, &lookup) {
+            found.push((*ci, *at, ClassId(Symbol::from(hit.as_str()))));
+        }
+    }
+    for (ci, at, id) in found {
+        app.library_classes[ci].includes[at] = id;
     }
     for controller in &mut app.controllers {
         if let Some(parent) = &mut controller.parent {
@@ -314,11 +325,27 @@ impl Names<'_> {
 
 struct Lookup<'a> {
     parents: &'a crate::det::HashMap<String, String>,
-    mixins: &'a crate::det::HashMap<String, Vec<String>>,
+    /// Each class's and module's include calls in order, each call's arguments in order.
+    mixins: &'a crate::det::HashMap<String, Vec<Vec<String>>>,
     declared: &'a crate::det::HashSet<String>,
 }
 
-fn model_includes(body: &[ModelBodyItem]) -> Vec<String> {
+/// A class's includes grouped by the call that wrote them (`include A, B` shares one span).
+fn include_calls(includes: &[ClassId], spans: &[Span]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut last: Option<Span> = None;
+    for (id, span) in includes.iter().zip(spans) {
+        let name = id.0.as_str().trim_start_matches("::").to_string();
+        match out.last_mut() {
+            Some(call) if last == Some(*span) => call.push(name),
+            _ => out.push(vec![name]),
+        }
+        last = Some(*span);
+    }
+    out
+}
+
+fn model_includes(body: &[ModelBodyItem]) -> Vec<Vec<String>> {
     body.iter()
         .filter_map(|item| match item {
             ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
@@ -327,19 +354,57 @@ fn model_includes(body: &[ModelBodyItem]) -> Vec<String> {
             },
             _ => None,
         })
-        .flatten()
-        .filter_map(|a| match &*a.node {
-            ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")),
-            _ => None,
+        .map(|args| {
+            args.iter()
+                .filter_map(|a| match &*a.node {
+                    ExprNode::Const { path } => {
+                        Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"))
+                    }
+                    _ => None,
+                })
+                .collect()
         })
         .collect()
+}
+
+enum Search {
+    Found(String),
+    /// A module written bare may be any declaration of the name: one holding the constant leaves the answer unknown.
+    Unknown,
+    Missing,
+}
+
+/// Ruby's order over a class's include calls: the last call first, a call's arguments in order (`include A, B` puts
+/// `A` first), and each module's own includes before the next module.
+fn in_modules(calls: &[Vec<String>], written: &str, lookup: &Lookup, visited: &mut crate::det::HashSet<String>) -> Search {
+    for call in calls.iter().rev() {
+        for module in call {
+            if !visited.insert(module.clone()) {
+                continue;
+            }
+            let nested = format!("::{module}::{written}");
+            if !module.contains("::") && lookup.declared.iter().any(|d| d.ends_with(&nested)) {
+                return Search::Unknown;
+            }
+            let candidate = format!("{module}::{written}");
+            if lookup.declared.contains(&candidate) {
+                return Search::Found(candidate);
+            }
+            let inner = lookup.mixins.get(module).map(Vec::as_slice).unwrap_or(&[]);
+            match in_modules(inner, written, lookup, visited) {
+                Search::Missing => {}
+                other => return other,
+            }
+        }
+    }
+    Search::Missing
 }
 
 /// Rubydex answers nothing for a bare mixin of a class that includes more than one (`include RateConcept` beside
 /// `include PriceConcept` in `class Provider::Synth < Provider`, where one alone resolves): the name as Ruby finds it in
 /// the class's own constants and mixins, then each superclass's, then the top level's, among the app's declarations. Not the
 /// enclosing namespaces, which a compact `class A::B` does not open. Removable once Shopify/rubydex#1106 is fixed.
-fn ancestor_constant(owner: &str, written: &str, earlier: &[String], lookup: &Lookup) -> Option<String> {
+fn ancestor_constant(owner: &str, written: &str, earlier: &[Vec<String>], lookup: &Lookup) -> Option<String> {
     if written.contains("::") {
         return None;
     }
@@ -356,21 +421,17 @@ fn ancestor_constant(owner: &str, written: &str, earlier: &[String], lookup: &Lo
             found = Some(candidate);
             break;
         }
-        // The class's own mixins come before its superclass, the last included first, and for the class itself only
-        // those included above the one being resolved.
-        let modules = if class == owner { earlier } else { lookup.mixins.get(&class).map(Vec::as_slice).unwrap_or(&[]) };
-        for module in modules.iter().rev() {
-            // A module still written bare may be any declaration of the name, so one of them holding the constant
-            // leaves the answer unknown rather than passing on to the superclass.
-            let nested = format!("::{module}::{written}");
-            if !module.contains("::") && lookup.declared.iter().any(|d| d.ends_with(&nested)) {
-                return None;
-            }
-            let candidate = format!("{module}::{written}");
-            if lookup.declared.contains(&candidate) {
-                found = Some(candidate);
+        // The class's own mixins come before its superclass, and for the class itself only those included by the calls
+        // above the one being resolved.
+        let calls = if class == owner { earlier } else { lookup.mixins.get(&class).map(Vec::as_slice).unwrap_or(&[]) };
+        let mut visited = crate::det::HashSet::default();
+        match in_modules(calls, written, lookup, &mut visited) {
+            Search::Found(hit) => {
+                found = Some(hit);
                 break 'chain;
             }
+            Search::Unknown => return None,
+            Search::Missing => {}
         }
         current = lookup.parents.get(&class).cloned();
     }
@@ -390,4 +451,41 @@ fn ancestor_constant(owner: &str, written: &str, earlier: &[String], lookup: &Lo
         prefix = outer;
     }
     Some(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup<'a>(
+        parents: &'a crate::det::HashMap<String, String>,
+        mixins: &'a crate::det::HashMap<String, Vec<Vec<String>>>,
+        declared: &'a crate::det::HashSet<String>,
+    ) -> Lookup<'a> {
+        Lookup { parents, mixins, declared }
+    }
+
+    #[test]
+    fn the_current_calls_own_arguments_are_not_ancestors_yet() {
+        // `class Child < Root; include Pack::A, Kind`: `Kind` is read before `Pack::A` joins the ancestry.
+        let parents = [("Child".to_string(), "Root".to_string())].into_iter().collect();
+        let mixins = crate::det::HashMap::default();
+        let declared = ["Root", "Root::Kind", "Pack::A", "Pack::A::Kind"].into_iter().map(String::from).collect();
+        let earlier = include_calls(&[], &[]);
+        assert_eq!(ancestor_constant("Child", "Kind", &earlier, &lookup(&parents, &mixins, &declared)).as_deref(), Some("Root::Kind"));
+        // A completed call before it does count.
+        let earlier = vec![vec!["Pack::A".to_string()]];
+        assert_eq!(ancestor_constant("Child", "Kind", &earlier, &lookup(&parents, &mixins, &declared)).as_deref(), Some("Pack::A::Kind"));
+    }
+
+    #[test]
+    fn calls_are_read_last_first_and_a_calls_arguments_in_order() {
+        let parents = crate::det::HashMap::default();
+        let mixins = crate::det::HashMap::default();
+        let declared = ["A", "A::Kind", "B", "B::Kind"].into_iter().map(String::from).collect();
+        let one_call = vec![vec!["A".to_string(), "B".to_string()]];
+        assert_eq!(ancestor_constant("C", "Kind", &one_call, &lookup(&parents, &mixins, &declared)).as_deref(), Some("A::Kind"));
+        let two_calls = vec![vec!["A".to_string()], vec!["B".to_string()]];
+        assert_eq!(ancestor_constant("C", "Kind", &two_calls, &lookup(&parents, &mixins, &declared)).as_deref(), Some("B::Kind"));
+    }
 }
