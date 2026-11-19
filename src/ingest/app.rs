@@ -2943,6 +2943,7 @@ end
     app.vite_manifest = super::vite::read_manifest(vfs, dir);
     let vite_digest = app.vite_manifest.as_ref().map(|m| m.digest.clone());
     app.inertia = super::inertia::load_inertia_config(vfs, dir, vite_digest.as_deref())?;
+    app.pagy = super::pagy::load_settings(vfs, dir)?;
 
     // An engine's initializers run at boot as the host's do, and the boot
     // program takes their top-level constant writes
@@ -3545,6 +3546,7 @@ end
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
     super::vite::lower_vite_tags(&mut app);
+    super::yield_partials::specialize(&mut app);
     super::computed_partials::dispatch(&mut app);
     super::current_page::lower_current_page(&mut app);
     super::time_tag::lower_time_tags(&mut app);

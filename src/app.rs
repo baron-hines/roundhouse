@@ -739,6 +739,18 @@ pub struct App {
     /// are reported as warnings, since Rails never runs them.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unreachable_views: BTreeSet<Symbol>,
+    /// A pagy before 43's extras and `Pagy::DEFAULT[...] =` settings, as
+    /// the initializers write them (`ingest::pagy::read_settings`).
+    #[serde(default)]
+    pub pagy: PagyConfig,
+    /// The block renders `ingest::yield_partials` turned into a render of a
+    /// partial copy, by the call's span: off the ruby family still refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yield_specialized: Vec<crate::span::Span>,
+    /// The partials `ingest::yield_partials` copied for a block render: named only by a render of their own name,
+    /// since each such call now renders the copy (`ingest::unreachable_views`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub yield_originals: BTreeSet<Symbol>,
     /// The `app/helpers` modules' diagnostics, taken before the
     /// post-analyze lowerings rewrite their bodies; `None` until then,
     /// and on a path that never lowers (`check`), where they are
@@ -1095,6 +1107,21 @@ impl MixinKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct PagyConfig {
+    /// `require "pagy/extras/overflow"`'s mode: `empty_page` (the extra's
+    /// own default) unless a `Pagy::DEFAULT[:overflow] =` names another.
+    /// `None` without the extra, where the gem raises past the end.
+    pub overflow: Option<String>,
+    /// `require "pagy/extras/array"`: `pagy_array` exists.
+    pub array: bool,
+    /// `Pagy::DEFAULT[:limit] =`, an Integer literal of at least 1.
+    pub limit: Option<i64>,
+    /// What the initializers set that this model does not read: another
+    /// extra, another `Pagy::DEFAULT` key, a value that is not a literal.
+    pub unmodeled: Vec<(crate::span::Span, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct InertiaConfig {
     pub version: String,
     pub encrypt_history: bool,
@@ -1441,6 +1468,9 @@ impl App {
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),
             unreachable_views: BTreeSet::new(),
+            pagy: PagyConfig::default(),
+            yield_specialized: Vec::new(),
+            yield_originals: BTreeSet::new(),
             helper_diagnostics: None,
             unknown_association_targets: Vec::new(),
             helper_modules: BTreeSet::new(),

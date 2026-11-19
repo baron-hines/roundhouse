@@ -1688,6 +1688,66 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    /// A bare constant Rubydex leaves unanswered where the class mixes in more than one module (`LIMIT` from
+    /// `include RateConcept` beside `include PriceConcept`; one alone resolves): Ruby's ancestor lookup, the class,
+    /// its modules (the last included first), then its superclass and on, among the app's declarations. Removable once Shopify/rubydex#1106 is fixed.
+    fn mixed_in_constant(&self, path: &mut Vec<Symbol>, ctx: &Ctx, decisions: u64) -> Option<Ty> {
+        // Not from `class << self`: Ruby looks a bare name up through the singleton class there, a NameError the
+        // caller keeps.
+        if decisions & crate::expr::SINGLETON_CREF_CONST_REF != 0 {
+            return None;
+        }
+        let [name] = path.as_slice() else { return None };
+        let Some(Ty::Class { id, .. }) = ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) else { return None };
+        let classes = self.classes();
+        // Each module followed by its own modules, the last included first, as Ruby's ancestors list them.
+        fn with_modules(m: &ClassId, classes: &HashMap<ClassId, ClassInfo>, order: &mut Vec<ClassId>) {
+            if order.contains(m) {
+                return;
+            }
+            order.push(m.clone());
+            for inner in classes.get(m).map(|i| i.includes.iter().rev().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+                with_modules(&inner, classes, order);
+            }
+        }
+        let mut chain: Vec<ClassId> = Vec::new();
+        let mut current = Some(id.clone());
+        while let Some(c) = current.filter(|c| !chain.contains(c)) {
+            chain.push(c.clone());
+            current = classes.get(&c).and_then(|i| i.parent.clone());
+        }
+        // A module a superclass also includes sits at that superclass's position, as Ruby's ancestors skip it below.
+        let mut order: Vec<ClassId> = Vec::new();
+        for (i, c) in chain.iter().enumerate() {
+            let mut below: Vec<ClassId> = Vec::new();
+            for above in &chain[i + 1..] {
+                with_modules(above, classes, &mut below);
+            }
+            let mut own: Vec<ClassId> = Vec::new();
+            with_modules(c, classes, &mut own);
+            for m in own {
+                if (m == *c || !below.contains(&m)) && !order.contains(&m) {
+                    order.push(m);
+                }
+            }
+        }
+        for owner in order {
+            let full = format!("{}::{}", owner.0.as_str(), name.as_str());
+            let value = self.typed_constants
+                .and_then(|values| values.get(&rubydex::model::ids::declaration_id_from_lookup_name(&full)))
+                .cloned();
+            // A value keeps its bare spelling, which Ruby's own lookup reads through the same ancestors.
+            if let Some(ty) = value {
+                return Some(ty);
+            }
+            if classes.get(&ClassId(Symbol::from(full.as_str()))).is_some_and(|c| c.app_declared) {
+                qualify_resolved_path(path, &ClassId(Symbol::from(full.as_str())));
+                return Some(Ty::Class { id: ClassId(Symbol::from(full.as_str())), args: vec![].into() });
+            }
+        }
+        None
+    }
+
     // `x.class` is not a class reference to `is_class_object`, yet types as the same flat `Ty::Class` as an instance.
     fn is_instance(&self, expr: &Expr, ctx: &Ctx) -> bool {
         !self.is_class_object(expr, ctx)
@@ -1927,7 +1987,7 @@ impl<'a> BodyTyper<'a> {
                     }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
-                    Some(None) => exact_modeled_class(path),
+                    Some(None) => self.mixed_in_constant(path, ctx, expr.decisions).unwrap_or_else(|| exact_modeled_class(path)),
                     // A borrowed span is not evidence of a written constant
                     // only when the producer marked its generated origin.
                     None if indexed_source
@@ -1935,7 +1995,7 @@ impl<'a> BodyTyper<'a> {
                     {
                         exact_modeled_class(path)
                     }
-                    None if indexed_source => unknown(),
+                    None if indexed_source => self.mixed_in_constant(path, ctx, expr.decisions).unwrap_or_else(unknown),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A
                     // qualified name `A::B` names its owner, so only the
@@ -2781,12 +2841,12 @@ impl<'a> BodyTyper<'a> {
                     self.analyze_expr(a, ctx);
                 }
                 // The pagy gem's `pagy(scope)`: `[Pagy, <the scope's type>]`.
-                if method.as_str() == "pagy"
+                if matches!(method.as_str(), "pagy" | "pagy_array")
                     && block.is_none()
                     && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                 {
                     let mut refusal = None;
-                    if let Some(ty) = self.pagy_call_ty(args, ctx, &mut refusal) {
+                    if let Some(ty) = self.pagy_call_ty(method, args, ctx, &mut refusal) {
                         if refusal.is_some() {
                             expr.set_diagnostic(refusal);
                         }
@@ -2795,6 +2855,11 @@ impl<'a> BodyTyper<'a> {
                 }
                 if let Some(refusal) = self.pagy_object_refusal(recv_ty.as_ref(), method, args) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(refusal));
+                }
+                if let Some(r) = recv.as_mut()
+                    && Self::pagy9_vars_read(r, method, args)
+                {
+                    crate::expr::ExprCold::set_diagnostic(&mut r.cold, None);
                 }
                 if let Some(r) = recv.as_mut() {
                     if promotes_to_param_value(r, recv_ty.as_ref(), method, args, &ctx.local_bindings) {

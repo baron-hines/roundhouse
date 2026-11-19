@@ -4811,6 +4811,8 @@ fn is_framework_view_helper(name: &str) -> bool {
     matches!(
         name,
         "image_tag"
+            // pagy9.rb's `Pagy::Frontend#pagy_url_for`, shipped only for an app locking a pagy before 43.
+            | "pagy_url_for"
             // `include ActionView::RecordIdentifier` brings `dom_id`
             // (below) and its sibling `dom_class` into non-view classes.
             | "dom_class"
