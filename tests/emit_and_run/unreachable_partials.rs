@@ -20,6 +20,30 @@ fn errors_with(show_reads: &str, elsewhere: &str) -> Vec<String> {
 fn a_partial_nothing_renders_warns() {
     let errors = errors_with("", "<%= link_to \"x\", \"/x\", data: { tab: \"ghost\" } %>");
     assert!(!errors.iter().any(|e| e.contains("_ghost") || e.contains("@ghost")), "{errors:#?}");
+    // Downgraded, not dropped: the partial is still emitted.
+    let (emitted, _) = emit_and_run::real_blog()
+        .write("app/views/articles/_ghost.html.erb", "<p><%= @ghost.missing_method %></p>\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let mut found = false;
+    fn walk(dir: &std::path::Path, found: &mut bool) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("_ghost")) {
+                *found = true;
+            }
+        }
+    }
+    walk(&emitted, &mut found);
+    assert!(found, "no _ghost partial in {}", emitted.display());
+}
+
+/// A bare name a local holds names any directory's partial, as a literal does.
+#[test]
+fn a_bare_render_through_a_local_keeps_its_errors() {
+    let errors = errors_with("", "<% panel = \"ghost\" %><%= render partial: panel %>");
+    assert!(errors.iter().any(|e| e.contains("@ghost")), "{errors:#?}");
 }
 
 #[test]
@@ -58,6 +82,10 @@ fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
         "<%= render params[:panel].to_s.gsub(\"-\", \"_\") %>",
         "<% @panel = cookies.signed[:panel] %><%= render partial: @panel %>",
         "<% panel = \"articles/gh\" %><% panel.concat(\"ost\") %><%= render partial: panel %>",
+        "<% panel = \"articles/gh\" %><% panel += \"ost\" %><%= render panel %>",
+        "<%= render sprintf(\"%s\", params[:panel]) %>",
+        "<% panel = +\"articles/gh\" %><% alias_name = panel %><% alias_name.concat(\"ost\") %><%= render partial: panel %>",
+        "<%= render partial: \"articles/article\", collection: [], spacer_template: params[:spacer].to_s %>",
     ] {
         let errors = errors_with(reads, "");
         assert!(errors.iter().any(|e| e.contains("@ghost")), "{reads}: {errors:#?}");
