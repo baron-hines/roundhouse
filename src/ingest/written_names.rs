@@ -36,19 +36,52 @@ use crate::span::{SourceFile, Span};
 /// declaration Rubydex resolved it to.
 pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstResolver) {
     let names = Names { sources, resolver };
+    let declared: crate::det::HashSet<String> =
+        app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).chain(app.models.iter().map(|m| m.name.0.as_str().to_string())).collect();
+    // The superclasses first, so the mixin fallback below follows each as Rubydex resolved it (`N::Base`, not `Base`).
+    for class in &mut app.library_classes {
+        if let Some(parent) = &mut class.parent {
+            names.rewrite_parent(&class.name, parent, class.parent_span);
+        }
+    }
+    for model in &mut app.models {
+        if let Some(parent) = &mut model.parent {
+            names.rewrite_parent(&model.name, parent, model.parent_span);
+        }
+    }
+    let parents: crate::det::HashMap<String, String> = app
+        .library_classes
+        .iter()
+        .filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str().to_string(), p.0.as_str().to_string())))
+        .chain(app.models.iter().filter_map(|m| m.parent.as_ref().map(|p| (m.name.0.as_str().to_string(), p.0.as_str().to_string()))))
+        .collect();
+    let mixins: crate::det::HashMap<String, Vec<String>> = app
+        .library_classes
+        .iter()
+        .map(|c| (c.name.0.as_str().to_string(), c.includes.iter().map(|i| i.0.as_str().to_string()).collect()))
+        .chain(app.models.iter().map(|m| (m.name.0.as_str().to_string(), model_includes(&m.body))))
+        .collect();
     for class in &mut app.library_classes {
         // A `Data.define` block's includes are absolute already, and its
         // spans locate the factory call, not a written name.
         let data = class.data_define().is_some();
-        if let Some(parent) = &mut class.parent {
-            names.rewrite_parent(&class.name, parent, class.parent_span);
-        }
         if data {
             continue;
         }
-        for (included, call) in class.includes.iter_mut().zip(&class.include_spans) {
-            if let Some(span) = names.argument_span(*call, included.0.as_str()) {
-                names.rewrite_id(included, span);
+        let owner = class.name.0.as_str().to_string();
+        for at in 0..class.includes.len() {
+            let written = class.includes[at].0.as_str().to_string();
+            if let Some(span) = names.argument_span(class.include_spans[at], &written) {
+                match names.resolved(span, &written) {
+                    Some(resolved) => class.includes[at] = resolved,
+                    None => {
+                        let earlier: Vec<String> = class.includes[..at].iter().map(|i| i.0.as_str().to_string()).collect();
+                        let lookup = Lookup { parents: &parents, mixins: &mixins, declared: &declared };
+                        if let Some(found) = ancestor_constant(&owner, &written, &earlier, &lookup) {
+                            class.includes[at] = ClassId(Symbol::from(found.as_str()));
+                        }
+                    }
+                }
             }
         }
         // `extend`/`prepend` a library class's own body does not model
@@ -277,4 +310,84 @@ impl Names<'_> {
             *path = resolved.0.as_str().split("::").map(Symbol::from).collect();
         }
     }
+}
+
+struct Lookup<'a> {
+    parents: &'a crate::det::HashMap<String, String>,
+    mixins: &'a crate::det::HashMap<String, Vec<String>>,
+    declared: &'a crate::det::HashSet<String>,
+}
+
+fn model_includes(body: &[ModelBodyItem]) -> Vec<String> {
+    body.iter()
+        .filter_map(|item| match item {
+            ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "include" => Some(args),
+                _ => None,
+            },
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|a| match &*a.node {
+            ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rubydex answers nothing for a bare mixin of a class that includes more than one (`include RateConcept` beside
+/// `include PriceConcept` in `class Provider::Synth < Provider`, where one alone resolves): the name as Ruby finds it in
+/// the class's own constants and mixins, then each superclass's, then the top level's, among the app's declarations. Not the
+/// enclosing namespaces, which a compact `class A::B` does not open. Removable once Shopify/rubydex#1106 is fixed.
+fn ancestor_constant(owner: &str, written: &str, earlier: &[String], lookup: &Lookup) -> Option<String> {
+    if written.contains("::") {
+        return None;
+    }
+
+    let mut seen = crate::det::HashSet::default();
+    let mut current = Some(owner.to_string());
+    let mut found = None;
+    'chain: while let Some(class) = current {
+        if !seen.insert(class.clone()) {
+            break;
+        }
+        let candidate = format!("{class}::{written}");
+        if lookup.declared.contains(&candidate) {
+            found = Some(candidate);
+            break;
+        }
+        // The class's own mixins come before its superclass, the last included first, and for the class itself only
+        // those included above the one being resolved.
+        let modules = if class == owner { earlier } else { lookup.mixins.get(&class).map(Vec::as_slice).unwrap_or(&[]) };
+        for module in modules.iter().rev() {
+            // A module still written bare may be any declaration of the name, so one of them holding the constant
+            // leaves the answer unknown rather than passing on to the superclass.
+            let nested = format!("::{module}::{written}");
+            if !module.contains("::") && lookup.declared.iter().any(|d| d.ends_with(&nested)) {
+                return None;
+            }
+            let candidate = format!("{module}::{written}");
+            if lookup.declared.contains(&candidate) {
+                found = Some(candidate);
+                break 'chain;
+            }
+        }
+        current = lookup.parents.get(&class).cloned();
+    }
+    // Not where an enclosing namespace declares another of the name: `module N; class C` reads `N::M` first and a
+    // compact `class N::C` does not, which the class's name alone cannot tell.
+    let found = found?;
+    // The class's own constant is its innermost lexical scope, read first whether the class is nested or compact.
+    if found == format!("{owner}::{written}") {
+        return Some(found);
+    }
+    let mut prefix = owner;
+    while let Some((outer, _)) = prefix.rsplit_once("::") {
+        let lexical = format!("{outer}::{written}");
+        if lookup.declared.contains(&lexical) && lexical != found {
+            return None;
+        }
+        prefix = outer;
+    }
+    Some(found)
 }
