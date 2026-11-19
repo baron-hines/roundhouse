@@ -602,6 +602,9 @@ pub struct BodyTyper<'a> {
     lambda_seeds: std::cell::RefCell<Option<lambda_local::Seeds>>,
     /// The block parameter `block_ctx_for` proved a class object (`klass.tap { |k| }`), for the Lambda arm that clears its parameters.
     block_class_param: std::cell::RefCell<Option<Symbol>>,
+    /// How many blocks the expression being typed sits in: a block's `self` may be another object (`Menu.define do
+    /// scope … end` is `instance_eval`ed), so a class-body check stops at the first.
+    block_depth: std::cell::Cell<usize>,
     /// The locals of the outermost expression being typed, counted once
     /// for the selector proofs of `active_storage`.
     scope_bindings: std::cell::RefCell<Option<active_storage::ScopeBindings>>,
@@ -747,6 +750,7 @@ impl<'a> BodyTyper<'a> {
             open_classes: None,
             lambda_seeds: std::cell::RefCell::new(None),
             block_class_param: std::cell::RefCell::new(None),
+            block_depth: std::cell::Cell::new(0),
             scope_bindings: std::cell::RefCell::new(None),
             block_selector_param: std::cell::RefCell::new(None),
         }
@@ -2504,7 +2508,9 @@ impl<'a> BodyTyper<'a> {
                 if let Some(seeds) = &seeds {
                     seeds.bind_keywords(&mut inner, extra_params);
                 }
+                self.block_depth.set(self.block_depth.get() + 1);
                 let body_ty = self.analyze_expr(body, &inner);
+                self.block_depth.set(self.block_depth.get() - 1);
                 // A block's parameter types were seeded into `ctx` and are
                 // not repeated here. A stored lambda records the types its
                 // `.call` sites supplied, so the value's type is
@@ -3726,6 +3732,34 @@ impl<'a> BodyTyper<'a> {
                             Ty::Var { .. } => Ty::Untyped,
                             other => other,
                         };
+                    }
+                }
+                // A class body's receiverless call no ancestor answers (`class_attribute :x, default: field_helpers` under
+                // a FormBuilder that has none): it runs as the class loads and raises `NameError` there. Not under an
+                // ancestor this analysis cannot see, which may define it.
+                if recv.is_none() && block.is_none() && ctx.class_side && !ctx.method_body && self.block_depth.get() == 0
+                    && let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref()
+                {
+                    let unknown = matches!(dispatched, Ty::Var { .. })
+                        && self.inquirers.is_some()
+                        && !self.has_unknown_ancestor(id)
+                        // Only a class under a known superclass, whose class methods all come from there: not a
+                        // module (a concern's `def self.`, a gem module the app reopens) or a parentless class
+                        // (`class << self` definitions), and not a name any class here defines, which a lookup
+                        // this check skips may reach.
+                        && self.classes().get(id).is_some_and(|c| !c.is_module && c.parent.is_some())
+                        && !self.classes().values().any(|c| c.class_methods.contains_key(method) || c.instance_methods.contains_key(method));
+                    let ours = |d: Option<&crate::diagnostic::DiagnosticKind>| {
+                        matches!(d, Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed { method: m, recv_ty: Ty::Class { id: r, .. } }) if m == method && r == id)
+                    };
+                    if unknown && crate::expr::ExprCold::diagnostic(&expr.cold).is_none() {
+                        crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed {
+                            method: method.clone(),
+                            recv_ty: Ty::Class { id: id.clone(), args: vec![].into() },
+                        }));
+                    } else if !unknown && ours(crate::expr::ExprCold::diagnostic(&expr.cold).as_ref()) {
+                        // A round that ran before the registry held every class may have set it.
+                        crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
                     }
                 }
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()

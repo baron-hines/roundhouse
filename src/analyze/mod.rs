@@ -4550,8 +4550,12 @@ impl Analyzer {
             };
 
             if retype {
+                // Class side: an initializer runs in the class body, where `self` is the class (`class_attribute
+                // :x, default: field_helpers` calls `FormBuilder.field_helpers`), and an unknown method there raises
+                // when the class loads.
+                let body_ctx = Ctx { class_side: true, ..class_ctx.clone() };
                 for initializer in &mut lc.class_ivar_initializers {
-                    self.body_typer().analyze_expr(initializer, &class_ctx);
+                    self.body_typer().analyze_expr(initializer, &body_ctx);
                 }
                 for (_, value) in &mut lc.constants {
                     if self.data_factories.contains_key(&value.span) || self.class_factories.contains_key(&value.span) {
