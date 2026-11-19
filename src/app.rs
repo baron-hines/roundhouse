@@ -743,6 +743,10 @@ pub struct App {
     /// partial copy, by the call's span: off the ruby family still refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub yield_specialized: Vec<crate::span::Span>,
+    /// The partials `ingest::yield_partials` copied for a block render: named only by a render of their own name,
+    /// since each such call now renders the copy (`ingest::unreachable_views`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub yield_originals: BTreeSet<Symbol>,
     /// The `app/helpers` modules' diagnostics, taken before the
     /// post-analyze lowerings rewrite their bodies; `None` until then,
     /// and on a path that never lowers (`check`), where they are
@@ -1446,6 +1450,7 @@ impl App {
             concern_spliced_actions: HashMap::default(),
             unreachable_views: BTreeSet::new(),
             yield_specialized: Vec::new(),
+            yield_originals: BTreeSet::new(),
             helper_diagnostics: None,
             unknown_association_targets: Vec::new(),
             helper_modules: BTreeSet::new(),

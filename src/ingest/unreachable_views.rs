@@ -380,6 +380,13 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             continue;
         }
         let partial = format!("{dir}/{leaf}");
+        // Not by any literal ending in its leaf (a `/rooms/1/edit` URL): every block render of it now renders its copy.
+        if app.yield_originals.contains(&view.name) {
+            if !(names.contains(&partial) || view_names.contains(&(dir.to_string(), leaf.to_string())) || bare_targets.contains(leaf) || model_partials.contains(&partial)) {
+                out.push(i);
+            }
+            continue;
+        }
         let named = names.contains(leaf)
             || view_names.contains(&(dir.to_string(), leaf.to_string()))
             || bare_targets.contains(leaf)

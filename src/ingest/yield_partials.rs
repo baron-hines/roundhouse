@@ -31,6 +31,7 @@ pub(super) fn specialize(app: &mut App) {
     let snapshot: Vec<View> = app.views.clone();
     let mut next = 0usize;
     let mut spans = Vec::new();
+    let mut originals = std::collections::BTreeSet::new();
     // A copy holds the partial's own block renders, and an outer block's body an inner one: each round rewrites the
     // copies the last made, up to a depth no wrapper-in-wrapper nesting reaches.
     let mut pending: Vec<usize> = (0..app.views.len()).collect();
@@ -45,7 +46,13 @@ pub(super) fn specialize(app: &mut App) {
             let format = view.format.clone();
             let mut counts = Counts::default();
             names(&view.body, &mut counts);
-            let mut cx = Cx { dir: &dir, format: &format, views: &snapshot, caller: &counts, copies: &mut copies, next: &mut next, spans: &mut spans };
+            // A declared local is the caller's even where only the block uses it.
+            for p in view.strict_locals.iter().flatten() {
+                *counts.entry(p.name.as_str().to_string()).or_default() += 1;
+            }
+            let leaf = view.name.as_str().rsplit('/').next().unwrap_or("");
+            let loose_partial = leaf.starts_with('_') && view.strict_locals.is_none();
+            let mut cx = Cx { dir: &dir, format: &format, views: &snapshot, caller: &counts, loose_partial, copies: &mut copies, next: &mut next, spans: &mut spans, originals: &mut originals };
             rewrite(&mut view.body, &mut cx);
         }
         let base = app.views.len();
@@ -53,9 +60,15 @@ pub(super) fn specialize(app: &mut App) {
         pending = (base..app.views.len()).collect();
     }
     app.yield_specialized = spans;
+    app.yield_originals = originals;
 }
 
 type Counts = crate::det::HashMap<String, usize>;
+
+/// A name this pass renames: not the template's `_buf`, nor a `$global`, which the copy reaches as it is.
+fn local(name: &str) -> bool {
+    name != "_buf" && !name.starts_with('$')
+}
 
 struct Cx<'a> {
     dir: &'a str,
@@ -64,9 +77,12 @@ struct Cx<'a> {
     /// Every name the caller's body reads or binds, with how often: one the block binds that also occurs outside it
     /// is the caller's own local, which the block writes.
     caller: &'a Counts,
+    /// The caller is a partial with no strict-locals header.
+    loose_partial: bool,
     copies: &'a mut Vec<View>,
     next: &'a mut usize,
     spans: &'a mut Vec<crate::span::Span>,
+    originals: &'a mut std::collections::BTreeSet<Symbol>,
 }
 
 fn rewrite(e: &mut Expr, cx: &mut Cx) {
@@ -180,7 +196,11 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     let mut inside = Counts::default();
     names(block, &mut inside);
     // Not a block writing the caller's local (`total += 1`): renamed apart, the write would miss it.
-    if bound.iter().any(|n| n != "_buf" && cx.caller.get(n).copied().unwrap_or(0) > inside.get(n).copied().unwrap_or(0)) {
+    if bound.iter().any(|n| local(n) && cx.caller.get(n).copied().unwrap_or(0) > inside.get(n).copied().unwrap_or(0)) {
+        return None;
+    }
+    // A partial without a strict-locals header takes whatever locals its renders pass, which a write may be to.
+    if cx.loose_partial && bound.iter().any(|n| local(n) && !params.iter().any(|p| p.as_str() == n) && assigned(body, n)) {
         return None;
     }
     let k = *cx.next;
@@ -189,12 +209,13 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     bound.extend(params.iter().map(|p| p.as_str().to_string()));
     let mut free: Vec<String> = Vec::new();
     reads(body, &mut |n| {
-        if n != "_buf" && !bound.contains(n) && !free.iter().any(|f| f == n) {
+        if local(n) && !bound.contains(n) && !free.iter().any(|f| f == n) {
             free.push(n.to_string());
         }
     });
     let mut inlined = body.clone();
     rename(&mut inlined, &renamed);
+    qualify_renders(&mut inlined, dir);
     let params: Vec<Symbol> = params.iter().map(|p| renamed(p.as_str())).collect();
     let mut copy = partial.clone();
     copy.name = Symbol::from(format!("{pdir}/_{base}__yield{k}"));
@@ -204,6 +225,7 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
             strict.push(crate::dialect::Param { name: renamed(n), default: None, keyword: true, rest: false, forwarding: false, from_keyword: false, from_kwrest: false });
         }
     }
+    cx.originals.insert(partial.name.clone());
     cx.copies.push(copy);
     let span = call.span;
     let mut entries = locals;
@@ -230,6 +252,7 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
 fn leaves_or_binds(e: &Expr) -> bool {
     let mut found = match &*e.node {
         ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Return { .. } | ExprNode::Redo | ExprNode::Retry | ExprNode::Yield { .. } => true,
+        ExprNode::CaseMatch { .. } | ExprNode::MatchPredicate { .. } | ExprNode::MatchRequired { .. } => true,
         ExprNode::BeginRescue { rescues, .. } => rescues.iter().any(|r| r.binding.is_some()),
         ExprNode::Case { arms, .. } => arms.iter().any(|a| !matches!(a.pattern, crate::expr::Pattern::Lit { .. } | crate::expr::Pattern::Wildcard | crate::expr::Pattern::Expr { .. })),
         ExprNode::Lambda { rest_param, extra_params, block_param, .. } => rest_param.is_some() || !extra_params.is_empty() || block_param.is_some(),
@@ -289,9 +312,13 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
                 continue;
             };
             let span = stmt.span;
-            for (i, p) in params.iter().enumerate() {
+            // Every argument evaluated once, in order, as the yield does, the ones no parameter takes too.
+            for i in 0..params.len().max(args.len()) {
                 let value = args.get(i).cloned().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-                out.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: p.clone() }, value }));
+                match params.get(i) {
+                    Some(p) => out.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: p.clone() }, value })),
+                    None => out.push(value),
+                }
             }
             match &*body.node {
                 ExprNode::Seq { exprs } => out.extend(exprs.iter().cloned()),
@@ -302,6 +329,16 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
         return;
     }
     e.node.for_each_child_mut(&mut |c| replace_yields(c, params, body));
+}
+
+fn assigned(e: &Expr, name: &str) -> bool {
+    let mut found = match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n.as_str() == name,
+        ExprNode::MultiAssign { targets, .. } => targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if n.as_str() == name)),
+        _ => false,
+    };
+    e.node.for_each_child(&mut |c| found = found || assigned(c, name));
+    found
 }
 
 /// The names the block binds: its assignments and its nested blocks' parameters.
@@ -323,6 +360,34 @@ fn binders(e: &Expr, out: &mut crate::det::HashSet<String>) {
     e.node.for_each_child(&mut |c| binders(c, out));
 }
 
+/// A bare `render "badge"` in the body names the caller's directory's partial; in the copy it would name the callee's.
+fn qualify_renders(e: &mut Expr, dir: &str) {
+    if let ExprNode::Send { recv: None, method, args, .. } = &mut *e.node
+        && matches!(method.as_str(), "render" | "render_to_string")
+        && !dir.is_empty()
+    {
+        let qualify = |v: &mut Expr| {
+            if let ExprNode::Lit { value: Literal::Str { value } } = &mut *v.node
+                && !value.contains('/')
+            {
+                *value = format!("{dir}/{value}");
+            }
+        };
+        match args.first_mut().map(|a| &mut *a.node) {
+            Some(ExprNode::Hash { entries, .. }) => {
+                for (k, v) in entries.iter_mut() {
+                    if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout")) {
+                        qualify(v);
+                    }
+                }
+            }
+            Some(_) => qualify(args.first_mut().unwrap()),
+            None => {}
+        }
+    }
+    e.node.for_each_child_mut(&mut |c| qualify_renders(c, dir));
+}
+
 fn reads(e: &Expr, f: &mut dyn FnMut(&str)) {
     if let ExprNode::Var { name, .. } = &*e.node {
         f(name.as_str());
@@ -332,15 +397,17 @@ fn reads(e: &Expr, f: &mut dyn FnMut(&str)) {
 
 fn rename(e: &mut Expr, to: &dyn Fn(&str) -> Symbol) {
     match &mut *e.node {
-        ExprNode::Var { name, .. } if name.as_str() != "_buf" => *name = to(name.as_str()),
+        ExprNode::Var { name, .. } if local(name.as_str()) => *name = to(name.as_str()),
         ExprNode::Assign { target: LValue::Var { name, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
-            if name.as_str() != "_buf" =>
+            if local(name.as_str()) =>
         {
             *name = to(name.as_str())
         }
         ExprNode::MultiAssign { targets, .. } => {
             for t in targets {
-                if let LValue::Var { name, .. } = t {
+                if let LValue::Var { name, .. } = t
+                    && local(name.as_str())
+                {
                     *name = to(name.as_str());
                 }
             }

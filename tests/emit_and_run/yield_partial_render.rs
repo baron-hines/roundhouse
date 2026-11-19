@@ -124,3 +124,31 @@ fn nested_and_looped_block_renders_run_on_spinel() {
     run.assert_passes();
     assert!(run.stdout.contains("nested yield passed"), "{}", run.stdout);
 }
+
+/// What moves with the body keeps its meaning: a `$global` stays the
+/// global, a bare `render "badge"` stays the caller's directory's, and a
+/// yield argument no parameter takes is still evaluated (here, raises).
+fn moved_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/views/shared/_wrap.html.erb", "<s><%= yield %></s>")
+        .write("app/views/shared/_loud.html.erb", "<s><%= yield(raise \"evaluated\") %></s>")
+        .write("app/views/shared/_badge.html.erb", "S")
+        .write("app/views/articles/_badge.html.erb", "A")
+        .edit(
+            "app/views/articles/show.html.erb",
+            "    <p class=\"text-gray-700\">",
+            "<em id=\"moved\"><%= render \"shared/wrap\" do %><% $yield_hits = ($yield_hits || 0) + 1 %>G<%= $yield_hits %><%= render \"badge\" %><% end %></em>\
+<% if params[:loud] %><%= render \"shared/loud\" do %>never<% end %><% end %>\n    <p class=\"text-gray-700\">",
+        )
+}
+
+#[test]
+fn a_moved_body_keeps_its_meaning() {
+    let script = format!(
+        "{RUBY_PAGE}\nhello = Article.create!(title: \"Hello\", body: \"Body text here\")\nbody = page(hello.id)\nraise body[0, 3000] unless body.include?(\"<em id=\\\"moved\\\"><s>G1A</s></em>\")\n\
+         got = begin\n  Main.dispatch_core({{ \"REQUEST_METHOD\" => \"GET\", \"PATH_INFO\" => \"/articles/#{{hello.id}}\", \"QUERY_STRING\" => \"loud=1\", \"HTTP_ACCEPT\" => \"text/html\" }}, StringIO.new(\"\"))[0]\nrescue RuntimeError => e\n  e.message\nend\nraise got.inspect unless got == \"evaluated\" || got == 500\nputs \"moved passed\"\n"
+    );
+    let run = moved_app().run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("moved passed"), "{}", run.stdout);
+}

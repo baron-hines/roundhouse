@@ -224,6 +224,7 @@ fn tiny_blog_round_trips() {
         global_id_locate_signed_models: std::collections::BTreeSet::new(),
         unreachable_views: std::collections::BTreeSet::new(),
         yield_specialized: Vec::new(),
+        yield_originals: std::collections::BTreeSet::new(),
         helper_diagnostics: None,
         unknown_association_targets: Vec::new(),
         helper_modules: Default::default(),
