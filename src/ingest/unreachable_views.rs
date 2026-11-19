@@ -510,7 +510,10 @@ fn builds_template_hash(e: &Expr) -> bool {
     };
     let mut found = matches!(&*e.node, ExprNode::Hash { entries, .. } if key(entries));
     match &*e.node {
-        ExprNode::Send { method, recv, args, block, .. } if !matches!(method.as_str(), "render" | "render_to_string") => {
+        // Not the hashes a call builds options from (`{}.merge(template: …)`), which keep their keys.
+        ExprNode::Send { method, recv, args, block, .. }
+            if !matches!(method.as_str(), "render" | "render_to_string" | "merge" | "merge!" | "reverse_merge" | "reverse_merge!" | "deep_merge" | "deep_merge!" | "with_defaults" | "update" | "store" | "[]=") =>
+        {
             for a in args {
                 match &*a.node {
                     ExprNode::Hash { entries, .. } => {
@@ -589,7 +592,15 @@ fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool, bool)) {
     }
     let mut lits = Vec::new();
     let mut dynamic = method.as_str() == "respond_with";
-    let splat = matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::KeywordSplat { value } if !matches!(&*value.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "params" | "session" | "cookies" | "request"))));
+    // Not options a request may hold (`**params.permit(:template).to_h`): its root, through any calls on it.
+    fn from_request(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { recv: None, method, .. } => matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
+            ExprNode::Send { recv: Some(r), .. } => from_request(r),
+            _ => false,
+        }
+    }
+    let splat = matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::KeywordSplat { value } if !from_request(value)));
     for (i, a) in args.iter().enumerate() {
         match &*a.node {
             ExprNode::Lit { value: Literal::Str { value } } => lits.push(value.clone()),
