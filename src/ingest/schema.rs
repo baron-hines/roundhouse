@@ -111,7 +111,7 @@ pub fn ingest_schema_with_generated_expression_dialect(
             // Dumped ahead of the tables (`create_schema`, then
             // `enable_extension`), as the PostgreSQL DDL creates them.
             verb @ ("enable_extension" | "disable_extension" | "create_schema" | "drop_schema") => {
-                apply_database_object_verb(verb, &call_arguments(call), &mut schema);
+                if let Err(gap) = apply_database_object_verb(verb, &call_arguments(call), file, &mut schema) { gaps.push(gap); }
             }
             _ => {}
         }
@@ -822,7 +822,7 @@ fn apply_table_verb(
         // Extensions and schemas don't affect column typing. They are
         // recorded for the PostgreSQL DDL, which creates them ahead of the
         // tables.
-        "enable_extension" | "disable_extension" | "create_schema" | "drop_schema" => apply_database_object_verb(verb, args, schema),
+        "enable_extension" | "disable_extension" | "create_schema" | "drop_schema" => apply_database_object_verb(verb, args, file, schema)?,
         // Anything else receiver-less is arbitrary migration Ruby
         // (`say`, backfill helpers) — not schema-affecting.
         _ => {}
@@ -835,19 +835,43 @@ fn apply_table_verb(
 /// [`Schema::extensions`] and [`Schema::schemas`]. A name that is not a
 /// literal is left out, as every one was before; column typing never
 /// depends on it.
-fn apply_database_object_verb(verb: &str, args: &[Node<'_>], schema: &mut Schema) {
-    let Some(name) = args.first().and_then(name_value) else { return };
+///
+/// Each verb follows what Rails runs. `enable_extension` is `CREATE
+/// EXTENSION IF NOT EXISTS`, so enabling one already recorded keeps its
+/// place and schema. `drop_schema` is `DROP SCHEMA ... CASCADE`, which
+/// drops the extensions created in that schema too. `disable_extension`
+/// with `force: :cascade` also drops whatever depends on the extension
+/// (other extensions, columns of its types), which the fold can't tell,
+/// so it is refused.
+fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema: &mut Schema) -> Result<(), IngestError> {
+    let Some(name) = args.first().and_then(name_value) else { return Ok(()) };
     // Rails' PostgreSQL adapter takes the last two dot-separated parts
     // as the schema and the extension (`name.to_s.split(".").values_at(-2, -1)`).
     let parts: Vec<&str> = name.split('.').collect();
     let bare = parts.last().copied().unwrap_or_default();
     match verb {
         "enable_extension" => {
-            let in_schema = (parts.len() > 1).then(|| Symbol::from(parts[parts.len() - 2]));
-            schema.extensions.retain(|e| e.name.as_str() != bare);
-            schema.extensions.push(crate::schema::Extension { name: Symbol::from(bare), schema: in_schema });
+            if !schema.extensions.iter().any(|e| e.name.as_str() == bare) {
+                let in_schema = (parts.len() > 1).then(|| Symbol::from(parts[parts.len() - 2]));
+                schema.extensions.push(crate::schema::Extension { name: Symbol::from(bare), schema: in_schema });
+            }
         }
         "disable_extension" => {
+            // Rails adds CASCADE only for `force: :cascade`; any other
+            // literal is a plain drop.
+            if let Some(force) = kwarg_value(args.iter().skip(1), "force") {
+                let plain = force.as_false_node().is_some()
+                    || force.as_nil_node().is_some()
+                    || force.as_true_node().is_some()
+                    || force.as_symbol_node().is_some_and(|s| s.unescaped() != b"cascade");
+                if !plain {
+                    let option = if force.as_symbol_node().is_some() { "force: :cascade" } else { "a non-literal force:" };
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!("disable_extension \"{name}\" with {option} can drop what depends on the extension (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result"),
+                    });
+                }
+            }
             schema.extensions.retain(|e| e.name.as_str() != bare);
         }
         "create_schema" => {
@@ -855,8 +879,12 @@ fn apply_database_object_verb(verb: &str, args: &[Node<'_>], schema: &mut Schema
                 schema.schemas.push(Symbol::from(name.as_str()));
             }
         }
-        _ => schema.schemas.retain(|s| s.as_str() != name),
+        _ => {
+            schema.schemas.retain(|s| s.as_str() != name);
+            schema.extensions.retain(|e| e.schema.as_ref().is_none_or(|s| s.as_str() != name));
+        }
     }
+    Ok(())
 }
 
 /// `add_column`/`change_column` of one literal column, as either verb
