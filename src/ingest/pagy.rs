@@ -216,7 +216,8 @@ pub(super) fn lower_pagy(app: &mut crate::App) -> super::IngestResult<()> {
     }
     let prepended: Vec<String> = found.iter().flat_map(|(_, _, w, _)| w.iter().cloned()).collect();
     // `pagy_array` too: the analysis types a call to it as the gem's pair whatever the app's own returns.
-    let gem_method = |name: &str| matches!(name, "pagy" | "pagy_array");
+    let before_43 = locked_before_43(app);
+    let gem_method = |name: &str| name == "pagy" || (before_43 && name == "pagy_array");
     let mut refusals: Vec<(String, String, String)> = Vec::new();
     for controller in &app.controllers {
         for action in controller.actions().filter(|a| gem_method(a.name.as_str())) {

@@ -10495,10 +10495,9 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         // method; ledger it rather than emit it.
         if let crate::expr::ExprNode::Send { recv, method, .. } = &*expr.node
             && (method.as_str() == "pagy" || method.as_str() == "pagy_array" || method.as_str() == "pagy_url_for")
-            // Not an app's own `pagy_array`/`pagy_url_for`, which needs no pagy runtime; an app's `pagy` is a wrapper whose `super` does.
+            // Only what the locked gem provides: `pagy_array` with pagy 9's array extra, `pagy_url_for` with pagy 9.
             && (method.as_str() == "pagy"
-                || (!app.library_classes.iter().any(|c| c.methods.iter().any(|m| m.name == *method))
-                    && !app.controllers.iter().any(|c| c.actions().any(|a| a.name == *method))))
+                || (crate::ingest::pagy_locked_before_43(app) && (method.as_str() == "pagy_url_for" || app.pagy.array)))
             && target != "spinel"
             && target != "jruby"
             && !expr.span.is_synthetic()
