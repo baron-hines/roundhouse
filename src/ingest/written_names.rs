@@ -110,15 +110,15 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
         }
     }
     // Not the written spellings: a superclass's bare include reads the module Rubydex resolved it to.
-    let unresolved: crate::det::HashSet<(usize, usize)> = missed.iter().map(|(ci, at, _)| (*ci, *at)).collect();
-    let mixins: crate::det::HashMap<String, Vec<Vec<String>>> = app
+    let mut unresolved: crate::det::HashSet<(usize, usize)> = missed.iter().map(|(ci, at, _)| (*ci, *at)).collect();
+    let mut mixins: crate::det::HashMap<String, Vec<Vec<String>>> = app
         .library_classes
         .iter()
         .enumerate()
         .map(|(ci, c)| (c.name.0.as_str().to_string(), include_calls(&c.includes, &c.include_spans, &|at| unresolved.contains(&(ci, at)))))
         .chain(app.models.iter().map(|m| (m.name.0.as_str().to_string(), model_includes(&m.body))))
         .collect();
-    let mut found: Vec<(usize, usize, ClassId)> = Vec::new();
+    // One at a time, in source order: an answer is visible to the includes resolved after it.
     for (ci, at, written) in &missed {
         let class = &app.library_classes[*ci];
         // Only the calls before this one: Ruby evaluates a call's arguments before the include changes the ancestry.
@@ -126,12 +126,12 @@ pub(super) fn resolve(app: &mut App, sources: &[SourceFile], resolver: &ConstRes
         let first = class.include_spans.iter().position(|s| *s == this_call).unwrap_or(*at);
         let earlier = include_calls(&class.includes[..first], &class.include_spans[..first], &|at| unresolved.contains(&(*ci, at)));
         let lookup = Lookup { parents: &parents, mixins: &mixins, declared: &declared };
-        if let Some(hit) = ancestor_constant(class.name.0.as_str(), written, &earlier, &lookup) {
-            found.push((*ci, *at, ClassId(Symbol::from(hit.as_str()))));
-        }
-    }
-    for (ci, at, id) in found {
-        app.library_classes[ci].includes[at] = id;
+        let Some(hit) = ancestor_constant(class.name.0.as_str(), written, &earlier, &lookup) else { continue };
+        unresolved.remove(&(*ci, *at));
+        let class = &mut app.library_classes[*ci];
+        class.includes[*at] = ClassId(Symbol::from(hit.as_str()));
+        let calls = include_calls(&class.includes, &class.include_spans, &|at| unresolved.contains(&(*ci, at)));
+        mixins.insert(class.name.0.as_str().to_string(), calls);
     }
     for controller in &mut app.controllers {
         if let Some(parent) = &mut controller.parent {
@@ -374,27 +374,50 @@ fn model_includes(body: &[ModelBodyItem]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A class's (or module's) modules in Ruby's ancestor order, highest first: each `include` call puts its modules
-/// above those of earlier calls, `include A, B` puts `A` above `B` (it appends `B` first), and a module brings its own
-/// ancestors in below it, skipping one already there (`A` and `B` sharing `Common` give `A, B, Common`).
-fn module_ancestors(calls: &[Vec<String>], lookup: &Lookup, active: &mut Vec<String>) -> Vec<String> {
-    let mut ancestors: Vec<String> = Vec::new();
+/// A module's own ancestors below it, in Ruby's order, each module's expansion computed once.
+fn expansion(module: &str, lookup: &Lookup, cache: &mut crate::det::HashMap<String, Vec<String>>, active: &mut Vec<String>) -> Vec<String> {
+    if let Some(done) = cache.get(module) {
+        return done.clone();
+    }
+    if active.iter().any(|m| m == module) {
+        return Vec::new();
+    }
+    active.push(module.to_string());
+    let calls = lookup.mixins.get(module).cloned().unwrap_or_default();
+    let out = apply_calls(&calls, &[], lookup, cache, active);
+    active.pop();
+    cache.insert(module.to_string(), out.clone());
+    out
+}
+
+/// A class's modules, highest first, after its include calls, as Ruby's `include` inserts them: each call's arguments
+/// appended last first (`include A, B` puts `A` above `B`), each module with its own ancestors below it, a module the
+/// class already has moving the insertion point past it, and one a superclass has (`inherited`) left where it is.
+fn apply_calls(
+    calls: &[Vec<String>],
+    inherited: &[String],
+    lookup: &Lookup,
+    cache: &mut crate::det::HashMap<String, Vec<String>>,
+    active: &mut Vec<String>,
+) -> Vec<String> {
+    let same = |a: &str, b: &str| a.trim_start_matches('?') == b.trim_start_matches('?');
+    let mut list: Vec<String> = Vec::new();
     for call in calls {
         for module in call.iter().rev() {
-            let bare = module.trim_start_matches('?');
-            if active.iter().any(|m| m == bare) {
-                continue;
-            }
-            active.push(bare.to_string());
-            let inner = lookup.mixins.get(bare).map(Vec::as_slice).unwrap_or(&[]);
             let mut chain = vec![module.clone()];
-            chain.extend(module_ancestors(inner, lookup, active));
-            active.pop();
-            let fresh: Vec<String> = chain.into_iter().filter(|m| !ancestors.iter().any(|a| a.trim_start_matches('?') == m.trim_start_matches('?'))).collect();
-            ancestors.splice(0..0, fresh);
+            chain.extend(expansion(module.trim_start_matches('?'), lookup, cache, active));
+            let mut at = 0;
+            for m in chain {
+                if let Some(i) = list.iter().position(|l| same(l, &m)) {
+                    at = i + 1;
+                } else if !inherited.iter().any(|l| same(l, &m)) {
+                    list.insert(at, m);
+                    at += 1;
+                }
+            }
         }
     }
-    ancestors
+    list
 }
 
 enum Search {
@@ -405,11 +428,11 @@ enum Search {
     Missing,
 }
 
-fn in_modules(calls: &[Vec<String>], written: &str, lookup: &Lookup) -> Search {
-    for module in module_ancestors(calls, lookup, &mut Vec::new()) {
+fn in_modules(modules: &[String], written: &str, lookup: &Lookup) -> Search {
+    for module in modules {
         let (bare, unresolved) = match module.strip_prefix('?') {
-            Some(b) => (b.to_string(), true),
-            None => (module.clone(), false),
+            Some(b) => (b, true),
+            None => (module.as_str(), false),
         };
         let nested = format!("::{bare}::{written}");
         if unresolved && !bare.contains("::") && lookup.declared.iter().any(|d| d.ends_with(&nested)) {
@@ -432,30 +455,40 @@ fn ancestor_constant(owner: &str, written: &str, earlier: &[Vec<String>], lookup
         return None;
     }
 
-    let mut seen = crate::det::HashSet::default();
+    let mut chain: Vec<String> = Vec::new();
     let mut current = Some(owner.to_string());
-    let mut found = None;
-    'chain: while let Some(class) = current {
-        if !seen.insert(class.clone()) {
+    while let Some(class) = current {
+        if chain.contains(&class) {
             break;
         }
+        current = lookup.parents.get(&class).cloned();
+        chain.push(class);
+    }
+    // Each class's own modules, from the top of the chain down, so a module a superclass has is not inserted again;
+    // for the class itself only those included by the calls above the one being resolved.
+    let mut cache = crate::det::HashMap::default();
+    let mut inherited: Vec<String> = Vec::new();
+    let mut own: Vec<Vec<String>> = vec![Vec::new(); chain.len()];
+    for (i, class) in chain.iter().enumerate().rev() {
+        let calls = if i == 0 { earlier } else { lookup.mixins.get(class).map(Vec::as_slice).unwrap_or(&[]) };
+        own[i] = apply_calls(calls, &inherited, lookup, &mut cache, &mut Vec::new());
+        inherited.extend(own[i].iter().cloned());
+    }
+    let mut found = None;
+    for (class, modules) in chain.iter().zip(&own) {
         let candidate = format!("{class}::{written}");
         if lookup.declared.contains(&candidate) {
             found = Some(candidate);
             break;
         }
-        // The class's own mixins come before its superclass, and for the class itself only those included by the calls
-        // above the one being resolved.
-        let calls = if class == owner { earlier } else { lookup.mixins.get(&class).map(Vec::as_slice).unwrap_or(&[]) };
-        match in_modules(calls, written, lookup) {
+        match in_modules(modules, written, lookup) {
             Search::Found(hit) => {
                 found = Some(hit);
-                break 'chain;
+                break;
             }
             Search::Unknown => return None,
             Search::Missing => {}
         }
-        current = lookup.parents.get(&class).cloned();
     }
     // Not where an enclosing namespace declares another of the name: `module N; class C` reads `N::M` first and a
     // compact `class N::C` does not, which the class's name alone cannot tell.
@@ -532,5 +565,32 @@ mod tests {
         assert_eq!(ancestor_constant("C", "Hue", &resolved, &lookup(&parents, &mixins, &declared)).as_deref(), Some("A::Hue"));
         let unresolved = vec![vec!["?A".to_string()]];
         assert_eq!(ancestor_constant("C", "Hue", &unresolved, &lookup(&parents, &mixins, &declared)), None);
+    }
+
+    fn calls(groups: &[&[&str]]) -> Vec<Vec<String>> {
+        groups.iter().map(|g| g.iter().map(|m| m.to_string()).collect()).collect()
+    }
+
+    #[test]
+    fn a_shared_ancestor_keeps_its_place_and_moves_the_insertion_point() {
+        // `include First; include Second`, First including Common, Second including Common, Tail: Ruby's order is
+        // Second, First, Common, Tail.
+        let parents = crate::det::HashMap::default();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> =
+            [("First".to_string(), calls(&[&["Common"]])), ("Second".to_string(), calls(&[&["Common", "Tail"]]))].into_iter().collect();
+        let declared = ["First", "First::Hue", "Second", "Common", "Tail", "Tail::Hue"].into_iter().map(String::from).collect();
+        let own = calls(&[&["First"], &["Second"]]);
+        assert_eq!(ancestor_constant("C", "Hue", &own, &lookup(&parents, &mixins, &declared)).as_deref(), Some("First::Hue"));
+    }
+
+    #[test]
+    fn a_module_a_superclass_has_stays_below_it() {
+        // `Mid < Base`, Base including Common, Mid including Outer (which includes Common): Common stays below Base.
+        let parents = [("Mid".to_string(), "Base".to_string())].into_iter().collect();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> =
+            [("Base".to_string(), calls(&[&["Common"]])), ("Outer".to_string(), calls(&[&["Common"]]))].into_iter().collect();
+        let declared = ["Base", "Base::Hue", "Common", "Common::Hue", "Outer"].into_iter().map(String::from).collect();
+        let own = calls(&[&["Outer"]]);
+        assert_eq!(ancestor_constant("Mid", "Hue", &own, &lookup(&parents, &mixins, &declared)).as_deref(), Some("Base::Hue"));
     }
 }

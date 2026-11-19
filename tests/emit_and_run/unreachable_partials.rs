@@ -20,7 +20,10 @@ fn errors_with(show_reads: &str, elsewhere: &str) -> Vec<String> {
 fn a_partial_nothing_renders_warns() {
     let errors = errors_with("", "<%= link_to \"x\", \"/x\", data: { tab: \"ghost\" } %>");
     assert!(!errors.iter().any(|e| e.contains("_ghost") || e.contains("@ghost")), "{errors:#?}");
-    // A collection built with `+=` renders its records, and names no partial.
+    // A collection built with `+=` renders its records, and a nil spacer names nothing; neither names a partial.
+    let errors = errors_with("", "<%= render partial: \"articles/article\", collection: [], spacer_template: nil %>");
+    assert!(!errors.iter().any(|e| e.contains("_ghost") || e.contains("@ghost")), "{errors:#?}");
+
     let errors = errors_with("", "<% posts = [] %><% posts += Article.all.to_a %><%= render posts %>");
     assert!(!errors.iter().any(|e| e.contains("_ghost") || e.contains("@ghost")), "{errors:#?}");
     // Downgraded, not dropped: the partial is still emitted.
@@ -87,6 +90,7 @@ fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
         "<% panel = \"articles/gh\" %><% panel.concat(\"ost\") %><%= render partial: panel %>",
         "<% panel = \"articles/gh\" %><% panel += \"ost\" %><%= render panel %>",
         "<%= render sprintf(\"%s\", params[:panel]) %>",
+        "<% panel = \"articles/gh\" %><% alias_name = panel %><% alias_name.concat(\"ost\") %><%= render panel %>",
         "<% panel = +\"articles/gh\" %><% alias_name = panel %><% alias_name.concat(\"ost\") %><%= render partial: panel %>",
         "<%= render partial: \"articles/article\", collection: [], spacer_template: params[:spacer].to_s %>",
     ] {

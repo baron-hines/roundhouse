@@ -256,7 +256,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         entries.iter().any(|(k, v)| {
             (key(k, "partial") && open(v))
                 || (partial && key(k, "layout") && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil }) && open(v))
-                || (partial && key(k, "spacer_template") && open(v))
+                || (partial && key(k, "spacer_template") && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil }) && open(v))
         })
     }
     fn computed_partial(
@@ -264,6 +264,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         open: &dyn Fn(&Expr) -> bool,
         request: &dyn Fn(&Expr) -> bool,
         locals: &[(String, bool, &Expr)],
+        mutated: &HashSet<String>,
     ) -> bool {
         let mut found = false;
         if let ExprNode::Send { method, args, .. } = &*e.node
@@ -275,7 +276,10 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 // Options passed through a local (`opts = { partial: … }; render opts`).
                 // Or a name built in place (`panel += "ost"`); not a local holding a record, which renders itself.
                 ExprNode::Var { name, .. } => {
-                    request(first)
+                    // A String mutated in place (directly or through an alias), as a record collection is not.
+                    let built = mutated.contains(name.as_str())
+                        && locals.iter().any(|(n, ivar, h)| !*ivar && n == name.as_str() && matches!(&*h.node, ExprNode::Lit { value: Literal::Str { .. } }));
+                    built || request(first)
                         || locals.iter().any(|(n, ivar, h)| {
                             !*ivar
                                 && n == name.as_str()
@@ -291,7 +295,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 _ => request(first),
             };
         }
-        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request, locals));
+        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request, locals, mutated));
         found
     }
     let body_computed = |b: &Expr| -> bool {
@@ -319,7 +323,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 break;
             }
         }
-        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here)
+        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here, &mutated)
     };
     let mut computed = false;
     crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));
