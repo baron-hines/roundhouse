@@ -314,3 +314,60 @@ fn a_rooted_superclass_that_is_no_model_keeps_its_subclasses_plain() {
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+/// Review 6: a rooted class in a model body whose superclass is a
+/// `Struct.new(...)` expression. Its generated struct base is kept with
+/// it. ActiveRecord 8.1.4.1 gives `["A", "a", nil]`.
+fn struct_model_body_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/account.rb", r##"class Account < ApplicationRecord
+  class ::Parser < Struct.new(:raw)
+    def shout
+      raw.upcase
+    end
+  end
+end
+"##)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"accounts\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const STRUCT_MODEL_BODY: &str = r##"Account
+parser = Parser.new("a")
+got = [parser.shout, parser.raw, defined?(Account::Parser)]
+raise "struct superclass: #{got.inspect}" unless got == ["A", "a", nil]
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_struct_subclass_in_a_model_body_keeps_its_struct_base() {
+    let run = struct_model_body_app().run_ruby(STRUCT_MODEL_BODY);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+/// Review 6: a rooted subclass (`module Ledger; class ::Special < Item`)
+/// whose bare parent is a concrete model in the module around it. Ruby
+/// reads `Item` where the line is written, so it is `Ledger::Item`, and
+/// `Special` is its single-table-inheritance subclass. ActiveRecord 8.1.4.1
+/// gives `["Ledger::Item", "items", "Special", 1, "Special"]`.
+fn rooted_sti_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/item.rb", "module Ledger\n  class Item < ApplicationRecord\n  end\nend\n")
+        .write("app/models/special.rb", "module Ledger\n  class ::Special < Item\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"type\"\n  end\nend\n")
+}
+
+const ROOTED_STI: &str = r##"special = Special.create!(name: "s")
+got = [Special.superclass.name, Special.table_name, special.type, Ledger::Item.count, Ledger::Item.first.class.name]
+raise "rooted STI: #{got.inspect}" unless got == ["Ledger::Item", "items", "Special", 1, "Special"]
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_subclass_of_a_model_in_the_module_around_it_is_that_models_subclass() {
+    let run = rooted_sti_app().run_ruby(ROOTED_STI);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
