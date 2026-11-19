@@ -30,7 +30,7 @@ module ActiveRecord
   end
 
   class UuidCast
-    def self.cast_text: (untyped value) -> String
+    def self.cast_text: (String | Integer | Float | bool | nil value) -> String
   end
 
   class Result
