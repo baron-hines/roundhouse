@@ -16320,6 +16320,8 @@ end
 mod pagy;
 #[path = "emit_and_run/pagy9.rs"]
 mod pagy9;
+#[path = "emit_and_run/yield_partial_render.rs"]
+mod yield_partial_render;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
 
