@@ -1318,9 +1318,13 @@ fn emit_fields_for(
 
     // Rails' `fields_for_with_nested_attributes` for a has_one/belongs_to the model accepts nested attributes for:
     // `parent[assoc_attributes]`, nothing for a nil association, and the record's hidden id when it is persisted.
-    let nested_attributes = binding
+    let nested_kind = binding
         .metadata_class(ctx)
-        .is_some_and(|owner| ctx.nested_attributes.get(&(owner.to_owned(), nested.as_str().to_owned())) == Some(&false));
+        .and_then(|owner| ctx.nested_attributes.get(&(owner.to_owned(), nested.as_str().to_owned())).copied());
+    if nested_kind == Some(true) {
+        return emit_nested_collection_fields(binding, nested, &nested_param, positional, opts, body, ctx);
+    }
+    let nested_attributes = nested_kind == Some(false);
     let model_name = if nested_attributes {
         format!("{}[{}_attributes]", binding.model_name, nested.as_str())
     } else {
@@ -1404,6 +1408,140 @@ fn emit_fields_for(
         },
     ));
     Some(out)
+}
+
+/// The index a nested child's names carry while its fields are written (`parent[assoc_attributes][<here>][field]`),
+/// replaced by the child's index once they are: letters only, which `name` and the sanitized `id` both keep.
+const CHILD_INDEX_MARK: &str = "rhnestedchildindexmark";
+
+/// Rails' `fields_for_with_nested_attributes` for a has_many: each child of the association (or the one record or
+/// collection given) under `parent[assoc_attributes][i]`, `i` the explicit `child_index:` or the builder's count,
+/// with the persisted child's hidden id after its fields.
+fn emit_nested_collection_fields(
+    binding: &FormBuilderBinding,
+    nested: Symbol,
+    nested_param: &Symbol,
+    positional: &[&Expr],
+    opts: &[(Expr, Expr)],
+    body: &Expr,
+    ctx: &ViewCtx,
+) -> Option<Vec<Expr>> {
+    let var = |name: &str| Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) });
+    let param = nested_param.as_str();
+    let record_var = Symbol::from(format!("{param}_record"));
+    let children = match positional.get(1) {
+        // One record given is that child alone; a collection given is the children.
+        Some(given) if matches!(given.ty.as_ref().map(|t| t.peel_nilable()), Some(crate::ty::Ty::Class { .. })) => {
+            Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![(*given).clone()], style: Default::default() })
+        }
+        Some(given) => (*given).clone(),
+        None => send(Some(var(binding.record_var.as_str())), nested.as_str(), Vec::new(), None, false),
+    };
+    let opt = |key: &str| opts.iter().find_map(|(k, v)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key).then_some(v));
+    let include_id = !opt("include_id").is_some_and(|v| matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } }));
+    let counter = format!("rh_{param}_index");
+    let child_index = format!("rh_{param}_child_index");
+    let mut out = Vec::new();
+    let index_value = match opt("child_index") {
+        Some(explicit) => send(Some(explicit.clone()), "to_s", Vec::new(), None, false),
+        None => {
+            out.push(Expr::new(Span::synthetic(), ExprNode::Assign {
+                target: super::LValue::Var { id: VarId(0), name: Symbol::from(counter.as_str()) },
+                value: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: -1 } }),
+            }));
+            send(Some(var(&counter)), "to_s", Vec::new(), None, false)
+        }
+    };
+    let model_name = format!("{}[{}_attributes][{CHILD_INDEX_MARK}]", binding.model_name, nested.as_str());
+    let mut inner = ctx.with_locals([param.to_string(), record_var.as_str().to_string()]);
+    inner.form_records.push(FormBuilderBinding {
+        overridden: Default::default(),
+        builder: None,
+        form_param: param.to_string(),
+        model_name,
+        model_class: binding.metadata_class(ctx).and_then(|owner| ctx.nested_record_classes.get(&(owner.to_owned(), nested.as_str().to_owned())).cloned()),
+        record_var: record_var.clone(),
+        form_method_var: binding.form_method_var.clone(),
+        id_prefix: binding.id_prefix.clone(),
+        recordless: false,
+    });
+    let body = super::form_with::rewrite_form_object_reads(body, param, &record_var);
+    let mut loop_body = Vec::new();
+    if opt("child_index").is_none() {
+        loop_body.push(Expr::new(Span::synthetic(), ExprNode::Assign {
+            target: super::LValue::Var { id: VarId(0), name: Symbol::from(counter.as_str()) },
+            value: send(Some(var(&counter)), "+", vec![Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 1 } })], None, false),
+        }));
+    }
+    loop_body.push(Expr::new(Span::synthetic(), ExprNode::Assign {
+        target: super::LValue::Var { id: VarId(0), name: Symbol::from(child_index.as_str()) },
+        value: index_value,
+    }));
+    let mut fields = walk_body(&body, &inner);
+    if include_id
+        && !calls_hidden_id(&body, param)
+        && let Some(nested_binding) = inner.form_records.last()
+    {
+        let id = lit_sym(Symbol::from("id"));
+        fields.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: send(Some(var(record_var.as_str())), "persisted?", Vec::new(), None, false),
+                then_branch: super::seq(emit_hidden_field(Some(&id), &[], nested_binding, &inner)),
+                else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        ));
+    }
+    for f in &mut fields {
+        mark_child_index(f, &var(&child_index));
+    }
+    loop_body.extend(fields);
+    let lambda = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda {
+            extra_params: Vec::new(),
+            rest_param: None,
+            params: vec![record_var],
+            block_param: None,
+            body: super::seq(loop_body),
+            block_style: crate::expr::BlockStyle::Do,
+        },
+    );
+    out.push(send(Some(children), "each", Vec::new(), Some(lambda), false));
+    Some(out)
+}
+
+/// The child's index for [`CHILD_INDEX_MARK`] in every string its fields wrote.
+fn mark_child_index(e: &mut Expr, index: &Expr) {
+    e.node.for_each_child_mut(&mut |c| mark_child_index(c, index));
+    let split = |text: &str| -> Vec<InterpPart> {
+        let mut parts = Vec::new();
+        for (i, piece) in text.split(CHILD_INDEX_MARK).enumerate() {
+            if i > 0 {
+                parts.push(InterpPart::Expr { expr: index.clone() });
+            }
+            if !piece.is_empty() {
+                parts.push(InterpPart::Text { value: piece.to_string() });
+            }
+        }
+        parts
+    };
+    match &mut *e.node {
+        ExprNode::Lit { value: Literal::Str { value } } if value.contains(CHILD_INDEX_MARK) => {
+            let parts = split(value);
+            *e = Expr::new(e.span, ExprNode::StringInterp { parts });
+        }
+        ExprNode::StringInterp { parts } if parts.iter().any(|p| matches!(p, InterpPart::Text { value } if value.contains(CHILD_INDEX_MARK))) => {
+            let old = std::mem::take(parts);
+            for p in old {
+                match p {
+                    InterpPart::Text { value } if value.contains(CHILD_INDEX_MARK) => parts.extend(split(&value)),
+                    other => parts.push(other),
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether a `fields_for` body writes the record's id itself (`f.hidden_field :id`), which Rails then does not repeat.

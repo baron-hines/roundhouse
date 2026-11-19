@@ -333,15 +333,51 @@ puts "namespace passed"
     assert!(run.stdout.contains("namespace passed"), "{}", run.stdout);
 }
 
-/// `fields_for :comments` over nested attributes: Rails names each child `article[comments_attributes][0][body]` and
-/// adds its hidden id, which the lowering's one `article[comments]` record does not write; reported on every target.
+/// `fields_for :comments` over a has_many's nested attributes: Rails 8.1.4 writes each child under
+/// `article[comments_attributes][i]`, counting `i` from 0, with the persisted child's hidden id after its fields, and
+/// an explicit `child_index:` for one record given. Attribute sets, since order is not markup.
 #[test]
-fn fields_for_over_nested_attributes_is_reported() {
-    let (_, errors) = emit_and_run::real_blog()
+fn fields_for_over_a_has_many_nested_attribute_names_as_rails() {
+    let run = nested_many_app().run_ruby(&nested_many_script());
+    run.assert_passes();
+    assert!(run.stdout.contains("has_many passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn fields_for_over_a_has_many_nested_attribute_names_as_rails_on_spinel() {
+    let run = nested_many_app().run_spinel_with_db(&nested_many_script());
+    run.assert_passes();
+    assert!(run.stdout.contains("has_many passed"), "{}", run.stdout);
+}
+
+fn nested_many_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
         .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  accepts_nested_attributes_for :comments\n")
-        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
-        .emit(roundhouse::build_target::BuildTarget::Ruby);
-    assert!(errors.iter().any(|e| e.contains("fields_for nested attributes") && e.contains("comments")), "{errors:#?}");
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"New\"), child_index: \"IDX\" do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
+}
+
+fn nested_many_script() -> String {
+    format!(
+            r##"{ATTRS}a = Article.create!(title: "Hi", body: "A body long enough for validation.")
+one = Comment.create!(article_id: a.id, commenter: "me", body: "One")
+two = Comment.create!(article_id: a.id, commenter: "me", body: "Two")
+io = +""
+Views::Articles.form_into(io, Article.find(a.id), nil, nil)
+{{
+  "article[comments_attributes][0][body]" => {{ "type" => "text", "value" => "One", "id" => "article_comments_attributes_0_body" }},
+  "article[comments_attributes][0][id]" => {{ "type" => "hidden", "value" => one.id.to_s, "id" => "article_comments_attributes_0_id" }},
+  "article[comments_attributes][1][body]" => {{ "type" => "text", "value" => "Two", "id" => "article_comments_attributes_1_body" }},
+  "article[comments_attributes][1][id]" => {{ "type" => "hidden", "value" => two.id.to_s, "id" => "article_comments_attributes_1_id" }},
+  "article[comments_attributes][IDX][body]" => {{ "type" => "text", "value" => "New", "id" => "article_comments_attributes_IDX_body" }},
+}}.each do |name, want|
+  got = attrs(io, name)
+  raise "#{{name}}: #{{got}}" unless got == want.merge("name" => name)
+end
+raise "new record has no id:\n#{{io}}" if io.include?("article[comments_attributes][IDX][id]")
+puts "has_many passed"
+"##
+    )
 }
 
 /// `fields_for :article` over a belongs_to the model accepts nested attributes for: Rails 8.1.4 names the fields
