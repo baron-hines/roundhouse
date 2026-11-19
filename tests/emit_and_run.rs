@@ -16318,6 +16318,8 @@ end
 
 #[path = "emit_and_run/pagy.rs"]
 mod pagy;
+#[path = "emit_and_run/pagy9.rs"]
+mod pagy9;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
 
@@ -22743,6 +22745,10 @@ mod token_for_string_key;
 mod integer_times_enumerator;
 #[path = "emit_and_run/own_namespace_association.rs"]
 mod own_namespace_association;
+#[path = "emit_and_run/rooted_class_name.rs"]
+mod rooted_class_name;
+#[path = "emit_and_run/unreachable_partials.rs"]
+mod unreachable_partials;
 #[path = "emit_and_run/mixed_in_constants.rs"]
 mod mixed_in_constants;
 #[path = "emit_and_run/struct_predicate_members.rs"]

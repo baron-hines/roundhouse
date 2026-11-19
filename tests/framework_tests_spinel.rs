@@ -138,6 +138,10 @@ fn build_and_run(test_file: &Path, tag: &str) {
             stems.push(name);
         }
     }
+    // Not both pagy runtimes: `project.rs::apply_pagy_demand` ships one per app, and their RBS declare the same members.
+    for f in ["pagy9.rb", "pagy9.rbs"] {
+        let _ = std::fs::remove_file(scratch_runtime.join("action_controller").join(f));
+    }
     stems.sort();
     for entry in stems.iter().map(|s| s.as_str()) {
         let src = runtime_ruby.join(entry);

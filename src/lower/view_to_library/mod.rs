@@ -1620,6 +1620,7 @@ pub(crate) fn insert_framework_stubs(
     let any_hash = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
     let html_helpers = [
         "turbo_stream_from",
+        "pagy_url_for",
         "link_to",
         "button_to",
         "html_escape",
