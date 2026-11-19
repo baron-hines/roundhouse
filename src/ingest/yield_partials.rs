@@ -236,7 +236,7 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
         return None;
     }
     // A partial's locals are what its renders pass: a write to one is the caller's, which the rename would miss.
-    if cx.loose_partial && bound.iter().any(|n| local(n) && !params.iter().any(|p| p.as_str() == n) && assigned(body, n) && cx.caller_locals.contains(n)) {
+    if cx.loose_partial && bound.iter().any(|n| local(n) && !params.iter().any(|p| p.as_str() == n) && assigned(body, n) && cx.maybe_locals.contains(n)) {
         return None;
     }
     let k = *cx.next;

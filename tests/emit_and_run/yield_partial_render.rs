@@ -208,6 +208,10 @@ fn unsure_caller_locals_are_not_specialized() {
             "<%= render layout: \"shared/wrap\" do %><% [1].each do |tcp| %><%= tcp %><% end %><%= tcp %><% end %>",
             "<%= render \"articles/inner\", tcp: \"T\" %>",
         ),
+        (
+            "<%= render layout: \"shared/wrap\" do %><% total += 1 %><%= total %><% end %>",
+            "<%= render \"articles/inner\", total: 5 %><%= render \"articles/inner\" %>",
+        ),
     ] {
         let (emitted, _) = emit_and_run::real_blog()
             .write("app/views/shared/_wrap.html.erb", "<s><%= yield %></s>")
@@ -216,10 +220,8 @@ fn unsure_caller_locals_are_not_specialized() {
             .emit(roundhouse::project::BuildTarget::Ruby);
         let shared = emitted.join("app/views/shared");
         let copies: Vec<String> = std::fs::read_dir(&shared)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .unwrap_or_else(|e| panic!("read {}: {e}", shared.display()))
+            .map(|e| e.expect("directory entry").file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains("__yield"))
             .collect();
         assert!(copies.is_empty(), "{inner}: {copies:?}");
