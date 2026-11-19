@@ -22739,6 +22739,8 @@ mod token_for_string_key;
 mod integer_times_enumerator;
 #[path = "emit_and_run/own_namespace_association.rs"]
 mod own_namespace_association;
+#[path = "emit_and_run/mixed_in_constants.rs"]
+mod mixed_in_constants;
 #[path = "emit_and_run/struct_predicate_members.rs"]
 mod struct_predicate_members;
 #[path = "emit_and_run/params_compact_blank.rs"]
