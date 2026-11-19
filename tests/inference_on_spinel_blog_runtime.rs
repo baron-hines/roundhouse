@@ -663,7 +663,26 @@ fn untyped_subexpressions_baseline() {
     // payload writers take the key already written as JSON, a `key` var where
     // `id.to_s` read a String (+12), and `str_key` / `data_str_id` (+3), vars
     // on this RBS-less probe; token_for.rbs types them for the RBS-paired gate.
-    const CEILING: usize = 1448;
+    // MEASURED 1434 on routed connection handles (main 105a34827: 1433):
+    // the Db slot calls a connection handle makes in
+    // active_record/connection.rb read the Db contract, which this
+    // RBS-less probe does not model, as `self.transaction`'s `Db.exec`
+    // calls do: `Base.connection`'s `Db.connection_slot` and the `slot` it
+    // answers (+4), `transaction`'s guard (+2), and `enter_slot` /
+    // `leave_slot` in `execute`, `select_rows` and `exec_update` with
+    // `raw_connection`'s guard (+8). `Base.connection` now answers a
+    // `Connection.new` on one arm, so its callers' chains in
+    // migration_runner.rb, schema_reader.rb and tasks.rb type (-13).
+    // db.rbs and connection.rbs type them for the RBS-paired gate.
+    // MEASURED 1436 on a held `with_connection` (1434): the handle's
+    // `_hold_slot` and `_release_slot` call `Db.enter_slot` and
+    // `Db.leave_slot`, the Db contract this probe does not model, as the
+    // handle's statements do (+2 in active_record/connection.rb);
+    // `with_connection` itself adds none. db.rbs and connection.rbs type
+    // them for the RBS-paired gate.
+    // MEASURED 1451 on merging main 2d02f862f (1448) with the routed
+    // connection handles' +3, which add up.
+    const CEILING: usize = 1451;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

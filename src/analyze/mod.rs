@@ -421,6 +421,10 @@ impl Analyzer {
             // `Base.uncached`), and its value is the block's, as
             // `transaction`'s is.
             cls.class_methods.insert(Symbol::from("uncached"), Ty::Untyped);
+            // Inherited from Base in a routed app (below); a view's call on the connection class resolves here.
+            for (method, ty) in ROUTED_SCOPE_METHODS.iter().filter(|_| app.database_routes.is_some()) {
+                cls.class_methods.insert(Symbol::from(*method), ty.clone());
+            }
             cls.class_methods.insert(Symbol::from("current_transaction"), registry::ar::transaction_ty());
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
@@ -1137,6 +1141,15 @@ impl Analyzer {
         // ActiveRecord::AdapterInterface contract, and the Arel node family —
         // see `registry::ar`.
         registry::ar::register(&mut classes);
+        // Role and shard switching on the literal Base, which only a routed
+        // app's runtime answers; any other app keeps the refusal of an
+        // unknown Base method.
+        if app.database_routes.is_some() {
+            let base = classes.entry(ClassId(Symbol::from("ActiveRecord::Base"))).or_default();
+            for (method, ty) in ROUTED_SCOPE_METHODS {
+                base.class_methods.entry(Symbol::from(*method)).or_insert(ty.clone());
+            }
+        }
         registry::ar::register_action_text(&mut classes);
         registry::ar::register_action_cable(&mut classes);
         if app.gem_lock.as_ref().is_some_and(|lock| lock.has("sentry-ruby")) {
@@ -12026,6 +12039,18 @@ fn register_attr_accessors(body: &[ModelBodyItem], methods: &mut HashMap<Symbol,
         }
     }
 }
+
+/// Rails' role and shard switching, the class methods `runtime/spinel/db.rb` answers on ActiveRecord::Base.
+const ROUTED_SCOPE_METHODS: &[(&str, Ty)] = &[
+    ("connected_to", Ty::Untyped),
+    ("while_preventing_writes", Ty::Untyped),
+    ("connected_to?", Ty::Bool),
+    ("current_preventing_writes", Ty::Bool),
+    ("current_role", Ty::Sym),
+    ("current_shard", Ty::Sym),
+    ("default_shard", Ty::Sym),
+    ("with_connection", Ty::Untyped),
+];
 
 /// `attribute :name, :type` (ActiveModel::Attributes) declares a typed
 /// virtual attribute backed by something other than a schema column

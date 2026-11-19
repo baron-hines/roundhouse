@@ -22741,6 +22741,8 @@ mod integer_times_enumerator;
 mod own_namespace_association;
 #[path = "emit_and_run/unreachable_partials.rs"]
 mod unreachable_partials;
+#[path = "emit_and_run/struct_predicate_members.rs"]
+mod struct_predicate_members;
 #[path = "emit_and_run/params_compact_blank.rs"]
 mod params_compact_blank;
 #[path = "emit_and_run/computed_partial_render.rs"]
