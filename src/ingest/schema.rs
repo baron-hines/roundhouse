@@ -838,8 +838,8 @@ fn apply_table_verb(
 ///
 /// Each verb follows what Rails runs. `enable_extension` is `CREATE
 /// EXTENSION IF NOT EXISTS`, so enabling one already recorded keeps its
-/// place and schema. `drop_schema` is `DROP SCHEMA ... CASCADE`, which
-/// drops the extensions created in that schema too. `disable_extension`
+/// place and schema. `drop_schema` (and `create_schema` with `force:`) is
+/// `DROP SCHEMA ... CASCADE`; see [`drop_folded_schema`]. `disable_extension`
 /// with `force: :cascade` also drops whatever depends on the extension
 /// (other extensions, columns of its types), which the fold can't tell,
 /// so it is refused.
@@ -886,15 +886,36 @@ fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema:
             schema.extensions.retain(|e| e.name.as_str() != bare);
         }
         "create_schema" => {
+            // `force:` (anything but a literal false or nil, or a `**`
+            // splat that may carry it) is `drop_schema` first.
+            let forced = args.iter().skip(1).any(|arg| {
+                arg.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some()))
+            }) || kwarg_value(args.iter().skip(1), "force").is_some_and(|force| force.as_false_node().is_none() && force.as_nil_node().is_none());
+            if forced {
+                drop_folded_schema(&name, &format!("create_schema \"{name}\" with force:"), file, schema)?;
+            }
             if !schema.schemas.iter().any(|s| s.as_str() == name) {
                 schema.schemas.push(Symbol::from(name.as_str()));
             }
         }
-        _ => {
-            schema.schemas.retain(|s| s.as_str() != name);
-            schema.extensions.retain(|e| e.schema.as_ref().is_none_or(|s| s.as_str() != name));
-        }
+        _ => drop_folded_schema(&name, &format!("drop_schema \"{name}\""), file, schema)?,
     }
+    Ok(())
+}
+
+/// Rails' `DROP SCHEMA ... CASCADE`, folded. A schema with no recorded
+/// extension in it is removed. One that holds an extension is refused:
+/// CASCADE also drops what depends on that extension in other schemas
+/// (another extension, a column of its type), which the fold can't tell.
+fn drop_folded_schema(name: &str, call: &str, file: &str, schema: &mut Schema) -> Result<(), IngestError> {
+    let held: Vec<&str> = schema.extensions.iter().filter(|e| e.schema.as_ref().is_some_and(|s| s.as_str() == name)).map(|e| e.name.as_str()).collect();
+    if !held.is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("{call} drops the schema with CASCADE, taking extension {} and what depends on it in other schemas (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result", held.join(", ")),
+        });
+    }
+    schema.schemas.retain(|s| s.as_str() != name);
     Ok(())
 }
 
