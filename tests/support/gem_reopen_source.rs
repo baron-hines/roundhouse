@@ -221,6 +221,28 @@ pub fn acronym_models_app() -> emit_and_run::Overlay {
         .write("app/models/api/box.rb", &LOCAL.replace("module Shelf", "module API"))
 }
 
+/// A gem whose `Shelf::Box` is in a file of its own, `lib/shelf/box.rb`,
+/// which `lib/shelf.rb` doesn't require.
+fn with_unrequired_gem_box() -> emit_and_run::Overlay {
+    with_gem_lib("module Shelf\nend\n").write(&format!("{GEM_DIR}/lib/shelf/box.rb"), SHELF)
+}
+
+/// [`models_app`] with the gem's `Shelf::Box` in `lib/shelf/box.rb`, which
+/// nothing requires.
+#[allow(dead_code)]
+pub fn unrequired_gem_box_models_app() -> emit_and_run::Overlay {
+    with_unrequired_gem_box().write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// [`unrequired_gem_box_models_app`]: the gem has not defined `Shelf::Box`
+/// when Zeitwerk scans `app/models`, so Rails 8.1.4.1 loads the app's file,
+/// with eager loading or without, and never the gem's.
+#[allow(dead_code)]
+pub const APP_FILE_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.respond_to?(:kind), Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "app file models #{got.inspect}" unless got == [false, "app box", true]
+puts "app file models passed"
+"##;
+
 /// [`acronym_models_app`]: Rails 8.1.4.1 never loads the reopen, so the class is the gem's.
 pub const ACRONYM_MODELS_ASSERTIONS: &str = r##"got = [API::Box.kind, API::Box.label, API::Box.respond_to?(:local_tag)]
 raise "acronym models #{got.inspect}" unless got == ["box", "shelf box", false]

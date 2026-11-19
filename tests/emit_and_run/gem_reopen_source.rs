@@ -60,6 +60,14 @@ fn a_reopen_at_an_acronym_autoload_path_leaves_the_gems_class() {
     contract::listed(contract::acronym_models_app()).run_ruby(contract::ACRONYM_MODELS_ASSERTIONS).assert_passes();
 }
 
+/// A gem file that nothing requires defines nothing, so Rails loads the
+/// app's file at that path. The gem's file isn't one roundhouse reads
+/// either: a source gem is the files its requires reach.
+#[test]
+fn a_reopen_at_the_autoload_path_of_a_gem_class_in_an_unrequired_file_is_loaded() {
+    contract::listed(contract::unrequired_gem_box_models_app()).run_ruby(contract::APP_FILE_MODELS_ASSERTIONS).assert_passes();
+}
+
 /// The emitted `Shelf::Box`: one file holding each opening in load order.
 fn shelf_box(app: super::emit_and_run::Overlay) -> String {
     let (emitted, _errors) = app.emit(BuildTarget::Spinel);
