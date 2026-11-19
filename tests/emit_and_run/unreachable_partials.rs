@@ -49,8 +49,17 @@ fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
         "<%= render session[:panel].to_s %>",
         "<%= render partial: \"#{params[:panel]}t\" %>",
         "<%= render partial: \"#{params[:a]}o#{params[:b]}t\" %>",
+        "<% @panel ||= params[:panel].to_s %><%= render partial: @panel %>",
+        "<% panel = \"articles/known\" %><% [params[:panel].to_s].each do |panel| %><%= render partial: panel %><% end %>",
     ] {
         let errors = errors_with(reads, "");
         assert!(errors.iter().any(|e| e.contains("@ghost")), "{reads}: {errors:#?}");
     }
+}
+
+/// An ivar a request value reaches through a local, rendered from another view.
+#[test]
+fn a_partial_an_ivar_fed_through_a_local_may_name_keeps_its_errors() {
+    let errors = errors_with("<% candidate = params[:panel].to_s %><% @panel = candidate %>", "<%= render partial: @panel %>");
+    assert!(errors.iter().any(|e| e.contains("@ghost")), "{errors:#?}");
 }

@@ -145,19 +145,20 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         match &*e.node {
             ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
             ExprNode::Send { recv: Some(r), method, .. } => CARRIES.contains(&method.as_str()) && reads_request(r, fed),
-            ExprNode::Var { name, .. } | ExprNode::Ivar { name } => fed.contains(name.as_str()),
+            ExprNode::Var { name, .. } => fed.contains(name.as_str()),
+            ExprNode::Ivar { name } => fed.contains(&format!("@{name}")),
             ExprNode::StringInterp { parts } => parts.iter().any(|p| matches!(p, crate::expr::InterpPart::Expr { expr } if reads_request(expr, fed))),
             ExprNode::If { then_branch, else_branch, .. } => reads_request(then_branch, fed) || reads_request(else_branch, fed),
             ExprNode::BoolOp { left, right, .. } => reads_request(left, fed) || reads_request(right, fed),
             _ => false,
         }
     }
-    // Every local and ivar assignment of a body, by name.
+    // Every local and ivar assignment of a body, `||=` too, by name (an ivar's with its `@`, apart from a local's).
     fn assignments<'a>(e: &'a Expr, out: &mut Vec<(String, bool, &'a Expr)>) {
-        if let ExprNode::Assign { target, value } = &*e.node {
+        if let ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. } = &*e.node {
             match target {
                 crate::expr::LValue::Var { name, .. } => out.push((name.as_str().to_string(), false, value)),
-                crate::expr::LValue::Ivar { name } => out.push((name.as_str().to_string(), true, value)),
+                crate::expr::LValue::Ivar { name } => out.push((format!("@{name}"), true, value)),
                 _ => {}
             }
         }
@@ -184,8 +185,10 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         let mut grow = |b: &Expr| {
             let mut here = Vec::new();
             assignments(b, &mut here);
-            let ivars: Vec<_> = here.into_iter().filter(|(_, ivar, _)| *ivar).collect();
-            request_fed(&ivars, &mut fed_ivars);
+            // Through the body's locals too (`candidate = params[:p]; @panel = candidate`), exporting only its ivars.
+            let mut fed = fed_ivars.clone();
+            request_fed(&here, &mut fed);
+            fed_ivars.extend(fed.into_iter().filter(|n| n.starts_with('@')));
         };
         crate::lower::for_each_hook_body_ref(app, &mut |b| grow(b));
         for v in &app.views {
@@ -195,12 +198,21 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             break;
         }
     }
-    let open_in = |v: &Expr, locals: &[(String, bool, &Expr)], fed: &HashSet<String>| -> bool {
+    // A block's parameters, which shadow a local of the name: the assignments by name are not that binding's.
+    fn block_params(e: &Expr, out: &mut HashSet<String>) {
+        if let ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } = &*e.node {
+            out.extend(params.iter().chain(rest_param).chain(block_param).map(|p| p.as_str().to_string()));
+            out.extend(extra_params.iter().map(|p| p.name.as_str().to_string()));
+        }
+        e.node.for_each_child(&mut |c| block_params(c, out));
+    }
+    let open_in = |v: &Expr, locals: &[(String, bool, &Expr)], shadowed: &HashSet<String>, fed: &HashSet<String>| -> bool {
         match &*v.node {
             ExprNode::Lit { .. } => false,
             // A collection or a pool a controller assigns (`partial: @tags`), unless a request value reaches it.
-            ExprNode::Ivar { name } => fed.contains(name.as_str()),
+            ExprNode::Ivar { name } => fed.contains(&format!("@{name}")),
             // A local is a known name only where each assignment of it is a literal.
+            ExprNode::Var { name, .. } if shadowed.contains(name.as_str()) => true,
             ExprNode::Var { name, .. } => {
                 let mine: Vec<_> = locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).collect();
                 mine.is_empty() || mine.iter().any(|(_, _, value)| !matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } }))
@@ -237,7 +249,9 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         assignments(b, &mut here);
         let mut fed = fed_ivars.clone();
         request_fed(&here, &mut fed);
-        computed_partial(b, &|v: &Expr| open_in(v, &here, &fed), &|v: &Expr| reads_request(v, &fed))
+        let mut shadowed = HashSet::default();
+        block_params(b, &mut shadowed);
+        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &fed), &|v: &Expr| reads_request(v, &fed))
     };
     let mut computed = false;
     crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));
