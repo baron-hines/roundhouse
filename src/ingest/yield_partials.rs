@@ -56,8 +56,17 @@ pub(super) fn specialize(app: &mut App) {
             let loose_partial = leaf.starts_with('_') && view.strict_locals.is_none();
             // A copy reads the locals its original is passed.
             let key = origin.get(view.name.as_str()).cloned().unwrap_or_else(|| view.name.as_str().to_string());
-            let mut caller_locals = passed.get(key.as_str()).cloned().unwrap_or_default();
-            caller_locals.extend(view.strict_locals.iter().flatten().map(|p| p.name.as_str().to_string()));
+            // Captured at the render site only where every render passes it, so it is a local there, not a call.
+            let (mut caller_locals, mut maybe_locals) = match passed.get(key.as_str()) {
+                Some(p) => (
+                    p.by.iter().filter(|(_, n)| **n == p.renders).map(|(k, _)| k.clone()).collect::<crate::det::HashSet<String>>(),
+                    p.by.keys().cloned().collect::<crate::det::HashSet<String>>(),
+                ),
+                None => Default::default(),
+            };
+            let declared = view.strict_locals.iter().flatten().map(|p| p.name.as_str().to_string());
+            caller_locals.extend(declared.clone());
+            maybe_locals.extend(declared);
             let mut cx = Cx {
                 dir: &dir,
                 format: &format,
@@ -65,6 +74,7 @@ pub(super) fn specialize(app: &mut App) {
                 caller: &counts,
                 loose_partial,
                 caller_locals: &caller_locals,
+                maybe_locals: &maybe_locals,
                 copies: &mut copies,
                 next: &mut next,
                 spans: &mut spans,
@@ -103,6 +113,8 @@ struct Cx<'a> {
     loose_partial: bool,
     /// The caller partial's locals (what its renders pass, its strict locals), which its body reads as calls.
     caller_locals: &'a crate::det::HashSet<String>,
+    /// Those some render passes: a call of one that not every render passes may be a helper, evaluated in the block.
+    maybe_locals: &'a crate::det::HashSet<String>,
     copies: &'a mut Vec<View>,
     next: &'a mut usize,
     spans: &'a mut Vec<crate::span::Span>,
@@ -240,6 +252,13 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     // A caller partial's local reads as a call (`type_change_path`): it is passed in like a local, as that call.
     let mut called: Vec<String> = Vec::new();
     local_calls(body, cx.caller_locals, &bound, &mut called);
+    // Not a name only some renders pass, nor one the block also binds in a nested scope: which it reads is decided
+    // where the block runs.
+    let mut unsure: Vec<String> = Vec::new();
+    local_calls(body, cx.maybe_locals, &crate::det::HashSet::default(), &mut unsure);
+    if unsure.iter().any(|n| !called.contains(n)) {
+        return None;
+    }
     // Not a bare render whose name the caller's directory does not hold: the controller's lookup would reach it
     // elsewhere, which the copy's own directory does not follow.
     let mut bare = Vec::new();
@@ -410,10 +429,16 @@ fn binders(e: &Expr, out: &mut crate::det::HashSet<String>) {
     e.node.for_each_child(&mut |c| binders(c, out));
 }
 
-/// What every render of a partial passes it, by the partial's view name: its locals' keys and the record local
+#[derive(Default)]
+struct Passed {
+    renders: usize,
+    by: crate::det::HashMap<String, usize>,
+}
+
+/// What the renders of a partial pass it, by the partial's view name: its locals' keys and the record local
 /// its name gives (`render "rooms/closeds/form", type_change_path: …`).
-fn passed_locals(views: &[View]) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
-    fn visit(e: &Expr, dir: &str, out: &mut crate::det::HashMap<String, crate::det::HashSet<String>>) {
+fn passed_locals(views: &[View]) -> crate::det::HashMap<String, Passed> {
+    fn visit(e: &Expr, dir: &str, out: &mut crate::det::HashMap<String, Passed>) {
         if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
             && method.as_str() == "render"
         {
@@ -441,11 +466,15 @@ fn passed_locals(views: &[View]) -> crate::det::HashMap<String, crate::det::Hash
             if let Some(name) = name {
                 let (pdir, base) = name.rsplit_once('/').map(|(d, b)| (d.to_string(), b.to_string())).unwrap_or((dir.to_string(), name.to_string()));
                 let entry = out.entry(format!("{pdir}/_{base}")).or_default();
-                entry.insert(base.clone());
+                entry.renders += 1;
+                let mut here: crate::det::HashSet<String> = [base.clone()].into_iter().collect();
                 for (k, _) in locals {
                     if let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node {
-                        entry.insert(value.as_str().to_string());
+                        here.insert(value.as_str().to_string());
                     }
+                }
+                for n in here {
+                    *entry.by.entry(n).or_default() += 1;
                 }
             }
         }

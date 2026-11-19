@@ -196,3 +196,32 @@ fn a_copys_block_render_reads_the_originals_local() {
     run.assert_passes();
     assert!(run.stdout.contains("outer passed"), "{}", run.stdout);
 }
+
+/// Left to the captured string: a call of a name only some renders of the
+/// caller partial pass (it may be a helper, which Rails calls only at the
+/// yield), and one the block also binds in a nested scope.
+#[test]
+fn unsure_caller_locals_are_not_specialized() {
+    for (inner, renders) in [
+        ("<%= render layout: \"shared/wrap\" do %><%= tcp %><% end %>", "<%= render \"articles/inner\", tcp: \"T\" %><%= render \"articles/inner\" %>"),
+        (
+            "<%= render layout: \"shared/wrap\" do %><% [1].each do |tcp| %><%= tcp %><% end %><%= tcp %><% end %>",
+            "<%= render \"articles/inner\", tcp: \"T\" %>",
+        ),
+    ] {
+        let (emitted, _) = emit_and_run::real_blog()
+            .write("app/views/shared/_wrap.html.erb", "<s><%= yield %></s>")
+            .write("app/views/articles/_inner.html.erb", inner)
+            .edit("app/views/articles/show.html.erb", "    <p class=\"text-gray-700\">", &format!("{renders}\n    <p class=\"text-gray-700\">"))
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        let shared = emitted.join("app/views/shared");
+        let copies: Vec<String> = std::fs::read_dir(&shared)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("__yield"))
+            .collect();
+        assert!(copies.is_empty(), "{inner}: {copies:?}");
+    }
+}
