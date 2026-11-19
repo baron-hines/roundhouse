@@ -146,6 +146,18 @@ fn a_helper_a_constant_value_calls_is_kept() {
     contract::listed(contract::class_eval_constant_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
 }
 
+/// A helper module a kept helper includes is kept.
+#[test]
+fn a_helper_a_kept_helper_includes_is_kept() {
+    contract::listed(contract::class_eval_included_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper class a kept helper inherits from is kept.
+#[test]
+fn a_helper_a_kept_helper_inherits_from_is_kept() {
+    contract::listed(contract::class_eval_superclass_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
 /// A helper the block names from the top level (`::LabelHelper`) is kept.
 #[test]
 fn a_helper_a_kept_class_eval_names_from_the_top_level_is_kept() {

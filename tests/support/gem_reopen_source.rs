@@ -271,6 +271,29 @@ pub fn class_eval_constant_helper_app() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 
+/// A kept helper that includes a second helper module only the
+/// initializer defines, which nothing names in a method body
+/// (`class LabelHelper; include TagSource`). Ruby answers `box / app box
+/// / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_included_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper\n  include TagSource\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.new.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper whose superclass is a second helper only the initializer
+/// defines (`class LabelHelper < TagSource`). Ruby answers `box / app box
+/// / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_superclass_helper_app() -> emit_and_run::Overlay {
+    let source = "class TagSource\n  def tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper < TagSource\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.new.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// [`class_eval_helper_app`] with the helper named from the top level,
 /// `::LabelHelper.tag`. Ruby answers the same.
 #[allow(dead_code)]
