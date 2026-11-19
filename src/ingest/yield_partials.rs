@@ -29,6 +29,7 @@ use crate::ident::{Symbol, VarId};
 
 pub(super) fn specialize(app: &mut App) {
     let snapshot: Vec<View> = app.views.clone();
+    let passed = passed_locals(&snapshot);
     let mut next = 0usize;
     let mut spans = Vec::new();
     let mut originals = std::collections::BTreeSet::new();
@@ -52,7 +53,20 @@ pub(super) fn specialize(app: &mut App) {
             }
             let leaf = view.name.as_str().rsplit('/').next().unwrap_or("");
             let loose_partial = leaf.starts_with('_') && view.strict_locals.is_none();
-            let mut cx = Cx { dir: &dir, format: &format, views: &snapshot, caller: &counts, loose_partial, copies: &mut copies, next: &mut next, spans: &mut spans, originals: &mut originals };
+            let mut caller_locals = passed.get(view.name.as_str()).cloned().unwrap_or_default();
+            caller_locals.extend(view.strict_locals.iter().flatten().map(|p| p.name.as_str().to_string()));
+            let mut cx = Cx {
+                dir: &dir,
+                format: &format,
+                views: &snapshot,
+                caller: &counts,
+                loose_partial,
+                caller_locals: &caller_locals,
+                copies: &mut copies,
+                next: &mut next,
+                spans: &mut spans,
+                originals: &mut originals,
+            };
             rewrite(&mut view.body, &mut cx);
         }
         let base = app.views.len();
@@ -79,6 +93,8 @@ struct Cx<'a> {
     caller: &'a Counts,
     /// The caller is a partial with no strict-locals header.
     loose_partial: bool,
+    /// The caller partial's locals (what its renders pass, its strict locals), which its body reads as calls.
+    caller_locals: &'a crate::det::HashSet<String>,
     copies: &'a mut Vec<View>,
     next: &'a mut usize,
     spans: &'a mut Vec<crate::span::Span>,
@@ -199,8 +215,8 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     if bound.iter().any(|n| local(n) && cx.caller.get(n).copied().unwrap_or(0) > inside.get(n).copied().unwrap_or(0)) {
         return None;
     }
-    // A partial without a strict-locals header takes whatever locals its renders pass, which a write may be to.
-    if cx.loose_partial && bound.iter().any(|n| local(n) && !params.iter().any(|p| p.as_str() == n) && assigned(body, n)) {
+    // A partial's locals are what its renders pass: a write to one is the caller's, which the rename would miss.
+    if cx.loose_partial && bound.iter().any(|n| local(n) && !params.iter().any(|p| p.as_str() == n) && assigned(body, n) && cx.caller_locals.contains(n)) {
         return None;
     }
     let k = *cx.next;
@@ -213,15 +229,32 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
             free.push(n.to_string());
         }
     });
+    // A caller partial's local reads as a call (`type_change_path`): it is passed in like a local, as that call.
+    let mut called: Vec<String> = Vec::new();
+    local_calls(body, cx.caller_locals, &bound, &mut called);
+    // Not a bare render whose name the caller's directory does not hold: the controller's lookup would reach it
+    // elsewhere, which the copy's own directory does not follow.
+    let mut bare = Vec::new();
+    bare_renders(body, &mut bare);
+    if bare.iter().any(|n| !views.iter().any(|v| v.name.as_str() == format!("{dir}/_{n}"))) {
+        return None;
+    }
     let mut inlined = body.clone();
     rename(&mut inlined, &renamed);
+    calls_to_locals(&mut inlined, &called, &renamed);
     qualify_renders(&mut inlined, dir);
+    // Each yield runs the block in a fresh scope, where the block's own locals start out nil.
+    let owned: Vec<Symbol> = bound
+        .iter()
+        .filter(|n| local(n) && !params.iter().any(|p| p.as_str() == n.as_str()))
+        .map(|n| renamed(n))
+        .collect();
     let params: Vec<Symbol> = params.iter().map(|p| renamed(p.as_str())).collect();
     let mut copy = partial.clone();
     copy.name = Symbol::from(format!("{pdir}/_{base}__yield{k}"));
-    replace_yields(&mut copy.body, &params, &inlined);
+    replace_yields(&mut copy.body, &params, &owned, &inlined);
     if let Some(strict) = &mut copy.strict_locals {
-        for n in &free {
+        for n in free.iter().chain(&called) {
             strict.push(crate::dialect::Param { name: renamed(n), default: None, keyword: true, rest: false, forwarding: false, from_keyword: false, from_kwrest: false });
         }
     }
@@ -232,6 +265,11 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     for n in &free {
         let key = Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: renamed(n) } });
         let value = Expr::new(span, ExprNode::Var { id: VarId(0), name: Symbol::from(n.as_str()) });
+        entries.push((key, value));
+    }
+    for n in &called {
+        let key = Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: renamed(n) } });
+        let value = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from(n.as_str()), args: Vec::new(), block: None, parenthesized: false });
         entries.push((key, value));
     }
     let target = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: format!("{pdir}/{base}__yield{k}") } });
@@ -267,12 +305,13 @@ fn only_output_yields(e: &Expr, counts: &mut Vec<usize>) -> bool {
     // A block whose body is the one statement holds it bare, not in a `Seq`.
     if let Some(ExprNode::Yield { args }) = appended(e).map(|c| &*c.node) {
         counts.push(args.len());
-        return args.iter().all(|a| only_output_yields(a, &mut Vec::new()));
+        return !args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. })) && args.iter().all(|a| only_output_yields(a, &mut Vec::new()));
     }
     if let ExprNode::Seq { exprs } = &*e.node {
         for stmt in exprs {
             if let Some(ExprNode::Yield { args }) = appended(stmt).map(|c| &*c.node) {
-                if args.iter().any(|a| !only_output_yields(a, &mut Vec::new())) {
+                // Not a splat: how many values it spreads over the parameters is known only at run time.
+                if args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. }) || !only_output_yields(a, &mut Vec::new())) {
                     return false;
                 }
                 counts.push(args.len());
@@ -292,10 +331,10 @@ fn only_output_yields(e: &Expr, counts: &mut Vec<usize>) -> bool {
     ok
 }
 
-fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
+fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr) {
     if matches!(appended(e).map(|c| &*c.node), Some(ExprNode::Yield { .. })) {
         let mut seq = Expr::new(e.span, ExprNode::Seq { exprs: vec![e.clone()] });
-        replace_yields(&mut seq, params, body);
+        replace_yields(&mut seq, params, owned, body);
         *e = seq;
         return;
     }
@@ -307,7 +346,7 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
                 _ => None,
             };
             let Some(args) = yielded else {
-                replace_yields(&mut stmt, params, body);
+                replace_yields(&mut stmt, params, owned, body);
                 out.push(stmt);
                 continue;
             };
@@ -320,6 +359,9 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
                     None => out.push(value),
                 }
             }
+            for n in owned {
+                out.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: n.clone() }, value: Expr::new(span, ExprNode::Lit { value: Literal::Nil }) }));
+            }
             match &*body.node {
                 ExprNode::Seq { exprs } => out.extend(exprs.iter().cloned()),
                 _ => out.push(body.clone()),
@@ -328,7 +370,7 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
         *exprs = out;
         return;
     }
-    e.node.for_each_child_mut(&mut |c| replace_yields(c, params, body));
+    e.node.for_each_child_mut(&mut |c| replace_yields(c, params, owned, body));
 }
 
 fn assigned(e: &Expr, name: &str) -> bool {
@@ -358,6 +400,105 @@ fn binders(e: &Expr, out: &mut crate::det::HashSet<String>) {
         _ => {}
     }
     e.node.for_each_child(&mut |c| binders(c, out));
+}
+
+/// What every render of a partial passes it, by the partial's view name: its locals' keys and the record local
+/// its name gives (`render "rooms/closeds/form", type_change_path: …`).
+fn passed_locals(views: &[View]) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    fn visit(e: &Expr, dir: &str, out: &mut crate::det::HashMap<String, crate::det::HashSet<String>>) {
+        if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+            && method.as_str() == "render"
+        {
+            let (name, locals): (Option<&str>, Vec<&(Expr, Expr)>) = match args.as_slice() {
+                [first, rest @ ..] if str_lit(first).is_some() => {
+                    let locals = match rest.first().map(|a| &*a.node) {
+                        Some(ExprNode::Hash { entries, .. }) => entries.iter().collect(),
+                        _ => Vec::new(),
+                    };
+                    (str_lit(first), locals)
+                }
+                [opts, ..] => match &*opts.node {
+                    ExprNode::Hash { entries, .. } => {
+                        let name = sym_key(entries, "partial").or_else(|| sym_key(entries, "layout")).and_then(str_lit);
+                        let locals = match sym_key(entries, "locals").map(|l| &*l.node) {
+                            Some(ExprNode::Hash { entries, .. }) => entries.iter().collect(),
+                            _ => Vec::new(),
+                        };
+                        (name, locals)
+                    }
+                    _ => (None, Vec::new()),
+                },
+                _ => (None, Vec::new()),
+            };
+            if let Some(name) = name {
+                let (pdir, base) = name.rsplit_once('/').map(|(d, b)| (d.to_string(), b.to_string())).unwrap_or((dir.to_string(), name.to_string()));
+                let entry = out.entry(format!("{pdir}/_{base}")).or_default();
+                entry.insert(base.clone());
+                for (k, _) in locals {
+                    if let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node {
+                        entry.insert(value.as_str().to_string());
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| visit(c, dir, out));
+    }
+    let mut out = crate::det::HashMap::default();
+    for v in views {
+        let dir = v.name.as_str().rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        visit(&v.body, dir, &mut out);
+    }
+    out
+}
+
+/// The receiverless, argument-less calls in the body that name a caller local the block does not bind itself.
+fn local_calls(e: &Expr, locals: &crate::det::HashSet<String>, bound: &crate::det::HashSet<String>, out: &mut Vec<String>) {
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && args.is_empty()
+        && locals.contains(method.as_str())
+        && !bound.contains(method.as_str())
+        && !out.iter().any(|n| n == method.as_str())
+    {
+        out.push(method.as_str().to_string());
+    }
+    e.node.for_each_child(&mut |c| local_calls(c, locals, bound, out));
+}
+
+fn calls_to_locals(e: &mut Expr, called: &[String], to: &dyn Fn(&str) -> Symbol) {
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && args.is_empty()
+        && called.iter().any(|n| n == method.as_str())
+    {
+        let name = to(method.as_str());
+        *e.node = ExprNode::Var { id: VarId(0), name };
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| calls_to_locals(c, called, to));
+}
+
+/// The body's bare render names (`render "badge"`, `partial: "badge"`).
+fn bare_renders(e: &Expr, out: &mut Vec<String>) {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+        && matches!(method.as_str(), "render" | "render_to_string")
+    {
+        let mut take = |v: &Expr| {
+            if let Some(n) = str_lit(v).filter(|n| !n.contains('/')) {
+                out.push(n.to_string());
+            }
+        };
+        match args.first().map(|a| &*a.node) {
+            Some(ExprNode::Hash { entries, .. }) => {
+                for (k, v) in entries {
+                    if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout")) {
+                        take(v);
+                    }
+                }
+            }
+            Some(_) => take(&args[0]),
+            None => {}
+        }
+    }
+    e.node.for_each_child(&mut |c| bare_renders(c, out));
 }
 
 /// A bare `render "badge"` in the body names the caller's directory's partial; in the copy it would name the callee's.

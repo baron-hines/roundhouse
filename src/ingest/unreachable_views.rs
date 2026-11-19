@@ -348,6 +348,39 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         }
         e.node.for_each_child(&mut |c| bare_render_targets(c, out));
     }
+    // The text pieces of a render's own interpolated name (`render "ghost_#{kind}"`), apart from any other string's.
+    fn render_name_fragments(e: &Expr, out: &mut Vec<String>) {
+        if let ExprNode::Send { method, args, .. } = &*e.node
+            && matches!(method.as_str(), "render" | "render_to_string")
+        {
+            let mut take = |v: &Expr| {
+                if let ExprNode::StringInterp { parts } = &*v.node {
+                    for part in parts {
+                        if let crate::expr::InterpPart::Text { value } = part {
+                            out.push(value.clone());
+                        }
+                    }
+                }
+            };
+            match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Hash { entries, .. }) => {
+                    for (k, v) in entries {
+                        if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout" | "spacer_template")) {
+                            take(v);
+                        }
+                    }
+                }
+                Some(_) => take(&args[0]),
+                None => {}
+            }
+        }
+        e.node.for_each_child(&mut |c| render_name_fragments(c, out));
+    }
+    let mut render_fragments: Vec<String> = Vec::new();
+    for v in &app.views {
+        render_name_fragments(&v.body, &mut render_fragments);
+    }
+    crate::lower::for_each_hook_body_ref(app, &mut |b| render_name_fragments(b, &mut render_fragments));
     let mut bare_targets: HashSet<String> = HashSet::default();
     for v in &app.views {
         bare_render_targets(&v.body, &mut bare_targets);
@@ -382,7 +415,16 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         let partial = format!("{dir}/{leaf}");
         // Not by any literal ending in its leaf (a `/rooms/1/edit` URL): every block render of it now renders its copy.
         if app.yield_originals.contains(&view.name) {
-            if !(names.contains(&partial) || view_names.contains(&(dir.to_string(), leaf.to_string())) || bare_targets.contains(leaf) || model_partials.contains(&partial)) {
+            let by_render_fragment = render_fragments.iter().any(|f| {
+                let piece = f.trim_matches('/');
+                f.contains(leaf) || (piece.len() >= 2 && partial.contains(piece))
+            });
+            if !(names.contains(&partial)
+                || view_names.contains(&(dir.to_string(), leaf.to_string()))
+                || bare_targets.contains(leaf)
+                || model_partials.contains(&partial)
+                || by_render_fragment)
+            {
                 out.push(i);
             }
             continue;

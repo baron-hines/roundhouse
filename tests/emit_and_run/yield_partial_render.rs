@@ -75,6 +75,7 @@ fn other_yields_stay_reported() {
     for (partial, call) in [
         ("<% got = yield 1 %><p><%= got %></p>\n", "<%= render \"articles/frame\" do |n| %>b<% end %>"),
         ("<p><%= yield 1 %></p>\n", "<%= render \"articles/frame\" do |n| %><% next if n == 1 %>b<% end %>"),
+        ("<p><%= yield(*[1, 2]) %></p>\n", "<%= render \"articles/frame\" do |a, b| %><%= a %><% end %>"),
     ] {
         let (_emitted, errors) = emit_and_run::real_blog()
             .write("app/views/articles/_frame.html.erb", partial)
@@ -151,4 +152,28 @@ fn a_moved_body_keeps_its_meaning() {
     let run = moved_app().run_ruby(&script);
     run.assert_passes();
     assert!(run.stdout.contains("moved passed"), "{}", run.stdout);
+}
+
+/// campfire's `rooms/closeds/_form`: a partial passing its own local, which
+/// its body reads as a call (`tcp`), into a block render; and a block's own
+/// local, fresh at each of two yields.
+fn caller_local_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/views/shared/_twice.html.erb", "<s><%= yield %>|<%= yield %></s>")
+        .write("app/views/articles/_inner.html.erb", "<%= render layout: \"shared/twice\" do %><% memo ||= 0 %><% memo += 1 %><%= tcp %><%= memo %><% end %>")
+        .edit(
+            "app/views/articles/show.html.erb",
+            "    <p class=\"text-gray-700\">",
+            "<em id=\"local\"><%= render \"articles/inner\", tcp: \"T\" %></em>\n    <p class=\"text-gray-700\">",
+        )
+}
+
+#[test]
+fn a_caller_partials_local_and_a_fresh_block_local() {
+    let script = format!(
+        "{RUBY_PAGE}\nhello = Article.create!(title: \"Hello\", body: \"Body text here\")\nbody = page(hello.id)\nraise body[0, 3000] unless body.include?(\"<em id=\\\"local\\\"><s>T1|T1</s></em>\")\nputs \"local passed\"\n"
+    );
+    let run = caller_local_app().run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("local passed"), "{}", run.stdout);
 }
