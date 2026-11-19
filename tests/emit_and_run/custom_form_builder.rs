@@ -450,3 +450,22 @@ puts "shared passed"
     run.assert_passes();
     assert!(run.stdout.contains("shared passed"), "{}", run.stdout);
 }
+
+/// `form_with(model: [article, comment])` names its fields after the last element (`comment[body]`), and a partial
+/// handed its builder alone binds to that record too.
+#[test]
+fn a_partial_of_an_array_model_form_binds_its_last_record() {
+    let run = emit_and_run::real_blog()
+        .write("app/views/articles/_form.html.erb", "<% comment = Comment.new(body: \"Hi\") %>\n<%= form_with(model: [article, comment]) do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n")
+        .write("app/views/articles/_fields.html.erb", "<%= f.text_field :body %>\n")
+        .run_ruby(&format!(
+            r##"{ATTRS}a = Article.create!(title: "Hi", body: "A body long enough for validation.")
+io = +""
+Views::Articles.form_into(io, a, nil, nil)
+raise "body #{{attrs(io, "comment[body]")}}" unless attrs(io, "comment[body]")["value"] == "Hi"
+puts "array passed"
+"##
+        ));
+    run.assert_passes();
+    assert!(run.stdout.contains("array passed"), "{}", run.stdout);
+}

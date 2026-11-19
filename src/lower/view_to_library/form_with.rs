@@ -1010,14 +1010,21 @@ fn classify_form_with_components(
         }
     };
 
-    if let Some((nested_model, nested_name, nested_action)) =
+    if let Some((nested_model, nested_name, nested_action, persisted)) =
         nested_resource_form(&model, &route_helpers)
     {
+        let method = method_expr.clone().unwrap_or_else(|| match persisted {
+            Some(cond) => Expr::new(
+                Span::synthetic(),
+                ExprNode::If { cond, then_branch: lit_sym(Symbol::from("patch")), else_branch: lit_sym(Symbol::from("post")) },
+            ),
+            None => default_post(),
+        });
         return Some(FormWithComponents {
             model: nested_model,
             model_name: nested_name,
             action: nested_action,
-            method: method_expr.clone().unwrap_or_else(default_post),
+            method,
             opts_entries,
             id_prefix: namespace.clone().unwrap_or_default(),
         });
@@ -1349,7 +1356,7 @@ fn scoped_record_form(model: &Expr) -> Option<(Expr, String, String)> {
 fn nested_resource_form(
     model: &Expr,
     route_helpers: &dyn Fn() -> Expr,
-) -> Option<(Expr, String, Expr)> {
+) -> Option<(Expr, String, Expr, Option<Expr>)> {
     let ExprNode::Array { elements, .. } = &*model.node else {
         return None;
     };
@@ -1370,24 +1377,23 @@ fn nested_resource_form(
     };
     let parent_singular = singularize(&snake_case(&parent_local));
 
-    // Child class: only support `Class.new(...)` shape. Comment.new is
-    // by definition not persisted, so the action is the nested
-    // collection path with method :post.
-    let ExprNode::Send {
-        recv: Some(child_recv),
-        method: child_method,
-        ..
-    } = &*child.node
-    else {
-        return None;
+    // `Class.new(...)`, by definition not persisted: the nested collection path with method :post.
+    let constructed = match &*child.node {
+        ExprNode::Send { recv: Some(child_recv), method, .. } if method.as_str() == "new" => match &*child_recv.node {
+            ExprNode::Const { path } => Some(path.last()?.as_str().to_string()),
+            _ => None,
+        },
+        _ => None,
     };
-    if child_method.as_str() != "new" {
-        return None;
-    }
-    let ExprNode::Const { path } = &*child_recv.node else {
-        return None;
+    // A record of a known model (`comment`): the member path once persisted, as Rails' `polymorphic_path` picks.
+    let typed = match child.ty.as_ref().map(|t| t.peel_nilable()) {
+        Some(crate::ty::Ty::Class { id, .. }) if constructed.is_none() && !matches!(&*child.node, ExprNode::Send { method, .. } if method.as_str() == "new") => {
+            Some(id.0.as_str().rsplit("::").next()?.to_string())
+        }
+        _ => None,
     };
-    let class_name = path.last()?.as_str();
+    let class_name = constructed.clone().or(typed)?;
+    let class_name = class_name.as_str();
     let child_singular = snake_case(class_name);
     let child_plural = crate::naming::pluralize_snake(&child_singular);
     let child_collection = crate::lower::routes::collection_name(&child_singular, &child_plural);
@@ -1402,7 +1408,19 @@ fn nested_resource_form(
         true,
     );
 
-    Some((child.clone(), child_singular, action))
+    if constructed.is_some() {
+        return Some((child.clone(), child_singular, action, None));
+    }
+    let persisted = send(Some(child.clone()), "persisted?", Vec::new(), None, false);
+    let member = send(
+        Some(route_helpers()),
+        &format!("{parent_singular}_{child_singular}_path"),
+        vec![send(Some(parent.clone()), "id", Vec::new(), None, false), send(Some(child.clone()), "id", Vec::new(), None, false)],
+        None,
+        true,
+    );
+    let action = Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: member, else_branch: action });
+    Some((child.clone(), child_singular, action, Some(persisted)))
 }
 
 /// True when the receiver is a `<x>.errors` Send — i.e. the iterable

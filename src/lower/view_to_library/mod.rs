@@ -2614,8 +2614,13 @@ pub(crate) fn partial_form_bindings(
                                     match key.as_str() {
                                         "model" => {
                                             // Rails' prefix is the model's `param_key`, not the reference's name (`@edit_user` → `user`).
+                                            // `model: [account, article]` names the fields after its last element, as Rails does.
+                                            let named = match &*v.node {
+                                                ExprNode::Array { elements, .. } => elements.last().unwrap_or(v),
+                                                _ => v,
+                                            };
                                             if scope.model_name.is_none()
-                                                && let Some(crate::ty::Ty::Class { id, .. }) = v.ty.as_ref().map(|t| t.peel_nilable())
+                                                && let Some(crate::ty::Ty::Class { id, .. }) = named.ty.as_ref().map(|t| t.peel_nilable())
                                             {
                                                 scope.model_name = Some(crate::naming::snake_case(&id.0.as_str().replace("::", "")));
                                             }

@@ -15068,9 +15068,21 @@ fn read_active_job_retry_jitter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> f64 {
 /// `config.load_defaults` 8.1+ turns it on, and an explicit `config.action_view.remove_hidden_field_autocomplete = …`
 /// (application, production or an initializer, such as the upgrade's `new_framework_defaults_8_1.rb`) wins.
 fn read_remove_hidden_field_autocomplete<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
-    // Not a trailing comment's assignment (`config.eager_load = true # config.action_view.… = false`).
+    // Not a trailing comment's assignment (`config.eager_load = true# config.action_view.… = false`).
+    let code = |line: &str| -> String {
+        let mut quote: Option<char> = None;
+        for (i, c) in line.char_indices() {
+            match (quote, c) {
+                (None, '#') => return line[..i].trim().to_string(),
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => quote = None,
+                _ => {}
+            }
+        }
+        line.trim().to_string()
+    };
     let code_lines = |bytes: &[u8]| -> Vec<String> {
-        String::from_utf8_lossy(bytes).lines().map(|l| l.split(" #").next().unwrap_or("").trim().to_string()).filter(|l| !l.starts_with('#')).collect()
+        String::from_utf8_lossy(bytes).lines().map(code).filter(|l| !l.is_empty()).collect()
     };
     let mut files: Vec<Vec<String>> = Vec::new();
     let mut on = false;
