@@ -23,6 +23,10 @@ module ActiveRecord
   class ConnectionTimeoutError < ConnectionNotEstablished
   end
 
+  # No pool for the role and shard a `connected_to` block selected.
+  class ConnectionNotDefined < ConnectionNotEstablished
+  end
+
   # Rails raises it when the configured database does not exist. An
   # after_initialize callback rescues it around a boot-time query, beside
   # ConnectionNotEstablished; the emitted Db has opened its database by

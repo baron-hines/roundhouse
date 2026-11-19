@@ -112,6 +112,10 @@ mod data_factory;
 mod data_record_siblings_contract;
 #[path = "spinel_toolchain/data_record_siblings.rs"]
 mod data_record_siblings;
+#[path = "support/database_routes.rs"]
+mod database_routes_contract;
+#[path = "spinel_toolchain/database_routes.rs"]
+mod database_routes;
 #[path = "support/relation_fork.rs"]
 mod relation_fork_contract;
 #[path = "spinel_toolchain/relation_fork.rs"]
