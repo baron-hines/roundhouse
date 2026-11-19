@@ -331,7 +331,8 @@ fn synthesized_source(
         } else if RUBY_KEYWORDS.contains(&t) {
             format!("self.{t}")
         } else {
-            t.to_string()
+            // Not bare: `__target = __target` would read the local being assigned, not the method.
+            format!("{t}()")
         };
         if d.allow_nil {
             body.push_str(&format!(
