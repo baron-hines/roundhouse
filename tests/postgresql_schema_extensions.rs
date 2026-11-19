@@ -168,3 +168,58 @@ fn boot_creates_the_extension_the_models_sql_calls() {
         }
     }
 }
+
+/// Folds one migration's `change` body, as the db/migrate walk does with
+/// no db/schema.rb, and returns the PostgreSQL boot DDL's schema and
+/// extension statements, in order.
+fn folded_database_objects(body: &str) -> Result<Vec<String>, String> {
+    let mut schema = roundhouse::schema::Schema::default();
+    let source = format!("class Extensions < ActiveRecord::Migration[8.1]\n  def change\n{body}\n  end\nend\n");
+    roundhouse::ingest::ingest_migration_with_generated_expression_dialect(
+        source.as_bytes(),
+        "db/migrate/20260101000000_extensions.rb",
+        &mut schema,
+        roundhouse::schema::generated::GeneratedExpressionDialect::Postgres,
+    )
+    .map_err(|error| error.to_string())?;
+    let ddl = roundhouse::emit::shared::schema_sql::render_schema_statements_for(&schema, roundhouse::emit::shared::schema_sql::Dialect::Postgres)?;
+    Ok(ddl.into_iter().filter(|sql| sql.contains("EXTENSION") || sql.contains("CREATE SCHEMA")).collect())
+}
+
+/// A repeated `enable_extension` is Rails' `CREATE EXTENSION IF NOT
+/// EXISTS` again, a no-op: ActiveRecord 8.1.4.1 leaves `cube` installed
+/// ahead of `earthdistance`, which requires it, and leaves `pgcrypto` in
+/// `public` when `extensions.pgcrypto` follows. After a disable, enabling
+/// again installs it last.
+#[test]
+fn a_repeated_enable_keeps_the_first_position_and_schema() {
+    let ddl = folded_database_objects("    enable_extension \"cube\"\n    enable_extension \"earthdistance\"\n    enable_extension \"cube\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "cube""#.to_string(), r#"CREATE EXTENSION IF NOT EXISTS "earthdistance""#.to_string()]));
+    let ddl = folded_database_objects("    create_schema \"extensions\"\n    enable_extension \"pgcrypto\"\n    enable_extension \"extensions.pgcrypto\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE SCHEMA IF NOT EXISTS "extensions""#.to_string(), r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string()]));
+    let ddl = folded_database_objects("    enable_extension \"cube\"\n    enable_extension \"pgcrypto\"\n    disable_extension \"cube\"\n    enable_extension \"cube\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string(), r#"CREATE EXTENSION IF NOT EXISTS "cube""#.to_string()]));
+}
+
+/// `disable_extension "cube", force: :cascade` is `DROP EXTENSION IF
+/// EXISTS "cube" CASCADE`, which also drops what depends on it: other
+/// extensions (`earthdistance`) and columns of its types (a `citext`
+/// column). The fold knows neither, so it refuses the migration. A plain
+/// disable still folds.
+#[test]
+fn a_cascading_disable_is_refused() {
+    let error = folded_database_objects("    enable_extension \"cube\"\n    enable_extension \"earthdistance\"\n    disable_extension \"cube\", force: :cascade")
+        .expect_err("a cascading disable is refused");
+    assert!(error.contains("disable_extension") && error.contains("force: :cascade"), "{error}");
+    let ddl = folded_database_objects("    enable_extension \"cube\"\n    enable_extension \"pgcrypto\"\n    disable_extension \"cube\", force: false");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string()]));
+}
+
+/// `drop_schema` is `DROP SCHEMA ... CASCADE`: ActiveRecord 8.1.4.1
+/// drops the extension created in that schema with it, and keeps one in
+/// another schema.
+#[test]
+fn drop_schema_drops_the_extensions_created_in_it() {
+    let ddl = folded_database_objects("    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"\n    enable_extension \"cube\"\n    drop_schema \"extensions\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "cube""#.to_string()]));
+}
