@@ -304,15 +304,32 @@ puts "strict passed"
     assert!(run.stdout.contains("strict passed"), "{}", run.stdout);
 }
 
-/// A `fields_for` builder handed to a partial: the nested fields are written inline, so the partial would get no
-/// builder; reported on every target rather than raise at render.
-#[test]
-fn a_fields_for_builder_handed_to_a_partial_is_reported() {
-    let (_, errors) = emit_and_run::real_blog()
+/// A `fields_for` builder handed to a partial (forem's `render "poll_fields", f: poll_form`): Rails hands it the
+/// nested builder object, which the Ruby family builds from its overlay; other targets report it. Rails 8.1.4's names.
+fn nested_partial_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
         .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :meta, article do |child| %>\n<%= render \"articles/fields\", f: child %>\n<% end %>\n<% end %>\n")
         .write("app/views/articles/_fields.html.erb", "<%= f.text_field :title %>\n")
-        .emit(roundhouse::build_target::BuildTarget::Ruby);
-    assert!(errors.iter().any(|e| e.contains("fields_for builder in a partial")), "{errors:#?}");
+}
+
+#[test]
+fn a_fields_for_builder_handed_to_a_partial_renders_on_ruby() {
+    let run = nested_partial_app().run_ruby(
+        r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = "<input type=\"text\" value=\"Hi\" name=\"article[meta][title]\" id=\"article_meta_title\" />"
+raise "missing #{want}:\n#{io}" unless io.include?(want)
+puts "nested partial passed"
+"##,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("nested partial passed"), "{}", run.stdout);
+}
+
+#[test]
+fn a_fields_for_builder_handed_to_a_partial_is_reported_off_the_ruby_family() {
+    let (_, errors) = nested_partial_app().emit(roundhouse::build_target::BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("custom form builder method") && e.contains("fields_for")), "{errors:#?}");
 }
 
 /// Rails hands the nested builder the form's `namespace:`, so an override's field ids carry it.
@@ -468,4 +485,30 @@ puts "array passed"
         ));
     run.assert_passes();
     assert!(run.stdout.contains("array passed"), "{}", run.stdout);
+}
+
+/// maybe's rules form: a custom builder's `fields_for` over a has_many's nested attributes, each child's builder
+/// handed to a partial, whose override runs on it under the child's index.
+#[test]
+fn a_custom_builders_nested_children_render_in_a_partial() {
+    let run = emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  accepts_nested_attributes_for :comments\n")
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= render \"articles/fields\", f: c %>\n<% end %>\n<% end %>\n")
+        .write("app/views/articles/_fields.html.erb", "<%= f.text_field :body %>\n")
+        .run_ruby(
+            r##"a = Article.create!(title: "Hi", body: "A body long enough for validation.")
+Comment.create!(article_id: a.id, commenter: "me", body: "One")
+Comment.create!(article_id: a.id, commenter: "me", body: "Two")
+io = +""
+Views::Articles.form_into(io, Article.find(a.id), nil, nil)
+[0, 1].zip(%w[One Two]).each do |i, body|
+  want = "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"#{body}\" name=\"article[comments_attributes][#{i}][body]\" id=\"article_comments_attributes_#{i}_body\" /></div>"
+  raise "missing #{want}:\n#{io}" unless io.include?(want)
+end
+puts "children passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("children passed"), "{}", run.stdout);
 }

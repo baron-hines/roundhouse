@@ -1330,29 +1330,10 @@ fn emit_fields_for(
     } else {
         format!("{}[{}]", binding.model_name, nested.as_str())
     };
-    // Rails' `fields_for` builds the parent's `builder:` again: an override runs on that object, as the form's do.
-    if let Some(builder) = &binding.builder {
-        let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
-        let args = vec![
-            lit_str(model_name.clone()),
-            Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() }),
-            template,
-            // Rails' `fields_for` hands the nested builder the form's `namespace:`.
-            Expr::new(Span::synthetic(), ExprNode::Hash {
-                entries: (!binding.id_prefix.is_empty())
-                    .then(|| (lit_sym(Symbol::from("namespace")), lit_str(binding.id_prefix.clone())))
-                    .into_iter()
-                    .collect(),
-                kwargs: false,
-            }),
-        ];
-        out.push(Expr::new(
-            Span::synthetic(),
-            ExprNode::Assign {
-                target: super::LValue::Var { id: VarId(0), name: nested_param.clone() },
-                value: send(Some(builder.clone()), "new", args, None, true),
-            },
-        ));
+    // Rails' `fields_for` builds the parent's `builder:` again: an override runs on that object, as the form's do, and a
+    // partial handed the nested builder gets it.
+    if let Some(assign) = nested_builder_object(binding, &nested_param, &model_name, &record_var, body) {
+        out.push(assign);
     }
     let mut inner = ctx.with_locals([nested_param_str.clone()]);
     inner.form_records.push(FormBuilderBinding {
@@ -1455,8 +1436,8 @@ fn emit_nested_collection_fields(
     let model_name = format!("{}[{}_attributes][{CHILD_INDEX_MARK}]", binding.model_name, nested.as_str());
     let mut inner = ctx.with_locals([param.to_string(), record_var.as_str().to_string()]);
     inner.form_records.push(FormBuilderBinding {
-        overridden: Default::default(),
-        builder: None,
+        overridden: if binding.builder.is_some() { binding.overridden.clone() } else { Default::default() },
+        builder: binding.builder.clone(),
         form_param: param.to_string(),
         model_name,
         model_class: binding.metadata_class(ctx).and_then(|owner| ctx.nested_record_classes.get(&(owner.to_owned(), nested.as_str().to_owned())).cloned()),
@@ -1477,6 +1458,8 @@ fn emit_nested_collection_fields(
         target: super::LValue::Var { id: VarId(0), name: Symbol::from(child_index.as_str()) },
         value: index_value,
     }));
+    let model_name_for_object = format!("{}[{}_attributes][{CHILD_INDEX_MARK}]", binding.model_name, nested.as_str());
+    let builder_object = nested_builder_object(binding, nested_param, &model_name_for_object, &record_var, &body);
     let mut fields = walk_body(&body, &inner);
     if include_id
         && !calls_hidden_id(&body, param)
@@ -1491,6 +1474,9 @@ fn emit_nested_collection_fields(
                 else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
             },
         ));
+    }
+    if let Some(object) = builder_object {
+        fields.insert(0, object);
     }
     for f in &mut fields {
         mark_child_index(f, &var(&child_index));
@@ -1509,6 +1495,54 @@ fn emit_nested_collection_fields(
     );
     out.push(send(Some(children), "each", Vec::new(), Some(lambda), false));
     Some(out)
+}
+
+/// `<param> = <builder>.new("<name>", <record>, ActionView::Base.new, { namespace: … })` for a `fields_for` whose
+/// builder must be an object: the form's overriding `builder:`, or Rails' own when the body hands it to a partial.
+fn nested_builder_object(binding: &FormBuilderBinding, param: &Symbol, model_name: &str, record_var: &Symbol, body: &Expr) -> Option<Expr> {
+    let class = binding.builder.clone().or_else(|| {
+        hands_to_render(body, param.as_str()).then(|| {
+            Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Helpers"), Symbol::from("FormBuilder")] })
+        })
+    })?;
+    let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
+    let args = vec![
+        lit_str(model_name.to_string()),
+        Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() }),
+        template,
+        // Rails' `fields_for` hands the nested builder the form's `namespace:`.
+        Expr::new(Span::synthetic(), ExprNode::Hash {
+            entries: (!binding.id_prefix.is_empty())
+                .then(|| (lit_sym(Symbol::from("namespace")), lit_str(binding.id_prefix.clone())))
+                .into_iter()
+                .collect(),
+            kwargs: false,
+        }),
+    ];
+    Some(Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: super::LValue::Var { id: VarId(0), name: param.clone() },
+            value: send(Some(class), "new", args, None, true),
+        },
+    ))
+}
+
+/// Whether a block hands its builder to a `render` (`render "poll_fields", f: poll_form`).
+fn hands_to_render(body: &Expr, param: &str) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, param: &str, found: &mut bool) {
+        let is_param = |v: &Expr| matches!(&*v.node, ExprNode::Var { name, .. } if name.as_str() == param);
+        if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+            && method.as_str() == "render"
+            && args.iter().any(|a| is_param(a) || matches!(&*a.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(_, v)| is_param(v))))
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, param, found));
+    }
+    walk(body, param, &mut found);
+    found
 }
 
 /// The child's index for [`CHILD_INDEX_MARK`] in every string its fields wrote.

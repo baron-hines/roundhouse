@@ -244,7 +244,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         }
         expr.node.for_each_child(&mut |c| nested_attributes_fields(nested, c, out));
     }
-    // A `fields_for` builder handed to a partial: the lowering writes the nested fields inline and builds no object to pass.
+    // A `fields_for` builder handed to a partial: the partial calls the object, which only the Ruby family's overlay builds.
     fn nested_builder_renders(expr: &Expr, params: &[Symbol], out: &mut Vec<Diagnostic>) {
         if let ExprNode::Lambda { params: own, body, .. } = &*expr.node
             && params.iter().any(|p| own.contains(p))
@@ -280,11 +280,12 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                 }
             }
             if args.iter().any(|a| hands(a, params)) {
+                // The Ruby family builds Rails' FormBuilder for it, which no other tree carries.
                 out.push(Diagnostic::unsupported(
                     expr.span,
                     None,
-                    "fields_for builder in a partial",
-                    "a `fields_for` builder handed to a partial: the nested fields are written inline, and the partial would get no builder".to_string(),
+                    "custom form builder method",
+                    "a `fields_for` builder handed to a partial is Rails' FormBuilder object at request time, carried by the Ruby family's runtime only".to_string(),
                 ));
             }
         }
