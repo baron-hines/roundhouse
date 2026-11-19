@@ -48,6 +48,8 @@ fn a_partial_nothing_renders_warns() {
 /// A bare name a local holds names any directory's partial, as a literal does.
 #[test]
 fn a_bare_render_through_a_local_keeps_its_errors() {
+    let errors = errors_with("", "<% source = \"ghost\" %><% panel = source %><%= render partial: panel %>");
+    assert!(errors.iter().any(|e| e.contains("@ghost")), "{errors:#?}");
     let errors = errors_with("", "<% panel = \"ghost\" %><%= render partial: panel %>");
     assert!(errors.iter().any(|e| e.contains("@ghost")), "{errors:#?}");
 }

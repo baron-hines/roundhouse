@@ -357,10 +357,20 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             && let Some(first) = args.first()
         {
             let mut take = |v: &Expr| {
-                let values: Vec<&Expr> = match &*v.node {
-                    ExprNode::Var { name, .. } => locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).map(|(_, _, value)| *value).collect(),
-                    _ => vec![v],
-                };
+                // Through aliases too (`source = "ghost"; panel = source`), each local followed once.
+                let mut values: Vec<&Expr> = Vec::new();
+                let mut pending: Vec<&Expr> = vec![v];
+                let mut seen: HashSet<String> = HashSet::default();
+                while let Some(e) = pending.pop() {
+                    match &*e.node {
+                        ExprNode::Var { name, .. } => {
+                            if seen.insert(name.as_str().to_string()) {
+                                pending.extend(locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).map(|(_, _, value)| *value));
+                            }
+                        }
+                        _ => values.push(e),
+                    }
+                }
                 for v in values {
                     if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node
                         && !value.contains('/')

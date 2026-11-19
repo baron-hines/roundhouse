@@ -392,7 +392,8 @@ fn expansion(module: &str, lookup: &Lookup, cache: &mut crate::det::HashMap<Stri
 
 /// A class's modules, highest first, after its include calls, as Ruby's `include` inserts them: each call's arguments
 /// appended last first (`include A, B` puts `A` above `B`), each module with its own ancestors below it, a module the
-/// class already has moving the insertion point past it, and one a superclass has (`inherited`) left where it is.
+/// class already has moving the insertion point past it, and one a superclass has (`inherited`) left where it is. An
+/// `UNSURE` marker sits where an unresolved spelling leaves the rest unknown, so what sits above it still answers.
 fn apply_calls(
     calls: &[Vec<String>],
     inherited: &[String],
@@ -400,50 +401,59 @@ fn apply_calls(
     cache: &mut crate::det::HashMap<String, Vec<String>>,
     active: &mut Vec<String>,
 ) -> Vec<String> {
-    // The same module only when both spellings are resolved, or both the same unresolved one: a `?Common` may be a
-    // `N::Common`, which leaves the order unknown.
-    let same = |a: &str, b: &str, unsure: &mut bool| {
-        if a.trim_start_matches('?') != b.trim_start_matches('?') {
-            return false;
-        }
-        if a.starts_with('?') != b.starts_with('?') {
-            *unsure = true;
-        }
-        true
-    };
-    let mut unsure = false;
     let mut list: Vec<String> = Vec::new();
     for call in calls {
         for module in call.iter().rev() {
             let mut chain = vec![module.clone()];
             match module.strip_prefix('?') {
                 // Not a declaration's ancestors as definite: an unresolved name may be any declaration of it, and one
-                // with includes of its own leaves the order unknown.
+                // with includes of its own leaves what follows unknown.
                 Some(bare) => {
                     let nested = format!("::{bare}");
-                    unsure |= lookup.mixins.iter().any(|(name, calls)| (name == bare || name.ends_with(&nested)) && !calls.is_empty());
+                    if lookup.mixins.iter().any(|(name, calls)| (name == bare || name.ends_with(&nested)) && !calls.is_empty()) {
+                        chain.push(UNSURE.to_string());
+                    }
                 }
                 None => chain.extend(expansion(module, lookup, cache, active)),
             }
-            // The marker an expansion carries is its own uncertainty, kept apart from the duplicate handling below.
-            if chain.iter().any(|m| m == UNSURE) {
-                unsure = true;
-                chain.retain(|m| m != UNSURE);
-            }
             let mut at = 0;
             for m in chain {
-                // Not backwards past an earlier match: Ruby only moves the insertion point forward.
-                if let Some(i) = list.iter().position(|l| same(l, &m, &mut unsure)) {
-                    at = at.max(i + 1);
-                } else if !inherited.iter().filter(|l| l.as_str() != UNSURE).any(|l| same(l, &m, &mut unsure)) {
+                if m == UNSURE {
                     list.insert(at, m);
                     at += 1;
+                    continue;
+                }
+                let bare = m.trim_start_matches('?');
+                let found = list.iter().position(|l| l != UNSURE && l.trim_start_matches('?') == bare);
+                let inherited_hit = inherited.iter().find(|l| l.as_str() != UNSURE && l.trim_start_matches('?') == bare);
+                match (found, inherited_hit) {
+                    // Not backwards past an earlier match: Ruby only moves the insertion point forward.
+                    (Some(i), _) => {
+                        // A resolved and an unresolved spelling of one name may be two modules, the other one
+                        // inserted where this one would be.
+                        let mut i = i;
+                        if list[i].starts_with('?') != m.starts_with('?') {
+                            list.insert(at, UNSURE.to_string());
+                            if i >= at {
+                                i += 1;
+                            }
+                            at += 1;
+                        }
+                        at = at.max(i + 1);
+                    }
+                    (None, Some(l)) => {
+                        if l.starts_with('?') != m.starts_with('?') {
+                            list.insert(at, UNSURE.to_string());
+                            at += 1;
+                        }
+                    }
+                    (None, None) => {
+                        list.insert(at, m);
+                        at += 1;
+                    }
                 }
             }
         }
-    }
-    if unsure {
-        list.insert(0, UNSURE.to_string());
     }
     list
 }
@@ -672,5 +682,16 @@ mod tests {
         let declared = ["Base", "A", "B", "X", "X::Hue", "N::B", "N::B::Hue", "Outer"].into_iter().map(String::from).collect();
         let own = calls(&[&["Outer"]]);
         assert_eq!(ancestor_constant("Child", "Hue", &own, &lookup(&parents, &mixins, &declared)), None);
+    }
+
+    #[test]
+    fn uncertainty_below_a_definite_match_does_not_hide_it() {
+        // `include ?A; include B`, B holding `Hue` and above `?A`: B answers whatever `?A` denotes.
+        let parents = crate::det::HashMap::default();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> =
+            [("A".to_string(), calls(&[&["Tail"]])), ("N::A".to_string(), calls(&[&["Other"]]))].into_iter().collect();
+        let declared = ["A", "N::A", "B", "B::Hue", "Tail", "Tail::Hue", "Other"].into_iter().map(String::from).collect();
+        let own = calls(&[&["?A"], &["B"]]);
+        assert_eq!(ancestor_constant("C", "Hue", &own, &lookup(&parents, &mixins, &declared)).as_deref(), Some("B::Hue"));
     }
 }
