@@ -1690,7 +1690,7 @@ impl<'a> BodyTyper<'a> {
 
     /// A bare constant Rubydex leaves unanswered where the class mixes in more than one module (`LIMIT` from
     /// `include RateConcept` beside `include PriceConcept`; one alone resolves): Ruby's ancestor lookup, the class,
-    /// its modules (the last included first), then its superclass and on, among the app's declarations.
+    /// its modules (the last included first), then its superclass and on, among the app's declarations. Removable once Shopify/rubydex#1106 is fixed.
     fn mixed_in_constant(&self, path: &mut Vec<Symbol>, ctx: &Ctx, decisions: u64) -> Option<Ty> {
         // Not from `class << self`: Ruby looks a bare name up through the singleton class there, a NameError the
         // caller keeps.

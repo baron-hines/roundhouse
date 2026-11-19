@@ -338,7 +338,7 @@ fn model_includes(body: &[ModelBodyItem]) -> Vec<String> {
 /// Rubydex answers nothing for a bare mixin of a class that includes more than one (`include RateConcept` beside
 /// `include PriceConcept` in `class Provider::Synth < Provider`, where one alone resolves): the name as Ruby finds it in
 /// the class's own constants and mixins, then each superclass's, then the top level's, among the app's declarations. Not the
-/// enclosing namespaces, which a compact `class A::B` does not open.
+/// enclosing namespaces, which a compact `class A::B` does not open. Removable once Shopify/rubydex#1106 is fixed.
 fn ancestor_constant(owner: &str, written: &str, earlier: &[String], lookup: &Lookup) -> Option<String> {
     if written.contains("::") {
         return None;
