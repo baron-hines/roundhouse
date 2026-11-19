@@ -2851,6 +2851,7 @@ end
     app.vite_manifest = super::vite::read_manifest(vfs, dir);
     let vite_digest = app.vite_manifest.as_ref().map(|m| m.digest.clone());
     app.inertia = super::inertia::load_inertia_config(vfs, dir, vite_digest.as_deref())?;
+    app.pagy = super::pagy::load_settings(vfs, dir)?;
 
     // An engine's initializers run at boot as the host's do, and the boot
     // program takes their top-level constant writes

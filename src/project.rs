@@ -10502,11 +10502,15 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             }
         }
         // The pagy gem's `pagy(scope)` is `runtime/ruby/action_controller/
-        // pagy.rb`, a Base reopen only the ruby family and spinel load. On
+        // pagy.rb` (or pagy9.rb's `pagy` / `pagy_array` / `pagy_url_for`),
+        // a Base reopen only the ruby family and spinel load. On
         // a strict target the call would reach a controller with no such
         // method; ledger it rather than emit it.
         if let crate::expr::ExprNode::Send { recv, method, .. } = &*expr.node
-            && method.as_str() == "pagy"
+            && (method.as_str() == "pagy" || method.as_str() == "pagy_array" || method.as_str() == "pagy_url_for")
+            // Only what the locked gem provides: `pagy_array` with pagy 9's array extra, `pagy_url_for` with pagy 9.
+            && (method.as_str() == "pagy"
+                || (crate::ingest::pagy_locked_before_43(app) && (method.as_str() == "pagy_url_for" || app.pagy.array)))
             && target != "spinel"
             && target != "jruby"
             && !expr.span.is_synthetic()
@@ -10517,7 +10521,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 expr.span,
                 target,
                 "pagy",
-                "the pagy gem's `pagy` is only available on the ruby family and spinel".to_string(),
+                format!("the pagy gem's `{method}` is only available on the ruby family and spinel"),
             );
         }
         // Kernel#` is the backtick / `%x` shell-out. The ruby family and
@@ -11940,16 +11944,16 @@ fn apply_pay_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(), 
     Ok(())
 }
 
-/// The pagy gem's `pagy` / `Pagy` (runtime/ruby/action_controller/pagy.rb)
-/// ride the tree only for an app whose Gemfile.lock carries pagy: the file
-/// reopens `ActionController::Base`, and an app without the gem has no
-/// `pagy` method to model (a controller of its own named `pagy` would
-/// otherwise meet the base's).
+/// The pagy gem's `pagy` / `Pagy` (runtime/ruby/action_controller/pagy.rb,
+/// or pagy9.rb for a pagy before 43) ride the tree only for an app whose
+/// Gemfile.lock carries pagy: the file reopens `ActionController::Base`,
+/// and an app without the gem has no `pagy` method to model (a controller
+/// of its own named `pagy` would otherwise meet the base's). The overflow
+/// extra's mode, which an initializer sets, is replayed after pagy9.rb.
 fn apply_pagy_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
-    if app.gem_lock.as_ref().is_some_and(|l| l.has("pagy")) {
-        return Ok(());
-    }
     const REQUIRE: &str = "require_relative \"action_controller/pagy\"\n";
+    let locked = app.gem_lock.as_ref().is_some_and(|l| l.has("pagy"));
+    let before_43 = locked && crate::ingest::pagy_locked_before_43(app);
     let ac = files
         .iter_mut()
         .find(|(p, _)| p == "runtime/action_controller.rb")
@@ -11957,12 +11961,31 @@ fn apply_pagy_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(),
     if !ac.1.contains(REQUIRE) {
         return Err("runtime/action_controller.rb: the pagy require moved".into());
     }
-    ac.1 = ac.1.replacen(REQUIRE, "", 1);
+    if !locked {
+        ac.1 = ac.1.replacen(REQUIRE, "", 1);
+    } else if before_43 {
+        ac.1 = ac.1.replacen(REQUIRE, "require_relative \"action_controller/pagy9\"\n", 1);
+    }
+    let dropped: &[&str] = match (locked, before_43) {
+        (false, _) => &["pagy", "pagy9"],
+        (true, true) => &["pagy"],
+        (true, false) => &["pagy9"],
+    };
     files.retain(|(p, _)| {
-        p != "runtime/action_controller/pagy.rb"
-            && p != "runtime/action_controller/pagy.rbs"
-            && p != "sig/runtime/action_controller/pagy.rbs"
+        !dropped.iter().any(|stem| {
+            p == &format!("runtime/action_controller/{stem}.rb")
+                || p == &format!("runtime/action_controller/{stem}.rbs")
+                || p == &format!("sig/runtime/action_controller/{stem}.rbs")
+        })
     });
+    if before_43 && let Some((_, src)) = files.iter_mut().find(|(p, _)| p == "runtime/action_controller/pagy9.rb") {
+        if let Some(mode) = app.pagy.overflow.as_deref() {
+            src.push_str(&format!("\nPagy.overflow = :{mode}\n"));
+        }
+        if let Some(limit) = app.pagy.limit {
+            src.push_str(&format!("\nPagy.default_limit = {limit}\n"));
+        }
+    }
     Ok(())
 }
 
