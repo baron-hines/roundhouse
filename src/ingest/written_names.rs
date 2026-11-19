@@ -518,6 +518,11 @@ fn ancestor_constant(owner: &str, written: &str, earlier: &[Vec<String>], lookup
         own[i] = apply_calls(calls, &inherited, lookup, &mut cache, &mut Vec::new());
         inherited.extend(own[i].iter().cloned());
     }
+    // Not past a name Rubydex left unresolved: it may be any declaration of it, with any constants and ancestry, so
+    // neither what it holds nor where the modules after it sit is known.
+    if own.iter().flatten().any(|m| m.starts_with('?')) {
+        return None;
+    }
     let mut found = None;
     for (class, modules) in chain.iter().zip(&own) {
         let candidate = format!("{class}::{written}");
@@ -685,13 +690,14 @@ mod tests {
     }
 
     #[test]
-    fn uncertainty_below_a_definite_match_does_not_hide_it() {
-        // `include ?A; include B`, B holding `Hue` and above `?A`: B answers whatever `?A` denotes.
+    fn an_unresolved_name_anywhere_leaves_the_answer_unknown() {
+        // `include ?A; include B`: if `?A` is an `A` that includes `B`, Ruby keeps `A` above `B`, so even `B::Hue`
+        // is not proven.
         let parents = crate::det::HashMap::default();
         let mixins: crate::det::HashMap<String, Vec<Vec<String>>> =
             [("A".to_string(), calls(&[&["Tail"]])), ("N::A".to_string(), calls(&[&["Other"]]))].into_iter().collect();
         let declared = ["A", "N::A", "B", "B::Hue", "Tail", "Tail::Hue", "Other"].into_iter().map(String::from).collect();
         let own = calls(&[&["?A"], &["B"]]);
-        assert_eq!(ancestor_constant("C", "Hue", &own, &lookup(&parents, &mixins, &declared)).as_deref(), Some("B::Hue"));
+        assert_eq!(ancestor_constant("C", "Hue", &own, &lookup(&parents, &mixins, &declared)), None);
     }
 }
