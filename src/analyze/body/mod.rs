@@ -3784,7 +3784,7 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some(id.0.as_str())
                         }
-                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d" | "as_json" | "tableize") => Some("String extension"),
+                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "as_json" | "tableize") => Some("String extension"),
                         Some(Ty::Hash { .. }) if method.as_str() == "to_sentence" => Some("Hash extension"),
                         _ if method.as_str() == "not_nil!" => Some("not_nil!"),
                         // `to_param` on Untyped goes through ActiveSupport.to_param
