@@ -88,6 +88,11 @@ pub(in crate::analyze) fn register(
     // `form.object` is the form's model (unknown model → gradual);
     // nested `fields_for`/`fields` yield another builder.
     form_builder.instance_methods.insert(Symbol::from("object"), Ty::Untyped);
+    // Rails' `class_attribute :field_helpers`, which a builder subclass reads in its body (maybe's `StyledFormBuilder`);
+    // the Ruby family's overlay answers it (`action_view_form_builder.rb`).
+    let symbols = Ty::Array { elem: std::sync::Arc::new(Ty::Sym) };
+    form_builder.class_methods.insert(Symbol::from("field_helpers"), symbols.clone());
+    form_builder.instance_methods.insert(Symbol::from("field_helpers"), symbols);
     for m in ["fields_for", "fields"] {
         form_builder
             .instance_methods

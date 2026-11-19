@@ -94,7 +94,7 @@ module ActionView
       return "" if Thread.current[:view_broadcast_rendering] == true
       return "" if ActionController.forgery_switched_off
       return "" if token_fields_omitted?
-      %(<input type="hidden" name="authenticity_token" value="#{form_authenticity_token}">)
+      %(<input type="hidden" name="authenticity_token" value="#{form_authenticity_token}"#{hidden_autocomplete_attr}>)
     end
 
     def self.token_fields_omitted?

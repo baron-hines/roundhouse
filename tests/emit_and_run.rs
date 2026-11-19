@@ -22744,6 +22744,9 @@ mod concern_plain_includer;
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
 
+// A module defining `method_missing`: its receiverless reads are the includer's.
+#[path = "emit_and_run/module_method_missing_includer.rs"]
+mod module_method_missing_includer;
 // Declarations: a rooted class or module name inside a module.
 #[path = "emit_and_run/rooted_class_declarations.rs"]
 mod rooted_class_declarations;
@@ -22769,5 +22772,7 @@ mod computed_partial_render;
 mod view_raise_statement;
 #[path = "emit_and_run/params_string_filter_scalars.rs"]
 mod params_string_filter_scalars;
+#[path = "emit_and_run/hidden_field_autocomplete.rs"]
+mod hidden_field_autocomplete;
 #[path = "emit_and_run/record_as_json_in_literal.rs"]
 mod record_as_json_in_literal;
