@@ -16318,6 +16318,8 @@ end
 
 #[path = "emit_and_run/pagy.rs"]
 mod pagy;
+#[path = "emit_and_run/yield_partial_render.rs"]
+mod yield_partial_render;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
 

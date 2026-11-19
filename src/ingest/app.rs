@@ -3452,6 +3452,7 @@ end
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
     super::vite::lower_vite_tags(&mut app);
+    super::yield_partials::specialize(&mut app);
     super::computed_partials::dispatch(&mut app);
     super::current_page::lower_current_page(&mut app);
     super::time_tag::lower_time_tags(&mut app);
