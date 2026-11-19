@@ -285,6 +285,7 @@ pub struct ViewLowerCtx<'a> {
     form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
     builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     hidden_autocomplete: bool,
+    nested_attributes: std::rc::Rc<crate::det::HashMap<(String, String), bool>>,
     /// See the ViewCtx field of the same name. Off unless the emitter
     /// opts in with [`ViewLowerCtx::observe_form_with_entry`].
     form_with_entry: bool,
@@ -383,6 +384,7 @@ impl<'a> ViewLowerCtx<'a> {
             form_wrappers: std::rc::Rc::new(form_wrapper_helpers(app)),
             builder_overrides: std::rc::Rc::new(crate::lower::view::form_builder_overrides(app)),
             hidden_autocomplete: app.hidden_field_autocomplete,
+            nested_attributes: std::rc::Rc::new(crate::lower::view::nested_attribute_associations(app)),
             form_with_entry: false,
         }
     }
@@ -908,6 +910,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         form_wrappers: lx.form_wrappers.clone(),
         builder_overrides: lx.builder_overrides.clone(),
         hidden_autocomplete: lx.hidden_autocomplete,
+        nested_attributes: lx.nested_attributes.clone(),
         form_with_entry: lx.form_with_entry,
         model_param_keys: lx.model_param_keys.clone(),
         stylesheets: app.stylesheets.clone(),
@@ -5502,6 +5505,8 @@ pub(super) struct ViewCtx {
     pub(super) builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     /// `App::hidden_field_autocomplete`: every hidden input carries Rails' `autocomplete="off"`.
     pub(super) hidden_autocomplete: bool,
+    /// `crate::lower::view::nested_attribute_associations`: (model, association) → whether it is a collection.
+    pub(super) nested_attributes: std::rc::Rc<crate::det::HashMap<(String, String), bool>>,
     /// Begin each `form_with` expansion with the
     /// `ActionView::Base.new.form_with` entry (Ruby family only — see
     /// `form_with::form_with_entry`).

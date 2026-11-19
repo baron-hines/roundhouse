@@ -332,3 +332,54 @@ puts "namespace passed"
     run.assert_passes();
     assert!(run.stdout.contains("namespace passed"), "{}", run.stdout);
 }
+
+/// `fields_for :comments` over nested attributes: Rails names each child `article[comments_attributes][0][body]` and
+/// adds its hidden id, which the lowering's one `article[comments]` record does not write; reported on every target.
+#[test]
+fn fields_for_over_nested_attributes_is_reported() {
+    let (_, errors) = emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  accepts_nested_attributes_for :comments\n")
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
+        .emit(roundhouse::build_target::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("fields_for nested attributes") && e.contains("comments")), "{errors:#?}");
+}
+
+/// `fields_for :article` over a belongs_to the model accepts nested attributes for: Rails 8.1.4 names the fields
+/// `comment[article_attributes][…]` and adds the persisted record's hidden id after them.
+#[test]
+fn fields_for_over_a_singular_nested_attribute_names_as_rails() {
+    let run = emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "  belongs_to :article\n", "  belongs_to :article\n  accepts_nested_attributes_for :article\n")
+        .write("app/views/comments/_comment.html.erb", "<%= form_with(model: comment, url: \"/c\") do |form| %>\n<%= form.fields_for :article do |a| %>\n<%= a.text_field :title %>\n<% end %>\n<% end %>\n")
+        .run_ruby(&format!(
+            r##"{ATTRS}a = Article.create!(title: "Hi", body: "A body long enough for validation.")
+c = Comment.create!(article_id: a.id, commenter: "me", body: "A comment body.")
+io = +""
+Views::Comments.comment_into(io, c, nil, nil)
+raise "title #{{attrs(io, "comment[article_attributes][title]")}}" unless attrs(io, "comment[article_attributes][title]") == {{ "type" => "text", "value" => "Hi", "name" => "comment[article_attributes][title]", "id" => "comment_article_attributes_title" }}
+raise "id #{{attrs(io, "comment[article_attributes][id]")}}" unless attrs(io, "comment[article_attributes][id]") == {{ "type" => "hidden", "value" => a.id.to_s, "name" => "comment[article_attributes][id]", "id" => "comment_article_attributes_id" }}
+puts "nested attributes passed"
+"##
+        ));
+    run.assert_passes();
+    assert!(run.stdout.contains("nested attributes passed"), "{}", run.stdout);
+}
+
+/// `form_with(model: comment)` for a local the view assigns, under `articles/`: Rails names the fields after the
+/// record's `param_key` (`comment[body]`), not the directory.
+#[test]
+fn a_form_for_a_view_local_names_fields_by_its_model() {
+    let run = emit_and_run::real_blog()
+        .write("app/views/articles/_form.html.erb", "<% comment = article.comments.first %>\n<% if comment %><%= form_with(model: comment, url: \"/c\") do |form| %>\n<%= form.text_field :body %>\n<% end %><% end %>\n")
+        .run_ruby(&format!(
+            r##"{ATTRS}a = Article.create!(title: "Hi", body: "A body long enough for validation.")
+Comment.create!(article_id: a.id, commenter: "me", body: "A comment body.")
+io = +""
+Views::Articles.form_into(io, a, nil, nil)
+raise "body #{{attrs(io, "comment[body]")}}" unless attrs(io, "comment[body]")["id"] == "comment_body"
+puts "local passed"
+"##
+        ));
+    run.assert_passes();
+    assert!(run.stdout.contains("local passed"), "{}", run.stdout);
+}

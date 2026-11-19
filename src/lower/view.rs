@@ -1132,6 +1132,35 @@ pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, c
     out
 }
 
+/// The associations each model accepts nested attributes for (`accepts_nested_attributes_for`, or its generated
+/// `<assoc>_attributes=`), keyed by model class and association name, valued true for a collection (has_many).
+pub fn nested_attribute_associations(app: &crate::App) -> crate::det::HashMap<(String, String), bool> {
+    use crate::dialect::{Association, ModelBodyItem};
+    let mut out = crate::det::HashMap::default();
+    for model in &app.models {
+        let accepts = |assoc: &str| {
+            let writer = format!("{assoc}_attributes=");
+            model.body.iter().any(|item| match item {
+                ModelBodyItem::Method { method, .. } => method.name.as_str() == writer,
+                ModelBodyItem::Unknown { expr, .. } => matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, args, .. }
+                    if method.as_str() == "accepts_nested_attributes_for"
+                        && args.iter().any(|a| matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == assoc))),
+                _ => false,
+            })
+        };
+        for association in model.associations() {
+            let (name, collection) = match association {
+                Association::HasMany { name, .. } | Association::HasAndBelongsToMany { name, .. } => (name, true),
+                Association::HasOne { name, .. } | Association::BelongsTo { name, .. } => (name, false),
+            };
+            if accepts(name.as_str()) {
+                out.insert((model.name.0.as_str().to_string(), name.as_str().to_string()), collection);
+            }
+        }
+    }
+    out
+}
+
 pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
     match method {
         "label" => Some(FormBuilderMethod::Label),

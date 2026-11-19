@@ -208,6 +208,26 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         }
         expr.node.for_each_child(&mut |c| nested(c, overrides, scope, out));
     }
+    // Rails' `fields_for` over a has_many the model accepts nested attributes for writes each child under
+    // `parent[assoc_attributes][i]`, its index counted at render; the lowering writes one record's fields.
+    fn nested_attributes_fields(nested: &crate::det::HashMap<(String, String), bool>, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && !expr.span.is_synthetic()
+            && let Some(Ty::Class { args: tyargs, .. }) = &r.ty
+            && let [Ty::Class { id: model, .. }] = tyargs.as_slice()
+            && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: assoc } }) = args.first().map(|a| &*a.node)
+            && nested.get(&(model.0.as_str().to_string(), assoc.as_str().to_string())) == Some(&true)
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "fields_for nested attributes",
+                format!("`fields_for :{}` over {}'s nested attributes: Rails writes each child under `[{}_attributes][i]`, its index counted at render, and the lowering writes one record's fields", assoc.as_str(), model.0.as_str(), assoc.as_str()),
+            ));
+        }
+        expr.node.for_each_child(&mut |c| nested_attributes_fields(nested, c, out));
+    }
     // A `fields_for` builder handed to a partial: the lowering writes the nested fields inline and builds no object to pass.
     fn nested_builder_renders(expr: &Expr, params: &[Symbol], out: &mut Vec<Diagnostic>) {
         if let ExprNode::Lambda { params: own, body, .. } = &*expr.node
@@ -256,10 +276,12 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
     }
     let mut out = Vec::new();
     let overrides = crate::lower::view::form_builder_overrides(app);
+    let nested_attributes = crate::lower::view::nested_attribute_associations(app);
     for view in &app.views {
         visit(app, &overrides, &view.body, &mut out);
         nested(&view.body, &overrides, &[], &mut out);
         nested_builder_renders(&view.body, &[], &mut out);
+        nested_attributes_fields(&nested_attributes, &view.body, &mut out);
     }
     out
 }

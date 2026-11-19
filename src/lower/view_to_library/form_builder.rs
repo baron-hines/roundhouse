@@ -1242,7 +1242,7 @@ pub(super) fn emit_form_builder_block_inline(
             Some(out)
         }
         FormBuilderMethod::FieldsFor => {
-            emit_fields_for(binding, &positional, params, body, ctx)
+            emit_fields_for(binding, &positional, opts.as_slice(), params, body, ctx)
         }
         // Lexxy's editor takes a block — its children, campfire's
         // `<lexxy-prompt>` for mentions. Trix's helper takes none.
@@ -1283,6 +1283,7 @@ pub(super) fn emit_form_builder_block_inline(
 fn emit_fields_for(
     binding: &FormBuilderBinding,
     positional: &[&Expr],
+    opts: &[(Expr, Expr)],
     params: &[Symbol],
     body: &Expr,
     ctx: &ViewCtx,
@@ -1315,7 +1316,16 @@ fn emit_fields_for(
         },
     )];
 
-    let model_name = format!("{}[{}]", binding.model_name, nested.as_str());
+    // Rails' `fields_for_with_nested_attributes` for a has_one/belongs_to the model accepts nested attributes for:
+    // `parent[assoc_attributes]`, nothing for a nil association, and the record's hidden id when it is persisted.
+    let nested_attributes = binding
+        .metadata_class(ctx)
+        .is_some_and(|owner| ctx.nested_attributes.get(&(owner.to_owned(), nested.as_str().to_owned())) == Some(&false));
+    let model_name = if nested_attributes {
+        format!("{}[{}_attributes]", binding.model_name, nested.as_str())
+    } else {
+        format!("{}[{}]", binding.model_name, nested.as_str())
+    };
     // Rails' `fields_for` builds the parent's `builder:` again: an override runs on that object, as the form's do.
     if let Some(builder) = &binding.builder {
         let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
@@ -1361,8 +1371,56 @@ fn emit_fields_for(
         recordless: binding.recordless && positional.get(1).is_none(),
     });
     let body = super::form_with::rewrite_form_object_reads(body, &nested_param_str, &record_var);
-    out.extend(walk_body(&body, &inner));
+    let mut fields = walk_body(&body, &inner);
+    if !nested_attributes {
+        out.extend(fields);
+        return Some(out);
+    }
+    let record_ref = || Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() });
+    let include_id = !opts.iter().any(|(k, v)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "include_id")
+            && matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } })
+    });
+    if include_id
+        && !calls_hidden_id(&body, &nested_param_str)
+        && let Some(nested_binding) = inner.form_records.last()
+    {
+        let id = lit_sym(Symbol::from("id"));
+        fields.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: send(Some(record_ref()), "persisted?", Vec::new(), None, false),
+                then_branch: super::seq(emit_hidden_field(Some(&id), &[], nested_binding, &inner)),
+                else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        ));
+    }
+    out.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send(Some(record_ref()), "nil?", Vec::new(), None, false),
+            then_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            else_branch: super::seq(fields),
+        },
+    ));
     Some(out)
+}
+
+/// Whether a `fields_for` body writes the record's id itself (`f.hidden_field :id`), which Rails then does not repeat.
+fn calls_hidden_id(body: &Expr, param: &str) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, param: &str, found: &mut bool) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && method.as_str() == "hidden_field"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == param)
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { value } }) if value.as_str() == "id")
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, param, found));
+    }
+    walk(body, param, &mut found);
+    found
 }
 
 fn emit_button(

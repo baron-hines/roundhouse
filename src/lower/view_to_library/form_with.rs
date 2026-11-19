@@ -1285,9 +1285,15 @@ fn record_model_name(model: &Expr, ctx: &ViewCtx, fallback: &str) -> String {
         }
         _ => return fallback.to_string(),
     };
+    // A view's own local (`<% comment = article.comments.first %>`) is in no ivar map: its type names the model too.
+    let typed = match model.ty.as_ref().map(|t| t.peel_nilable()) {
+        Some(crate::ty::Ty::Class { id, .. }) => ctx.model_param_keys.get(id.0.as_str()).cloned(),
+        _ => None,
+    };
     ctx.ivar_models
         .get(name)
         .cloned()
+        .or(typed)
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -1762,6 +1768,7 @@ mod tests {
             form_wrappers: Default::default(),
             builder_overrides: Default::default(),
             hidden_autocomplete: false,
+            nested_attributes: Default::default(),
             form_with_entry: true,
             model_param_keys: Default::default(),
             stylesheets: Vec::new(),

@@ -2532,6 +2532,7 @@ mod tests {
             form_wrappers: Default::default(),
             builder_overrides: Default::default(),
             hidden_autocomplete: false,
+            nested_attributes: Default::default(),
             form_with_entry: false,
             model_param_keys: Default::default(),
             stylesheets: Vec::new(),
