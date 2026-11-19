@@ -410,6 +410,7 @@ fn emit_form_inline(
         form_method_var,
         id_prefix: comps.id_prefix.clone(),
         recordless: !comps.model_name.is_empty() && matches!(&*comps.model.node, ExprNode::Lit { value: Literal::Nil }),
+        builder: (!overridden.is_empty()).then(|| custom_builder(args)).flatten(),
         overridden,
     });
     // `f.object` is the one FormBuilder method used in EXPRESSION

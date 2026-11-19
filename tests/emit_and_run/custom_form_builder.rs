@@ -165,14 +165,23 @@ puts "field helpers passed"
     assert!(run.stdout.contains("field helpers passed"), "{}", run.stdout);
 }
 
-/// Rails hands `fields_for` the form's `builder:`, so a nested `text_field` runs the override too; the lowering
-/// writes nested fields as the base's, and reports them rather than drop the wrapper.
+/// Rails hands `fields_for` the form's `builder:`, so a nested `text_field` runs the override too, on a builder for
+/// the nested name. Expected strings are Rails 8.1.4's.
 #[test]
-fn an_override_inside_fields_for_is_reported() {
-    let form = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.fields_for :comments do |nested| %>\n<%= nested.text_field :body %>\n<% end %>\n<% end %>\n";
-    let (_, errors) = emit_and_run::real_blog()
+fn an_override_inside_fields_for_runs_on_the_nested_builder() {
+    let form = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.fields_for :meta, article do |nested| %>\n<%= nested.text_field :title %>\n<% end %>\n<% end %>\n";
+    let run = emit_and_run::real_blog()
         .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
         .write("app/views/articles/_form.html.erb", form)
-        .emit(roundhouse::build_target::BuildTarget::Ruby);
-    assert!(errors.iter().any(|e| e.contains("custom form builder fields_for") && e.contains("nested.text_field")), "{errors:#?}");
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+[
+  "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"Hi\" name=\"article[meta][title]\" id=\"article_meta_title\" /></div>",
+].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
+puts "nested passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("nested passed"), "{}", run.stdout);
 }

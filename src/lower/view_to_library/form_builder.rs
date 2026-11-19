@@ -1314,12 +1314,30 @@ fn emit_fields_for(
         },
     )];
 
+    let model_name = format!("{}[{}]", binding.model_name, nested.as_str());
+    // Rails' `fields_for` builds the parent's `builder:` again: an override runs on that object, as the form's do.
+    if let Some(builder) = &binding.builder {
+        let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
+        let args = vec![
+            lit_str(model_name.clone()),
+            Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() }),
+            template,
+            Expr::new(Span::synthetic(), ExprNode::Hash { entries: Vec::new(), kwargs: false }),
+        ];
+        out.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: super::LValue::Var { id: VarId(0), name: nested_param.clone() },
+                value: send(Some(builder.clone()), "new", args, None, true),
+            },
+        ));
+    }
     let mut inner = ctx.with_locals([nested_param_str.clone()]);
     inner.form_records.push(FormBuilderBinding {
-        // Not the parent builder's overrides: the nested builder is no object here, so a call on it could reach none.
-        overridden: Default::default(),
+        overridden: if binding.builder.is_some() { binding.overridden.clone() } else { Default::default() },
+        builder: binding.builder.clone(),
         form_param: nested_param_str.clone(),
-        model_name: format!("{}[{}]", binding.model_name, nested.as_str()),
+        model_name,
         model_class: if positional.get(1).is_some() {
             super::form_with::form_model_class(&record_expr, "", ctx)
         } else {

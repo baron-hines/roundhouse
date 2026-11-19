@@ -970,6 +970,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             id_prefix: binding.id_prefix.clone(),
             recordless: false,
             overridden: Default::default(),
+            builder: None,
         });
         let record_ref = Expr::new(
             Span::synthetic(),
@@ -5221,6 +5222,8 @@ pub(super) struct FormBuilderBinding {
     pub(super) recordless: bool,
     /// The stock fields the form's own builder defines again, which run on it rather than inline.
     pub(super) overridden: crate::det::HashSet<String>,
+    /// The form's `builder:` class when it overrides a stock field, which a `fields_for` inside builds again.
+    pub(super) builder: Option<Expr>,
 }
 
 impl FormBuilderBinding {
