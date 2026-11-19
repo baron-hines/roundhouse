@@ -112,13 +112,30 @@ fn rails_answers(url: &str, search_path: &str, schema: &str, test_schema: &str) 
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Runs `sql` against `url` when dropped, so a run that panics still
+/// removes its schemas, and the extension in them, before the next run.
+struct DropOnExit<'a> {
+    url: &'a str,
+    sql: String,
+}
+
+impl Drop for DropOnExit<'_> {
+    fn drop(&mut self) {
+        // No assertion here: this also runs while a failed assertion unwinds.
+        let _ = std::process::Command::new("ruby").args(["-rpg", "-e", "PG.connect(ARGV[0]).exec(ARGV[1])", self.url, &self.sql]).output();
+    }
+}
+
 /// Boot (`Main.configure_default_adapter!`) on an empty schema creates
 /// the extension, so the model's SQL reaches its function, as it does on
 /// Rails after `db:schema:load`. Both forms run in this one test, one
 /// after the other: an extension is one per database, so two tests
 /// creating pgcrypto at once would race. Rails runs first on each form,
 /// in a schema of its own, which is dropped (with the extension) before
-/// the emitted app boots.
+/// the emitted app boots, also when the run fails. Each run first drops
+/// any pgcrypto already in the database: `CREATE EXTENSION IF NOT EXISTS`
+/// would keep one left in another schema (by a run that was killed), off
+/// this run's search path.
 #[test]
 fn boot_creates_the_extension_the_models_sql_calls() {
     let Some(db) = pg_test_url::pg_test_db("postgresql_schema_extensions") else { return };
@@ -143,11 +160,11 @@ fn boot_creates_the_extension_the_models_sql_calls() {
                 ("  enable_extension \"pgcrypto\"".to_string(), schema.clone())
             };
             let schema_rb = schema_rb(&preamble);
-            on_server(format!("CREATE SCHEMA {schema}"));
-            let drop = || on_server(format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP SCHEMA IF EXISTS {ext_schema} CASCADE"));
+            on_server(format!("DROP EXTENSION IF EXISTS pgcrypto CASCADE; CREATE SCHEMA {schema}"));
+            let cleanup = DropOnExit { url: &db.url, sql: format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP SCHEMA IF EXISTS {ext_schema} CASCADE") };
             let answers = if side == "rails" {
                 let answers = rails_answers(&db.url, &search_path, &schema_rb, &schema);
-                drop();
+                drop(cleanup);
                 answers
             } else {
                 let options = format!("-c search_path={search_path}");
@@ -155,7 +172,7 @@ fn boot_creates_the_extension_the_models_sql_calls() {
                     PROBE,
                     &[("DATABASE_URL", db.url.as_str()), ("PGOPTIONS", options.as_str()), ("RH_TEST_SCHEMA", schema.as_str())],
                 );
-                drop();
+                drop(cleanup);
                 run.assert_passes();
                 Some(run.stdout.clone())
             };
@@ -221,7 +238,7 @@ fn a_cascading_disable_is_refused() {
 /// the dropped schema, and a `public` table's `citext` column. The fold
 /// can't tell what depends on an extension, so dropping a schema that
 /// holds one is refused, like `disable_extension ..., force: :cascade`.
-/// A schema with no recorded extension still drops.
+/// A schema that holds none of the recorded extensions still drops.
 #[test]
 fn drop_schema_with_an_extension_in_it_is_refused() {
     for body in [
@@ -231,8 +248,62 @@ fn drop_schema_with_an_extension_in_it_is_refused() {
         let error = folded_database_objects(body).expect_err("dropping a schema that holds an extension is refused");
         assert!(error.contains("drop_schema \"extensions\""), "{error}");
     }
-    let ddl = folded_database_objects("    create_schema \"reports\"\n    enable_extension \"pgcrypto\"\n    drop_schema \"reports\"");
-    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string()]));
+    let ddl = folded_database_objects("    create_schema \"reports\"\n    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"\n    drop_schema \"reports\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE SCHEMA IF NOT EXISTS "extensions""#.to_string(), r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto" SCHEMA extensions"#.to_string()]));
+}
+
+/// Rails writes an extension's schema unquoted (`SCHEMA EXTENSIONS`), so
+/// PostgreSQL folds it to lowercase, while `create_schema` and
+/// `drop_schema` quote theirs. On ActiveRecord 8.1.4.1 with PostgreSQL 18,
+/// `enable_extension "EXTENSIONS.pgcrypto"` installs into `extensions`,
+/// `enable_extension '"Ext".pgcrypto'` into `Ext`, and `drop_schema` of
+/// either takes the extension.
+#[test]
+fn an_extension_schema_is_matched_as_postgresql_reads_it() {
+    for (body, dropped) in [
+        ("    create_schema \"extensions\"\n    enable_extension \"EXTENSIONS.pgcrypto\"\n    drop_schema \"extensions\"", "drop_schema \"extensions\""),
+        ("    create_schema \"Ext\"\n    enable_extension '\"Ext\".pgcrypto'\n    drop_schema \"Ext\"", "drop_schema \"Ext\""),
+    ] {
+        let error = folded_database_objects(body).expect_err("the dropped schema holds the extension");
+        assert!(error.contains(dropped), "{error}");
+    }
+}
+
+/// An unqualified `enable_extension` installs into the first schema on the
+/// search path, which the fold does not know. On ActiveRecord 8.1.4.1 with
+/// PostgreSQL 18, `enable_extension "pgcrypto"`, `create_schema "public",
+/// force: true`, `create_schema "extensions"`, `enable_extension
+/// "extensions.pgcrypto"` leaves pgcrypto in `extensions` only. So
+/// dropping any schema while an unqualified extension is recorded is
+/// refused.
+#[test]
+fn dropping_a_schema_with_an_unqualified_extension_recorded_is_refused() {
+    let error = folded_database_objects("    enable_extension \"pgcrypto\"\n    create_schema \"public\", force: true\n    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"")
+        .expect_err("public may hold the unqualified pgcrypto");
+    assert!(error.contains("create_schema \"public\" with force:") && error.contains("pgcrypto"), "{error}");
+    let error = folded_database_objects("    create_schema \"reports\"\n    enable_extension \"pgcrypto\"\n    drop_schema \"reports\"")
+        .expect_err("reports may be first on the search path");
+    assert!(error.contains("drop_schema \"reports\""), "{error}");
+}
+
+/// A name the fold can't read (`disable_extension target`) still runs on
+/// Rails: on ActiveRecord 8.1.4.1, `enable_extension "pgcrypto"; target =
+/// "pgcrypto"; disable_extension target` leaves no extension. Skipping it
+/// would keep the recorded one, so a destructive call with such a name is
+/// refused once there is something it could remove; with nothing recorded
+/// it changes nothing the fold holds.
+#[test]
+fn a_destructive_call_with_a_name_the_fold_cannot_read_is_refused() {
+    for (body, call) in [
+        ("    enable_extension \"pgcrypto\"\n    target = \"pgcrypto\"\n    disable_extension target", "disable_extension"),
+        ("    create_schema \"extensions\"\n    target = \"extensions\"\n    drop_schema target", "drop_schema"),
+        ("    create_schema \"extensions\"\n    target = \"extensions\"\n    create_schema target, force: true", "create_schema"),
+    ] {
+        let error = folded_database_objects(body).expect_err("a destructive call with an unread name is refused");
+        assert!(error.contains(call) && error.contains("name"), "{error}");
+    }
+    let ddl = folded_database_objects("    target = \"pgcrypto\"\n    disable_extension target\n    enable_extension \"citext\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "citext""#.to_string()]));
 }
 
 /// `create_schema "x", force: true` is `drop_schema "x", if_exists: true`
