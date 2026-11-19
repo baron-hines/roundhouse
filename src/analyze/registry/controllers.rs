@@ -259,7 +259,47 @@ pub(in crate::analyze) fn register(
     // the name resolve. The `Pagy` surface below is `pagy.rbs` verbatim;
     // a method that is not listed (`page_url`, `in`, `options`, the `_js`
     // helpers, ...) is "no known method on Pagy" -- the refusal.
-    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) {
+    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) && crate::ingest::pagy_locked_before_43(app) {
+        // pagy9.rb: the API before 43, beside the extras the initializers load.
+        app_ctrl.class_methods.insert(Symbol::from("pagy"), Ty::Untyped);
+        if app.pagy.array {
+            app_ctrl.class_methods.insert(Symbol::from("pagy_array"), Ty::Untyped);
+        }
+        let nullable_int = Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
+        let mut pagy = ClassInfo::default();
+        let series_item = Ty::Union { variants: vec![Ty::Int, Ty::Str, Ty::Sym].into() };
+        let Ty::Union { variants: param } = param_value_ty(true) else { unreachable!() };
+        let var = Ty::Union { variants: std::iter::once(Ty::Int).chain(param.iter().cloned()).collect::<Vec<_>>().into() };
+        for (m, ty) in [
+            ("page", Ty::Int),
+            ("limit", Ty::Int),
+            ("count", Ty::Int),
+            ("offset", Ty::Int),
+            ("last", Ty::Int),
+            ("pages", Ty::Int),
+            ("from", Ty::Int),
+            ("to", Ty::Int),
+            ("in", Ty::Int),
+            ("prev", nullable_int.clone()),
+            ("next", nullable_int),
+            ("series", Ty::Array { elem: std::sync::Arc::new(series_item) }),
+            ("vars", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(var) }),
+        ] {
+            pagy.instance_methods.insert(Symbol::from(m), ty);
+        }
+        classes.insert(ClassId(Symbol::from("Pagy")), pagy);
+        for module in ["Pagy::Backend", "Pagy::Frontend"] {
+            let mut info = ClassInfo::default();
+            info.is_module = true;
+            classes.insert(ClassId(Symbol::from(module)), info);
+        }
+        let mut variable_error = ClassInfo::default();
+        variable_error.parent = Some(ClassId(Symbol::from("ArgumentError")));
+        classes.insert(ClassId(Symbol::from("Pagy::VariableError")), variable_error);
+        let mut overflow_error = ClassInfo::default();
+        overflow_error.parent = Some(ClassId(Symbol::from("Pagy::VariableError")));
+        classes.insert(ClassId(Symbol::from("Pagy::OverflowError")), overflow_error);
+    } else if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) {
         app_ctrl.class_methods.insert(Symbol::from("pagy"), Ty::Untyped);
         let nullable_int = Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
         let mut pagy = ClassInfo::default();
