@@ -1813,9 +1813,10 @@ module ActiveSupport
       sign = text[i] == "-" ? "-" : ""
       i = i + 1
     end
-    rest = text[i, n].to_s
-    return sign + "Infinity" if rest.start_with?("Infinity")
-    return "NaN" if sign.empty? && rest.start_with?("NaN")
+    # A special value only as the whole rest (trailing whitespace allowed): `"Infinityjunk"` reads as a zero.
+    rest = text[i, n].to_s.rstrip
+    return sign + "Infinity" if rest == "Infinity"
+    return "NaN" if sign.empty? && rest == "NaN"
     int_part = loose_digits(text, i)
     i = loose_digits_end(text, i)
     frac_part = ""
@@ -1825,7 +1826,7 @@ module ActiveSupport
     end
     return sign + "0" if int_part.empty? && frac_part.empty?
     exponent = ""
-    if i < n && (text[i] == "e" || text[i] == "E")
+    if i < n && (text[i] == "e" || text[i] == "E" || text[i] == "d" || text[i] == "D")
       j = i + 1
       exp_sign = ""
       if j < n && (text[j] == "+" || text[j] == "-")
