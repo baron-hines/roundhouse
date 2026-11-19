@@ -835,6 +835,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // is carried so the census and the unknown-gem attribution can
     // read it beside the diagnostics.
     let lock_path = dir.join("Gemfile.lock");
+    super::library_class::set_actionview_major(None);
     if vfs.exists(&lock_path) {
         if let Ok(text) = vfs.read_to_string(&lock_path) {
             let mut lock = crate::gems::Lockfile::parse(&text);
@@ -845,6 +846,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             lock.source.extend(auto_sourced.iter().cloned());
             app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
+                let version = lock.specs.iter().find(|(n, _)| n == "actionview").or_else(|| lock.specs.iter().find(|(n, _)| n == "rails"));
+                super::library_class::set_actionview_major(version.and_then(|(_, v)| v.split('.').next()?.parse().ok()));
                 app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock, &app.extensions);
             }
         }

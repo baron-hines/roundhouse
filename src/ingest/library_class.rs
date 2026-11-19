@@ -29,6 +29,12 @@ struct IncludedHoist {
 
 thread_local! {
     static INCLUDED_HOISTS: std::cell::RefCell<Vec<IncludedHoist>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The app's actionview major version from its `Gemfile.lock`, which `field_helpers`' spelling follows.
+    static ACTIONVIEW_MAJOR: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn set_actionview_major(major: Option<u32>) {
+    ACTIONVIEW_MAJOR.with(|m| m.set(major));
 }
 
 /// The hoisted defs a module the same `included do` includes also defines: Ruby defines the block's
@@ -4615,14 +4621,26 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
     (kept, evaled)
 }
 
-/// Rails 8.1's `FormBuilder.field_helpers`, the list the runtime's builder carries (Rails 7.2 spelled
-/// `text_area`/`check_box`, which 8.x keeps as aliases of `textarea`/`checkbox`).
+/// Rails 8's `FormBuilder.field_helpers`, also the list without a lockfile; Rails 7 spells two of them
+/// `text_area`/`check_box`, which 8 keeps as aliases of `textarea`/`checkbox`.
 pub(crate) const FORM_BUILDER_FIELD_HELPERS: [&str; 24] = [
     "fields_for", "fields", "label", "text_field", "password_field", "hidden_field", "file_field", "textarea", "checkbox",
     "radio_button", "color_field", "search_field", "telephone_field", "phone_field", "date_field", "time_field",
     "datetime_field", "datetime_local_field", "month_field", "week_field", "url_field", "email_field", "number_field",
     "range_field",
 ];
+
+fn form_builder_field_helpers() -> Vec<String> {
+    let rails7 = ACTIONVIEW_MAJOR.with(|m| m.get()).is_some_and(|major| major < 8);
+    FORM_BUILDER_FIELD_HELPERS
+        .iter()
+        .map(|h| match *h {
+            "textarea" if rails7 => "text_area".to_string(),
+            "checkbox" if rails7 => "check_box".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
 
 /// The literal list a node names: an Array of Strings or Symbols, a FormBuilder's `field_helpers` (unless the class
 /// defines its own), or one list less another (`field_helpers - [:label]`, maybe's `StyledFormBuilder`). Each name
@@ -4642,7 +4660,7 @@ fn static_name_list(node: &ruby_prism::Node<'_>, framework_helpers: bool) -> Opt
     let call = node.as_call_node()?;
     let name = constant_id_str(&call.name());
     if name == "field_helpers" && framework_helpers && call.receiver().is_none() && call.arguments().is_none() && call.block().is_none() {
-        return Some(FORM_BUILDER_FIELD_HELPERS.iter().map(|s| (true, s.to_string())).collect());
+        return Some(form_builder_field_helpers().into_iter().map(|s| (true, s)).collect());
     }
     if name == "-" {
         let left = static_name_list(&call.receiver()?, framework_helpers)?;

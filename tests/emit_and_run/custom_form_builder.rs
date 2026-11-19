@@ -185,3 +185,24 @@ puts "nested passed"
     run.assert_passes();
     assert!(run.stdout.contains("nested passed"), "{}", run.stdout);
 }
+
+/// The same builder in a Rails 7.2 app (its `Gemfile.lock`): `field_helpers` spells `text_area`/`check_box` there, so
+/// the loop overrides `text_area`, which Rails 7.2 renders wrapped. Expected strings are actionview 7.2.3.1's.
+#[test]
+fn a_field_helpers_loop_follows_the_apps_rails_version() {
+    let run = emit_and_run::real_blog()
+        .edit("Gemfile.lock", "    actionview (8.1.4)\n", "    actionview (7.2.3.1)\n")
+        .edit("Gemfile.lock", "    rails (8.1.4)\n", "    rails (7.2.3.1)\n")
+        .write("app/helpers/styled_probe_builder.rb", &FIELD_HELPERS_BUILDER.replace(":checkbox, :radio_button", ":check_box, :radio_button"))
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: StyledProbeBuilder) do |form| %>\n<%= form.text_area :body %>\n<% end %>\n")
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = "<div class=\"field\"><textarea name=\"article[body]\" id=\"article_body\">\nBody</textarea></div>"
+raise "missing #{want}:\n#{io}" unless io.include?(want)
+puts "rails 7 passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("rails 7 passed"), "{}", run.stdout);
+}

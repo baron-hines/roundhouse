@@ -141,14 +141,16 @@ module ActionView
     class FormBuilder
       attr_reader :object, :object_name, :options, :index
 
-      # Rails 8.1's `class_attribute :field_helpers` (`ingest::library_class::FORM_BUILDER_FIELD_HELPERS`).
+      # Rails' `class_attribute :field_helpers` (`ingest::library_class::FORM_BUILDER_FIELD_HELPERS`): the app's
+      # Rails 7 spells two of them `text_area`/`check_box`, which Rails 8 keeps as aliases.
       FIELD_HELPERS = %i[fields_for fields label text_field password_field hidden_field file_field textarea checkbox
                          radio_button color_field search_field telephone_field phone_field date_field time_field
                          datetime_field datetime_local_field month_field week_field url_field email_field number_field
                          range_field].freeze
+      RAILS7_FIELD_HELPERS = FIELD_HELPERS.map { |h| { textarea: :text_area, checkbox: :check_box }.fetch(h, h) }.freeze
 
       def self.field_helpers
-        FIELD_HELPERS
+        defined?(Rails::VERSION::MAJOR) && Rails::VERSION::MAJOR < 8 ? RAILS7_FIELD_HELPERS : FIELD_HELPERS
       end
 
       def field_helpers
