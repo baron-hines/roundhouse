@@ -28,32 +28,76 @@ use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{Symbol, VarId};
 
 pub(super) fn specialize(app: &mut App) {
-    let mut copies: Vec<View> = Vec::new();
-    let mut next = 0usize;
     let snapshot: Vec<View> = app.views.clone();
+    let mut next = 0usize;
     let mut spans = Vec::new();
-    for view in &mut app.views {
-        let dir = view.name.as_str().rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
-        let format = view.format.clone();
-        rewrite(&mut view.body, &dir, &format, &snapshot, &mut copies, &mut next, &mut spans);
+    // A copy holds the partial's own block renders, and an outer block's body an inner one: each round rewrites the
+    // copies the last made, up to a depth no wrapper-in-wrapper nesting reaches.
+    let mut pending: Vec<usize> = (0..app.views.len()).collect();
+    for _ in 0..8 {
+        if pending.is_empty() {
+            break;
+        }
+        let mut copies: Vec<View> = Vec::new();
+        for i in pending {
+            let view = &mut app.views[i];
+            let dir = view.name.as_str().rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+            let format = view.format.clone();
+            let mut counts = Counts::default();
+            names(&view.body, &mut counts);
+            let mut cx = Cx { dir: &dir, format: &format, views: &snapshot, caller: &counts, copies: &mut copies, next: &mut next, spans: &mut spans };
+            rewrite(&mut view.body, &mut cx);
+        }
+        let base = app.views.len();
+        app.views.extend(copies);
+        pending = (base..app.views.len()).collect();
     }
-    app.views.extend(copies);
     app.yield_specialized = spans;
 }
 
-fn rewrite(e: &mut Expr, dir: &str, format: &Symbol, views: &[View], copies: &mut Vec<View>, next: &mut usize, spans: &mut Vec<crate::span::Span>) {
-    if let ExprNode::Seq { exprs } = &mut *e.node {
-        for stmt in exprs.iter_mut() {
-            if let Some((new, span)) = specialized(stmt, dir, format, views, copies, next) {
-                *stmt = new;
-                spans.push(span);
-            } else {
-                rewrite(stmt, dir, format, views, copies, next, spans);
-            }
-        }
+type Counts = crate::det::HashMap<String, usize>;
+
+struct Cx<'a> {
+    dir: &'a str,
+    format: &'a Symbol,
+    views: &'a [View],
+    /// Every name the caller's body reads or binds, with how often: one the block binds that also occurs outside it
+    /// is the caller's own local, which the block writes.
+    caller: &'a Counts,
+    copies: &'a mut Vec<View>,
+    next: &'a mut usize,
+    spans: &'a mut Vec<crate::span::Span>,
+}
+
+fn rewrite(e: &mut Expr, cx: &mut Cx) {
+    if let Some((new, span)) = specialized(e, cx) {
+        *e = new;
+        cx.spans.push(span);
         return;
     }
-    e.node.for_each_child_mut(&mut |c| rewrite(c, dir, format, views, copies, next, spans));
+    e.node.for_each_child_mut(&mut |c| rewrite(c, cx));
+}
+
+fn names(e: &Expr, out: &mut Counts) {
+    let mut add = |n: &str| *out.entry(n.to_string()).or_default() += 1;
+    match &*e.node {
+        ExprNode::Var { name, .. } => add(name.as_str()),
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => add(name.as_str()),
+        ExprNode::MultiAssign { targets, .. } => {
+            for t in targets {
+                if let LValue::Var { name, .. } = t {
+                    add(name.as_str());
+                }
+            }
+        }
+        ExprNode::Lambda { params, .. } => {
+            for p in params {
+                add(p.as_str());
+            }
+        }
+        _ => {}
+    }
+    e.node.for_each_child(&mut |c| names(c, out));
 }
 
 /// `_buf = _buf + (<call>).to_s`'s `<call>`.
@@ -84,7 +128,8 @@ fn str_lit(e: &Expr) -> Option<&str> {
     }
 }
 
-fn specialized(stmt: &Expr, dir: &str, format: &Symbol, views: &[View], copies: &mut Vec<View>, next: &mut usize) -> Option<(Expr, crate::span::Span)> {
+fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
+    let (dir, format, views) = (cx.dir, cx.format, cx.views);
     let call = appended(stmt)?;
     let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else { return None };
     if method.as_str() != "render" {
@@ -130,11 +175,18 @@ fn specialized(stmt: &Expr, dir: &str, format: &Symbol, views: &[View], copies: 
     if params.len() > 1 && yields.iter().any(|n| *n == 1) {
         return None;
     }
-    let k = *next;
-    *next += 1;
-    let renamed = |n: &str| Symbol::from(format!("__yield{k}_{n}"));
-    let mut bound: crate::det::HashSet<String> = params.iter().map(|p| p.as_str().to_string()).collect();
+    let mut bound: crate::det::HashSet<String> = crate::det::HashSet::default();
     binders(body, &mut bound);
+    let mut inside = Counts::default();
+    names(block, &mut inside);
+    // Not a block writing the caller's local (`total += 1`): renamed apart, the write would miss it.
+    if bound.iter().any(|n| n != "_buf" && cx.caller.get(n).copied().unwrap_or(0) > inside.get(n).copied().unwrap_or(0)) {
+        return None;
+    }
+    let k = *cx.next;
+    *cx.next += 1;
+    let renamed = |n: &str| Symbol::from(format!("__yield{k}_{n}"));
+    bound.extend(params.iter().map(|p| p.as_str().to_string()));
     let mut free: Vec<String> = Vec::new();
     reads(body, &mut |n| {
         if n != "_buf" && !bound.contains(n) && !free.iter().any(|f| f == n) {
@@ -152,7 +204,7 @@ fn specialized(stmt: &Expr, dir: &str, format: &Symbol, views: &[View], copies: 
             strict.push(crate::dialect::Param { name: renamed(n), default: None, keyword: true, rest: false, forwarding: false, from_keyword: false, from_kwrest: false });
         }
     }
-    copies.push(copy);
+    cx.copies.push(copy);
     let span = call.span;
     let mut entries = locals;
     for n in &free {

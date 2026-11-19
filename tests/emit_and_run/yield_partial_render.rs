@@ -83,3 +83,44 @@ fn other_yields_stay_reported() {
         assert!(errors.iter().any(|e| e.contains("render with a block")), "{partial} {call}: {errors:#?}");
     }
 }
+
+/// A block render alone in a loop body, one inside another's block, and a
+/// block writing the caller's local (left to the captured-string path,
+/// which closes over it, as Rails' block does).
+fn nested_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/views/articles/_box.html.erb", "<u><%= yield %></u>")
+        .edit(
+            "app/views/articles/show.html.erb",
+            "    <p class=\"text-gray-700\">",
+            "<em id=\"loop\"><% [1, 2].each do |i| %><%= render \"articles/box\" do %>L<%= i %><% end %><% end %></em>\
+<em id=\"nest\"><%= render \"articles/box\" do %><%= render \"articles/box\" do %>N<% end %><% end %></em>\
+<% total = 0 %><em id=\"write\"><%= render \"articles/box\" do %>W<% total += 1 %><% end %><%= total %></em>\n    <p class=\"text-gray-700\">",
+        )
+}
+
+const NESTED_WANT: &[&str] = &[
+    "<em id=\"loop\"><u>L1</u><u>L2</u></em>",
+    "<em id=\"nest\"><u><u>N</u></u></em>",
+    "<em id=\"write\"><u>W</u>1</em>",
+];
+
+fn nested_assertions(page: &str) -> String {
+    let checks: String = NESTED_WANT.iter().map(|w| format!("raise body[0, 3000] unless body.include?({w:?})\n")).collect();
+    format!("{page}\nhello = Article.create!(title: \"Hello\", body: \"Body text here\")\nbody = page(hello.id)\n{checks}puts \"nested yield passed\"\n")
+}
+
+#[test]
+fn nested_and_looped_block_renders_run() {
+    let run = nested_app().run_ruby(&nested_assertions(RUBY_PAGE));
+    run.assert_passes();
+    assert!(run.stdout.contains("nested yield passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nested_and_looped_block_renders_run_on_spinel() {
+    let run = nested_app().run_spinel_with_db(&nested_assertions(SPINEL_PAGE));
+    run.assert_passes();
+    assert!(run.stdout.contains("nested yield passed"), "{}", run.stdout);
+}
