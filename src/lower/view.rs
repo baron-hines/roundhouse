@@ -1090,12 +1090,16 @@ pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
 /// The stock fields each app builder (`class StyledFormBuilder < ActionView::Helpers::FormBuilder`) or a builder it
 /// descends from defines again, keyed by the builder's class path: Rails dispatches them to that override.
 pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    form_builder_overrides_in(&app.library_classes)
+}
+
+pub fn form_builder_overrides_in(classes: &[crate::dialect::LibraryClass]) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
     // Every declaration of a name is one class: a reopening names no superclass, and its methods are the class's.
     let decls = |id: &crate::ident::ClassId| -> Vec<&crate::dialect::LibraryClass> {
-        app.library_classes.iter().filter(|l| l.name == *id).collect()
+        classes.iter().filter(|l| l.name == *id).collect()
     };
     let mut out: crate::det::HashMap<String, crate::det::HashSet<String>> = crate::det::HashMap::default();
-    let mut names: Vec<&crate::ident::ClassId> = app.library_classes.iter().map(|c| &c.name).collect();
+    let mut names: Vec<&crate::ident::ClassId> = classes.iter().map(|c| &c.name).collect();
     names.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     names.dedup();
     for name in names {

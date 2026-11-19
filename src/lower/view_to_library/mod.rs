@@ -362,7 +362,7 @@ impl<'a> ViewLowerCtx<'a> {
             bool_readers: std::rc::Rc::new(bool_reader_names(app)),
             time_columns: std::rc::Rc::new(time_column_names(app)),
             store_readers: std::rc::Rc::new(store_reader_names(app)),
-            partial_form_bindings: partial_form_bindings(&app.views),
+            partial_form_bindings: partial_form_bindings(&app.views, &app.library_classes),
             i18n: std::rc::Rc::new(crate::i18n::FormI18n::of(app)),
             route_helper_names: std::rc::Rc::new(
                 route_helpers.iter().map(|(n, _)| n.clone()).collect(),
@@ -378,7 +378,7 @@ impl<'a> ViewLowerCtx<'a> {
                     .collect(),
             ),
             route_helper_arity: std::rc::Rc::new(route_helpers.into_iter().collect()),
-            strict_locals: std::rc::Rc::new(strict_locals_by_key(&app.views)),
+            strict_locals: std::rc::Rc::new(strict_locals_by_key(&app.views, &app.library_classes)),
             yielding_partials: std::rc::Rc::new(yielding),
             collection_element_locals: std::rc::Rc::new(element_locals),
             form_wrappers: std::rc::Rc::new(form_wrapper_helpers(app)),
@@ -630,7 +630,8 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     let form_binding = (is_partial)
         .then(|| view_key.as_ref().and_then(|k| lx.partial_form_bindings.get(k)))
         .flatten();
-    if let Some(binding) = form_binding {
+    // A builder that overrides a stock field is the caller's object, which the partial takes.
+    if let Some(binding) = form_binding.filter(|b| b.builder.is_none()) {
         extra_params.retain(|k| k != &binding.form_local);
     }
     // An extra is a positional param, and a positional param cannot have
@@ -753,7 +754,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // callers bind provided keyword locals by name, omitted ones default.
     // Not the declared form local of a bound partial: its `f.*` calls inline at compile time, and a caller has no builder to pass.
     let strict_without_form = view.strict_locals.as_ref().map(|sl| {
-        sl.iter().filter(|p| form_binding.is_none_or(|b| p.name.as_str() != b.form_local)).cloned().collect::<Vec<Param>>()
+        sl.iter().filter(|p| form_binding.is_none_or(|b| b.builder.is_some() || p.name.as_str() != b.form_local)).cloned().collect::<Vec<Param>>()
     });
     if let Some(sl) = strict_without_form.as_ref().filter(|sl| is_partial && !sl.is_empty()) {
         use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
@@ -982,26 +983,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             overridden: overridden.clone(),
             builder: builder.clone(),
         });
-        // The form's `builder:` again when it overrides a stock field, for those calls to run on, as `fields_for` does.
-        if let Some(builder) = builder {
-            let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
-            let args = vec![
-                lit_str(binding.model_name.clone()),
-                Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(binding.record_local.as_str()) }),
-                template,
-                Expr::new(Span::synthetic(), ExprNode::Hash {
-                    entries: binding.builder_options.iter().map(|(k, v)| (lit_sym(k.clone()), Expr::new(Span::synthetic(), ExprNode::Lit { value: v.clone() }))).collect(),
-                    kwargs: false,
-                }),
-            ];
-            prelude.push(Expr::new(
-                Span::synthetic(),
-                ExprNode::Assign {
-                    target: LValue::Var { id: VarId(0), name: Symbol::from(binding.form_local.as_str()) },
-                    value: send(Some(builder), "new", args, None, true),
-                },
-            ));
-        }
+
         let record_ref = Expr::new(
             Span::synthetic(),
             ExprNode::Var { id: VarId(0), name: record_var },
@@ -2441,8 +2423,10 @@ pub(crate) struct PartialFormBinding {
 
 pub(crate) fn partial_form_bindings(
     views: &[View],
+    library_classes: &[crate::dialect::LibraryClass],
 ) -> crate::det::HashMap<ViewKey, PartialFormBinding> {
     use crate::det::{HashMap, HashSet};
+    let overrides = crate::lower::view::form_builder_overrides_in(library_classes);
 
     // A "simple reference" — the shapes a form's record expr and a
     // locals value can share (`@story`, a bare local).
@@ -2602,6 +2586,7 @@ pub(crate) fn partial_form_bindings(
         e: &Expr,
         own_dir: Option<&str>,
         stems: &PartialStems,
+        overrides: &crate::det::HashMap<String, crate::det::HashSet<String>>,
         out: &mut Vec<(ViewKey, PartialFormBinding)>,
     ) {
         if let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*e.node {
@@ -2644,8 +2629,10 @@ pub(crate) fn partial_form_bindings(
                                             }
                                         }
                                         "builder" => {
+                                            // Only a builder that overrides a stock field: the partial then takes the object itself.
                                             if let ExprNode::Const { path } = &*v.node {
-                                                scope.builder = Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"));
+                                                let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                                                scope.builder = overrides.contains_key(&name).then_some(name);
                                             }
                                         }
                                         "namespace" => {
@@ -2674,7 +2661,7 @@ pub(crate) fn partial_form_bindings(
                 }
             }
         }
-        e.node.for_each_child(&mut |c| seed_scopes(c, own_dir, stems, out));
+        e.node.for_each_child(&mut |c| seed_scopes(c, own_dir, stems, overrides, out));
     }
 
     let stems = PartialStems::of(views);
@@ -2682,7 +2669,7 @@ pub(crate) fn partial_form_bindings(
     for v in views {
         let (dir, _) = split_view_name(v.name.as_str());
         let own = (!dir.is_empty()).then_some(dir);
-        seed_scopes(&v.body, own, &stems, &mut edges);
+        seed_scopes(&v.body, own, &stems, &overrides, &mut edges);
     }
 
     let mut out: HashMap<ViewKey, PartialFormBinding> = HashMap::default();
@@ -2873,7 +2860,7 @@ pub(crate) fn render_locals_keys(
     // every `f.*` call at compile time, so neither the nil-default
     // param nor the call-site arg should exist (the arg would be a
     // NameError — no FormBuilder object is ever constructed).
-    for (key, binding) in partial_form_bindings(views) {
+    for (key, binding) in partial_form_bindings(views, library_classes).into_iter().filter(|(_, b)| b.builder.is_none()) {
         if let Some(set) = acc.get_mut(&key) {
             set.remove(&binding.form_local);
         }
@@ -3106,7 +3093,7 @@ pub(crate) fn partial_call_contracts(
     let (collection_locals, _) = collection_element_locals_from_views(views, &stems);
     let ivar_records = ivar_record_partials(views, controllers, library_classes);
     let request_context = request_context_views(views);
-    let form_bindings = partial_form_bindings(views);
+    let form_bindings = partial_form_bindings(views, library_classes);
     let mut out = crate::det::HashMap::default();
     for view in views {
         let (dir, base) = split_view_name(view.name.as_str());
@@ -3121,7 +3108,7 @@ pub(crate) fn partial_call_contracts(
         let spelled = (module, base.trim_start_matches('_').to_string());
         // Strict locals declare the whole contract: the first local is
         // the positional record, the rest are keywords.
-        let form_local = form_bindings.get(&key).map(|b| b.form_local.as_str());
+        let form_local = form_bindings.get(&key).filter(|b| b.builder.is_none()).map(|b| b.form_local.as_str());
         if let Some(sl) = view.strict_locals.as_ref().filter(|sl| sl.iter().any(|p| Some(p.name.as_str()) != form_local)) {
             // Not the declared form local: the def drops it (`strict_without_form`), so a caller passing it would hand over an unknown keyword.
             let declared: Vec<String> = sl
@@ -3583,9 +3570,11 @@ pub(super) fn partial_extras_map(
     // Mirror the def site's bound-form-local drop (the defined?-extras
     // channel re-adds it here otherwise, and the call site would pass
     // an arg the def no longer has).
-    for (key, binding) in partial_form_bindings(&app.views) {
+    for (key, binding) in partial_form_bindings(&app.views, &app.library_classes) {
         if let Some(extras) = out.get_mut(&key) {
-            extras.retain(|k| k != &binding.form_local);
+            if binding.builder.is_none() {
+                extras.retain(|k| k != &binding.form_local);
+            }
         }
     }
     out
@@ -4176,14 +4165,14 @@ pub(crate) fn dynamic_partial_pools(
 /// look up whether the target declares strict locals, which closure
 /// ivars to suppress, and which names it binds by keyword. Consumers
 /// skip index 0 (the positional record) when binding keywords.
-fn strict_locals_by_key(views: &[View]) -> crate::det::HashMap<ViewKey, Vec<Param>> {
+fn strict_locals_by_key(views: &[View], library_classes: &[crate::dialect::LibraryClass]) -> crate::det::HashMap<ViewKey, Vec<Param>> {
     let stems = PartialStems::of(views);
-    let bindings = partial_form_bindings(views);
+    let bindings = partial_form_bindings(views, library_classes);
     let mut out = crate::det::HashMap::default();
     for v in views {
         let Some(sl) = v.strict_locals.as_ref() else { continue };
         let Some(key) = view_key_of(v, &stems) else { continue };
-        let form_local = bindings.get(&key).map(|b| b.form_local.as_str());
+        let form_local = bindings.get(&key).filter(|b| b.builder.is_none()).map(|b| b.form_local.as_str());
         let declared: Vec<_> = sl.iter().filter(|p| Some(p.name.as_str()) != form_local).cloned().collect();
         // Not an empty contract: the definition skips strict lowering for one, and a caller reading it as strict would bind nothing.
         if !declared.is_empty() {

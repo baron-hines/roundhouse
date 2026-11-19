@@ -1543,11 +1543,17 @@ fn calls_unexpanded(body: &Expr, form_param: &str, overridden: &crate::det::Hash
     let mut found = false;
     fn walk(e: &Expr, form_param: &str, overridden: &crate::det::HashSet<String>, found: &mut bool) {
         let is_form = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == form_param);
+        // A render's locals hash (`render "x", f: form`) hands the builder too, which a partial of an overriding builder takes.
+        let hands = |e: &Expr| {
+            is_form(e)
+                || (!overridden.is_empty()
+                    && matches!(&*e.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(_, v)| is_form(v))))
+        };
         if let ExprNode::Send { recv, method, args, .. } = &*e.node
             && (recv.as_ref().is_some_and(|r| is_form(r))
                 && method.as_str() != "object"
                 && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden.contains(method.as_str()))
-                || args.iter().any(is_form))
+                || args.iter().any(hands))
         {
             *found = true;
         }

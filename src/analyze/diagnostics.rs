@@ -210,6 +210,22 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
     }
     // Rails' `fields_for` over a has_many the model accepts nested attributes for writes each child under
     // `parent[assoc_attributes][i]`, its index counted at render; the lowering writes one record's fields.
+    // Rails adds the persisted child's hidden id unless the body wrote it at render; one written only under a
+    // condition is known then, and the lowering decides at compile time.
+    fn conditional_hidden_id(e: &Expr, param: &Symbol, under: bool) -> bool {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && under
+            && method.as_str() == "hidden_field"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name == param)
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) if value.as_str() == "id")
+        {
+            return true;
+        }
+        let branch = under || matches!(&*e.node, ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } | ExprNode::BoolOp { .. } | ExprNode::Lambda { .. });
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found |= conditional_hidden_id(c, param, branch));
+        found
+    }
     fn nested_attributes_fields(nested: &crate::det::HashMap<(String, String), bool>, expr: &Expr, out: &mut Vec<Diagnostic>) {
         if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
             && method.as_str() == "fields_for"
@@ -224,6 +240,23 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                 None,
                 "fields_for nested attributes",
                 format!("`fields_for :{}` over {}'s nested attributes: Rails writes each child under `[{}_attributes][i]`, its index counted at render, and the lowering writes one record's fields", assoc.as_str(), model.0.as_str(), assoc.as_str()),
+            ));
+        }
+        if let ExprNode::Send { recv: Some(r), method, args, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let Some(Ty::Class { args: tyargs, .. }) = &r.ty
+            && let [Ty::Class { id: model, .. }] = tyargs.as_slice()
+            && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: assoc } }) = args.first().map(|a| &*a.node)
+            && nested.get(&(model.0.as_str().to_string(), assoc.as_str().to_string())) == Some(&false)
+            && let ExprNode::Lambda { params, body, .. } = &*b.node
+            && let Some(param) = params.first()
+            && conditional_hidden_id(body, param, false)
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "fields_for nested attributes",
+                format!("`fields_for :{}` writes the record's hidden id only under a condition: Rails adds it unless the body wrote it at render, which the lowering decides at compile time", assoc.as_str()),
             ));
         }
         expr.node.for_each_child(&mut |c| nested_attributes_fields(nested, c, out));

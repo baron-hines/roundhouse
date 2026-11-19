@@ -50,3 +50,10 @@ fn field_helpers_in_a_builder_body_is_known() {
     let errors = errors("class ProbeBuilder < ActionView::Helpers::FormBuilder\n  class_attribute :listed, default: field_helpers - [:label]\nend\n");
     assert!(!errors.iter().any(|e| e.contains("field_helpers")), "{errors:#?}");
 }
+
+/// A rescue of another class (`rescue ArgumentError`) does not catch the `NameError`, so the class still fails to load.
+#[test]
+fn a_rescue_that_does_not_catch_name_error_keeps_the_error() {
+    let errors = errors("class ProbeBuilder < ActionView::Helpers::FormBuilder\n  LIST = begin\n    absent_probe_hook\n  rescue ArgumentError\n    []\n  end\nend\n");
+    assert!(errors.iter().any(|e| e.contains("no known method `absent_probe_hook`")), "{errors:#?}");
+}

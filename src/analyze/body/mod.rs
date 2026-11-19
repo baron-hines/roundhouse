@@ -2175,8 +2175,12 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-                // Not a load-time failure under a rescue, which may catch the `NameError` (`block_depth`).
-                let guarded = !rescues.is_empty();
+                // Not a load-time failure under a rescue that catches the `NameError` (`block_depth`); `rescue ArgumentError` does not.
+                let guarded = rescues.iter().any(|rc| {
+                    rc.classes.is_empty()
+                        || rc.classes.iter().any(|c| matches!(&*c.node, ExprNode::Const { path }
+                            if path.last().is_some_and(|n| matches!(n.as_str(), "NameError" | "StandardError" | "Exception"))))
+                });
                 if guarded {
                     self.block_depth.set(self.block_depth.get() + 1);
                 }

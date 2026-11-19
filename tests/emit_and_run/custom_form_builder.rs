@@ -383,3 +383,34 @@ puts "local passed"
     run.assert_passes();
     assert!(run.stdout.contains("local passed"), "{}", run.stdout);
 }
+
+/// A body that writes the record's hidden id only under a condition: Rails adds its own unless that write ran, which
+/// the lowering would decide at compile time; reported rather than drop the id when the condition is false.
+#[test]
+fn a_conditional_hidden_id_in_nested_attributes_is_reported() {
+    let (_, errors) = emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "  belongs_to :article\n", "  belongs_to :article\n  accepts_nested_attributes_for :article\n")
+        .write("app/views/comments/_comment.html.erb", "<%= form_with(model: comment, url: \"/c\") do |form| %>\n<%= form.fields_for :article do |a| %>\n<% if comment.body.present? %><%= a.hidden_field :id %><% end %>\n<% end %>\n<% end %>\n")
+        .emit(roundhouse::build_target::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("hidden id only under a condition")), "{errors:#?}");
+}
+
+/// A partial of an overriding builder takes the caller's builder object, as Rails hands it: an override that keeps
+/// state (`@sequence`) counts on across the partial boundary.
+#[test]
+fn a_partial_of_a_custom_builder_shares_its_object() {
+    let builder = "class CountingFormBuilder < ActionView::Helpers::FormBuilder\n  def text_field(method, options = {})\n    @sequence = (@sequence || 0) + 1\n    super(method, options.merge(name: \"answers[#{@sequence}]\"))\n  end\nend\n";
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/counting_form_builder.rb", builder)
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: CountingFormBuilder) do |form| %>\n<%= form.text_field :title %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n")
+        .write("app/views/articles/_fields.html.erb", "<%= f.text_field :body %>\n")
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+raise "sequence:\n#{io}" unless io.include?("name=\"answers[1]\"") && io.include?("name=\"answers[2]\"")
+puts "shared passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("shared passed"), "{}", run.stdout);
+}
