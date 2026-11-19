@@ -682,7 +682,13 @@ fn untyped_subexpressions_baseline() {
     // them for the RBS-paired gate.
     // MEASURED 1451 on merging main 2d02f862f (1448) with the routed
     // connection handles' +3, which add up.
-    const CEILING: usize = 1451;
+    // MEASURED 1452 on PostgreSQL uuid casts (1451): a record's id under a
+    // uuid column is read on its own arm, `uuid_value_predicate(qcol,
+    // val._primary_key_value)`, as the bound arm already reads it. That is
+    // one more `_primary_key_value` send this RBS-less probe leaves
+    // unresolved (+1 in active_record/relation.rb). base.rbs types it
+    // `Integer` for the RBS-paired gate.
+    const CEILING: usize = 1452;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
