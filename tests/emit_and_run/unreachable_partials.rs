@@ -51,6 +51,10 @@ fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
         "<%= render partial: \"#{params[:a]}o#{params[:b]}t\" %>",
         "<% @panel ||= params[:panel].to_s %><%= render partial: @panel %>",
         "<% panel = \"articles/known\" %><% [params[:panel].to_s].each do |panel| %><%= render partial: panel %><% end %>",
+        "<% panel = \"articles/\" + params[:panel].to_s %><%= render partial: panel %>",
+        "<% panel = \"articles/gh\" %><% panel += \"ost\" %><%= render partial: panel %>",
+        "<%= render partial: \"articles/card\", layout: params[:wrapper].to_s %>",
+        "<% opts = { partial: params[:panel].to_s } %><%= render opts %>",
     ] {
         let errors = errors_with(reads, "");
         assert!(errors.iter().any(|e| e.contains("@ghost")), "{reads}: {errors:#?}");
@@ -61,5 +65,12 @@ fn a_partial_a_variable_or_a_request_string_may_name_keeps_its_errors() {
 #[test]
 fn a_partial_an_ivar_fed_through_a_local_may_name_keeps_its_errors() {
     let errors = errors_with("<% candidate = params[:panel].to_s %><% @panel = candidate %>", "<%= render partial: @panel %>");
+    assert!(errors.iter().any(|e| e.contains("@ghost")), "{errors:#?}");
+}
+
+/// A bare render target in a shared partial resolves through the controller's prefixes, not its own directory.
+#[test]
+fn a_bare_render_in_another_directory_keeps_its_errors() {
+    let errors = errors_with("", "<%= render \"ghost\" %>");
     assert!(errors.iter().any(|e| e.contains("@ghost")), "{errors:#?}");
 }
