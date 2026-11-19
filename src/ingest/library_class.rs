@@ -5640,8 +5640,8 @@ impl ModelBases {
             let mut full = scope.clone();
             full.extend(path);
             let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
-            // A bare parent is kept with its scope: a concrete `Admin::Base` is found from `module Admin` below.
-            let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { scope.clone() } else { Vec::new() };
+            // A bare parent is kept with the modules it is looked up through ([`superclass_enclosing`]): a concrete `Admin::Base` is found from `module Admin`, and from `module Ledger; class ::Special < Item` its `Ledger::Item`.
+            let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { superclass_enclosing(&scope, &nesting, &class) } else { Vec::new() };
             self.concrete_pairs.push((full.join("::"), lexical, parent, table));
         }
     }
@@ -5655,7 +5655,7 @@ impl ModelBases {
                 if self.concrete.contains_key(child) {
                     continue;
                 }
-                let lexical = (1..=scope.len()).rev().map(|n| format!("{}::{parent}", scope[..n].join("::"))).find(|c| self.concrete.contains_key(c));
+                let lexical = scope.iter().map(|module| format!("{module}::{parent}")).find(|c| self.concrete.contains_key(c));
                 if lexical.is_some() || self.names.contains(parent) || self.concrete.contains_key(parent) {
                     found.push((child.clone(), table.clone()));
                 }

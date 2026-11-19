@@ -10556,7 +10556,9 @@ fn record_library_ingest_failure(app: &mut App, path: &str, err: &IngestError) {
 
 /// The classes of `classes` the file declares in `outer`'s body: named
 /// under it, or written inside it with a rooted name (`class ::Parser`
-/// in a model is top-level, though only this walk reaches it).
+/// in a model is top-level, though only this walk reaches it). The
+/// generated base of a kept `class X < Struct.new(...)` is kept with it,
+/// whatever its name.
 fn nested_under(
     source: &[u8],
     outer: &crate::ident::ClassId,
@@ -10565,9 +10567,14 @@ fn nested_under(
     let prefix = format!("{}::", outer.0.as_str());
     let parsed = super::prism::parse_silent(source);
     let inside = super::util::declared_inside(&parsed.node(), outer.0.as_str());
+    let declared = |name: &str| name.starts_with(&prefix) || inside.contains(name);
+    let struct_owner = |c: &crate::dialect::LibraryClass| match &c.origin {
+        Some(crate::dialect::LibraryClassOrigin::StructSuperclass { owner, .. }) => Some(owner.as_str().to_string()),
+        _ => None,
+    };
     classes
         .into_iter()
-        .filter(|c| c.name.0.as_str().starts_with(&prefix) || inside.contains(c.name.0.as_str()))
+        .filter(|c| declared(c.name.0.as_str()) || struct_owner(c).is_some_and(|owner| declared(&owner)))
         .collect()
 }
 
