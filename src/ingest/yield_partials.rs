@@ -384,7 +384,10 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
                 let value = args.get(i).cloned().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
                 match params.get(i) {
                     // Not copied into the parameter: a `form_with` builder is no value at runtime, only its calls are lowered.
-                    Some(p) if matches!(&*value.node, ExprNode::Var { name, .. } if local(name.as_str())) && !assigned(&body, p.as_str()) => {
+                    Some(p) if matches!(&*value.node, ExprNode::Var { name, .. } if local(name.as_str())
+                        && !args[i + 1..].iter().any(|a| assigned(a, name.as_str())))
+                        && !assigned(&body, p.as_str()) =>
+                    {
                         let ExprNode::Var { name: arg, .. } = &*value.node else { unreachable!() };
                         let (p, arg) = (p.clone(), arg.clone());
                         rename(&mut body, &|n| if n == p.as_str() { arg.clone() } else { Symbol::from(n) });

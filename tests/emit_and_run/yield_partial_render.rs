@@ -4,7 +4,8 @@
 //! copy of the partial with the block's body at each yield, the block's
 //! parameters bound to what it yields, and the caller's locals passed in, so
 //! the body reads the yielded value, the caller's locals and the page's ivars
-//! where Rails does, also in a loop and in a strict-locals partial.
+//! where Rails does, also in a loop and in a strict-locals partial, each
+//! argument taken when the yield evaluates it.
 
 use super::emit_and_run;
 
@@ -14,17 +15,20 @@ fn app() -> emit_and_run::Overlay {
             "app/views/articles/_frame.html.erb",
             "<section><%= title %>:<% [1, 2].each do |i| %>[<%= yield \"slot#{i}\", i %>]<% end %></section>\n",
         )
+        .write("app/views/articles/_snap.html.erb", "<% n = 1 %><u><%= yield n, (n = 2) %>/<%= n %></u>\n")
         .write("app/views/articles/_strict.html.erb", "<%# locals: (heading:) %>\n<aside><%= heading %>|<%= yield %>|</aside>\n")
         .edit(
             "app/views/articles/show.html.erb",
             "    <p class=\"text-gray-700\">",
             "<% note = \"n1\" %><%= render \"articles/frame\", title: \"T\" do |label, n| %><i><%= label %>-<%= n * 10 %>-<%= note %>-<%= @article.title %></i><% end %>\
+<%= render \"articles/snap\" do |a, _b| %><%= a %><% end %>\
 <%= render layout: \"articles/strict\", locals: { heading: \"H\" } do %><b><%= note %></b><% end %>\n    <p class=\"text-gray-700\">",
         )
 }
 
 const WANT: &[&str] = &[
     "<section>T:[<i>slot1-10-n1-Hello</i>][<i>slot2-20-n1-Hello</i>]</section>",
+    "<u>1/2</u>",
     "<aside>H|<b>n1</b>|</aside>",
 ];
 

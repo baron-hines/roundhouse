@@ -245,6 +245,22 @@ fn partial_app(form: &str) -> emit_and_run::Overlay {
         .write("app/views/articles/_fields.html.erb", "<%= f.text_field :title %>\n<%= f.text_area :body %>\n")
 }
 
+/// Two stock forms that differ only in literal options (`url:`) hand the partial the same builder.
+#[test]
+fn forms_differing_in_options_share_a_partial_handed_the_builder() {
+    let form = "<%= form_with(model: article, url: \"/a\") do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n\
+<%= form_with(model: article, url: \"/b\") do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n";
+    let run = partial_app(form).run_ruby(&format!(
+        r##"{ATTRS}io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+raise "forms:\n#{{io}}" unless io.scan("name=\"article[title]\"").size == 2 && io.include?("action=\"/a\"") && io.include?("action=\"/b\"")
+puts "two forms passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("two forms passed"), "{}", run.stdout);
+}
+
 #[test]
 fn a_partial_handed_the_builder_alone_renders_its_fields() {
     let run = partial_app("<%= form_with(model: article) do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n").run_ruby(&format!(

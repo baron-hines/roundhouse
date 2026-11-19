@@ -283,7 +283,8 @@ fn emit_form_inline(
     // A form_for record is often a helper (Devise's `resource`), which a local of its name would not call.
     let record_local = find_kwarg_local_name(args).filter(|name| form_for.is_none() || ctx.locals.iter().any(|l| l == name));
 
-    let Some(comps) = classify_form_with_components(args, ctx) else {
+    let synth_record = format!("{}_record", form_param.as_str());
+    let Some(comps) = classify_form_with_components(args, ctx, &synth_record) else {
         // Non-resource form_with (no `model:` kwarg) — fall back to a
         // safe-empty append so the file still parses. Real fixtures
         // always pass `model:`; if this shape becomes load-bearing,
@@ -911,6 +912,7 @@ fn route_helperize(url: Expr, route_helpers: &impl Fn() -> Expr, ctx: &ViewCtx) 
 fn classify_form_with_components(
     args: &[Expr],
     ctx: &ViewCtx,
+    record: &str,
 ) -> Option<FormWithComponents> {
     let mut model_expr: Option<Expr> = None;
     let mut url_expr: Option<Expr> = None;
@@ -1011,7 +1013,7 @@ fn classify_form_with_components(
     };
 
     if let Some((nested_model, nested_name, nested_action, persisted)) =
-        nested_resource_form(&model, &route_helpers)
+        nested_resource_form(&model, &route_helpers, record, ctx)
     {
         let method = method_expr.clone().unwrap_or_else(|| match persisted {
             Some(cond) => Expr::new(
@@ -1356,6 +1358,8 @@ fn scoped_record_form(model: &Expr) -> Option<(Expr, String, String)> {
 fn nested_resource_form(
     model: &Expr,
     route_helpers: &dyn Fn() -> Expr,
+    record: &str,
+    ctx: &ViewCtx,
 ) -> Option<(Expr, String, Expr, Option<Expr>)> {
     let ExprNode::Array { elements, .. } = &*model.node else {
         return None;
@@ -1399,7 +1403,7 @@ fn nested_resource_form(
     let child_collection = crate::lower::routes::collection_name(&child_singular, &child_plural);
 
     // RouteHelpers.<parent_singular>_<child collection>_path(parent.id)
-    let parent_id = send(Some(parent.clone()), "id", Vec::new(), None, false);
+    let parent_id = send(Some(parent.clone()), if ctx.slug_models.contains(&parent_singular) { "to_param" } else { "id" }, Vec::new(), None, false);
     let action = send(
         Some(route_helpers()),
         &format!("{parent_singular}_{child_collection}_path"),
@@ -1411,15 +1415,27 @@ fn nested_resource_form(
     if constructed.is_some() {
         return Some((child.clone(), child_singular, action, None));
     }
-    let persisted = send(Some(child.clone()), "persisted?", Vec::new(), None, false);
+    // Not the child again: the form binds it to `record` first, and a `comments.build` read three times builds three.
+    let read = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(record) });
+    let persisted = send(Some(read.clone()), "persisted?", Vec::new(), None, false);
+    let key = |e: Expr, singular: &str| send(Some(e), if ctx.slug_models.contains(singular) { "to_param" } else { "id" }, Vec::new(), None, false);
+    let member_name = format!("{parent_singular}_{child_singular}_path");
     let member = send(
         Some(route_helpers()),
-        &format!("{parent_singular}_{child_singular}_path"),
-        vec![send(Some(parent.clone()), "id", Vec::new(), None, false), send(Some(child.clone()), "id", Vec::new(), None, false)],
+        &member_name,
+        vec![key(parent.clone(), &parent_singular), key(read, &child_singular)],
         None,
         true,
     );
-    let action = Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: member, else_branch: action });
+    // Only the arms the route table defines, as the plain record's form does.
+    let has_member = ctx.route_helper_names.is_empty() || ctx.route_helper_names.contains(&member_name);
+    let has_collection = ctx.route_helper_names.is_empty()
+        || ctx.route_helper_names.contains(&format!("{parent_singular}_{child_collection}_path"));
+    let action = match (has_member, has_collection) {
+        (true, false) => member,
+        (false, true) => action,
+        _ => Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: member, else_branch: action }),
+    };
     Some((child.clone(), child_singular, action, Some(persisted)))
 }
 

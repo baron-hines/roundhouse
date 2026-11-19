@@ -2560,7 +2560,8 @@ pub(crate) fn partial_form_bindings(
                                     model_name,
                                     id_prefix: id_prefix.to_string(),
                                     builder: form.builder.clone(),
-                                    builder_options: form.options.clone(),
+                                    // Not a stock builder's options: only an overriding builder is rebuilt from them, and they would split equal bindings.
+                                    builder_options: if form.builder.is_some() { form.options.clone() } else { Vec::new() },
                                 },
                             ));
                         }
