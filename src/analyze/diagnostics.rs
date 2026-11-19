@@ -74,6 +74,34 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
     type Overrides = crate::det::HashMap<String, crate::det::HashSet<String>>;
     fn visit(app: &App, overrides: &Overrides, expr: &Expr, out: &mut Vec<Diagnostic>) {
         let overridden = |id: &crate::ident::ClassId, m: &str| overrides.get(id.0.as_str()).is_some_and(|o| o.contains(m));
+        // Rails hands `fields_for` the parent's `builder:`, and the lowering writes a nested field as the base's.
+        if let ExprNode::Send { recv: Some(r), method, block: Some(block), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let Some(Ty::Class { id, .. }) = &r.ty
+            && let Some(own) = overrides.get(id.0.as_str())
+            && let ExprNode::Lambda { params, body, .. } = &*block.node
+            && let Some(param) = params.first()
+        {
+            fn nested_calls(e: &Expr, param: &Symbol, own: &crate::det::HashSet<String>, out: &mut Vec<(crate::span::Span, String)>) {
+                if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+                    && matches!(&*r.node, ExprNode::Var { name, .. } if name == param)
+                    && own.contains(method.as_str())
+                {
+                    out.push((e.span, method.as_str().to_string()));
+                }
+                e.node.for_each_child(&mut |c| nested_calls(c, param, own, out));
+            }
+            let mut calls = Vec::new();
+            nested_calls(body, param, own, &mut calls);
+            for (span, m) in calls {
+                out.push(Diagnostic::unsupported(
+                    span,
+                    None,
+                    "custom form builder fields_for",
+                    format!("`{}.{m}` inside `fields_for` runs {}'s override in Rails, and the lowering writes the base's field", param.as_str(), id.0.as_str()),
+                ));
+            }
+        }
         // A builder class of the app's or a gem's own (`builder: MoneyFormBuilder`): a method the lowering does not
         // expand runs on Rails' builder at request time, which the Ruby family's overlay carries and no other tree.
         if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node

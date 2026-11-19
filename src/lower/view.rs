@@ -1097,10 +1097,19 @@ pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, c
         let mut descends = false;
         for _ in 0..32 {
             let Some(c) = current else { break };
-            for m in c.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
-                if classify_form_builder_method(m.name.as_str()).is_some() {
-                    overrides.insert(m.name.as_str().to_string());
+            // The class's own methods and its included modules', nested includes too.
+            let mut owners = vec![c];
+            let mut seen: crate::det::HashSet<&crate::ident::ClassId> = crate::det::HashSet::default();
+            while let Some(owner) = owners.pop() {
+                if !seen.insert(&owner.name) {
+                    continue;
                 }
+                for m in owner.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+                    if classify_form_builder_method(m.name.as_str()).is_some() {
+                        overrides.insert(m.name.as_str().to_string());
+                    }
+                }
+                owners.extend(owner.includes.iter().filter_map(|id| app.library_classes.iter().find(|l| l.name == *id)));
             }
             let Some(parent) = &c.parent else { break };
             if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {

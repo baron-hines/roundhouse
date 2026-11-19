@@ -4624,30 +4624,31 @@ pub(crate) const FORM_BUILDER_FIELD_HELPERS: [&str; 24] = [
     "range_field",
 ];
 
-/// The literal list a node names: an Array of Strings or Symbols, a FormBuilder's `field_helpers`, or one list less
-/// another (`field_helpers - [:label]`, maybe's `StyledFormBuilder`).
-fn static_name_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+/// The literal list a node names: an Array of Strings or Symbols, a FormBuilder's `field_helpers` (unless the class
+/// defines its own), or one list less another (`field_helpers - [:label]`, maybe's `StyledFormBuilder`). Each name
+/// keeps whether it was a Symbol, as `Array#-` compares by `eql?`.
+fn static_name_list(node: &ruby_prism::Node<'_>, framework_helpers: bool) -> Option<Vec<(bool, String)>> {
     if let Some(array) = node.as_array_node() {
         return array
             .elements()
             .iter()
             .map(|e| {
                 e.as_string_node()
-                    .map(|n| String::from_utf8_lossy(n.unescaped()).into_owned())
-                    .or_else(|| e.as_symbol_node().map(|n| String::from_utf8_lossy(n.unescaped()).into_owned()))
+                    .map(|n| (false, String::from_utf8_lossy(n.unescaped()).into_owned()))
+                    .or_else(|| e.as_symbol_node().map(|n| (true, String::from_utf8_lossy(n.unescaped()).into_owned())))
             })
             .collect();
     }
     let call = node.as_call_node()?;
     let name = constant_id_str(&call.name());
-    if name == "field_helpers" && call.receiver().is_none() && call.arguments().is_none() && call.block().is_none() {
-        return Some(FORM_BUILDER_FIELD_HELPERS.iter().map(|s| s.to_string()).collect());
+    if name == "field_helpers" && framework_helpers && call.receiver().is_none() && call.arguments().is_none() && call.block().is_none() {
+        return Some(FORM_BUILDER_FIELD_HELPERS.iter().map(|s| (true, s.to_string())).collect());
     }
     if name == "-" {
-        let left = static_name_list(&call.receiver()?)?;
+        let left = static_name_list(&call.receiver()?, framework_helpers)?;
         let args: Vec<_> = call.arguments()?.arguments().iter().collect();
         let [right] = args.as_slice() else { return None };
-        let right = static_name_list(right)?;
+        let right = static_name_list(right, framework_helpers)?;
         return Some(left.into_iter().filter(|n| !right.contains(n)).collect());
     }
     None
@@ -4655,15 +4656,41 @@ fn static_name_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
 
 /// `class_attribute :text_field_helpers, default: field_helpers - [...]`: the attributes whose default is a literal
 /// list, which a loop over the reader (`text_field_helpers.each`) walks as the body loads.
-// Not an attribute the body writes again or defines a reader for: the loop would then read another list.
+// Not an attribute declared twice, written (`self.x =`), handed to any call but `each`, or given a reader of the
+// class's own: the loop would then read another list than the default.
 fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::default();
+    let mut declared: HashMap<String, Option<Vec<(bool, String)>>> = HashMap::default();
     let mut redefined: HashSet<String> = HashSet::default();
+    let framework_helpers = !statements.iter().any(|s| {
+        s.as_def_node().is_some_and(|d| constant_id_str(&d.name()) == "field_helpers")
+            || s.as_call_node().is_some_and(|c| {
+                c.receiver().is_none()
+                    && matches!(constant_id_str(&c.name()).as_ref(), "class_attribute" | "cattr_accessor" | "cattr_reader")
+                    && c.arguments().is_some_and(|a| a.arguments().iter().any(|a| a.as_symbol_node().is_some_and(|n| n.unescaped() == b"field_helpers")))
+            })
+    });
+    fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
+        let Some(call) = node.as_call_node() else { return };
+        let name = constant_id_str(&call.name()).to_string();
+        if let Some(attr) = name.strip_suffix('=')
+            && call.receiver().is_some_and(|r| r.as_self_node().is_some())
+        {
+            redefined.insert(attr.to_string());
+        }
+        if let Some(reader) = call.receiver().and_then(|r| r.as_call_node())
+            && reader.receiver().is_none()
+            && reader.arguments().is_none()
+            && name != "each"
+        {
+            redefined.insert(constant_id_str(&reader.name()).to_string());
+        }
+    }
     for s in statements {
         if let Some(def) = s.as_def_node() {
             redefined.insert(constant_id_str(&def.name()).trim_end_matches('=').to_string());
             continue;
         }
+        note_uses(s, &mut redefined);
         let Some(call) = s.as_call_node() else { continue };
         if call.receiver().is_some() {
             continue;
@@ -4678,23 +4705,26 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             }
             continue;
         }
-        let [name, options] = args.as_slice() else { continue };
-        let Some(name) = name.as_symbol_node() else { continue };
-        let name = String::from_utf8_lossy(name.unescaped()).into_owned();
-        let Some(options) = options.as_keyword_hash_node() else { continue };
-        let default = options.elements().iter().find_map(|e| {
-            let pair = e.as_assoc_node()?;
-            let key = pair.key().as_symbol_node()?;
-            (key.unescaped() == b"default").then(|| pair.value())
+        let default = args.iter().find_map(|a| a.as_keyword_hash_node()).and_then(|options| {
+            options.elements().iter().find_map(|e| {
+                let pair = e.as_assoc_node()?;
+                let key = pair.key().as_symbol_node()?;
+                (key.unescaped() == b"default").then(|| pair.value())
+            })
         });
-        if let Some(list) = default.as_ref().and_then(static_name_list) {
-            if out.insert(name.clone(), list).is_some() {
+        let list = default.as_ref().and_then(|d| static_name_list(d, framework_helpers));
+        for name in args.iter().filter_map(|a| a.as_symbol_node()) {
+            let name = String::from_utf8_lossy(name.unescaped()).into_owned();
+            if declared.insert(name.clone(), list.clone()).is_some() {
                 redefined.insert(name);
             }
         }
     }
-    out.retain(|name, _| !redefined.contains(name));
-    out
+    declared
+        .into_iter()
+        .filter(|(name, _)| !redefined.contains(name))
+        .filter_map(|(name, list)| Some((name, list?.into_iter().map(|(_, n)| n).collect())))
+        .collect()
 }
 
 /// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
@@ -4709,7 +4739,12 @@ fn class_eval_loop_sources(s: &ruby_prism::Node<'_>, lists: &HashMap<String, Vec
             Some(reader) if reader.receiver().is_none() && reader.arguments().is_none() && reader.block().is_none() => {
                 lists.get(&*constant_id_str(&reader.name()))?.clone()
             }
-            _ => receiver.as_array_node().and_then(|_| static_name_list(&receiver))?,
+            _ => receiver
+                .as_array_node()
+                .and_then(|_| static_name_list(&receiver, false))?
+                .into_iter()
+                .map(|(_, n)| n)
+                .collect(),
         };
         let block = call.block()?.as_block_node()?;
         let params: Vec<_> = block.parameters()?.as_block_parameters_node()?.parameters()?.requireds().iter().collect();

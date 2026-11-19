@@ -56,7 +56,15 @@ fn a_custom_builders_own_method_is_reported_off_the_ruby_family() {
 
 /// maybe's `StyledFormBuilder`: a builder that defines a stock field again, by hand or by a `class_eval` loop, wraps
 /// it, and Rails dispatches `form.text_field` to that override, not to the base's field.
-const OVERRIDING_BUILDER: &str = r##"class WrappingFormBuilder < ActionView::Helpers::FormBuilder
+const OVERRIDING_BUILDER: &str = r##"module PasswordWrapping
+  def password_field(method, options = {})
+    @template.content_tag(:div, super(method, options), class: "mixin")
+  end
+end
+
+class WrappingFormBuilder < ActionView::Helpers::FormBuilder
+  include PasswordWrapping
+
   %i[email_field text_area].each do |selector|
     class_eval <<-RUBY_EVAL, __FILE__, __LINE__ + 1
       def #{selector}(method, options = {})
@@ -71,7 +79,7 @@ const OVERRIDING_BUILDER: &str = r##"class WrappingFormBuilder < ActionView::Hel
 end
 "##;
 
-const OVERRIDING_FORM: &str = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.text_field :title %>\n<%= form.email_field :body %>\n<%= form.text_area :body %>\n<%= form.hidden_field :title %>\n<% end %>\n";
+const OVERRIDING_FORM: &str = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.text_field :title %>\n<%= form.email_field :body %>\n<%= form.text_area :body %>\n<%= form.hidden_field :title %>\n<%= form.password_field :title %>\n<% end %>\n";
 
 fn overriding_app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
@@ -88,6 +96,7 @@ Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
   "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>",
   "<div class=\"loop\"><input type=\"email\" value=\"Body\" name=\"article[body]\" id=\"article_body\" /></div>",
   "<div class=\"loop\"><textarea name=\"article[body]\" id=\"article_body\">\nBody</textarea></div>",
+  "<div class=\"mixin\"><input type=\"password\" name=\"article[title]\" id=\"article_title\" /></div>",
 ].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
 puts "override passed"
 "##,
@@ -154,4 +163,16 @@ puts "field helpers passed"
         );
     run.assert_passes();
     assert!(run.stdout.contains("field helpers passed"), "{}", run.stdout);
+}
+
+/// Rails hands `fields_for` the form's `builder:`, so a nested `text_field` runs the override too; the lowering
+/// writes nested fields as the base's, and reports them rather than drop the wrapper.
+#[test]
+fn an_override_inside_fields_for_is_reported() {
+    let form = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.fields_for :comments do |nested| %>\n<%= nested.text_field :body %>\n<% end %>\n<% end %>\n";
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_form.html.erb", form)
+        .emit(roundhouse::build_target::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("custom form builder fields_for") && e.contains("nested.text_field")), "{errors:#?}");
 }
