@@ -833,8 +833,9 @@ fn apply_table_verb(
 /// `enable_extension` / `disable_extension` / `create_schema` /
 /// `drop_schema` with a literal name, folded into the schema's
 /// [`Schema::extensions`] and [`Schema::schemas`]. A name that is not a
-/// literal is left out, as every one was before; column typing never
-/// depends on it.
+/// literal is left out of what the call creates, as every one was before;
+/// a call with such a name that could remove what is already recorded is
+/// refused (see [`unread_name`]).
 ///
 /// Each verb follows what Rails runs. `enable_extension` is `CREATE
 /// EXTENSION IF NOT EXISTS`, so enabling one already recorded keeps its
@@ -844,7 +845,7 @@ fn apply_table_verb(
 /// (other extensions, columns of its types), which the fold can't tell,
 /// so it is refused.
 fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema: &mut Schema) -> Result<(), IngestError> {
-    let Some(name) = args.first().and_then(name_value) else { return Ok(()) };
+    let Some(name) = args.first().and_then(name_value) else { return unread_name(verb, args, file, schema) };
     // Rails' PostgreSQL adapter takes the last two dot-separated parts
     // as the schema and the extension (`name.to_s.split(".").values_at(-2, -1)`).
     let parts: Vec<&str> = name.split('.').collect();
@@ -888,10 +889,7 @@ fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema:
         "create_schema" => {
             // `force:` (anything but a literal false or nil, or a `**`
             // splat that may carry it) is `drop_schema` first.
-            let forced = args.iter().skip(1).any(|arg| {
-                arg.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some()))
-            }) || kwarg_value(args.iter().skip(1), "force").is_some_and(|force| force.as_false_node().is_none() && force.as_nil_node().is_none());
-            if forced {
+            if create_schema_forced(args) {
                 drop_folded_schema(&name, &format!("create_schema \"{name}\" with force:"), file, schema)?;
             }
             if !schema.schemas.iter().any(|s| s.as_str() == name) {
@@ -903,16 +901,67 @@ fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema:
     Ok(())
 }
 
-/// Rails' `DROP SCHEMA ... CASCADE`, folded. A schema with no recorded
-/// extension in it is removed. One that holds an extension is refused:
-/// CASCADE also drops what depends on that extension in other schemas
-/// (another extension, a column of its type), which the fold can't tell.
+/// `create_schema`'s `force:`: anything but a literal false or nil, or a
+/// `**` splat that may carry it, runs `drop_schema` first.
+fn create_schema_forced(args: &[Node<'_>]) -> bool {
+    args.iter().skip(1).any(|arg| arg.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some())))
+        || kwarg_value(args.iter().skip(1), "force").is_some_and(|force| force.as_false_node().is_none() && force.as_nil_node().is_none())
+}
+
+/// A call whose name the fold can't read (`disable_extension target`).
+/// Rails still runs it, so one that could remove what is already recorded
+/// (`disable_extension` an extension, `drop_schema` or a forced
+/// `create_schema` a schema and the extensions in it) is refused rather
+/// than skipped, which would create at boot what the migration removed.
+/// With nothing recorded it changes nothing the fold holds.
+fn unread_name(verb: &str, args: &[Node<'_>], file: &str, schema: &Schema) -> Result<(), IngestError> {
+    let (call, removes) = match verb {
+        "disable_extension" => ("disable_extension", !schema.extensions.is_empty()),
+        "drop_schema" => ("drop_schema", !schema.schemas.is_empty() || !schema.extensions.is_empty()),
+        "create_schema" if create_schema_forced(args) => ("create_schema with force:", !schema.schemas.is_empty() || !schema.extensions.is_empty()),
+        _ => return Ok(()),
+    };
+    if !removes {
+        return Ok(());
+    }
+    Err(IngestError::Unsupported {
+        file: file.into(),
+        message: format!("{call} with a name that is not a literal may remove a schema or extension recorded before it, which boot would then create; a db/schema.rb dumped after it holds the result"),
+    })
+}
+
+/// The schema an extension's qualifier names, as PostgreSQL reads it.
+/// Rails writes it unquoted (`SCHEMA EXTENSIONS`), so it folds to
+/// lowercase unless the qualifier is itself quoted (`'"Ext".pgcrypto'`).
+/// `create_schema` and `drop_schema` quote their names, which keep their
+/// case.
+fn extension_schema(qualifier: &str) -> String {
+    match qualifier.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => qualifier.to_ascii_lowercase(),
+    }
+}
+
+/// Rails' `DROP SCHEMA ... CASCADE`, folded. A schema that holds none of
+/// the recorded extensions is removed. One that may hold an extension is
+/// refused: CASCADE also drops what depends on that extension in other
+/// schemas (another extension, a column of its type), which the fold
+/// can't tell. An extension enabled without a schema is in the first
+/// schema on the search path, which the fold does not know, so it may be
+/// in any dropped schema.
 fn drop_folded_schema(name: &str, call: &str, file: &str, schema: &mut Schema) -> Result<(), IngestError> {
-    let held: Vec<&str> = schema.extensions.iter().filter(|e| e.schema.as_ref().is_some_and(|s| s.as_str() == name)).map(|e| e.name.as_str()).collect();
+    let held: Vec<&str> = schema
+        .extensions
+        .iter()
+        .filter(|e| e.schema.as_ref().is_none_or(|s| extension_schema(s.as_str()) == name))
+        .map(|e| e.name.as_str())
+        .collect();
     if !held.is_empty() {
+        let unqualified = schema.extensions.iter().any(|e| e.schema.is_none());
+        let note = if unqualified { " (an extension enabled without a schema is in the first schema on the search path, which may be this one)" } else { "" };
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: format!("{call} drops the schema with CASCADE, taking extension {} and what depends on it in other schemas (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result", held.join(", ")),
+            message: format!("{call} drops the schema with CASCADE, taking extension {}{note} and what depends on it in other schemas (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result", held.join(", ")),
         });
     }
     schema.schemas.retain(|s| s.as_str() != name);
