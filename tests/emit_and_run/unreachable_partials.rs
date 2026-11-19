@@ -20,6 +20,9 @@ fn errors_with(show_reads: &str, elsewhere: &str) -> Vec<String> {
 fn a_partial_nothing_renders_warns() {
     let errors = errors_with("", "<%= link_to \"x\", \"/x\", data: { tab: \"ghost\" } %>");
     assert!(!errors.iter().any(|e| e.contains("_ghost") || e.contains("@ghost")), "{errors:#?}");
+    // A collection built with `+=` renders its records, and names no partial.
+    let errors = errors_with("", "<% posts = [] %><% posts += Article.all.to_a %><%= render posts %>");
+    assert!(!errors.iter().any(|e| e.contains("_ghost") || e.contains("@ghost")), "{errors:#?}");
     // Downgraded, not dropped: the partial is still emitted.
     let (emitted, _) = emit_and_run::real_blog()
         .write("app/views/articles/_ghost.html.erb", "<p><%= @ghost.missing_method %></p>\n")

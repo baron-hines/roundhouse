@@ -280,7 +280,8 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                             !*ivar
                                 && n == name.as_str()
                                 && (matches!(&*h.node, ExprNode::Hash { entries, .. } if options_open(entries, open))
-                                    || matches!(&*h.node, ExprNode::OpAssign { op: crate::expr::OpAssignOp::Add, .. }))
+                                    || matches!(&*h.node, ExprNode::OpAssign { op: crate::expr::OpAssignOp::Add, value, .. }
+                                        if matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })))
                         })
                 }
                 ExprNode::StringInterp { .. } => open(first),
