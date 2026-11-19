@@ -269,6 +269,16 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| super::gem_package_settings::extract(p.text.as_bytes(), PROBE).iter().any(|s| s.carried()),
     },
     Recognizer {
+        name: "pagy settings (Pagy::DEFAULT[:overflow] = for a pagy before 43)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| {
+            let mut state = super::pagy::Settings::default();
+            super::pagy::read_settings(p.text.as_bytes(), PROBE, &mut state);
+            state.recognized
+        },
+    },
+    Recognizer {
         name: "default_per_page (Kaminari.configure { |c| c.default_per_page = })",
         origins: INIT,
         levels: TOP_HOOK,

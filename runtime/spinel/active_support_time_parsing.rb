@@ -146,7 +146,8 @@ module ActiveSupport
   #
   # `parse_db_time` above now lands the instant in the app's zone, so
   # the offset is the receiver's own — NOT a hardcoded "+00:00", which
-  # would label local clock fields as UTC and be wrong by the offset.
+  # would label local clock fields as UTC and be wrong by the offset —
+  # and `Z` for the UTC zone, as `xmlschema` writes it (`time_json`).
   # The milliseconds are `usec / 1000`, formatted apart: strftime here
   # has no millisecond directive, and xmlschema(3) TRUNCATES (.027418 →
   # .027), which integer division does too. A monomorphized `as_json`
@@ -155,7 +156,7 @@ module ActiveSupport
   def self.json_time(str)
     t = parse_db_time(str)
     return nil if t.nil?
-    t.strftime("%Y-%m-%dT%H:%M:%S") + format(".%03d", t.usec / 1000) + t.strftime("%:z")
+    ActiveSupport::JSON.time_json(t)
   end
 
   # Normalize a temporal-writer value into the canonical storage form.
