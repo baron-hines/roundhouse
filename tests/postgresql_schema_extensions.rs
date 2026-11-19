@@ -293,11 +293,18 @@ fn dropping_public_with_an_unqualified_extension_recorded_is_refused() {
 /// "pgcrypto"; disable_extension target` leaves no extension. Skipping it
 /// would keep the recorded one, so a destructive call with such a name is
 /// refused once there is something it could remove; with nothing recorded
-/// it changes nothing the fold holds.
+/// it changes nothing the fold holds. A cascading one is refused whatever
+/// is recorded, as a literal one is: after `target = "citext"; enable_extension
+/// target` and a `t.citext :email` table, `disable_extension target, force:
+/// :cascade` leaves `accounts` with only `id` on ActiveRecord 8.1.4.1 and
+/// PostgreSQL 18.
 #[test]
 fn a_destructive_call_with_a_name_the_fold_cannot_read_is_refused() {
+    let citext = "    target = \"citext\"\n    enable_extension target\n    create_table :accounts do |t|\n      t.citext :email\n    end\n";
     for (body, call) in [
         ("    enable_extension \"pgcrypto\"\n    target = \"pgcrypto\"\n    disable_extension target", "disable_extension"),
+        (format!("{citext}    disable_extension target, force: :cascade").as_str(), "disable_extension"),
+        (format!("{citext}    disable_extension target, **options").as_str(), "disable_extension"),
         ("    create_schema \"extensions\"\n    target = \"extensions\"\n    drop_schema target", "drop_schema"),
         ("    create_schema \"extensions\"\n    target = \"extensions\"\n    create_schema target, force: true", "create_schema"),
     ] {
