@@ -73,13 +73,16 @@ const PROBE: &str = r##"class UuidProbe
       "where other uuid column bare hex: #{try { Widget.where(owner_id: "22222222222242228222222222222222").pluck(:name) }}",
       "relation find_by blank: #{try { Widget.where(name: "sprocket").find_by(id: "") }}",
       "relation exists blank: #{try { Widget.where(name: "sprocket").exists?(id: "") }}",
+      "relation find blank: #{try { Widget.where(name: "sprocket").find("") }}",
+      "relation find junk: #{try { Widget.all.find("not-a-uuid") }}",
+      "relation find bare hex: #{try { Widget.where(name: "sprocket").find("11111111111141118111111111111111").name }}",
     ]
   end
 end
 "##;
 
 /// Native Rails 8.1.4's answers on PostgreSQL 18.
-const EXPECTED: [&str; 24] = [
+const EXPECTED: [&str; 27] = [
     "find_by blank: nil",
     "find_by junk: nil",
     "where blank count: 0",
@@ -104,6 +107,9 @@ const EXPECTED: [&str; 24] = [
     r#"where other uuid column bare hex: ["sprocket"]"#,
     "relation find_by blank: nil",
     "relation exists blank: false",
+    "relation find blank: ActiveRecord::RecordNotFound",
+    "relation find junk: ActiveRecord::RecordNotFound",
+    r#"relation find bare hex: "sprocket""#,
 ];
 
 const LOADS: [&str; 3] = ["app/models/application_record", "app/models/widget", "app/models/uuid_probe"];
