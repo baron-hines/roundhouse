@@ -4567,9 +4567,17 @@ fn walk_decl_body_with_visibility<'pr>(
         let mut classes = parsed?;
         let Some(class) = classes.pop() else { continue };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
-        for include in &class.includes {
+        // At the element, and one span per statement of the string: `include A; include B` is two statements
+        // and `include A, B` one. The end moves a byte per statement and stays inside the loop.
+        let mut statement = 0;
+        for (i, include) in class.includes.iter().enumerate() {
+            let parsed = class.include_spans.get(i);
+            if i > 0 && (parsed.is_none() || parsed != class.include_spans.get(i - 1)) {
+                statement += 1;
+            }
             out.includes.push(include.clone());
-            out.include_spans.push(Span { file: super::sources::file_id(file), start: element_start, end: element_end });
+            let end = element_end.saturating_add(statement).min(end.max(element_end));
+            out.include_spans.push(Span { file: super::sources::file_id(file), start: element_start, end });
         }
         out.unknown_calls.extend(class.unknown_calls.iter().cloned());
         for mut method in class.methods {
