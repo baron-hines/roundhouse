@@ -5252,6 +5252,11 @@ impl Analyzer {
             for init in &lc.class_ivar_initializers {
                 writes(init, &mut vars);
             }
+            // Not `SelfInstance`: an initializer's `new` builds the declaring class, read the same from a subclass.
+            let declaring = Ty::Class { id: lc.name.clone(), args: vec![].into() };
+            for ty in vars.values_mut() {
+                *ty = ty.subst_self(&declaring);
+            }
             for method in lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class) {
                 writes(&method.body, &mut vars);
             }

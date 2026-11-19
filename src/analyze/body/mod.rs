@@ -2175,7 +2175,15 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+                // Not a load-time failure under a rescue, which may catch the `NameError` (`block_depth`).
+                let guarded = !rescues.is_empty();
+                if guarded {
+                    self.block_depth.set(self.block_depth.get() + 1);
+                }
                 self.analyze_expr(body, ctx);
+                if guarded {
+                    self.block_depth.set(self.block_depth.get() - 1);
+                }
                 for rc in rescues.iter_mut() {
                     for c in rc.classes.iter_mut() {
                         self.analyze_expr(c, ctx);
@@ -2444,7 +2452,10 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::RescueModifier { expr, fallback } => {
+                // A rescue catches the class body's `NameError` too: not a load-time failure (`block_depth`).
+                self.block_depth.set(self.block_depth.get() + 1);
                 let et = self.analyze_expr(expr, ctx);
+                self.block_depth.set(self.block_depth.get() - 1);
                 let ft = self.analyze_expr(fallback, ctx);
                 union_of(et, ft)
             }

@@ -32,6 +32,8 @@ fn other_class_body_calls_stay_unreported() {
         "class ProbePlain\n  class << self\n    def defaults = {}\n  end\n  D = defaults\nend\n",
         // a lambda's default, which runs when it is called
         "class ProbeLambda < ActionView::Helpers::FormBuilder\n  HANDLER = ->(value = unresolved_default) { value }\nend\n",
+        // a rescue, which catches the NameError
+        "class ProbeRescue < ActionView::Helpers::FormBuilder\n  LIST = optional_probe_hook rescue []\nend\n",
         // a name another class defines
         "class ProbeHelper < ActionView::Helpers::FormBuilder\n  class_attribute :x, default: shared_list\nend\n",
     ] {
