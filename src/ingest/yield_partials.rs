@@ -273,7 +273,7 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     // Each yield runs the block in a fresh scope, where the block's own locals start out nil.
     let owned: Vec<Symbol> = bound
         .iter()
-        .filter(|n| local(n) && !params.iter().any(|p| p.as_str() == n.as_str()))
+        .filter(|n| local(n) && !params.iter().any(|p| p.as_str() == n.as_str()) && scope_assigned(body, n))
         .map(|n| renamed(n))
         .collect();
     let params: Vec<Symbol> = params.iter().map(|p| renamed(p.as_str())).collect();
@@ -378,10 +378,17 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
                 continue;
             };
             let span = stmt.span;
+            let mut body = body.clone();
             // Every argument evaluated once, in order, as the yield does, the ones no parameter takes too.
             for i in 0..params.len().max(args.len()) {
                 let value = args.get(i).cloned().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
                 match params.get(i) {
+                    // Not copied into the parameter: a `form_with` builder is no value at runtime, only its calls are lowered.
+                    Some(p) if matches!(&*value.node, ExprNode::Var { name, .. } if local(name.as_str())) && !assigned(&body, p.as_str()) => {
+                        let ExprNode::Var { name: arg, .. } = &*value.node else { unreachable!() };
+                        let (p, arg) = (p.clone(), arg.clone());
+                        rename(&mut body, &|n| if n == p.as_str() { arg.clone() } else { Symbol::from(n) });
+                    }
                     Some(p) => out.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: p.clone() }, value })),
                     None => out.push(value),
                 }
@@ -391,7 +398,7 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
             }
             match &*body.node {
                 ExprNode::Seq { exprs } => out.extend(exprs.iter().cloned()),
-                _ => out.push(body.clone()),
+                _ => out.push(body),
             }
         }
         *exprs = out;
@@ -407,6 +414,20 @@ fn assigned(e: &Expr, name: &str) -> bool {
         _ => false,
     };
     e.node.for_each_child(&mut |c| found = found || assigned(c, name));
+    found
+}
+
+// Not a nested block's names: a nil reset outside it would shadow its parameters, which then read as that nil.
+fn scope_assigned(e: &Expr, name: &str) -> bool {
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return false;
+    }
+    let mut found = match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n.as_str() == name,
+        ExprNode::MultiAssign { targets, .. } => targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if n.as_str() == name)),
+        _ => false,
+    };
+    e.node.for_each_child(&mut |c| found = found || scope_assigned(c, name));
     found
 }
 

@@ -186,6 +186,28 @@ puts "nested passed"
     assert!(run.stdout.contains("nested passed"), "{}", run.stdout);
 }
 
+/// maybe's `render "accounts/form" do |form| form.fields_for :accountable do |nested| … end end` over a partial that
+/// yields its builder: the nested block's parameter is the nested builder, not the yield copy's nil-started locals.
+#[test]
+fn fields_for_in_a_block_a_partial_yields_the_builder_to_runs_the_override() {
+    let shell = "<%# locals: (article:) %>\n<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= yield form %>\n<% end %>\n";
+    let form = "<%= render \"articles/shell\", article: article do |form| %>\n<%= form.fields_for :meta, article do |nested| %>\n<%= nested.text_field :title %>\n<% end %>\n<% end %>\n";
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_shell.html.erb", shell)
+        .write("app/views/articles/_form.html.erb", form)
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"Hi\" name=\"article[meta][title]\" id=\"article_meta_title\" /></div>"
+raise "missing #{want}:\n#{io}" unless io.include?(want)
+puts "yielded nested passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("yielded nested passed"), "{}", run.stdout);
+}
+
 /// The same builder in a Rails 7.2 app (its `Gemfile.lock`): `field_helpers` spells `text_area`/`check_box` there, so
 /// the loop overrides `text_area`, which Rails 7.2 renders wrapped. Expected strings are actionview 7.2.3.1's.
 #[test]
