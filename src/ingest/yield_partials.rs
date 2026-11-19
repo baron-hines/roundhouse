@@ -31,26 +31,29 @@ pub(super) fn specialize(app: &mut App) {
     let mut copies: Vec<View> = Vec::new();
     let mut next = 0usize;
     let snapshot: Vec<View> = app.views.clone();
+    let mut spans = Vec::new();
     for view in &mut app.views {
         let dir = view.name.as_str().rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
         let format = view.format.clone();
-        rewrite(&mut view.body, &dir, &format, &snapshot, &mut copies, &mut next);
+        rewrite(&mut view.body, &dir, &format, &snapshot, &mut copies, &mut next, &mut spans);
     }
     app.views.extend(copies);
+    app.yield_specialized = spans;
 }
 
-fn rewrite(e: &mut Expr, dir: &str, format: &Symbol, views: &[View], copies: &mut Vec<View>, next: &mut usize) {
+fn rewrite(e: &mut Expr, dir: &str, format: &Symbol, views: &[View], copies: &mut Vec<View>, next: &mut usize, spans: &mut Vec<crate::span::Span>) {
     if let ExprNode::Seq { exprs } = &mut *e.node {
         for stmt in exprs.iter_mut() {
-            if let Some(new) = specialized(stmt, dir, format, views, copies, next) {
+            if let Some((new, span)) = specialized(stmt, dir, format, views, copies, next) {
                 *stmt = new;
+                spans.push(span);
             } else {
-                rewrite(stmt, dir, format, views, copies, next);
+                rewrite(stmt, dir, format, views, copies, next, spans);
             }
         }
         return;
     }
-    e.node.for_each_child_mut(&mut |c| rewrite(c, dir, format, views, copies, next));
+    e.node.for_each_child_mut(&mut |c| rewrite(c, dir, format, views, copies, next, spans));
 }
 
 /// `_buf = _buf + (<call>).to_s`'s `<call>`.
@@ -81,7 +84,7 @@ fn str_lit(e: &Expr) -> Option<&str> {
     }
 }
 
-fn specialized(stmt: &Expr, dir: &str, format: &Symbol, views: &[View], copies: &mut Vec<View>, next: &mut usize) -> Option<Expr> {
+fn specialized(stmt: &Expr, dir: &str, format: &Symbol, views: &[View], copies: &mut Vec<View>, next: &mut usize) -> Option<(Expr, crate::span::Span)> {
     let call = appended(stmt)?;
     let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else { return None };
     if method.as_str() != "render" {
@@ -168,7 +171,7 @@ fn specialized(stmt: &Expr, dir: &str, format: &Symbol, views: &[View], copies: 
     {
         *inner = render;
     }
-    Some(out)
+    Some((out, span))
 }
 
 /// Whether the block leaves early, yields itself, or binds a name `rename` does not reach.
@@ -186,6 +189,11 @@ fn leaves_or_binds(e: &Expr) -> bool {
 
 /// The partial's yields, each an output (`<%= yield … %>`), by argument count; false past any other yield.
 fn only_output_yields(e: &Expr, counts: &mut Vec<usize>) -> bool {
+    // A block whose body is the one statement holds it bare, not in a `Seq`.
+    if let Some(ExprNode::Yield { args }) = appended(e).map(|c| &*c.node) {
+        counts.push(args.len());
+        return args.iter().all(|a| only_output_yields(a, &mut Vec::new()));
+    }
     if let ExprNode::Seq { exprs } = &*e.node {
         for stmt in exprs {
             if let Some(ExprNode::Yield { args }) = appended(stmt).map(|c| &*c.node) {
@@ -210,6 +218,12 @@ fn only_output_yields(e: &Expr, counts: &mut Vec<usize>) -> bool {
 }
 
 fn replace_yields(e: &mut Expr, params: &[Symbol], body: &Expr) {
+    if matches!(appended(e).map(|c| &*c.node), Some(ExprNode::Yield { .. })) {
+        let mut seq = Expr::new(e.span, ExprNode::Seq { exprs: vec![e.clone()] });
+        replace_yields(&mut seq, params, body);
+        *e = seq;
+        return;
+    }
     if let ExprNode::Seq { exprs } = &mut *e.node {
         let mut out = Vec::with_capacity(exprs.len());
         for mut stmt in std::mem::take(exprs) {

@@ -739,6 +739,10 @@ pub struct App {
     /// are reported as warnings, since Rails never runs them.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unreachable_views: BTreeSet<Symbol>,
+    /// The block renders `ingest::yield_partials` turned into a render of a
+    /// partial copy, by the call's span: off the ruby family still refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yield_specialized: Vec<crate::span::Span>,
     /// The `app/helpers` modules' diagnostics, taken before the
     /// post-analyze lowerings rewrite their bodies; `None` until then,
     /// and on a path that never lowers (`check`), where they are
@@ -1441,6 +1445,7 @@ impl App {
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),
             unreachable_views: BTreeSet::new(),
+            yield_specialized: Vec::new(),
             helper_diagnostics: None,
             unknown_association_targets: Vec::new(),
             helper_modules: BTreeSet::new(),
