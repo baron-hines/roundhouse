@@ -913,10 +913,12 @@ fn create_schema_forced(args: &[Node<'_>]) -> bool {
 /// (`disable_extension` an extension, `drop_schema` or a forced
 /// `create_schema` a schema and the extensions in it) is refused rather
 /// than skipped, which would create at boot what the migration removed.
-/// With nothing recorded it changes nothing the fold holds.
+/// With nothing recorded it changes nothing the fold holds, unless it is
+/// a `disable_extension` with `force:`, refused as a literal one is.
 fn unread_name(verb: &str, args: &[Node<'_>], file: &str, schema: &Schema) -> Result<(), IngestError> {
     let (call, removes) = match verb {
-        "disable_extension" => ("disable_extension", !schema.extensions.is_empty()),
+        // Its only keyword is `force:`, so one given (or a `**` splat) may cascade to what the fold can't see.
+        "disable_extension" => ("disable_extension", !schema.extensions.is_empty() || args.iter().skip(1).any(|arg| arg.as_keyword_hash_node().is_some())),
         "drop_schema" => ("drop_schema", !schema.schemas.is_empty() || !schema.extensions.is_empty()),
         "create_schema" if create_schema_forced(args) => ("create_schema with force:", !schema.schemas.is_empty() || !schema.extensions.is_empty()),
         _ => return Ok(()),
@@ -926,7 +928,7 @@ fn unread_name(verb: &str, args: &[Node<'_>], file: &str, schema: &Schema) -> Re
     }
     Err(IngestError::Unsupported {
         file: file.into(),
-        message: format!("{call} with a name that is not a literal may remove a schema or extension recorded before it, which boot would then create; a db/schema.rb dumped after it holds the result"),
+        message: format!("{call} with a name that is not a literal may remove a schema or extension recorded before it, or what depends on one, which boot would then create; a db/schema.rb dumped after it holds the result"),
     })
 }
 
