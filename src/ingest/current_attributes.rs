@@ -20,7 +20,8 @@
 //! * one `@__instance` singleton plus `self.instance` / `self.reset`;
 //! * a reader and writer per declared attribute, storing in an ivar;
 //! * `delegate … to: :x, prefix: true, allow_nil: true` expanded to real
-//!   methods (`request_host` → `@request.nil? ? nil : @request.host`);
+//!   methods (`request_host` → `@request.host` unless `@request` is nil; a
+//!   target that is a method, not an attribute, is called, as Rails does);
 //! * a `self.<name>` forwarder for every instance method, which is what
 //!   makes the class-level call sites app code actually writes resolve.
 //!
@@ -316,13 +317,19 @@ fn synthesized_source(
             continue;
         }
         let (t, m) = (d.target.as_str(), d.method.as_str());
+        // `to: :user` calls the method: the ivar only for a declared attribute whose reader the app left as storage.
+        let target = if t.starts_with('@') || (attrs.iter().any(|a| a.as_str() == t) && !defines(t)) {
+            format!("@{}", t.trim_start_matches('@'))
+        } else {
+            t.to_string()
+        };
         if d.allow_nil {
             body.push_str(&format!(
-                "  def {}\n    @{t}.nil? ? nil : @{t}.{m}\n  end\n\n",
+                "  def {}\n    __target = {target}\n    __target.nil? ? nil : __target.{m}\n  end\n\n",
                 d.name
             ));
         } else {
-            body.push_str(&format!("  def {}\n    @{t}.{m}\n  end\n\n", d.name));
+            body.push_str(&format!("  def {}\n    {target}.{m}\n  end\n\n", d.name));
         }
     }
 

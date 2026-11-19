@@ -16326,6 +16326,8 @@ mod yield_partial_render;
 mod string_bytes;
 #[path = "emit_and_run/string_to_d.rs"]
 mod string_to_d;
+#[path = "emit_and_run/current_delegate_method.rs"]
+mod current_delegate_method;
 
 /// A Slim view is ingested rather than skipped, so `check` going quiet on
 /// it is a claim the emitted page renders. Swap the blog's index for a
@@ -22759,3 +22761,5 @@ mod params_compact_blank;
 mod computed_partial_render;
 #[path = "emit_and_run/view_raise_statement.rs"]
 mod view_raise_statement;
+#[path = "emit_and_run/record_as_json_in_literal.rs"]
+mod record_as_json_in_literal;
