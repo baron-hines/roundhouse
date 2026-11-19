@@ -450,9 +450,21 @@ fn family<'a>(controller: &'a Controller, by_name: &HashMap<&str, &'a Controller
 fn defines(c: &Controller, name: &str, modules: &HashMap<&str, HashSet<&str>>) -> bool {
     c.body.iter().any(|item| match item {
         ControllerBodyItem::Action { action, .. } => action.name.as_str() == name,
-        ControllerBodyItem::Unknown { expr, .. } => included(expr).iter().any(|m| modules.get(m.as_str()).is_none_or(|defs| defs.contains(name))),
+        ControllerBodyItem::Unknown { expr, .. } => included(expr).iter().any(|m| match modeled_module(m) {
+            Some(defs) => defs.contains(&name),
+            None => modules.get(m.as_str()).is_none_or(|defs| defs.contains(name)),
+        }),
         _ => false,
     })
+}
+
+/// The methods a module the runtime models (not a library class here) defines: pagy's backends.
+fn modeled_module(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "Pagy::Backend" => Some(&["pagy", "pagy_array", "pagy_get_count", "pagy_get_items", "pagy_get_limit", "pagy_get_page"]),
+        "Pagy::Method" => Some(&["pagy"]),
+        _ => None,
+    }
 }
 
 fn included(expr: &Expr) -> Vec<String> {
@@ -471,16 +483,52 @@ fn included(expr: &Expr) -> Vec<String> {
 /// Whether a render in `c` may reach the template: one naming it, or one
 /// whose target is computed.
 fn renders(c: &Controller, action: &str, template: &str) -> bool {
+    let bodies = || {
+        c.body.iter().filter_map(|item| match item {
+            ControllerBodyItem::Action { action, .. } => Some(&action.body),
+            ControllerBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        })
+    };
+    // `render(**notification)` (maybe's `Notifiable`) reaches a template only through a `template:`/`action:`/`file:`
+    // key, which no hash this controller builds holds: it renders the partials its hashes name.
+    let template_hash = bodies().any(builds_template_hash);
     let mut found = false;
-    for item in &c.body {
-        let body = match item {
-            ControllerBodyItem::Action { action, .. } => &action.body,
-            ControllerBodyItem::Unknown { expr, .. } => expr,
-            _ => continue,
-        };
-        visit_renders(body, &mut |lits, dynamic| {
-            found |= dynamic || lits.iter().any(|l| l == action || names_template(l, template));
+    for body in bodies() {
+        visit_renders(body, &mut |lits, dynamic, splat| {
+            found |= (dynamic && !(splat && !template_hash)) || lits.iter().any(|l| l == action || names_template(l, template));
         });
+    }
+    found
+}
+
+/// Whether a hash literal in `e` holds a `template:`, `action:` or `file:` key. Not one passed straight to another
+/// call (`logs.create!(action: action_name, …)`), which is that call's attributes, not render options.
+fn builds_template_hash(e: &Expr) -> bool {
+    let key = |entries: &[(Expr, Expr)]| {
+        entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "template" | "action" | "file")))
+    };
+    let mut found = matches!(&*e.node, ExprNode::Hash { entries, .. } if key(entries));
+    match &*e.node {
+        ExprNode::Send { method, recv, args, block, .. } if !matches!(method.as_str(), "render" | "render_to_string") => {
+            for a in args {
+                match &*a.node {
+                    ExprNode::Hash { entries, .. } => {
+                        for (k, v) in entries {
+                            found = found || builds_template_hash(k) || builds_template_hash(v);
+                        }
+                    }
+                    _ => found = found || builds_template_hash(a),
+                }
+            }
+            if let Some(r) = recv {
+                found = found || builds_template_hash(r);
+            }
+            if let Some(b) = block {
+                found = found || builds_template_hash(b);
+            }
+        }
+        _ => e.node.for_each_child(&mut |c| found = found || builds_template_hash(c)),
     }
     found
 }
@@ -508,7 +556,7 @@ fn render_literals_outside_controllers(app: &App, unrouted: &HashSet<String>) ->
         app.library_classes.iter().any(|c| c.includes.iter().any(|i| i.0.as_str().trim_start_matches("::") == lc.name.0.as_str()))
     };
     let mut out = Vec::new();
-    let mut collect = |e: &Expr| visit_renders(e, &mut |lits, _| out.extend(lits.iter().cloned()));
+    let mut collect = |e: &Expr| visit_renders(e, &mut |lits, _, _| out.extend(lits.iter().cloned()));
     for lc in &app.library_classes {
         let module_included = included(lc);
         let runs_nowhere = |span: &crate::span::Span| {
@@ -532,7 +580,8 @@ fn render_literals_outside_controllers(app: &App, unrouted: &HashSet<String>) ->
 
 /// Each render-like call under `e`: the String/Symbol literals among its
 /// arguments, and whether its target is computed.
-fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool)) {
+/// Each render's literal names, whether one is not a literal, and whether that is only a `**hash` argument.
+fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool, bool)) {
     e.node.for_each_child(&mut |c| visit_renders(c, f));
     let ExprNode::Send { method, args, .. } = &*e.node else { return };
     if !matches!(method.as_str(), "render" | "render_to_string" | "respond_with") {
@@ -540,6 +589,7 @@ fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool)) {
     }
     let mut lits = Vec::new();
     let mut dynamic = method.as_str() == "respond_with";
+    let splat = matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::KeywordSplat { value } if !matches!(&*value.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "params" | "session" | "cookies" | "request"))));
     for (i, a) in args.iter().enumerate() {
         match &*a.node {
             ExprNode::Lit { value: Literal::Str { value } } => lits.push(value.clone()),
@@ -564,5 +614,5 @@ fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool)) {
             _ => {}
         }
     }
-    f(&lits, dynamic);
+    f(&lits, dynamic, splat);
 }

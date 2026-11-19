@@ -36,3 +36,29 @@ fn an_unreachable_template_s_errors_are_warnings() {
 fn the_app_with_it_still_boots() {
     app().run_ruby("raise \"kept\" unless defined?(Views::Notes) && Views::Notes.respond_to?(:rendered) && Views::Notes.respond_to?(:orphan)\nputs \"boots\"\n").assert_passes();
 }
+
+/// maybe's `Notifiable`: an ancestor's `view_context.render(**notification)`
+/// renders the partials its hashes name, not a template, when no hash the
+/// controller builds holds `template:`/`action:`/`file:` (an attribute hash
+/// passed to `create!` is not one), and `include Pagy::Backend` defines no
+/// action of the template's name. A `template:` hash keeps the render open.
+#[test]
+fn a_splatted_partial_render_and_pagy_backend_reach_no_template() {
+    let notifiable = "module Notifiable\n  extend ActiveSupport::Concern\n\n  private\n    def render_notices\n      notices.map { |n| view_context.render(**n) }\n    end\n\n    def notices\n      [{ partial: \"shared/notice\", locals: { message: \"hi\" } }]\n    end\n\n    def log_visit\n      Rails.logger.info(controller: controller_name, action: action_name)\n    end\nend\n";
+    let base = |notifiable: &str| {
+        app()
+            .write("app/controllers/concerns/notifiable.rb", notifiable)
+            .write("app/views/shared/_notice.html.erb", "<p><%= message %></p>\n")
+            .edit("Gemfile.lock", "    debug (1.11.1)\n", "    pagy (9.3.5)\n    debug (1.11.1)\n")
+            .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  pagy\n")
+            .edit(
+                "app/controllers/application_controller.rb",
+                "class ApplicationController < ActionController::Base\n",
+                "class ApplicationController < ActionController::Base\n  include Notifiable\n  include Pagy::Backend\n",
+            )
+    };
+    let warnings = base(notifiable).ingest_warnings();
+    assert!(warnings.iter().any(|w| w.contains("`notes/orphan` is rendered by no action, route or render call")), "{warnings:#?}");
+    let warnings = base(&notifiable.replace("{ partial: \"shared/notice\"", "{ template: \"notes/orphan\"")).ingest_warnings();
+    assert!(!warnings.iter().any(|w| w.contains("`notes/orphan` is rendered by no action")), "{warnings:#?}");
+}
