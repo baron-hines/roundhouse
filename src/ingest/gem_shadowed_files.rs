@@ -25,7 +25,7 @@ use super::util::{class_name_path, constant_id_str, constant_path_segments_strs,
 
 /// The app files under an autoload root whose constant, as Zeitwerk names
 /// it from the file's path with the app's inflections, one of `gems`'
-/// `lib/` files defines. Read before anything is hidden, so `vfs` is the
+/// `lib/` files defines, of those the gem loads while it boots. Read before anything is hidden, so `vfs` is the
 /// whole tree.
 pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], gems: &[SourceGem]) -> HashSet<PathBuf> {
     let mut out = HashSet::default();
@@ -39,11 +39,12 @@ pub(super) fn shadowed<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf], 
             continue;
         }
         // Not a generator: `rails generate` loads it, the app's boot does not.
+        // Nor a file only a feature-name autoload reaches (`autoload :Box, "shelf/box"`): Zeitwerk sets its own autoload over that one.
         gem_files.extend(
             super::app::read_rb_files(vfs, &lib)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|f| !f.strip_prefix(&lib).is_ok_and(|rel| rel.starts_with("generators"))),
+                .filter(|f| !f.strip_prefix(&lib).is_ok_and(|rel| rel.starts_with("generators")) && gem.loaded_at_boot(f)),
         );
     }
     let defined = defined_constants(vfs, &gem_files);
