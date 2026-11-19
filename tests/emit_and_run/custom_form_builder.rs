@@ -165,6 +165,27 @@ puts "field helpers passed"
     assert!(run.stdout.contains("field helpers passed"), "{}", run.stdout);
 }
 
+/// A list the class body adds to (`self.text_field_helpers += [:label]`) is the one the loop walks, as the body runs it.
+#[test]
+fn a_field_helpers_loop_walks_the_list_as_the_body_adds_to_it() {
+    let builder = FIELD_HELPERS_BUILDER.replace("\n\n  text_field_helpers.each", "\n  self.text_field_helpers += [:label]\n\n  text_field_helpers.each");
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/styled_probe_builder.rb", &builder)
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: StyledProbeBuilder) do |form| %>\n<%= form.label :title %>\n<%= form.text_field :title %>\n<% end %>\n")
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+[
+  "<div class=\"field\"><label for=\"article_title\">Title</label></div>",
+  "<div class=\"field\"><input type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>",
+].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
+puts "added list passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("added list passed"), "{}", run.stdout);
+}
+
 /// Rails hands `fields_for` the form's `builder:`, so a nested `text_field` runs the override too, on a builder for
 /// the nested name. Expected strings are Rails 8.1.4's.
 #[test]
@@ -390,7 +411,8 @@ puts "namespace passed"
 
 /// `fields_for :comments` over a has_many's nested attributes: Rails 8.1.4 writes each child under
 /// `article[comments_attributes][i]`, counting `i` from 0, with the persisted child's hidden id after its fields, and
-/// an explicit `child_index:` for one record given. Attribute sets, since order is not markup.
+/// an explicit `child_index:` for one record given, and a later call continuing the count. Attribute sets, since order
+/// is not markup.
 #[test]
 fn fields_for_over_a_has_many_nested_attribute_names_as_rails() {
     let run = nested_many_app().run_ruby(&nested_many_script());
@@ -409,7 +431,7 @@ fn fields_for_over_a_has_many_nested_attribute_names_as_rails_on_spinel() {
 fn nested_many_app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  accepts_nested_attributes_for :comments\n")
-        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"New\"), child_index: \"IDX\" do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"New\"), child_index: \"IDX\" do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"Third\") do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
 }
 
 fn nested_many_script() -> String {
@@ -425,6 +447,7 @@ Views::Articles.form_into(io, Article.find(a.id), nil, nil)
   "article[comments_attributes][1][body]" => {{ "type" => "text", "value" => "Two", "id" => "article_comments_attributes_1_body" }},
   "article[comments_attributes][1][id]" => {{ "type" => "hidden", "value" => two.id.to_s, "id" => "article_comments_attributes_1_id" }},
   "article[comments_attributes][IDX][body]" => {{ "type" => "text", "value" => "New", "id" => "article_comments_attributes_IDX_body" }},
+  "article[comments_attributes][2][body]" => {{ "type" => "text", "value" => "Third", "id" => "article_comments_attributes_2_body" }},
 }}.each do |name, want|
   got = attrs(io, name)
   raise "#{{name}}: #{{got}}" unless got == want.merge("name" => name)

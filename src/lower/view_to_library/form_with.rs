@@ -414,12 +414,13 @@ fn emit_form_inline(
         recordless: !comps.model_name.is_empty() && matches!(&*comps.model.node, ExprNode::Lit { value: Literal::Nil }),
         builder: (!overridden.is_empty()).then(|| custom_builder(args)).flatten(),
         overridden,
+        child_counters: Default::default(),
     });
     // `f.object` is the one FormBuilder method used in EXPRESSION
     // position (`errors_for f.object`) — substitute the record local
     // before the walk so downstream classifiers see a plain Var.
     let body = rewrite_form_object_reads(body, form_param_str, &record_var);
-    out.extend(walk_body(&body, &inner_ctx));
+    out.extend(super::walk_counting(&body, &inner_ctx));
 
     // 5. Close `</form>`.
     out.push(accumulator_append_call(
@@ -1025,7 +1026,11 @@ fn classify_form_with_components(
         return Some(FormWithComponents {
             model: nested_model,
             model_name: nested_name,
-            action: nested_action,
+            // Not the nested route when `url:` is given: Rails' form_with takes the url first.
+            action: match &url_expr {
+                Some(url) => route_helperize(url.clone(), &route_helpers, ctx),
+                None => nested_action,
+            },
             method,
             opts_entries,
             id_prefix: namespace.clone().unwrap_or_default(),

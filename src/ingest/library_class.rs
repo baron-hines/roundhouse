@@ -4715,6 +4715,14 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             })
     });
     fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
+        // `self.list += [:x]`, `||=` and `&&=` write the attribute too, though they are no CallNode.
+        if let Some(name) = node.as_call_operator_write_node().map(|w| w.read_name())
+            .or_else(|| node.as_call_or_write_node().map(|w| w.read_name()))
+            .or_else(|| node.as_call_and_write_node().map(|w| w.read_name()))
+        {
+            redefined.insert(constant_id_str(&name).to_string());
+            return;
+        }
         let Some(call) = node.as_call_node() else { return };
         let name = constant_id_str(&call.name()).to_string();
         if let Some(attr) = name.strip_suffix('=')
@@ -4734,6 +4742,24 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
         if let Some(def) = s.as_def_node() {
             redefined.insert(constant_id_str(&def.name()).trim_end_matches('=').to_string());
             continue;
+        }
+        // `self.list += [:x]` / `-= [:x]` with a literal list changes the list the later loop walks, as the body runs.
+        if let Some(write) = s.as_call_operator_write_node()
+            && write.receiver().is_some_and(|r| r.as_self_node().is_some())
+            && let Some(Some(list)) = declared.get_mut(&*constant_id_str(&write.read_name()))
+            && let Some(right) = static_name_list(&write.value(), framework_helpers)
+        {
+            match &*constant_id_str(&write.binary_operator()) {
+                "+" => {
+                    list.extend(right);
+                    continue;
+                }
+                "-" => {
+                    list.retain(|n| !right.contains(n));
+                    continue;
+                }
+                _ => {}
+            }
         }
         note_uses(s, &mut redefined);
         let Some(call) = s.as_call_node() else { continue };

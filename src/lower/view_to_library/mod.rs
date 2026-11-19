@@ -982,6 +982,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             recordless: false,
             overridden: overridden.clone(),
             builder: builder.clone(),
+            child_counters: Default::default(),
         });
 
         let record_ref = Expr::new(
@@ -1018,7 +1019,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         body_stmts.push(accumulator_append_call(view_helpers_call("keep_hidden_autocomplete", Vec::new()), &ctx));
     }
     body_stmts.extend(prelude);
-    body_stmts.extend(walk_body(&rewritten, &ctx));
+    body_stmts.extend(walk_counting(&rewritten, &ctx));
     body_stmts.push(accumulator_result_ref(&ctx.accumulator));
 
     let mut body = seq(body_stmts);
@@ -5294,6 +5295,22 @@ pub(super) struct FormBuilderBinding {
     pub(super) overridden: crate::det::HashSet<String>,
     /// The form's `builder:` class when it overrides a stock field, which a `fields_for` inside builds again.
     pub(super) builder: Option<Expr>,
+    /// Rails' `nested_child_index` counters of this builder, one per has_many its `fields_for` calls count over.
+    pub(super) child_counters: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+/// The builder scope's walked body after its child counters start at -1: declared before the scope's first statement,
+/// not at the first `fields_for`, which a branch may skip.
+pub(super) fn walk_counting(body: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
+    let walked = walk_body(body, ctx);
+    let Some(binding) = ctx.form_records.last() else { return walked };
+    let counters = binding.child_counters.borrow();
+    let mut out: Vec<Expr> = counters.iter().map(|name| Expr::new(Span::synthetic(), ExprNode::Assign {
+        target: LValue::Var { id: VarId(0), name: Symbol::from(name.as_str()) },
+        value: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: -1 } }),
+    })).collect();
+    out.extend(walked);
+    out
 }
 
 impl FormBuilderBinding {

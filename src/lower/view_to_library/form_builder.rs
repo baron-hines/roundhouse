@@ -1354,9 +1354,10 @@ fn emit_fields_for(
         form_method_var: binding.form_method_var.clone(),
         id_prefix: binding.id_prefix.clone(),
         recordless: binding.recordless && positional.get(1).is_none(),
+        child_counters: Default::default(),
     });
     let body = super::form_with::rewrite_form_object_reads(body, &nested_param_str, &record_var);
-    let mut fields = walk_body(&body, &inner);
+    let mut fields = super::walk_counting(&body, &inner);
     if !nested_attributes {
         out.extend(fields);
         return Some(out);
@@ -1420,16 +1421,17 @@ fn emit_nested_collection_fields(
     };
     let opt = |key: &str| opts.iter().find_map(|(k, v)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key).then_some(v));
     let include_id = !opt("include_id").is_some_and(|v| matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } }));
-    let counter = format!("rh_{param}_index");
+    // Not the block's own counter: Rails counts on the parent builder per association, across its `fields_for` calls.
+    let counter = format!("rh_{}_{}_index", binding.form_param, nested.as_str());
     let child_index = format!("rh_{param}_child_index");
     let mut out = Vec::new();
     let index_value = match opt("child_index") {
         Some(explicit) => send(Some(explicit.clone()), "to_s", Vec::new(), None, false),
         None => {
-            out.push(Expr::new(Span::synthetic(), ExprNode::Assign {
-                target: super::LValue::Var { id: VarId(0), name: Symbol::from(counter.as_str()) },
-                value: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: -1 } }),
-            }));
+            let mut counters = binding.child_counters.borrow_mut();
+            if !counters.contains(&counter) {
+                counters.push(counter.clone());
+            }
             send(Some(var(&counter)), "to_s", Vec::new(), None, false)
         }
     };
@@ -1445,6 +1447,7 @@ fn emit_nested_collection_fields(
         form_method_var: binding.form_method_var.clone(),
         id_prefix: binding.id_prefix.clone(),
         recordless: false,
+        child_counters: Default::default(),
     });
     let body = super::form_with::rewrite_form_object_reads(body, param, &record_var);
     let mut loop_body = Vec::new();

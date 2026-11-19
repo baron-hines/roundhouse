@@ -1,5 +1,5 @@
 //! `form_with model: [@article, @article.comments.build]`: Rails evaluates the child once, so the association holds
-//! one built comment, and posts to the nested collection while it is new.
+//! one built comment, and posts to the nested collection while it is new; an explicit `url:` wins.
 
 use super::emit_and_run;
 
@@ -12,7 +12,7 @@ fn app() -> emit_and_run::Overlay {
     .edit(
         "app/views/articles/show.html.erb",
         "rounded\" %>\n<% end %>",
-        "rounded\" %>\n<% end %>\n<p id=\"held\"><%= @article.comments.size %></p>",
+        "rounded\" %>\n<% end %>\n<p id=\"held\"><%= @article.comments.size %></p>\n<%= form_with model: [@article, Comment.new], url: \"/custom\" do |f| %><%= f.text_field :body %><% end %>",
     )
 }
 
@@ -25,6 +25,7 @@ raise "status #{r[0]}" unless r[0] == 200
 body = r[1].is_a?(Array) ? r[1].join : r[1].to_s
 raise body[0, 3000] unless body.include?("<form action=\"/articles/#{hello.id}/comments\"")
 raise body[0, 3000] unless body.include?("<p id=\"held-before\">0</p>") && body.include?("<p id=\"held\">1</p>")
+raise body[-3000, 3000] unless body.include?("<form action=\"/custom\"")
 puts "nested child passed"
 "#;
 
