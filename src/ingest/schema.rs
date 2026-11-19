@@ -857,6 +857,17 @@ fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema:
             }
         }
         "disable_extension" => {
+            // A keyword splat (`**{ force: :cascade }`, `**options`)
+            // hides the `force:` it may carry.
+            let splat = args.iter().skip(1).any(|arg| {
+                arg.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some()))
+            });
+            if splat {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("disable_extension \"{name}\" with a ** keyword splat may carry force: :cascade, which drops what depends on the extension and is not modelled; a db/schema.rb dumped after it holds the result"),
+                });
+            }
             // Rails adds CASCADE only for `force: :cascade`; any other
             // literal is a plain drop.
             if let Some(force) = kwarg_value(args.iter().skip(1), "force") {
