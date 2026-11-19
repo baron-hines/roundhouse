@@ -4051,9 +4051,8 @@ module ActiveRecord
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
         # On a uuid column the id casts as any other value there does.
-        key = val._primary_key_value
-        return uuid_value_predicate(qcol, key) if uuid_query_column?(col)
-        "#{qcol} = #{bind_literal(key)}"
+        return uuid_value_predicate(qcol, val._primary_key_value) if uuid_query_column?(col)
+        "#{qcol} = #{bind_literal(val._primary_key_value)}"
       elsif enum_column?(col)
         # An enum label held in a variable (the literal ones were cast
         # when the app was lowered): its stored value, and a label no
