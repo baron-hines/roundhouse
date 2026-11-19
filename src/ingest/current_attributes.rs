@@ -168,6 +168,14 @@ fn declare_attribute_types(methods: &mut [MethodDef], declared: &[(Symbol, crate
     out
 }
 
+/// A delegate target Ruby would parse as a keyword (`to: :class`), which Rails' delegate qualifies with `self.`.
+const RUBY_KEYWORDS: [&str; 41] = [
+    "__ENCODING__", "__LINE__", "__FILE__", "BEGIN", "END", "alias", "and", "begin", "break", "case", "class", "def",
+    "defined?", "do", "else", "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not", "or",
+    "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless", "until", "when", "while",
+    "yield",
+];
+
 /// `delegate :host, :protocol, to: :request, prefix: true, allow_nil: true`.
 /// Returns `(method, target, generated_name, allow_nil)`.
 struct Delegation {
@@ -320,6 +328,8 @@ fn synthesized_source(
         // `to: :user` calls the method: the ivar only for a declared attribute whose reader the app left as storage.
         let target = if t.starts_with('@') || (attrs.iter().any(|a| a.as_str() == t) && !defines(t)) {
             format!("@{}", t.trim_start_matches('@'))
+        } else if RUBY_KEYWORDS.contains(&t) {
+            format!("self.{t}")
         } else {
             t.to_string()
         };
