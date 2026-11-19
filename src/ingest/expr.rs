@@ -1209,17 +1209,19 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 return Ok(source_file_path_lit(span, dir));
             }
             if let Some(body) = writing_connection_block(&c) {
-                return match body {
-                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file),
-                    WritingBlock::Body(None) => Ok(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
-                    WritingBlock::Forwarded(name) => Ok(Expr::new(span, ExprNode::Send {
+                let mut body = match body {
+                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file)?,
+                    WritingBlock::Body(None) => Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+                    WritingBlock::Forwarded(name) => Expr::new(span, ExprNode::Send {
                         recv: Some(Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name })),
                         method: Symbol::from("call"),
                         args: Vec::new(),
                         block: None,
                         parenthesized: false,
-                    })),
+                    }),
                 };
+                body.decisions |= crate::expr::ERASED_WRITING_SCOPE;
+                return Ok(body);
             }
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
                 ingest_forwardable_arguments(&a, file)?
@@ -4386,8 +4388,12 @@ fn destructure_block_params(params_node: Option<Node<'_>>, body: Expr, file: &st
     // otherwise become the value: a rest binding answers the tail, and
     // `map { |(month, *row)| }` would return those tails.
     let body_empty = matches!(&*body.node, ExprNode::Seq { exprs } if exprs.is_empty());
+    // A writing block read as its body stays one statement, with its mark
+    // (`ERASED_WRITING_SCOPE`): spliced in, a routed app could not put the
+    // call back around it.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs } => prelude.extend(exprs),
+        ExprNode::Seq { exprs } if !erased => prelude.extend(exprs),
         other => prelude.push(Expr { node: Box::new(other), ..body }),
     }
     if body_empty {
@@ -4485,9 +4491,15 @@ fn desugar_post_params(rest_param: &mut Option<Symbol>, posts: Vec<Symbol>, body
             )
         })
         .collect();
+    // As in `destructure_block_params`: a marked body stays one statement.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs: inner } => exprs.extend(inner),
-        other => exprs.push(Expr::new(body.span, other)),
+        ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
+        other => {
+            let mut only = Expr::new(body.span, other);
+            only.decisions = body.decisions;
+            exprs.push(only);
+        }
     }
     Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
 }
@@ -4518,8 +4530,10 @@ fn scope_block_locals(params_node: Option<Node<'_>>, mut body: Expr) -> Expr {
                 },
             );
             let mut exprs = vec![init];
+            // As in `destructure_block_params`: a marked body stays one statement.
+            let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
             match *body.node {
-                ExprNode::Seq { exprs: inner } => exprs.extend(inner),
+                ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
                 other => exprs.push(Expr { node: Box::new(other), ..body }),
             }
             body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs });

@@ -20,6 +20,15 @@ module Db
   # holder is in a transaction of its own (not the request snapshot).
   def self.database_path: () -> String
   def self.adapter_name: () -> String
+  # The pool slot a connection handle taken now stays on (`ActiveRecord::Base.connection`), for Base itself or for the
+  # connection class; -1 on a Db with one database, where the handle is the shared one, and -2 before `configure`.
+  def self.connection_slot: (bool) -> Integer
+  # The pair a handle with a slot runs each statement between (`ActiveRecord::Connection`). Only a shim whose
+  # `connection_slot` answers a slot is called; the Spinel shims define them.
+  def self.enter_slot: (Integer, bool) -> nil
+  # Hold a handle's lease without selecting its slot for model queries.
+  def self.hold_slot: (Integer, bool) -> nil
+  def self.leave_slot: () -> nil
   def self.transaction_open?: () -> bool
   def self.close: () -> void
   def self.exec: (String) -> void

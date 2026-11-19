@@ -896,6 +896,23 @@ module Db
     "postgresql"
   end
 
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
+  end
+
+  def self.enter_slot(_slot, _base)
+    nil
+  end
+
+  def self.hold_slot(_slot, _base)
+    nil
+  end
+
+  def self.leave_slot
+    nil
+  end
+
   def self.transaction_open?
     st = current_conn.status
     st == PG::PQTRANS_INTRANS || st == PG::PQTRANS_INERROR

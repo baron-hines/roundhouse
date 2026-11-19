@@ -947,6 +947,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     let expression_dialect = schema_expression_dialect(vfs, dir);
+    let mut schema_file = None;
     // A refused `schema_dump:` leaves the schema empty.
     if let Some(named) = &named_schema.primary {
         if let Ok((path, sql)) = named
@@ -960,6 +961,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             };
             if let Some(schema) = unwrap_or_record(schema)? {
                 app.schema = schema;
+                schema_file = (!*sql).then(|| path.strip_prefix(dir).unwrap_or(path).to_string_lossy().into_owned());
             }
         }
     } else if vfs.exists(&schema_path) {
@@ -968,6 +970,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                 unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &schema_path.display().to_string(), expression_dialect))?
             {
                 app.schema = schema;
+                schema_file = Some("db/schema.rb".to_string());
             }
         }
     } else if vfs.exists(&structure_path) {
@@ -3641,7 +3644,8 @@ end
     key_composite_tables(&mut app)?;
     // Model-to-database ownership reads every model, concern splice and
     // library module, so it runs once they all exist.
-    super::database_ownership::resolve(&mut app);
+    super::database_ownership::resolve(&mut app, schema_file.as_deref());
+    super::database_ownership::refuse_routing_settings(&mut app, vfs, dir);
     // Not an error: the queue's tables joined the primary at ingest, so solid_queue's record runs there, where the runtime's one connection is.
     if solid_queue_root.is_some() {
         for refusal in &mut app.database_refusals {

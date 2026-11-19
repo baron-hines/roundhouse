@@ -14,6 +14,8 @@
 # placeholder bind params — the FFI shim can't construct SQLITE_TRANSIENT
 # for bind_text, so the shared contract is "inline escaped values".
 module SqliteAdapter
+  DML_QUERY = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:insert|update|delete|replace)\b/i
+
   # Quote one schema-validated SQL identifier (not a value); SQLite
   # doubles embedded quotes and accepts this SQL-standard spelling.
   def self.quote_column_name(name)
@@ -118,7 +120,8 @@ module SqliteAdapter
   # leave it checked out on the connection until the lease ends — or,
   # outside `Db.with_connection`, until `Db.close`.
   def self.each_row(sql)
-    stmt = Db.prepare(sql)
+    # A write keeps its returned rows and invalidates held readers.
+    stmt = sql.match?(DML_QUERY) ? Db.exec_returning(ActiveRecord::Relation.inline_sql(sql)) : Db.prepare(sql)
     begin
       ncols = Db.column_count(stmt)
       # Column names can't change between rows — resolve them once, not
