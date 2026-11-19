@@ -67,6 +67,14 @@ impl<'a> BodyTyper<'a> {
         args: &[Expr],
     ) -> Option<crate::diagnostic::DiagnosticKind> {
         let Some(Ty::Class { id, .. }) = recv_ty else { return None };
+        // Cleared by the `[]` read on it when its key is one pagy9.rb's `vars` holds (`pagy9_vars_read`).
+        if id.0.as_str() == "Pagy" && method.as_str() == "vars" && self.classes().contains_key(&ClassId(Symbol::from("Pagy::Backend"))) {
+            return Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                target: None,
+                construct: Symbol::from("pagy"),
+                detail: "`Pagy#vars` is modeled only as `vars[k]` for `count`, `limit`, `page`, `items`, `outset` or `size`".into(),
+            });
+        }
         if id.0.as_str() != "Pagy" || args.is_empty() {
             return None;
         }
@@ -87,12 +95,19 @@ impl<'a> BodyTyper<'a> {
     /// does not lock the gem).
     pub(super) fn pagy_call_ty(
         &self,
+        method: &Symbol,
         args: &[Expr],
         ctx: &Ctx,
         refusal: &mut Option<crate::diagnostic::DiagnosticKind>,
     ) -> Option<Ty> {
         let pagy_id = ClassId(Symbol::from("Pagy"));
         self.classes().get(&pagy_id)?;
+        if self.classes().contains_key(&ClassId(Symbol::from("Pagy::Backend"))) {
+            return self.pagy9_call_ty(method, args, ctx, refusal);
+        }
+        if method.as_str() != "pagy" {
+            return None;
+        }
         let Some(Ty::Class { id: self_id, .. }) = &ctx.self_ty else { return None };
         // Only inside a controller: some class up the chain carries the
         // registry's `pagy` (registry/controllers). A `pagy` the app
@@ -203,5 +218,146 @@ impl<'a> BodyTyper<'a> {
             });
         }
         Some(result(records.unwrap_or(Ty::Untyped)))
+    }
+
+    fn includes_pagy_backend(&self, ctx: &Ctx) -> bool {
+        let Some(Ty::Class { id: self_id, .. }) = &ctx.self_ty else { return false };
+        let mut current = Some(self_id);
+        for _ in 0..32 {
+            let Some(cid) = current else { break };
+            let Some(cls) = self.classes().get(cid) else { break };
+            if cls.includes.iter().any(|m| m.0.as_str().trim_start_matches("::") == "Pagy::Backend") {
+                return true;
+            }
+            current = cls.parent.as_ref();
+        }
+        false
+    }
+
+    /// Whether a controller up `ctx`'s chain carries the registry's `method`.
+    fn in_pagy_controller(&self, method: &Symbol, ctx: &Ctx) -> bool {
+        let Some(Ty::Class { id: self_id, .. }) = &ctx.self_ty else { return false };
+        let mut current = Some(self_id);
+        for _ in 0..32 {
+            let Some(cid) = current else { break };
+            let Some(cls) = self.classes().get(cid) else { break };
+            if cls.class_methods.contains_key(method) {
+                return true;
+            }
+            current = cls.parent.as_ref();
+        }
+        false
+    }
+
+    /// pagy before 43 (runtime/ruby/action_controller/pagy9.rb):
+    /// `pagy(scope, **vars)` and the array extra's `pagy_array(array,
+    /// **vars)`, with `limit:` and `page:` any value the gem reads with
+    /// `to_i` (a String from the request, an Integer, nil), and `items:`
+    /// a literal Integer it only keeps in `vars`.
+    fn pagy9_call_ty(
+        &self,
+        method: &Symbol,
+        args: &[Expr],
+        ctx: &Ctx,
+        refusal: &mut Option<crate::diagnostic::DiagnosticKind>,
+    ) -> Option<Ty> {
+        let array = match method.as_str() {
+            "pagy" => false,
+            "pagy_array" => true,
+            _ => return None,
+        };
+        let refuse = |detail: String, refusal: &mut Option<crate::diagnostic::DiagnosticKind>| {
+            if refusal.is_none() {
+                *refusal = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    target: None,
+                    construct: Symbol::from("pagy"),
+                    detail,
+                });
+            }
+        };
+        if !self.in_pagy_controller(method, ctx) {
+            // pagy9.rb's `Pagy::Backend` is an empty marker: outside a controller the include brings no `pagy`.
+            if self.includes_pagy_backend(ctx) {
+                refuse(format!("`{method}` from `include Pagy::Backend` is modeled on controllers only (it reads the request's params)"), refusal);
+                return Some(Ty::Untyped);
+            }
+            return None;
+        }
+        let pagy_ty = Ty::Class { id: ClassId(Symbol::from("Pagy")), args: vec![].into() };
+        let result = |records: Ty| Ty::Tuple { elems: vec![pagy_ty.clone(), records].into() };
+        let Some(collection) = args.first() else {
+            refuse(format!("`{method}` needs a collection"), refusal);
+            return Some(result(Ty::Untyped));
+        };
+        let records = if array {
+            match collection.ty.as_ref() {
+                Some(Ty::Array { elem }) => Some(Ty::Array { elem: elem.clone() }),
+                None | Some(Ty::Untyped) | Some(Ty::Var { .. }) => Some(Ty::Untyped),
+                _ => None,
+            }
+        } else {
+            self.pagy_scope_ty(collection.ty.as_ref())
+        };
+        if records.is_none() {
+            let wanted = if array { "an Array the analysis can type" } else { "an ActiveRecord scope the analysis can type" };
+            refuse(format!("the collection must be {wanted} (got {:?})", collection.ty), refusal);
+        }
+        match &args[1..] {
+            [] => {}
+            [opts] => match &*opts.node {
+                ExprNode::Hash { entries, .. } => {
+                    for (k, v) in entries {
+                        let key = match &*k.node {
+                            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => value.as_str().to_string(),
+                            _ => {
+                                refuse("an option key that is not a Symbol literal is not modeled".into(), refusal);
+                                continue;
+                            }
+                        };
+                        match key.as_str() {
+                            "limit" | "page" => {
+                                if !Self::pagy9_var_ty(v.ty.as_ref()) {
+                                    refuse(
+                                        format!("`{key}:` must be an Integer, a String or nil, read with `to_i` (got {:?})", v.ty),
+                                        refusal,
+                                    );
+                                }
+                            }
+                            "items" => {
+                                if !matches!(&*v.node, ExprNode::Lit { value: crate::expr::Literal::Int { .. } }) {
+                                    refuse("`items:` is modeled only as a literal Integer (it is kept in `vars`, not read)".into(), refusal);
+                                }
+                            }
+                            _ => refuse(format!("option `{key}:` is not modeled (only `limit:`, `page:` and `items:` are)"), refusal),
+                        }
+                    }
+                }
+                _ => refuse("the options must be a literal hash".into(), refusal),
+            },
+            _ => refuse("expected a collection and at most one options hash".into(), refusal),
+        }
+        Some(result(records.unwrap_or(Ty::Untyped)))
+    }
+
+    /// A value the runtime reads as the gem does: `nil`/`""` the default, an Integer or a String by `to_i`, and a
+    /// request param of another shape (an Array, a nested hash, a file) raising Pagy::VariableError.
+    fn pagy9_var_ty(ty: Option<&Ty>) -> bool {
+        match ty {
+            None | Some(Ty::Untyped) | Some(Ty::Var { .. }) | Some(Ty::Int) | Some(Ty::Str) | Some(Ty::Nil) | Some(Ty::Array { .. }) => true,
+            Some(Ty::Union { variants }) => variants.iter().all(|v| Self::pagy9_var_ty(Some(v))),
+            Some(Ty::Class { id, .. }) => matches!(id.0.as_str(), "ActionController::Parameters" | "ActionDispatch::Http::UploadedFile") || Some(&Ty::Class { id: id.clone(), args: vec![].into() }) == Some(&send::param_value_ty()),
+            Some(_) => false,
+        }
+    }
+
+    /// `pagy.vars[k]` for a key pagy9.rb's `vars` holds, the only use of `vars` admitted.
+    pub(super) fn pagy9_vars_read(recv: &Expr, method: &Symbol, args: &[Expr]) -> bool {
+        let ExprNode::Send { recv: Some(pagy), method: vars, args: none, .. } = &*recv.node else { return false };
+        method.as_str() == "[]"
+            && vars.as_str() == "vars"
+            && none.is_empty()
+            && matches!(&pagy.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "Pagy")
+            && matches!(args, [k] if matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+                if matches!(value.as_str(), "count" | "limit" | "page" | "items" | "outset" | "size")))
     }
 }

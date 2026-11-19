@@ -2781,12 +2781,12 @@ impl<'a> BodyTyper<'a> {
                     self.analyze_expr(a, ctx);
                 }
                 // The pagy gem's `pagy(scope)`: `[Pagy, <the scope's type>]`.
-                if method.as_str() == "pagy"
+                if matches!(method.as_str(), "pagy" | "pagy_array")
                     && block.is_none()
                     && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                 {
                     let mut refusal = None;
-                    if let Some(ty) = self.pagy_call_ty(args, ctx, &mut refusal) {
+                    if let Some(ty) = self.pagy_call_ty(method, args, ctx, &mut refusal) {
                         if refusal.is_some() {
                             expr.set_diagnostic(refusal);
                         }
@@ -2795,6 +2795,11 @@ impl<'a> BodyTyper<'a> {
                 }
                 if let Some(refusal) = self.pagy_object_refusal(recv_ty.as_ref(), method, args) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(refusal));
+                }
+                if let Some(r) = recv.as_mut()
+                    && Self::pagy9_vars_read(r, method, args)
+                {
+                    crate::expr::ExprCold::set_diagnostic(&mut r.cold, None);
                 }
                 if let Some(r) = recv.as_mut() {
                     if promotes_to_param_value(r, recv_ty.as_ref(), method, args, &ctx.local_bindings) {

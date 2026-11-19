@@ -314,3 +314,99 @@ pub(super) fn lower_pagy(app: &mut crate::App) -> super::IngestResult<()> {
     }
     Ok(())
 }
+
+/// Whether the app locks a pagy before 43, whose API
+/// (`runtime/ruby/action_controller/pagy9.rb`) is another one.
+pub fn locked_before_43(app: &crate::App) -> bool {
+    app.gem_lock
+        .as_ref()
+        .and_then(|lock| lock.version_of("pagy"))
+        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major < 43)
+}
+
+/// The initializers' pagy extras and `Pagy::DEFAULT[...] =` settings (`:overflow` and `:limit`), in
+/// load order: `require "pagy/extras/overflow"` sets the extra's own
+/// `:empty_page`, and a later `Pagy::DEFAULT[:overflow] =` replaces it.
+pub(super) fn load_settings<V: crate::vfs::Vfs + ?Sized>(
+    vfs: &V,
+    dir: &std::path::Path,
+) -> super::IngestResult<crate::app::PagyConfig> {
+    let init_dir = dir.join("config/initializers");
+    let mut state = Settings::default();
+    if vfs.is_dir(&init_dir) {
+        for entry in super::app::read_rb_files(vfs, &init_dir)? {
+            if let Ok(bytes) = vfs.read(&entry) {
+                read_settings(&bytes, &entry.display().to_string(), &mut state);
+            }
+        }
+    }
+    Ok(crate::app::PagyConfig {
+        overflow: state.overflow_extra.then(|| state.overflow.unwrap_or_else(|| "empty_page".into())),
+        array: state.array,
+        limit: state.limit,
+        unmodeled: state.unmodeled,
+    })
+}
+
+#[derive(Default)]
+pub(super) struct Settings {
+    overflow_extra: bool,
+    overflow: Option<String>,
+    array: bool,
+    limit: Option<i64>,
+    unmodeled: Vec<(crate::span::Span, String)>,
+    /// Whether any statement was a `Pagy::DEFAULT[...] =` (the initializer ledger's "consumed").
+    pub(super) recognized: bool,
+}
+
+pub(super) fn read_settings(source: &[u8], file: &str, state: &mut Settings) {
+    if !String::from_utf8_lossy(source).contains("agy") {
+        return;
+    }
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return };
+    let span = |node: &ruby_prism::Node<'_>| {
+        let (start, end) = super::prism_api::span_offsets(&node.location());
+        crate::span::Span { file: super::sources::file_id(file), start, end }
+    };
+    for stmt in super::app::initializer_statements(&program) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        let name = super::util::constant_id_str(&call.name());
+        let args: Vec<ruby_prism::Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if name == "require" && call.receiver().is_none() {
+            let Some(path) = args.first().and_then(|a| a.as_string_node()) else { continue };
+            let path = String::from_utf8_lossy(path.unescaped()).into_owned();
+            let Some(extra) = path.strip_prefix("pagy/extras/") else { continue };
+            match extra {
+                "overflow" => {
+                    state.overflow_extra = true;
+                    state.overflow = Some("empty_page".into());
+                }
+                "array" => state.array = true,
+                _ => state.unmodeled.push((span(&stmt), format!("the `pagy/extras/{extra}` extra"))),
+            }
+            continue;
+        }
+        if name != "[]=" {
+            continue;
+        }
+        let on_default = call.receiver().is_some_and(|r| {
+            matches!(String::from_utf8_lossy(r.location().as_slice()).trim_start_matches("::"), "Pagy::DEFAULT")
+        });
+        if !on_default {
+            continue;
+        }
+        state.recognized = true;
+        let key = args.first().and_then(|k| k.as_symbol_node()).map(|k| String::from_utf8_lossy(k.unescaped()).into_owned());
+        let value = args.get(1).and_then(|v| v.as_symbol_node()).map(|v| String::from_utf8_lossy(v.unescaped()).into_owned());
+        let limit = args.get(1).and_then(|v| v.as_integer_node()).and_then(|i| super::util::integer_i64(&i.value())).filter(|n| *n >= 1);
+        match (key.as_deref(), value) {
+            (Some("overflow"), Some(mode)) => state.overflow = Some(mode),
+            (Some("limit"), _) if limit.is_some() => state.limit = limit,
+            (Some(key), _) => state.unmodeled.push((span(&stmt), format!("`Pagy::DEFAULT[:{key}] =` with this value"))),
+            (None, _) => state.unmodeled.push((span(&stmt), "`Pagy::DEFAULT[...] =` with a key that is not a Symbol".into())),
+        }
+    }
+}
