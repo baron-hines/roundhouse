@@ -241,7 +241,8 @@ impl<'a> BodyTyper<'a> {
         for _ in 0..32 {
             let Some(cid) = current else { break };
             let Some(cls) = self.classes().get(cid) else { break };
-            if cls.class_methods.contains_key(method) {
+            // The registry's entry, not an app class that defines a `self.pagy_array` of its own on the way.
+            if (cid.0.as_str() == "ApplicationController" || cid.0.as_str().starts_with("ActionController::")) && cls.class_methods.contains_key(method) {
                 return true;
             }
             current = cls.parent.as_ref();
