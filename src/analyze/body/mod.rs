@@ -602,6 +602,9 @@ pub struct BodyTyper<'a> {
     lambda_seeds: std::cell::RefCell<Option<lambda_local::Seeds>>,
     /// The block parameter `block_ctx_for` proved a class object (`klass.tap { |k| }`), for the Lambda arm that clears its parameters.
     block_class_param: std::cell::RefCell<Option<Symbol>>,
+    /// How many blocks the expression being typed sits in: a block's `self` may be another object (`Menu.define do
+    /// scope … end` is `instance_eval`ed), so a class-body check stops at the first.
+    block_depth: std::cell::Cell<usize>,
     /// The locals of the outermost expression being typed, counted once
     /// for the selector proofs of `active_storage`.
     scope_bindings: std::cell::RefCell<Option<active_storage::ScopeBindings>>,
@@ -747,6 +750,7 @@ impl<'a> BodyTyper<'a> {
             open_classes: None,
             lambda_seeds: std::cell::RefCell::new(None),
             block_class_param: std::cell::RefCell::new(None),
+            block_depth: std::cell::Cell::new(0),
             scope_bindings: std::cell::RefCell::new(None),
             block_selector_param: std::cell::RefCell::new(None),
         }
@@ -2171,7 +2175,15 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+                // Not a load-time failure under a rescue, which may catch the `NameError` (`block_depth`).
+                let guarded = !rescues.is_empty();
+                if guarded {
+                    self.block_depth.set(self.block_depth.get() + 1);
+                }
                 self.analyze_expr(body, ctx);
+                if guarded {
+                    self.block_depth.set(self.block_depth.get() - 1);
+                }
                 for rc in rescues.iter_mut() {
                     for c in rc.classes.iter_mut() {
                         self.analyze_expr(c, ctx);
@@ -2440,7 +2452,10 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::RescueModifier { expr, fallback } => {
+                // A rescue catches the class body's `NameError` too: not a load-time failure (`block_depth`).
+                self.block_depth.set(self.block_depth.get() + 1);
                 let et = self.analyze_expr(expr, ctx);
+                self.block_depth.set(self.block_depth.get() - 1);
                 let ft = self.analyze_expr(fallback, ctx);
                 union_of(et, ft)
             }
@@ -2488,6 +2503,8 @@ impl<'a> BodyTyper<'a> {
                 // untyped until a `.call` site names it. A default is typed
                 // in the lambda's own scope as filled so far, so it reads an
                 // earlier extra parameter (`c = b`) rather than an outer local.
+                // A default runs when the block is called, not where it is written.
+                self.block_depth.set(self.block_depth.get() + 1);
                 for param in extra_params.iter_mut() {
                     let ty = match (&mut param.default, param.keyword && param.rest) {
                         (_, true) => Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
@@ -2505,6 +2522,7 @@ impl<'a> BodyTyper<'a> {
                     seeds.bind_keywords(&mut inner, extra_params);
                 }
                 let body_ty = self.analyze_expr(body, &inner);
+                self.block_depth.set(self.block_depth.get() - 1);
                 // A block's parameter types were seeded into `ctx` and are
                 // not repeated here. A stored lambda records the types its
                 // `.call` sites supplied, so the value's type is
@@ -3728,6 +3746,34 @@ impl<'a> BodyTyper<'a> {
                         };
                     }
                 }
+                // A class body's receiverless call no ancestor answers (`class_attribute :x, default: field_helpers` under
+                // a FormBuilder that has none): it runs as the class loads and raises `NameError` there. Not under an
+                // ancestor this analysis cannot see, which may define it.
+                if recv.is_none() && block.is_none() && ctx.class_side && !ctx.method_body && self.block_depth.get() == 0
+                    && let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref()
+                {
+                    let unknown = matches!(dispatched, Ty::Var { .. })
+                        && self.inquirers.is_some()
+                        && !self.has_unknown_ancestor(id)
+                        // Only a class under a known superclass, whose class methods all come from there: not a
+                        // module (a concern's `def self.`, a gem module the app reopens) or a parentless class
+                        // (`class << self` definitions), and not a name any class here defines, which a lookup
+                        // this check skips may reach.
+                        && self.classes().get(id).is_some_and(|c| !c.is_module && c.parent.is_some())
+                        && !self.classes().values().any(|c| c.class_methods.contains_key(method) || c.instance_methods.contains_key(method));
+                    let ours = |d: Option<&crate::diagnostic::DiagnosticKind>| {
+                        matches!(d, Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed { method: m, recv_ty: Ty::Class { id: r, .. } }) if m == method && r == id)
+                    };
+                    if unknown && crate::expr::ExprCold::diagnostic(&expr.cold).is_none() {
+                        crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed {
+                            method: method.clone(),
+                            recv_ty: Ty::Class { id: id.clone(), args: vec![].into() },
+                        }));
+                    } else if !unknown && ours(crate::expr::ExprCold::diagnostic(&expr.cold).as_ref()) {
+                        // A round that ran before the registry held every class may have set it.
+                        crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
+                    }
+                }
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
                     let gap = match super::singleton_of(recv_ty.as_ref()).or(recv_ty.as_ref()) {
@@ -3738,7 +3784,7 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some(id.0.as_str())
                         }
-                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d" | "as_json" | "tableize") => Some("String extension"),
+                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "as_json" | "tableize") => Some("String extension"),
                         Some(Ty::Hash { .. }) if method.as_str() == "to_sentence" => Some("Hash extension"),
                         _ if method.as_str() == "not_nil!" => Some("not_nil!"),
                         // `to_param` on Untyped goes through ActiveSupport.to_param
