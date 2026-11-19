@@ -775,7 +775,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("mocha", GemFate::Modeled),       // lower/mocha bridge
     ("nokogiri", GemFate::Modeled),    // catalog/gems: Nokogiri
     ("oj", GemFate::Modeled),          // ingest/oj + lower/oj: under Oj.mimic_JSON, load/generate on ruby, jruby and spinel; dump and every other target refused
-    ("pagy", GemFate::Modeled),        // registry/controllers + analyze/body/pagy + runtime action_controller/pagy.rb: pagy(scope[, limit: n]) offset paginator, Pagy#series_nav/info_tag/readers (English); other paginators/options/helpers refused
+    ("pagy", GemFate::Modeled),        // registry/controllers + analyze/body/pagy + runtime action_controller/pagy.rb: pagy(scope[, limit: n]) offset paginator, Pagy#series_nav/info_tag/readers (English); before 43, pagy9.rb: pagy/pagy_array(limit:, page:, items:), readers, series, vars[k], pagy_url_for, the overflow/array extras; other paginators/options/helpers refused
     ("pdf-reader", GemFate::Modeled),  // catalog/gems: PDF::Reader
     ("platform_agent", GemFate::Modeled), // useragent port
     ("pretender", GemFate::Modeled), // impersonates with local current_* → true_* wrap + impersonate_*; inherited-only stays unsupported

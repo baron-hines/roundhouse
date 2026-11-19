@@ -16318,6 +16318,8 @@ end
 
 #[path = "emit_and_run/pagy.rs"]
 mod pagy;
+#[path = "emit_and_run/pagy9.rs"]
+mod pagy9;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
 
