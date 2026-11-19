@@ -371,3 +371,30 @@ fn a_rooted_subclass_of_a_model_in_the_module_around_it_is_that_models_subclass(
     run.assert_passes();
     assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
 }
+
+/// Review 6, what sits below that rooted subclass: `Special` only counts
+/// as a concrete model once `Item` is read as `Ledger::Item`, and that is
+/// what makes `Special::Part` take `Special`'s table singular as a prefix
+/// (a model nested in a concrete one does). ActiveRecord 8.1.4.1 gives
+/// `["Ledger::Item", "special_parts", 1]`.
+fn rooted_subclass_with_a_nested_model_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/item.rb", "module Ledger\n  class Item < ApplicationRecord\n  end\nend\n")
+        .write("app/models/special.rb", "module Ledger\n  class ::Special < Item\n    self.table_name = \"specials\"\n  end\nend\n")
+        .write("app/models/special/part.rb", "class Special::Part < ApplicationRecord\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"specials\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"special_parts\", force: :cascade do |t|\n    t.string \"label\"\n  end\n  create_table \"parts\", force: :cascade do |t|\n    t.string \"label\"\n  end\nend\n")
+}
+
+const NESTED_IN_A_ROOTED_SUBCLASS: &str = r##"Special::Part.create!(label: "x")
+got = [Special.superclass.name, Special::Part.table_name, Special::Part.count]
+raise "nested in a rooted subclass: #{got.inspect}" unless got == ["Ledger::Item", "special_parts", 1]
+puts "probe passed"
+"##;
+
+#[test]
+fn a_model_nested_in_a_rooted_subclass_takes_its_table_prefix() {
+    let run = rooted_subclass_with_a_nested_model_app().run_ruby(NESTED_IN_A_ROOTED_SUBCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
