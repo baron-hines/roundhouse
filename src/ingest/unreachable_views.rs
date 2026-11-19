@@ -541,7 +541,9 @@ fn renders(c: &Controller, action: &str, template: &str) -> bool {
     };
     // `render(**notification)` (maybe's `Notifiable`) reaches a template only through a `template:`/`action:`/`file:`
     // key, which no hash this controller builds holds: it renders the partials its hashes name.
-    let template_hash = bodies().any(builds_template_hash);
+    // Parameter defaults too (`def notice(options = { template: … })`), which an action keeps apart from its body.
+    let defaults = c.actions().flat_map(|a| a.opt_params.iter().map(|(_, d)| d).chain(a.kw_params.iter().filter_map(|(_, d)| d.as_ref())));
+    let template_hash = bodies().any(builds_template_hash) || defaults.into_iter().any(builds_template_hash);
     let mut found = false;
     for body in bodies() {
         visit_renders(body, &mut |lits, dynamic, splat| {
@@ -645,6 +647,9 @@ fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool, bool)) {
     fn from_request(e: &Expr) -> bool {
         match &*e.node {
             ExprNode::Send { recv: None, method, .. } => matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
+            ExprNode::Send { recv: Some(r), method, .. } if matches!(&*r.node, ExprNode::SelfRef) => {
+                matches!(method.as_str(), "params" | "session" | "cookies" | "request")
+            }
             ExprNode::Send { recv: Some(r), .. } => from_request(r),
             _ => false,
         }

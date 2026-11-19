@@ -63,6 +63,8 @@ fn a_splatted_partial_render_and_pagy_backend_reach_no_template() {
         notifiable.replace("{ partial: \"shared/notice\"", "{ template: \"notes/orphan\""),
         notifiable.replace("[{ partial: \"shared/notice\", locals: { message: \"hi\" } }]", "[{}.merge(template: \"notes/orphan\")]"),
         notifiable.replace("notices.map { |n| view_context.render(**n) }", "view_context.render(**params.permit(:template).to_h.symbolize_keys)"),
+        notifiable.replace("notices.map { |n| view_context.render(**n) }", "view_context.render(**self.params.permit(:template).to_h.symbolize_keys)"),
+        notifiable.replace("def render_notices\n      notices.map { |n| view_context.render(**n) }", "def render_notices(options = { template: \"notes/orphan\" })\n      view_context.render(**options)"),
     ] {
         let warnings = base(&open).ingest_warnings();
         assert!(!warnings.iter().any(|w| w.contains("`notes/orphan` is rendered by no action")), "{open}: {warnings:#?}");
