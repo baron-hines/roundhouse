@@ -63,7 +63,7 @@ module ActionView
       return "" if token == false
       default = ActionView::ViewHelpers.csrf_token_hidden_input
       return default if token.nil? || token == true || default.empty?
-      tag(:input, "type" => "hidden", "name" => "authenticity_token", "value" => token, "autocomplete" => "off")
+      tag(:input, { "type" => "hidden", "name" => "authenticity_token", "value" => token }.merge(ActionView::Base.hidden_autocomplete))
     end
 
     # Rails' `polymorphic_path` for a record, a class or a nesting of them, by the app's route helpers: the

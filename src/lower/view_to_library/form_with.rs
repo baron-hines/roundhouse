@@ -1761,6 +1761,7 @@ mod tests {
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
             builder_overrides: Default::default(),
+            hidden_autocomplete: false,
             form_with_entry: true,
             model_param_keys: Default::default(),
             stylesheets: Vec::new(),

@@ -5,7 +5,7 @@ use super::emit_and_run;
 /// `hidden_field`, `password_field`, `email_field`, `check_box`, `submit`, `button`, `@template.content_tag`,
 /// `@template.safe_join`, and a safe `+` of two of them), each
 /// wrapped in `field_with_errors` for an attribute with an error, answer the markup Rails 8.1.4 renders for the same
-/// record. The expected strings are Rails' own output.
+/// record. The expected strings are Rails' own output under the blog's `load_defaults` 8.1 (no hidden `autocomplete`).
 const BUILDER: &str = r##"class ProbeFormBuilder < ActionView::Helpers::FormBuilder
   def everything
     @template.safe_join([label(:title), text_field(:title, placeholder: "x"), text_area(:body, rows: 3), hidden_field(:title),
@@ -26,7 +26,7 @@ const SCRIPT: &str = r##"def rendered(article)
   io
 end
 fresh = rendered(Article.new(title: "Hi <b>", body: "Long\nbody"))
-everything = "<label for=\"article_title\">Title</label>|<input placeholder=\"x\" type=\"text\" value=\"Hi &lt;b&gt;\" name=\"article[title]\" id=\"article_title\" />|<textarea rows=\"3\" name=\"article[body]\" id=\"article_body\">\nLong\nbody</textarea>|<input autocomplete=\"off\" type=\"hidden\" value=\"Hi &lt;b&gt;\" name=\"article[title]\" id=\"article_title\" />|<input type=\"password\" name=\"article[title]\" id=\"article_title\" />|<input type=\"email\" value=\"Long\nbody\" name=\"article[body]\" id=\"article_body\" />|<input name=\"article[title]\" type=\"hidden\" value=\"0\" autocomplete=\"off\" /><input type=\"checkbox\" value=\"1\" name=\"article[title]\" id=\"article_title\" />|<input type=\"submit\" name=\"commit\" value=\"Create Article\" data-disable-with=\"Create Article\" />|<button name=\"button\" type=\"submit\">Create Article</button>"
+everything = "<label for=\"article_title\">Title</label>|<input placeholder=\"x\" type=\"text\" value=\"Hi &lt;b&gt;\" name=\"article[title]\" id=\"article_title\" />|<textarea rows=\"3\" name=\"article[body]\" id=\"article_body\">\nLong\nbody</textarea>|<input type=\"hidden\" value=\"Hi &lt;b&gt;\" name=\"article[title]\" id=\"article_title\" />|<input type=\"password\" name=\"article[title]\" id=\"article_title\" />|<input type=\"email\" value=\"Long\nbody\" name=\"article[body]\" id=\"article_body\" />|<input name=\"article[title]\" type=\"hidden\" value=\"0\" /><input type=\"checkbox\" value=\"1\" name=\"article[title]\" id=\"article_title\" />|<input type=\"submit\" name=\"commit\" value=\"Create Article\" data-disable-with=\"Create Article\" />|<button name=\"button\" type=\"submit\">Create Article</button>"
 raise "everything:\n#{fresh}" unless fresh.include?(everything)
 blank = Article.new(title: "", body: "long enough body")
 blank.valid?

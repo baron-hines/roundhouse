@@ -4,6 +4,12 @@
 # call back on `@template_object`. CRuby overlay, beside `action_view_form_builder.rb`.
 module ActionView
   class Base
+    # Rails' `autocomplete: "off"` on a hidden input unless `remove_hidden_field_autocomplete` (`load_defaults` 8.1),
+    # which the lowered render's `ViewHelpers.keep_hidden_autocomplete` turns on for an app before it.
+    def self.hidden_autocomplete
+      ActionView::ViewHelpers.hidden_autocomplete_attr.empty? ? {} : { "autocomplete" => "off" }
+    end
+
     def field_id(object_name, method_name, *suffixes, index: nil, namespace: nil)
       object_name = object_name.model_name.singular if object_name.respond_to?(:model_name)
       sanitized_object_name = object_name.to_s.gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").delete_suffix("_")
@@ -55,7 +61,7 @@ module ActionView
     alias check_box checkbox
 
     def hidden_field_tag(name, value = nil, options = {})
-      tag(:input, { "type" => "hidden", "name" => name, "id" => sanitize_to_id(name), "value" => value, "autocomplete" => "off" }.merge(Helpers::FormBuilder.stringify(options)))
+      tag(:input, { "type" => "hidden", "name" => name, "id" => sanitize_to_id(name), "value" => value }.merge(ActionView::Base.hidden_autocomplete).merge(Helpers::FormBuilder.stringify(options)))
     end
 
     def label_tag(name = nil, content_or_options = nil, options = nil, &block)
@@ -374,7 +380,7 @@ module ActionView
 
       class HiddenField < TextField
         def render
-          @options = { autocomplete: "off" }.merge(@options)
+          @options = ActionView::Base.hidden_autocomplete.transform_keys(&:to_sym).merge(@options)
           super
         end
       end
@@ -514,7 +520,7 @@ module ActionView
 
         def hidden_field_for_checkbox(options)
           return "".html_safe unless @unchecked_value
-          tag("input", options.slice("name", "disabled", "form").merge!("type" => "hidden", "value" => @unchecked_value, "autocomplete" => "off"))
+          tag("input", options.slice("name", "disabled", "form").merge!("type" => "hidden", "value" => @unchecked_value).merge!(ActionView::Base.hidden_autocomplete))
         end
       end
 
@@ -535,7 +541,7 @@ module ActionView
           value = options.fetch(:selected) { value() }
           select = content_tag("select", add_options(option_tags, options, value), html_options)
           if html_options["multiple"] && options.fetch(:include_hidden, true)
-            hidden = { "disabled" => html_options["disabled"], "name" => html_options["name"], "type" => "hidden", "value" => "", "autocomplete" => "off" }
+            hidden = { "disabled" => html_options["disabled"], "name" => html_options["name"], "type" => "hidden", "value" => "" }.merge(ActionView::Base.hidden_autocomplete)
             @template_object.tag("input", hidden) + select
           else
             select

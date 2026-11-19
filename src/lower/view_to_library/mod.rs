@@ -284,6 +284,7 @@ pub struct ViewLowerCtx<'a> {
     /// form helper (see [`form_wrapper_helpers`]).
     form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
     builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    hidden_autocomplete: bool,
     /// See the ViewCtx field of the same name. Off unless the emitter
     /// opts in with [`ViewLowerCtx::observe_form_with_entry`].
     form_with_entry: bool,
@@ -381,6 +382,7 @@ impl<'a> ViewLowerCtx<'a> {
             collection_element_locals: std::rc::Rc::new(element_locals),
             form_wrappers: std::rc::Rc::new(form_wrapper_helpers(app)),
             builder_overrides: std::rc::Rc::new(crate::lower::view::form_builder_overrides(app)),
+            hidden_autocomplete: app.hidden_field_autocomplete,
             form_with_entry: false,
         }
     }
@@ -905,6 +907,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         route_helper_arity: lx.route_helper_arity.clone(),
         form_wrappers: lx.form_wrappers.clone(),
         builder_overrides: lx.builder_overrides.clone(),
+        hidden_autocomplete: lx.hidden_autocomplete,
         form_with_entry: lx.form_with_entry,
         model_param_keys: lx.model_param_keys.clone(),
         stylesheets: app.stylesheets.clone(),
@@ -1022,6 +1025,10 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
 
     let mut body_stmts: Vec<Expr> = Vec::new();
     body_stmts.push(assign_accumulator_string_new(&ctx.accumulator));
+    // The runtime's hidden inputs (the CSRF token, `_method`, `button_to`'s) follow the app, as the inline ones below do.
+    if ctx.hidden_autocomplete {
+        body_stmts.push(accumulator_append_call(view_helpers_call("keep_hidden_autocomplete", Vec::new()), &ctx));
+    }
     body_stmts.extend(prelude);
     body_stmts.extend(walk_body(&rewritten, &ctx));
     body_stmts.push(accumulator_result_ref(&ctx.accumulator));
@@ -5471,6 +5478,8 @@ pub(super) struct ViewCtx {
     pub(super) form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
     /// The stock fields an app builder defines again ([`crate::lower::view::form_builder_overrides`]).
     pub(super) builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    /// `App::hidden_field_autocomplete`: every hidden input carries Rails' `autocomplete="off"`.
+    pub(super) hidden_autocomplete: bool,
     /// Begin each `form_with` expansion with the
     /// `ActionView::Base.new.form_with` entry (Ruby family only — see
     /// `form_with::form_with_entry`).

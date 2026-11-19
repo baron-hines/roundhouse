@@ -228,7 +228,8 @@ fn emit_check_box(
     // The unchecked-value companion carries no `autocomplete`
     // attribute — Rails renders exactly
     // `<input name="user[f]" type="hidden" value="0">`.
-    let hidden = lit_str(format!("<input name=\"{model_name}[{field_str}]\" type=\"hidden\" value=\"0\">"));
+    let autocomplete = if ctx.hidden_autocomplete { " autocomplete=\"off\"" } else { "" };
+    let hidden = lit_str(format!("<input name=\"{model_name}[{field_str}]\" type=\"hidden\" value=\"0\"{autocomplete}>"));
     let mut parts: Vec<InterpPart> = Vec::new();
     parts.push(InterpPart::Text {
         value: format!(
@@ -1567,7 +1568,8 @@ fn emit_hidden_field(
     let mut parts: Vec<InterpPart> = Vec::new();
     parts.push(InterpPart::Text {
         value: format!(
-            "<input type=\"hidden\"{}",
+            "<input type=\"hidden\"{}{}",
+            if ctx.hidden_autocomplete && !opts_have_key(opts, "autocomplete") { " autocomplete=\"off\"" } else { "" },
             name_id_attrs_for(binding, field_sym.as_str(), opts)
         ),
     });
@@ -1677,6 +1679,10 @@ fn field_value_read(binding: &FormBuilderBinding, field: Symbol, ctx: &ViewCtx) 
 
 /// True when `opts` carries an explicit `value:` — a `hidden_field` with a
 /// caller-supplied value uses it instead of reading the record attribute.
+fn opts_have_key(opts: &[(Expr, Expr)], key: &str) -> bool {
+    opts.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key))
+}
+
 fn opts_have_value(opts: &[(Expr, Expr)]) -> bool {
     opts.iter().any(|(k, _)| {
         matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "value")
@@ -1959,7 +1965,7 @@ fn emit_rich_text_area(
 
     let mut parts: Vec<InterpPart> = Vec::new();
     parts.push(InterpPart::Text {
-        value: format!("<input type=\"hidden\" name=\"{name}\" id=\""),
+        value: format!("<input type=\"hidden\"{} name=\"{name}\" id=\"", if ctx.hidden_autocomplete { " autocomplete=\"off\"" } else { "" }),
     });
     parts.push(input_id_part());
     parts.push(InterpPart::Text { value: "\"".to_string() });

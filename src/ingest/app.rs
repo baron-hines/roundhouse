@@ -1643,6 +1643,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // not abort ingest.
     // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
     app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
+    // Not for an app with no `config/application.rb`: the runtime's defaults are `load_defaults` 8.1's.
+    app.hidden_field_autocomplete = vfs.exists(&dir.join("config/application.rb")) && !read_remove_hidden_field_autocomplete(vfs, dir);
     app.active_job_retry_jitter = read_active_job_retry_jitter(vfs, dir);
     // The ActiveJob queue adapter (see `App::queue_adapter`).
     app.queue_adapter = read_queue_adapter(vfs, dir);
@@ -15062,6 +15064,50 @@ fn read_active_job_retry_jitter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> f64 {
 /// What a trimmed, non-comment config line sets the app-wide
 /// `wrap_parameters_by_default` to, or `None` when the line says nothing
 /// about it. One definition for the lift and the initializer ledger.
+/// `ActionView::Base.remove_hidden_field_autocomplete`, read as `read_wrap_parameters_by_default` reads its key:
+/// `config.load_defaults` 8.1+ turns it on, and an explicit `config.action_view.remove_hidden_field_autocomplete = …`
+/// (application, production or an initializer, such as the upgrade's `new_framework_defaults_8_1.rb`) wins.
+fn read_remove_hidden_field_autocomplete<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    let code_lines = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes).lines().map(|l| l.trim().to_string()).filter(|l| !l.starts_with('#')).collect()
+    };
+    let mut files: Vec<Vec<String>> = Vec::new();
+    let mut on = false;
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        let lines = code_lines(&source);
+        for line in &lines {
+            if let Some(v) = load_defaults_version(line) {
+                on = v >= 8.1;
+            }
+        }
+        files.push(lines);
+    }
+    if let Ok(source) = vfs.read(&dir.join("config/environments/production.rb")) {
+        files.push(code_lines(&source));
+    }
+    let init_dir = dir.join("config/initializers");
+    if vfs.is_dir(&init_dir)
+        && let Ok(paths) = read_rb_files(vfs, &init_dir)
+    {
+        for path in paths {
+            if let Ok(source) = vfs.read(&path) {
+                files.push(code_lines(&source));
+            }
+        }
+    }
+    for line in files.iter().flatten() {
+        if let Some(i) = line.find("action_view.remove_hidden_field_autocomplete") {
+            let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            if rest.starts_with("true") {
+                on = true;
+            } else if rest.starts_with("false") {
+                on = false;
+            }
+        }
+    }
+    on
+}
+
 pub(super) fn wrap_parameters_line(line: &str) -> Option<bool> {
     if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
         let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
