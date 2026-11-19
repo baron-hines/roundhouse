@@ -2183,12 +2183,79 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
     )
 }
 
+/// The ivar and the parameter a member is held in: a predicate or bang member (`success?`) is not a name either can
+/// take.
+fn struct_slot(member: &Symbol) -> Symbol {
+    let name = member.as_str();
+    match (name.strip_suffix('?'), name.strip_suffix('!')) {
+        (Some(stem), _) => Symbol::from(format!("__q_{stem}")),
+        (_, Some(stem)) => Symbol::from(format!("__b_{stem}")),
+        _ => member.clone(),
+    }
+}
+
+/// A struct with a predicate or bang member (maybe's `Struct.new(:success?, :changes_made?, :error, keyword_init:
+/// true)`), its methods written as Ruby and read back: Struct's reader of each member; its writer, which Ruby spells
+/// `success?=` and only `send` can call, for the plain ones alone; and its constructor. A keyword one takes
+/// `**attrs`, since `success?:` is no parameter's name, and refuses an unknown keyword as Struct does.
+fn suffixed_struct_methods(base: &ClassId, members: &[Symbol], keyword_init: bool) -> Option<Vec<MethodDef>> {
+    let mut src = String::new();
+    for m in members {
+        let slot = struct_slot(m);
+        src.push_str(&format!("def {m}\n  @{slot}\nend\n"));
+        if slot == *m {
+            src.push_str(&format!("def {m}=(value)\n  @{slot} = value\nend\n"));
+        }
+    }
+    if keyword_init {
+        let keys = members.iter().map(|m| format!(":{m}")).collect::<Vec<_>>().join(", ");
+        src.push_str("def initialize(**attrs)\n");
+        // In the hash's order, a String key read as its Symbol: the later of `:success?` and `"success?"` wins, as in Struct.
+        src.push_str("  given = {}\n  attrs.each { |k, v| given[k.is_a?(String) ? k.to_sym : k] = v }\n");
+        src.push_str(&format!("  unknown = given.keys - [{keys}]\n"));
+        src.push_str("  raise ArgumentError, \"unknown keywords: #{unknown.join(\", \")}\" unless unknown.empty?\n");
+        for m in members {
+            src.push_str(&format!("  @{} = given.fetch(:{m}, nil)\n", struct_slot(m)));
+        }
+        src.push_str("end\n");
+    } else {
+        let params = members.iter().map(|m| format!("{} = nil", struct_slot(m))).collect::<Vec<_>>().join(", ");
+        src.push_str(&format!("def initialize({params})\n"));
+        for m in members {
+            let slot = struct_slot(m);
+            src.push_str(&format!("  @{slot} = {slot}\n"));
+        }
+        src.push_str("end\n");
+    }
+    let file = "(roundhouse)/struct_members.rb";
+    let result = super::prism::parse_silent(src.as_bytes());
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let mut methods = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let def = stmt.as_def_node()?;
+        let mut method = super::model::ingest_method(&def, file).ok()?;
+        method.enclosing_class = Some(base.0.clone());
+        if method.name.as_str() == "initialize" {
+            method.visibility = crate::dialect::MethodVisibility::Private;
+            method.mutates_self = true;
+        }
+        methods.push(method);
+    }
+    Some(methods)
+}
+
 fn struct_class(
     base: ClassId,
     members: &[Symbol],
     keyword_init: bool,
     origin: crate::dialect::LibraryClassOrigin,
 ) -> LibraryClass {
+    if members.iter().any(|m| struct_slot(m) != *m)
+        && let Some(methods) = suffixed_struct_methods(&base, members, keyword_init)
+    {
+        return struct_library_class(base, methods, origin);
+    }
     let mut methods = Vec::new();
     for m in members {
         methods.push(synth_attr_reader(&base, m, MethodReceiver::Instance));
@@ -2237,6 +2304,10 @@ fn struct_class(
         mutates_self: true,
         block_param: None,
     });
+    struct_library_class(base, methods, origin)
+}
+
+fn struct_library_class(base: ClassId, methods: Vec<MethodDef>, origin: crate::dialect::LibraryClassOrigin) -> LibraryClass {
     LibraryClass {
         name: base,
         is_module: false,
@@ -2303,14 +2374,21 @@ fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<StructCons
             continue;
         }
         let member = symbol_value(&arg)?;
-        // Not `success?` / `valid!`: the member is also the ivar and the constructor's parameter, which cannot carry the suffix.
-        if !member.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-            || !member.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || crate::emit::ruby::expr::is_ruby_keyword(&member)
+        // A trailing `?` / `!` is held under another name (`struct_slot`); any other character is no method's name.
+        let stem = member.strip_suffix(['?', '!']).unwrap_or(&member);
+        if !stem.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            || !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || crate::emit::ruby::expr::is_ruby_keyword(stem)
         {
             return None;
         }
         members.push(Symbol::from(member));
+    }
+    // Not one whose held name is another member's (`:success?` beside `:__q_success`), or one its block names (an
+    // `attr_accessor :__q_success` there): the two would share a slot.
+    let block_text = call.block().map(|b| String::from_utf8_lossy(b.location().as_slice()).into_owned()).unwrap_or_default();
+    if members.iter().any(|m| { let slot = struct_slot(m); slot != *m && (members.contains(&slot) || block_text.contains(slot.as_str())) }) {
+        return None;
     }
     // The positional form too: since Ruby 3.2 it also takes keywords, which
     // the positional constructor would bind to its first member, so analysis
@@ -5418,6 +5496,9 @@ pub struct ModelBases {
     /// scope, the parent as written, and whether the child writes its
     /// own `initialize`.
     tableless_pairs: Vec<(String, Vec<String>, Vec<String>, bool)>,
+    /// Every concrete model under `app/models`, with the table its body declares (`concrete_model_table`).
+    concrete: crate::det::HashMap<String, Option<String>>,
+    concrete_pairs: Vec<(String, Vec<String>, String, Option<String>)>,
 }
 
 impl ModelBases {
@@ -5524,6 +5605,51 @@ impl ModelBases {
             };
             pairs.push((full.join("::"), parent));
         }
+    }
+
+    /// One file's non-abstract `class X < Y` pairs, for `close_over_concrete`.
+    pub fn record_concrete(&mut self, source: &[u8], file: &str) {
+        let result = parse(source);
+        let root = result.node();
+        for (scope, class) in find_all_classes_with_scope(&root) {
+            let Some(path) = class_name_path(&class) else { continue };
+            if declares_abstract_class(&class) {
+                continue;
+            }
+            let Some(parent) = self.resolve_class_superclass(&scope, &class) else { continue };
+            let mut full = scope.clone();
+            full.extend(path);
+            let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
+            // A bare parent is kept with its scope: a concrete `Admin::Base` is found from `module Admin` below.
+            let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { scope.clone() } else { Vec::new() };
+            self.concrete_pairs.push((full.join("::"), lexical, parent, table));
+        }
+    }
+
+    /// The concrete models: a class whose parent is a base, or (single-table inheritance) another concrete model.
+    pub fn close_over_concrete(&mut self) {
+        loop {
+            let before = self.concrete.len();
+            let mut found = Vec::new();
+            for (child, scope, parent, table) in &self.concrete_pairs {
+                if self.concrete.contains_key(child) {
+                    continue;
+                }
+                let lexical = (1..=scope.len()).rev().map(|n| format!("{}::{parent}", scope[..n].join("::"))).find(|c| self.concrete.contains_key(c));
+                if lexical.is_some() || self.names.contains(parent) || self.concrete.contains_key(parent) {
+                    found.push((child.clone(), table.clone()));
+                }
+            }
+            self.concrete.extend(found);
+            if self.concrete.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// `Some(declared)` for a concrete model, the table its own body declares or `None` for Rails' default.
+    pub fn concrete_model_table(&self, name: &str) -> Option<Option<&str>> {
+        self.concrete.get(name).map(|t| t.as_deref())
     }
 
     /// Close the set: anything whose parent is already a base is one.
