@@ -4384,6 +4384,8 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // lower). Both answer a String whatever the width.
         | "rjust" | "ljust" | "center" => Ty::Str,
         "to_f" => Ty::Float,
+        // bigdecimal/util's loose parse, which `lower::bigdecimal` spells through the runtime.
+        "to_d" => Ty::Class { id: crate::ident::ClassId(Symbol::from("BigDecimal")), args: vec![].into() },
         "to_sym" | "intern" => Ty::Sym,
         // Case-insensitive comparison: `casecmp` returns -1/0/1 (Int),
         // `casecmp?` returns Bool.
@@ -5052,6 +5054,8 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         "values" | "to_a" => Ty::Array { elem: std::sync::Arc::new(pv()) },
         "size" | "length" | "count" | "to_i" => Ty::Int,
         "to_f" => Ty::Float,
+        // A String's or nil's, raising for another shape as Ruby does (`lower::bigdecimal`).
+        "to_d" => Ty::Class { id: crate::ident::ClassId(Symbol::from("BigDecimal")), args: vec![].into() },
         "to_s" | "join" => Ty::Str,
         "to_sym" => Ty::Sym,
         "tap" | "dup" | "freeze" => pv(),

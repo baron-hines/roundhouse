@@ -142,6 +142,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
     // object the render asks for its own partial.
     fn reads_request(e: &Expr, fed: &HashSet<String>) -> bool {
         match &*e.node {
+            ExprNode::Send { recv: None, method, args, .. } if matches!(method.as_str(), "sprintf" | "format") => args.iter().any(|a| reads_request(a, fed)),
             ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
             // A name built from one (`"articles/" + params[:panel]`), apart from a record a request selects.
             ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "+" => {
@@ -255,6 +256,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         entries.iter().any(|(k, v)| {
             (key(k, "partial") && open(v))
                 || (partial && key(k, "layout") && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil }) && open(v))
+                || (partial && key(k, "spacer_template") && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil }) && open(v))
         })
     }
     fn computed_partial(
@@ -262,6 +264,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         open: &dyn Fn(&Expr) -> bool,
         request: &dyn Fn(&Expr) -> bool,
         locals: &[(String, bool, &Expr)],
+        mutated: &HashSet<String>,
     ) -> bool {
         let mut found = false;
         if let ExprNode::Send { method, args, .. } = &*e.node
@@ -271,10 +274,18 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             found = match &*first.node {
                 ExprNode::Hash { entries, .. } => options_open(entries, open),
                 // Options passed through a local (`opts = { partial: … }; render opts`).
+                // Or a name built in place (`panel += "ost"`); not a local holding a record, which renders itself.
                 ExprNode::Var { name, .. } => {
-                    request(first)
+                    // A String mutated in place (directly or through an alias), as a record collection is not.
+                    let built = mutated.contains(name.as_str())
+                        && locals.iter().any(|(n, ivar, h)| !*ivar && n == name.as_str() && matches!(&*h.node, ExprNode::Lit { value: Literal::Str { .. } }));
+                    built || request(first)
                         || locals.iter().any(|(n, ivar, h)| {
-                            !*ivar && n == name.as_str() && matches!(&*h.node, ExprNode::Hash { entries, .. } if options_open(entries, open))
+                            !*ivar
+                                && n == name.as_str()
+                                && (matches!(&*h.node, ExprNode::Hash { entries, .. } if options_open(entries, open))
+                                    || matches!(&*h.node, ExprNode::OpAssign { op: crate::expr::OpAssignOp::Add, value, .. }
+                                        if matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })))
                         })
                 }
                 ExprNode::StringInterp { .. } => open(first),
@@ -284,7 +295,7 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 _ => request(first),
             };
         }
-        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request, locals));
+        e.node.for_each_child(&mut |c| found = found || computed_partial(c, open, request, locals, mutated));
         found
     }
     let body_computed = |b: &Expr| -> bool {
@@ -296,7 +307,23 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
         block_params(b, &mut shadowed);
         let mut mutated = HashSet::default();
         mutated_locals(b, &mut mutated);
-        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here)
+        // An alias shares the String (`alias_name = panel; alias_name.concat(…)`): a mutation of either is of both.
+        loop {
+            let before = mutated.len();
+            for (name, ivar, value) in &here {
+                if let ExprNode::Var { name: other, .. } = &*value.node
+                    && !*ivar
+                    && (mutated.contains(name) || mutated.contains(other.as_str()))
+                {
+                    mutated.insert(name.clone());
+                    mutated.insert(other.as_str().to_string());
+                }
+            }
+            if mutated.len() == before {
+                break;
+            }
+        }
+        computed_partial(b, &|v: &Expr| open_in(v, &here, &shadowed, &mutated, &fed), &|v: &Expr| reads_request(v, &fed), &here, &mutated)
     };
     let mut computed = false;
     crate::lower::for_each_hook_body_ref(app, &mut |b| computed = computed || body_computed(b));
@@ -323,22 +350,39 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
     }
     // A bare render target resolves through the rendering controller's lookup prefixes, not the view's own
     // directory (`shared/_card`'s `render "ghost"` may be `articles/_ghost`), so its leaf names any directory's.
-    fn bare_render_targets(e: &Expr, out: &mut HashSet<String>) {
+    // A local read there names what its literal assignments hold (`panel = "ghost"; render partial: panel`).
+    fn bare_render_targets(e: &Expr, locals: &[(String, bool, &Expr)], out: &mut HashSet<String>) {
         if let ExprNode::Send { method, args, .. } = &*e.node
             && matches!(method.as_str(), "render" | "render_to_string")
             && let Some(first) = args.first()
         {
             let mut take = |v: &Expr| {
-                if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node
-                    && !value.contains('/')
-                {
-                    out.insert(value.clone());
+                // Through aliases too (`source = "ghost"; panel = source`), each local followed once.
+                let mut values: Vec<&Expr> = Vec::new();
+                let mut pending: Vec<&Expr> = vec![v];
+                let mut seen: HashSet<String> = HashSet::default();
+                while let Some(e) = pending.pop() {
+                    match &*e.node {
+                        ExprNode::Var { name, .. } => {
+                            if seen.insert(name.as_str().to_string()) {
+                                pending.extend(locals.iter().filter(|(n, ivar, _)| !*ivar && n == name.as_str()).map(|(_, _, value)| *value));
+                            }
+                        }
+                        _ => values.push(e),
+                    }
+                }
+                for v in values {
+                    if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node
+                        && !value.contains('/')
+                    {
+                        out.insert(value.clone());
+                    }
                 }
             };
             match &*first.node {
                 ExprNode::Hash { entries, .. } => {
                     for (k, v) in entries {
-                        if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout")) {
+                        if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout" | "spacer_template")) {
                             take(v);
                         }
                     }
@@ -346,13 +390,51 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
                 _ => take(first),
             }
         }
-        e.node.for_each_child(&mut |c| bare_render_targets(c, out));
+        e.node.for_each_child(&mut |c| bare_render_targets(c, locals, out));
     }
-    let mut bare_targets: HashSet<String> = HashSet::default();
+    // The text pieces of a render's own interpolated name (`render "ghost_#{kind}"`), apart from any other string's.
+    fn render_name_fragments(e: &Expr, out: &mut Vec<String>) {
+        if let ExprNode::Send { method, args, .. } = &*e.node
+            && matches!(method.as_str(), "render" | "render_to_string")
+        {
+            let mut take = |v: &Expr| {
+                if let ExprNode::StringInterp { parts } = &*v.node {
+                    for part in parts {
+                        if let crate::expr::InterpPart::Text { value } = part {
+                            out.push(value.clone());
+                        }
+                    }
+                }
+            };
+            match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Hash { entries, .. }) => {
+                    for (k, v) in entries {
+                        if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "partial" | "layout" | "spacer_template")) {
+                            take(v);
+                        }
+                    }
+                }
+                Some(_) => take(&args[0]),
+                None => {}
+            }
+        }
+        e.node.for_each_child(&mut |c| render_name_fragments(c, out));
+    }
+    let mut render_fragments: Vec<String> = Vec::new();
     for v in &app.views {
-        bare_render_targets(&v.body, &mut bare_targets);
+        render_name_fragments(&v.body, &mut render_fragments);
     }
-    crate::lower::for_each_hook_body_ref(app, &mut |b| bare_render_targets(b, &mut bare_targets));
+    crate::lower::for_each_hook_body_ref(app, &mut |b| render_name_fragments(b, &mut render_fragments));
+    let mut bare_targets: HashSet<String> = HashSet::default();
+    let mut bare_in = |b: &Expr, out: &mut HashSet<String>| {
+        let mut here = Vec::new();
+        assignments(b, &mut here);
+        bare_render_targets(b, &here, out);
+    };
+    for v in &app.views {
+        bare_in(&v.body, &mut bare_targets);
+    }
+    crate::lower::for_each_hook_body_ref(app, &mut |b| bare_in(b, &mut bare_targets));
     // Not models alone: an STI subclass ingested as a library class (`AssistantMessage < Message`), or any class
     // answering `to_partial_path`, is rendered by `render @messages` the same way.
     let model_partials: HashSet<String> = app
@@ -380,6 +462,22 @@ fn unreachable_partials(app: &App) -> Vec<usize> {
             continue;
         }
         let partial = format!("{dir}/{leaf}");
+        // Not by any literal ending in its leaf (a `/rooms/1/edit` URL): every block render of it now renders its copy.
+        if app.yield_originals.contains(&view.name) {
+            let by_render_fragment = render_fragments.iter().any(|f| {
+                let piece = f.trim_matches('/');
+                f.contains(leaf) || (piece.len() >= 2 && partial.contains(piece))
+            });
+            if !(names.contains(&partial)
+                || view_names.contains(&(dir.to_string(), leaf.to_string()))
+                || bare_targets.contains(leaf)
+                || model_partials.contains(&partial)
+                || by_render_fragment)
+            {
+                out.push(i);
+            }
+            continue;
+        }
         let named = names.contains(leaf)
             || view_names.contains(&(dir.to_string(), leaf.to_string()))
             || bare_targets.contains(leaf)
@@ -450,9 +548,21 @@ fn family<'a>(controller: &'a Controller, by_name: &HashMap<&str, &'a Controller
 fn defines(c: &Controller, name: &str, modules: &HashMap<&str, HashSet<&str>>) -> bool {
     c.body.iter().any(|item| match item {
         ControllerBodyItem::Action { action, .. } => action.name.as_str() == name,
-        ControllerBodyItem::Unknown { expr, .. } => included(expr).iter().any(|m| modules.get(m.as_str()).is_none_or(|defs| defs.contains(name))),
+        ControllerBodyItem::Unknown { expr, .. } => included(expr).iter().any(|m| match modeled_module(m) {
+            Some(defs) => defs.contains(&name),
+            None => modules.get(m.as_str()).is_none_or(|defs| defs.contains(name)),
+        }),
         _ => false,
     })
+}
+
+/// The methods a module the runtime models (not a library class here) defines: pagy's backends.
+fn modeled_module(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "Pagy::Backend" => Some(&["pagy", "pagy_array", "pagy_get_count", "pagy_get_items", "pagy_get_limit", "pagy_get_page"]),
+        "Pagy::Method" => Some(&["pagy"]),
+        _ => None,
+    }
 }
 
 fn included(expr: &Expr) -> Vec<String> {
@@ -471,16 +581,57 @@ fn included(expr: &Expr) -> Vec<String> {
 /// Whether a render in `c` may reach the template: one naming it, or one
 /// whose target is computed.
 fn renders(c: &Controller, action: &str, template: &str) -> bool {
+    let bodies = || {
+        c.body.iter().filter_map(|item| match item {
+            ControllerBodyItem::Action { action, .. } => Some(&action.body),
+            ControllerBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        })
+    };
+    // `render(**notification)` (maybe's `Notifiable`) reaches a template only through a `template:`/`action:`/`file:`
+    // key, which no hash this controller builds holds: it renders the partials its hashes name.
+    // Parameter defaults too (`def notice(options = { template: … })`), which an action keeps apart from its body.
+    let defaults = c.actions().flat_map(|a| a.opt_params.iter().map(|(_, d)| d).chain(a.kw_params.iter().filter_map(|(_, d)| d.as_ref())));
+    let template_hash = bodies().any(builds_template_hash) || defaults.into_iter().any(builds_template_hash);
     let mut found = false;
-    for item in &c.body {
-        let body = match item {
-            ControllerBodyItem::Action { action, .. } => &action.body,
-            ControllerBodyItem::Unknown { expr, .. } => expr,
-            _ => continue,
-        };
-        visit_renders(body, &mut |lits, dynamic| {
-            found |= dynamic || lits.iter().any(|l| l == action || names_template(l, template));
+    for body in bodies() {
+        visit_renders(body, &mut |lits, dynamic, splat| {
+            found |= (dynamic && !(splat && !template_hash)) || lits.iter().any(|l| l == action || names_template(l, template));
         });
+    }
+    found
+}
+
+/// Whether a hash literal in `e` holds a `template:`, `action:` or `file:` key. Not one passed straight to another
+/// call (`logs.create!(action: action_name, …)`), which is that call's attributes, not render options.
+fn builds_template_hash(e: &Expr) -> bool {
+    let key = |entries: &[(Expr, Expr)]| {
+        entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "template" | "action" | "file")))
+    };
+    let mut found = matches!(&*e.node, ExprNode::Hash { entries, .. } if key(entries));
+    match &*e.node {
+        // Not the hashes a call builds options from (`{}.merge(template: …)`), which keep their keys.
+        ExprNode::Send { method, recv, args, block, .. }
+            if !matches!(method.as_str(), "render" | "render_to_string" | "merge" | "merge!" | "reverse_merge" | "reverse_merge!" | "deep_merge" | "deep_merge!" | "with_defaults" | "update" | "store" | "[]=") =>
+        {
+            for a in args {
+                match &*a.node {
+                    ExprNode::Hash { entries, .. } => {
+                        for (k, v) in entries {
+                            found = found || builds_template_hash(k) || builds_template_hash(v);
+                        }
+                    }
+                    _ => found = found || builds_template_hash(a),
+                }
+            }
+            if let Some(r) = recv {
+                found = found || builds_template_hash(r);
+            }
+            if let Some(b) = block {
+                found = found || builds_template_hash(b);
+            }
+        }
+        _ => e.node.for_each_child(&mut |c| found = found || builds_template_hash(c)),
     }
     found
 }
@@ -508,7 +659,7 @@ fn render_literals_outside_controllers(app: &App, unrouted: &HashSet<String>) ->
         app.library_classes.iter().any(|c| c.includes.iter().any(|i| i.0.as_str().trim_start_matches("::") == lc.name.0.as_str()))
     };
     let mut out = Vec::new();
-    let mut collect = |e: &Expr| visit_renders(e, &mut |lits, _| out.extend(lits.iter().cloned()));
+    let mut collect = |e: &Expr| visit_renders(e, &mut |lits, _, _| out.extend(lits.iter().cloned()));
     for lc in &app.library_classes {
         let module_included = included(lc);
         let runs_nowhere = |span: &crate::span::Span| {
@@ -532,7 +683,8 @@ fn render_literals_outside_controllers(app: &App, unrouted: &HashSet<String>) ->
 
 /// Each render-like call under `e`: the String/Symbol literals among its
 /// arguments, and whether its target is computed.
-fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool)) {
+/// Each render's literal names, whether one is not a literal, and whether that is only a `**hash` argument.
+fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool, bool)) {
     e.node.for_each_child(&mut |c| visit_renders(c, f));
     let ExprNode::Send { method, args, .. } = &*e.node else { return };
     if !matches!(method.as_str(), "render" | "render_to_string" | "respond_with") {
@@ -540,6 +692,18 @@ fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool)) {
     }
     let mut lits = Vec::new();
     let mut dynamic = method.as_str() == "respond_with";
+    // Not options a request may hold (`**params.permit(:template).to_h`): its root, through any calls on it.
+    fn from_request(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { recv: None, method, .. } => matches!(method.as_str(), "params" | "session" | "cookies" | "request"),
+            ExprNode::Send { recv: Some(r), method, .. } if matches!(&*r.node, ExprNode::SelfRef) => {
+                matches!(method.as_str(), "params" | "session" | "cookies" | "request")
+            }
+            ExprNode::Send { recv: Some(r), .. } => from_request(r),
+            _ => false,
+        }
+    }
+    let splat = matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::KeywordSplat { value } if !from_request(value)));
     for (i, a) in args.iter().enumerate() {
         match &*a.node {
             ExprNode::Lit { value: Literal::Str { value } } => lits.push(value.clone()),
@@ -564,5 +728,5 @@ fn visit_renders(e: &Expr, f: &mut dyn FnMut(&[String], bool)) {
             _ => {}
         }
     }
-    f(&lits, dynamic);
+    f(&lits, dynamic, splat);
 }

@@ -1594,29 +1594,42 @@ fn report_block_render_partials(app: &App, target: BuildTarget) {
     ) {
         return;
     }
-    fn visit(e: &crate::expr::Expr, unreachable: bool, target: BuildTarget) {
-        if let crate::expr::ExprNode::Send { recv, method, args, block: Some(block), .. } = &*e.node
-            && !e.span.is_synthetic()
-            && matches!(
-                crate::lower::view::classify_render_partial(recv.as_ref(), method.as_str(), args, Some(block), &|_| true, &|_| false),
-                Some(crate::lower::view::RenderPartial::LayoutBlock { .. })
-            )
-        {
+    fn visit(e: &crate::expr::Expr, unreachable: bool, target: BuildTarget, specialized: &[crate::span::Span]) {
+        // Not only the block form: `ingest::yield_partials` rewrote most into a render of a partial copy, which no
+        // target outside the ruby family has been run with.
+        let inlined = matches!(&*e.node, crate::expr::ExprNode::Send { method, block: None, .. } if method.as_str() == "render")
+            && specialized.contains(&e.span);
+        let captured = match &*e.node {
+            crate::expr::ExprNode::Send { recv, method, args, block: Some(block), .. } => {
+                !e.span.is_synthetic()
+                    && matches!(
+                        crate::lower::view::classify_render_partial(recv.as_ref(), method.as_str(), args, Some(block), &|_| true, &|_| false),
+                        Some(crate::lower::view::RenderPartial::LayoutBlock { .. })
+                    )
+            }
+            _ => false,
+        };
+        if inlined || captured {
+            let why = if inlined {
+                "the block is inlined at the yields of a copy of the partial, which this target's views have not been checked to carry"
+            } else {
+                "the block becomes the partial's `yield`, captured into a String, which this target's views don't carry"
+            };
             let mut d = crate::diagnostic::Diagnostic::unsupported(
                 e.span,
                 Some(crate::ident::Symbol::from(target.as_str())),
                 "render with a block",
-                "the block becomes the partial's `yield`, captured into a String, which this target's views don't carry",
+                why,
             );
             if unreachable {
                 d.severity = crate::diagnostic::Severity::Warning;
             }
             emit::diagnostics::push(d);
         }
-        e.node.for_each_child(&mut |c| visit(c, unreachable, target));
+        e.node.for_each_child(&mut |c| visit(c, unreachable, target, specialized));
     }
     for view in &app.views {
-        visit(&view.body, app.unreachable_views.contains(&view.name), target);
+        visit(&view.body, app.unreachable_views.contains(&view.name), target, &app.yield_specialized);
     }
 }
 
