@@ -163,9 +163,12 @@ pub(crate) fn root_shadowed(lcs: &mut [crate::dialect::LibraryClass], app: &App)
         // emitter may nest them), and its superclasses.
         let mut scopes: Vec<String> = vec![owner.clone()];
         scopes.extend(owner.match_indices("::").map(|(i, _)| owner[..i].to_string()));
+        // Not `scopes` as the visited set: a parent that is also a lexical namespace (`Account::Archive < Account`)
+        // still has superclasses of its own.
+        let mut visited: crate::det::HashSet<String> = crate::det::HashSet::default();
         let mut current = parents.get(&owner);
         while let Some(parent) = current {
-            if scopes.contains(parent) {
+            if !visited.insert(parent.clone()) {
                 break;
             }
             scopes.push(parent.clone());
