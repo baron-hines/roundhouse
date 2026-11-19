@@ -986,7 +986,10 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
                 lit_str(binding.model_name.clone()),
                 Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(binding.record_local.as_str()) }),
                 template,
-                Expr::new(Span::synthetic(), ExprNode::Hash { entries: Vec::new(), kwargs: false }),
+                Expr::new(Span::synthetic(), ExprNode::Hash {
+                    entries: binding.builder_options.iter().map(|(k, v)| (lit_sym(k.clone()), Expr::new(Span::synthetic(), ExprNode::Lit { value: v.clone() }))).collect(),
+                    kwargs: false,
+                }),
             ];
             prelude.push(Expr::new(
                 Span::synthetic(),
@@ -2429,6 +2432,8 @@ pub(crate) struct PartialFormBinding {
     pub(crate) id_prefix: String,
     /// The defining form's `builder:` class, which the partial builds again when it overrides a stock field.
     pub(crate) builder: Option<String>,
+    /// The defining form's options with a literal value, which Rails hands the builder (`layout: :horizontal`).
+    pub(crate) builder_options: Vec<(Symbol, Literal)>,
 }
 
 pub(crate) fn partial_form_bindings(
@@ -2568,6 +2573,7 @@ pub(crate) fn partial_form_bindings(
                                     model_name,
                                     id_prefix: id_prefix.to_string(),
                                     builder: form.builder.clone(),
+                                    builder_options: form.options.clone(),
                                 },
                             ));
                         }
@@ -2584,6 +2590,7 @@ pub(crate) fn partial_form_bindings(
     struct FormScope {
         model_name: Option<String>,
         builder: Option<String>,
+        options: Vec<(Symbol, Literal)>,
     }
 
     /// Find `form_with ... do |f|` scopes and collect their render
@@ -2602,7 +2609,7 @@ pub(crate) fn partial_form_bindings(
                     if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
                         let mut record_refs: HashSet<String> = HashSet::default();
                         let mut id_prefix = String::new();
-                        let mut scope = FormScope { model_name: None, builder: None };
+                        let mut scope = FormScope { model_name: None, builder: None, options: Vec::new() };
                         for arg in args {
                             if let ExprNode::Hash { entries, .. } = &*arg.node {
                                 for (k, v) in entries {
@@ -2611,6 +2618,11 @@ pub(crate) fn partial_form_bindings(
                                     else {
                                         continue;
                                     };
+                                    if key.as_str() != "builder"
+                                        && let ExprNode::Lit { value } = &*v.node
+                                    {
+                                        scope.options.push((key.clone(), value.clone()));
+                                    }
                                     match key.as_str() {
                                         "model" => {
                                             // Rails' prefix is the model's `param_key`, not the reference's name (`@edit_user` → `user`).
@@ -2709,7 +2721,7 @@ pub(crate) fn partial_form_bindings(
                     &binding.form_local,
                     &refs,
                     &binding.id_prefix,
-                    &FormScope { model_name: Some(binding.model_name.clone()), builder: binding.builder.clone() },
+                    &FormScope { model_name: Some(binding.model_name.clone()), builder: binding.builder.clone(), options: binding.builder_options.clone() },
                     &stems,
                     &mut next,
                 );

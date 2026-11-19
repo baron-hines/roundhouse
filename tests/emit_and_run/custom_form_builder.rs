@@ -284,3 +284,51 @@ puts "named passed"
     run.assert_passes();
     assert!(run.stdout.contains("named passed"), "{}", run.stdout);
 }
+
+/// A strict-locals partial (`locals: (f:, caption:)`) handed the builder alone takes the record first, as its lowering
+/// reads one, beside the locals it declares.
+#[test]
+fn a_strict_locals_partial_handed_the_builder_alone_renders_its_fields() {
+    let run = emit_and_run::real_blog()
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= render \"articles/fields\", f: form, caption: \"Cap\" %>\n<% end %>\n")
+        .write("app/views/articles/_fields.html.erb", "<%# locals: (f:, caption: \"none\") -%>\n<p><%= caption %></p>\n<%= f.text_field :title %>\n")
+        .run_ruby(&format!(
+            r##"{ATTRS}io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+raise "title #{{attrs(io, "article[title]")}}" unless attrs(io, "article[title]")["value"] == "Hi"
+raise "caption:\n#{{io}}" unless io.include?("<p>Cap</p>")
+puts "strict passed"
+"##
+        ));
+    run.assert_passes();
+    assert!(run.stdout.contains("strict passed"), "{}", run.stdout);
+}
+
+/// A `fields_for` builder handed to a partial: the nested fields are written inline, so the partial would get no
+/// builder; reported on every target rather than raise at render.
+#[test]
+fn a_fields_for_builder_handed_to_a_partial_is_reported() {
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :meta, article do |child| %>\n<%= render \"articles/fields\", f: child %>\n<% end %>\n<% end %>\n")
+        .write("app/views/articles/_fields.html.erb", "<%= f.text_field :title %>\n")
+        .emit(roundhouse::build_target::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("fields_for builder in a partial")), "{errors:#?}");
+}
+
+/// Rails hands the nested builder the form's `namespace:`, so an override's field ids carry it.
+#[test]
+fn a_nested_builder_keeps_the_forms_namespace() {
+    let form = "<%= form_with(model: article, builder: WrappingFormBuilder, namespace: \"editor\") do |form| %>\n<%= form.fields_for :meta, article do |nested| %>\n<%= nested.text_field :title %>\n<% end %>\n<% end %>\n";
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_form.html.erb", form)
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+raise "namespace:\n#{io}" unless io.include?("id=\"editor_article_meta_title\"")
+puts "namespace passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("namespace passed"), "{}", run.stdout);
+}

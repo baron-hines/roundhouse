@@ -160,6 +160,14 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
     // A `fields_for` block's builder is the outer form's class in Rails, though the analysis types one inside another as
     // the base: carry the class in, and report an override called on it as the outer level's is.
     fn nested(expr: &Expr, overrides: &Overrides, scope: &[(Symbol, crate::ident::ClassId)], out: &mut Vec<Diagnostic>) {
+        // A block that binds a name again (`others.each do |child|`) hides the builder of that name inside it.
+        if let ExprNode::Lambda { params, body, .. } = &*expr.node
+            && scope.iter().any(|(n, _)| params.contains(n))
+        {
+            let inner: Vec<_> = scope.iter().filter(|(n, _)| !params.contains(n)).cloned().collect();
+            nested(body, overrides, &inner, out);
+            return;
+        }
         let class_of = |r: &Expr| -> Option<crate::ident::ClassId> {
             match &*r.node {
                 ExprNode::Var { name, .. } => scope.iter().rev().find(|(n, _)| n == name).map(|(_, c)| c.clone()),
@@ -200,11 +208,58 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         }
         expr.node.for_each_child(&mut |c| nested(c, overrides, scope, out));
     }
+    // A `fields_for` builder handed to a partial: the lowering writes the nested fields inline and builds no object to pass.
+    fn nested_builder_renders(expr: &Expr, params: &[Symbol], out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Lambda { params: own, body, .. } = &*expr.node
+            && params.iter().any(|p| own.contains(p))
+        {
+            let inner: Vec<_> = params.iter().filter(|p| !own.contains(p)).cloned().collect();
+            nested_builder_renders(body, &inner, out);
+            return;
+        }
+        if let ExprNode::Send { method, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let ExprNode::Lambda { params: own, body, .. } = &*b.node
+            && let Some(param) = own.first()
+        {
+            let mut inner = params.to_vec();
+            inner.push(param.clone());
+            nested_builder_renders(body, &inner, out);
+            if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                for e in recv.iter().chain(args.iter()) {
+                    nested_builder_renders(e, params, out);
+                }
+            }
+            return;
+        }
+        if let ExprNode::Send { recv: None, method, args, .. } = &*expr.node
+            && method.as_str() == "render"
+            && !expr.span.is_synthetic()
+        {
+            fn hands(e: &Expr, params: &[Symbol]) -> bool {
+                match &*e.node {
+                    ExprNode::Var { name, .. } => params.contains(name),
+                    ExprNode::Hash { entries, .. } => entries.iter().any(|(_, v)| hands(v, params)),
+                    _ => false,
+                }
+            }
+            if args.iter().any(|a| hands(a, params)) {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "fields_for builder in a partial",
+                    "a `fields_for` builder handed to a partial: the nested fields are written inline, and the partial would get no builder".to_string(),
+                ));
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested_builder_renders(c, params, out));
+    }
     let mut out = Vec::new();
     let overrides = crate::lower::view::form_builder_overrides(app);
     for view in &app.views {
         visit(app, &overrides, &view.body, &mut out);
         nested(&view.body, &overrides, &[], &mut out);
+        nested_builder_renders(&view.body, &[], &mut out);
     }
     out
 }

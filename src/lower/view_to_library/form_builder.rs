@@ -1323,7 +1323,14 @@ fn emit_fields_for(
             lit_str(model_name.clone()),
             Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() }),
             template,
-            Expr::new(Span::synthetic(), ExprNode::Hash { entries: Vec::new(), kwargs: false }),
+            // Rails' `fields_for` hands the nested builder the form's `namespace:`.
+            Expr::new(Span::synthetic(), ExprNode::Hash {
+                entries: (!binding.id_prefix.is_empty())
+                    .then(|| (lit_sym(Symbol::from("namespace")), lit_str(binding.id_prefix.clone())))
+                    .into_iter()
+                    .collect(),
+                kwargs: false,
+            }),
         ];
         out.push(Expr::new(
             Span::synthetic(),
