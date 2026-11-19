@@ -177,3 +177,22 @@ fn a_caller_partials_local_and_a_fresh_block_local() {
     run.assert_passes();
     assert!(run.stdout.contains("local passed"), "{}", run.stdout);
 }
+
+/// A copy's own block render reads a local its original is passed (`tcp`).
+#[test]
+fn a_copys_block_render_reads_the_originals_local() {
+    let overlay = emit_and_run::real_blog()
+        .write("app/views/shared/_wrap.html.erb", "<s><%= yield %></s>")
+        .write("app/views/articles/_outer.html.erb", "<%= render layout: \"shared/wrap\" do %><%= tcp %><% end %><%= yield %>")
+        .edit(
+            "app/views/articles/show.html.erb",
+            "    <p class=\"text-gray-700\">",
+            "<em id=\"outer\"><%= render \"articles/outer\", tcp: \"T\" do %>B<% end %></em>\n    <p class=\"text-gray-700\">",
+        );
+    let script = format!(
+        "{RUBY_PAGE}\nhello = Article.create!(title: \"Hello\", body: \"Body text here\")\nbody = page(hello.id)\nraise body[0, 3000] unless body.include?(\"<em id=\\\"outer\\\"><s>T</s>B</em>\")\nputs \"outer passed\"\n"
+    );
+    let run = overlay.run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("outer passed"), "{}", run.stdout);
+}

@@ -30,6 +30,7 @@ use crate::ident::{Symbol, VarId};
 pub(super) fn specialize(app: &mut App) {
     let snapshot: Vec<View> = app.views.clone();
     let passed = passed_locals(&snapshot);
+    let mut origin: crate::det::HashMap<String, String> = crate::det::HashMap::default();
     let mut next = 0usize;
     let mut spans = Vec::new();
     let mut originals = std::collections::BTreeSet::new();
@@ -53,7 +54,9 @@ pub(super) fn specialize(app: &mut App) {
             }
             let leaf = view.name.as_str().rsplit('/').next().unwrap_or("");
             let loose_partial = leaf.starts_with('_') && view.strict_locals.is_none();
-            let mut caller_locals = passed.get(view.name.as_str()).cloned().unwrap_or_default();
+            // A copy reads the locals its original is passed.
+            let key = origin.get(view.name.as_str()).cloned().unwrap_or_else(|| view.name.as_str().to_string());
+            let mut caller_locals = passed.get(key.as_str()).cloned().unwrap_or_default();
             caller_locals.extend(view.strict_locals.iter().flatten().map(|p| p.name.as_str().to_string()));
             let mut cx = Cx {
                 dir: &dir,
@@ -70,6 +73,11 @@ pub(super) fn specialize(app: &mut App) {
             rewrite(&mut view.body, &mut cx);
         }
         let base = app.views.len();
+        for copy in &copies {
+            let from = copy.name.as_str().rsplit_once("__yield").map(|(o, _)| o.to_string()).unwrap_or_default();
+            let root = origin.get(from.as_str()).cloned().unwrap_or(from);
+            origin.insert(copy.name.as_str().to_string(), root);
+        }
         app.views.extend(copies);
         pending = (base..app.views.len()).collect();
     }
@@ -453,7 +461,8 @@ fn passed_locals(views: &[View]) -> crate::det::HashMap<String, crate::det::Hash
 
 /// The receiverless, argument-less calls in the body that name a caller local the block does not bind itself.
 fn local_calls(e: &Expr, locals: &crate::det::HashSet<String>, bound: &crate::det::HashSet<String>, out: &mut Vec<String>) {
-    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+    // Not `tcp()`: with parentheses Ruby calls the method, whatever local of the name the partial has.
+    if let ExprNode::Send { recv: None, method, args, block: None, parenthesized: false } = &*e.node
         && args.is_empty()
         && locals.contains(method.as_str())
         && !bound.contains(method.as_str())
@@ -465,7 +474,7 @@ fn local_calls(e: &Expr, locals: &crate::det::HashSet<String>, bound: &crate::de
 }
 
 fn calls_to_locals(e: &mut Expr, called: &[String], to: &dyn Fn(&str) -> Symbol) {
-    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+    if let ExprNode::Send { recv: None, method, args, block: None, parenthesized: false } = &*e.node
         && args.is_empty()
         && called.iter().any(|n| n == method.as_str())
     {
