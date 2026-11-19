@@ -330,6 +330,8 @@ fn synthesized_source(
             format!("@{}", t.trim_start_matches('@'))
         } else if RUBY_KEYWORDS.contains(&t) {
             format!("self.{t}")
+        } else if t.starts_with(|c: char| c.is_ascii_uppercase()) {
+            t.to_string()
         } else {
             // Not bare: `__target = __target` would read the local being assigned, not the method.
             format!("{t}()")
