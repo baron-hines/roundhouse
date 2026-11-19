@@ -331,6 +331,34 @@ pub fn class_eval_bare_constant_app() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 
+/// The gem's `Shelf::Box` inherits a `TokenSource` (from its superclass
+/// `Shelf::Base`, or from a module it includes), and the initializer
+/// defines a top-level `TokenSource` its block reads bare. Ruby 4.0.7
+/// reads the top level's in the block (`"top"`), and the ancestor's in a
+/// `class Shelf::Box` reopen (`"base"`).
+#[allow(dead_code)]
+pub fn class_eval_inherited_constant_apps() -> Vec<emit_and_run::Overlay> {
+    let token = "module TokenSource\n      def self.tag\n        \"base\"\n      end\n    end\n";
+    let superclass = SHELF.replace("  class Box\n", &format!("  class Base\n    {token}  end\n\n  class Box < Base\n"));
+    let included = SHELF.replace("  class Box\n", &format!("  module Tokens\n    {token}  end\n\n  class Box\n    include Tokens\n\n"));
+    let initializer = "module TokenSource\n  def self.tag\n    \"top\"\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    TokenSource.tag\n  end\nend\n";
+    [superclass, included]
+        .iter()
+        .map(|lib| with_gem_lib(lib).write("config/initializers/shelf_box.rb", initializer).write("app/models/article_box.rb", ARTICLE_BOX))
+        .collect()
+}
+
+/// A kept helper whose class body sets a class ivar from a second helper
+/// only the initializer defines (`@tag = TagSource.tag`). Ruby 4.0.7
+/// answers `box / app box / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_class_ivar_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper\n  @tag = TagSource.tag\n\n  def self.tag\n    @tag\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// A block the ingest refuses (`defined?` of a call with arguments), then
 /// [`CLASS_EVAL`]. Ruby runs both; the second is a reopen like any other.
 #[allow(dead_code)]

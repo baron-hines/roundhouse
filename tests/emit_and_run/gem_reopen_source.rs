@@ -158,6 +158,12 @@ fn a_helper_a_kept_helper_inherits_from_is_kept() {
     contract::listed(contract::class_eval_superclass_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
 }
 
+/// A helper a kept helper's class ivar initializer calls is kept.
+#[test]
+fn a_helper_a_kept_helpers_class_ivar_calls_is_kept() {
+    contract::listed(contract::class_eval_class_ivar_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
 /// A helper the block names from the top level (`::LabelHelper`) is kept.
 #[test]
 fn a_helper_a_kept_class_eval_names_from_the_top_level_is_kept() {
@@ -193,6 +199,27 @@ fn a_class_eval_reading_a_constant_of_the_gems_class_is_left_reported() {
         .map(|d| d.message)
         .collect();
     assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block whose method reads a bare name the gem's class inherits, from
+/// its superclass or a module it includes, is not taken either: Ruby
+/// reads the initializer's top-level `TokenSource` there, and the opening
+/// would read the ancestor's. It stays reported, and the class is the gem's.
+#[test]
+fn a_class_eval_reading_a_constant_the_gems_class_inherits_is_left_reported() {
+    for app in contract::class_eval_inherited_constant_apps() {
+        let source = shelf_box(app);
+        assert!(!source.contains("local_tag"), "{source}");
+    }
+    for app in contract::class_eval_inherited_constant_apps() {
+        let warned: Vec<String> = app
+            .ingest_diagnostics()
+            .into_iter()
+            .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+            .map(|d| d.message)
+            .collect();
+        assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+    }
 }
 
 /// A block the ingest refuses leaves the file's other blocks taken.
