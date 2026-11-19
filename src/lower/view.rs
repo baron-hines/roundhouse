@@ -1087,6 +1087,35 @@ pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
 
 /// Map a Ruby form method name to the lowered method kind. Rails
 /// accepts both `text_area` and `textarea` as aliases; fold them.
+/// The stock fields each app builder (`class StyledFormBuilder < ActionView::Helpers::FormBuilder`) or a builder it
+/// descends from defines again, keyed by the builder's class path: Rails dispatches them to that override.
+pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    let mut out: crate::det::HashMap<String, crate::det::HashSet<String>> = crate::det::HashMap::default();
+    for class in &app.library_classes {
+        let mut overrides = crate::det::HashSet::default();
+        let mut current = Some(class);
+        let mut descends = false;
+        for _ in 0..32 {
+            let Some(c) = current else { break };
+            for m in c.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+                if classify_form_builder_method(m.name.as_str()).is_some() {
+                    overrides.insert(m.name.as_str().to_string());
+                }
+            }
+            let Some(parent) = &c.parent else { break };
+            if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
+                descends = true;
+                break;
+            }
+            current = app.library_classes.iter().find(|p| p.name == *parent);
+        }
+        if descends && !overrides.is_empty() {
+            out.insert(class.name.0.as_str().to_string(), overrides);
+        }
+    }
+    out
+}
+
 pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
     match method {
         "label" => Some(FormBuilderMethod::Label),

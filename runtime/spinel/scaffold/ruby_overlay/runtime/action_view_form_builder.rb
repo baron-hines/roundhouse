@@ -141,6 +141,20 @@ module ActionView
     class FormBuilder
       attr_reader :object, :object_name, :options, :index
 
+      # Rails 8.1's `class_attribute :field_helpers` (`ingest::library_class::FORM_BUILDER_FIELD_HELPERS`).
+      FIELD_HELPERS = %i[fields_for fields label text_field password_field hidden_field file_field textarea checkbox
+                         radio_button color_field search_field telephone_field phone_field date_field time_field
+                         datetime_field datetime_local_field month_field week_field url_field email_field number_field
+                         range_field].freeze
+
+      def self.field_helpers
+        FIELD_HELPERS
+      end
+
+      def field_helpers
+        self.class.field_helpers
+      end
+
       def initialize(object_name, object, template, options)
         @object_name = object_name
         @object = object
@@ -195,6 +209,14 @@ module ActionView
 
       def radio_button(method, tag_value, options = {})
         @template.radio_button(@object_name, method, tag_value, objectify_options(options))
+      end
+
+      def select(method, choices = nil, options = {}, html_options = {}, &block)
+        @template.select(@object_name, method, choices, objectify_options(options), @default_html_options.merge(html_options), &block)
+      end
+
+      def collection_select(method, collection, value_method, text_method, options = {}, html_options = {})
+        @template.collection_select(@object_name, method, collection, value_method, text_method, objectify_options(options), @default_html_options.merge(html_options))
       end
 
       def label(method, text = nil, options = {}, &block)

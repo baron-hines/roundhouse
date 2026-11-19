@@ -283,6 +283,7 @@ pub struct ViewLowerCtx<'a> {
     /// Helper methods that are a thin wrapper around a BUILDER-YIELDING
     /// form helper (see [`form_wrapper_helpers`]).
     form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
+    builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     /// See the ViewCtx field of the same name. Off unless the emitter
     /// opts in with [`ViewLowerCtx::observe_form_with_entry`].
     form_with_entry: bool,
@@ -379,6 +380,7 @@ impl<'a> ViewLowerCtx<'a> {
             yielding_partials: std::rc::Rc::new(yielding),
             collection_element_locals: std::rc::Rc::new(element_locals),
             form_wrappers: std::rc::Rc::new(form_wrapper_helpers(app)),
+            builder_overrides: std::rc::Rc::new(crate::lower::view::form_builder_overrides(app)),
             form_with_entry: false,
         }
     }
@@ -902,6 +904,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         i18n: lx.i18n.clone(),
         route_helper_arity: lx.route_helper_arity.clone(),
         form_wrappers: lx.form_wrappers.clone(),
+        builder_overrides: lx.builder_overrides.clone(),
         form_with_entry: lx.form_with_entry,
         model_param_keys: lx.model_param_keys.clone(),
         stylesheets: app.stylesheets.clone(),
@@ -966,6 +969,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             form_method_var: form_method_var.clone(),
             id_prefix: binding.id_prefix.clone(),
             recordless: false,
+            overridden: Default::default(),
         });
         let record_ref = Expr::new(
             Span::synthetic(),
@@ -5215,6 +5219,8 @@ pub(super) struct FormBuilderBinding {
     /// A `scope:` form with no record (`form_for :filter, url: ...`): its
     /// fields are named under the scope but read no attributes.
     pub(super) recordless: bool,
+    /// The stock fields the form's own builder defines again, which run on it rather than inline.
+    pub(super) overridden: crate::det::HashSet<String>,
 }
 
 impl FormBuilderBinding {
@@ -5417,6 +5423,8 @@ pub(super) struct ViewCtx {
     /// to the wrapped call so the form-builder macro-inline can see
     /// both halves at once.
     pub(super) form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
+    /// The stock fields an app builder defines again ([`crate::lower::view::form_builder_overrides`]).
+    pub(super) builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     /// Begin each `form_with` expansion with the
     /// `ActionView::Base.new.form_with` entry (Ruby family only — see
     /// `form_with::form_with_entry`).

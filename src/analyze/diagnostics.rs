@@ -71,7 +71,9 @@ fn descends_from_form_builder(app: &App, id: &crate::ident::ClassId) -> bool {
 }
 
 fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
-    fn visit(app: &App, expr: &Expr, out: &mut Vec<Diagnostic>) {
+    type Overrides = crate::det::HashMap<String, crate::det::HashSet<String>>;
+    fn visit(app: &App, overrides: &Overrides, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        let overridden = |id: &crate::ident::ClassId, m: &str| overrides.get(id.0.as_str()).is_some_and(|o| o.contains(m));
         // A builder class of the app's or a gem's own (`builder: MoneyFormBuilder`): a method the lowering does not
         // expand runs on Rails' builder at request time, which the Ruby family's overlay carries and no other tree.
         if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
@@ -80,7 +82,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             && id.0.as_str() != "ActionView::Helpers::FormBuilder"
             && descends_from_form_builder(app, id)
             && method.as_str() != "object"
-            && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+            && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden(id, method.as_str()))
         {
             out.push(Diagnostic::unsupported(
                 expr.span,
@@ -98,9 +100,9 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         {
             let base = id.0.as_str() == "ActionView::Helpers::FormBuilder";
             let m = method.as_str();
-            if crate::lower::classify_form_builder_method(m).is_none() {
+            if crate::lower::classify_form_builder_method(m).is_none() || overridden(id, m) {
                 if !base {
-                    expr.node.for_each_child(&mut |child| visit(app, child, out));
+                    expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
                     return;
                 }
                 out.push(Diagnostic::unsupported(
@@ -131,7 +133,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                 ));
             }
         }
-        expr.node.for_each_child(&mut |child| visit(app, child, out));
+        expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
     }
     /// The option of `method`'s call that Rails' `Tags::*#render`
     /// rewrites: `NumberField` (and `RangeField`) turn `in:`/`within:`
@@ -156,8 +158,9 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         })
     }
     let mut out = Vec::new();
+    let overrides = crate::lower::view::form_builder_overrides(app);
     for view in &app.views {
-        visit(app, &view.body, &mut out);
+        visit(app, &overrides, &view.body, &mut out);
     }
     out
 }

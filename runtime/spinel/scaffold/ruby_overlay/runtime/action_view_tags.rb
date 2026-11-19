@@ -41,6 +41,14 @@ module ActionView
       Helpers::Tags::RadioButton.new(object_name, method, self, tag_value, options).render
     end
 
+    def select(object, method, choices = nil, options = {}, html_options = {}, &block)
+      Helpers::Tags::Select.new(object, method, self, choices, options, html_options, &block).render
+    end
+
+    def collection_select(object, method, collection, value_method, text_method, options = {}, html_options = {})
+      Helpers::Tags::CollectionSelect.new(object, method, self, collection, value_method, text_method, options, html_options).render
+    end
+
     def checkbox(object_name, method, options = {}, checked_value = "1", unchecked_value = "0")
       Helpers::Tags::CheckBox.new(object_name, method, self, checked_value, unchecked_value, options).render
     end
@@ -72,7 +80,92 @@ module ActionView
 
   module Helpers
     module FormOptionsHelper
+      # Rails' `options_for_select`: an `<option>` per element, its text and value the pair's (or the element twice).
+      def options_for_select(container, selected = nil)
+        return container if String === container
+
+        selected, disabled = extract_selected_and_disabled(selected).map { |r| Array(r).map(&:to_s) }
+        container.map do |element|
+          html_attributes = option_html_attributes(element)
+          text, value = option_text_and_value(element).map(&:to_s)
+          html_attributes[:selected] ||= option_value_selected?(value, selected)
+          html_attributes[:disabled] ||= disabled && option_value_selected?(value, disabled)
+          html_attributes[:value] = value
+          option_tag(text, html_attributes)
+        end.join("\n").html_safe
+      end
+
+      def options_from_collection_for_select(collection, value_method, text_method, selected = nil)
+        options = collection.map do |element|
+          [value_for_collection(element, text_method), value_for_collection(element, value_method), option_html_attributes(element)]
+        end
+        selected, disabled = extract_selected_and_disabled(selected)
+        select_deselect = {
+          selected: extract_values_from_collection(collection, value_method, selected),
+          disabled: extract_values_from_collection(collection, value_method, disabled)
+        }
+        options_for_select(options, select_deselect)
+      end
+
+      def grouped_options_for_select(grouped_options, selected_key = nil, options = {})
+        prompt = options[:prompt]
+        divider = options[:divider]
+        body = "".html_safe
+        body.safe_concat(option_tag(prompt_text(prompt), { value: "" })) if prompt
+        grouped_options.each do |container|
+          html_attributes = option_html_attributes(container)
+          if divider
+            label = divider
+          else
+            label, container = container
+          end
+          html_attributes = { label: label }.merge!(html_attributes)
+          body.safe_concat(ActionView::Helpers::FormBuilder.tag_html("optgroup", options_for_select(container, selected_key), html_attributes))
+        end
+        body
+      end
+
       private
+
+      # Rails' `tag_builder.option`, which no field error wraps.
+      def option_tag(text, attributes)
+        ActionView::Helpers::FormBuilder.tag_html("option", text, attributes)
+      end
+
+      def option_text_and_value(option)
+        if !option.is_a?(String) && option.respond_to?(:first) && option.respond_to?(:last)
+          option = option.reject { |e| Hash === e } if Array === option
+          [option.first, option.last]
+        else
+          [option, option]
+        end
+      end
+
+      def option_value_selected?(value, selected)
+        Array(selected).include?(value)
+      end
+
+      def extract_selected_and_disabled(selected)
+        if selected.is_a?(Proc)
+          [selected, nil]
+        else
+          selected = selected.is_a?(Array) ? selected.dup : [selected].compact
+          options = (selected.last.is_a?(Hash) ? selected.pop : {}).transform_keys(&:to_sym)
+          [options.fetch(:selected, selected), options[:disabled]]
+        end
+      end
+
+      def extract_values_from_collection(collection, value_method, selected)
+        if selected.is_a?(Proc)
+          collection.filter_map { |element| element.public_send(value_method) if selected.call(element) }
+        else
+          selected
+        end
+      end
+
+      def prompt_text(prompt)
+        prompt.is_a?(String) ? prompt : I18n.translate("helpers.select.prompt", default: "Please select")
+      end
 
       def option_html_attributes(element)
         element.is_a?(Array) ? element.select { |e| e.is_a?(Hash) }.reduce({}, :merge!) : {}
@@ -422,6 +515,102 @@ module ActionView
         def hidden_field_for_checkbox(options)
           return "".html_safe unless @unchecked_value
           tag("input", options.slice("name", "disabled", "form").merge!("type" => "hidden", "value" => @unchecked_value, "autocomplete" => "off"))
+        end
+      end
+
+      # Rails 8.1's `Tags::SelectRenderer`.
+      module SelectRenderer
+        private
+
+        def select_content_tag(option_tags, options, html_options)
+          html_options = html_options.to_h.transform_keys(&:to_s)
+          [:required, :multiple, :size].each do |prop|
+            html_options[prop.to_s] = options.delete(prop) if options.key?(prop) && !html_options.key?(prop.to_s)
+          end
+          add_default_name_and_field(html_options)
+          if placeholder_required?(html_options)
+            raise ArgumentError, "include_blank cannot be false for a required field." if options[:include_blank] == false
+            options[:include_blank] ||= true unless options[:prompt]
+          end
+          value = options.fetch(:selected) { value() }
+          select = content_tag("select", add_options(option_tags, options, value), html_options)
+          if html_options["multiple"] && options.fetch(:include_hidden, true)
+            hidden = { "disabled" => html_options["disabled"], "name" => html_options["name"], "type" => "hidden", "value" => "", "autocomplete" => "off" }
+            @template_object.tag("input", hidden) + select
+          else
+            select
+          end
+        end
+
+        def placeholder_required?(html_options)
+          html_options["required"] && !html_options["multiple"] && html_options.fetch("size", 1).to_i == 1
+        end
+
+        def add_options(option_tags, options, value = nil)
+          if options[:include_blank]
+            content = (options[:include_blank] if options[:include_blank].is_a?(String))
+            label = (" " unless content)
+            option_tags = option_tag(content, { value: "", label: label }) + "\n" + option_tags
+          end
+          if value.blank? && options[:prompt]
+            tag_options = { value: "" }
+            tag_options[:disabled] = true if options[:disabled] == ""
+            tag_options[:selected] = true if options[:selected] == ""
+            option_tags = option_tag(prompt_text(options[:prompt]), tag_options) + "\n" + option_tags
+          end
+          option_tags
+        end
+      end
+
+      class Select < Base
+        include SelectRenderer
+        include FormOptionsHelper
+
+        def initialize(object_name, method_name, template_object, choices, options, html_options)
+          @choices = block_given? ? template_object.capture { yield || "" } : choices
+          @choices = @choices.to_a if @choices.is_a?(Range)
+          @html_options = html_options
+          super(object_name, method_name, template_object, options)
+        end
+
+        def render
+          option_tags_options = { selected: @options.fetch(:selected) { value.nil? ? "" : value }, disabled: @options[:disabled] }
+          option_tags = if grouped_choices?
+            grouped_options_for_select(@choices, option_tags_options)
+          else
+            options_for_select(@choices, option_tags_options)
+          end
+          select_content_tag(option_tags, @options, @html_options)
+        end
+
+        private
+
+        def grouped_choices?
+          return false if @choices.blank?
+          first_choice = @choices.first
+          return false unless first_choice.is_a?(Enumerable)
+          first_choice.to_a[1].is_a?(Array)
+        end
+      end
+
+      class CollectionSelect < Base
+        include SelectRenderer
+        include FormOptionsHelper
+
+        def initialize(object_name, method_name, template_object, collection, value_method, text_method, options, html_options)
+          @collection = collection
+          @value_method = value_method
+          @text_method = text_method
+          @html_options = html_options
+          super(object_name, method_name, template_object, options)
+        end
+
+        def render
+          option_tags_options = { selected: @options.fetch(:selected) { value }, disabled: @options[:disabled] }
+          select_content_tag(
+            options_from_collection_for_select(@collection, @value_method, @text_method, option_tags_options),
+            @options, @html_options
+          )
         end
       end
 

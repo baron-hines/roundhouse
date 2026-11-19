@@ -53,3 +53,105 @@ fn a_custom_builders_own_method_is_reported_off_the_ruby_family() {
     let (_, errors) = app().emit(roundhouse::build_target::BuildTarget::Spinel);
     assert!(errors.iter().any(|e| e.contains("custom form builder method") && e.contains("form.everything")), "{errors:#?}");
 }
+
+/// maybe's `StyledFormBuilder`: a builder that defines a stock field again, by hand or by a `class_eval` loop, wraps
+/// it, and Rails dispatches `form.text_field` to that override, not to the base's field.
+const OVERRIDING_BUILDER: &str = r##"class WrappingFormBuilder < ActionView::Helpers::FormBuilder
+  %i[email_field text_area].each do |selector|
+    class_eval <<-RUBY_EVAL, __FILE__, __LINE__ + 1
+      def #{selector}(method, options = {})
+        @template.content_tag(:div, super(method, options), class: "loop")
+      end
+    RUBY_EVAL
+  end
+
+  def text_field(method, options = {})
+    @template.content_tag(:div, super(method, options.merge(class: "input")), class: "wrap")
+  end
+end
+"##;
+
+const OVERRIDING_FORM: &str = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.text_field :title %>\n<%= form.email_field :body %>\n<%= form.text_area :body %>\n<%= form.hidden_field :title %>\n<% end %>\n";
+
+fn overriding_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_form.html.erb", OVERRIDING_FORM)
+}
+
+#[test]
+fn a_custom_builders_override_of_a_stock_field_renders_as_rails_on_ruby() {
+    let run = overriding_app().run_ruby(
+        r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+[
+  "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>",
+  "<div class=\"loop\"><input type=\"email\" value=\"Body\" name=\"article[body]\" id=\"article_body\" /></div>",
+  "<div class=\"loop\"><textarea name=\"article[body]\" id=\"article_body\">\nBody</textarea></div>",
+].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
+puts "override passed"
+"##,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("override passed"), "{}", run.stdout);
+}
+
+#[test]
+fn a_custom_builders_override_of_a_stock_field_is_reported_off_the_ruby_family() {
+    let (_, errors) = overriding_app().emit(roundhouse::build_target::BuildTarget::Spinel);
+    for field in ["form.text_field", "form.email_field", "form.text_area"] {
+        assert!(errors.iter().any(|e| e.contains("custom form builder method") && e.contains(field)), "{field}: {errors:#?}");
+    }
+    assert!(!errors.iter().any(|e| e.contains("form.hidden_field")), "{errors:#?}");
+}
+
+/// maybe's `StyledFormBuilder` shape: a `class_attribute` whose default is `field_helpers` less some, and a
+/// `class_eval` loop over it, which defines the stock fields again, beside `select`/`collection_select` overrides
+/// calling `super`. Expected strings are Rails 8.1.4's for the same builder (Rails 8's `text_area` is an alias of the
+/// base's `textarea`, so the override of `textarea` leaves it as it was).
+const FIELD_HELPERS_BUILDER: &str = r##"class StyledProbeBuilder < ActionView::Helpers::FormBuilder
+  class_attribute :text_field_helpers, default: field_helpers - [:label, :checkbox, :radio_button, :fields_for, :fields, :hidden_field, :file_field]
+
+  text_field_helpers.each do |selector|
+    class_eval <<-RUBY_EVAL, __FILE__, __LINE__ + 1
+      def #{selector}(method, options = {})
+        @template.content_tag(:div, super(method, options), class: "field")
+      end
+    RUBY_EVAL
+  end
+
+  def select(method, choices, options = {}, html_options = {})
+    @template.content_tag(:div, super(method, choices, options, html_options.merge(class: "sel")), class: "field")
+  end
+
+  def collection_select(method, collection, value_method, text_method, options = {}, html_options = {})
+    @template.content_tag(:div, super(method, collection, value_method, text_method, options, html_options), class: "field")
+  end
+end
+"##;
+
+const FIELD_HELPERS_FORM: &str = "<%= form_with(model: article, builder: StyledProbeBuilder) do |form| %>\n<%= form.text_field :title %>\n<%= form.textarea :body %>\n<%= form.text_area :body %>\n<%= form.select :title, [[\"Hi\", \"Hi\"], [\"Other\", \"o\"]], { include_blank: true } %>\n<%= form.collection_select :title, Article.order(:id), :title, :title, { prompt: true } %>\n<%= form.collection_select :body, Article.order(:id), :id, :title, { prompt: true } %>\n<% end %>\n";
+
+#[test]
+fn a_field_helpers_loop_builder_renders_as_rails_on_ruby() {
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/styled_probe_builder.rb", FIELD_HELPERS_BUILDER)
+        .write("app/views/articles/_form.html.erb", FIELD_HELPERS_FORM)
+        .run_ruby(
+            r##"Article.create!(title: "Hi", body: "A body long enough for validation.")
+Article.create!(title: "Other", body: "A body long enough for validation.")
+io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+[
+  "<div class=\"field\"><input type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>",
+  "<div class=\"field\"><textarea name=\"article[body]\" id=\"article_body\">\nBody</textarea></div>\n<textarea name=\"article[body]\" id=\"article_body\">\nBody</textarea>",
+  "<div class=\"field\"><select class=\"sel\" name=\"article[title]\" id=\"article_title\"><option value=\"\" label=\" \"></option>\n<option selected=\"selected\" value=\"Hi\">Hi</option>\n<option value=\"o\">Other</option></select></div>",
+  "<div class=\"field\"><select name=\"article[title]\" id=\"article_title\"><option selected=\"selected\" value=\"Hi\">Hi</option>\n<option value=\"Other\">Other</option></select></div>",
+  "<div class=\"field\"><select name=\"article[body]\" id=\"article_body\"><option value=\"1\">Hi</option>\n<option value=\"2\">Other</option></select></div>",
+].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
+puts "field helpers passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("field helpers passed"), "{}", run.stdout);
+}

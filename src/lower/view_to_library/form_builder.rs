@@ -1316,6 +1316,8 @@ fn emit_fields_for(
 
     let mut inner = ctx.with_locals([nested_param_str.clone()]);
     inner.form_records.push(FormBuilderBinding {
+        // Not the parent builder's overrides: the nested builder is no object here, so a call on it could reach none.
+        overridden: Default::default(),
         form_param: nested_param_str.clone(),
         model_name: format!("{}[{}]", binding.model_name, nested.as_str()),
         model_class: if positional.get(1).is_some() {

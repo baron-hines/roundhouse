@@ -4602,8 +4602,9 @@ fn walk_decl_body_with_visibility<'pr>(
 fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), String)>) {
     let mut kept = Vec::with_capacity(statements.len());
     let mut evaled = Vec::new();
+    let lists = class_attribute_lists(&statements);
     for s in statements {
-        match class_eval_loop_sources(&s) {
+        match class_eval_loop_sources(&s, &lists) {
             Some(sources) => {
                 let at = (s.location().start_offset() as u32, s.location().end_offset() as u32);
                 evaled.extend(sources.into_iter().map(|source| (at, source)));
@@ -4614,16 +4615,20 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
     (kept, evaled)
 }
 
-/// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
-fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
-    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<String>> {
-        let call = s.as_call_node()?;
-        if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
-            return None;
-        }
-        let elements: Vec<String> = call
-            .receiver()?
-            .as_array_node()?
+/// Rails 8.1's `FormBuilder.field_helpers`, the list the runtime's builder carries (Rails 7.2 spelled
+/// `text_area`/`check_box`, which 8.x keeps as aliases of `textarea`/`checkbox`).
+pub(crate) const FORM_BUILDER_FIELD_HELPERS: [&str; 24] = [
+    "fields_for", "fields", "label", "text_field", "password_field", "hidden_field", "file_field", "textarea", "checkbox",
+    "radio_button", "color_field", "search_field", "telephone_field", "phone_field", "date_field", "time_field",
+    "datetime_field", "datetime_local_field", "month_field", "week_field", "url_field", "email_field", "number_field",
+    "range_field",
+];
+
+/// The literal list a node names: an Array of Strings or Symbols, a FormBuilder's `field_helpers`, or one list less
+/// another (`field_helpers - [:label]`, maybe's `StyledFormBuilder`).
+fn static_name_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    if let Some(array) = node.as_array_node() {
+        return array
             .elements()
             .iter()
             .map(|e| {
@@ -4631,7 +4636,81 @@ fn class_eval_loop_sources(s: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
                     .map(|n| String::from_utf8_lossy(n.unescaped()).into_owned())
                     .or_else(|| e.as_symbol_node().map(|n| String::from_utf8_lossy(n.unescaped()).into_owned()))
             })
-            .collect::<Option<_>>()?;
+            .collect();
+    }
+    let call = node.as_call_node()?;
+    let name = constant_id_str(&call.name());
+    if name == "field_helpers" && call.receiver().is_none() && call.arguments().is_none() && call.block().is_none() {
+        return Some(FORM_BUILDER_FIELD_HELPERS.iter().map(|s| s.to_string()).collect());
+    }
+    if name == "-" {
+        let left = static_name_list(&call.receiver()?)?;
+        let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+        let [right] = args.as_slice() else { return None };
+        let right = static_name_list(right)?;
+        return Some(left.into_iter().filter(|n| !right.contains(n)).collect());
+    }
+    None
+}
+
+/// `class_attribute :text_field_helpers, default: field_helpers - [...]`: the attributes whose default is a literal
+/// list, which a loop over the reader (`text_field_helpers.each`) walks as the body loads.
+// Not an attribute the body writes again or defines a reader for: the loop would then read another list.
+fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::default();
+    let mut redefined: HashSet<String> = HashSet::default();
+    for s in statements {
+        if let Some(def) = s.as_def_node() {
+            redefined.insert(constant_id_str(&def.name()).trim_end_matches('=').to_string());
+            continue;
+        }
+        let Some(call) = s.as_call_node() else { continue };
+        if call.receiver().is_some() {
+            continue;
+        }
+        let Some(args) = call.arguments() else { continue };
+        let args: Vec<_> = args.arguments().iter().collect();
+        if constant_id_str(&call.name()) != "class_attribute" {
+            for a in &args {
+                if let Some(name) = a.as_symbol_node() {
+                    redefined.insert(String::from_utf8_lossy(name.unescaped()).into_owned());
+                }
+            }
+            continue;
+        }
+        let [name, options] = args.as_slice() else { continue };
+        let Some(name) = name.as_symbol_node() else { continue };
+        let name = String::from_utf8_lossy(name.unescaped()).into_owned();
+        let Some(options) = options.as_keyword_hash_node() else { continue };
+        let default = options.elements().iter().find_map(|e| {
+            let pair = e.as_assoc_node()?;
+            let key = pair.key().as_symbol_node()?;
+            (key.unescaped() == b"default").then(|| pair.value())
+        });
+        if let Some(list) = default.as_ref().and_then(static_name_list) {
+            if out.insert(name.clone(), list).is_some() {
+                redefined.insert(name);
+            }
+        }
+    }
+    out.retain(|name, _| !redefined.contains(name));
+    out
+}
+
+/// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
+fn class_eval_loop_sources(s: &ruby_prism::Node<'_>, lists: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<String>> {
+        let call = s.as_call_node()?;
+        if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
+            return None;
+        }
+        let receiver = call.receiver()?;
+        let elements: Vec<String> = match receiver.as_call_node() {
+            Some(reader) if reader.receiver().is_none() && reader.arguments().is_none() && reader.block().is_none() => {
+                lists.get(&*constant_id_str(&reader.name()))?.clone()
+            }
+            _ => receiver.as_array_node().and_then(|_| static_name_list(&receiver))?,
+        };
         let block = call.block()?.as_block_node()?;
         let params: Vec<_> = block.parameters()?.as_block_parameters_node()?.parameters()?.requireds().iter().collect();
         let [param] = params.as_slice() else { return None };
@@ -6084,11 +6163,13 @@ pub fn ingest_concern_class_method_spans(
 ) -> (Vec<ConcernClassMethodSpans>, HashSet<ClassId>) {
     fn defs_in(body: Option<ruby_prism::Node<'_>>, file: &str, out: &mut Vec<Span>) {
         let Some(body) = body else { return };
-        for stmt in flatten_statements(body) {
+        let statements = flatten_statements(body);
+        let lists = class_attribute_lists(&statements);
+        for stmt in statements {
             // A `define_method` loop's methods carry its name argument's span.
             out.extend(super::define_method_loop::name_spans(&stmt, file));
             // A `class_eval` string loop's, the loop's (`unroll_class_eval_loops`).
-            if class_eval_loop_sources(&stmt).is_some() {
+            if class_eval_loop_sources(&stmt, &lists).is_some() {
                 out.push(Span { file: super::sources::file_id(file), start: stmt.location().start_offset() as u32, end: stmt.location().end_offset() as u32 });
             }
             if let Some(def) = visibility::definition(&stmt) {

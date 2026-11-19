@@ -366,8 +366,16 @@ fn emit_form_inline(
     //    to `<label>...`/`<input>...` HTML.
     // A builder of another class (`builder: MoneyFormBuilder`) whose own methods the body calls: Rails' object, at
     // request time, for those calls (`form.money_field :title`), as the lowering expands only the stock fields.
+    let overridden = custom_builder(args)
+        .and_then(|b| match &*b.node {
+            ExprNode::Const { path } => {
+                ctx.builder_overrides.get(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")).cloned()
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
     if let Some(builder) = custom_builder(args)
-        && calls_unexpanded(body, form_param_str)
+        && calls_unexpanded(body, form_param_str, &overridden)
     {
         // Rails' object name is the model's `param_key`, a String.
         let object_name = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: comps.model_name.clone() } });
@@ -402,6 +410,7 @@ fn emit_form_inline(
         form_method_var,
         id_prefix: comps.id_prefix.clone(),
         recordless: !comps.model_name.is_empty() && matches!(&*comps.model.node, ExprNode::Lit { value: Literal::Nil }),
+        overridden,
     });
     // `f.object` is the one FormBuilder method used in EXPRESSION
     // position (`errors_for f.object`) — substitute the record local
@@ -1522,21 +1531,21 @@ fn custom_builder(args: &[Expr]) -> Option<Expr> {
 
 /// Whether the body calls a method of the builder the form lowering does not expand, or hands the builder to a call
 /// (`render_money(form)`), which may call one.
-fn calls_unexpanded(body: &Expr, form_param: &str) -> bool {
+fn calls_unexpanded(body: &Expr, form_param: &str, overridden: &crate::det::HashSet<String>) -> bool {
     let mut found = false;
-    fn walk(e: &Expr, form_param: &str, found: &mut bool) {
+    fn walk(e: &Expr, form_param: &str, overridden: &crate::det::HashSet<String>, found: &mut bool) {
         let is_form = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == form_param);
         if let ExprNode::Send { recv, method, args, .. } = &*e.node
             && (recv.as_ref().is_some_and(|r| is_form(r))
                 && method.as_str() != "object"
-                && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+                && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden.contains(method.as_str()))
                 || args.iter().any(is_form))
         {
             *found = true;
         }
-        e.node.for_each_child(&mut |c| walk(c, form_param, found));
+        e.node.for_each_child(&mut |c| walk(c, form_param, overridden, found));
     }
-    walk(body, form_param, &mut found);
+    walk(body, form_param, overridden, &mut found);
     found
 }
 
@@ -1749,6 +1758,7 @@ mod tests {
             i18n: Default::default(),
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
+            builder_overrides: Default::default(),
             form_with_entry: true,
             model_param_keys: Default::default(),
             stylesheets: Vec::new(),
