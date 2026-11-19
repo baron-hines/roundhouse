@@ -190,8 +190,10 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                 let mut inner = scope.to_vec();
                 inner.push((param.clone(), class));
                 nested(body, overrides, &inner, out);
-                if let Some(r) = match &*expr.node { ExprNode::Send { recv, .. } => recv.as_ref(), _ => None } {
-                    nested(r, overrides, scope, out);
+                if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                    for e in recv.iter().chain(args.iter()) {
+                        nested(e, overrides, scope, out);
+                    }
                 }
                 return;
             }

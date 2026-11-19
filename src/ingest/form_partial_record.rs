@@ -45,6 +45,12 @@ fn simple_ref(e: &Expr) -> Option<String> {
 }
 
 fn renders(e: &mut Expr, param: &Symbol, model: Option<&str>) {
+    // Not inside a block that binds the same name: its `f` is not the builder.
+    if let ExprNode::Lambda { params, .. } = &*e.node
+        && params.contains(param)
+    {
+        return;
+    }
     e.node.for_each_child_mut(&mut |c| renders(c, param, model));
     let ExprNode::Send { recv: None, method, args, .. } = &mut *e.node else { return };
     if method.as_str() != "render" {

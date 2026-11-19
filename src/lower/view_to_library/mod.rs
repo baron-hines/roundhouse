@@ -2613,9 +2613,19 @@ pub(crate) fn partial_form_bindings(
                                     };
                                     match key.as_str() {
                                         "model" => {
+                                            // Rails' prefix is the model's `param_key`, not the reference's name (`@edit_user` → `user`).
+                                            if scope.model_name.is_none()
+                                                && let Some(crate::ty::Ty::Class { id, .. }) = v.ty.as_ref().map(|t| t.peel_nilable())
+                                            {
+                                                scope.model_name = Some(crate::naming::snake_case(&id.0.as_str().replace("::", "")));
+                                            }
                                             if let Some(r) = simple_ref(v) {
-                                                scope.model_name = Some(r.trim_start_matches('@').to_string());
                                                 record_refs.insert(r);
+                                            }
+                                        }
+                                        "scope" => {
+                                            if let Some(s) = self::form_with::str_or_sym_literal(v) {
+                                                scope.model_name = Some(s);
                                             }
                                         }
                                         "builder" => {

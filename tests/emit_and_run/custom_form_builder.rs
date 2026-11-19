@@ -265,3 +265,22 @@ fn an_override_two_fields_for_deep_is_reported_off_the_ruby_family() {
         .emit(roundhouse::build_target::BuildTarget::Spinel);
     assert!(errors.iter().any(|e| e.contains("custom form builder method") && e.contains("text_field")), "{errors:#?}");
 }
+
+/// The partial's prefix is the record's `param_key`, not the local holding it (`edited` → `article[title]`), and a
+/// block that rebinds the builder's name inside the form hands its own value, not the builder.
+#[test]
+fn a_partial_handed_the_builder_alone_names_fields_by_the_model() {
+    let form = "<% edited = article %>\n<%= form_with(model: edited) do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% [\"x\"].each do |form| %><%= render \"articles/row\", value: form %><% end %>\n<% end %>\n";
+    let run = partial_app(form)
+        .write("app/views/articles/_row.html.erb", "<p><%= value %></p>\n")
+        .run_ruby(&format!(
+            r##"{ATTRS}io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+raise "title #{{attrs(io, "article[title]")}}" unless attrs(io, "article[title]")["id"] == "article_title"
+raise "row:\n#{{io}}" unless io.include?("<p>x</p>")
+puts "named passed"
+"##
+        ));
+    run.assert_passes();
+    assert!(run.stdout.contains("named passed"), "{}", run.stdout);
+}
