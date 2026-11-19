@@ -416,13 +416,26 @@ fn apply_calls(
     for call in calls {
         for module in call.iter().rev() {
             let mut chain = vec![module.clone()];
-            chain.extend(expansion(module.trim_start_matches('?'), lookup, cache, active));
+            match module.strip_prefix('?') {
+                // Not a declaration's ancestors as definite: an unresolved name may be any declaration of it, and one
+                // with includes of its own leaves the order unknown.
+                Some(bare) => {
+                    let nested = format!("::{bare}");
+                    unsure |= lookup.mixins.iter().any(|(name, calls)| (name == bare || name.ends_with(&nested)) && !calls.is_empty());
+                }
+                None => chain.extend(expansion(module, lookup, cache, active)),
+            }
+            // The marker an expansion carries is its own uncertainty, kept apart from the duplicate handling below.
+            if chain.iter().any(|m| m == UNSURE) {
+                unsure = true;
+                chain.retain(|m| m != UNSURE);
+            }
             let mut at = 0;
             for m in chain {
                 // Not backwards past an earlier match: Ruby only moves the insertion point forward.
                 if let Some(i) = list.iter().position(|l| same(l, &m, &mut unsure)) {
                     at = at.max(i + 1);
-                } else if !inherited.iter().any(|l| same(l, &m, &mut unsure)) {
+                } else if !inherited.iter().filter(|l| l.as_str() != UNSURE).any(|l| same(l, &m, &mut unsure)) {
                     list.insert(at, m);
                     at += 1;
                 }
@@ -632,6 +645,32 @@ mod tests {
         let mixins: crate::det::HashMap<String, Vec<Vec<String>>> = [("Base".to_string(), calls(&[&["?Common"]]))].into_iter().collect();
         let declared = ["Base", "Base::Hue", "Common", "Common::Hue", "N::Common"].into_iter().map(String::from).collect();
         let own = calls(&[&["Common"]]);
+        assert_eq!(ancestor_constant("Child", "Hue", &own, &lookup(&parents, &mixins, &declared)), None);
+    }
+
+    #[test]
+    fn an_unresolved_name_does_not_lend_one_declarations_ancestors() {
+        // `include ?A`, where top-level `A` includes Tail and `N::A` includes Other: which one supplies `Hue` is unknown.
+        let parents = crate::det::HashMap::default();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> =
+            [("A".to_string(), calls(&[&["Tail"]])), ("N::A".to_string(), calls(&[&["Other"]]))].into_iter().collect();
+        let declared = ["A", "N::A", "Tail", "Tail::Hue", "Other", "Other::Hue"].into_iter().map(String::from).collect();
+        let own = calls(&[&["?A"]]);
+        assert_eq!(ancestor_constant("C", "Hue", &own, &lookup(&parents, &mixins, &declared)), None);
+    }
+
+    #[test]
+    fn an_expansions_uncertainty_survives_an_inherited_one() {
+        // Base: A, ?A (unsure); Child < Base includes Outer: B, X, ?B (unsure on its own).
+        let parents = [("Child".to_string(), "Base".to_string())].into_iter().collect();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> = [
+            ("Base".to_string(), calls(&[&["A"], &["?A"]])),
+            ("Outer".to_string(), calls(&[&["B"], &["X"], &["?B"]])),
+        ]
+        .into_iter()
+        .collect();
+        let declared = ["Base", "A", "B", "X", "X::Hue", "N::B", "N::B::Hue", "Outer"].into_iter().map(String::from).collect();
+        let own = calls(&[&["Outer"]]);
         assert_eq!(ancestor_constant("Child", "Hue", &own, &lookup(&parents, &mixins, &declared)), None);
     }
 }
