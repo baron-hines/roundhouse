@@ -16324,6 +16324,8 @@ mod pagy9;
 mod yield_partial_render;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
+#[path = "emit_and_run/class_body_unknown_call.rs"]
+mod class_body_unknown_call;
 #[path = "emit_and_run/string_to_d.rs"]
 mod string_to_d;
 
