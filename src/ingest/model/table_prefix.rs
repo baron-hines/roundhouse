@@ -177,26 +177,22 @@ pub fn ingest_class_table_prefixes(source: &[u8], file: &str) -> TablePrefixes {
 /// The prefix each abstract base passes down: its own, else its parent's.
 /// `pairs` are the pre-pass's `(abstract class, parent)` pairs; a bare
 /// parent is found the way Ruby finds it, the child's enclosing scopes first.
-pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)]) -> TablePrefixes {
-    let parents: crate::det::HashMap<&str, &str> = pairs
+pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[crate::ingest::library_class::BasePair]) -> TablePrefixes {
+    let parents: crate::det::HashMap<&str, (&str, &[String])> = pairs
         .iter()
-        .map(|(c, p)| (c.as_str(), p.as_str()))
+        .map(|(c, p, enclosing)| (c.as_str(), (p.as_str(), enclosing.as_slice())))
         .collect();
     let known = |name: &str| own.contains_key(name) || parents.contains_key(name);
-    let resolve = |child: &str, parent: &str| -> String {
-        let mut segments: Vec<&str> = child.split("::").collect();
-        segments.pop();
-        while !segments.is_empty() {
-            let candidate = format!("{}::{parent}", segments.join("::"));
-            if known(&candidate) {
-                return candidate;
-            }
-            segments.pop();
-        }
-        parent.to_string()
+    // A bare parent through the modules `record` stored for the child.
+    let resolve = |parent: &str, enclosing: &[String]| -> String {
+        enclosing
+            .iter()
+            .map(|outer| format!("{outer}::{parent}"))
+            .find(|candidate| known(candidate))
+            .unwrap_or_else(|| parent.to_string())
     };
     let mut out = TablePrefixes::default();
-    for (child, _) in pairs {
+    for (child, _, _) in pairs {
         let mut at = child.clone();
         // A cycle guard: the walk follows `parent` links, so a cyclic
         // hierarchy must end somewhere.
@@ -205,10 +201,10 @@ pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)])
                 out.insert(child.clone(), prefix.clone());
                 break;
             }
-            let Some(parent) = parents.get(at.as_str()) else {
+            let Some((parent, enclosing)) = parents.get(at.as_str()) else {
                 break;
             };
-            at = resolve(&at, parent);
+            at = resolve(parent, enclosing);
         }
     }
     out

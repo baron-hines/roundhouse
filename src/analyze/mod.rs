@@ -4550,8 +4550,17 @@ impl Analyzer {
             };
 
             if retype {
+                // Class side: an initializer runs in the class body, where `self` is the class (`class_attribute
+                // :x, default: field_helpers` calls `FormBuilder.field_helpers`), and an unknown method there raises
+                // when the class loads.
+                // Not the sole includer a module's methods are typed against: its own body is the module's.
+                let body_ctx = Ctx {
+                    class_side: true,
+                    self_ty: Some(Ty::Class { id: lc.name.clone(), args: vec![].into() }),
+                    ..class_ctx.clone()
+                };
                 for initializer in &mut lc.class_ivar_initializers {
-                    self.body_typer().analyze_expr(initializer, &class_ctx);
+                    self.body_typer().analyze_expr(initializer, &body_ctx);
                 }
                 for (_, value) in &mut lc.constants {
                     if self.data_factories.contains_key(&value.span) || self.class_factories.contains_key(&value.span) {
@@ -5242,6 +5251,11 @@ impl Analyzer {
             let mut vars: HashMap<Symbol, Ty> = HashMap::default();
             for init in &lc.class_ivar_initializers {
                 writes(init, &mut vars);
+            }
+            // Not `SelfInstance`: an initializer's `new` builds the declaring class, read the same from a subclass.
+            let declaring = Ty::Class { id: lc.name.clone(), args: vec![].into() };
+            for ty in vars.values_mut() {
+                *ty = ty.subst_self(&declaring);
             }
             for method in lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class) {
                 writes(&method.body, &mut vars);
