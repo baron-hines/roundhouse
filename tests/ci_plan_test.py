@@ -952,6 +952,22 @@ class Routing(unittest.TestCase):
         # This is a toolchain test, not a framework-suite binary.
         self.assertNotIn("data_record_siblings", ci.SPINEL_TESTS)
 
+    def test_role_and_shard_routes_select_the_native_toolchain_lane(self):
+        for path in [
+            "src/database.rs",
+            "src/ingest/database_ownership.rs",
+            "src/ingest/database_yml.rs",
+            "src/ingest/expr.rs",
+            "runtime/spinel/db.rb",
+            "tests/database_routes.rs",
+            "tests/support/database_routes.rs",
+            "tests/spinel_toolchain/database_routes.rs",
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn("unit", plan["jobs"])
+                self.assertIn("spinel-toolchain", plan["jobs"])
+
     def test_after_initialize_boot_order_selects_the_native_toolchain_lane(self):
         for path in [
             "src/ingest/after_initialize.rs",
