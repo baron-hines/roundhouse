@@ -400,7 +400,18 @@ fn apply_calls(
     cache: &mut crate::det::HashMap<String, Vec<String>>,
     active: &mut Vec<String>,
 ) -> Vec<String> {
-    let same = |a: &str, b: &str| a.trim_start_matches('?') == b.trim_start_matches('?');
+    // The same module only when both spellings are resolved, or both the same unresolved one: a `?Common` may be a
+    // `N::Common`, which leaves the order unknown.
+    let same = |a: &str, b: &str, unsure: &mut bool| {
+        if a.trim_start_matches('?') != b.trim_start_matches('?') {
+            return false;
+        }
+        if a.starts_with('?') != b.starts_with('?') {
+            *unsure = true;
+        }
+        true
+    };
+    let mut unsure = false;
     let mut list: Vec<String> = Vec::new();
     for call in calls {
         for module in call.iter().rev() {
@@ -408,17 +419,24 @@ fn apply_calls(
             chain.extend(expansion(module.trim_start_matches('?'), lookup, cache, active));
             let mut at = 0;
             for m in chain {
-                if let Some(i) = list.iter().position(|l| same(l, &m)) {
-                    at = i + 1;
-                } else if !inherited.iter().any(|l| same(l, &m)) {
+                // Not backwards past an earlier match: Ruby only moves the insertion point forward.
+                if let Some(i) = list.iter().position(|l| same(l, &m, &mut unsure)) {
+                    at = at.max(i + 1);
+                } else if !inherited.iter().any(|l| same(l, &m, &mut unsure)) {
                     list.insert(at, m);
                     at += 1;
                 }
             }
         }
     }
+    if unsure {
+        list.insert(0, UNSURE.to_string());
+    }
     list
 }
+
+/// Marks a class's module list whose order a resolved and an unresolved spelling of one name left unknown.
+const UNSURE: &str = "?";
 
 enum Search {
     Found(String),
@@ -430,6 +448,9 @@ enum Search {
 
 fn in_modules(modules: &[String], written: &str, lookup: &Lookup) -> Search {
     for module in modules {
+        if module == UNSURE {
+            return Search::Unknown;
+        }
         let (bare, unresolved) = match module.strip_prefix('?') {
             Some(b) => (b, true),
             None => (module.as_str(), false),
@@ -592,5 +613,25 @@ mod tests {
         let declared = ["Base", "Base::Hue", "Common", "Common::Hue", "Outer"].into_iter().map(String::from).collect();
         let own = calls(&[&["Outer"]]);
         assert_eq!(ancestor_constant("Mid", "Hue", &own, &lookup(&parents, &mixins, &declared)).as_deref(), Some("Base::Hue"));
+    }
+
+    #[test]
+    fn the_insertion_point_never_moves_back() {
+        // `include A; include B; include Outer`, Outer including A, B, Tail: Ruby's order is Outer, B, A, Tail.
+        let parents = crate::det::HashMap::default();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> = [("Outer".to_string(), calls(&[&["A", "B", "Tail"]]))].into_iter().collect();
+        let declared = ["A", "A::Hue", "B", "Outer", "Tail", "Tail::Hue"].into_iter().map(String::from).collect();
+        let own = calls(&[&["A"], &["B"], &["Outer"]]);
+        assert_eq!(ancestor_constant("C", "Hue", &own, &lookup(&parents, &mixins, &declared)).as_deref(), Some("A::Hue"));
+    }
+
+    #[test]
+    fn an_unresolved_inherited_spelling_is_not_the_resolved_module() {
+        // `Child < Base`, Base including an unresolved `Common` (maybe `N::Common`), Child including resolved `Common`.
+        let parents = [("Child".to_string(), "Base".to_string())].into_iter().collect();
+        let mixins: crate::det::HashMap<String, Vec<Vec<String>>> = [("Base".to_string(), calls(&[&["?Common"]]))].into_iter().collect();
+        let declared = ["Base", "Base::Hue", "Common", "Common::Hue", "N::Common"].into_iter().map(String::from).collect();
+        let own = calls(&[&["Common"]]);
+        assert_eq!(ancestor_constant("Child", "Hue", &own, &lookup(&parents, &mixins, &declared)), None);
     }
 }
