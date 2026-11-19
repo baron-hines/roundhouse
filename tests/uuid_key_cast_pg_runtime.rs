@@ -17,6 +17,21 @@ const STRUCTURE: &str = r#"CREATE TABLE widgets (
     name character varying,
     owner_id uuid
 );
+
+CREATE TABLE kits (
+    id uuid DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY,
+    name character varying
+);
+
+CREATE TABLE boxes (
+    id character varying NOT NULL PRIMARY KEY,
+    name character varying
+);
+
+CREATE TABLE parts (
+    id character varying NOT NULL PRIMARY KEY,
+    name character varying
+);
 "#;
 
 const DATABASE_YML: &str = r#"default: &default
@@ -35,6 +50,15 @@ end
 
 const WIDGET: &str = "class Widget < ApplicationRecord\nend\n";
 
+/// An abstract parent whose conventional table exists and has a uuid
+/// key, and a child on a table of its own with a string key. Rails
+/// reads the child's columns from `boxes`.
+const KIT: &str = "class Kit < ApplicationRecord\n  self.abstract_class = true\nend\n";
+const BOX: &str = "class Box < Kit\nend\n";
+
+/// A string-keyed record whose id is no uuid.
+const PART: &str = "class Part < ApplicationRecord\nend\n";
+
 const PROBE: &str = r##"class UuidProbe
   REAL = "11111111-1111-4111-8111-111111111111"
   OWNER = "22222222-2222-4222-8222-222222222222"
@@ -48,6 +72,8 @@ const PROBE: &str = r##"class UuidProbe
   def self.lines
     Widget.create!(id: REAL, name: "sprocket", owner_id: OWNER)
     Widget.create!(id: "33333333-3333-4333-8333-333333333333", name: "cog")
+    Box.create!(id: "legacy-1", name: "old")
+    part = Part.create!(id: "not-a-uuid", name: "bolt")
     [
       "find_by blank: #{try { Widget.find_by(id: "") }}",
       "find_by junk: #{try { Widget.find_by(id: "not-a-uuid") }}",
@@ -76,13 +102,17 @@ const PROBE: &str = r##"class UuidProbe
       "relation find blank: #{try { Widget.where(name: "sprocket").find("") }}",
       "relation find junk: #{try { Widget.all.find("not-a-uuid") }}",
       "relation find bare hex: #{try { Widget.where(name: "sprocket").find("11111111111141118111111111111111").name }}",
+      "abstract parent child where: #{try { Box.where(id: "legacy-1").pluck(:name) }}",
+      "abstract parent child find_by: #{try { Box.find_by(id: "legacy-1")&.name }}",
+      "record no uuid: #{try { Widget.where(owner_id: part).count }}",
+      "record uuid: #{try { Widget.where(id: Widget.find(REAL)).pluck(:name) }}",
     ]
   end
 end
 "##;
 
 /// Native Rails 8.1.4's answers on PostgreSQL 18.
-const EXPECTED: [&str; 27] = [
+const EXPECTED: [&str; 31] = [
     "find_by blank: nil",
     "find_by junk: nil",
     "where blank count: 0",
@@ -110,17 +140,31 @@ const EXPECTED: [&str; 27] = [
     "relation find blank: ActiveRecord::RecordNotFound",
     "relation find junk: ActiveRecord::RecordNotFound",
     r#"relation find bare hex: "sprocket""#,
+    r#"abstract parent child where: ["old"]"#,
+    r#"abstract parent child find_by: "old""#,
+    "record no uuid: 0",
+    r#"record uuid: ["sprocket"]"#,
 ];
 
-const LOADS: [&str; 3] = ["app/models/application_record", "app/models/widget", "app/models/uuid_probe"];
+const LOADS: [&str; 6] = [
+    "app/models/application_record",
+    "app/models/widget",
+    "app/models/kit",
+    "app/models/box",
+    "app/models/part",
+    "app/models/uuid_probe",
+];
 
-const FILES: [(&str, &str); 7] = [
+const FILES: [(&str, &str); 10] = [
     ("roundhouse.yml", ""),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ("db/structure.sql", STRUCTURE),
     ("app/models/application_record.rb", APPLICATION_RECORD),
     ("app/models/widget.rb", WIDGET),
+    ("app/models/kit.rb", KIT),
+    ("app/models/box.rb", BOX),
+    ("app/models/part.rb", PART),
     ("app/models/uuid_probe.rb", PROBE),
 ];
 
@@ -166,5 +210,12 @@ fn the_emitted_model_casts_its_uuid_columns() {
         model.matches("ActiveRecord::UuidCast.cast_text(id)").count(),
         2,
         "find and exists? cast the key:\n{model}"
+    );
+    // Its own empty list, or it would inherit Kit's and cast its string
+    // key as a uuid.
+    let child = std::fs::read_to_string(emitted.join("app/models/box.rb")).expect("emitted child");
+    assert!(
+        child.contains("def self.schema_uuid_query_columns\n    []\n"),
+        "a child on a table without uuid columns lists none:\n{child}"
     );
 }
