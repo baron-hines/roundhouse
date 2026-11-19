@@ -206,3 +206,62 @@ puts "rails 7 passed"
     run.assert_passes();
     assert!(run.stdout.contains("rails 7 passed"), "{}", run.stdout);
 }
+
+/// A partial handed the builder alone (`render "articles/fields", f: form`) reads the form's record through it, and a
+/// custom builder's override runs there as in the form: Rails 8.1.4's markup, compared as attribute sets where the
+/// stock field is written inline (attribute order is not markup, `docs/pipeline/verification.md`).
+const ATTRS: &str = r##"def attrs(html, name)
+  tag = html[/<input [^>]*name="#{Regexp.escape(name)}"[^>]*>/] or raise "no input #{name}:\n#{html}"
+  tag.scan(/(\S+?)="([^"]*)"/).to_h
+end
+"##;
+
+fn partial_app(form: &str) -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_form.html.erb", form)
+        .write("app/views/articles/_fields.html.erb", "<%= f.text_field :title %>\n<%= f.text_area :body %>\n")
+}
+
+#[test]
+fn a_partial_handed_the_builder_alone_renders_its_fields() {
+    let run = partial_app("<%= form_with(model: article) do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n").run_ruby(&format!(
+        r##"{ATTRS}io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = {{ "type" => "text", "value" => "Hi", "name" => "article[title]", "id" => "article_title" }}
+raise "title #{{attrs(io, "article[title]")}}" unless attrs(io, "article[title]") == want
+raise "body:\n#{{io}}" unless io.include?("id=\"article_body\">\nBody</textarea>")
+puts "partial passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("partial passed"), "{}", run.stdout);
+}
+
+#[test]
+fn a_partial_of_a_custom_builder_runs_its_overrides() {
+    let run = partial_app("<%= form_with(model: article, builder: ::WrappingFormBuilder) do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n").run_ruby(
+        r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+[
+  "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>",
+  "<div class=\"loop\"><textarea name=\"article[body]\" id=\"article_body\">\nBody</textarea></div>",
+].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
+puts "custom partial passed"
+"##,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("custom partial passed"), "{}", run.stdout);
+}
+
+/// A `fields_for` inside a `fields_for` is the same builder class in Rails, though the analysis types the inner one as
+/// the base: its override is reported off the Ruby family as the outer level's is.
+#[test]
+fn an_override_two_fields_for_deep_is_reported_off_the_ruby_family() {
+    let form = "<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= form.fields_for :meta, article do |a| %>\n<%= a.fields_for :inner, article do |b| %>\n<%= b.text_field :title %>\n<% end %>\n<% end %>\n<% end %>\n";
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_form.html.erb", form)
+        .emit(roundhouse::build_target::BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("custom form builder method") && e.contains("text_field")), "{errors:#?}");
+}

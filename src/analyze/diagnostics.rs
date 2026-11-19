@@ -157,10 +157,52 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             rewritten.iter().find(|o| **o == key).copied()
         })
     }
+    // A `fields_for` block's builder is the outer form's class in Rails, though the analysis types one inside another as
+    // the base: carry the class in, and report an override called on it as the outer level's is.
+    fn nested(expr: &Expr, overrides: &Overrides, scope: &[(Symbol, crate::ident::ClassId)], out: &mut Vec<Diagnostic>) {
+        let class_of = |r: &Expr| -> Option<crate::ident::ClassId> {
+            match &*r.node {
+                ExprNode::Var { name, .. } => scope.iter().rev().find(|(n, _)| n == name).map(|(_, c)| c.clone()),
+                _ => None,
+            }
+            .or_else(|| match &r.ty {
+                Some(Ty::Class { id, .. }) if overrides.contains_key(id.0.as_str()) => Some(id.clone()),
+                _ => None,
+            })
+        };
+        if let ExprNode::Send { recv: Some(r), method, block, .. } = &*expr.node
+            && let Some(class) = class_of(r)
+        {
+            let typed_as_it = matches!(&r.ty, Some(Ty::Class { id, .. }) if *id == class);
+            if !typed_as_it && !expr.span.is_synthetic() && overrides.get(class.0.as_str()).is_some_and(|o| o.contains(method.as_str())) {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    format!("`form.{}` is {}'s own method, which runs on Rails' FormBuilder at request time, carried by the Ruby family's runtime only", method.as_str(), class.0.as_str()),
+                ));
+            }
+            if method.as_str() == "fields_for"
+                && let Some(b) = block
+                && let ExprNode::Lambda { params, body, .. } = &*b.node
+                && let Some(param) = params.first()
+            {
+                let mut inner = scope.to_vec();
+                inner.push((param.clone(), class));
+                nested(body, overrides, &inner, out);
+                if let Some(r) = match &*expr.node { ExprNode::Send { recv, .. } => recv.as_ref(), _ => None } {
+                    nested(r, overrides, scope, out);
+                }
+                return;
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested(c, overrides, scope, out));
+    }
     let mut out = Vec::new();
     let overrides = crate::lower::view::form_builder_overrides(app);
     for view in &app.views {
         visit(app, &overrides, &view.body, &mut out);
+        nested(&view.body, &overrides, &[], &mut out);
     }
     out
 }

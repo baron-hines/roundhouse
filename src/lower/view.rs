@@ -1090,18 +1090,25 @@ pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
 /// The stock fields each app builder (`class StyledFormBuilder < ActionView::Helpers::FormBuilder`) or a builder it
 /// descends from defines again, keyed by the builder's class path: Rails dispatches them to that override.
 pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    // Every declaration of a name is one class: a reopening names no superclass, and its methods are the class's.
+    let decls = |id: &crate::ident::ClassId| -> Vec<&crate::dialect::LibraryClass> {
+        app.library_classes.iter().filter(|l| l.name == *id).collect()
+    };
     let mut out: crate::det::HashMap<String, crate::det::HashSet<String>> = crate::det::HashMap::default();
-    for class in &app.library_classes {
+    let mut names: Vec<&crate::ident::ClassId> = app.library_classes.iter().map(|c| &c.name).collect();
+    names.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    names.dedup();
+    for name in names {
         let mut overrides = crate::det::HashSet::default();
-        let mut current = Some(class);
+        let mut current = Some(name.clone());
         let mut descends = false;
         for _ in 0..32 {
-            let Some(c) = current else { break };
+            let Some(id) = current.take() else { break };
             // The class's own methods and its included modules', nested includes too.
-            let mut owners = vec![c];
-            let mut seen: crate::det::HashSet<&crate::ident::ClassId> = crate::det::HashSet::default();
+            let mut owners: Vec<&crate::dialect::LibraryClass> = decls(&id);
+            let mut seen: crate::det::HashSet<*const crate::dialect::LibraryClass> = crate::det::HashSet::default();
             while let Some(owner) = owners.pop() {
-                if !seen.insert(&owner.name) {
+                if !seen.insert(owner as *const _) {
                     continue;
                 }
                 for m in owner.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
@@ -1109,17 +1116,17 @@ pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, c
                         overrides.insert(m.name.as_str().to_string());
                     }
                 }
-                owners.extend(owner.includes.iter().filter_map(|id| app.library_classes.iter().find(|l| l.name == *id)));
+                owners.extend(owner.includes.iter().flat_map(|inc| decls(inc)));
             }
-            let Some(parent) = &c.parent else { break };
+            let Some(parent) = decls(&id).iter().find_map(|c| c.parent.clone()) else { break };
             if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
                 descends = true;
                 break;
             }
-            current = app.library_classes.iter().find(|p| p.name == *parent);
+            current = Some(parent);
         }
         if descends && !overrides.is_empty() {
-            out.insert(class.name.0.as_str().to_string(), overrides);
+            out.insert(name.0.as_str().to_string(), overrides);
         }
     }
     out

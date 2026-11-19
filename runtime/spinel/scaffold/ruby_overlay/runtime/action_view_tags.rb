@@ -586,7 +586,8 @@ module ActionView
         private
 
         def grouped_choices?
-          return false if @choices.blank?
+          # Not `first` on a String (pre-rendered options): ActiveSupport's `String#first` is not in this overlay.
+          return false if @choices.blank? || @choices.is_a?(String)
           first_choice = @choices.first
           return false unless first_choice.is_a?(Enumerable)
           first_choice.to_a[1].is_a?(Array)

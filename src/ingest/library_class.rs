@@ -4679,8 +4679,14 @@ fn static_name_list(node: &ruby_prism::Node<'_>, framework_helpers: bool) -> Opt
 fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String, Vec<String>> {
     let mut declared: HashMap<String, Option<Vec<(bool, String)>>> = HashMap::default();
     let mut redefined: HashSet<String> = HashSet::default();
+    let writes_field_helpers = |s: &ruby_prism::Node<'_>| {
+        s.as_call_node().is_some_and(|c| constant_id_str(&c.name()) == "field_helpers=")
+            || s.as_call_operator_write_node().is_some_and(|w| constant_id_str(&w.read_name()) == "field_helpers")
+            || s.as_call_or_write_node().is_some_and(|w| constant_id_str(&w.read_name()) == "field_helpers")
+    };
     let framework_helpers = !statements.iter().any(|s| {
         s.as_def_node().is_some_and(|d| constant_id_str(&d.name()) == "field_helpers")
+            || writes_field_helpers(s)
             || s.as_call_node().is_some_and(|c| {
                 c.receiver().is_none()
                     && matches!(constant_id_str(&c.name()).as_ref(), "class_attribute" | "cattr_accessor" | "cattr_reader")
@@ -4696,9 +4702,9 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             redefined.insert(attr.to_string());
         }
         if let Some(reader) = call.receiver().and_then(|r| r.as_call_node())
-            && reader.receiver().is_none()
+            && reader.receiver().is_none_or(|r| r.as_self_node().is_some())
             && reader.arguments().is_none()
-            && name != "each"
+            && (name != "each" || reader.receiver().is_some())
         {
             redefined.insert(constant_id_str(&reader.name()).to_string());
         }

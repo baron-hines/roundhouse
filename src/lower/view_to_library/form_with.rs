@@ -369,7 +369,8 @@ fn emit_form_inline(
     let overridden = custom_builder(args)
         .and_then(|b| match &*b.node {
             ExprNode::Const { path } => {
-                ctx.builder_overrides.get(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")).cloned()
+                let key = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                ctx.builder_overrides.get(key.trim_start_matches("::")).cloned()
             }
             _ => None,
         })

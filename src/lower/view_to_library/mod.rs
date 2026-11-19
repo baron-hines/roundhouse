@@ -960,6 +960,10 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             &record_var,
         );
         rewritten = fold_defined_form_local(&rewritten, &binding.form_local);
+        let overridden = binding.builder.as_ref().and_then(|b| ctx.builder_overrides.get(b)).cloned().unwrap_or_default();
+        let builder = (!overridden.is_empty()).then(|| binding.builder.as_ref().map(|b| {
+            Expr::new(Span::synthetic(), ExprNode::Const { path: b.split("::").map(Symbol::from).collect() })
+        })).flatten();
         ctx.form_records.push(FormBuilderBinding {
             form_param: binding.form_local.clone(),
             model_name: binding.model_name.clone(),
@@ -969,9 +973,26 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             form_method_var: form_method_var.clone(),
             id_prefix: binding.id_prefix.clone(),
             recordless: false,
-            overridden: Default::default(),
-            builder: None,
+            overridden: overridden.clone(),
+            builder: builder.clone(),
         });
+        // The form's `builder:` again when it overrides a stock field, for those calls to run on, as `fields_for` does.
+        if let Some(builder) = builder {
+            let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
+            let args = vec![
+                lit_str(binding.model_name.clone()),
+                Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(binding.record_local.as_str()) }),
+                template,
+                Expr::new(Span::synthetic(), ExprNode::Hash { entries: Vec::new(), kwargs: false }),
+            ];
+            prelude.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: LValue::Var { id: VarId(0), name: Symbol::from(binding.form_local.as_str()) },
+                    value: send(Some(builder), "new", args, None, true),
+                },
+            ));
+        }
         let record_ref = Expr::new(
             Span::synthetic(),
             ExprNode::Var { id: VarId(0), name: record_var },
@@ -2399,6 +2420,8 @@ pub(crate) struct PartialFormBinding {
     /// The defining `form_with`'s `namespace:` — a partial's fields
     /// belong to that form, so they carry its id prefix too.
     pub(crate) id_prefix: String,
+    /// The defining form's `builder:` class, which the partial builds again when it overrides a stock field.
+    pub(crate) builder: Option<String>,
 }
 
 pub(crate) fn partial_form_bindings(
@@ -2437,6 +2460,7 @@ pub(crate) fn partial_form_bindings(
         form_param: &str,
         record_refs: &HashSet<String>,
         id_prefix: &str,
+        form: &FormScope,
         stems: &PartialStems,
         out: &mut Vec<(ViewKey, PartialFormBinding)>,
     ) {
@@ -2524,8 +2548,11 @@ pub(crate) fn partial_form_bindings(
                     if let (Some(p), Some(form_local), Some(record_local)) =
                         (partial, form_local, record_local)
                     {
-                        if let Some(key) = partial_name_to_key_from(&p, own_dir, stems) {
-                            let model_name = record_local.clone();
+                        // `ingest::form_partial_record`'s local is no model's name: the form's record names it.
+                        let model_name = if record_local.starts_with("__") { form.model_name.clone() } else { Some(record_local.clone()) };
+                        if let Some(key) = partial_name_to_key_from(&p, own_dir, stems)
+                            && let Some(model_name) = model_name
+                        {
                             out.push((
                                 key,
                                 PartialFormBinding {
@@ -2533,6 +2560,7 @@ pub(crate) fn partial_form_bindings(
                                     record_local,
                                     model_name,
                                     id_prefix: id_prefix.to_string(),
+                                    builder: form.builder.clone(),
                                 },
                             ));
                         }
@@ -2541,8 +2569,14 @@ pub(crate) fn partial_form_bindings(
             }
         }
         e.node.for_each_child(&mut |c| {
-            render_edges(c, own_dir, form_param, record_refs, id_prefix, stems, out)
+            render_edges(c, own_dir, form_param, record_refs, id_prefix, form, stems, out)
         });
+    }
+
+    /// What a form scope hands the partials it renders beside its builder.
+    struct FormScope {
+        model_name: Option<String>,
+        builder: Option<String>,
     }
 
     /// Find `form_with ... do |f|` scopes and collect their render
@@ -2561,6 +2595,7 @@ pub(crate) fn partial_form_bindings(
                     if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
                         let mut record_refs: HashSet<String> = HashSet::default();
                         let mut id_prefix = String::new();
+                        let mut scope = FormScope { model_name: None, builder: None };
                         for arg in args {
                             if let ExprNode::Hash { entries, .. } = &*arg.node {
                                 for (k, v) in entries {
@@ -2572,7 +2607,13 @@ pub(crate) fn partial_form_bindings(
                                     match key.as_str() {
                                         "model" => {
                                             if let Some(r) = simple_ref(v) {
+                                                scope.model_name = Some(r.trim_start_matches('@').to_string());
                                                 record_refs.insert(r);
+                                            }
+                                        }
+                                        "builder" => {
+                                            if let ExprNode::Const { path } = &*v.node {
+                                                scope.builder = Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"));
                                             }
                                         }
                                         "namespace" => {
@@ -2593,6 +2634,7 @@ pub(crate) fn partial_form_bindings(
                             form_param.as_str(),
                             &record_refs,
                             &id_prefix,
+                            &scope,
                             stems,
                             out,
                         );
@@ -2650,6 +2692,7 @@ pub(crate) fn partial_form_bindings(
                     &binding.form_local,
                     &refs,
                     &binding.id_prefix,
+                    &FormScope { model_name: Some(binding.model_name.clone()), builder: binding.builder.clone() },
                     &stems,
                     &mut next,
                 );
