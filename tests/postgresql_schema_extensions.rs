@@ -223,3 +223,15 @@ fn drop_schema_drops_the_extensions_created_in_it() {
     let ddl = folded_database_objects("    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"\n    enable_extension \"cube\"\n    drop_schema \"extensions\"");
     assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "cube""#.to_string()]));
 }
+
+/// A keyword splat hides `force:` from the fold
+/// (`disable_extension "cube", **{ force: :cascade }` is Rails' cascading
+/// drop), so the fold refuses a splat it can't read through.
+#[test]
+fn a_keyword_splat_on_disable_extension_is_refused() {
+    for splat in ["**{ force: :cascade }", "**options"] {
+        let body = format!("    options = {{ force: :cascade }}\n    enable_extension \"cube\"\n    enable_extension \"earthdistance\"\n    disable_extension \"cube\", {splat}");
+        let error = folded_database_objects(&body).expect_err("a keyword splat is refused");
+        assert!(error.contains("disable_extension") && error.contains("**"), "{splat}: {error}");
+    }
+}
