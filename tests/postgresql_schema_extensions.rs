@@ -270,20 +270,22 @@ fn an_extension_schema_is_matched_as_postgresql_reads_it() {
 }
 
 /// An unqualified `enable_extension` installs into the first schema on the
-/// search path, which the fold does not know. On ActiveRecord 8.1.4.1 with
-/// PostgreSQL 18, `enable_extension "pgcrypto"`, `create_schema "public",
-/// force: true`, `create_schema "extensions"`, `enable_extension
-/// "extensions.pgcrypto"` leaves pgcrypto in `extensions` only. So
-/// dropping any schema while an unqualified extension is recorded is
-/// refused.
+/// search path. On ActiveRecord 8.1.4.1 with PostgreSQL 18, with the
+/// default search path, `enable_extension "pgcrypto"`, `create_schema
+/// "public", force: true`, `create_schema "extensions"`, `enable_extension
+/// "extensions.pgcrypto"` leaves pgcrypto in `extensions` only. The fold
+/// reads no search path, so it takes the default's, where that schema is
+/// `public`: dropping `public` while an unqualified extension is recorded
+/// is refused, and dropping another schema still folds.
 #[test]
-fn dropping_a_schema_with_an_unqualified_extension_recorded_is_refused() {
+fn dropping_public_with_an_unqualified_extension_recorded_is_refused() {
     let error = folded_database_objects("    enable_extension \"pgcrypto\"\n    create_schema \"public\", force: true\n    create_schema \"extensions\"\n    enable_extension \"extensions.pgcrypto\"")
-        .expect_err("public may hold the unqualified pgcrypto");
+        .expect_err("public holds the unqualified pgcrypto");
     assert!(error.contains("create_schema \"public\" with force:") && error.contains("pgcrypto"), "{error}");
-    let error = folded_database_objects("    create_schema \"reports\"\n    enable_extension \"pgcrypto\"\n    drop_schema \"reports\"")
-        .expect_err("reports may be first on the search path");
-    assert!(error.contains("drop_schema \"reports\""), "{error}");
+    let error = folded_database_objects("    enable_extension \"pgcrypto\"\n    drop_schema \"public\"").expect_err("public holds the unqualified pgcrypto");
+    assert!(error.contains("drop_schema \"public\""), "{error}");
+    let ddl = folded_database_objects("    create_schema \"reports\"\n    enable_extension \"pgcrypto\"\n    drop_schema \"reports\"");
+    assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#.to_string()]));
 }
 
 /// A name the fold can't read (`disable_extension target`) still runs on
