@@ -15131,7 +15131,7 @@ fn read_remove_hidden_field_autocomplete<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -
         if let Some(i) = line.find("action_view.remove_hidden_field_autocomplete") {
             let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
             // Not a prefix: `= false if ENV[…]` is set only when its condition holds, which is not known here.
-            match rest {
+            match rest.strip_suffix(';').unwrap_or(rest).trim_end() {
                 "true" => on = true,
                 "false" => on = false,
                 _ => {}

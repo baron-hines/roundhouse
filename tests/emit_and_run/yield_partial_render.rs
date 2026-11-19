@@ -15,7 +15,7 @@ fn app() -> emit_and_run::Overlay {
             "app/views/articles/_frame.html.erb",
             "<section><%= title %>:<% [1, 2].each do |i| %>[<%= yield \"slot#{i}\", i %>]<% end %></section>\n",
         )
-        .write("app/views/articles/_snap.html.erb", "<% n = 1 %><u><%= yield n, (n = 2) %>/<%= n %></u>\n")
+        .write("app/views/articles/_snap.html.erb", "<% n = 1 %><% change = -> { n = 3 } %><u><%= yield n, (n = 2) %>/<%= yield n, change.call %>/<%= n %></u>\n")
         .write("app/views/articles/_strict.html.erb", "<%# locals: (heading:) %>\n<aside><%= heading %>|<%= yield %>|</aside>\n")
         .edit(
             "app/views/articles/show.html.erb",
@@ -28,7 +28,7 @@ fn app() -> emit_and_run::Overlay {
 
 const WANT: &[&str] = &[
     "<section>T:[<i>slot1-10-n1-Hello</i>][<i>slot2-20-n1-Hello</i>]</section>",
-    "<u>1/2</u>",
+    "<u>1/2/3</u>",
     "<aside>H|<b>n1</b>|</aside>",
 ];
 

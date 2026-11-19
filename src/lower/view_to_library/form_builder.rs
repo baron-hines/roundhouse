@@ -1421,8 +1421,9 @@ fn emit_nested_collection_fields(
     };
     let opt = |key: &str| opts.iter().find_map(|(k, v)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key).then_some(v));
     let include_id = !opt("include_id").is_some_and(|v| matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } }));
-    // Not the block's own counter: Rails counts on the parent builder per association, across its `fields_for` calls.
-    let counter = format!("rh_{}_{}_index", binding.form_param, nested.as_str());
+    // Not the block's own counter: Rails counts on the parent builder (its depth, as names repeat) per association.
+    let depth = ctx.form_records.iter().rposition(|b| b.form_param == binding.form_param).unwrap_or(ctx.form_records.len());
+    let counter = format!("rh_{}{depth}_{}_index", binding.form_param, nested.as_str());
     let child_index = format!("rh_{param}_child_index");
     let mut out = Vec::new();
     let index_value = match opt("child_index") {

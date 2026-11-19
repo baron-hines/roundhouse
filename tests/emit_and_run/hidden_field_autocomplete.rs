@@ -53,3 +53,13 @@ fn a_conditional_setting_leaves_the_default() {
     run.assert_passes();
     assert!(run.stdout.contains("hidden 5 marked 0"), "{}", run.stdout);
 }
+
+/// A plain setting ended by `;` is set.
+#[test]
+fn a_setting_ended_by_a_semicolon_is_set() {
+    let run = app("8.1")
+        .write("config/initializers/hidden_autocomplete.rb", "Rails.application.config.action_view.remove_hidden_field_autocomplete = false;\n")
+        .run_ruby(SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("hidden 5 marked 5"), "{}", run.stdout);
+}
