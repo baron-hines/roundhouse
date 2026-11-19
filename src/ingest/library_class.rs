@@ -4569,15 +4569,29 @@ fn walk_decl_body_with_visibility<'pr>(
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
         // At the element, and one span per statement of the string: `include A; include B` is two statements
         // and `include A, B` one. The end moves a byte per statement and stays inside the loop.
+        // Where the loop stands: after the includes before it and its earlier elements', ahead of an ordinary
+        // `include` written after it, which Ruby runs later.
+        let spanned = out.include_spans.len() == out.includes.len();
+        let mut at = if spanned {
+            out.include_spans.iter().take_while(|span| span.is_synthetic() || span.start < end).count()
+        } else {
+            out.includes.len()
+        };
         let mut statement = 0;
         for (i, include) in class.includes.iter().enumerate() {
             let parsed = class.include_spans.get(i);
             if i > 0 && (parsed.is_none() || parsed != class.include_spans.get(i - 1)) {
                 statement += 1;
             }
-            out.includes.push(include.clone());
             let end = element_end.saturating_add(statement).min(end.max(element_end));
-            out.include_spans.push(Span { file: super::sources::file_id(file), start: element_start, end });
+            if spanned {
+                out.includes.insert(at, include.clone());
+                out.include_spans.insert(at, Span { file: super::sources::file_id(file), start: element_start, end });
+                at += 1;
+            } else {
+                out.includes.push(include.clone());
+                out.include_spans.push(Span { file: super::sources::file_id(file), start: element_start, end });
+            }
         }
         out.unknown_calls.extend(class.unknown_calls.iter().cloned());
         for mut method in class.methods {

@@ -5892,21 +5892,27 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             controller_parent.entry(controller.name.clone()).or_insert_with(|| parent.clone());
         }
     }
+    // The modules of the superclass's chain, nearest first: each
+    // superclass's own, without what the classes above it already have,
+    // ahead of theirs.
     let inherited_of = |name: &crate::ident::ClassId| {
-        let none = crate::det::HashSet::default();
-        let mut inherited: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
-        let mut walked: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+        let mut parents: Vec<&crate::ident::ClassId> = Vec::new();
         let mut parent = controller_parent.get(name);
         while let Some(p) = parent {
-            if !walked.insert(p.clone()) {
+            if parents.contains(&p) {
                 break;
             }
-            for group in controller_groups.get(p).into_iter() {
-                inherited.extend(ancestry.of_statements(group, &none));
-            }
+            parents.push(p);
             parent = controller_parent.get(p);
         }
-        inherited
+        let mut above: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+        let mut levels: Vec<Vec<crate::ident::ClassId>> = Vec::new();
+        for p in parents.into_iter().rev() {
+            let chain = ancestry.of_statements(controller_groups.get(p).map(Vec::as_slice).unwrap_or(&[]), &above);
+            above.extend(chain.iter().cloned());
+            levels.push(chain);
+        }
+        levels.into_iter().rev().flatten().collect::<Vec<_>>()
     };
 
     // controller -> (spliced method -> the module it came from). Built
@@ -5956,27 +5962,31 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         // Every module the controller reaches, nearest ancestor first:
         // the prepended ones ahead of the class, then the included, then
         // what the superclass's chain has already.
-        let inherited = inherited_of(&controller.name);
+        let inherited_order = inherited_of(&controller.name);
+        let inherited: crate::det::HashSet<crate::ident::ClassId> = inherited_order.iter().cloned().collect();
         let (prepended, included): (Vec<_>, Vec<_>) = statements.iter().partition(|(at, _)| {
             matches!(&controller.body[*at], ControllerBodyItem::Unknown { expr, .. }
                 if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "prepend"))
         });
         let groups = |of: Vec<&(usize, Vec<crate::ident::ClassId>)>| of.into_iter().map(|(_, group)| group.clone()).collect::<Vec<_>>();
         let (prepended, included) = (groups(prepended), groups(included));
-        let mut queue = ancestry.of_statements(&prepended, &inherited);
+        // `prepend` puts a module ahead of the class even when the
+        // superclass's chain has it already; `include` adds nothing then.
+        let none = crate::det::HashSet::default();
+        let mut queue = ancestry.of_statements(&prepended, &none);
         for module in ancestry.of_statements(&included, &inherited) {
             if !queue.contains(&module) {
                 queue.push(module);
             }
         }
         // A module the superclass has is found below everything the child
-        // adds. It still comes last here, not left out: the splice
-        // flattens each controller, and the calls are resolved against
-        // the controller's own methods.
-        let none = crate::det::HashSet::default();
-        for module in ancestry.of_statements(&prepended, &none).into_iter().chain(ancestry.of_statements(&included, &none)) {
-            if !queue.contains(&module) {
-                queue.push(module);
+        // adds, in the superclass's order. It still comes last here, not
+        // left out: the splice flattens each controller, and the calls
+        // are resolved against the controller's own methods.
+        let named: crate::det::HashSet<crate::ident::ClassId> = ancestry.of_statements(&included, &none).into_iter().collect();
+        for module in inherited_order.iter().filter(|m| named.contains(*m)) {
+            if !queue.contains(module) {
+                queue.push(module.clone());
             }
         }
 
