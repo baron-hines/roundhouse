@@ -227,6 +227,7 @@ pub fn ingest_migration_with_generated_expression_dialect(
 const UNSUPPORTED_VERBS: &[&str] = &[
     "create_join_table",
     "drop_join_table",
+    "rename_schema",
     "reversible",
     "revert",
     "up_only",
