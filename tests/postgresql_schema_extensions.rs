@@ -315,6 +315,19 @@ fn a_destructive_call_with_a_name_the_fold_cannot_read_is_refused() {
     assert_eq!(ddl, Ok(vec![r#"CREATE EXTENSION IF NOT EXISTS "citext""#.to_string()]));
 }
 
+/// `rename_schema` is `ALTER SCHEMA ... RENAME TO` on ActiveRecord 8.1.4.1:
+/// after `create_schema "old"; rename_schema "old", "extensions";
+/// enable_extension "extensions.pgcrypto"`, PostgreSQL 18 has `extensions`
+/// holding pgcrypto and no `old`. The fold doesn't model a rename, so the
+/// migration is refused rather than folded into a boot that creates `old`
+/// and then fails on the missing `extensions`.
+#[test]
+fn rename_schema_is_refused() {
+    let error = folded_database_objects("    create_schema \"old\"\n    rename_schema \"old\", \"extensions\"\n    enable_extension \"extensions.pgcrypto\"")
+        .expect_err("a rename the fold doesn't model");
+    assert!(error.contains("rename_schema"), "{error}");
+}
+
 /// `create_schema "x", force: true` is `drop_schema "x", if_exists: true`
 /// and then `CREATE SCHEMA` (ActiveRecord 8.1.4.1), so the extensions
 /// created in it go too. The fold applies the drop first: a schema with
