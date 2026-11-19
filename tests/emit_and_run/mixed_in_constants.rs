@@ -41,3 +41,37 @@ fn constants_of_several_mixed_in_modules_resolve_on_spinel() {
     run.assert_passes();
     assert!(run.stdout.contains("mixed in constants passed"), "{}", run.stdout);
 }
+
+/// `class Vault::Synth < Vault::Base` with `Vault::Base < Vault::Root` including `Locker`: a bare `Kind` is the one
+/// `Locker` holds, which Ruby reads before the grandparent's `Vault::Root::Kind`.
+fn superclass_mixin_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/models/vault/root.rb", "class Vault::Root\nend\n")
+        .write("app/models/vault/root/kind.rb", "module Vault::Root::Kind\n  def kind = \"root\"\nend\n")
+        .write("app/models/vault/root/extra.rb", "module Vault::Root::Extra\n  def extra = \"extra\"\nend\n")
+        .write("app/models/locker.rb", "module Locker\nend\n")
+        .write("app/models/locker/kind.rb", "module Locker::Kind\n  def kind = \"locker\"\nend\n")
+        .write("app/models/vault/base.rb", "class Vault::Base < Vault::Root\n  include Locker\nend\n")
+        .write("app/models/vault/synth.rb", "class Vault::Synth < Vault::Base\n  include Kind, Extra\nend\n")
+}
+
+const SUPERCLASS_MIXIN_ASSERTIONS: &str = r#"s = Vault::Synth.new
+got = [s.kind, s.extra]
+raise got.inspect unless got == ["locker", "extra"]
+puts "superclass mixin constants passed"
+"#;
+
+#[test]
+fn a_superclass_mixin_constant_comes_before_the_grandparent() {
+    let run = superclass_mixin_app().run_ruby(SUPERCLASS_MIXIN_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("superclass mixin constants passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_superclass_mixin_constant_comes_before_the_grandparent_on_spinel() {
+    let run = superclass_mixin_app().run_spinel(SUPERCLASS_MIXIN_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("superclass mixin constants passed"), "{}", run.stdout);
+}
