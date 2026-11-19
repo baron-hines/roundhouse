@@ -97,7 +97,7 @@ fn an_app_written_writer_keeps_its_body_and_loses_super() {
 fn delegate_expands_with_its_nil_guard() {
     let c = current();
     assert!(c.contains("def request_host"), "prefixed name:\n{c}");
-    assert!(c.contains("@request.nil?"), "allow_nil guard:\n{c}");
+    assert!(c.contains("__target = @request\n    if __target.nil?"), "allow_nil guard:\n{c}");
 }
 
 /// The surface app code actually calls. Rails supplies these through

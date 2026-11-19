@@ -16328,6 +16328,8 @@ mod string_bytes;
 mod class_body_unknown_call;
 #[path = "emit_and_run/string_to_d.rs"]
 mod string_to_d;
+#[path = "emit_and_run/current_delegate_method.rs"]
+mod current_delegate_method;
 
 /// A Slim view is ingested rather than skipped, so `check` going quiet on
 /// it is a claim the emitted page renders. Swap the blog's index for a
@@ -22741,6 +22743,10 @@ mod concern_plain_includer;
 // Concern shapes: a namespaced prepend by its relative name.
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
+
+// Declarations: a rooted class or module name inside a module.
+#[path = "emit_and_run/rooted_class_declarations.rs"]
+mod rooted_class_declarations;
 #[path = "emit_and_run/token_for_string_key.rs"]
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
@@ -22763,3 +22769,5 @@ mod computed_partial_render;
 mod view_raise_statement;
 #[path = "emit_and_run/hidden_field_autocomplete.rs"]
 mod hidden_field_autocomplete;
+#[path = "emit_and_run/record_as_json_in_literal.rs"]
+mod record_as_json_in_literal;
