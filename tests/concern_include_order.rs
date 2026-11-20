@@ -25,7 +25,7 @@ const CONCERNS: &[(&str, &str)] = &[
     // Plain modules: A, B, and AB including both.
     ("plain_a", "module PlainA\n  def label\n    \"plain a\"\n  end\nend\n"),
     ("plain_b", "module PlainB\n  def label\n    \"plain b\"\n  end\nend\n"),
-    ("plain_ab", "module PlainAb\n  include PlainA\n  include PlainB\nend\n"),
+    ("plain_ab", "module PlainAb\n  include PlainA\n  include PlainB\n\n  def plain_ab\n    \"plain ab\"\n  end\nend\n"),
     // The same three as concerns.
     ("concern_a", "module ConcernA\n  extend ActiveSupport::Concern\n\n  def label\n    \"concern a\"\n  end\nend\n"),
     ("concern_b", "module ConcernB\n  extend ActiveSupport::Concern\n\n  def label\n    \"concern b\"\n  end\nend\n"),
@@ -54,6 +54,13 @@ const CONCERNS: &[(&str, &str)] = &[
     ("self_b", "module SelfB\n  self.extend ActiveSupport::Concern\n\n  def label\n    \"self b\"\n  end\nend\n"),
     ("self_ab", "module SelfAb\n  self.extend ActiveSupport::Concern\n  include SelfA\n  include SelfB\nend\n"),
     // `prepend` puts its module below the class, ahead of it.
+    // Includes ConcernA and ConcernB before it extends ActiveSupport::Concern,
+    // so Ruby includes both into LateConcern itself.
+    ("late_concern", "module LateConcern\n  include ConcernA\n  include ConcernB\n  extend ActiveSupport::Concern\n\n  def late\n    \"late\"\n  end\nend\n"),
+    // A plain module: HookDef's hook runs on it and defines `label` there.
+    ("hook_plain_wrapper", "module HookPlainWrapper\n  include HookDef\n  include PlainDef\n\n  def hook_plain_wrapper\n    \"wrapper\"\n  end\nend\n"),
+    // The loop's string names a module nested in the host.
+    ("loop_host", "module LoopHost\n  module GeneratedLeaf\n    def label\n      \"generated leaf\"\n    end\n  end\n\n  %w[unused].each { |m| class_eval \"include GeneratedLeaf\" }\n\n  def loop_host\n    \"loop host\"\n  end\nend\n"),
     ("prepend_a", "module PrependA\n  def label\n    \"prepended\"\n  end\nend\n"),
     ("prepend_b", "module PrependB\n  def label\n    \"included\"\n  end\nend\n"),
     // A hook that includes a module.
@@ -116,6 +123,17 @@ const CASES: &[(&str, &str, &str)] = &[
     // [RewrappedHook, PlainDef, HookDefWrapper, HookDef]: HookDefWrapper put
     // HookDef in the chain, so the controller's own `include HookDef` runs no hook.
     ("rewrapped_hook", "  include HookDefWrapper\n  include HookDef\n  include PlainDef\n", "plain"),
+    // [LateConcern, ConcernB, ConcernA]: LateConcern wasn't a concern yet
+    // when it included the two, so they are its ancestors, not deferred.
+    ("late_concern", "  include ConcernB\n  include LateConcern\n", "concern b"),
+    // [PrependA, PrependOverHook, HookDef]: the prepended module is ahead
+    // of the `label` HookDef's hook defines on the controller.
+    ("prepend_over_hook", "  prepend PrependA\n  include HookDef\n", "prepended"),
+    // [HookPlainWrapper, PlainDef, HookDef]: HookDef's `label` is on
+    // HookPlainWrapper, above PlainDef.
+    ("hook_plain_wrapper", "  include HookPlainWrapper\n", "hook"),
+    // [LoopNested, LoopHost, LoopHost::GeneratedLeaf]
+    ("loop_nested", "  include LoopHost\n", "generated leaf"),
 ];
 
 /// Cases that need more than a bare controller: (controller, its source,
@@ -160,6 +178,10 @@ const SPECIAL: &[(&str, &str, &str)] = &[
     // [DeepChain, Deep0, Deep1, …, Deep65]: a chain of 66 modules, each
     // including the next; only the last defines `label`.
     ("deep_chain", "class DeepChainController < ApplicationController\n  include Deep0\n\n  def show\n    render json: { label: label }\n  end\nend\n", "deep 65"),
+    // [LibDelegateChild, DelegateLibParent, DelegateOne]: the lib/ superclass
+    // has DelegateOne, so the child's include runs no hook; the forwarder
+    // DelegateOne's hook defined on the superclass answers.
+    ("lib_delegate_child", "class LibDelegateChildController < DelegateLibParent\n  include DelegateOne\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\nend\n", "source one"),
     // DelegateTwo's hook runs last, so its `delegate` defines `label`.
     ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
@@ -178,6 +200,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/controllers/super_parent_controller.rb", "class SuperParentController < ApplicationController\n  include SuperM\nend\n")
         .write("app/controllers/super_pair_parent_controller.rb", "class SuperPairParentController < ApplicationController\n  include SuperM\n  include SuperN\nend\n")
         .write("lib/super_lib_parent.rb", "class SuperLibParent < ApplicationController\n  include SuperM\nend\n")
+        .write("lib/delegate_lib_parent.rb", "class DelegateLibParent < ApplicationController\n  include DelegateOne\nend\n")
         .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
     // Deep0 includes Deep1, … Deep64 includes Deep65; each has a method of
     // its own, so each is kept.
