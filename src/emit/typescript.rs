@@ -1758,8 +1758,9 @@ pub fn emit_library_class(class: &crate::dialect::LibraryClass) -> Result<String
 /// The instance field names `js_library_class` declares for `class`:
 /// its attribute readers and the ivars its instance methods assign.
 /// The class-side counterpart of `instance_field_names`: a class-side
-/// attribute reader, and each `@ivar` a class method assigns, which
-/// `js_library_class` declares as a `static` field (`def self.label;
+/// attribute reader, each `@ivar` a class method assigns, and each
+/// `class_body_static_ivars` names, which `js_library_class` declares as
+/// a `static` field (`def self.label;
 /// @label ||= "x"; end` is `static label`, and the method is left out).
 fn static_field_names(class: &crate::dialect::LibraryClass) -> crate::det::HashSet<String> {
     use crate::dialect::{AccessorKind, MethodReceiver};
@@ -1774,6 +1775,7 @@ fn static_field_names(class: &crate::dialect::LibraryClass) -> crate::det::HashS
         }
         collect_ivar_assignments(&m.body, &mut ivars);
     }
+    names.extend(class_body_static_ivars(class, &ivars).into_iter().map(|(name, _, _)| name));
     names.extend(ivars.into_keys());
     names
 }
@@ -1913,6 +1915,15 @@ pub(super) fn js_library_class(
             fields.push((name, ts_ty(&ty), false, true, crate::span::Span::synthetic()));
         }
     }
+    // The class body's own writes (`module M; @flag = false; …; end`):
+    // see `class_body_static_ivars`.
+    let mut static_ivar_initial: crate::det::HashMap<String, &crate::expr::Expr> = crate::det::HashMap::default();
+    for (name, ty, literal) in class_body_static_ivars(class, &static_ivar_assignments) {
+        if let Some(literal) = literal {
+            static_ivar_initial.insert(name.clone(), literal);
+        }
+        static_ivar_assignments.entry(name).or_insert(ty);
+    }
     for (name, ty) in static_ivar_assignments {
         if side_field_names[1].insert(name.clone()) {
             field_names_seen.insert(name.clone());
@@ -2045,6 +2056,8 @@ pub(super) fn js_library_class(
         let memo = memoized.get(&(name.clone(), *is_static));
         let needs_declare = needs_declare && memo.is_none();
         let init = if let Some(literal) = memo {
+            Some(expr::js_expr(literal))
+        } else if *is_static && *from_ivar && !needs_declare && let Some(literal) = static_ivar_initial.get(name) {
             Some(expr::js_expr(literal))
         } else if *is_static && !needs_declare {
             ts_default_for_type(ty)
@@ -2897,6 +2910,56 @@ pub fn emit_module(methods: &[crate::dialect::MethodDef]) -> Result<String, Stri
 /// emitted `export function <x>` parses.
 pub(super) fn escape_for_function_name(raw: &str) -> String {
     escape_reserved(&crate::emit::typescript::library::sanitize_identifier(raw))
+}
+
+/// The class-side ivars the class body itself writes (`module M; @flag =
+/// false; …; end`) that need a `static` field: Ruby creates them at load,
+/// before any method runs, so one a class method reads needs the field
+/// even when no surviving method writes it (the runtime shake can drop
+/// its only writer), and the field starts at the body's value, not its
+/// type's default. Each is `(name, type of the body's value, the value
+/// when it is a literal TypeScript renders as written)`. `assigned` is
+/// the ivars the class methods themselves write; a body write of one of
+/// those is kept for its value. A body write no class method touches
+/// declares nothing.
+fn class_body_static_ivars<'a>(
+    class: &'a crate::dialect::LibraryClass,
+    assigned: &indexmap::IndexMap<String, Ty>,
+) -> Vec<(String, Ty, Option<&'a crate::expr::Expr>)> {
+    use crate::expr::{Expr, ExprNode, LValue, Literal};
+    fn reads(e: &Expr, out: &mut crate::det::HashSet<String>) {
+        if let ExprNode::Ivar { name } = &*e.node {
+            out.insert(name.as_str().to_string());
+        }
+        e.node.for_each_child(&mut |c| reads(c, out));
+    }
+    let mut read = crate::det::HashSet::default();
+    for m in class.methods.iter().filter(|m| matches!(m.receiver, crate::dialect::MethodReceiver::Class)) {
+        reads(&m.body, &mut read);
+    }
+    let mut out: Vec<(String, Ty, Option<&'a Expr>)> = Vec::new();
+    for init in &class.class_ivar_initializers {
+        let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*init.node else {
+            continue;
+        };
+        let name = name.as_str();
+        if !assigned.contains_key(name) && !read.contains(name) {
+            continue;
+        }
+        // The last body write is the value a method first sees.
+        out.retain(|(n, _, _)| n != name);
+        // The runtime loader leaves a body write untyped; a scalar
+        // literal still says what it is.
+        let ty = value.ty.clone().or_else(|| match &*value.node {
+            ExprNode::Lit { value: Literal::Bool { .. } } => Some(Ty::Bool),
+            ExprNode::Lit { value: Literal::Int { .. } } => Some(Ty::Int),
+            ExprNode::Lit { value: Literal::Float { .. } } => Some(Ty::Float),
+            ExprNode::Lit { value: Literal::Str { .. } } => Some(Ty::Str),
+            _ => None,
+        });
+        out.push((name.to_string(), ty.unwrap_or(Ty::Untyped), declarable_constant_value(value)));
+    }
+    out
 }
 
 /// Walk an Expr collecting every `@ivar = value` assignment, keyed
