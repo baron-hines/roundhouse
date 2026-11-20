@@ -116,3 +116,13 @@ fn a_load_time_conditionals_include_and_private_run_in_its_branch() {
     run.assert_passes();
     assert!(run.stdout.contains("conditional branch passed"), "{}", run.stdout);
 }
+
+/// Ruby's value constants a view reads (maybe's `2 * Math::PI * radius`, `Date::ABBR_MONTHNAMES.compact`).
+#[test]
+fn core_value_constants_read_as_rubys() {
+    let run = emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  def circle(radius)\n    (2 * Math::PI * radius).round(2)\n  end\n\n  def months\n    Date::ABBR_MONTHNAMES.compact.first(2).join(\",\") + \"/\" + Date::DAYNAMES.first\n  end\n\n")
+        .run_ruby("a = Article.new\ngot = [a.circle(1), a.months]\nraise \"got #{got.inspect}\" unless got == [6.28, \"Jan,Feb/Sunday\"]\nputs \"core constants passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("core constants passed"), "{}", run.stdout);
+}
