@@ -701,7 +701,11 @@ fn untyped_subexpressions_baseline() {
     // `Integer` for the RBS-paired gate.
     // MEASURED 1465 on merging main 81b6491fc (1464) with the uuid casts'
     // +1 (1452 less 1451), which add up.
-    const CEILING: usize = 1465;
+    // MEASURED 1467 on an unsaved record under a uuid column (1465): the
+    // record arm reads `new_record?` and the key's `to_s` before casting
+    // (+2 in active_record/relation.rb), so an unsaved record is
+    // `IS NULL` as in Rails.
+    const CEILING: usize = 1467;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

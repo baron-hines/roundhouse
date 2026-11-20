@@ -4050,8 +4050,13 @@ module ActiveRecord
         # static `v && v.id` narrowing was dropped in favor of this
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
-        # On a uuid column the id casts as any other value there does.
-        return uuid_value_predicate(qcol, val._primary_key_value) if uuid_query_column?(col)
+        # On a uuid column the id casts as any other value there does. An
+        # unsaved record has no id, which Rails writes `IS NULL`; its
+        # emitted id is "", which the cast would bind as `= NULL`.
+        if uuid_query_column?(col)
+          return "#{qcol} IS NULL" if val.new_record? && val._primary_key_value.to_s.empty?
+          return uuid_value_predicate(qcol, val._primary_key_value)
+        end
         "#{qcol} = #{bind_literal(val._primary_key_value)}"
       elsif enum_column?(col)
         # An enum label held in a variable (the literal ones were cast
