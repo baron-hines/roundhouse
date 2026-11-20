@@ -4,7 +4,10 @@
 //! where Rails answers an `ActionController::Parameters`, which takes a
 //! String key as it takes a Symbol. So `.except("version")` and
 //! `.slice("title")` on it, and on what `merge` / `compact` answer from it,
-//! name the Symbol keys. A plain Hash the app builds keeps Ruby's answer.
+//! name the Symbol keys, as do calls on a no-argument private helper that
+//! answers such a `permit` (`def x_params = params.permit(%w[a b])`, or
+//! `@x ||= params.permit(...)`). A plain Hash the app builds, inline or in
+//! a helper, keeps Ruby's answer.
 
 use super::emit_and_run;
 
@@ -17,6 +20,9 @@ const ROUTES: &str = r#"  post "/imports/splat" => "imports#splat"
   post "/imports/splat_variable" => "imports#splat_variable"
   post "/imports/merge_string" => "imports#merge_string"
   post "/imports/plain" => "imports#plain"
+  post "/imports/helper" => "imports#helper"
+  post "/imports/memo_helper" => "imports#memo_helper"
+  post "/imports/plain_helper" => "imports#plain_helper"
 "#;
 
 const CONTROLLER: &str = r#"class ImportsController < ApplicationController
@@ -71,6 +77,35 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
     attrs = { title: params[:title], version: params[:version] }.except("version")
     render plain: attrs.keys.map(&:to_s).sort.join(",")
   end
+
+  # Only the body may change here; the stored title is kept.
+  def helper
+    article = Article.create!(title: "kept", body: "long enough body")
+    article.update!(article_params.except("title"))
+    render plain: article.reload.title
+  end
+
+  def memo_helper
+    attrs = self.memo_params.merge(body: "x").compact.except(*%w[version])
+    render plain: attrs.keys.map(&:to_s).sort.join(",")
+  end
+
+  def plain_helper
+    attrs = plain_attrs.except("version")
+    render plain: attrs.keys.map(&:to_s).sort.join(",")
+  end
+
+  private
+
+  def article_params = params.permit(%w[title body])
+
+  def memo_params
+    @memo_params ||= params.permit(%w[title body version])
+  end
+
+  def plain_attrs
+    { title: params[:title], version: params[:version] }
+  end
 end
 "#;
 
@@ -121,6 +156,21 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
 
   test "a plain Hash keeps Ruby's except" do
     post "/imports/plain", params: PARAMS
+    assert_equal "title,version", response.body
+  end
+
+  test "except with a String on a permit helper drops the key" do
+    post "/imports/helper", params: PARAMS
+    assert_equal "kept", response.body
+  end
+
+  test "except with a splatted String list on a memoized permit helper drops the key" do
+    post "/imports/memo_helper", params: PARAMS
+    assert_equal "body,title", response.body
+  end
+
+  test "a helper's plain Hash keeps Ruby's except" do
+    post "/imports/plain_helper", params: PARAMS
     assert_equal "title,version", response.body
   end
 end
