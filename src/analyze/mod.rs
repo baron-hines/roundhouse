@@ -5844,7 +5844,9 @@ impl Analyzer {
         // parallel; the registry is written afterwards, in source order.
         let this = &*self;
         let returns = parallel::map_ref(&app.library_classes, |lc| {
-            lc.methods.iter().map(|method| this.method_return_ty(&lc.name, method)).collect::<Vec<_>>()
+            lc.methods.iter().map(|method| {
+                this.method_return_ty(&lc.name, method).map(|ret| this.widen_empty_base_list(app, lc, method, ret))
+            }).collect::<Vec<_>>()
         });
         for (lc, rets) in app.library_classes.iter().zip(returns) {
             let class_id = &lc.name;
@@ -6353,6 +6355,50 @@ impl Analyzer {
     /// call `x.session = v` EVALUATES to `v`; the body typer answers
     /// the call-site fact, the harvest the function's, and a compiled
     /// target (spinel) returns what the function returns.
+    /// A base's `def filters = []` that subclasses override answers, under Ruby's dispatch, one of their Arrays.
+    fn widen_empty_base_list(&self, app: &App, lc: &crate::dialect::LibraryClass, method: &crate::dialect::MethodDef, ret: Ty) -> Ty {
+        let empty = |e: &crate::expr::Expr| matches!(&*e.node, ExprNode::Array { elements, .. } if elements.is_empty());
+        let last = match &*method.body.node {
+            ExprNode::Seq { exprs } => exprs.last(),
+            _ => Some(&method.body),
+        };
+        if lc.is_module
+            || method.receiver != crate::dialect::MethodReceiver::Instance
+            || !last.is_some_and(empty)
+            || !matches!(&ret, Ty::Array { elem } if elem.is_unknown())
+        {
+            return ret;
+        }
+        let descends = |start: Option<&ClassId>| {
+            let mut at = start.cloned();
+            for _ in 0..32 {
+                match at {
+                    Some(id) if id == lc.name => return true,
+                    Some(id) => at = self.classes.get(&id).and_then(|c| c.parent.clone()),
+                    None => return false,
+                }
+            }
+            false
+        };
+        let mut elems = Vec::new();
+        for sub in app.library_classes.iter().filter(|c| !c.is_module && descends(c.parent.as_ref())) {
+            if !sub.methods.iter().any(|m| m.name == method.name && m.receiver == method.receiver) {
+                continue;
+            }
+            match self.classes.get(&sub.name).and_then(|c| c.instance_methods.get(&method.name)) {
+                Some(Ty::Array { elem }) if !elem.is_unknown() => elems.push((**elem).clone()),
+                Some(Ty::Tuple { elems: slots }) if !slots.is_empty() && slots.iter().all(|t| !t.is_unknown()) => {
+                    elems.extend(slots.iter().cloned());
+                }
+                _ => return ret,
+            }
+        }
+        match elems.into_iter().reduce(body::union_of) {
+            Some(elem) => Ty::Array { elem: std::sync::Arc::new(elem) },
+            None => ret,
+        }
+    }
+
     fn method_return_ty(&self, _class_id: &ClassId, method: &crate::dialect::MethodDef) -> Option<Ty> {
         // A declared signature (ingest-expanded DSL, RBS, …) wins over
         // body harvest: `delegated_type`'s `def page; leafable if page?;
