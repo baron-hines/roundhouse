@@ -14,8 +14,12 @@ pub(super) fn fold(app: &mut App) {
         .chain(app.library_classes.iter().map(|c| c.name.0.as_str().to_string()))
         .collect();
     let parents: crate::det::HashSet<ClassId> = app.controllers.iter().filter_map(|c| c.parent.clone()).collect();
-    let defines_name = |c: &crate::dialect::Controller| c.body.iter().any(|item| matches!(item,
-        crate::dialect::ControllerBodyItem::Action { action, .. } if action.name.as_str() == "controller_name"));
+    // Either side: Rails' instance `controller_name` reads the class's, so a `def self.controller_name` changes it too.
+    let defines_name = |c: &crate::dialect::Controller| c.body.iter().any(|item| match item {
+        crate::dialect::ControllerBodyItem::Action { action, .. } => action.name.as_str() == "controller_name",
+        crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => method.name.as_str() == "controller_name",
+        _ => false,
+    });
     let by_name: crate::det::HashMap<ClassId, (Option<ClassId>, bool)> =
         app.controllers.iter().map(|c| (c.name.clone(), (c.parent.clone(), defines_name(c)))).collect();
     // Not a controller that defines `controller_name`, or inherits one: the call reads that, not the name.
@@ -63,7 +67,9 @@ fn rewrite(e: &mut Expr, model: &str) {
             if method.as_str() == "controller_name" && args.is_empty())
     {
         // Not the call's span: the source index resolves a constant at its position, and the concern's file names none.
-        let mut read = Expr::new(crate::span::Span::synthetic(), ExprNode::Const { path: model.split("::").map(Symbol::from).collect() });
+        // Not relative: Rails' `constantize` reads from the top level, and the controller's namespace may hold the name too.
+        let path = std::iter::once(Symbol::from("")).chain(model.split("::").map(Symbol::from)).collect();
+        let mut read = Expr::new(crate::span::Span::synthetic(), ExprNode::Const { path });
         read.decisions |= crate::expr::GENERATED_CONST_REF;
         *e = read;
         return;
