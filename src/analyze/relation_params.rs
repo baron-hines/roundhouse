@@ -40,19 +40,15 @@ pub fn relation_params(app: &App) -> RelationParams {
     for def in app.models.iter().flat_map(|m| m.methods()).chain(app.library_classes.iter().flat_map(|c| c.methods.iter())) {
         by_name.entry(def.name.clone()).or_default().push(def);
     }
+    let mut actions = crate::det::HashSet::default();
     for controller in &app.controllers {
         for def in controller.class_methods() {
             by_name.entry(def.name.clone()).or_default().push(def);
         }
-        for action in controller.actions() {
-            // An action's name taken by an app method makes the name ambiguous, not chained.
-            if let Some(defs) = by_name.get_mut(&action.name) {
-                defs.clear();
-            } else {
-                by_name.insert(action.name.clone(), Vec::new());
-            }
-        }
+        actions.extend(controller.actions().map(|a| a.name.clone()));
     }
+    // An action's name taken by an app method makes the name ambiguous, not chained.
+    by_name.retain(|name, _| !actions.contains(name));
     let mut out = RelationParams::default();
     for (name, defs) in by_name {
         let Some(first) = defs.first() else { continue };
@@ -93,12 +89,21 @@ fn is_rest(param: &crate::dialect::Param) -> bool {
 /// The locals holding the parameter or a chain on it, when every write to each is one.
 fn aliases_of(body: &Expr, param: &Symbol) -> Option<Vec<Symbol>> {
     let mut writes: Vec<(Symbol, &Expr)> = Vec::new();
-    collect_writes(body, &mut writes);
+    let mut opaque = Vec::new();
+    collect_writes(body, false, &mut writes, &mut opaque);
+    // Only a local the body writes unconditionally first holds a value wherever it is read.
+    let top: Vec<&Symbol> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().filter_map(|e| match &*e.node {
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => Some(name),
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    };
     let mut aliases = vec![param.clone()];
     loop {
         let before = aliases.len();
         for (name, value) in &writes {
-            if !aliases.contains(name) && chain_on(value, &aliases) {
+            if !aliases.contains(name) && top.contains(&name) && chain_on(value, &aliases) {
                 aliases.push(name.clone());
             }
         }
@@ -106,19 +111,32 @@ fn aliases_of(body: &Expr, param: &Symbol) -> Option<Vec<Symbol>> {
             break;
         }
     }
-    let clean = writes.iter().all(|(name, value)| !aliases.contains(name) || chain_on(value, &aliases));
+    let clean = writes.iter().all(|(name, value)| !aliases.contains(name) || chain_on(value, &aliases))
+        && !opaque.iter().any(|name| aliases.contains(name));
     clean.then_some(aliases)
 }
 
-fn collect_writes<'a>(expr: &'a Expr, out: &mut Vec<(Symbol, &'a Expr)>) {
+/// `opaque` collects the locals written where the order of writes is not the body's: in a block, which may run any
+/// number of times, or by a multiple assignment.
+fn collect_writes<'a>(expr: &'a Expr, in_block: bool, out: &mut Vec<(Symbol, &'a Expr)>, opaque: &mut Vec<Symbol>) {
     match &*expr.node {
         ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
-            out.push((name.clone(), value));
-            collect_writes(value, out);
+            if in_block {
+                opaque.push(name.clone());
+            } else {
+                out.push((name.clone(), value));
+            }
+            collect_writes(value, in_block, out, opaque);
         }
-        // A block or lambda body runs at another time, and may write the local more than once.
-        ExprNode::Lambda { .. } => {}
-        _ => expr.node.for_each_child(&mut |c| collect_writes(c, out)),
+        ExprNode::MultiAssign { targets, value } => {
+            opaque.extend(targets.iter().filter_map(|t| match t {
+                LValue::Var { name, .. } => Some(name.clone()),
+                _ => None,
+            }));
+            collect_writes(value, in_block, out, opaque);
+        }
+        ExprNode::Lambda { .. } => expr.node.for_each_child(&mut |c| collect_writes(c, true, out, opaque)),
+        _ => expr.node.for_each_child(&mut |c| collect_writes(c, in_block, out, opaque)),
     }
 }
 
@@ -146,15 +164,18 @@ fn calls_builder(expr: &Expr, aliases: &[Symbol]) -> bool {
 
 fn all_returns_chain(body: &Expr, aliases: &[Symbol]) -> bool {
     let mut explicit = Vec::new();
-    collect_returns(body, &mut explicit);
-    explicit.iter().all(|v| tail_chains(v, aliases)) && tail_chains(body, aliases)
+    let mut in_block = false;
+    collect_returns(body, false, &mut explicit, &mut in_block);
+    !in_block && explicit.iter().all(|v| tail_chains(v, aliases)) && tail_chains(body, aliases)
 }
 
-fn collect_returns<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+/// `in_block` is set by a `return` inside a block, which may return from the method with a value the block computes.
+fn collect_returns<'a>(expr: &'a Expr, nested: bool, out: &mut Vec<&'a Expr>, in_block: &mut bool) {
     match &*expr.node {
+        ExprNode::Return { .. } if nested => *in_block = true,
         ExprNode::Return { value } => out.push(value),
-        ExprNode::Lambda { .. } => {}
-        _ => expr.node.for_each_child(&mut |c| collect_returns(c, out)),
+        ExprNode::Lambda { .. } => expr.node.for_each_child(&mut |c| collect_returns(c, true, out, in_block)),
+        _ => expr.node.for_each_child(&mut |c| collect_returns(c, nested, out, in_block)),
     }
 }
 
@@ -169,5 +190,38 @@ fn tail_chains(expr: &Expr, aliases: &[Symbol]) -> bool {
         ExprNode::Return { .. } => true,
         ExprNode::Assign { target: LValue::Var { name, .. }, value } => aliases.contains(name) && chain_on(value, aliases),
         _ => chain_on(expr, aliases),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params_of(src: &str) -> RelationParams {
+        let mut app = App::default();
+        app.library_classes = crate::ingest::ingest_library_classes(src.as_bytes(), "s.rb").expect("ingest");
+        relation_params(&app)
+    }
+
+    #[test]
+    fn a_filter_that_returns_its_scope_or_a_query_on_it() {
+        let got = params_of("class S\n  def self.f(scope, q)\n    return scope if q.blank?\n\n    query = scope\n    query = query.where(a: q) if q\n    query\n  end\nend\n");
+        assert!(got.chains(&Symbol::from("f"), 0) && got.returns(&Symbol::from("f"), 0), "{got:?}");
+    }
+
+    #[test]
+    fn a_local_first_written_in_a_branch_or_a_block_is_no_alias() {
+        let branch = params_of("class S\n  def self.f(scope, q)\n    query = scope if q\n    query.where(a: 1)\n  end\nend\n");
+        assert!(!branch.chains(&Symbol::from("f"), 0), "{branch:?}");
+        let block = params_of("class S\n  def self.f(scope, q)\n    query = scope\n    q.each { |x| query = x }\n    query.where(a: 1)\n  end\nend\n");
+        assert!(!block.chains(&Symbol::from("f"), 0), "{block:?}");
+        let multi = params_of("class S\n  def self.f(scope, q)\n    query = scope\n    query, other = q\n    query.where(a: 1)\n  end\nend\n");
+        assert!(!multi.chains(&Symbol::from("f"), 0), "{multi:?}");
+    }
+
+    #[test]
+    fn a_return_from_a_block_is_not_the_scope() {
+        let got = params_of("class S\n  def self.f(scope, q)\n    q.each { |x| return x }\n    scope.where(a: 1)\n  end\nend\n");
+        assert!(got.chains(&Symbol::from("f"), 0) && !got.returns(&Symbol::from("f"), 0), "{got:?}");
     }
 }
