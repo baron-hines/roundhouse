@@ -68,6 +68,7 @@ pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
 mod narrowing;
 mod pagy;
+mod association_relation;
 mod send;
 mod active_storage;
 mod buffered_stdlib;
@@ -3340,6 +3341,12 @@ impl<'a> BodyTyper<'a> {
                 let mut dispatched =
                     self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver
                         || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
+                if block.is_none()
+                    && let Some(r) = recv.as_ref()
+                    && let Some(rel) = self.association_scope_relation(r, method, &dispatched)
+                {
+                    dispatched = rel;
+                }
                 // One controller arm cannot supply a missing writer on a
                 // different concrete receiver in the same union.
                 if controller_writer

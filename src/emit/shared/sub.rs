@@ -72,6 +72,8 @@ pub fn classify_sub<'a>(lhs: &'a Expr, rhs: &'a Expr) -> SubCase<'a> {
         (Ty::Array { elem: l }, Ty::Array { .. }) => {
             SubCase::ArrayDifference { elem: l.as_ref() }
         }
+        // Not a raise: Array#- takes a relation through its `to_ary` (mastodon's `collections - selected_collections`).
+        (Ty::Array { .. }, Ty::Relation { .. }) => SubCase::Unknown,
         // Time `-` is receiver-overloaded and not disambiguable from
         // the operand types alone: `Time - Duration → Time`, but
         // `Time - Time → Float` (elapsed seconds). Both are valid Ruby,

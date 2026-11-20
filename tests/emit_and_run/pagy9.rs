@@ -306,8 +306,8 @@ puts "PASS"
     assert!(errors.iter().any(|e| e.contains("pagy 8.6.3")), "{errors:#?}");
 }
 
-/// maybe's `pagy(@chat.messages.ordered)`: a scope on an association read is the target's relation, as Rails'
-/// CollectionProxy is one, so the page is its rows and the count is the owner's.
+/// maybe's `accounts_query = family.accounts.visible; pagy(accounts_query)`: a scope on an association read is the
+/// target's relation, as Rails' CollectionProxy is one, so the page is its rows and the count is the owner's.
 #[test]
 fn an_association_scope_paginates() {
     let run = emit_and_run::real_blog()
@@ -319,7 +319,7 @@ fn an_association_scope_paginates() {
             "class ApplicationController < ActionController::Base\n  include Pagy::Backend\n",
         )
         .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", "class Comment < ApplicationRecord\n  scope :ordered, -> { order(:id) }\n")
-        .edit("app/controllers/articles_controller.rb", "  def show\n  end\n", "  def show\n    @pagy, @page_comments = pagy(@article.comments.ordered, limit: 2)\n  end\n")
+        .edit("app/controllers/articles_controller.rb", "  def show\n  end\n", "  def show\n    comments = @article.comments.ordered\n    @pagy, @page_comments = pagy(comments, limit: 2)\n  end\n")
         .edit(
             "app/views/articles/show.html.erb",
             "<hr class=\"my-8\">\n",
@@ -336,6 +336,30 @@ Comment.create!(article_id: b.id, commenter: "other", body: "x")
 status, _h, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles/#{a.id}", "QUERY_STRING" => "page=2", "rack.input" => StringIO.new(""))
 got = body.join[%r{<div id="page">(.*?)</div>}m, 1]
 raise "status #{status}, page #{got.inspect}" unless status == 200 && got == "c3,c4|5|3"
+puts "PASS"
+"##,
+        );
+    run.assert_passes();
+}
+
+/// mastodon's `@report.collections - selected_collections`: an Array minus an association scope's relation is
+/// Array#- over its records (`to_ary`), not a raise.
+#[test]
+fn an_array_minus_an_association_relation_is_the_difference() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def kept_commenters\n    (comments.to_a - comments.where(commenter: \"drop\")).map(&:commenter).join(\",\")\n  end\n\n",
+        )
+        .run_ruby(
+            r##"
+Comment.delete_all
+Article.delete_all
+a = Article.create!(title: "One", body: "body number one is long enough")
+%w[keep drop also].each { |c| Comment.create!(article_id: a.id, commenter: c, body: "x") }
+got = Article.find(a.id).kept_commenters
+raise "got #{got.inspect}" unless got == "keep,also"
 puts "PASS"
 "##,
         );

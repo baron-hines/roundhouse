@@ -35,45 +35,6 @@ impl<'a> BodyTyper<'a> {
     /// class it does not model, a method whose other return paths are
     /// open) -- gradual, as everywhere else. `None` for a known type that
     /// is not a scope, or a union of different scopes.
-    /// `owner.accounts.visible`: typed as the association's Array, but a scope or query method on an association
-    /// read is lowered to the target's Relation (`scope_chain`'s association seed), as Rails' CollectionProxy is one.
-    /// A bare association read is not: it stays the loaded Array.
-    fn seeded_association_relation(&self, e: &Expr) -> Option<Ty> {
-        let ExprNode::Send { recv: Some(recv), method, block: None, .. } = &*e.node else { return None };
-        let Some(Ty::Array { elem }) = recv.ty.as_ref() else { return None };
-        let Ty::Class { id: target, .. } = &**elem else { return None };
-        if !self.is_relation_step(recv, method) {
-            return None;
-        }
-        if self.seeded_association_relation(recv).is_some() {
-            return Some(Ty::Relation { of: target.clone() });
-        }
-        let ExprNode::Send { recv: Some(owner), args, block: None, method: assoc, .. } = &*recv.node else { return None };
-        // A nilable owner (`Article.first`) reads its id as Rails' would, raising on nil.
-        let owner_id = match owner.ty.as_ref() {
-            Some(Ty::Class { id, .. }) => id,
-            Some(Ty::Union { variants }) => match variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect::<Vec<_>>().as_slice() {
-                [Ty::Class { id, .. }] => id,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let reads_association = args.is_empty()
-            && (matches!(&*owner.node, ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::SelfRef) || crate::lower::scope_chain::owner_reads_once(owner))
-            && self.classes().get(owner_id).is_some_and(|c| matches!(c.instance_methods.get(assoc), Some(Ty::Array { elem: e }) if **e == **elem));
-        reads_association.then(|| Ty::Relation { of: target.clone() })
-    }
-
-    /// A chain step that keeps a relation: a query method, or a class method of the element model answering one.
-    fn is_relation_step(&self, recv: &Expr, method: &Symbol) -> bool {
-        if crate::lower::scope_chain::is_relation_chain_method(method.as_str()) {
-            return true;
-        }
-        let Some(Ty::Array { elem }) = recv.ty.as_ref() else { return false };
-        let Ty::Class { id: target, .. } = &**elem else { return false };
-        self.classes().get(target).is_some_and(|c| matches!(c.class_methods.get(method), Some(Ty::Array { .. } | Ty::Relation { .. })))
-    }
-
     fn pagy_scope_ty(&self, ty: Option<&Ty>) -> Option<Ty> {
         match ty {
             None | Some(Ty::Untyped) | Some(Ty::Var { .. }) => Some(Ty::Untyped),
@@ -176,7 +137,7 @@ impl<'a> BodyTyper<'a> {
             });
         };
         let scope_ty = args.first().and_then(|a| a.ty.as_ref());
-        let records = self.pagy_scope_ty(scope_ty).or_else(|| args.first().and_then(|a| self.seeded_association_relation(a)));
+        let records = self.pagy_scope_ty(scope_ty);
         let result = |records: Ty| Ty::Tuple {
             elems: vec![Ty::Class { id: pagy_id.clone(), args: vec![].into() }, records].into(),
         };
@@ -336,7 +297,7 @@ impl<'a> BodyTyper<'a> {
                 _ => None,
             }
         } else {
-            self.pagy_scope_ty(collection.ty.as_ref()).or_else(|| self.seeded_association_relation(collection))
+            self.pagy_scope_ty(collection.ty.as_ref())
         };
         if records.is_none() {
             let wanted = if array { "an Array the analysis can type" } else { "an ActiveRecord scope the analysis can type" };
