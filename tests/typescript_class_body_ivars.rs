@@ -98,3 +98,16 @@ fn a_class_body_ivar_read_only_by_a_parameter_default_is_a_static_field() {
     assert!(ts.contains("this.armed"), "{ts}");
     assert!(ts.contains("static armed: boolean = true;"), "{ts}");
 }
+
+#[test]
+fn a_truthy_class_body_value_outlasts_a_memo_and_a_falsy_one_gives_way() {
+    // `@armed ||= false` keeps the body's `true`; `@label ||= "idle"`
+    // replaces the body's `nil` on the first read, which the field stands for.
+    let ts = emit_one(
+        "module Widget\n  @armed = true\n  @label = nil\n\n  def self.armed\n    @armed ||= false\n  end\n\n  def self.label\n    @label ||= \"idle\"\n  end\nend\n",
+        "module Widget\n  def self.armed: () -> bool\n  def self.label: () -> String\nend\n",
+        "Widget",
+    );
+    assert!(ts.contains("static armed: boolean = true;"), "{ts}");
+    assert!(ts.contains("static label: string = \"idle\";"), "{ts}");
+}

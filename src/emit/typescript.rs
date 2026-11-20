@@ -2059,7 +2059,16 @@ pub(super) fn js_library_class(
         // too), and is this class's own, so never only `declare`d: the
         // class object's ivar is not its parent's.
         let body = if *is_static { static_ivar_initial.get(name) } else { None };
-        let literal = memo.or(body);
+        // A memo (`@armed ||= false`) keeps a truthy body value and
+        // replaces a falsy one (`false`/`nil`) on the first read, which
+        // the field stands for.
+        let body_truthy = body.is_some_and(|b| {
+            !matches!(
+                &*b.node,
+                crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil | crate::expr::Literal::Bool { value: false } }
+            )
+        });
+        let literal = if body_truthy { body } else { memo.or(body) };
         let needs_declare = needs_declare && literal.is_none();
         let init = if let Some(literal) = literal {
             Some(expr::js_expr(literal))
