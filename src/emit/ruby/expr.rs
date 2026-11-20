@@ -1569,7 +1569,9 @@ pub(super) fn emit_send_base(
             // operand needs parens too.
             // A trailing-modifier operand (`(x rescue nil) == true`) would
             // swallow the operator.
+            // Nor an open-ended one (`raise E.new(m) =~ /x/` raises the comparison): it takes the operator in.
             let lhs = if renders_as_trailing_modifier(r)
+                || renders_open_ended(r)
                 || binop_of(r).is_some_and(|o| {
                     binop_prec(o) < prec || (prec == 30 && binop_prec(o) == 30)
                 })
@@ -1578,7 +1580,7 @@ pub(super) fn emit_send_base(
             } else {
                 emit_expr(r)
             };
-            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) {
+            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) || renders_open_ended(&args[0]) {
                 format!("({})", args_s[0])
             } else {
                 args_s[0].clone()
@@ -2549,6 +2551,13 @@ mod tests {
         // as the same command.
         let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
         assert_eq!(emit_expr(&or_sym(send(None, "found", vec![]), raise)), "found || (raise \"missing\")");
+    }
+
+    #[test]
+    fn synthesized_raise_operand_of_a_binary_operator_is_parenthesized() {
+        // An absent constant read as `Raise` in `RUBY_ENGINE =~ /rbx/` (method_source): bare, `raise` takes `=~` in.
+        let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
+        assert_eq!(emit_expr(&send(Some(raise), "=~", vec![lit_str("rbx")])), "(raise \"missing\") =~ \"rbx\"");
     }
 
     #[test]

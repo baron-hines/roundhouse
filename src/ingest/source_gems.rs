@@ -434,12 +434,81 @@ pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf
 /// `autoload` to a feature name (one ending in `.rb` is a path Zeitwerk
 /// defers to, as to a defined constant).
 fn requires(text: &str) -> Vec<(bool, String, bool)> {
-    struct Finder(Vec<(bool, String, bool)>, usize);
+    struct Finder(Vec<(bool, String, bool)>, usize, Vec<Vec<u8>>, usize);
+    /// `File.dirname(__FILE__)` or `__dir__`: the directory of the file being loaded.
+    fn file_dir(node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(call) = node.as_call_node() {
+            if call.name().as_slice() == b"__dir__" && call.receiver().is_none() && call.arguments().is_none() {
+                return true;
+            }
+            let file = call.receiver().and_then(|r| r.as_constant_read_node()).is_some_and(|c| c.name().as_slice() == b"File");
+            let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            return file && call.name().as_slice() == b"dirname" && matches!(args.as_slice(), [a] if a.as_source_file_node().is_some());
+        }
+        false
+    }
+    impl Finder {
+        /// `"#{direc}/method_source/version"` over `direc = File.dirname(__FILE__)` (method_source): a path relative to
+        /// the file, as `require_relative` takes it.
+        fn built_relative(&self, arg: &ruby_prism::Node<'_>) -> Option<String> {
+            let parts: Vec<_> = arg.as_interpolated_string_node()?.parts().iter().collect();
+            let [head, rest] = parts.as_slice() else { return None };
+            let embedded = head.as_embedded_statements_node()?.statements()?;
+            let body: Vec<_> = embedded.body().iter().collect();
+            let [inner] = body.as_slice() else { return None };
+            // Not a local inside a `def`: that is the method's own binding (a parameter, say), not the file's.
+            let dir = file_dir(inner)
+                || (self.1 == 0 && inner.as_local_variable_read_node().is_some_and(|l| self.2.iter().any(|n| n.as_slice() == l.name().as_slice())));
+            let rest = String::from_utf8_lossy(rest.as_string_node()?.unescaped()).into_owned();
+            (dir && rest.starts_with('/')).then(|| rest.trim_start_matches('/').to_string())
+        }
+    }
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
             self.1 += 1;
             ruby_prism::visit_def_node(self, node);
             self.1 -= 1;
+        }
+
+        // A class or module body is a scope of its own: its locals are not the file's.
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let outer = std::mem::take(&mut self.2);
+            ruby_prism::visit_class_node(self, node);
+            self.2 = outer;
+        }
+
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let outer = std::mem::take(&mut self.2);
+            ruby_prism::visit_module_node(self, node);
+            self.2 = outer;
+        }
+
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            self.3 += 1;
+            ruby_prism::visit_if_node(self, node);
+            self.3 -= 1;
+        }
+
+        fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+            self.3 += 1;
+            ruby_prism::visit_unless_node(self, node);
+            self.3 -= 1;
+        }
+
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            // The right side reads the value the local held before this write.
+            ruby_prism::visit_local_variable_write_node(self, node);
+            if self.1 == 0 {
+                let name = node.name().as_slice().to_vec();
+                let dir = file_dir(&node.value());
+                // Not from a branch that may not run: only an unconditional write ends (or starts) what the local holds.
+                if self.3 == 0 {
+                    self.2.retain(|n| *n != name);
+                    if dir {
+                        self.2.push(name);
+                    }
+                }
+            }
         }
 
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -461,12 +530,18 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
                 let feature = String::from_utf8_lossy(feature.unescaped()).into_owned();
                 let autoloaded = relative.is_none() && !feature.ends_with(".rb");
                 self.0.push((relative == Some(true), feature, autoloaded));
+            } else if relative == Some(false)
+                && node.receiver().is_none()
+                && let [arg] = args.as_slice()
+                && let Some(path) = self.built_relative(arg)
+            {
+                self.0.push((true, path, false));
             }
             ruby_prism::visit_call_node(self, node);
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder(Vec::new(), 0);
+    let mut finder = Finder(Vec::new(), 0, Vec::new(), 0);
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.0
 }
@@ -765,6 +840,31 @@ mod tests {
         let files: Vec<_> = gems[0].files.iter().map(|p| p.display().to_string()).collect();
         assert_eq!(files, vec!["lib/widgets/part.rb", "lib/widgets.rb"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_require_built_on_the_files_directory_is_relative() {
+        let found = super::requires("direc = File.dirname(__FILE__)\nrequire \"#{direc}/method_source/version\"\nrequire \"#{__dir__}/other\"\nrequire \"#{name}/no\"\n");
+        assert_eq!(found, vec![(true, "method_source/version".to_string(), false), (true, "other".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_directory_local_is_the_files_only_where_it_holds() {
+        let found = super::requires(
+            "dir = __dir__
+def load_plugin(dir)
+  require \"#{dir}/plugin\"
+end
+require \"#{dir}/kept\"
+dir = ENV[\"X\"]
+require \"#{dir}/gone\"
+",
+        );
+        assert_eq!(found, vec![(true, "kept".to_string(), false)]);
+        let found = super::requires(
+            "dir = __dir__\nmodule Other\n  dir = ENV[\"X\"]\nend\nif false\n  dir = ENV[\"X\"]\nend\nrequire \"#{dir}/a\"\ndir = require \"#{dir}/b\"\nrequire \"#{dir}/c\"\n",
+        );
+        assert_eq!(found, vec![(true, "a".to_string(), false), (true, "b".to_string(), false)]);
     }
 
     #[test]

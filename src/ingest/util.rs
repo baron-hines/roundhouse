@@ -324,6 +324,12 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         collect_classes(&decl, scope, nesting, out);
         return;
     }
+    if let Some(taken) = framework_defined_branch(node) {
+        for stmt in &taken {
+            collect_classes(stmt, scope, nesting, out);
+        }
+        return;
+    }
     if let Some(m) = node.as_module_node() {
         // Push the module's name onto the scope before descending —
         // bare class declarations inside qualify with the module
@@ -886,11 +892,26 @@ pub(super) fn flatten_statements<'pr>(node: Node<'pr>) -> Vec<Node<'pr>> {
     if let Some(s) = node.as_statements_node() {
         s.body().iter().flat_map(|stmt| match self_guarded_body(&stmt, None) {
             Some(body) => vec![body],
-            None => vec![stmt],
+            None => framework_defined_branch(&stmt).unwrap_or_else(|| vec![stmt]),
         }).collect()
     } else {
         vec![node]
     }
+}
+
+/// Constants every Rails this compiler reads defines before any app or gem file loads.
+const FRAMEWORK_DEFINED: &[&str] = &["ActiveSupport::CurrentAttributes"];
+
+/// `if defined?(ActiveSupport::CurrentAttributes) … else … end` (rails-settings-cached's `RequestCache`): the branch
+/// Ruby takes, as the guarded constant is always defined; the other is for a Rails this compiler does not read.
+fn framework_defined_branch<'pr>(node: &Node<'pr>) -> Option<Vec<Node<'pr>>> {
+    let branch = node.as_if_node()?;
+    branch.end_keyword_loc()?;
+    let path = constant_path_of(&branch.predicate().as_defined_node()?.value())?;
+    if !FRAMEWORK_DEFINED.contains(&path.join("::").trim_start_matches("::")) {
+        return None;
+    }
+    Some(branch.statements().map(|s| s.body().iter().collect()).unwrap_or_default())
 }
 
 // Only a reload guard around its own declaration: any other guard, or an `else`, takes the branch what else loaded decides.

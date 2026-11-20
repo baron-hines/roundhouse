@@ -1,4 +1,7 @@
 module I18n
+  class ArgumentError < ::ArgumentError
+  end
+
   self.@site_table: Hash[String, Integer]
   self.@leaf_table: Hash[String, String]
   self.@node_table: Hash[String, bool]

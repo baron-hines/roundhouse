@@ -304,3 +304,11 @@ module ActionView
     def self.boolean_attr?: (String name) -> bool
   end
 end
+
+module Turbo
+  module FramesHelper
+  end
+
+  module StreamsHelper
+  end
+end
