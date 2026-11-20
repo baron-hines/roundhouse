@@ -396,7 +396,7 @@ pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf
 }
 
 fn requires(text: &str) -> Vec<(bool, String)> {
-    struct Finder(Vec<(bool, String)>, usize, Vec<Vec<u8>>);
+    struct Finder(Vec<(bool, String)>, usize, Vec<Vec<u8>>, usize);
     /// `File.dirname(__FILE__)` or `__dir__`: the directory of the file being loaded.
     fn file_dir(node: &ruby_prism::Node<'_>) -> bool {
         if let Some(call) = node.as_call_node() {
@@ -432,16 +432,45 @@ fn requires(text: &str) -> Vec<(bool, String)> {
             self.1 -= 1;
         }
 
+        // A class or module body is a scope of its own: its locals are not the file's.
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let outer = std::mem::take(&mut self.2);
+            ruby_prism::visit_class_node(self, node);
+            self.2 = outer;
+        }
+
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let outer = std::mem::take(&mut self.2);
+            ruby_prism::visit_module_node(self, node);
+            self.2 = outer;
+        }
+
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            self.3 += 1;
+            ruby_prism::visit_if_node(self, node);
+            self.3 -= 1;
+        }
+
+        fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+            self.3 += 1;
+            ruby_prism::visit_unless_node(self, node);
+            self.3 -= 1;
+        }
+
         fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            // The right side reads the value the local held before this write.
+            ruby_prism::visit_local_variable_write_node(self, node);
             if self.1 == 0 {
                 let name = node.name().as_slice().to_vec();
-                // A later write to another value ends what the local held: a require after it is not file-relative.
-                self.2.retain(|n| *n != name);
-                if file_dir(&node.value()) {
-                    self.2.push(name);
+                let dir = file_dir(&node.value());
+                // Not from a branch that may not run: only an unconditional write ends (or starts) what the local holds.
+                if self.3 == 0 {
+                    self.2.retain(|n| *n != name);
+                    if dir {
+                        self.2.push(name);
+                    }
                 }
             }
-            ruby_prism::visit_local_variable_write_node(self, node);
         }
 
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -472,7 +501,7 @@ fn requires(text: &str) -> Vec<(bool, String)> {
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder(Vec::new(), 0, Vec::new());
+    let mut finder = Finder(Vec::new(), 0, Vec::new(), 0);
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.0
 }
@@ -792,6 +821,10 @@ require \"#{dir}/gone\"
 ",
         );
         assert_eq!(found, vec![(true, "kept".to_string())]);
+        let found = super::requires(
+            "dir = __dir__\nmodule Other\n  dir = ENV[\"X\"]\nend\nif false\n  dir = ENV[\"X\"]\nend\nrequire \"#{dir}/a\"\ndir = require \"#{dir}/b\"\nrequire \"#{dir}/c\"\n",
+        );
+        assert_eq!(found, vec![(true, "a".to_string()), (true, "b".to_string())]);
     }
 
     #[test]

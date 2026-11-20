@@ -215,7 +215,7 @@ fn marks_an_earlier_def(stmt: &Node<'_>, before: &[Node<'_>]) -> bool {
     }
     let Some(sym) = call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| a.as_symbol_node()) else { return false };
     let name = sym.unescaped();
-    before.iter().any(|b| b.as_def_node().is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == name))
+    before.iter().any(|b| definition(b).is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == name))
 }
 
 pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {

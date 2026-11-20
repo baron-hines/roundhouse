@@ -49,6 +49,9 @@ impl<'a> BodyTyper<'a> {
     /// A chain step that keeps a relation: a query method, or a class method of the element model answering one.
     fn is_relation_step(&self, target: &ClassId, method: &Symbol) -> bool {
         crate::lower::scope_chain::is_relation_chain_method(method.as_str())
-            || self.classes().get(target).is_some_and(|c| matches!(c.class_methods.get(method), Some(Ty::Array { .. } | Ty::Relation { .. })))
+            // Not a scope that loads its records (`last(2)`): Rails answers that one's Array.
+            || self.classes().get(target).is_some_and(|c| {
+                !c.materializing_scopes.contains(method) && matches!(c.class_methods.get(method), Some(Ty::Array { .. } | Ty::Relation { .. }))
+            })
     }
 }
