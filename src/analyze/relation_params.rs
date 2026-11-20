@@ -117,12 +117,14 @@ fn aliases_of(body: &Expr, param: &Symbol) -> Option<Vec<Symbol>> {
         }
     }
     let clean = writes.iter().all(|(name, value)| !aliases.contains(name) || chain_on(value, &aliases))
-        && !opaque.iter().any(|name| aliases.contains(name));
+        && !opaque.iter().any(|name| aliases.contains(name) || name.as_str() == ANY_LOCAL);
     clean.then_some(aliases)
 }
 
 /// `opaque` collects the locals written where the order of writes is not the body's: in a block, which may run any
 /// number of times, or by a multiple assignment.
+const ANY_LOCAL: &str = "*";
+
 fn collect_writes<'a>(expr: &'a Expr, in_block: bool, out: &mut Vec<(Symbol, &'a Expr)>, opaque: &mut Vec<Symbol>) {
     match &*expr.node {
         ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
@@ -144,7 +146,18 @@ fn collect_writes<'a>(expr: &'a Expr, in_block: bool, out: &mut Vec<(Symbol, &'a
             }));
             collect_writes(value, in_block, out, opaque);
         }
-        ExprNode::Lambda { .. } => expr.node.for_each_child(&mut |c| collect_writes(c, true, out, opaque)),
+        // A write to a name the block binds is the block's own local.
+        ExprNode::Lambda { .. } => {
+            let bound = block_names(expr);
+            let mut inner = Vec::new();
+            expr.node.for_each_child(&mut |c| collect_writes(c, true, out, &mut inner));
+            opaque.extend(inner.into_iter().filter(|n| !bound.contains(n)));
+        }
+        // A pattern binds names this walk does not follow, so none of the method's locals is known to keep its value.
+        ExprNode::CaseMatch { .. } | ExprNode::MatchPredicate { .. } | ExprNode::MatchRequired { .. } => {
+            opaque.push(Symbol::from(ANY_LOCAL));
+            expr.node.for_each_child(&mut |c| collect_writes(c, in_block, out, opaque));
+        }
         _ => expr.node.for_each_child(&mut |c| collect_writes(c, in_block, out, opaque)),
     }
 }
@@ -268,6 +281,16 @@ mod tests {
         assert!(!got.chains(&Symbol::from("f"), 0), "{got:?}");
         let outer = params_of("class S\n  def self.f(scope)\n    query = scope\n    [1].each { |scope| query.where(a: 1) }\n    query\n  end\nend\n");
         assert!(outer.chains(&Symbol::from("f"), 0), "{outer:?}");
+    }
+
+    #[test]
+    fn a_block_writing_its_own_parameter_leaves_the_methods_and_a_pattern_rebinds_it() {
+        let own = params_of("class S\n  def self.f(scope)\n    [1].each { |scope| scope = nil }\n    scope.where(a: 1)\n  end\nend\n");
+        assert!(own.chains(&Symbol::from("f"), 0), "{own:?}");
+        let captured = params_of("class S\n  def self.f(scope)\n    [1].each { scope = nil }\n    scope.where(a: 1)\n  end\nend\n");
+        assert!(!captured.chains(&Symbol::from("f"), 0), "{captured:?}");
+        let pattern = params_of("class S\n  def self.f(scope)\n    scope.where(a: 1)\n    [] => scope\n    scope\n  end\nend\n");
+        assert!(!pattern.returns(&Symbol::from("f"), 0), "{pattern:?}");
     }
 
     #[test]

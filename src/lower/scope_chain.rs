@@ -4844,7 +4844,14 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
 fn relation_argument(arg: &mut Expr, ctx: &Ctx, locals: &Locals) {
     let read = self_qualified_assoc_read(arg.clone(), ctx);
     let aliased = matches!(&*read.node, ExprNode::Var { name, .. } if locals.assoc.contains_key(&alias_key(name, false)));
-    if !aliased && seedable_assoc_read(ctx, &read, read.span).is_none() {
+    let seeded = |e: &Expr| match &*e.node {
+        ExprNode::Var { name, .. } => locals.assoc.get(&alias_key(name, false)).map(|(_, r)| r.clone()),
+        _ => Some(e.clone()),
+    };
+    // Not through `.all` when the association defines its own: that call is the extension's, not the relation.
+    let own_all = seeded(&read).is_some_and(|r| matches!(&*r.node, ExprNode::Send { method: aname, .. }
+        if ctx.assocs.is_assoc_extension(None, aname, &Symbol::from("all"))));
+    if own_all || (!aliased && seedable_assoc_read(ctx, &read, read.span).is_none()) {
         if arg.decisions & crate::expr::RELATION_ARGUMENT == 0 {
             return;
         }

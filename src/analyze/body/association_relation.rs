@@ -61,7 +61,13 @@ impl<'a> BodyTyper<'a> {
         if seeded {
             return Some(Ok(Ty::Relation { of: target.clone() }));
         }
-        is_model(target).then_some(Err(()))
+        // A read this rule cannot seed may be one `scope_chain::query_arguments` does (a concern's bare `tokens`).
+        let loaded = match &*arg.node {
+            ExprNode::Var { .. } | ExprNode::Array { .. } => true,
+            ExprNode::Send { method, .. } => matches!(method.as_str(), "to_a" | "to_ary" | "entries" | "records" | "load"),
+            _ => false,
+        };
+        (loaded && is_model(target)).then_some(Err(()))
     }
 
     /// The call whose every return is its relation argument or a chain on it answers that argument's relation.
