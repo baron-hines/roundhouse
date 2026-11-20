@@ -3480,6 +3480,8 @@ end
     drop_modelled_included_hooks(&mut app);
     let splice_resolver = const_resolver.for_sources(&app.sources);
     splice_concerns_into_controllers(&mut app, &splice_resolver);
+    // After the splice: each controller's copy of a concern's body names that controller's model.
+    super::controller_name_constants::fold(&mut app);
     // After the splice: a concern's filter reads the key as the controller's own body does.
     crate::lower::primary_key_send::rewrite_guarded(&mut app);
     // After the splice: an action a concern provides is not implicit.
@@ -15130,10 +15132,11 @@ fn read_remove_hidden_field_autocomplete<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -
     for line in files.iter().flatten() {
         if let Some(i) = line.find("action_view.remove_hidden_field_autocomplete") {
             let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
-            if rest.starts_with("true") {
-                on = true;
-            } else if rest.starts_with("false") {
-                on = false;
+            // Not a prefix: `= false if ENV[…]` is set only when its condition holds, which is not known here.
+            match rest.strip_suffix(';').unwrap_or(rest).trim_end() {
+                "true" => on = true,
+                "false" => on = false,
+                _ => {}
             }
         }
     }

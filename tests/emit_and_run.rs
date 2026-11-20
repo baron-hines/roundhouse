@@ -22219,6 +22219,12 @@ mod loaded_begin;
 mod class_eval_definer_call;
 #[path = "emit_and_run/custom_form_builder.rs"]
 mod custom_form_builder;
+#[path = "emit_and_run/controller_name_constantize.rs"]
+mod controller_name_constantize;
+#[path = "emit_and_run/class_macro_keyword_rest.rs"]
+mod class_macro_keyword_rest;
+#[path = "emit_and_run/nested_form_child.rs"]
+mod nested_form_child;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
@@ -22408,6 +22414,8 @@ mod errors_computed_field;
 mod aasm_gem;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
+#[path = "emit_and_run/aasm_generated_methods.rs"]
+mod aasm_generated_methods;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
 mod runtime_registered_callbacks;
 #[path = "emit_and_run/reopened_alias.rs"]

@@ -273,13 +273,14 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     // Each yield runs the block in a fresh scope, where the block's own locals start out nil.
     let owned: Vec<Symbol> = bound
         .iter()
-        .filter(|n| local(n) && !params.iter().any(|p| p.as_str() == n.as_str()))
+        .filter(|n| local(n) && !params.iter().any(|p| p.as_str() == n.as_str()) && scope_assigned(body, n))
         .map(|n| renamed(n))
         .collect();
     let params: Vec<Symbol> = params.iter().map(|p| renamed(p.as_str())).collect();
     let mut copy = partial.clone();
     copy.name = Symbol::from(format!("{pdir}/_{base}__yield{k}"));
-    replace_yields(&mut copy.body, &params, &owned, &inlined);
+    let original = copy.body.clone();
+    replace_yields(&mut copy.body, &params, &owned, &inlined, &original);
     if let Some(strict) = &mut copy.strict_locals {
         for n in free.iter().chain(&called) {
             strict.push(crate::dialect::Param { name: renamed(n), default: None, keyword: true, rest: false, forwarding: false, from_keyword: false, from_kwrest: false });
@@ -358,10 +359,10 @@ fn only_output_yields(e: &Expr, counts: &mut Vec<usize>) -> bool {
     ok
 }
 
-fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr) {
+fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr, partial: &Expr) {
     if matches!(appended(e).map(|c| &*c.node), Some(ExprNode::Yield { .. })) {
         let mut seq = Expr::new(e.span, ExprNode::Seq { exprs: vec![e.clone()] });
-        replace_yields(&mut seq, params, owned, body);
+        replace_yields(&mut seq, params, owned, body, partial);
         *e = seq;
         return;
     }
@@ -373,15 +374,24 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
                 _ => None,
             };
             let Some(args) = yielded else {
-                replace_yields(&mut stmt, params, owned, body);
+                replace_yields(&mut stmt, params, owned, body, partial);
                 out.push(stmt);
                 continue;
             };
             let span = stmt.span;
+            let mut body = body.clone();
             // Every argument evaluated once, in order, as the yield does, the ones no parameter takes too.
             for i in 0..params.len().max(args.len()) {
                 let value = args.get(i).cloned().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
                 match params.get(i) {
+                    // Not copied into the parameter: a `form_with` builder is no value at runtime, only its calls are lowered.
+                    // Only a local the partial never assigns (a block's parameter), which nothing can change before the read.
+                    Some(p) if matches!(&*value.node, ExprNode::Var { name, .. } if local(name.as_str()) && !assigned(partial, name.as_str()))
+                        && !assigned(&body, p.as_str()) =>
+                    {
+                        let ExprNode::Var { name: arg, .. } = &*value.node else { unreachable!() };
+                        substitute(&mut body, p, arg);
+                    }
                     Some(p) => out.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: p.clone() }, value })),
                     None => out.push(value),
                 }
@@ -391,22 +401,56 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
             }
             match &*body.node {
                 ExprNode::Seq { exprs } => out.extend(exprs.iter().cloned()),
-                _ => out.push(body.clone()),
+                _ => out.push(body),
             }
         }
         *exprs = out;
         return;
     }
-    e.node.for_each_child_mut(&mut |c| replace_yields(c, params, owned, body));
+    e.node.for_each_child_mut(&mut |c| replace_yields(c, params, owned, body, partial));
+}
+
+/// Reads of `from` as `to`, not under a nested block that binds `from` again, whose parameters stay as they are.
+fn substitute(e: &mut Expr, from: &Symbol, to: &Symbol) {
+    match &mut *e.node {
+        ExprNode::Lambda { params, .. } if params.iter().any(|p| p == from) => return,
+        ExprNode::Var { name, .. } if name == from => *name = to.clone(),
+        _ => {}
+    }
+    e.node.for_each_child_mut(&mut |c| substitute(c, from, to));
 }
 
 fn assigned(e: &Expr, name: &str) -> bool {
     let mut found = match &*e.node {
         ExprNode::Assign { target: LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n.as_str() == name,
         ExprNode::MultiAssign { targets, .. } => targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if n.as_str() == name)),
+        ExprNode::MatchRequired { pattern, .. } | ExprNode::MatchPredicate { pattern, .. } => {
+            let mut bound = Vec::new();
+            pattern.bound_names(&mut bound);
+            bound.iter().any(|n| n.as_str() == name)
+        }
+        ExprNode::CaseMatch { arms, .. } => arms.iter().any(|arm| {
+            let mut bound = Vec::new();
+            arm.pattern.bound_names(&mut bound);
+            bound.iter().any(|n| n.as_str() == name)
+        }),
         _ => false,
     };
     e.node.for_each_child(&mut |c| found = found || assigned(c, name));
+    found
+}
+
+// Not a nested block's names: a nil reset outside it would shadow its parameters, which then read as that nil.
+fn scope_assigned(e: &Expr, name: &str) -> bool {
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return false;
+    }
+    let mut found = match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n.as_str() == name,
+        ExprNode::MultiAssign { targets, .. } => targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if n.as_str() == name)),
+        _ => false,
+    };
+    e.node.for_each_child(&mut |c| found = found || scope_assigned(c, name));
     found
 }
 
