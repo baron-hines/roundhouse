@@ -59,6 +59,9 @@ const CONCERNS: &[(&str, &str)] = &[
     ("late_concern", "module LateConcern\n  include ConcernA\n  include ConcernB\n  extend ActiveSupport::Concern\n\n  def late\n    \"late\"\n  end\nend\n"),
     // A plain module: HookDef's hook runs on it and defines `label` there.
     ("hook_plain_wrapper", "module HookPlainWrapper\n  include HookDef\n  include PlainDef\n\n  def hook_plain_wrapper\n    \"wrapper\"\n  end\nend\n"),
+    // Includes ConcernA and ConcernB, then a loop's string extends
+    // ActiveSupport::Concern: Ruby runs the includes first.
+    ("loop_extend_host", "module LoopExtendHost\n  include ConcernA\n  include ConcernB\n  %w[x].each { |m| class_eval \"extend ::ActiveSupport::Concern\" }\n\n  def loop_extend_host\n    \"loop extend host\"\n  end\nend\n"),
     // The loop's string names a module nested in the host.
     ("loop_host", "module LoopHost\n  module GeneratedLeaf\n    def label\n      \"generated leaf\"\n    end\n  end\n\n  %w[unused].each { |m| class_eval \"include GeneratedLeaf\" }\n\n  def loop_host\n    \"loop host\"\n  end\nend\n"),
     ("prepend_a", "module PrependA\n  def label\n    \"prepended\"\n  end\nend\n"),
@@ -134,6 +137,9 @@ const CASES: &[(&str, &str, &str)] = &[
     ("hook_plain_wrapper", "  include HookPlainWrapper\n", "hook"),
     // [LoopNested, LoopHost, LoopHost::GeneratedLeaf]
     ("loop_nested", "  include LoopHost\n", "generated leaf"),
+    // [LoopExtend, LoopExtendHost, ConcernB, ConcernA]: LoopExtendHost
+    // wasn't a concern yet when it included the two.
+    ("loop_extend", "  include ConcernB\n  include LoopExtendHost\n", "concern b"),
 ];
 
 /// Cases that need more than a bare controller: (controller, its source,
