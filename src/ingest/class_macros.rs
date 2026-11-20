@@ -2390,11 +2390,11 @@ fn definition_syntax_kept(statement: &Expr, sources: &[SourceFile]) -> bool {
                 return;
             }
             self.0 |= node.as_splat_node().is_some()
-                || node.as_assoc_splat_node().is_some()
+                || node.as_assoc_splat_node().is_some_and(|s| s.value().is_none())
                 || node.as_def_node().is_some()
                 || node.as_defined_node().is_some()
                 || node.as_multi_target_node().is_some()
-                || node.as_keyword_rest_parameter_node().is_some()
+                || node.as_keyword_rest_parameter_node().is_some_and(|p| p.name().is_none())
                 || node.as_rest_parameter_node().is_some()
                 || node.as_block_parameter_node().is_some();
         }
