@@ -168,16 +168,23 @@ fn chain_on(expr: &Expr, aliases: &[Symbol]) -> bool {
     }
 }
 
-/// Whether a block's own parameter names one of `aliases`: inside it the name is the block's, not the method's.
-fn shadows(expr: &Expr, aliases: &[Symbol]) -> bool {
-    matches!(&*expr.node, ExprNode::Lambda { params, rest_param, extra_params, block_param, .. }
-        if params.iter().chain(rest_param.iter()).chain(block_param.iter()).chain(extra_params.iter().map(|p| &p.name))
-            .any(|p| aliases.contains(p)))
+/// The names a block binds itself: inside it they are the block's, not the method's.
+fn block_names(expr: &Expr) -> Vec<Symbol> {
+    match &*expr.node {
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => params.iter()
+            .chain(rest_param.iter()).chain(block_param.iter()).chain(extra_params.iter().map(|p| &p.name))
+            .cloned().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn calls_builder(expr: &Expr, aliases: &[Symbol]) -> bool {
-    if shadows(expr, aliases) {
-        return false;
+    let bound = block_names(expr);
+    if bound.iter().any(|b| aliases.contains(b)) {
+        let outer: Vec<Symbol> = aliases.iter().filter(|a| !bound.contains(a)).cloned().collect();
+        let mut found = false;
+        expr.node.for_each_child(&mut |c| found |= calls_builder(c, &outer));
+        return found;
     }
     if let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
         && crate::catalog::is_relation_builder_name(method.as_str())
@@ -259,6 +266,8 @@ mod tests {
     fn a_block_parameter_of_the_same_name_is_the_blocks() {
         let got = params_of("class S\n  def self.f(children)\n    [1].each { |children| children.order(:id) }\n    children\n  end\nend\n");
         assert!(!got.chains(&Symbol::from("f"), 0), "{got:?}");
+        let outer = params_of("class S\n  def self.f(scope)\n    query = scope\n    [1].each { |scope| query.where(a: 1) }\n    query\n  end\nend\n");
+        assert!(outer.chains(&Symbol::from("f"), 0), "{outer:?}");
     }
 
     #[test]

@@ -1212,6 +1212,18 @@ impl App {
     pub fn sole_includer_of_modules(
         &self,
     ) -> crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId> {
+        self.includers_of_modules()
+            .into_iter()
+            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
+            .collect()
+    }
+
+    /// Module → every non-module class that includes it, directly or
+    /// through another module (see `sole_includer_of_modules`, which is
+    /// the one-includer case of this).
+    pub fn includers_of_modules(
+        &self,
+    ) -> crate::det::HashMap<crate::ident::ClassId, std::collections::BTreeSet<crate::ident::ClassId>> {
         use std::collections::{BTreeMap, BTreeSet};
         use crate::det::HashMap;
         let modules: BTreeSet<&crate::ident::ClassId> = self
@@ -1264,9 +1276,6 @@ impl App {
             }
         }
         includers
-            .into_iter()
-            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
-            .collect()
     }
 
     /// A module that no class includes and exactly one class `extend`s
@@ -1717,18 +1726,146 @@ pub struct IngestDrop {
 /// The modules a model's body includes, as `include X` sends it keeps
 /// until the concerns are spliced.
 pub(crate) fn model_includes(model: &Model) -> Vec<crate::ident::ClassId> {
-    let mut ids = Vec::new();
+    model_include_groups(model).into_iter().flatten().collect()
+}
+
+/// [`model_includes`], one group per `include` call: `include A, B` is
+/// one group of two.
+pub(crate) fn model_include_groups(model: &Model) -> Vec<Vec<crate::ident::ClassId>> {
+    let mut groups = Vec::new();
     for item in &model.body {
         if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
             && let crate::expr::ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node
             && method.as_str() == "include"
         {
-            for arg in args {
-                if let crate::expr::ExprNode::Const { path } = &*arg.node {
-                    ids.push(crate::analyze::mixin_path_id(path));
+            let ids: Vec<_> = args
+                .iter()
+                .filter_map(|arg| match &*arg.node {
+                    crate::expr::ExprNode::Const { path } => Some(crate::analyze::mixin_path_id(path)),
+                    _ => None,
+                })
+                .collect();
+            if !ids.is_empty() {
+                groups.push(ids);
+            }
+        }
+    }
+    groups
+}
+
+/// The modules a model includes, directly or through other modules, in
+/// Ruby's method-lookup order: the one whose method a call finds first
+/// comes first.
+///
+/// Built as `Module#include` builds it: the included module's ancestors
+/// are walked in order with an insertion point that starts right above
+/// the class. One not in the chain goes in at the point, which then moves
+/// below it. One already there below the point moves the point below
+/// itself, once a module has gone in (`include_modules_at`'s `c_seen`).
+/// One call's arguments go in last to first, so `include A, B` looks in
+/// `A`, then `B`. A module's own includes are taken one call each.
+///
+/// An `ActiveSupport::Concern` defers the concerns it includes: its
+/// includer includes them first, in the order it named them, then the
+/// concern itself, which it skips when it is already there. So with a
+/// model including `Shared` and then `Wrapper`, a concern including
+/// `Tail` and then `Shared`, Rails gives `[Wrapper, Tail, Shared]`, where
+/// plain modules give `[Wrapper, Shared, Tail]`.
+pub(crate) fn model_include_ancestors(
+    model: &Model,
+    library_classes: &[crate::dialect::LibraryClass],
+) -> Vec<crate::ident::ClassId> {
+    use crate::ident::ClassId;
+    struct Modules<'a> {
+        includes: crate::det::HashMap<&'a ClassId, &'a Vec<ClassId>>,
+        concerns: crate::det::HashSet<&'a ClassId>,
+    }
+    impl Modules<'_> {
+        /// A module's ancestors below it, and, for a concern, the concerns
+        /// it defers to its includer.
+        fn own(&self, id: &ClassId, depth: usize) -> (Vec<ClassId>, Vec<ClassId>) {
+            let (mut chain, mut deferred) = (Vec::new(), Vec::new());
+            if depth > 32 {
+                return (chain, deferred);
+            }
+            let concern = self.concerns.contains(id);
+            for n in self.includes.get(id).into_iter().flat_map(|v| v.iter()) {
+                if n == id {
+                    continue;
+                }
+                if concern && self.concerns.contains(n) {
+                    deferred.push(n.clone());
+                } else {
+                    self.include(&mut chain, n, depth + 1);
+                }
+            }
+            (chain, deferred)
+        }
+
+        /// `Module#include` of `m` into a chain whose own entry (the class,
+        /// or the including module) sits just above index 0.
+        fn include(&self, chain: &mut Vec<ClassId>, m: &ClassId, depth: usize) {
+            if depth > 32 {
+                return;
+            }
+            let (below, deferred) = self.own(m, depth);
+            if self.concerns.contains(m) {
+                if chain.contains(m) {
+                    return;
+                }
+                for dep in &deferred {
+                    self.include(chain, dep, depth + 1);
+                }
+            }
+            let mut point = 0;
+            for a in std::iter::once(m.clone()).chain(below) {
+                match chain.iter().position(|present| *present == a) {
+                    Some(at) => {
+                        if point > 0 && at >= point {
+                            point = at + 1;
+                        }
+                    }
+                    None => {
+                        chain.insert(point, a);
+                        point += 1;
+                    }
                 }
             }
         }
     }
-    ids
+    let modules = Modules {
+        includes: library_classes
+            .iter()
+            .filter(|lc| lc.is_module && !lc.includes.is_empty())
+            .map(|lc| (&lc.name, &lc.includes))
+            .collect(),
+        concerns: library_classes
+            .iter()
+            .filter(|lc| lc.is_module && extends_active_support_concern(lc))
+            .map(|lc| &lc.name)
+            .collect(),
+    };
+    let mut chain: Vec<ClassId> = Vec::new();
+    for group in model_include_groups(model) {
+        for id in group.iter().rev() {
+            modules.include(&mut chain, id, 0);
+        }
+    }
+    chain
+}
+
+/// Whether a module runs `extend ActiveSupport::Concern` (or
+/// `self.extend`), which the ingest keeps as one of its unmodelled calls.
+fn extends_active_support_concern(lc: &crate::dialect::LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| {
+        let crate::expr::ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)) {
+            return false;
+        }
+        method.as_str() == "extend"
+            && args.iter().any(|arg| {
+                matches!(&*arg.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
+            })
+    })
 }

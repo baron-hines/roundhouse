@@ -2840,7 +2840,7 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             // reader's Array too.
                             | "load" | "load_async" | "from" | "extract_associated"
                     ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")))
-                // Array answers no `all` either; Rails' is the association's relation.
+                // `owner.items.all`: Array answers no `all` either.
                 || (method.as_str() == "all" && args.is_empty() && block.is_none());
             // `owner.items.update(attrs)` alone in a method body is the
             // proxy's bulk update over the records the association holds
@@ -5664,7 +5664,10 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             }
                         }
                         let is_scope = ctx.scope_of(&target, &method);
-                        let is_chain = is_relation_chain_method(method.as_str());
+                        // `all` on the association is its relation, as
+                        // a chain hop with nothing to add.
+                        let is_chain = is_relation_chain_method(method.as_str())
+                            || (method.as_str() == "all" && args.is_empty() && block.is_none());
                         let is_term =
                             is_relation_terminal(method.as_str(), &args, block.as_ref());
                         // A registered class method takes the same
@@ -5686,7 +5689,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             },
                             _ => None,
                         };
-                        if is_scope || is_chain || is_term || method.as_str() == "all" || assoc_cm.is_some() || extracted.is_some() {
+                        if is_scope || is_chain || is_term || assoc_cm.is_some() || extracted.is_some() {
                             let seed = build_association_seed(
                                 span, &target, fk, owner_id, type_entry.clone(), ir, aname,
                                 assoc_cm.is_some(), inverse.is_some(),
@@ -5825,7 +5828,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 *expr = put(span, Some(filtered), Symbol::from(terminal), vec![], None, false);
                                 return None;
                             }
-                            let keeps_model = is_chain || method.as_str() == "all";
+                            let keeps_model = is_chain;
                             let method = counted_terminal(&method, &args, block.as_ref())
                                 .unwrap_or(method);
                             *expr = put(span, Some(seed), method, args, block, parenthesized);
