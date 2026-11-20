@@ -1169,15 +1169,35 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 
 /// Constants the ancestors assign a list of Strings or Symbols
 /// (`PROTECTED_KEYS = %w[var value].freeze`), for a guard that reads one.
-/// Which classes of the line assign each constant a literal list, by name: a method reads its own class's.
-fn literal_constant_owners(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Vec<String>> {
-    let mut out: HashMap<Symbol, Vec<String>> = HashMap::default();
-    for id in ancestors {
-        for name in literal_constants(app, std::slice::from_ref(id)).into_keys() {
-            out.entry(name).or_default().push(id.0.as_str().to_string());
+/// Each class of the line, nearest first, with the literal lists it assigns: a method reads the nearest one up from
+/// the class it is written in, as Ruby's lexical-then-ancestor lookup does.
+struct ConstantOwners {
+    line: Vec<String>,
+    assigned: HashMap<String, HashMap<Symbol, Expr>>,
+}
+
+impl ConstantOwners {
+    fn lookup(&self, scope: Option<&Symbol>, name: &Symbol) -> Option<&Expr> {
+        match scope {
+            Some(scope) => {
+                let from = self.line.iter().position(|c| c == scope.as_str())?;
+                self.line[from..].iter().find_map(|c| self.assigned.get(c)?.get(name))
+            }
+            // Not known where the method is written: only a name one class of the line assigns.
+            None => {
+                let mut found = self.assigned.values().filter_map(|a| a.get(name));
+                let one = found.next()?;
+                found.next().is_none().then_some(one)
+            }
         }
     }
-    out
+}
+
+fn literal_constant_owners(app: &App, line: &[ClassId]) -> ConstantOwners {
+    ConstantOwners {
+        line: line.iter().map(|id| id.0.as_str().to_string()).collect(),
+        assigned: line.iter().map(|id| (id.0.as_str().to_string(), literal_constants(app, std::slice::from_ref(id)))).collect(),
+    }
 }
 
 fn literal_constants(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Expr> {
@@ -1228,7 +1248,7 @@ enum Val {
 struct Run<'a> {
     table: &'a HashMap<Symbol, MethodDef>,
     constants: &'a HashMap<Symbol, Expr>,
-    constant_owners: &'a HashMap<Symbol, Vec<String>>,
+    constant_owners: &'a ConstantOwners,
     frozen: &'a HashMap<(String, Symbol), Expr>,
     cvar_readers: &'a HashMap<(String, String), Symbol>,
     /// The modules the class has included so far, by full name.
@@ -1978,14 +1998,8 @@ impl Run<'_> {
             ExprNode::Const { path } if self.resolve_module(path).is_some() => Some(Val::Lit(e.clone())),
             // A constant of the class's line assigned a literal list (rails-settings-cached's `PROTECTED_KEYS`), as the
             // guard that reads it sees it.
-            // Only the one the running method's own class assigns: Ruby reads a constant from where the method is written.
             ExprNode::Const { path } if let [name] = path.as_slice()
-                && let Some(value) = self.constants.get(name)
-                && self.constant_owners.get(name).is_some_and(|owners| match &self.scope {
-                    Some(scope) => owners.as_slice() == [scope.as_str().to_string()],
-                    // Not known where the method is written: only a name one class of the line assigns.
-                    None => owners.len() == 1,
-                }) =>
+                && let Some(value) = self.constant_owners.lookup(self.scope.as_ref(), name) =>
             {
                 Some(Val::Lit(Expr { span: e.span, ..value.clone() }))
             }

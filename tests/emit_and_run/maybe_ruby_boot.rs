@@ -126,3 +126,19 @@ fn core_value_constants_read_as_rubys() {
     run.assert_passes();
     assert!(run.stdout.contains("core constants passed"), "{}", run.stdout);
 }
+
+/// A branch that `include`s a nested module declared after the conditional, under a guard that asks for it, is
+/// skipped as Ruby skips it: the module is not written ahead of the guard.
+#[test]
+fn a_guard_asking_for_a_later_nested_module_keeps_its_branch() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/guarded_owner.rb",
+            "class GuardedOwner\n  if const_defined?(:Feature, false)\n    include Feature\n\n    def selected\n      true\n    end\n  end\n\n  module Feature\n    def feature\n      \"f\"\n    end\n  end\nend\n",
+        )
+        .run_ruby(
+            "got = [GuardedOwner.method_defined?(:selected), GuardedOwner.include?(GuardedOwner::Feature)]\nraise \"got #{got.inspect}\" unless got == [false, false]\nputs \"guard passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("guard passed"), "{}", run.stdout);
+}

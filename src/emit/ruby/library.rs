@@ -10083,8 +10083,37 @@ fn emit_library_class_decl_inner(
         }
         let mut sts = Vec::new();
         statements(&lc.conditional_definitions[index], &mut sts);
-        for st in sts {
-            nested.borrow_mut().write_expr(s, depth, lc, st);
+        // Not ahead of a guard that asks for the module (`const_defined?(:Feature)`): writing it first would flip the branch.
+        fn conditions<'c>(c: &'c crate::dialect::ConditionalDefinitions, out: &mut Vec<&'c Expr>) {
+            for arm in &c.arms {
+                out.extend(arm.condition.iter());
+                for n in &arm.nested {
+                    conditions(n, out);
+                }
+            }
+        }
+        fn names_in(e: &Expr, out: &mut BTreeSet<String>) {
+            match &*e.node {
+                ExprNode::Const { path } => out.extend(path.iter().map(|p| p.as_str().to_string())),
+                ExprNode::Lit { value: Literal::Sym { value } } => {
+                    out.insert(value.as_str().to_string());
+                }
+                ExprNode::Lit { value: Literal::Str { value } } => out.extend(value.split("::").map(str::to_string)),
+                _ => {}
+            }
+            e.node.for_each_child(&mut |c| names_in(c, out));
+        }
+        let mut conds = Vec::new();
+        conditions(&lc.conditional_definitions[index], &mut conds);
+        let mut asked = BTreeSet::new();
+        for c in conds {
+            names_in(c, &mut asked);
+        }
+        let guarded = nested.borrow().names.iter().any(|n| asked.contains(n.rsplit("::").next().unwrap_or(n)));
+        if !guarded {
+            for st in sts {
+                nested.borrow_mut().write_expr(s, depth, lc, st);
+            }
         }
         write(s, &lc.conditional_definitions[index], lc, &body_pad, &require_of);
     };
