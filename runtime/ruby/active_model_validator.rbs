@@ -13,6 +13,8 @@ module ActiveModel
   end
 
   class ValidationError < StandardError
-    def initialize: (String message) -> void
+    @model: Object
+    def initialize: (String message, Object model) -> void
+    def model: () -> Object
   end
 end

@@ -6070,7 +6070,19 @@ pub fn is_app_tableless_active_model(source: &[u8]) -> bool {
             | "ActionDispatch" | "AbstractController" | "ActionView" | "ActionMailer" | "ActionCable" | "ActionText"
             | "ActiveStorage" | "ActionMailbox"
     );
-    !framework && class.superclass().is_none() && includes_active_model(&class)
+    // Not `ActiveModel::Model` (discourse's `Wizard::StepUpdater`): its own `initialize` and ivars keep
+    // `lower::active_model_model`'s treatment, which the model path would replace.
+    let validations_only = class.body().and_then(|b| b.as_statements_node()).is_some_and(|stmts| {
+        stmts.body().iter().any(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none() && call.name().as_slice() == b"include"
+                    && call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| {
+                        constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveModel::Validations")
+                    }))
+            })
+        })
+    });
+    !framework && class.superclass().is_none() && validations_only && includes_active_model(&class)
 }
 
 pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKind> {

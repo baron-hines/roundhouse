@@ -44,11 +44,16 @@ module ActiveModel
     end
   end
 
-  # `validate!`'s error on a class that includes `ActiveModel::Validations` (maybe's `Money`). Not built from the
-  # record as Rails' is: the synthesized `validate!` hands over the message, which is all a caller reads.
+  # `validate!`'s error on a class that includes `ActiveModel::Validations` (maybe's `Money`). Not its message built
+  # here as Rails' is: the synthesized `validate!` joins the class's own errors, which this port cannot name.
   class ValidationError < StandardError
-    def initialize(message)
+    def initialize(message, model)
+      @model = model
       super(message)
+    end
+
+    def model
+      @model
     end
   end
 end

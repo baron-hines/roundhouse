@@ -584,7 +584,15 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
         });
     }
     // Rails' `validate!`: `valid? || raise ActiveModel::ValidationError`, whose message joins the full messages.
-    if !defines("validate!") {
+    // Not a `def self.validate!`: the instance method is what Rails defines, and the class-side one leaves it.
+    let defines_instance = |name: &str| {
+        model.body.iter().any(|item| matches!(
+            item,
+            crate::dialect::ModelBodyItem::Method { method, .. }
+                if method.name.as_str() == name && method.receiver == MethodReceiver::Instance
+        ))
+    };
+    if !defines_instance("validate!") {
         let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>| {
             Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true })
         };
@@ -593,7 +601,7 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
         let error = send(
             Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from(""), Symbol::from("ActiveModel"), Symbol::from("ValidationError")] })),
             "new",
-            vec![message],
+            vec![message, Expr::new(span, ExprNode::SelfRef)],
         );
         let body = Expr::new(span, ExprNode::If {
             cond: send(None, "valid?", vec![]),

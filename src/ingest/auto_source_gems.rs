@@ -177,7 +177,10 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
         if !depends_on_sourced || sourced(gem) || !matches!(crate::gems::fate_of(gem), GemFate::Unknown) {
             continue;
         }
-        if lock.is_in_repo(gem) || lock.is_from_git(gem) || lock.is_source(gem) || app.extensions.is_rails_dependent(gem) {
+        // Not a Rails plugin the lockfile alone marks: compiled from source, it no longer loads Rails (devise-two-factor).
+        if lock.is_in_repo(gem) || lock.is_from_git(gem) || lock.is_source(gem)
+            || app.extensions.rails_dependent.iter().any(|row| row.gem == *gem && !row.inferred)
+        {
             continue;
         }
         let Some(version) = lock.version_of(gem) else { continue };

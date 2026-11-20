@@ -104,7 +104,15 @@ pub(super) fn ingest_model_with_enum_constants(
         let prefix = class.body().and_then(table_prefix::explicit_table_prefix)
             .or_else(|| model_bases.resolve_class_superclass(&scope, &nesting, &class).and_then(|parent| base_prefixes.get(&parent).cloned()))
             .unwrap_or_default();
-        format!("{prefix}{}", name.trim_start_matches(TABLE_PREFIX_MARK))
+        // Not checked before the prefix is known: `"archive_" + "2026"` is a table name, `"2026"` alone is not.
+        let table = format!("{prefix}{}", name.trim_start_matches(TABLE_PREFIX_MARK));
+        if !bare_table_identifier(&table) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "table_name binding requires one direct self.table_name assignment to a literal string or symbol naming a safe bare SQL identifier".into(),
+            });
+        }
+        table
     } else {
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
@@ -4805,9 +4813,8 @@ fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(Str
                     .filter(|args| args.arguments().len() == 1)
                     .and_then(|args| {
                         let arg = args.arguments().iter().next()?;
-                        symbol_or_string_value(&arg).or_else(|| prefixed_table(&arg))
-                    })
-                    .filter(|name| bare_table_identifier(name.trim_start_matches(TABLE_PREFIX_MARK)));
+                        symbol_or_string_value(&arg).filter(|name| bare_table_identifier(name)).or_else(|| prefixed_table(&arg))
+                    });
                 self.writes.push(name.map(|name| (name, offset)));
             } else {
                 let name = node.as_call_and_write_node().map(|w| w.write_name())

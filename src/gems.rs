@@ -1625,7 +1625,11 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
                 span,
                 None,
                 "gem_requires_rails",
-                format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why),
+                if row.inferred {
+                    format!("{path}: gem {} {}, so requiring it loads Rails, which no emitted tree carries", row.gem, row.why)
+                } else {
+                    format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why)
+                },
             )),
             Owner::Native(owner) => {
                 let target = refuser.target?;
