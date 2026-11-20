@@ -878,6 +878,10 @@ pub struct App {
     /// Read by `lower::controller_to_library::params_wrapper`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap_parameters_by_default: bool,
+    /// Rails writes `autocomplete="off"` on every hidden input: the app's `config.load_defaults` is before 8.1 (or it
+    /// sets `config.action_view.remove_hidden_field_autocomplete = false`). Off, the runtime's default, is 8.1's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden_field_autocomplete: bool,
     /// `ActiveJob::Base.retry_jitter`, app-wide: 0.15 when
     /// `config.load_defaults` is 6.1 or later, else 0.0, unless
     /// `config.active_job.retry_jitter = <number>` sets it (application,
@@ -1488,6 +1492,7 @@ impl App {
             controller_resolutions: HashMap::default(),
             sources: Vec::new(),
             wrap_parameters_by_default: false,
+            hidden_field_autocomplete: false,
             active_job_retry_jitter: 0.0,
             ports_active_model_validator: false,
             each_validator_calls: Vec::new(),

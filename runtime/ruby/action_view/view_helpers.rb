@@ -32,6 +32,7 @@ module ActionView
     # TS/Crystal/Rust/Go/Spinel keep working.
     @slots = {}
     @broadcast_rendering = false
+    @hidden_autocomplete = false
 
     def self.reset_slots!
       @slots = {}
@@ -1007,7 +1008,7 @@ module ActionView
       form_attrs[:class] = (form_class || "button_to").to_s
       button_attrs = render_attrs({ type: "submit" }.merge(inner_opts))
       method_input = if !method.nil? && method.to_s != "post"
-                       %(<input type="hidden" name="_method" value="#{method}">)
+                       %(<input type="hidden" name="_method" value="#{method}"#{hidden_autocomplete_attr}>)
                      else
                        ""
                      end
@@ -1468,7 +1469,18 @@ module ActionView
       return "" if @broadcast_rendering == true
       return "" if ActionController.forgery_switched_off
       return "" if token_fields_omitted?
-      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
+      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}"#{hidden_autocomplete_attr}>)
+    end
+
+    # Rails' `autocomplete="off"` on a hidden input, which `load_defaults` 8.1 drops: a view of an app before it turns it
+    # on (`keep_hidden_autocomplete`, the lowered render's first call).
+    def self.hidden_autocomplete_attr
+      @hidden_autocomplete == true ? " autocomplete=\"off\"" : ""
+    end
+
+    def self.keep_hidden_autocomplete
+      @hidden_autocomplete = true
+      ""
     end
 
     # Strict non-Ruby targets do not emit Rails::Application. The Ruby
@@ -1546,7 +1558,7 @@ module ActionView
       if method_str == "get" || method_str == "post"
         ""
       else
-        %(<input type="hidden" name="_method" value="#{method_str}">)
+        %(<input type="hidden" name="_method" value="#{method_str}"#{hidden_autocomplete_attr}>)
       end
     end
 

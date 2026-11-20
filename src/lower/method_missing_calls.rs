@@ -156,9 +156,38 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
             current = qualified_parent(&name);
         }
     }
+    // The classes that include `module`, directly, through a module they include, or through a parent: a receiverless
+    // call in the module's method runs on one of their instances.
+    let includers_of = |module: &ClassId| -> Vec<ClassId> {
+        let reaches = |class: &ClassId| {
+            let mut current = Some(class);
+            for _ in 0..32 {
+                let Some(id) = current else { break };
+                let Some(info) = registry.get(id) else { break };
+                let mut pending: Vec<&ClassId> = info.includes.iter().collect();
+                let mut seen: crate::det::HashSet<&ClassId> = crate::det::HashSet::default();
+                while let Some(m) = pending.pop() {
+                    if m == module {
+                        return true;
+                    }
+                    if seen.insert(m) {
+                        pending.extend(registry.get(m).into_iter().flat_map(|inc| inc.includes.iter()));
+                    }
+                }
+                current = info.parent.as_ref();
+            }
+            false
+        };
+        let mut out: Vec<ClassId> = registry.iter().filter(|(id, info)| !info.is_module && reaches(id)).map(|(id, _)| id.clone()).collect();
+        out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        out
+    };
     for lc in &mut app.library_classes {
         let owner = lc.name.clone();
-        let own_missing = answers_missing(&owner);
+        // A module's `self` is an includer: a receiverless call is a miss only if no includer answers it, and with no
+        // includer known it is left as written, where Ruby's own dispatch decides.
+        let includers = if lc.is_module && answers_missing(&owner) { includers_of(&owner) } else { Vec::new() };
+        let own_missing = answers_missing(&owner) && (!lc.is_module || !includers.is_empty());
         let subclasses_define = below.get(owner.0.as_str()).cloned().unwrap_or_default();
         for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
             // Not inside `method_missing` itself, where an unanswered name is the one it was asked.
@@ -168,7 +197,7 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
             let mut locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
             // (a name a subclass defines is no miss: treated as the locals are, left as written)
             locals.extend(subclasses_define.iter().map(|n| Symbol::from(n.as_str())));
-            rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers, &private_missing);
+            rewrite(&mut m.body, &owner, own_missing, &locals, &includers, true, registry, &answers_missing, &core_of, &module_answers, &private_missing);
         }
     }
     // A block a class-body call hands over (`uid do request.params[options.uid_field] end`, replayed and instance_eval'd
@@ -184,7 +213,7 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
     }
     // Every other body reaches such a class through a receiver (`auth.provider` on OmniAuth's AuthHash in a model).
     let nobody = ClassId(Symbol::from(""));
-    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], true, registry, &answers_missing, &core_of, &module_answers, &private_missing));
+    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], &[], true, registry, &answers_missing, &core_of, &module_answers, &private_missing));
 }
 
 fn rewrite(
@@ -192,6 +221,7 @@ fn rewrite(
     owner: &ClassId,
     own_missing: bool,
     locals: &[Symbol],
+    includers: &[ClassId],
     typed: bool,
     registry: &HashMap<ClassId, crate::analyze::ClassInfo>,
     answers_missing: &dyn Fn(&ClassId) -> bool,
@@ -199,7 +229,7 @@ fn rewrite(
     module_answers: &dyn Fn(&ClassId, &str) -> bool,
     private_missing: &crate::det::HashSet<String>,
 ) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, typed, registry, answers_missing, core_of, module_answers, private_missing));
+    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, includers, typed, registry, answers_missing, core_of, module_answers, private_missing));
     // Typed too where `typed` (the analysis answers a call no method takes with `method_missing`'s type), but not on a
     // receiver spelled as a class object (`Errors.new`, `self.class.new`): `Ty::Class` alone does not tell it from an instance.
     let instance_read = |r: &Expr| {
@@ -230,6 +260,16 @@ fn rewrite(
         || module_answers(&class, method.as_str())
         || (recv.is_none() && super::core_instance_methods::KERNEL_PRIVATE.contains(&method.as_str()))
     {
+        return;
+    }
+    // In a module, a name an includer answers (its column reader, its own `def`) is no miss.
+    let answered_by = |id: &ClassId| {
+        core_of(id).contains(&method.as_str())
+            || module_answers(id, method.as_str())
+            || crate::analyze::diagnostics::method_registered_on(registry, Some(&Ty::Class { id: id.clone(), args: vec![].into() }), method)
+            || registry.get(id).is_some_and(|info| info.attributes.fields.contains_key(method))
+    };
+    if recv.is_none() && includers.iter().any(answered_by) {
         return;
     }
     let private = recv.is_some() && private_missing.contains(class.0.as_str());

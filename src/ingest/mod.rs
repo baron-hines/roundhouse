@@ -175,6 +175,7 @@ pub mod vite;
 pub mod current_page;
 mod computed_partials;
 mod yield_partials;
+mod form_partial_record;
 pub mod time_tag;
 mod visibility;
 

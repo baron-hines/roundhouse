@@ -956,6 +956,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // is carried so the census and the unknown-gem attribution can
     // read it beside the diagnostics.
     let lock_path = dir.join("Gemfile.lock");
+    super::library_class::set_actionview_major(None);
     if vfs.exists(&lock_path) {
         if let Ok(text) = vfs.read_to_string(&lock_path) {
             let mut lock = crate::gems::Lockfile::parse(&text);
@@ -966,6 +967,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             lock.source.extend(auto_sourced.iter().cloned());
             app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
+                let version = lock.specs.iter().find(|(n, _)| n == "actionview").or_else(|| lock.specs.iter().find(|(n, _)| n == "rails"));
+                super::library_class::set_actionview_major(version.and_then(|(_, v)| v.split('.').next()?.parse().ok()));
                 app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock, &app.extensions);
             }
         }
@@ -1761,6 +1764,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // not abort ingest.
     // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
     app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
+    // Not for an app with no `config/application.rb`: the runtime's defaults are `load_defaults` 8.1's.
+    app.hidden_field_autocomplete = vfs.exists(&dir.join("config/application.rb")) && !read_remove_hidden_field_autocomplete(vfs, dir);
     app.active_job_retry_jitter = read_active_job_retry_jitter(vfs, dir);
     // The ActiveJob queue adapter (see `App::queue_adapter`).
     app.queue_adapter = read_queue_adapter(vfs, dir);
@@ -3586,6 +3591,7 @@ end
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
     super::vite::lower_vite_tags(&mut app);
+    super::form_partial_record::add(&mut app);
     super::yield_partials::specialize(&mut app);
     super::computed_partials::dispatch(&mut app);
     super::current_page::lower_current_page(&mut app);
@@ -15207,6 +15213,63 @@ fn read_active_job_retry_jitter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> f64 {
 /// What a trimmed, non-comment config line sets the app-wide
 /// `wrap_parameters_by_default` to, or `None` when the line says nothing
 /// about it. One definition for the lift and the initializer ledger.
+/// `ActionView::Base.remove_hidden_field_autocomplete`, read as `read_wrap_parameters_by_default` reads its key:
+/// `config.load_defaults` 8.1+ turns it on, and an explicit `config.action_view.remove_hidden_field_autocomplete = …`
+/// (application, production or an initializer, such as the upgrade's `new_framework_defaults_8_1.rb`) wins.
+fn read_remove_hidden_field_autocomplete<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    // Not a trailing comment's assignment (`config.eager_load = true# config.action_view.… = false`).
+    let code = |line: &str| -> String {
+        let mut quote: Option<char> = None;
+        for (i, c) in line.char_indices() {
+            match (quote, c) {
+                (None, '#') => return line[..i].trim().to_string(),
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => quote = None,
+                _ => {}
+            }
+        }
+        line.trim().to_string()
+    };
+    let code_lines = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes).lines().map(code).filter(|l| !l.is_empty()).collect()
+    };
+    let mut files: Vec<Vec<String>> = Vec::new();
+    let mut on = false;
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        let lines = code_lines(&source);
+        for line in &lines {
+            if let Some(v) = load_defaults_version(line) {
+                on = v >= 8.1;
+            }
+        }
+        files.push(lines);
+    }
+    if let Ok(source) = vfs.read(&dir.join("config/environments/production.rb")) {
+        files.push(code_lines(&source));
+    }
+    let init_dir = dir.join("config/initializers");
+    if vfs.is_dir(&init_dir)
+        && let Ok(paths) = read_rb_files(vfs, &init_dir)
+    {
+        for path in paths {
+            if let Ok(source) = vfs.read(&path) {
+                files.push(code_lines(&source));
+            }
+        }
+    }
+    for line in files.iter().flatten() {
+        if let Some(i) = line.find("action_view.remove_hidden_field_autocomplete") {
+            let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            if rest.starts_with("true") {
+                on = true;
+            } else if rest.starts_with("false") {
+                on = false;
+            }
+        }
+    }
+    on
+}
+
 pub(super) fn wrap_parameters_line(line: &str) -> Option<bool> {
     if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
         let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
