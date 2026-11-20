@@ -319,6 +319,21 @@ raise "describe #{got.inspect}" unless got == "box / app box / helped"
 puts "helper passed"
 "##;
 
+/// The gem's class sets a class variable, and a block's method asks
+/// `defined?(@@configured)`. The block's lexical scope is the top level,
+/// so Ruby 4.0.7 answers `"plain"` there; a `class Shelf::Box` reopening
+/// would answer `"configured"`.
+#[allow(dead_code)]
+pub fn class_eval_class_variable_app() -> emit_and_run::Overlay {
+    let lib = SHELF.replace("  class Box\n", "  class Box\n    @@configured = true\n\n");
+    with_gem_lib(&lib)
+        .write(
+            "config/initializers/shelf_box.rb",
+            "Shelf::Box.class_eval do\n  def self.local_tag\n    defined?(@@configured) ? \"configured\" : \"plain\"\n  end\nend\n",
+        )
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// An initializer reopen gives the gem's class a `TokenSource` of its
 /// own, and a later block in the same file reads `TokenSource` bare.
 /// Ruby 4.0.7 reads the top level's in the block (`"top"`); an opening

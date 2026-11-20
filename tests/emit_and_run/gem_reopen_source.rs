@@ -239,6 +239,22 @@ fn a_class_eval_reading_a_constant_an_initializer_reopen_defines_is_left_reporte
     assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
 }
 
+/// A block whose method reads a class variable is not taken: Ruby looks
+/// `@@configured` up in the block's lexical scope, the top level, and the
+/// opening would read the gem class's. It stays reported.
+#[test]
+fn a_class_eval_reading_a_class_variable_is_left_reported() {
+    let source = shelf_box(contract::class_eval_class_variable_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_class_variable_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
 /// A block the ingest refuses leaves the file's other blocks taken.
 #[test]
 fn a_refused_class_eval_block_leaves_the_files_others_kept() {
