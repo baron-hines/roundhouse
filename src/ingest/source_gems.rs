@@ -396,12 +396,45 @@ pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf
 }
 
 fn requires(text: &str) -> Vec<(bool, String)> {
-    struct Finder(Vec<(bool, String)>, usize);
+    struct Finder(Vec<(bool, String)>, usize, Vec<Vec<u8>>);
+    /// `File.dirname(__FILE__)` or `__dir__`: the directory of the file being loaded.
+    fn file_dir(node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(call) = node.as_call_node() {
+            if call.name().as_slice() == b"__dir__" && call.receiver().is_none() && call.arguments().is_none() {
+                return true;
+            }
+            let file = call.receiver().and_then(|r| r.as_constant_read_node()).is_some_and(|c| c.name().as_slice() == b"File");
+            let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            return file && call.name().as_slice() == b"dirname" && matches!(args.as_slice(), [a] if a.as_source_file_node().is_some());
+        }
+        false
+    }
+    impl Finder {
+        /// `"#{direc}/method_source/version"` over `direc = File.dirname(__FILE__)` (method_source): a path relative to
+        /// the file, as `require_relative` takes it.
+        fn built_relative(&self, arg: &ruby_prism::Node<'_>) -> Option<String> {
+            let parts: Vec<_> = arg.as_interpolated_string_node()?.parts().iter().collect();
+            let [head, rest] = parts.as_slice() else { return None };
+            let embedded = head.as_embedded_statements_node()?.statements()?;
+            let body: Vec<_> = embedded.body().iter().collect();
+            let [inner] = body.as_slice() else { return None };
+            let dir = file_dir(inner) || inner.as_local_variable_read_node().is_some_and(|l| self.2.iter().any(|n| n.as_slice() == l.name().as_slice()));
+            let rest = String::from_utf8_lossy(rest.as_string_node()?.unescaped()).into_owned();
+            (dir && rest.starts_with('/')).then(|| rest.trim_start_matches('/').to_string())
+        }
+    }
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
             self.1 += 1;
             ruby_prism::visit_def_node(self, node);
             self.1 -= 1;
+        }
+
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            if self.1 == 0 && file_dir(&node.value()) {
+                self.2.push(node.name().as_slice().to_vec());
+            }
+            ruby_prism::visit_local_variable_write_node(self, node);
         }
 
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -421,12 +454,18 @@ fn requires(text: &str) -> Vec<(bool, String)> {
             };
             if let (Some(feature), None) = (feature, node.receiver()) {
                 self.0.push((relative == Some(true), String::from_utf8_lossy(feature.unescaped()).into_owned()));
+            } else if relative == Some(false)
+                && node.receiver().is_none()
+                && let [arg] = args.as_slice()
+                && let Some(path) = self.built_relative(arg)
+            {
+                self.0.push((true, path));
             }
             ruby_prism::visit_call_node(self, node);
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder(Vec::new(), 0);
+    let mut finder = Finder(Vec::new(), 0, Vec::new());
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.0
 }
@@ -725,6 +764,12 @@ mod tests {
         let files: Vec<_> = gems[0].files.iter().map(|p| p.display().to_string()).collect();
         assert_eq!(files, vec!["lib/widgets/part.rb", "lib/widgets.rb"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_require_built_on_the_files_directory_is_relative() {
+        let found = super::requires("direc = File.dirname(__FILE__)\nrequire \"#{direc}/method_source/version\"\nrequire \"#{__dir__}/other\"\nrequire \"#{name}/no\"\n");
+        assert_eq!(found, vec![(true, "method_source/version".to_string()), (true, "other".to_string())]);
     }
 
     #[test]

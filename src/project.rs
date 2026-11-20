@@ -10313,7 +10313,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         }
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
-            && matches!(path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..], ["RUBY_VERSION" | "RUBY_PLATFORM"] | ["Object", "RUBY_VERSION" | "RUBY_PLATFORM"])
+            && matches!(path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..], ["RUBY_VERSION" | "RUBY_PLATFORM" | "RUBY_ENGINE"] | ["Object", "RUBY_VERSION" | "RUBY_PLATFORM" | "RUBY_ENGINE"])
         {
             emit::diagnostics::report_unsupported(
                 expr.span,

@@ -167,7 +167,7 @@ const CORE_TOP_CONSTS: &[&str] = &["STDIN", "STDOUT", "STDERR"];
 
 /// `if RUBY_VERSION >= "2.7.1"` (aasm, hashie): the running Ruby's own
 /// version, which a compile-time answer would freeze to the wrong one.
-const CORE_TOP_STR_CONSTS: &[&str] = &["RUBY_VERSION", "RUBY_PLATFORM"];
+const CORE_TOP_STR_CONSTS: &[&str] = &["RUBY_VERSION", "RUBY_PLATFORM", "RUBY_ENGINE"];
 
 fn io_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![].into() }
