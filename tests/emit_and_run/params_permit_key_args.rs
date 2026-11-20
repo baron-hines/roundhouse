@@ -186,7 +186,7 @@ fn string_keys_on_a_permitted_hash_name_its_keys() {
         .assert_passes();
 }
 
-/// The Spinel emit writes the same Symbol keys; the plain Hash keeps its String.
+/// The Spinel emit writes the same Symbol keys, through a helper too; a plain Hash keeps its String.
 #[test]
 fn the_spinel_emit_names_the_symbol_keys() {
     let (tree, errors) = emit_and_run::real_blog()
@@ -203,6 +203,9 @@ fn the_spinel_emit_names_the_symbol_keys() {
         ".except(*keys.map { |x| x.to_sym })",
         ".merge(title: \"z\")",
         "}.except(\"version\")",
+        "article_params.except(:title)",
+        "memo_params.merge(body: \"x\").compact.except(*%i[version])",
+        "plain_attrs.except(\"version\")",
     ] {
         assert!(src.contains(line), "missing `{line}`:\n{src}");
     }
