@@ -108,13 +108,15 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // strict mode too.
     let mut hotspots: Option<bool> = None;
 
+    // Not on by default: the boot runs the checked app's own code, which a static check never did.
+    let mut observe_boot = std::env::var_os("ROUNDHOUSE_OBSERVE_APP_BOOT").is_some_and(|v| v == "1");
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
                     "Usage: roundhouse check [--continue|--strict] [--unknown-sends]\n\
-                     \x20                  [--inventory PATH] [--hotspots|--no-hotspots] [APP]\n\n\
+                     \x20                  [--inventory PATH] [--hotspots|--no-hotspots] [--observe-boot] [APP]\n\n\
                      Analyze the Rails app at APP (default {default_app}) and print the\n\
                      diagnostics; exit 1 on parse or type errors.\n\n\
                      Options:\n\
@@ -131,7 +133,11 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
                        --hotspots   Print the ranked error/survey hotspot report (default\n\
                                     on with --continue).\n\
                        --no-hotspots\n\
-                                    Suppress the hotspot report."
+                                    Suppress the hotspot report.\n\
+                       --observe-boot\n\
+                                    Boot the app under its bundle (it runs the app's own\n\
+                                    code) to read what a gem defines on its classes as it\n\
+                                    loads (aasm's state methods). Also ROUNDHOUSE_OBSERVE_APP_BOOT=1."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -140,6 +146,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             "--strict" => continue_on_error = false,
             "--hotspots" => hotspots = Some(true),
             "--no-hotspots" => hotspots = Some(false),
+            "--observe-boot" => observe_boot = true,
             "--inventory" => {
                 let Some(path) = args.next() else {
                     eprintln!("roundhouse-check: --inventory requires a PATH argument");
@@ -195,9 +202,9 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     let mut survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
 
     // What a gem does to a class it holds in a variable (aasm's `klass.send(:define_method, …)`) is read from the app's
-    // own boot under its bundle; a boot that fails leaves the app as ingested, where those calls stay reported.
-    if let Ok(app) = &ingest_result
-        && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0")
+    // own boot under its bundle, when asked; a boot that fails leaves the app as ingested, where those calls stay reported.
+    if observe_boot
+        && let Ok(app) = &ingest_result
         && let gems = crate::observed_shapes::needed(app)
         && !gems.is_empty()
         && let Ok(dir) = path.canonicalize()

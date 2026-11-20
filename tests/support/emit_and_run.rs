@@ -273,12 +273,13 @@ impl Overlay {
     fn run_spinel_with_flags(self, script: &str, flags: &[&str]) -> Run {
         // Before the bundle's key: a recorded case and its lookup hash the same script.
         let script = &to_completion(script);
-        if let Some(dir) = bundle::collect_dir() {
+        // Not bundled when the boot is observed: the shared build ingests without the observation.
+        if let Some(dir) = bundle::collect_dir().filter(|_| !self.observe_boot) {
             bundle::record(&dir, &self, script, flags);
             panic!("spinel bundle collect: recorded, not run");
         }
         // Not the bundled run's failure as the test's: another case's added method or route rides in that build, so it is judged again alone.
-        let shared = bundle::run_shared(&self, script, flags).filter(|run| run.success);
+        let shared = if self.observe_boot { None } else { bundle::run_shared(&self, script, flags).filter(|run| run.success) };
         // Nor the bundle's errors as the case's: the group is checked merged, where another case's
         // added method can answer a call this one leaves unresolved. A case with errors of its own
         // runs alone, so its `Run` carries them and the program is its own.

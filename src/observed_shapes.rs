@@ -83,18 +83,43 @@ pub struct Cached {
 
 /// The Ruby and gem paths a boot runs with, read in the app's directory: a failed boot is reused only under the same.
 pub fn environment(dir: &Path) -> String {
-    let out = boot_env(std::process::Command::new("ruby"))
+    let mut probe = boot_env(std::process::Command::new("ruby"));
+    probe
         .args(["-e", "print RUBY_DESCRIPTION, \"\\n\", Gem.path.join(\":\"), \"\\n\", Gem::Specification.map(&:full_name).sort.join(\" \")"])
-        .current_dir(dir)
-        .output();
-    match out {
+        .current_dir(dir);
+    match output_within(probe, PROBE_SECS) {
         Ok(out) => {
             String::from_utf8_lossy(&out.stdout).into_owned()
                 + &std::env::var("GEM_PATH").unwrap_or_default()
                 + &std::env::var("GEM_HOME").unwrap_or_default()
                 + &std::env::var(BOOT_BUNDLE_PATH).unwrap_or_default()
+                // Not one observation for every environment: Rails boots what `RAILS_ENV` names.
+                + &std::env::var("RAILS_ENV").unwrap_or_else(|_| "development".into())
         }
         Err(_) => "no ruby".into(),
+    }
+}
+
+const PROBE_SECS: u64 = 60;
+
+/// A subprocess's output, or an error once it runs past `secs`: a Ruby that stalls must not hold the check.
+fn output_within(mut command: std::process::Command, secs: u64) -> Result<std::process::Output, String> {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return child.wait_with_output().map_err(|e| e.to_string());
+        }
+        if started.elapsed() > std::time::Duration::from_secs(secs) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("it did not finish in {secs} s"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -446,22 +471,35 @@ pub fn observe(input: &Path, gems: &[String], key: &str, boot: Boot<'_>) -> Resu
 pub fn observe_app(input: &Path, gems: &[String], key: &str) -> (Result<Patches, String>, Vec<(String, String)>) {
     let mut merged = Observation::default();
     let mut refused = Vec::new();
-    for gem in gems {
-        // Not one boot for all: a gem whose doing cannot be written (view_component's generated slot module) would
-        // keep every other gem's from being read.
-        let observation = observed(input, std::slice::from_ref(gem), key, Boot::App, &input.join(APP_CACHE).join(format!("{gem}.json")));
-        match observation.refusals.first() {
-            Some(why) => refused.push((gem.clone(), why.clone())),
-            None => {
-                merged.effects.extend(observation.effects);
-                merged.loaded.extend(observation.loaded);
-            }
-        }
-    }
     let dir = match input.canonicalize() {
         Ok(dir) => dir,
         Err(e) => return (Err(e.to_string()), refused),
     };
+    // The class-body statements whose effects a gem already merged: each gem's boot is separate, so the order of two
+    // gems' effects behind one statement is not known.
+    let mut triggers: std::collections::BTreeSet<Trigger> = std::collections::BTreeSet::new();
+    for gem in gems {
+        // Not one boot for all: a gem whose doing cannot be written (view_component's generated slot module) would
+        // keep every other gem's from being read.
+        let observation = observed(input, std::slice::from_ref(gem), key, Boot::App, &input.join(APP_CACHE).join(format!("{gem}.json")));
+        if let Some(why) = observation.refusals.first() {
+            refused.push((gem.clone(), why.clone()));
+            continue;
+        }
+        // Not merged before its own patches apply: a gem whose trigger reads two ways would drop every other's.
+        if let Err(why) = patches(&observation, &dir) {
+            refused.push((gem.clone(), why));
+            continue;
+        }
+        let own: std::collections::BTreeSet<Trigger> = observation.effects.iter().filter_map(|e| e.trigger.clone()).collect();
+        if let Some(shared) = own.iter().find(|t| triggers.contains(*t)) {
+            refused.push((gem.clone(), format!("{}: another gem's effects come from `{}` too, in an order the separate boots do not keep", shared.file, shared.text)));
+            continue;
+        }
+        triggers.extend(own);
+        merged.effects.extend(observation.effects);
+        merged.loaded.extend(observation.loaded);
+    }
     (patches(&merged, &dir), refused)
 }
 
@@ -478,10 +516,12 @@ fn observed(input: &Path, gems: &[String], key: &str, boot: Boot<'_>, cache: &Pa
     let before = obs::environment(input);
     let booted = boot_observer(input, gems, boot);
     let env = Some(before).filter(|before| *before == obs::environment(input));
+    // Not the app's failed boot kept: a database or service that was down may be up on the next check, which asked for it.
+    let keep = booted.is_ok() || !matches!(boot, Boot::App);
     let observation = booted.unwrap_or_else(|why| obs::Observation { effects: Vec::new(), refusals: vec![why], loaded: Vec::new() });
     // Not only a boot that answered: one that failed would otherwise be tried again on every build.
     // Nor one whose Ruby or gems changed while it ran: which of them it saw is not known.
-    if env.is_some() {
+    if env.is_some() && keep {
         if let Some(dir) = cache.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -500,7 +540,13 @@ fn boot_observer(input: &Path, gems: &[String], boot: Boot<'_>) -> Result<Observ
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
             std::env::temp_dir().join(format!("roundhouse-observe-{}-{nanos:x}-{attempt}", std::process::id()))
         })
-        .find(|dir| std::fs::create_dir(dir).is_ok())
+        .find(|dir| {
+            let mut builder = std::fs::DirBuilder::new();
+            // Not readable by other users: the boot's log holds what the app prints as it loads.
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).is_ok()
+        })
         .ok_or("no fresh temporary directory for the observed boot")?;
     let observed = boot_observer_in(input, gems, &tmp, boot);
     if std::env::var_os("ROUNDHOUSE_OBSERVE_KEEP").is_none() {
@@ -530,18 +576,25 @@ fn boot_observer_in(input: &Path, gems: &[String], tmp: &Path, boot: Boot<'_>) -
                     .rsplit_once('-')
                     .ok_or_else(|| format!("`{gem}` names no version"))?;
                 // In the app's directory: its `.ruby-version` names the Ruby whose gems the app runs on.
-                let found = ruby()
+                let mut lookup = ruby();
+                lookup
                     .args([
                         "-e",
                         &format!(
                             "print Gem::Specification.find_by_name({name:?}, {version:?}).gem_dir"
                         ),
                     ])
-                    .current_dir(input)
-                    .output()
-                    .map_err(|e| format!("ruby: {e}"))?;
+                    .current_dir(input);
+                let found = output_within(lookup, PROBE_SECS).map_err(|e| format!("looking up {gem}: {e}"))?;
                 if !found.status.success() {
-                    return Err(format!("CRuby does not have {gem} installed"));
+                    let stderr = String::from_utf8_lossy(&found.stderr);
+                    // Not always a missing gem: under `bundle exec` the bundle itself may not set up.
+                    let first = stderr.lines().next().unwrap_or("").chars().take(300).collect::<String>();
+                    return Err(if stderr.contains("Gem::MissingSpecError") {
+                        format!("CRuby does not have {gem} installed")
+                    } else {
+                        format!("looking up {gem}: {first}")
+                    });
                 }
                 roots.push(String::from_utf8_lossy(&found.stdout).into_owned());
             }

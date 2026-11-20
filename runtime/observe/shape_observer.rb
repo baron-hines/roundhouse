@@ -134,7 +134,8 @@ module RoundhouseShapeObserver
     end
 
     def record_base_loaded?
-      Object.const_defined?(:ActiveRecord, false) && !ActiveRecord.autoload?(:Base) && ActiveRecord.const_defined?(:Base, false)
+      Object.const_defined?(:ActiveRecord, false) && !Object.autoload?(:ActiveRecord) && !ActiveRecord.autoload?(:Base) &&
+        ActiveRecord.const_defined?(:Base, false)
     end
 
     def refuse(why)
@@ -151,7 +152,8 @@ module RoundhouseShapeObserver
     # The same as a lambda literal, for a macro handed one.
     def lambda_literal(name, proc_)
       parts = body_of(name, proc_) or return nil
-      "->(#{parts[0]}) { #{parts[1]} }"
+      # Not the brace on the body's last line: a trailing comment there would swallow it.
+      "->(#{parts[0]}) {\n#{parts[1]}\n}"
     end
 
     MUTATORS = %i[<< push append unshift prepend concat insert []= store update merge! replace clear delete delete_if keep_if select! reject! map! collect! compact! flatten! uniq! sort! sort_by! shift pop fill transform_values! transform_keys!].freeze
