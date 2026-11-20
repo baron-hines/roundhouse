@@ -514,6 +514,8 @@ impl Overlay {
                 }
             }
         }
+        // Not another overlay's patches: a test thread may run an observed overlay before this one.
+        roundhouse::observed_shapes::uninstall();
         if self.observe_boot {
             let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
             let app = app.expect("ingest the overlaid fixture before observing its boot");

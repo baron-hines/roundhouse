@@ -220,6 +220,8 @@ module RoundhouseShapeObserver
       body = node.body
       return nil if body && !walk.call(body, 0)
       source = File.binread(path)
+      # Not a body holding `=begin`/`=end`: written into the class body indented, they would no longer be comments.
+      return refuse("#{name}: an embedded `=begin` comment") if source.byteslice(node.location.start_offset, node.location.end_offset - node.location.start_offset).match?(/^=begin\b/)
       # Not the body's own end: Prism ends a statement list before the `)` of a last call handed `&block`.
       finish = node.closing_loc ? node.closing_loc.start_offset : body&.location&.end_offset
       text = body ? source.byteslice(body.location.start_offset, finish - body.location.start_offset).rstrip : "nil"

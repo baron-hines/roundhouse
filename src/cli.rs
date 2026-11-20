@@ -220,10 +220,19 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
                 if continue_on_error {
                     survey::activate();
                 }
-                (ingest_result, parse_diags) =
+                let (patched, patched_diags) =
                     crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
-                survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
+                let patched_survey = if continue_on_error { survey::drain() } else { Vec::new() };
                 crate::observed_shapes::uninstall();
+                // Not the patched app when it does not ingest: the first one, whose report the check still gives.
+                match patched {
+                    Ok(app) => {
+                        ingest_result = Ok(app);
+                        parse_diags = patched_diags;
+                        survey_errors = patched_survey;
+                    }
+                    Err(why) => eprintln!("roundhouse-check: note: the app with the observed boot's patches does not ingest: {why}"),
+                }
             }
             Ok(_) => {}
             Err(why) => eprintln!("roundhouse-check: note: the observed boot's patches do not apply: {why}"),
