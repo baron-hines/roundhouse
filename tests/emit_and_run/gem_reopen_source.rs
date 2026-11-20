@@ -222,6 +222,23 @@ fn a_class_eval_reading_a_constant_the_gems_class_inherits_is_left_reported() {
     }
 }
 
+/// A block whose method reads a bare name an initializer reopen defines
+/// in the gem's class is not taken either: Ruby reads the top level's
+/// `TokenSource` there, and the opening would read the reopen's. It stays
+/// reported.
+#[test]
+fn a_class_eval_reading_a_constant_an_initializer_reopen_defines_is_left_reported() {
+    let source = shelf_box(contract::class_eval_reopen_constant_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_reopen_constant_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
 /// A block the ingest refuses leaves the file's other blocks taken.
 #[test]
 fn a_refused_class_eval_block_leaves_the_files_others_kept() {

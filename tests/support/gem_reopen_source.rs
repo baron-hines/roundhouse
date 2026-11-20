@@ -319,6 +319,20 @@ raise "describe #{got.inspect}" unless got == "box / app box / helped"
 puts "helper passed"
 "##;
 
+/// An initializer reopen gives the gem's class a `TokenSource` of its
+/// own, and a later block in the same file reads `TokenSource` bare.
+/// Ruby 4.0.7 reads the top level's in the block (`"top"`); an opening
+/// would read the reopen's (`"shadow"`).
+#[allow(dead_code)]
+pub fn class_eval_reopen_constant_app() -> emit_and_run::Overlay {
+    with_gem()
+        .write(
+            "config/initializers/shelf_box.rb",
+            "TokenSource = \"top\"\n\nclass Shelf::Box\n  TokenSource = \"shadow\"\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    TokenSource\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n",
+        )
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
 /// The gem's class with a constant of its own, and a block whose method
 /// reads that name bare. The block's lexical scope is the top level, so
 /// Ruby looks `TOKEN` up there: `uninitialized constant TOKEN`, not the
