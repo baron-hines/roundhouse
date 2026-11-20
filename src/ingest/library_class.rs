@@ -4594,8 +4594,9 @@ fn walk_decl_body_with_visibility<'pr>(
         let mut classes = parsed?;
         let Some(class) = classes.pop() else { continue };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
-        // At the element, and one span per statement of the string: `include A; include B` is two statements
-        // and `include A, B` one. The end moves a byte per statement and stays inside the loop.
+        // From the element to the loop's end, one span per statement of the string: `include A; include B` is two
+        // statements and `include A, B` one, the end a byte nearer per statement. The span holds the string, so a
+        // name it spells (`include Leaf`, the host's nested `Leaf`) is looked up where it is written.
         // Where the loop stands: after the includes before it and its earlier elements', ahead of an ordinary
         // `include` written after it, which Ruby runs later.
         let spanned = out.include_spans.len() == out.includes.len();
@@ -4610,7 +4611,7 @@ fn walk_decl_body_with_visibility<'pr>(
             if i > 0 && (parsed.is_none() || parsed != class.include_spans.get(i - 1)) {
                 statement += 1;
             }
-            let end = element_end.saturating_add(statement).min(end.max(element_end));
+            let end = end.saturating_sub(statement).max(element_end);
             if spanned {
                 out.includes.insert(at, include.clone());
                 out.include_spans.insert(at, Span { file: super::sources::file_id(file), start: element_start, end });
