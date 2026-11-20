@@ -273,14 +273,21 @@ pub(super) const FRAMEWORK_ROOTS: &[&str] = &[
 /// Bundler loads the gem before Rails runs the initializer, so the class
 /// holds both, and a method both define is the initializer's. The emit
 /// writes the openings into one file, the gem's first.
+///
+/// A `Const.class_eval do … end` of `def`s on such a name
+/// (`library_class::class_eval_openings`) is the same opening and is kept
+/// the same way, as a module when the gem declares one. Its statement is
+/// returned, so the initializer ledger stops reporting it as having no
+/// effect; one on any other name is left on the ledger.
 fn keep_initializer_defined(
     app: &mut App,
     dir: &Path,
     sources: &[crate::span::SourceFile],
     gem_mounts: &[PathBuf],
     candidates: Vec<LibraryClass>,
+    class_evals: Vec<((String, u32), super::library_class::ClassEvalOpening)>,
     callback_constants: &std::collections::HashSet<String>,
-) {
+) -> Vec<(String, u32)> {
     const CORE: &[&str] = &[
         "Object", "BasicObject", "Kernel", "Module", "Class", "Comparable",
         "Enumerable", "Integer", "Float", "Numeric", "String", "Symbol",
@@ -318,46 +325,164 @@ fn keep_initializer_defined(
     let from_gem = |lc: &LibraryClass| {
         opening_file(lc, sources).is_some_and(|file| gem_mounts.iter().any(|mount| Path::new(file).starts_with(mount)))
     };
-    let gem_declared: HashSet<String> =
-        app.library_classes.iter().filter(|c| from_gem(c)).map(|c| c.name.0.as_str().to_string()).collect();
-    for lc in candidates {
-        let name = lc.name.0.as_str().to_string();
-        if gem_declared.contains(&name) {
-            app.library_classes.push(lc);
+    let gem_declared: HashMap<String, bool> =
+        app.library_classes.iter().filter(|c| from_gem(c)).map(|c| (c.name.0.as_str().to_string(), c.is_module)).collect();
+    // The names a gem's class or module defines in itself or in a gem
+    // superclass or included module: their constants and nested classes,
+    // the gem's or an initializer reopen's. A block reading one of them
+    // bare reads the top level's in Ruby, which the kept opening, looking
+    // through its ancestors, would not.
+    let gem_owns_itself = |owner: &str, name: &str| {
+        let nested = format!("{owner}::{name}");
+        let reopens = candidates.iter().filter(|c| gem_declared.contains_key(c.name.0.as_str()));
+        app.library_classes.iter().filter(|c| from_gem(c)).chain(reopens).any(|c| {
+            (c.name.0.as_str() == owner && c.constants.iter().any(|(n, _)| n.as_str() == name))
+                || c.name.0.as_str() == nested
+        })
+    };
+    // Every name the gem declares, with the namespaces its nested names
+    // open: a class holding only a nested module is no opening of its own.
+    let gem_namespaces: crate::det::HashSet<String> = gem_declared
+        .keys()
+        .flat_map(|name| name.match_indices("::").map(|(at, _)| name[..at].to_string()).chain([name.clone()]))
+        .collect();
+    let gem_owned = |owner: &str, name: &str| {
+        let mut pending = vec![owner.to_string()];
+        let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if gem_owns_itself(&current, name) {
+                return true;
+            }
+            for opening in app.library_classes.iter().filter(|c| from_gem(c) && c.name.0.as_str() == current) {
+                for ancestor in opening.parent.iter().chain(&opening.includes) {
+                    // A bare ancestor is looked up from the opening's namespaces outward.
+                    let written = ancestor.0.as_str().trim_start_matches("::");
+                    let mut scopes: Vec<&str> = current.match_indices("::").map(|(at, _)| &current[..at]).collect();
+                    scopes.reverse();
+                    let found = if ancestor.0.as_str().starts_with("::") {
+                        None
+                    } else {
+                        scopes.iter().map(|scope| format!("{scope}::{written}")).find(|n| gem_namespaces.contains(n))
+                    };
+                    pending.push(found.unwrap_or_else(|| written.to_string()));
+                }
+            }
+        }
+        false
+    };
+    // Where each kept reopen of a gem's name runs: its initializer, which
+    // Rails runs in sorted order, and its place in that file. A later one
+    // stands over an earlier one, a `class_eval` block or not.
+    let at = |lc: &LibraryClass| {
+        lc.source_span().and_then(|span| {
+            let file = sources.get((span.file.0 as usize).checked_sub(1)?)?;
+            Some((super::sources::relative_path(&file.path), span.start))
+        })
+    };
+    let mut gem_reopens: Vec<(Option<(String, u32)>, LibraryClass)> = Vec::new();
+    let mut taken = Vec::new();
+    // What the kept blocks' methods read: a helper the initializer defines
+    // for them is live, whether or not the app names it.
+    let mut read_by_kept: crate::det::HashSet<String> = crate::det::HashSet::default();
+    for (statement, eval) in class_evals {
+        let mut lc = eval.opening;
+        let Some(&is_module) = gem_declared.get(lc.name.0.as_str()) else { continue };
+        if eval.bare_constants.iter().any(|name| gem_owned(lc.name.0.as_str(), name)) {
             continue;
         }
-        if name.contains("::")
-            || FRAMEWORK_ROOTS.contains(&name.as_str())
-            || CORE.contains(&name.as_str())
-            || app.library_classes.iter().any(|c| c.name == lc.name)
-            || app.models.iter().any(|m| m.name == lc.name)
-            || app.controllers.iter().any(|c| c.name == lc.name)
-            || !referenced(&name)
-        {
-            continue;
-        }
-        app.library_classes.push(lc);
+        lc.is_module = is_module;
+        read_by_kept.extend(eval.bare_constants);
+        read_by_kept.extend(eval.rooted_constants);
+        gem_reopens.push((Some(statement.clone()), lc));
+        taken.push(statement);
     }
+    let mut rest = Vec::new();
+    for lc in candidates {
+        if gem_declared.contains_key(lc.name.0.as_str()) {
+            // Kept whatever the app names, so what it reads is live too.
+            read_by_kept.extend(opening_constant_reads(&lc, sources));
+            gem_reopens.push((at(&lc), lc));
+        } else {
+            rest.push(lc);
+        }
+    }
+    // A reopen whose place is unknown (one holding only nested classes)
+    // goes first, in its order: the sort is stable.
+    gem_reopens.sort_by(|(a, _), (b, _)| a.cmp(b));
+    app.library_classes.extend(gem_reopens.into_iter().map(|(_, lc)| lc));
+    let eligible: Vec<LibraryClass> = rest
+        .into_iter()
+        .filter(|lc| {
+            let name = lc.name.0.as_str();
+            !(name.contains("::")
+                || FRAMEWORK_ROOTS.contains(&name)
+                || CORE.contains(&name)
+                || app.library_classes.iter().any(|c| c.name == lc.name)
+                || app.models.iter().any(|m| m.name == lc.name)
+                || app.controllers.iter().any(|c| c.name == lc.name))
+        })
+        .collect();
+    // A kept definition's methods can call another the initializer
+    // defines (`LabelHelper.tag` calling `TagSource.tag`): what each kept
+    // one reads is live too, until nothing more is.
+    let mut kept = vec![false; eligible.len()];
+    loop {
+        let mut grew = false;
+        for (at, lc) in eligible.iter().enumerate() {
+            let name = lc.name.0.as_str();
+            if kept[at] || !(referenced(name) || read_by_kept.contains(name)) {
+                continue;
+            }
+            kept[at] = true;
+            grew = true;
+            read_by_kept.extend(opening_constant_reads(lc, sources));
+        }
+        if !grew {
+            break;
+        }
+    }
+    app.library_classes.extend(eligible.into_iter().zip(kept).filter(|(_, kept)| *kept).map(|(lc, _)| lc));
+    taken
 }
 
-/// The first of an opening's spans that points at a source.
-fn opening_span(lc: &LibraryClass) -> Option<crate::span::Span> {
-    std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        // A method's name before its body: an `attr_reader`'s reader has
-        // a synthesized body but the name it was written with.
-        .chain(lc.methods.iter().map(|m| m.name_span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        // A body that only sets a class-level variable (`@configured = true`).
-        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())
+/// The constants an opening reads, bare or rooted: its superclass and the
+/// modules it includes, which Ruby resolves when the opening runs, and,
+/// from their source text, its methods' bodies and parameter defaults,
+/// its constants' values, its class ivars' initializers and the
+/// body-level calls it keeps as written (`extend TagSource`).
+fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
+    let mut out: Vec<String> = lc.parent.iter().chain(&lc.includes).map(|named| named.0.as_str().trim_start_matches("::").to_string()).collect();
+    let spans = lc
+        .methods
+        .iter()
+        .flat_map(|method| {
+            std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
+        })
+        .chain(lc.constants.iter().map(|(_, value)| value.span))
+        .chain(lc.class_ivar_initializers.iter().map(|value| value.span))
+        // A body-level call the opening keeps as written, such as
+        // `extend TagSource`, reads its arguments when the class loads.
+        .chain(lc.unknown_calls.iter().map(|call| call.span));
+    for span in spans {
+        if span.is_synthetic() {
+            continue;
+        }
+        let Some(file) = (span.file.0 as usize).checked_sub(1).and_then(|at| sources.get(at)) else { continue };
+        let Some(text) = file.text.get(span.start as usize..span.end as usize) else { continue };
+        let parsed = ruby_prism::parse(text.as_bytes());
+        let (bare, rooted) = super::library_class::constant_reads(&parsed.node());
+        out.extend(bare);
+        out.extend(rooted);
+    }
+    out
 }
 
-/// The file an opening was read from.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file<'s>(lc: &LibraryClass, sources: &'s [crate::span::SourceFile]) -> Option<&'s str> {
-    let span = opening_span(lc)?;
+    let span = lc.source_span()?;
     sources.get((span.file.0 as usize).checked_sub(1)?).map(|f| f.path.as_str())
 }
 
@@ -835,6 +960,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // is carried so the census and the unknown-gem attribution can
     // read it beside the diagnostics.
     let lock_path = dir.join("Gemfile.lock");
+    super::library_class::set_actionview_major(None);
     if vfs.exists(&lock_path) {
         if let Ok(text) = vfs.read_to_string(&lock_path) {
             let mut lock = crate::gems::Lockfile::parse(&text);
@@ -843,8 +969,31 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             }
             lock.source = app.extensions.source_gems.clone();
             lock.source.extend(auto_sourced.iter().cloned());
+            // A Rails engine the app depends on (a gem that depends on railties, rails-settings-cached): requiring it
+            // loads Rails, which no emitted tree carries, so it reads as a `rails_dependent` fact would say.
+            for gem in &lock.dependencies {
+                let sourced = lock.version_of(gem).is_some_and(|v| {
+                    let dir = format!("{gem}-{v}");
+                    source_gems.iter().any(|g| g.mount.file_name().is_some_and(|n| n == dir.as_str()))
+                });
+                if crate::gems::fate_of(gem) == crate::gems::GemFate::Unknown
+                    && !sourced
+                    && !lock.source.contains(gem)
+                    && !lock.is_in_repo(gem)
+                    && !app.extensions.is_rails_dependent(gem)
+                    && lock.reaches(gem, "railties")
+                {
+                    app.extensions.rails_dependent.push(crate::extensions::RailsDependentGem {
+                        gem: gem.clone(),
+                        why: "it depends on railties".to_string(),
+                        inferred: true,
+                    });
+                }
+            }
             app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
+                let version = lock.specs.iter().find(|(n, _)| n == "actionview").or_else(|| lock.specs.iter().find(|(n, _)| n == "rails"));
+                super::library_class::set_actionview_major(version.and_then(|(_, v)| v.split('.').next()?.parse().ok()));
                 app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock, &app.extensions);
             }
         }
@@ -1016,7 +1165,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let mut model_bases = super::library_class::ModelBases::new();
     // A model subclass's own validations, placed once every class is read.
     let mut sti_validations = Vec::new();
-    let mut base_pairs: Vec<(String, String)> = Vec::new();
+    let mut base_pairs: Vec<super::library_class::BasePair> = Vec::new();
     for root in &roots {
         let models_dir = dir.join(root).join("models");
         if !vfs.is_dir(&models_dir) {
@@ -1139,7 +1288,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                                 ));
                             }
                             if let Some(classes) = nested {
-                                let nested = nested_under(&outer, classes);
+                                let nested = nested_under(&source, &outer, classes);
                                 let scan =
                                     ingest_concern_model_items_with_constants(
                                         &source, &path_str, &enum_constants,
@@ -1294,9 +1443,10 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             // So is a gem's own ActiveModel class (`include
             // ActiveModel::Validations` with no superclass): no runtime
             // port defines the module to include, and the gem's
-            // validations compile as a model's do. An app `lib/` class
-            // keeps `lower::active_model_model`'s treatment (it may reopen
-            // a framework class).
+            // validations compile as a model's do, and so do an app `lib/`
+            // class's of its own (maybe's `Money`); one under a framework
+            // namespace keeps `lower::active_model_model`'s treatment (it
+            // may reopen a framework class).
             //
             // Only an explicit `Model` classification routes this way.
             // `None` — a file with no class, a bare module — stays a
@@ -1304,6 +1454,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             // directory itself is the app saying what the file is.
             if super::library_class::has_active_record_base(&source, &model_bases)
                 || (gem_libs.iter().any(|lib| entry.starts_with(lib)) && super::library_class::is_tableless_active_model(&source))
+                || (sub == "lib" && super::library_class::is_app_tableless_active_model(&source))
             {
                 match ingest_model_with_enum_constants(
                     &source, &path_str, &app.schema, &table_prefixes, &base_prefixes, &enum_constants,
@@ -1316,11 +1467,13 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // A gem's file runs more than its declaration when
                         // it loads: a require written below the class runs
                         // after it (`file_program`), a model's file as any.
-                        if gem_libs.iter().any(|lib| entry.starts_with(lib)) {
+                        // An app `lib/` model file (maybe's `Money`) keeps
+                        // the declarations beside it too.
+                        if gem_libs.iter().any(|lib| entry.starts_with(lib)) || sub == "lib" {
                             let mut carried: crate::det::HashSet<String> = Default::default();
                             carried.insert(outer.0.as_str().to_string());
                             if let Ok(nested) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
-                                carried.extend(nested_under(&outer, nested).iter().map(|c| c.name.0.as_str().to_string()));
+                                carried.extend(nested_under(&source, &outer, nested).iter().map(|c| c.name.0.as_str().to_string()));
                             }
                             // A declaration beside the model (`Helpers`
                             // beside `Node` in `module Tessera`) is the
@@ -1389,7 +1542,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             ));
                         }
                         if let Ok(classes) = nested {
-                            let nested = nested_under(&outer, classes);
+                            let nested = nested_under(&source, &outer, classes);
                             let scan =
                                 ingest_concern_model_items_with_constants(
                                     &source, &path_str, &enum_constants,
@@ -1408,6 +1561,9 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             app.library_classes.extend(nested);
                         }
                         super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
+                        // A concern declared beside the model carries its `included do` filters, as a library file's does.
+                        let beside: crate::det::HashSet<crate::ident::ClassId> = beside_names.iter().cloned().collect();
+                        record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |id| beside.contains(id));
                         continue;
                     }
                     Ok(None) => {}
@@ -1640,6 +1796,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     // not abort ingest.
     // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
     app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
+    // Not for an app with no `config/application.rb`: the runtime's defaults are `load_defaults` 8.1's.
+    app.hidden_field_autocomplete = vfs.exists(&dir.join("config/application.rb")) && !read_remove_hidden_field_autocomplete(vfs, dir);
     app.active_job_retry_jitter = read_active_job_retry_jitter(vfs, dir);
     // The ActiveJob queue adapter (see `App::queue_adapter`).
     app.queue_adapter = read_queue_adapter(vfs, dir);
@@ -2198,6 +2356,10 @@ end
     // kept or dropped after every app file is read (see
     // `keep_initializer_defined`).
     let mut initializer_defined: Vec<LibraryClass> = Vec::new();
+    // An initializer's top-level `Const.class_eval do … end` of `def`s,
+    // by the statement it is (path, start): kept or left on the ledger
+    // with `initializer_defined` (see `keep_initializer_defined`).
+    let mut class_eval_openings: Vec<((String, u32), super::library_class::ClassEvalOpening)> = Vec::new();
     let mut rate_limit_stores = Vec::new();
     // `ActionController::Base.prepend_view_path …`, applied with the class
     // bodies' own once every class is read (see `view_paths`).
@@ -2254,6 +2416,10 @@ end
                             initializer_defined.push(lc);
                         }
                     }
+                }
+                if let Ok(openings) = super::library_class::class_eval_openings(&bytes, &path_str) {
+                    let relative = super::sources::relative_path(&path_str);
+                    class_eval_openings.extend(openings.into_iter().map(|opening| ((relative.clone(), opening.start), opening)));
                 }
                 rate_limit_stores.extend(super::rate_limit::initializer_stores(&bytes, &path_str));
                 app.module_mixins.extend(mixins);
@@ -2328,15 +2494,18 @@ end
                     if let Some(classes) =
                         unwrap_or_record(ingest_library_classes(&source, &path_str))?
                     {
-                        app.library_classes.extend(nested_under(&outer, classes));
+                        app.library_classes.extend(nested_under(&source, &outer, classes));
                     }
                     // A concern nested in the controller, here or in a
                     // `cache_controller/versioning.rb` opening, declares
                     // its `included do` filters as one in the concerns
-                    // folder does (the branch below).
+                    // folder does (the branch below). Nested is lexical,
+                    // as for its classes: a rooted `module ::AccessRules`
+                    // in the body is one too.
                     let prefix = format!("{}::", outer.0.as_str());
+                    let inside = super::util::declared_inside(&super::prism::parse_silent(&source).node(), outer.0.as_str());
                     record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |id| {
-                        id.0.as_str().starts_with(&prefix)
+                        id.0.as_str().starts_with(&prefix) || inside.contains(id.0.as_str())
                     });
                 } else {
                     // Not a controller file: a module-only concern under
@@ -2851,6 +3020,7 @@ end
     app.vite_manifest = super::vite::read_manifest(vfs, dir);
     let vite_digest = app.vite_manifest.as_ref().map(|m| m.digest.clone());
     app.inertia = super::inertia::load_inertia_config(vfs, dir, vite_digest.as_deref())?;
+    app.pagy = super::pagy::load_settings(vfs, dir)?;
 
     // An engine's initializers run at boot as the host's do, and the boot
     // program takes their top-level constant writes
@@ -3137,7 +3307,7 @@ end
     enum_constants.validate_consumed_sources(&app, &sources, &observed)?;
     let gem_mounts: Vec<PathBuf> = source_gems.iter().map(|gem| gem.mount.clone()).collect();
     let callback_constants = super::after_initialize::named_constants(&callbacks);
-    keep_initializer_defined(&mut app, dir, &sources, &gem_mounts, initializer_defined, &callback_constants);
+    let class_evals_taken = keep_initializer_defined(&mut app, dir, &sources, &gem_mounts, initializer_defined, class_eval_openings, &callback_constants);
     // `self.queue_adapter =` on ApplicationJob (see `App::queue_adapter`).
     apply_application_job_queue_adapter(&mut app);
     let const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
@@ -3174,6 +3344,7 @@ end
     let gem_lock = app.gem_lock.clone();
     let mut boot_taken = super::boot_program::build(vfs, dir, &path_gems, &mut app, gem_lock.as_ref(), &app_namespaces, &rate_limit_store_values)?;
     boot_taken.extend(super::engine_config::carry(&mut app, dir));
+    boot_taken.extend(class_evals_taken);
     boot_taken.extend(stacked_application_uses.iter().map(|start| ("config/application.rb".to_string(), *start)));
     super::boot_program::apply_call_sites(&mut app);
     super::initializer_ledger::record(
@@ -3452,6 +3623,8 @@ end
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
     super::vite::lower_vite_tags(&mut app);
+    super::form_partial_record::add(&mut app);
+    super::yield_partials::specialize(&mut app);
     super::computed_partials::dispatch(&mut app);
     super::current_page::lower_current_page(&mut app);
     super::time_tag::lower_time_tags(&mut app);
@@ -3469,6 +3642,8 @@ end
     drop_modelled_included_hooks(&mut app);
     let splice_resolver = const_resolver.for_sources(&app.sources);
     splice_concerns_into_controllers(&mut app, &splice_resolver);
+    // After the splice: each controller's copy of a concern's body names that controller's model.
+    super::controller_name_constants::fold(&mut app);
     // After the splice: a concern's filter reads the key as the controller's own body does.
     crate::lower::primary_key_send::rewrite_guarded(&mut app);
     // After the splice: an action a concern provides is not implicit.
@@ -5475,8 +5650,10 @@ fn carry_included_block_includes_into_controllers(app: &mut App) {
     }
 
     for controller in &mut app.controllers {
-        let mut seen: HashSet<ClassId> =
-            crate::analyze::controller_includes(controller).into_iter().collect();
+        // Only what an earlier statement included: a module a hook
+        // includes stays where the hook put it, and a later `include` of
+        // it moves nothing.
+        let mut seen: HashSet<ClassId> = HashSet::default();
         for item in &mut controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
             let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { continue };
@@ -5486,6 +5663,7 @@ fn carry_included_block_includes_into_controllers(app: &mut App) {
             let mut carried = Vec::with_capacity(args.len());
             for arg in std::mem::take(args) {
                 if let Some(id) = id_of(&arg) {
+                    seen.insert(id.clone());
                     ahead_of(&id, &block_includes, &mut seen, &mut carried);
                 }
                 carried.push(arg);
@@ -5590,6 +5768,227 @@ fn splice_concern_to_param_into_includers(app: &mut App) {
     }
 }
 
+/// An opening's `include` statements, each the modules it names in the
+/// order written: `include A, B` is one statement of two. The includes of
+/// one statement share its span. An opening without a span per include
+/// (one a lowering built) has each as a statement of its own.
+fn include_statements(lc: &LibraryClass) -> Vec<Vec<crate::ident::ClassId>> {
+    spanned_include_statements(lc).into_iter().map(|(_, group)| group).collect()
+}
+
+/// [`include_statements`], each with its span: a synthetic one where the
+/// opening has no span per include.
+fn spanned_include_statements(lc: &LibraryClass) -> Vec<(crate::span::Span, Vec<crate::ident::ClassId>)> {
+    if lc.include_spans.len() != lc.includes.len() {
+        return lc.includes.iter().map(|m| (crate::span::Span::synthetic(), vec![m.clone()])).collect();
+    }
+    let mut out: Vec<(crate::span::Span, Vec<crate::ident::ClassId>)> = Vec::new();
+    for (module, span) in lc.includes.iter().zip(&lc.include_spans) {
+        match out.last_mut() {
+            Some((last, group)) if last == span && !span.is_synthetic() => group.push(module.clone()),
+            _ => out.push((*span, vec![module.clone()])),
+        }
+    }
+    out
+}
+
+/// Where an opening runs `extend ActiveSupport::Concern`, which the
+/// ingest keeps as one of its unmodelled calls.
+fn extends_active_support_concern(lc: &LibraryClass) -> Option<crate::span::Span> {
+    lc.unknown_calls.iter().map(|call| call.span).zip(&lc.unknown_calls).find_map(|(span, call)| {
+        let crate::expr::ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+        // `self.extend` is the same call.
+        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)) {
+            return None;
+        }
+        (method.as_str() == "extend"
+            && args.iter().any(|arg| {
+                matches!(&*arg.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
+            }))
+        .then_some(span)
+    })
+}
+
+/// Ruby's ancestor order for the modules an includer reaches, nearest
+/// first, from each module's `include` statements.
+///
+/// `include X` puts X and its ancestors directly above the includer. A
+/// module of those already there stays where it is, and the ones after
+/// it go below it (`[Plain, AB, B, A]` for `include B; include AB` with
+/// `AB` including `A` and then `B`). A statement naming several modules
+/// includes the last first, so `include A, B` keeps `A` ahead of `B`.
+///
+/// A module that extends `ActiveSupport::Concern` does not include the
+/// concerns it names: it records them, and its includer includes them
+/// first, then the concern itself, which it skips when already there
+/// (`[Conc, AB, A, B]` for the same three as concerns). An `include`
+/// that runs before the module extends `ActiveSupport::Concern` is an
+/// ordinary one, whatever it names.
+struct Ancestry<'a> {
+    statements: &'a HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>>,
+    concerns: &'a crate::det::HashSet<crate::ident::ClassId>,
+    /// Per module, the indexes of its statements that ran before it
+    /// extended `ActiveSupport::Concern`.
+    before_concern: &'a crate::det::HashSet<(crate::ident::ClassId, usize)>,
+    /// Per module, its own ancestors below it and the concerns it defers
+    /// to its includer: the same for every includer, so walked once.
+    expanded: std::cell::RefCell<HashMap<crate::ident::ClassId, std::rc::Rc<Expanded>>>,
+    /// The modules each walk is in the middle of. A cycle of includes is a
+    /// load error in Ruby; a walk that meets one of its own stops there,
+    /// however long a chain without one is.
+    walking: std::cell::RefCell<crate::det::HashSet<(Walk, crate::ident::ClassId)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Walk {
+    Include,
+    Hook,
+}
+
+impl Ancestry<'_> {
+    /// Runs `body` unless `walk` is already in the middle of `module`.
+    fn guarded<T>(&self, walk: Walk, module: &crate::ident::ClassId, body: impl FnOnce() -> T) -> Option<T> {
+        if !self.walking.borrow_mut().insert((walk, module.clone())) {
+            return None;
+        }
+        let out = body();
+        self.walking.borrow_mut().remove(&(walk, module.clone()));
+        Some(out)
+    }
+}
+
+/// A module's ancestors below it, nearest first, and, for a concern, the
+/// concerns its includer includes ahead of it.
+struct Expanded {
+    own: Vec<crate::ident::ClassId>,
+    dependencies: Vec<crate::ident::ClassId>,
+}
+
+impl Ancestry<'_> {
+    /// Below an includer whose include statements are `statements`, and
+    /// whose superclass's chain already has `inherited`: Ruby leaves a
+    /// module there where it is, and the includer's walk skips it.
+    fn of_statements(
+        &self,
+        statements: &[Vec<crate::ident::ClassId>],
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) -> Vec<crate::ident::ClassId> {
+        let mut chain = Vec::new();
+        for statement in statements {
+            for module in statement.iter().rev() {
+                self.include(&mut chain, module, inherited);
+            }
+        }
+        chain
+    }
+
+    /// The modules whose `included` hook runs on an includer whose include
+    /// statements are `statements`, in the order the hooks run: the ones
+    /// they name, each statement last argument first, and the concerns
+    /// those defer to it, each concern's ahead of it in the order it
+    /// recorded them. A concern a plain module includes runs its hook on
+    /// that module. One the includer's chain already has runs none: one
+    /// the superclass's chain has (`inherited`), or one an earlier
+    /// statement put there, through a plain module too.
+    fn hook_order(
+        &self,
+        statements: &[Vec<crate::ident::ClassId>],
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) -> Vec<crate::ident::ClassId> {
+        // `chain`: the includer's ancestors so far, which `append_features` checks.
+        fn visit(
+            ancestry: &Ancestry<'_>,
+            module: &crate::ident::ClassId,
+            inherited: &crate::det::HashSet<crate::ident::ClassId>,
+            chain: &mut Vec<crate::ident::ClassId>,
+            out: &mut Vec<crate::ident::ClassId>,
+        ) {
+            if inherited.contains(module) || chain.contains(module) {
+                return;
+            }
+            ancestry.guarded(Walk::Hook, module, || {
+                for dependency in &ancestry.expanded(module).dependencies {
+                    visit(ancestry, dependency, inherited, chain, out);
+                }
+                if !out.contains(module) {
+                    out.push(module.clone());
+                }
+                ancestry.include(chain, module, inherited);
+            });
+        }
+        let mut chain = Vec::new();
+        let mut out = Vec::new();
+        for statement in statements {
+            for module in statement.iter().rev() {
+                visit(self, module, inherited, &mut chain, &mut out);
+            }
+        }
+        out
+    }
+
+    fn expanded(&self, module: &crate::ident::ClassId) -> std::rc::Rc<Expanded> {
+        let cached = self.expanded.borrow().get(module).cloned();
+        if let Some(done) = cached {
+            return done;
+        }
+        let concern = self.concerns.contains(module);
+        let none = crate::det::HashSet::default();
+        let mut own = Vec::new();
+        let mut dependencies = Vec::new();
+        for (at, statement) in self.statements.get(module).into_iter().flatten().enumerate() {
+            let deferred = concern && !self.before_concern.contains(&(module.clone(), at));
+            for nested in statement.iter().rev() {
+                if deferred && self.concerns.contains(nested) {
+                    dependencies.push(nested.clone());
+                } else {
+                    self.include(&mut own, nested, &none);
+                }
+            }
+        }
+        let done = std::rc::Rc::new(Expanded { own, dependencies });
+        self.expanded.borrow_mut().insert(module.clone(), done.clone());
+        done
+    }
+
+    fn include(
+        &self,
+        chain: &mut Vec<crate::ident::ClassId>,
+        module: &crate::ident::ClassId,
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) {
+        // A concern its includer has already, through the superclass too,
+        // adds nothing, its dependencies included.
+        if self.concerns.contains(module) && (chain.contains(module) || inherited.contains(module)) {
+            return;
+        }
+        let Some(expanded) = self.guarded(Walk::Include, module, || {
+            let expanded = self.expanded(module);
+            for dependency in &expanded.dependencies {
+                self.include(chain, dependency, inherited);
+            }
+            expanded
+        }) else {
+            return;
+        };
+        let mut at = 0;
+        for ancestor in std::iter::once(module).chain(expanded.own.iter()) {
+            if inherited.contains(ancestor) {
+                continue;
+            }
+            match chain.iter().position(|c| c == ancestor) {
+                // The walk goes on below it, never back up: a module
+                // found above the cursor leaves it where it is.
+                Some(found) => at = at.max(found + 1),
+                None => {
+                    chain.insert(at, ancestor.clone());
+                    at += 1;
+                }
+            }
+        }
+    }
+}
+
 fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::ConstResolver) {
     use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::ty::{Row, Ty};
@@ -5637,6 +6036,15 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
     // arm known to run it replaces as any definition does, in one known
     // not to it is left out, and when only running the program answers
     // the earlier definition stays ahead of it.
+    // Each module's `include` statements across its openings, in load
+    // order, and the modules that extend `ActiveSupport::Concern`: what
+    // `Ancestry` needs to put the modules in Ruby's ancestor order.
+    let mut module_statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+    let mut concerns: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+    let mut before_concern: crate::det::HashSet<(crate::ident::ClassId, usize)> = crate::det::HashSet::default();
+    // The instance methods an `included do` defines: the includer's own,
+    // not its ancestor's.
+    let mut hook_defined: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> = crate::det::HashSet::default();
     let settler = super::settled_conditionals::Settler::of(app, resolver);
     for lc in openings_gem_first(&app.library_classes, &app.sources) {
         let conditional = |m: &crate::dialect::MethodDef| settler.defines(lc, m).is_none();
@@ -5659,8 +6067,94 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         methods.extend(opened);
         module_constants.entry(lc.name.clone()).or_default().extend(lc.constants.iter().map(|(n, _)| n.clone()));
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        // An opening read while the module isn't a concern yet: its
+        // statements ahead of its `extend ActiveSupport::Concern`, or all of
+        // them without one, include as plain ones. A statement without a
+        // span is taken to come after it.
+        let extended = extends_active_support_concern(lc);
+        let statements = module_statements.entry(lc.name.clone()).or_default();
+        for (span, group) in spanned_include_statements(lc) {
+            let ahead = extended.is_none_or(|at| span.file == at.file && span.start < at.start);
+            if !concerns.contains(&lc.name) && !span.is_synthetic() && ahead {
+                before_concern.insert((lc.name.clone(), statements.len()));
+            }
+            statements.push(group);
+        }
+        if extended.is_some() {
+            concerns.insert(lc.name.clone());
+        }
+        let hooks: Vec<crate::span::Span> = lc
+            .unknown_calls
+            .iter()
+            .filter(|call| {
+                matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "included")
+            })
+            .map(|call| call.span)
+            .collect();
+        // `def self.x` in the hook is the includer's class-side method: not an instance one.
+        for m in lc.methods.iter().filter(|m| matches!(m.receiver, MethodReceiver::Instance)) {
+            let at = m.name_span;
+            if hooks.iter().any(|h| !at.is_synthetic() && h.file == at.file && h.start <= at.start && at.end <= h.end) {
+                hook_defined.insert((lc.name.clone(), m.name.clone()));
+            }
+        }
     }
     let filter_edges = filter_dependency_edges(app, &module_includes);
+    let ancestry = Ancestry {
+        statements: &module_statements,
+        concerns: &concerns,
+        before_concern: &before_concern,
+        expanded: Default::default(),
+        walking: Default::default(),
+    };
+    // Each controller's statements across its openings, and its
+    // superclass, for the modules a child finds in its superclass's chain.
+    let mut controller_groups: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+    let mut controller_parent: HashMap<crate::ident::ClassId, crate::ident::ClassId> = HashMap::default();
+    for controller in &app.controllers {
+        controller_groups
+            .entry(controller.name.clone())
+            .or_default()
+            .extend(crate::analyze::controller_include_statements(controller).into_iter().map(|(_, group)| group));
+        if let Some(parent) = &controller.parent {
+            controller_parent.entry(controller.name.clone()).or_insert_with(|| parent.clone());
+        }
+    }
+    // A superclass that isn't a controller (a class in lib/) has its own
+    // includes and superclass, from its openings.
+    for lc in &app.library_classes {
+        if let Some(parent) = &lc.parent {
+            controller_parent.entry(lc.name.clone()).or_insert_with(|| parent.clone());
+        }
+    }
+    // The modules of the superclass's chain, nearest first: each
+    // superclass's own, without what the classes above it already have,
+    // ahead of theirs. And of those, the ones a superclass that isn't a
+    // controller has, whose hooks' forwarders no splice emits there.
+    let inherited_of = |name: &crate::ident::ClassId| {
+        let mut parents: Vec<&crate::ident::ClassId> = Vec::new();
+        let mut parent = controller_parent.get(name);
+        while let Some(p) = parent {
+            if parents.contains(&p) {
+                break;
+            }
+            parents.push(p);
+            parent = controller_parent.get(p);
+        }
+        let mut above: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+        let mut levels: Vec<Vec<crate::ident::ClassId>> = Vec::new();
+        let mut library: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+        for p in parents.into_iter().rev() {
+            let groups = controller_groups.get(p);
+            let chain = ancestry.of_statements(groups.or_else(|| module_statements.get(p)).map(Vec::as_slice).unwrap_or(&[]), &above);
+            if groups.is_none() {
+                library.extend(chain.iter().cloned());
+            }
+            above.extend(chain.iter().cloned());
+            levels.push(chain);
+        }
+        (levels.into_iter().rev().flatten().collect::<Vec<_>>(), library)
+    };
 
     // controller -> (spliced method -> the module it came from). Built
     // alongside the splice and stored on the App: the copy is typed
@@ -5690,10 +6184,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             continue;
         }
         // Two orders, because Ruby has two. METHOD precedence follows
-        // the ancestor chain — `include A, B` puts A ahead of B, and a
-        // module ahead of what it includes — so the transitive closure
-        // below walks the list as written, dependencies after, and the
-        // first definition of a name wins. FILTER registration is the
+        // the ancestor chain (`Ancestry`): the first definition of a name
+        // in it wins. FILTER registration is the
         // order the `included` hooks fire, which is the reverse: Ruby
         // processes a multi-argument `include` last-argument-first, and
         // ActiveSupport::Concern includes a concern's dependencies
@@ -5708,18 +6200,35 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .zip(filter_registration_by_statement(&include_groups, &filter_edges))
             .flat_map(|((at, _), modules)| modules.into_iter().map(move |module| (*at, module)))
             .collect();
-        // Transitive closure, in include order.
-        let mut queue = includes;
-        let mut seen: std::collections::BTreeSet<crate::ident::ClassId> =
-            queue.iter().cloned().collect();
-        let mut qi = 0;
-        while qi < queue.len() {
-            let m = queue[qi].clone();
-            qi += 1;
-            for nested in module_includes.get(&m).into_iter().flatten() {
-                if seen.insert(nested.clone()) {
-                    queue.push(nested.clone());
-                }
+        // Every module the controller reaches, nearest ancestor first:
+        // the prepended ones ahead of the class, then the included, then
+        // what the superclass's chain has already.
+        let (inherited_order, from_library) = inherited_of(&controller.name);
+        let inherited: crate::det::HashSet<crate::ident::ClassId> = inherited_order.iter().cloned().collect();
+        let (prepended, included): (Vec<_>, Vec<_>) = statements.iter().partition(|(at, _)| {
+            matches!(&controller.body[*at], ControllerBodyItem::Unknown { expr, .. }
+                if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "prepend"))
+        });
+        let groups = |of: Vec<&(usize, Vec<crate::ident::ClassId>)>| of.into_iter().map(|(_, group)| group.clone()).collect::<Vec<_>>();
+        let (prepended, included) = (groups(prepended), groups(included));
+        // `prepend` puts a module ahead of the class even when the
+        // superclass's chain has it already; `include` adds nothing then.
+        let none = crate::det::HashSet::default();
+        let mut queue = ancestry.of_statements(&prepended, &none);
+        let ahead = queue.len();
+        for module in ancestry.of_statements(&included, &inherited) {
+            if !queue.contains(&module) {
+                queue.push(module);
+            }
+        }
+        // A module the superclass has is found below everything the child
+        // adds, in the superclass's order. It still comes last here, not
+        // left out: the splice flattens each controller, and the calls
+        // are resolved against the controller's own methods.
+        let named: crate::det::HashSet<crate::ident::ClassId> = ancestry.of_statements(&included, &none).into_iter().collect();
+        for module in inherited_order.iter().filter(|m| named.contains(*m)) {
+            if !queue.contains(module) {
+                queue.push(module.clone());
             }
         }
 
@@ -5764,11 +6273,92 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 }));
             }
         }
-        for module in &queue {
+        // `included do` runs in the includer, in hook order: its delegates
+        // go in that order, and the methods it defines are the includer's
+        // own, the last hook's ahead. The rest come in ancestor order.
+        let hooks = ancestry.hook_order(&include_groups, &inherited);
+        let mut hook_order: Vec<&crate::ident::ClassId> = Vec::new();
+        for module in hooks.iter().chain(&queue) {
+            if !hook_order.contains(&module) {
+                hook_order.push(module);
+            }
+        }
+        // A hook that ran on a plain module in the chain made its forwarder
+        // there: still found from the controller, below its own hooks'.
+        // Spliced first, farthest first, since the last forwarder stands.
+        // One the superclass's chain has stays the superclass's.
+        // One a superclass that isn't a controller (a class in lib/) has made
+        // its forwarder there, where no splice emits it: the child that
+        // names the module has it, below everything else.
+        let wrapped: Vec<&crate::ident::ClassId> = queue
+            .iter()
+            .rev()
+            .filter(|module| from_library.contains(*module))
+            .chain(queue.iter().rev().filter(|module| !hooks.contains(*module) && !inherited.contains(*module)))
+            .collect();
+        for module in wrapped {
             for call in module_delegates.get(module).into_iter().flatten() {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
-            for method in module_methods.get(module).into_iter().flatten() {
+        }
+        // Then the hooks that ran here, in the order they ran.
+        for module in &hooks {
+            for call in module_delegates.get(module).into_iter().flatten() {
+                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
+            }
+        }
+        // A def a hook made on a module in the chain is that module's: the
+        // plain module whose `include` ran the hook (`carried`) has it,
+        // where the chain has that module. Ruby finds a prepended module
+        // ahead of the controller's own, hooks' defs included.
+        let hooked: crate::det::HashSet<&crate::ident::ClassId> = hooks.iter().collect();
+        let hook_defines = |module: &crate::ident::ClassId| {
+            module_methods.get(module).into_iter().flatten().any(|m| hook_defined.contains(&(module.clone(), m.name.clone())))
+        };
+        let mut carried: HashMap<&crate::ident::ClassId, Vec<&crate::ident::ClassId>> = HashMap::default();
+        for module in queue.iter().filter(|m| !hooked.contains(*m) && hook_defines(m)) {
+            let names = |recipient: &crate::ident::ClassId| {
+                module_statements.get(recipient).into_iter().flatten().enumerate().any(|(at, statement)| {
+                    let deferred = concerns.contains(recipient) && !before_concern.contains(&(recipient.clone(), at)) && concerns.contains(module);
+                    !deferred && statement.contains(module)
+                })
+            };
+            if let Some(recipient) = queue.iter().find(|r| *r != module && names(r)) {
+                carried.entry(recipient).or_default().push(module);
+            }
+        }
+        let is_carried = |module: &crate::ident::ClassId| carried.values().flatten().any(|m| *m == module);
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pick {
+            /// The defs its hook made on the controller.
+            Hooked,
+            /// The module's own defs, not its hook's.
+            Own,
+            /// The defs its hook made on the module ahead of it in `carried`.
+            Carried,
+        }
+        fn in_place<'a>(
+            modules: &'a [crate::ident::ClassId],
+            carried: &HashMap<&'a crate::ident::ClassId, Vec<&'a crate::ident::ClassId>>,
+        ) -> Vec<(&'a crate::ident::ClassId, Pick)> {
+            modules
+                .iter()
+                .flat_map(|module| std::iter::once((module, Pick::Own)).chain(carried.get(module).into_iter().flatten().map(|m| (*m, Pick::Carried))))
+                .collect()
+        }
+        let mut passes = in_place(&queue[..ahead], &carried);
+        passes.extend(hook_order.iter().rev().map(|module| (*module, Pick::Hooked)));
+        passes.extend(in_place(&queue[ahead..], &carried));
+        for (module, pick) in passes {
+            let own = |method: &&&crate::dialect::MethodDef| {
+                let made_by_hook = hook_defined.contains(&(module.clone(), method.name.clone()));
+                match pick {
+                    Pick::Hooked => hooked.contains(module) && made_by_hook,
+                    Pick::Own => !(made_by_hook && (hooked.contains(module) || is_carried(module))),
+                    Pick::Carried => made_by_hook,
+                }
+            };
+            for method in module_methods.get(module).into_iter().flatten().filter(own) {
                 let renamed;
                 let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
                     method
@@ -6396,6 +6986,84 @@ pub(super) fn controller_concern_surfaces(app: &App) -> ControllerConcernSurface
 #[cfg(test)]
 mod controller_concern_surface_tests {
     use super::*;
+
+    /// An app whose `LoopHost` includes through a `class_eval` loop, and
+    /// whose `CarryHost` writes `include CarryA, CarryB` and has
+    /// `CarryExtra` included into it from another module's body.
+    fn include_statements_app() -> crate::App {
+        let tree = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            ("app/controllers/concerns/loop_a.rb", "module LoopA\n  def label\n    \"loop a\"\n  end\nend\n"),
+            ("app/controllers/concerns/loop_b.rb", "module LoopB\n  def label\n    \"loop b\"\n  end\nend\n"),
+            ("lib/loop_host.rb", "module LoopHost\n  %w[LoopA LoopB].each { |m| class_eval \"include #{m}\" }\n\n  def host\n    \"loop\"\n  end\nend\n"),
+            ("lib/one_statement_host.rb", "module OneStatementHost\n  %w[LoopA].each { |m| class_eval \"include #{m}, LoopB\" }\n\n  def host\n    \"one\"\n  end\nend\n"),
+            ("lib/loop_then_include_host.rb", "module LoopThenIncludeHost\n  %w[LoopA].each { |m| class_eval \"include #{m}\" }\n  include LoopB\n\n  def host\n    \"then\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_a.rb", "module CarryA\n  def label\n    \"carry a\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_b.rb", "module CarryB\n  def label\n    \"carry b\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_extra.rb", "module CarryExtra\n  def extra\n    \"extra\"\n  end\nend\n"),
+            ("lib/carry_host.rb", "module CarryHost\n  include CarryA, CarryB\n\n  def host\n    \"carry\"\n  end\nend\n"),
+            ("lib/carry_wiring.rb", "module CarryWiring\n  CarryHost.include CarryExtra\nend\n"),
+            ("app/controllers/hosts_controller.rb", "class HostsController < ActionController::Base\n  include LoopHost\n  include CarryHost\nend\n"),
+        ]
+        .into_iter()
+        .map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec()))
+        .collect();
+        crate::ingest::ingest_app_from_tree(tree).expect("ingest")
+    }
+
+    fn statements_of(app: &crate::App, name: &str) -> Vec<Vec<String>> {
+        app.library_classes
+            .iter()
+            .filter(|lc| lc.name.0.as_str() == name)
+            .flat_map(include_statements)
+            .map(|group| group.iter().map(|m| m.0.as_str().to_string()).collect())
+            .collect()
+    }
+
+    /// One `include A, B` in a `class_eval` loop's string stays one
+    /// statement (#2211). Ruby 4.0.7: `[OneStatementHost, LoopA, LoopB]`.
+    #[test]
+    fn a_class_eval_string_s_include_of_two_modules_is_one_statement() {
+        let app = include_statements_app();
+        assert_eq!(statements_of(&app, "OneStatementHost"), vec![vec!["LoopA".to_string(), "LoopB".to_string()]]);
+    }
+
+    /// A `class_eval` loop's includes come where the loop stands, ahead of
+    /// an ordinary `include` written after it (#2211). Ruby 4.0.7:
+    /// `[LoopThenIncludeHost, LoopB, LoopA]`.
+    #[test]
+    fn a_class_eval_loop_s_includes_come_before_a_later_include() {
+        let app = include_statements_app();
+        assert_eq!(statements_of(&app, "LoopThenIncludeHost"), vec![vec!["LoopA".to_string()], vec!["LoopB".to_string()]]);
+    }
+
+    /// An include another body adds is a statement of its own, and the
+    /// module's `include A, B` stays one (#2211). Ruby 4.0.7:
+    /// `[CarryHost, CarryExtra, CarryA, CarryB]`.
+    #[test]
+    fn an_include_another_body_adds_keeps_the_module_s_statements() {
+        let app = include_statements_app();
+        assert_eq!(
+            statements_of(&app, "CarryHost"),
+            vec![vec!["CarryA".to_string(), "CarryB".to_string()], vec!["CarryExtra".to_string()]]
+        );
+    }
+
+    /// A walk that meets modules already in the chain goes on below the
+    /// lowest it has met, never back up (#2211). Ruby 4.0.7: `X` including
+    /// `C`, `B`, `A` (ancestors `[X, A, B, C]`), and a class including
+    /// `A`, `B`, then `X`, has `[X, B, A, C]`.
+    #[test]
+    fn an_include_walk_never_moves_its_cursor_back_up() {
+        let id = |name: &str| crate::ident::ClassId(name.into());
+        let names = |chain: Vec<crate::ident::ClassId>| chain.iter().map(|m| m.0.as_str().to_string()).collect::<Vec<_>>();
+        let mut statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+        statements.insert(id("X"), vec![vec![id("C")], vec![id("B")], vec![id("A")]]);
+        let concerns = crate::det::HashSet::default();
+        let ancestry = Ancestry { statements: &statements, concerns: &concerns, before_concern: &Default::default(), expanded: Default::default(), walking: Default::default() };
+        let class = [vec![id("A")], vec![id("B")], vec![id("X")]];
+        assert_eq!(names(ancestry.of_statements(&class, &Default::default())), ["X", "B", "A", "C"]);
+    }
 
     #[test]
     fn reopened_concern_filters_keep_include_statement_order() {
@@ -10551,12 +11219,28 @@ fn record_library_ingest_failure(app: &mut App, path: &str, err: &IngestError) {
     }
 }
 
+/// The classes of `classes` the file declares in `outer`'s body: named
+/// under it, or written inside it with a rooted name (`class ::Parser`
+/// in a model is top-level, though only this walk reaches it). The
+/// generated base of a kept `class X < Struct.new(...)` is kept with it,
+/// whatever its name.
 fn nested_under(
+    source: &[u8],
     outer: &crate::ident::ClassId,
     classes: Vec<crate::dialect::LibraryClass>,
 ) -> Vec<crate::dialect::LibraryClass> {
     let prefix = format!("{}::", outer.0.as_str());
-    classes.into_iter().filter(|c| c.name.0.as_str().starts_with(&prefix)).collect()
+    let parsed = super::prism::parse_silent(source);
+    let inside = super::util::declared_inside(&parsed.node(), outer.0.as_str());
+    let declared = |name: &str| name.starts_with(&prefix) || inside.contains(name);
+    let struct_owner = |c: &crate::dialect::LibraryClass| match &c.origin {
+        Some(crate::dialect::LibraryClassOrigin::StructSuperclass { owner, .. }) => Some(owner.as_str().to_string()),
+        _ => None,
+    };
+    classes
+        .into_iter()
+        .filter(|c| declared(c.name.0.as_str()) || struct_owner(c).is_some_and(|owner| declared(&owner)))
+        .collect()
 }
 
 /// The support roots to walk for library classes: every `app/*`
@@ -15056,6 +15740,64 @@ fn read_active_job_retry_jitter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> f64 {
 /// What a trimmed, non-comment config line sets the app-wide
 /// `wrap_parameters_by_default` to, or `None` when the line says nothing
 /// about it. One definition for the lift and the initializer ledger.
+/// `ActionView::Base.remove_hidden_field_autocomplete`, read as `read_wrap_parameters_by_default` reads its key:
+/// `config.load_defaults` 8.1+ turns it on, and an explicit `config.action_view.remove_hidden_field_autocomplete = …`
+/// (application, production or an initializer, such as the upgrade's `new_framework_defaults_8_1.rb`) wins.
+fn read_remove_hidden_field_autocomplete<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    // Not a trailing comment's assignment (`config.eager_load = true# config.action_view.… = false`).
+    let code = |line: &str| -> String {
+        let mut quote: Option<char> = None;
+        for (i, c) in line.char_indices() {
+            match (quote, c) {
+                (None, '#') => return line[..i].trim().to_string(),
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => quote = None,
+                _ => {}
+            }
+        }
+        line.trim().to_string()
+    };
+    let code_lines = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes).lines().map(code).filter(|l| !l.is_empty()).collect()
+    };
+    let mut files: Vec<Vec<String>> = Vec::new();
+    let mut on = false;
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        let lines = code_lines(&source);
+        for line in &lines {
+            if let Some(v) = load_defaults_version(line) {
+                on = v >= 8.1;
+            }
+        }
+        files.push(lines);
+    }
+    if let Ok(source) = vfs.read(&dir.join("config/environments/production.rb")) {
+        files.push(code_lines(&source));
+    }
+    let init_dir = dir.join("config/initializers");
+    if vfs.is_dir(&init_dir)
+        && let Ok(paths) = read_rb_files(vfs, &init_dir)
+    {
+        for path in paths {
+            if let Ok(source) = vfs.read(&path) {
+                files.push(code_lines(&source));
+            }
+        }
+    }
+    for line in files.iter().flatten() {
+        if let Some(i) = line.find("action_view.remove_hidden_field_autocomplete") {
+            let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            // Not a prefix: `= false if ENV[…]` is set only when its condition holds, which is not known here.
+            match rest.strip_suffix(';').unwrap_or(rest).trim_end() {
+                "true" => on = true,
+                "false" => on = false,
+                _ => {}
+            }
+        }
+    }
+    on
+}
+
 pub(super) fn wrap_parameters_line(line: &str) -> Option<bool> {
     if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
         let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");

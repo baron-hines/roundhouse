@@ -165,6 +165,8 @@ module ActiveRecord
     def self.clear_query_caches_for_current_thread: () -> nil
     def self.transaction: (?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
+    def lock!: (?(bool | String)? lock) -> Base
+    def _lock_row: ((bool | String)? lock) -> nil
     def self.delete_all: () -> Integer
     def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
     def self.increment_counter: (Symbol | String counter_name, Integer | String id, ?by: Integer, ?touch: untyped) -> Integer

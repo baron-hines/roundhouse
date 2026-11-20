@@ -177,26 +177,22 @@ pub fn ingest_class_table_prefixes(source: &[u8], file: &str) -> TablePrefixes {
 /// The prefix each abstract base passes down: its own, else its parent's.
 /// `pairs` are the pre-pass's `(abstract class, parent)` pairs; a bare
 /// parent is found the way Ruby finds it, the child's enclosing scopes first.
-pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)]) -> TablePrefixes {
-    let parents: crate::det::HashMap<&str, &str> = pairs
+pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[crate::ingest::library_class::BasePair]) -> TablePrefixes {
+    let parents: crate::det::HashMap<&str, (&str, &[String])> = pairs
         .iter()
-        .map(|(c, p)| (c.as_str(), p.as_str()))
+        .map(|(c, p, enclosing)| (c.as_str(), (p.as_str(), enclosing.as_slice())))
         .collect();
     let known = |name: &str| own.contains_key(name) || parents.contains_key(name);
-    let resolve = |child: &str, parent: &str| -> String {
-        let mut segments: Vec<&str> = child.split("::").collect();
-        segments.pop();
-        while !segments.is_empty() {
-            let candidate = format!("{}::{parent}", segments.join("::"));
-            if known(&candidate) {
-                return candidate;
-            }
-            segments.pop();
-        }
-        parent.to_string()
+    // A bare parent through the modules `record` stored for the child.
+    let resolve = |parent: &str, enclosing: &[String]| -> String {
+        enclosing
+            .iter()
+            .map(|outer| format!("{outer}::{parent}"))
+            .find(|candidate| known(candidate))
+            .unwrap_or_else(|| parent.to_string())
     };
     let mut out = TablePrefixes::default();
-    for (child, _) in pairs {
+    for (child, _, _) in pairs {
         let mut at = child.clone();
         // A cycle guard: the walk follows `parent` links, so a cyclic
         // hierarchy must end somewhere.
@@ -205,10 +201,10 @@ pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)])
                 out.insert(child.clone(), prefix.clone());
                 break;
             }
-            let Some(parent) = parents.get(at.as_str()) else {
+            let Some((parent, enclosing)) = parents.get(at.as_str()) else {
                 break;
             };
-            at = resolve(&at, parent);
+            at = resolve(parent, enclosing);
         }
     }
     out
@@ -217,6 +213,27 @@ pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)])
 /// `self.table_name_prefix = "three_d_secure_"` in a model body, or GitLab's
 /// `def self.table_name_prefix; 'ci_'; end` on `Ci::ApplicationRecord`: the
 /// class's own prefix, which wins over any namespace module's.
+/// How many times the class body defines or writes its `table_name_prefix`: more than one, and which one a
+/// `table_name_prefix + "x"` reads turns on where it stands.
+pub(super) fn table_prefix_definitions(body: ruby_prism::Node<'_>) -> usize {
+    let stmts = flatten_statements(body);
+    let mut count = 0;
+    for stmt in &stmts {
+        if let Some(def) = stmt.as_def_node() {
+            count += usize::from(def.receiver().is_some_and(|r| r.as_self_node().is_some()) && def.name().as_slice() == b"table_name_prefix");
+        } else if let Some(sclass) = stmt.as_singleton_class_node() {
+            if sclass.expression().as_self_node().is_none() {
+                continue;
+            }
+            let Some(body) = sclass.body() else { continue };
+            count += flatten_statements(body).iter().filter(|inner| inner.as_def_node().is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == b"table_name_prefix")).count();
+        } else if let Some(call) = stmt.as_call_node() {
+            count += usize::from(call.receiver().is_some_and(|r| r.as_self_node().is_some()) && call.name().as_slice() == b"table_name_prefix=");
+        }
+    }
+    count
+}
+
 pub(super) fn explicit_table_prefix(body: ruby_prism::Node<'_>) -> Option<String> {
     let stmts = flatten_statements(body);
     // As in Ruby, the last definition wins; a computed one is simply unknown.

@@ -126,12 +126,17 @@ fn for_scope_is_not_a_block_scope() {
 }
 
 #[test]
+fn string_to_d_has_its_runtime() {
+    // `ActiveSupport.loose_to_d` (runtime/ruby/active_support_ext.rb), run by tests/emit_and_run/string_to_d.rs.
+    admits("\"1.5\".to_d");
+}
+
+#[test]
 fn registry_signatures_do_not_supply_missing_runtime() {
     for (body, name) in [
         ("ActiveRecord::Base.connected_to(role: :reading) { 7 }", "connected_to"),
         ("Benchmark.realtime { 1 }", "Benchmark"),
         ("\"2020-01-02\".to_date", "to_date"),
-        ("\"1.5\".to_d", "to_d"),
         ("{}.to_sentence", "to_sentence"),
     ] { refuses(body, name); }
 }

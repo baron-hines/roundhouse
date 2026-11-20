@@ -46,7 +46,8 @@ fn missing_string_conversion_runtimes_are_refused() {
     let f = failures(
         "  def index\n    a = \"2020-01-01\".to_date\n    b = \"12:00\".to_time\n    c = \"1.5\".to_d / 100\n    d = \"now\".in_time_zone\n    e = \"x\".to_json\n    f = \"x\".as_json\n    render plain: \"x\"\n  end",
     );
-    for name in ["to_date", "to_time", "to_d", "in_time_zone", "as_json"] {
+    // Not `to_d`: `lower::bigdecimal` spells it through the runtime's `loose_to_d` (tests/emit_and_run/string_to_d.rs).
+    for name in ["to_date", "to_time", "in_time_zone", "as_json"] {
         assert!(f.iter().any(|d| d.contains(name)), "missing {name}: {f:?}");
     }
 }
@@ -56,7 +57,9 @@ fn params_do_not_certify_missing_conversion_runtimes() {
     let f = failures(
         "  def index\n    a = params[:start_date]&.to_date\n    b = params[:percent].to_d / 100\n    c = params[:at].to_time\n    d = params[:time]&.in_time_zone\n    e = params[:tags].as_json\n    render plain: \"x\"\n  end",
     );
-    assert!(f.iter().any(|d| d.contains("to_d")), "{f:?}");
+    // `to_d` on a param answers through the runtime; the others still have none.
+    assert!(!f.iter().any(|d| d.ends_with("#to_d")), "{f:?}");
+    assert!(f.iter().any(|d| d.contains("to_date")), "{f:?}");
 }
 
 #[test]

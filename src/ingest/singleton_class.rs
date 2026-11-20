@@ -244,6 +244,27 @@ fn walk_statement(
                 out.methods.push(copy);
                 Ok(())
             }
+            None if let Some((to, from)) = framework_class_alias(&call) => {
+                // Not Rails' method under the new name: no emitted tree carries ActiveRecord's own `scope` as a method
+                // (each `scope :x` is lowered where it is written), so a call that reaches the copy raises, reported.
+                let src = format!(
+                    "class RoundhouseAliasStub\n  def self.{to}(*args, &block)\n    raise \"`{to}` is ActiveRecord's `{from}`, which this tree lowers where it is written\"\n  end\nend\n"
+                );
+                let (parsed, _) = super::prism::scope(|| super::library_class::ingest_library_classes(src.as_bytes(), file));
+                let Some(mut stub) = parsed.ok().and_then(|classes| classes.into_iter().flat_map(|c| c.methods).next()) else {
+                    return unsupported(file, "unsupported statement inside `class << self`: `alias_method` of a method the block does not define");
+                };
+                stub.enclosing_class = Some(owner.0.clone());
+                super::prism::push(crate::lower::residue_diagnostic(
+                    "framework_alias",
+                    "alias_method",
+                    super::util::node_span(stmt, file),
+                    "framework_method",
+                    format!("`alias_method :{to}, :{from}` copies ActiveRecord's own `{from}`, which no emitted tree carries as a method: `{to}` raises if it is called"),
+                ));
+                out.methods.push(stub);
+                Ok(())
+            }
             None => unsupported(
                 file,
                 "unsupported statement inside `class << self`: `alias_method` of a method the block does not define",
@@ -291,6 +312,16 @@ fn recover(err: IngestError) -> IngestResult<()> {
     } else {
         Err(err)
     }
+}
+
+/// `alias_method :to, :from` where `from` is an ActiveRecord class method the catalog knows (`scope`).
+fn framework_class_alias(call: &ruby_prism::CallNode<'_>) -> Option<(String, String)> {
+    let args: Vec<String> = call.arguments()?.arguments().iter().filter_map(|a| symbol_value(&a)).collect();
+    let [to, from] = args.as_slice() else { return None };
+    // Not in the catalog: the class-body macros ingest lowers where they are written.
+    const MACROS: &[&str] = &["scope", "default_scope", "has_many", "has_one", "belongs_to", "validates", "validate"];
+    (crate::catalog::lookup(from, crate::catalog::ReceiverContext::Class).is_some() || MACROS.contains(&from.as_str()))
+        .then(|| (to.clone(), from.clone()))
 }
 
 fn unsupported(file: &str, message: &str) -> IngestResult<()> {

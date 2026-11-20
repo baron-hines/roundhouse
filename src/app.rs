@@ -739,6 +739,18 @@ pub struct App {
     /// are reported as warnings, since Rails never runs them.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unreachable_views: BTreeSet<Symbol>,
+    /// A pagy before 43's extras and `Pagy::DEFAULT[...] =` settings, as
+    /// the initializers write them (`ingest::pagy::read_settings`).
+    #[serde(default)]
+    pub pagy: PagyConfig,
+    /// The block renders `ingest::yield_partials` turned into a render of a
+    /// partial copy, by the call's span: off the ruby family still refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yield_specialized: Vec<crate::span::Span>,
+    /// The partials `ingest::yield_partials` copied for a block render: named only by a render of their own name,
+    /// since each such call now renders the copy (`ingest::unreachable_views`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub yield_originals: BTreeSet<Symbol>,
     /// The `app/helpers` modules' diagnostics, taken before the
     /// post-analyze lowerings rewrite their bodies; `None` until then,
     /// and on a path that never lowers (`check`), where they are
@@ -866,6 +878,10 @@ pub struct App {
     /// Read by `lower::controller_to_library::params_wrapper`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap_parameters_by_default: bool,
+    /// Rails writes `autocomplete="off"` on every hidden input: the app's `config.load_defaults` is before 8.1 (or it
+    /// sets `config.action_view.remove_hidden_field_autocomplete = false`). Off, the runtime's default, is 8.1's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden_field_autocomplete: bool,
     /// `ActiveJob::Base.retry_jitter`, app-wide: 0.15 when
     /// `config.load_defaults` is 6.1 or later, else 0.0, unless
     /// `config.active_job.retry_jitter = <number>` sets it (application,
@@ -1092,6 +1108,21 @@ impl MixinKind {
             MixinKind::Include => "include",
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct PagyConfig {
+    /// `require "pagy/extras/overflow"`'s mode: `empty_page` (the extra's
+    /// own default) unless a `Pagy::DEFAULT[:overflow] =` names another.
+    /// `None` without the extra, where the gem raises past the end.
+    pub overflow: Option<String>,
+    /// `require "pagy/extras/array"`: `pagy_array` exists.
+    pub array: bool,
+    /// `Pagy::DEFAULT[:limit] =`, an Integer literal of at least 1.
+    pub limit: Option<i64>,
+    /// What the initializers set that this model does not read: another
+    /// extra, another `Pagy::DEFAULT` key, a value that is not a literal.
+    pub unmodeled: Vec<(crate::span::Span, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -1441,6 +1472,9 @@ impl App {
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),
             unreachable_views: BTreeSet::new(),
+            pagy: PagyConfig::default(),
+            yield_specialized: Vec::new(),
+            yield_originals: BTreeSet::new(),
             helper_diagnostics: None,
             unknown_association_targets: Vec::new(),
             helper_modules: BTreeSet::new(),
@@ -1458,6 +1492,7 @@ impl App {
             controller_resolutions: HashMap::default(),
             sources: Vec::new(),
             wrap_parameters_by_default: false,
+            hidden_field_autocomplete: false,
             active_job_retry_jitter: 0.0,
             ports_active_model_validator: false,
             each_validator_calls: Vec::new(),

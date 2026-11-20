@@ -314,15 +314,9 @@ fn order_openings_by_load(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
-/// The file an opening was read from: the first of its spans that points
-/// at a source.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file(lc: &LibraryClass, app: &App) -> Option<String> {
-    let span = std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())?;
+    let span = lc.source_span()?;
     let source = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
     Some(normalize_path(&source.path))
 }
@@ -4817,6 +4811,8 @@ fn is_framework_view_helper(name: &str) -> bool {
     matches!(
         name,
         "image_tag"
+            // pagy9.rb's `Pagy::Frontend#pagy_url_for`, shipped only for an app locking a pagy before 43.
+            | "pagy_url_for"
             // `include ActionView::RecordIdentifier` brings `dom_id`
             // (below) and its sibling `dom_class` into non-view classes.
             | "dom_class"
@@ -10042,6 +10038,7 @@ fn emit_library_class_decl_inner(
                 Method(&'a MethodDef),
                 Nested(&'a crate::dialect::ConditionalDefinitions),
                 Declared(&'a ClassId),
+                Statement(&'a crate::expr::Expr),
             }
             let mut parts: Vec<(u32, Part<'_>)> = Vec::new();
             for member in &arm.methods {
@@ -10051,12 +10048,17 @@ fn emit_library_class_decl_inner(
             }
             parts.extend(arm.nested.iter().map(|n| (n.span.start, Part::Nested(n))));
             parts.extend(arm.declarations.iter().map(|d| (d.start, Part::Declared(&d.name))));
+            // A branch's `include` / `require`, which runs where the branch does.
+            parts.extend(arm.statements.iter().filter(|st| matches!(&*st.node,
+                crate::expr::ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "require" | "private" | "public" | "protected")))
+                .map(|st| (st.span.start, Part::Statement(st))));
             parts.sort_by_key(|(start, _)| *start);
             for (_, part) in parts {
                 match part {
                     Part::Method(method) => render_library_method(s, method, &inner),
                     Part::Nested(nested) => write(s, nested, lc, &inner, require_of),
                     Part::Declared(name) => writeln!(s, "{inner}{}", require_of(name)).unwrap(),
+                    Part::Statement(st) => writeln!(s, "{inner}{}", super::emit_expr(st)).unwrap(),
                 }
             }
         }
@@ -10064,6 +10066,49 @@ fn emit_library_class_decl_inner(
     }
     let write_conditional = |s: &mut String, index: usize| {
         written_conditionals.borrow_mut().push(index);
+        // Not before the nested modules its branches `include`: those are written ahead of the conditional.
+        fn statements<'c>(c: &'c crate::dialect::ConditionalDefinitions, out: &mut Vec<&'c Expr>) {
+            for arm in &c.arms {
+                out.extend(arm.statements.iter());
+                for n in &arm.nested {
+                    statements(n, out);
+                }
+            }
+        }
+        let mut sts = Vec::new();
+        statements(&lc.conditional_definitions[index], &mut sts);
+        // Not ahead of a guard that asks for the module (`const_defined?(:Feature)`): writing it first would flip the branch.
+        fn conditions<'c>(c: &'c crate::dialect::ConditionalDefinitions, out: &mut Vec<&'c Expr>) {
+            for arm in &c.arms {
+                out.extend(arm.condition.iter());
+                for n in &arm.nested {
+                    conditions(n, out);
+                }
+            }
+        }
+        fn names_in(e: &Expr, out: &mut BTreeSet<String>) {
+            match &*e.node {
+                ExprNode::Const { path } => out.extend(path.iter().map(|p| p.as_str().to_string())),
+                ExprNode::Lit { value: Literal::Sym { value } } => {
+                    out.insert(value.as_str().to_string());
+                }
+                ExprNode::Lit { value: Literal::Str { value } } => out.extend(value.split("::").map(str::to_string)),
+                _ => {}
+            }
+            e.node.for_each_child(&mut |c| names_in(c, out));
+        }
+        let mut conds = Vec::new();
+        conditions(&lc.conditional_definitions[index], &mut conds);
+        let mut asked = BTreeSet::new();
+        for c in conds {
+            names_in(c, &mut asked);
+        }
+        let guarded = nested.borrow().names.iter().any(|n| asked.contains(n.rsplit("::").next().unwrap_or(n)));
+        if !guarded {
+            for st in sts {
+                nested.borrow_mut().write_expr(s, depth, lc, st);
+            }
+        }
         write(s, &lc.conditional_definitions[index], lc, &body_pad, &require_of);
     };
     let render_conditional = |s: &mut String, m: &MethodDef| -> bool {

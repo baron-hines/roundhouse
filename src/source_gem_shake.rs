@@ -447,8 +447,25 @@ impl<'a> Gems<'a> {
         }
         let mut written_consts: HashSet<String> = HashSet::default();
         fn consts_in(e: &crate::expr::Expr, out: &mut HashSet<String>) {
-            if let ExprNode::Const { path } = &*e.node {
-                out.insert(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"));
+            match &*e.node {
+                ExprNode::Const { path } => {
+                    out.insert(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"));
+                }
+                // A module named by a string (`"::Doorkeeper::SecretStoring::Sha256Hash"`), or one a string built on its
+                // namespace may name, is a value its class methods are called on, as a written one is.
+                ExprNode::Lit { value: Literal::Str { value } }
+                    if value.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase())
+                        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_') =>
+                {
+                    out.insert(value.trim_start_matches("::").to_string());
+                }
+                ExprNode::StringInterp { parts }
+                    if let Some(crate::expr::InterpPart::Text { value }) = parts.first()
+                        && let Some(namespace) = value.trim_start_matches("::").strip_suffix("::") =>
+                {
+                    out.insert(format!("{namespace}::*"));
+                }
+                _ => {}
             }
             e.node.for_each_child(&mut |c| consts_in(c, out));
         }
@@ -458,6 +475,12 @@ impl<'a> Gems<'a> {
             }
         }
         crate::lower::for_each_emit_body_ref(app, &mut |e| consts_in(e, &mut written_consts));
+        let built: Vec<String> = written_consts.iter().filter_map(|w| w.strip_suffix("::*").map(str::to_string)).collect();
+        written_consts.retain(|w| !w.ends_with("::*"));
+        for namespace in built {
+            let prefix = format!("{namespace}::");
+            written_consts.extend(entries.keys().filter(|k| k.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")) && !unloadable.contains(k.as_str())).map(|k| k.to_string()));
+        }
         let mut gems = Gems { names, written_consts, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes, unloadable, model_copies };
         gems.app_mixins = gems.mixed_into_the_app(app);
         Some(gems)
@@ -521,6 +544,18 @@ impl<'a> Gems<'a> {
 
     fn known(&self, name: &str) -> bool {
         self.entries.contains_key(name)
+    }
+
+    /// The gem classes directly under `namespace` (`RailsSettings::Fields`).
+    fn children_of(&self, namespace: &str) -> Vec<String> {
+        let prefix = format!("{namespace}::");
+        self.entries
+            .keys()
+            .filter(|name| name.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")))
+            // Not a class whose file requires a feature that is absent: it never exists for a string to name.
+            .filter(|name| !self.unloadable.contains(name.as_str()))
+            .map(|name| name.to_string())
+            .collect()
     }
 
     /// A name read inside `context` may be any enclosing namespace's (`Atoms::Entity` in `Parslet`).
@@ -1447,12 +1482,26 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
             s.consts.push((s.context.map(|c| c.0.to_string()), name));
         }
         // A gem class named by a string, as `constantize` takes one (Devise's `@@mailer = "Devise::Mailer"`).
+        // Rooted too (doorkeeper's `default = "::Doorkeeper::SecretStoring::Sha256Hash"`).
         ExprNode::Lit { value: Literal::Str { value } }
-            if value.starts_with(|c: char| c.is_ascii_uppercase())
-                && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+            if value.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase())
+                && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_')
                 && s.gems.is_some_and(|g| g.known(value.trim_start_matches("::"))) =>
         {
             s.consts.push((None, value.trim_start_matches("::").to_string()));
+        }
+        // A gem class named by a string built on a namespace (`"::RailsSettings::Fields::#{field_class_name}"` that
+        // rails-settings-cached `const_get`s): any class directly under it may be the one.
+        ExprNode::StringInterp { parts }
+            if let Some(crate::expr::InterpPart::Text { value }) = parts.first()
+                && let Some(namespace) = value.trim_start_matches("::").strip_suffix("::")
+                && namespace.starts_with(|c: char| c.is_ascii_uppercase())
+                && namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+                && let Some(gems) = s.gems =>
+        {
+            for child in gems.children_of(namespace) {
+                s.consts.push((None, child));
+            }
         }
         ExprNode::Send { recv, method, args, block, .. } => {
             let target = match recv {

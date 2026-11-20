@@ -167,3 +167,24 @@ fn a_definition_with_an_argument_splat_is_still_refused() {
         .emit(roundhouse::project::BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("`guarded` defines methods this call does not expand")), "{errors:#?}");
 }
+
+/// A macro reads a list its class inherits (`NAMES` on the root, the loop in the subclass), and a subclass that
+/// shadows the name does not change what the inherited macro reads, as Ruby's lexical-then-ancestor lookup.
+#[test]
+fn an_inherited_list_constant_folds_from_where_the_macro_is_written() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/macro_root.rb",
+            "class MacroRoot\n  NAMES = %i[alpha beta].freeze\nend\n",
+        )
+        .write(
+            "app/models/macro_leaf.rb",
+            "class MacroLeaf < MacroRoot\n  def self.install\n    NAMES.each do |n|\n      define_method(\"#{n}_name\") { n.to_s }\n    end\n  end\nend\n",
+        )
+        .write("app/models/macro_thing.rb", "class MacroThing < MacroLeaf\n  NAMES = %i[gamma].freeze\n  install\nend\n")
+        .run_ruby(
+            "t = MacroThing.new\ngot = [t.alpha_name, t.beta_name, t.respond_to?(:gamma_name)]\nraise \"got #{got.inspect}\" unless got == [\"alpha\", \"beta\", false]\nputs \"inherited constant passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("inherited constant passed"), "{}", run.stdout);
+}
