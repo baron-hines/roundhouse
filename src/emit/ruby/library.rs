@@ -2170,6 +2170,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         && !crate::lower::scope_chain::any_assoc_extensions(&assocs)
         && !wants_model_chain
         && query_arguments.is_empty()
+        && app.relation_params.chained.is_empty()
     {
         return;
     }
@@ -2187,6 +2188,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         unique_keys: &unique_keys,
         // The Ruby family's attrs Hash holds a record (see the field).
         owner_objects: true,
+        relation_params: Some(&app.relation_params),
     };
     query_arguments.rewrite(lcs, &regs);
     let sole_includers = app.sole_includer_of_modules();
@@ -2514,6 +2516,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                     || crate::lower::scope_chain::mentions_assoc_alias(e, &assocs)
                     || crate::lower::scope_chain::mentions_assoc_extension(e, &assocs)
                     || crate::lower::scope_chain::mentions_model_insert_all(e, &models)
+                    || crate::lower::scope_chain::mentions_relation_argument(e, &app.relation_params)
                     || crate::lower::scope_chain::mentions_assoc_class_method(
                         e,
                         &assocs,

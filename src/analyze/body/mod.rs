@@ -205,6 +205,8 @@ pub struct Ctx {
     /// Locals bound to a class the program already has (a constant, or
     /// `self` on the class side), not one `Class.new` is building.
     pub live_class_locals: crate::det::HashSet<Symbol>,
+    /// Locals a statement of this body last assigned a has_many read the lowering seeds (`analyze::relation_params`).
+    pub has_many_locals: HashMap<Symbol, Vec<Symbol>>,
     /// Typing an `app/helpers` module's body. Its `self` may be the
     /// module's sole includer (a controller), but the emitted body runs
     /// in the view, where a bare `render` is ActionView's String.
@@ -588,6 +590,7 @@ pub struct BodyTyper<'a> {
     /// Instance methods whose body is a literal `true` or `false` and whose name nothing else defines.
     constant_predicates: Option<&'a HashMap<(ClassId, Symbol), bool>>,
     predicate_bodies: Option<&'a HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>>,
+    relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
@@ -744,6 +747,7 @@ impl<'a> BodyTyper<'a> {
             class_factories: None,
             constant_predicates: None,
             predicate_bodies: None,
+            relation_params: None,
             inquirers: None,
             i18n: None,
             helper_modules: None,
@@ -923,6 +927,11 @@ impl<'a> BodyTyper<'a> {
 
     pub(super) fn with_constant_predicates(mut self, predicates: &'a HashMap<(ClassId, Symbol), bool>) -> Self {
         self.constant_predicates = Some(predicates);
+        self
+    }
+
+    pub(super) fn with_relation_params(mut self, params: &'a crate::analyze::relation_params::RelationParams) -> Self {
+        self.relation_params = Some(params);
         self
     }
 
@@ -2863,6 +2872,26 @@ impl<'a> BodyTyper<'a> {
                 for a in args.iter_mut() {
                     self.analyze_expr(a, ctx);
                 }
+                if let Some(params) = self.relation_params {
+                    for (i, a) in args.iter_mut().enumerate() {
+                        a.decisions &= !crate::expr::RELATION_ARGUMENT;
+                        if !params.chains(method, i) {
+                            continue;
+                        }
+                        match self.relation_argument(a, ctx) {
+                            Some(Ok(rel)) => {
+                                a.ty = Some(rel);
+                                a.decisions |= crate::expr::RELATION_ARGUMENT;
+                            }
+                            Some(Err(())) => a.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None,
+                                construct: Symbol::from("records passed as a relation"),
+                                detail: "the method calls a query method on this parameter, and the argument is not an association read the lowering can seed".to_string(),
+                            })),
+                            None => {}
+                        }
+                    }
+                }
                 // The pagy gem's `pagy(scope)`: `[Pagy, <the scope's type>]`.
                 if matches!(method.as_str(), "pagy" | "pagy_array")
                     && block.is_none()
@@ -3345,6 +3374,9 @@ impl<'a> BodyTyper<'a> {
                     && let Some(r) = recv.as_ref()
                     && let Some(rel) = self.association_scope_relation(r, method, &dispatched)
                 {
+                    dispatched = rel;
+                }
+                if block.is_none() && let Some(rel) = self.returned_relation_argument(method, args) {
                     dispatched = rel;
                 }
                 // One controller arm cannot supply a missing writer on a
@@ -4106,6 +4138,12 @@ impl<'a> BodyTyper<'a> {
                             local_ctx.class_objects.remove(name);
                             local_ctx.query_class_objects.remove(name);
                             local_ctx.live_class_locals.remove(name);
+                            local_ctx.has_many_locals.remove(name);
+                            // A parked read is seeded from its owner when used, so rebinding the owner drops it.
+                            local_ctx.has_many_locals.retain(|_, owners| !owners.contains(name));
+                            if self.seeded_has_many_read(value, if local_ctx.class_side { None } else { local_ctx.self_ty.as_ref() }) {
+                                local_ctx.has_many_locals.insert(name.clone(), locals_read(value));
+                            }
                             if proven { local_ctx.class_objects.insert(name.clone()); }
                             // `flag ? A : B` has no single identity to write
                             // through, but either class answers a Module query.
@@ -4117,6 +4155,21 @@ impl<'a> BodyTyper<'a> {
                             // Before the binding insert below: the lambda body
                             // was typed in this `local_ctx`, without its own name.
                             lambda_local::remember(&mut lambda_locals, i, e, &local_ctx);
+                        }
+                        match &*e.node {
+                            ExprNode::MultiAssign { targets, .. } => {
+                                for t in targets {
+                                    if let LValue::Var { name, .. } = t {
+                                        local_ctx.has_many_locals.remove(name);
+                                        local_ctx.has_many_locals.retain(|_, owners| !owners.contains(name));
+                                    }
+                                }
+                            }
+                            ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => {
+                                local_ctx.has_many_locals.remove(name);
+                                local_ctx.has_many_locals.retain(|_, owners| !owners.contains(name));
+                            }
+                            _ => {}
                         }
                         // Warden's `strategy ||= Class.new(Base)` over a `strategy = nil` parameter: a class either way, of no one identity.
                         if let ExprNode::OpAssign { target: LValue::Var { name, .. }, op: crate::expr::OpAssignOp::OrOr, value } = &*e.node
@@ -8740,4 +8793,17 @@ fn declare_dropped_locals(kept: Expr, dropped: &Expr, cond: &Expr, ctx: &Ctx) ->
         .collect();
     exprs.push(kept);
     Expr::new(span, ExprNode::Seq { exprs })
+}
+
+/// The locals `expr` reads.
+fn locals_read(expr: &Expr) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<Symbol>) {
+        if let ExprNode::Var { name, .. } = &*e.node {
+            out.push(name.clone());
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    walk(expr, &mut out);
+    out
 }

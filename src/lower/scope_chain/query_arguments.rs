@@ -164,6 +164,7 @@ impl<'a> QueryArguments<'a> {
             user_returns: regs.user_returns,
             unique_keys: regs.unique_keys,
             owner_objects: regs.owner_objects,
+            relation_params: regs.relation_params,
             scope_body: None,
             self_const_is_implicit: false,
             class_self: (method.receiver == MethodReceiver::Class).then(|| self_class.clone()),

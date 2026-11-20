@@ -13,21 +13,70 @@ impl<'a> BodyTyper<'a> {
         if **recv_elem != **elem || !self.is_relation_step(target, method) {
             return None;
         }
-        let ExprNode::Send { recv: Some(owner), args, block: None, method: assoc, .. } = &*recv.node else { return None };
+        self.seeded_has_many_read(recv, None).then(|| Ty::Relation { of: target.clone() })
+    }
+
+    /// A has_many read the seed takes (`owner.items`, or a bare `items` in the owner's own body): an owner it reads
+    /// once, whose reader answers the loaded Array.
+    pub(super) fn seeded_has_many_read(&self, read: &Expr, self_ty: Option<&Ty>) -> bool {
+        let Some(Ty::Array { elem }) = read.ty.as_ref() else { return false };
+        let ExprNode::Send { recv, args, block: None, method: assoc, .. } = &*read.node else { return false };
+        if !args.is_empty() {
+            return false;
+        }
+        let owner_ty = match recv {
+            Some(owner) if matches!(&*owner.node, ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::SelfRef)
+                || crate::lower::scope_chain::owner_reads_once(owner) => owner.ty.as_ref(),
+            Some(_) => return false,
+            None => self_ty,
+        };
         // A nilable owner (`Article.first`) reads its id as Rails' would, raising on nil.
-        let owner_id = match owner.ty.as_ref() {
+        let owner_id = match owner_ty {
             Some(Ty::Class { id, .. }) => id,
             Some(Ty::Union { variants }) => match variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect::<Vec<_>>().as_slice() {
                 [Ty::Class { id, .. }] => id,
-                _ => return None,
+                _ => return false,
             },
-            _ => return None,
+            _ => return false,
         };
-        let seeded = args.is_empty()
-            && (matches!(&*owner.node, ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::SelfRef)
-                || crate::lower::scope_chain::owner_reads_once(owner))
-            && self.reads_has_many(owner_id, assoc, elem);
-        seeded.then(|| Ty::Relation { of: target.clone() })
+        self.reads_has_many(owner_id, assoc, elem)
+    }
+
+    /// An argument a relation parameter takes (`relation_params`): a has_many read, or a local this body last bound to
+    /// one, is lowered to its relation. Other records of a model there are ones Rails' `where` would not answer either.
+    pub(super) fn relation_argument(&self, arg: &Expr, ctx: &Ctx) -> Option<Result<Ty, ()>> {
+        let is_model = |id: &ClassId| self.classes().get(id).is_some_and(|c| c.table.is_some() || c.active_record_model);
+        let Some(Ty::Array { elem }) = arg.ty.as_ref() else {
+            // A union holding records may be them at run time, and they answer no `where`.
+            let records = matches!(arg.ty.as_ref(), Some(Ty::Union { variants }) if variants.iter().any(|v| matches!(v,
+                Ty::Array { elem } if matches!(&**elem, Ty::Class { id, .. } if is_model(id)))));
+            return records.then_some(Err(()));
+        };
+        let Ty::Class { id: target, .. } = &**elem else { return None };
+        let self_ty = if ctx.class_side { None } else { ctx.self_ty.as_ref() };
+        let seeded = match &*arg.node {
+            ExprNode::Var { name, .. } => ctx.has_many_locals.contains_key(name),
+            _ => self.seeded_has_many_read(arg, self_ty),
+        };
+        if seeded {
+            return Some(Ok(Ty::Relation { of: target.clone() }));
+        }
+        // A read this rule cannot seed may be one `scope_chain::query_arguments` does (a concern's bare `tokens`).
+        let loaded = match &*arg.node {
+            ExprNode::Var { .. } | ExprNode::Array { .. } => true,
+            ExprNode::Send { method, .. } => matches!(method.as_str(), "to_a" | "to_ary" | "entries" | "records" | "load"),
+            _ => false,
+        };
+        (loaded && is_model(target)).then_some(Err(()))
+    }
+
+    /// The call whose every return is its relation argument or a chain on it answers that argument's relation.
+    pub(super) fn returned_relation_argument(&self, method: &Symbol, args: &[Expr]) -> Option<Ty> {
+        let params = self.relation_params?;
+        args.iter().enumerate().find_map(|(i, a)| match a.ty.as_ref() {
+            Some(rel @ Ty::Relation { .. }) if params.returns(method, i) => Some(rel.clone()),
+            _ => None,
+        })
     }
 
     /// The owner's has_many reader: one whose `<name>_loaded?` predicate is synthesized beside it, answering the
@@ -49,6 +98,7 @@ impl<'a> BodyTyper<'a> {
     /// A chain step that keeps a relation: a query method, or a class method of the element model answering one.
     fn is_relation_step(&self, target: &ClassId, method: &Symbol) -> bool {
         crate::lower::scope_chain::is_relation_chain_method(method.as_str())
+            || method.as_str() == "all"
             // Not a scope that loads its records (`last(2)`): Rails answers that one's Array.
             || self.classes().get(target).is_some_and(|c| {
                 !c.materializing_scopes.contains(method) && matches!(c.class_methods.get(method), Some(Ty::Array { .. } | Ty::Relation { .. }))
