@@ -549,8 +549,14 @@ fn concern_includes_module(body: Option<Node<'_>>) -> bool {
             call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
         })
     }
+    // `self.extend` is the same call.
     let extends_concern = statements.iter().any(|stmt| {
-        call_named(stmt, "extend").is_some_and(|call| {
+        let call = stmt.as_call_node().filter(|call| {
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && call.block().is_none()
+                && constant_id_str(&call.name()) == "extend"
+        });
+        call.is_some_and(|call| {
             call.arguments().is_some_and(|a| {
                 a.arguments().iter().any(|arg| {
                     constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")

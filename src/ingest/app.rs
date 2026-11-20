@@ -5622,8 +5622,10 @@ fn carry_included_block_includes_into_controllers(app: &mut App) {
     }
 
     for controller in &mut app.controllers {
-        let mut seen: HashSet<ClassId> =
-            crate::analyze::controller_includes(controller).into_iter().collect();
+        // Only what an earlier statement included: a module a hook
+        // includes stays where the hook put it, and a later `include` of
+        // it moves nothing.
+        let mut seen: HashSet<ClassId> = HashSet::default();
         for item in &mut controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
             let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { continue };
@@ -5633,6 +5635,7 @@ fn carry_included_block_includes_into_controllers(app: &mut App) {
             let mut carried = Vec::with_capacity(args.len());
             for arg in std::mem::take(args) {
                 if let Some(id) = id_of(&arg) {
+                    seen.insert(id.clone());
                     ahead_of(&id, &block_includes, &mut seen, &mut carried);
                 }
                 carried.push(arg);
@@ -5737,6 +5740,227 @@ fn splice_concern_to_param_into_includers(app: &mut App) {
     }
 }
 
+/// An opening's `include` statements, each the modules it names in the
+/// order written: `include A, B` is one statement of two. The includes of
+/// one statement share its span. An opening without a span per include
+/// (one a lowering built) has each as a statement of its own.
+fn include_statements(lc: &LibraryClass) -> Vec<Vec<crate::ident::ClassId>> {
+    spanned_include_statements(lc).into_iter().map(|(_, group)| group).collect()
+}
+
+/// [`include_statements`], each with its span: a synthetic one where the
+/// opening has no span per include.
+fn spanned_include_statements(lc: &LibraryClass) -> Vec<(crate::span::Span, Vec<crate::ident::ClassId>)> {
+    if lc.include_spans.len() != lc.includes.len() {
+        return lc.includes.iter().map(|m| (crate::span::Span::synthetic(), vec![m.clone()])).collect();
+    }
+    let mut out: Vec<(crate::span::Span, Vec<crate::ident::ClassId>)> = Vec::new();
+    for (module, span) in lc.includes.iter().zip(&lc.include_spans) {
+        match out.last_mut() {
+            Some((last, group)) if last == span && !span.is_synthetic() => group.push(module.clone()),
+            _ => out.push((*span, vec![module.clone()])),
+        }
+    }
+    out
+}
+
+/// Where an opening runs `extend ActiveSupport::Concern`, which the
+/// ingest keeps as one of its unmodelled calls.
+fn extends_active_support_concern(lc: &LibraryClass) -> Option<crate::span::Span> {
+    lc.unknown_calls.iter().map(|call| call.span).zip(&lc.unknown_calls).find_map(|(span, call)| {
+        let crate::expr::ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+        // `self.extend` is the same call.
+        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)) {
+            return None;
+        }
+        (method.as_str() == "extend"
+            && args.iter().any(|arg| {
+                matches!(&*arg.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
+            }))
+        .then_some(span)
+    })
+}
+
+/// Ruby's ancestor order for the modules an includer reaches, nearest
+/// first, from each module's `include` statements.
+///
+/// `include X` puts X and its ancestors directly above the includer. A
+/// module of those already there stays where it is, and the ones after
+/// it go below it (`[Plain, AB, B, A]` for `include B; include AB` with
+/// `AB` including `A` and then `B`). A statement naming several modules
+/// includes the last first, so `include A, B` keeps `A` ahead of `B`.
+///
+/// A module that extends `ActiveSupport::Concern` does not include the
+/// concerns it names: it records them, and its includer includes them
+/// first, then the concern itself, which it skips when already there
+/// (`[Conc, AB, A, B]` for the same three as concerns). An `include`
+/// that runs before the module extends `ActiveSupport::Concern` is an
+/// ordinary one, whatever it names.
+struct Ancestry<'a> {
+    statements: &'a HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>>,
+    concerns: &'a crate::det::HashSet<crate::ident::ClassId>,
+    /// Per module, the indexes of its statements that ran before it
+    /// extended `ActiveSupport::Concern`.
+    before_concern: &'a crate::det::HashSet<(crate::ident::ClassId, usize)>,
+    /// Per module, its own ancestors below it and the concerns it defers
+    /// to its includer: the same for every includer, so walked once.
+    expanded: std::cell::RefCell<HashMap<crate::ident::ClassId, std::rc::Rc<Expanded>>>,
+    /// The modules each walk is in the middle of. A cycle of includes is a
+    /// load error in Ruby; a walk that meets one of its own stops there,
+    /// however long a chain without one is.
+    walking: std::cell::RefCell<crate::det::HashSet<(Walk, crate::ident::ClassId)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Walk {
+    Include,
+    Hook,
+}
+
+impl Ancestry<'_> {
+    /// Runs `body` unless `walk` is already in the middle of `module`.
+    fn guarded<T>(&self, walk: Walk, module: &crate::ident::ClassId, body: impl FnOnce() -> T) -> Option<T> {
+        if !self.walking.borrow_mut().insert((walk, module.clone())) {
+            return None;
+        }
+        let out = body();
+        self.walking.borrow_mut().remove(&(walk, module.clone()));
+        Some(out)
+    }
+}
+
+/// A module's ancestors below it, nearest first, and, for a concern, the
+/// concerns its includer includes ahead of it.
+struct Expanded {
+    own: Vec<crate::ident::ClassId>,
+    dependencies: Vec<crate::ident::ClassId>,
+}
+
+impl Ancestry<'_> {
+    /// Below an includer whose include statements are `statements`, and
+    /// whose superclass's chain already has `inherited`: Ruby leaves a
+    /// module there where it is, and the includer's walk skips it.
+    fn of_statements(
+        &self,
+        statements: &[Vec<crate::ident::ClassId>],
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) -> Vec<crate::ident::ClassId> {
+        let mut chain = Vec::new();
+        for statement in statements {
+            for module in statement.iter().rev() {
+                self.include(&mut chain, module, inherited);
+            }
+        }
+        chain
+    }
+
+    /// The modules whose `included` hook runs on an includer whose include
+    /// statements are `statements`, in the order the hooks run: the ones
+    /// they name, each statement last argument first, and the concerns
+    /// those defer to it, each concern's ahead of it in the order it
+    /// recorded them. A concern a plain module includes runs its hook on
+    /// that module. One the includer's chain already has runs none: one
+    /// the superclass's chain has (`inherited`), or one an earlier
+    /// statement put there, through a plain module too.
+    fn hook_order(
+        &self,
+        statements: &[Vec<crate::ident::ClassId>],
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) -> Vec<crate::ident::ClassId> {
+        // `chain`: the includer's ancestors so far, which `append_features` checks.
+        fn visit(
+            ancestry: &Ancestry<'_>,
+            module: &crate::ident::ClassId,
+            inherited: &crate::det::HashSet<crate::ident::ClassId>,
+            chain: &mut Vec<crate::ident::ClassId>,
+            out: &mut Vec<crate::ident::ClassId>,
+        ) {
+            if inherited.contains(module) || chain.contains(module) {
+                return;
+            }
+            ancestry.guarded(Walk::Hook, module, || {
+                for dependency in &ancestry.expanded(module).dependencies {
+                    visit(ancestry, dependency, inherited, chain, out);
+                }
+                if !out.contains(module) {
+                    out.push(module.clone());
+                }
+                ancestry.include(chain, module, inherited);
+            });
+        }
+        let mut chain = Vec::new();
+        let mut out = Vec::new();
+        for statement in statements {
+            for module in statement.iter().rev() {
+                visit(self, module, inherited, &mut chain, &mut out);
+            }
+        }
+        out
+    }
+
+    fn expanded(&self, module: &crate::ident::ClassId) -> std::rc::Rc<Expanded> {
+        let cached = self.expanded.borrow().get(module).cloned();
+        if let Some(done) = cached {
+            return done;
+        }
+        let concern = self.concerns.contains(module);
+        let none = crate::det::HashSet::default();
+        let mut own = Vec::new();
+        let mut dependencies = Vec::new();
+        for (at, statement) in self.statements.get(module).into_iter().flatten().enumerate() {
+            let deferred = concern && !self.before_concern.contains(&(module.clone(), at));
+            for nested in statement.iter().rev() {
+                if deferred && self.concerns.contains(nested) {
+                    dependencies.push(nested.clone());
+                } else {
+                    self.include(&mut own, nested, &none);
+                }
+            }
+        }
+        let done = std::rc::Rc::new(Expanded { own, dependencies });
+        self.expanded.borrow_mut().insert(module.clone(), done.clone());
+        done
+    }
+
+    fn include(
+        &self,
+        chain: &mut Vec<crate::ident::ClassId>,
+        module: &crate::ident::ClassId,
+        inherited: &crate::det::HashSet<crate::ident::ClassId>,
+    ) {
+        // A concern its includer has already, through the superclass too,
+        // adds nothing, its dependencies included.
+        if self.concerns.contains(module) && (chain.contains(module) || inherited.contains(module)) {
+            return;
+        }
+        let Some(expanded) = self.guarded(Walk::Include, module, || {
+            let expanded = self.expanded(module);
+            for dependency in &expanded.dependencies {
+                self.include(chain, dependency, inherited);
+            }
+            expanded
+        }) else {
+            return;
+        };
+        let mut at = 0;
+        for ancestor in std::iter::once(module).chain(expanded.own.iter()) {
+            if inherited.contains(ancestor) {
+                continue;
+            }
+            match chain.iter().position(|c| c == ancestor) {
+                // The walk goes on below it, never back up: a module
+                // found above the cursor leaves it where it is.
+                Some(found) => at = at.max(found + 1),
+                None => {
+                    chain.insert(at, ancestor.clone());
+                    at += 1;
+                }
+            }
+        }
+    }
+}
+
 fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::ConstResolver) {
     use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::ty::{Row, Ty};
@@ -5784,6 +6008,15 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
     // arm known to run it replaces as any definition does, in one known
     // not to it is left out, and when only running the program answers
     // the earlier definition stays ahead of it.
+    // Each module's `include` statements across its openings, in load
+    // order, and the modules that extend `ActiveSupport::Concern`: what
+    // `Ancestry` needs to put the modules in Ruby's ancestor order.
+    let mut module_statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+    let mut concerns: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+    let mut before_concern: crate::det::HashSet<(crate::ident::ClassId, usize)> = crate::det::HashSet::default();
+    // The instance methods an `included do` defines: the includer's own,
+    // not its ancestor's.
+    let mut hook_defined: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> = crate::det::HashSet::default();
     let settler = super::settled_conditionals::Settler::of(app, resolver);
     for lc in openings_gem_first(&app.library_classes, &app.sources) {
         let conditional = |m: &crate::dialect::MethodDef| settler.defines(lc, m).is_none();
@@ -5806,8 +6039,94 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         methods.extend(opened);
         module_constants.entry(lc.name.clone()).or_default().extend(lc.constants.iter().map(|(n, _)| n.clone()));
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        // An opening read while the module isn't a concern yet: its
+        // statements ahead of its `extend ActiveSupport::Concern`, or all of
+        // them without one, include as plain ones. A statement without a
+        // span is taken to come after it.
+        let extended = extends_active_support_concern(lc);
+        let statements = module_statements.entry(lc.name.clone()).or_default();
+        for (span, group) in spanned_include_statements(lc) {
+            let ahead = extended.is_none_or(|at| span.file == at.file && span.start < at.start);
+            if !concerns.contains(&lc.name) && !span.is_synthetic() && ahead {
+                before_concern.insert((lc.name.clone(), statements.len()));
+            }
+            statements.push(group);
+        }
+        if extended.is_some() {
+            concerns.insert(lc.name.clone());
+        }
+        let hooks: Vec<crate::span::Span> = lc
+            .unknown_calls
+            .iter()
+            .filter(|call| {
+                matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "included")
+            })
+            .map(|call| call.span)
+            .collect();
+        // `def self.x` in the hook is the includer's class-side method: not an instance one.
+        for m in lc.methods.iter().filter(|m| matches!(m.receiver, MethodReceiver::Instance)) {
+            let at = m.name_span;
+            if hooks.iter().any(|h| !at.is_synthetic() && h.file == at.file && h.start <= at.start && at.end <= h.end) {
+                hook_defined.insert((lc.name.clone(), m.name.clone()));
+            }
+        }
     }
     let filter_edges = filter_dependency_edges(app, &module_includes);
+    let ancestry = Ancestry {
+        statements: &module_statements,
+        concerns: &concerns,
+        before_concern: &before_concern,
+        expanded: Default::default(),
+        walking: Default::default(),
+    };
+    // Each controller's statements across its openings, and its
+    // superclass, for the modules a child finds in its superclass's chain.
+    let mut controller_groups: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+    let mut controller_parent: HashMap<crate::ident::ClassId, crate::ident::ClassId> = HashMap::default();
+    for controller in &app.controllers {
+        controller_groups
+            .entry(controller.name.clone())
+            .or_default()
+            .extend(crate::analyze::controller_include_statements(controller).into_iter().map(|(_, group)| group));
+        if let Some(parent) = &controller.parent {
+            controller_parent.entry(controller.name.clone()).or_insert_with(|| parent.clone());
+        }
+    }
+    // A superclass that isn't a controller (a class in lib/) has its own
+    // includes and superclass, from its openings.
+    for lc in &app.library_classes {
+        if let Some(parent) = &lc.parent {
+            controller_parent.entry(lc.name.clone()).or_insert_with(|| parent.clone());
+        }
+    }
+    // The modules of the superclass's chain, nearest first: each
+    // superclass's own, without what the classes above it already have,
+    // ahead of theirs. And of those, the ones a superclass that isn't a
+    // controller has, whose hooks' forwarders no splice emits there.
+    let inherited_of = |name: &crate::ident::ClassId| {
+        let mut parents: Vec<&crate::ident::ClassId> = Vec::new();
+        let mut parent = controller_parent.get(name);
+        while let Some(p) = parent {
+            if parents.contains(&p) {
+                break;
+            }
+            parents.push(p);
+            parent = controller_parent.get(p);
+        }
+        let mut above: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+        let mut levels: Vec<Vec<crate::ident::ClassId>> = Vec::new();
+        let mut library: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+        for p in parents.into_iter().rev() {
+            let groups = controller_groups.get(p);
+            let chain = ancestry.of_statements(groups.or_else(|| module_statements.get(p)).map(Vec::as_slice).unwrap_or(&[]), &above);
+            if groups.is_none() {
+                library.extend(chain.iter().cloned());
+            }
+            above.extend(chain.iter().cloned());
+            levels.push(chain);
+        }
+        (levels.into_iter().rev().flatten().collect::<Vec<_>>(), library)
+    };
 
     // controller -> (spliced method -> the module it came from). Built
     // alongside the splice and stored on the App: the copy is typed
@@ -5837,10 +6156,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             continue;
         }
         // Two orders, because Ruby has two. METHOD precedence follows
-        // the ancestor chain — `include A, B` puts A ahead of B, and a
-        // module ahead of what it includes — so the transitive closure
-        // below walks the list as written, dependencies after, and the
-        // first definition of a name wins. FILTER registration is the
+        // the ancestor chain (`Ancestry`): the first definition of a name
+        // in it wins. FILTER registration is the
         // order the `included` hooks fire, which is the reverse: Ruby
         // processes a multi-argument `include` last-argument-first, and
         // ActiveSupport::Concern includes a concern's dependencies
@@ -5855,18 +6172,35 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .zip(filter_registration_by_statement(&include_groups, &filter_edges))
             .flat_map(|((at, _), modules)| modules.into_iter().map(move |module| (*at, module)))
             .collect();
-        // Transitive closure, in include order.
-        let mut queue = includes;
-        let mut seen: std::collections::BTreeSet<crate::ident::ClassId> =
-            queue.iter().cloned().collect();
-        let mut qi = 0;
-        while qi < queue.len() {
-            let m = queue[qi].clone();
-            qi += 1;
-            for nested in module_includes.get(&m).into_iter().flatten() {
-                if seen.insert(nested.clone()) {
-                    queue.push(nested.clone());
-                }
+        // Every module the controller reaches, nearest ancestor first:
+        // the prepended ones ahead of the class, then the included, then
+        // what the superclass's chain has already.
+        let (inherited_order, from_library) = inherited_of(&controller.name);
+        let inherited: crate::det::HashSet<crate::ident::ClassId> = inherited_order.iter().cloned().collect();
+        let (prepended, included): (Vec<_>, Vec<_>) = statements.iter().partition(|(at, _)| {
+            matches!(&controller.body[*at], ControllerBodyItem::Unknown { expr, .. }
+                if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "prepend"))
+        });
+        let groups = |of: Vec<&(usize, Vec<crate::ident::ClassId>)>| of.into_iter().map(|(_, group)| group.clone()).collect::<Vec<_>>();
+        let (prepended, included) = (groups(prepended), groups(included));
+        // `prepend` puts a module ahead of the class even when the
+        // superclass's chain has it already; `include` adds nothing then.
+        let none = crate::det::HashSet::default();
+        let mut queue = ancestry.of_statements(&prepended, &none);
+        let ahead = queue.len();
+        for module in ancestry.of_statements(&included, &inherited) {
+            if !queue.contains(&module) {
+                queue.push(module);
+            }
+        }
+        // A module the superclass has is found below everything the child
+        // adds, in the superclass's order. It still comes last here, not
+        // left out: the splice flattens each controller, and the calls
+        // are resolved against the controller's own methods.
+        let named: crate::det::HashSet<crate::ident::ClassId> = ancestry.of_statements(&included, &none).into_iter().collect();
+        for module in inherited_order.iter().filter(|m| named.contains(*m)) {
+            if !queue.contains(module) {
+                queue.push(module.clone());
             }
         }
 
@@ -5911,11 +6245,92 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 }));
             }
         }
-        for module in &queue {
+        // `included do` runs in the includer, in hook order: its delegates
+        // go in that order, and the methods it defines are the includer's
+        // own, the last hook's ahead. The rest come in ancestor order.
+        let hooks = ancestry.hook_order(&include_groups, &inherited);
+        let mut hook_order: Vec<&crate::ident::ClassId> = Vec::new();
+        for module in hooks.iter().chain(&queue) {
+            if !hook_order.contains(&module) {
+                hook_order.push(module);
+            }
+        }
+        // A hook that ran on a plain module in the chain made its forwarder
+        // there: still found from the controller, below its own hooks'.
+        // Spliced first, farthest first, since the last forwarder stands.
+        // One the superclass's chain has stays the superclass's.
+        // One a superclass that isn't a controller (a class in lib/) has made
+        // its forwarder there, where no splice emits it: the child that
+        // names the module has it, below everything else.
+        let wrapped: Vec<&crate::ident::ClassId> = queue
+            .iter()
+            .rev()
+            .filter(|module| from_library.contains(*module))
+            .chain(queue.iter().rev().filter(|module| !hooks.contains(*module) && !inherited.contains(*module)))
+            .collect();
+        for module in wrapped {
             for call in module_delegates.get(module).into_iter().flatten() {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
-            for method in module_methods.get(module).into_iter().flatten() {
+        }
+        // Then the hooks that ran here, in the order they ran.
+        for module in &hooks {
+            for call in module_delegates.get(module).into_iter().flatten() {
+                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
+            }
+        }
+        // A def a hook made on a module in the chain is that module's: the
+        // plain module whose `include` ran the hook (`carried`) has it,
+        // where the chain has that module. Ruby finds a prepended module
+        // ahead of the controller's own, hooks' defs included.
+        let hooked: crate::det::HashSet<&crate::ident::ClassId> = hooks.iter().collect();
+        let hook_defines = |module: &crate::ident::ClassId| {
+            module_methods.get(module).into_iter().flatten().any(|m| hook_defined.contains(&(module.clone(), m.name.clone())))
+        };
+        let mut carried: HashMap<&crate::ident::ClassId, Vec<&crate::ident::ClassId>> = HashMap::default();
+        for module in queue.iter().filter(|m| !hooked.contains(*m) && hook_defines(m)) {
+            let names = |recipient: &crate::ident::ClassId| {
+                module_statements.get(recipient).into_iter().flatten().enumerate().any(|(at, statement)| {
+                    let deferred = concerns.contains(recipient) && !before_concern.contains(&(recipient.clone(), at)) && concerns.contains(module);
+                    !deferred && statement.contains(module)
+                })
+            };
+            if let Some(recipient) = queue.iter().find(|r| *r != module && names(r)) {
+                carried.entry(recipient).or_default().push(module);
+            }
+        }
+        let is_carried = |module: &crate::ident::ClassId| carried.values().flatten().any(|m| *m == module);
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pick {
+            /// The defs its hook made on the controller.
+            Hooked,
+            /// The module's own defs, not its hook's.
+            Own,
+            /// The defs its hook made on the module ahead of it in `carried`.
+            Carried,
+        }
+        fn in_place<'a>(
+            modules: &'a [crate::ident::ClassId],
+            carried: &HashMap<&'a crate::ident::ClassId, Vec<&'a crate::ident::ClassId>>,
+        ) -> Vec<(&'a crate::ident::ClassId, Pick)> {
+            modules
+                .iter()
+                .flat_map(|module| std::iter::once((module, Pick::Own)).chain(carried.get(module).into_iter().flatten().map(|m| (*m, Pick::Carried))))
+                .collect()
+        }
+        let mut passes = in_place(&queue[..ahead], &carried);
+        passes.extend(hook_order.iter().rev().map(|module| (*module, Pick::Hooked)));
+        passes.extend(in_place(&queue[ahead..], &carried));
+        for (module, pick) in passes {
+            let own = |method: &&&crate::dialect::MethodDef| {
+                let made_by_hook = hook_defined.contains(&(module.clone(), method.name.clone()));
+                match pick {
+                    Pick::Hooked => hooked.contains(module) && made_by_hook,
+                    Pick::Own => !(made_by_hook && (hooked.contains(module) || is_carried(module))),
+                    Pick::Carried => made_by_hook,
+                }
+            };
+            for method in module_methods.get(module).into_iter().flatten().filter(own) {
                 let renamed;
                 let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
                     method
@@ -6543,6 +6958,84 @@ pub(super) fn controller_concern_surfaces(app: &App) -> ControllerConcernSurface
 #[cfg(test)]
 mod controller_concern_surface_tests {
     use super::*;
+
+    /// An app whose `LoopHost` includes through a `class_eval` loop, and
+    /// whose `CarryHost` writes `include CarryA, CarryB` and has
+    /// `CarryExtra` included into it from another module's body.
+    fn include_statements_app() -> crate::App {
+        let tree = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            ("app/controllers/concerns/loop_a.rb", "module LoopA\n  def label\n    \"loop a\"\n  end\nend\n"),
+            ("app/controllers/concerns/loop_b.rb", "module LoopB\n  def label\n    \"loop b\"\n  end\nend\n"),
+            ("lib/loop_host.rb", "module LoopHost\n  %w[LoopA LoopB].each { |m| class_eval \"include #{m}\" }\n\n  def host\n    \"loop\"\n  end\nend\n"),
+            ("lib/one_statement_host.rb", "module OneStatementHost\n  %w[LoopA].each { |m| class_eval \"include #{m}, LoopB\" }\n\n  def host\n    \"one\"\n  end\nend\n"),
+            ("lib/loop_then_include_host.rb", "module LoopThenIncludeHost\n  %w[LoopA].each { |m| class_eval \"include #{m}\" }\n  include LoopB\n\n  def host\n    \"then\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_a.rb", "module CarryA\n  def label\n    \"carry a\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_b.rb", "module CarryB\n  def label\n    \"carry b\"\n  end\nend\n"),
+            ("app/controllers/concerns/carry_extra.rb", "module CarryExtra\n  def extra\n    \"extra\"\n  end\nend\n"),
+            ("lib/carry_host.rb", "module CarryHost\n  include CarryA, CarryB\n\n  def host\n    \"carry\"\n  end\nend\n"),
+            ("lib/carry_wiring.rb", "module CarryWiring\n  CarryHost.include CarryExtra\nend\n"),
+            ("app/controllers/hosts_controller.rb", "class HostsController < ActionController::Base\n  include LoopHost\n  include CarryHost\nend\n"),
+        ]
+        .into_iter()
+        .map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec()))
+        .collect();
+        crate::ingest::ingest_app_from_tree(tree).expect("ingest")
+    }
+
+    fn statements_of(app: &crate::App, name: &str) -> Vec<Vec<String>> {
+        app.library_classes
+            .iter()
+            .filter(|lc| lc.name.0.as_str() == name)
+            .flat_map(include_statements)
+            .map(|group| group.iter().map(|m| m.0.as_str().to_string()).collect())
+            .collect()
+    }
+
+    /// One `include A, B` in a `class_eval` loop's string stays one
+    /// statement (#2211). Ruby 4.0.7: `[OneStatementHost, LoopA, LoopB]`.
+    #[test]
+    fn a_class_eval_string_s_include_of_two_modules_is_one_statement() {
+        let app = include_statements_app();
+        assert_eq!(statements_of(&app, "OneStatementHost"), vec![vec!["LoopA".to_string(), "LoopB".to_string()]]);
+    }
+
+    /// A `class_eval` loop's includes come where the loop stands, ahead of
+    /// an ordinary `include` written after it (#2211). Ruby 4.0.7:
+    /// `[LoopThenIncludeHost, LoopB, LoopA]`.
+    #[test]
+    fn a_class_eval_loop_s_includes_come_before_a_later_include() {
+        let app = include_statements_app();
+        assert_eq!(statements_of(&app, "LoopThenIncludeHost"), vec![vec!["LoopA".to_string()], vec!["LoopB".to_string()]]);
+    }
+
+    /// An include another body adds is a statement of its own, and the
+    /// module's `include A, B` stays one (#2211). Ruby 4.0.7:
+    /// `[CarryHost, CarryExtra, CarryA, CarryB]`.
+    #[test]
+    fn an_include_another_body_adds_keeps_the_module_s_statements() {
+        let app = include_statements_app();
+        assert_eq!(
+            statements_of(&app, "CarryHost"),
+            vec![vec!["CarryA".to_string(), "CarryB".to_string()], vec!["CarryExtra".to_string()]]
+        );
+    }
+
+    /// A walk that meets modules already in the chain goes on below the
+    /// lowest it has met, never back up (#2211). Ruby 4.0.7: `X` including
+    /// `C`, `B`, `A` (ancestors `[X, A, B, C]`), and a class including
+    /// `A`, `B`, then `X`, has `[X, B, A, C]`.
+    #[test]
+    fn an_include_walk_never_moves_its_cursor_back_up() {
+        let id = |name: &str| crate::ident::ClassId(name.into());
+        let names = |chain: Vec<crate::ident::ClassId>| chain.iter().map(|m| m.0.as_str().to_string()).collect::<Vec<_>>();
+        let mut statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+        statements.insert(id("X"), vec![vec![id("C")], vec![id("B")], vec![id("A")]]);
+        let concerns = crate::det::HashSet::default();
+        let ancestry = Ancestry { statements: &statements, concerns: &concerns, before_concern: &Default::default(), expanded: Default::default(), walking: Default::default() };
+        let class = [vec![id("A")], vec![id("B")], vec![id("X")]];
+        assert_eq!(names(ancestry.of_statements(&class, &Default::default())), ["X", "B", "A", "C"]);
+    }
 
     #[test]
     fn reopened_concern_filters_keep_include_statement_order() {

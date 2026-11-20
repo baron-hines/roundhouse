@@ -4737,11 +4737,32 @@ fn walk_decl_body_with_visibility<'pr>(
         let mut classes = parsed?;
         let Some(class) = classes.pop() else { continue };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
+        // Each has the loop's span, as it runs there: a name the string spells (`include Leaf`, the host's nested
+        // `Leaf`) is looked up in the loop, and an `extend` it makes runs after the includes written ahead of the
+        // loop. The includes come where the loop stands: after the ones written before it, ahead of an ordinary
+        // `include` written after it, which Ruby runs later.
+        let at_loop = Span { file: super::sources::file_id(file), start, end };
+        let spanned = out.include_spans.len() == out.includes.len();
+        let mut at = if spanned {
+            out.include_spans.iter().take_while(|span| span.is_synthetic() || span.start < end).count()
+        } else {
+            out.includes.len()
+        };
         for include in &class.includes {
-            out.includes.push(include.clone());
-            out.include_spans.push(Span { file: super::sources::file_id(file), start, end });
+            if spanned {
+                out.includes.insert(at, include.clone());
+                out.include_spans.insert(at, at_loop);
+                at += 1;
+            } else {
+                out.includes.push(include.clone());
+                out.include_spans.push(at_loop);
+            }
         }
-        out.unknown_calls.extend(class.unknown_calls.iter().cloned());
+        out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
+            let mut call = call.clone();
+            call.span = at_loop;
+            call
+        }));
         for mut method in class.methods {
             // A `module ClassMethods` body's methods are the includer's class side, as its own `def`s are.
             if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
