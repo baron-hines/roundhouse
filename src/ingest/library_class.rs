@@ -4588,40 +4588,38 @@ fn walk_decl_body_with_visibility<'pr>(
     // The `def`s a `class_eval` string loop makes, after the body's own: Ruby runs the loop where it stands, and a
     // later `def` of the body replaces one of them only by name, which no target here orders by.
     let mut from_eval: Vec<usize> = Vec::new();
-    for ((start, end), (element_start, element_end), source) in evaled {
+    for ((start, end), source) in evaled {
         let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
         let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
         let mut classes = parsed?;
         let Some(class) = classes.pop() else { continue };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
-        // From the element to the loop's end, one span per statement of the string: `include A; include B` is two
-        // statements and `include A, B` one, the end a byte nearer per statement. The span holds the string, so a
-        // name it spells (`include Leaf`, the host's nested `Leaf`) is looked up where it is written.
-        // Where the loop stands: after the includes before it and its earlier elements', ahead of an ordinary
+        // Each has the loop's span, as it runs there: a name the string spells (`include Leaf`, the host's nested
+        // `Leaf`) is looked up in the loop, and an `extend` it makes runs after the includes written ahead of the
+        // loop. The includes come where the loop stands: after the ones written before it, ahead of an ordinary
         // `include` written after it, which Ruby runs later.
+        let at_loop = Span { file: super::sources::file_id(file), start, end };
         let spanned = out.include_spans.len() == out.includes.len();
         let mut at = if spanned {
             out.include_spans.iter().take_while(|span| span.is_synthetic() || span.start < end).count()
         } else {
             out.includes.len()
         };
-        let mut statement = 0;
-        for (i, include) in class.includes.iter().enumerate() {
-            let parsed = class.include_spans.get(i);
-            if i > 0 && (parsed.is_none() || parsed != class.include_spans.get(i - 1)) {
-                statement += 1;
-            }
-            let end = end.saturating_sub(statement).max(element_end);
+        for include in &class.includes {
             if spanned {
                 out.includes.insert(at, include.clone());
-                out.include_spans.insert(at, Span { file: super::sources::file_id(file), start: element_start, end });
+                out.include_spans.insert(at, at_loop);
                 at += 1;
             } else {
                 out.includes.push(include.clone());
-                out.include_spans.push(Span { file: super::sources::file_id(file), start: element_start, end });
+                out.include_spans.push(at_loop);
             }
         }
-        out.unknown_calls.extend(class.unknown_calls.iter().cloned());
+        out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
+            let mut call = call.clone();
+            call.span = at_loop;
+            call
+        }));
         for mut method in class.methods {
             // A `module ClassMethods` body's methods are the includer's class side, as its own `def`s are.
             if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
@@ -4649,12 +4647,7 @@ fn walk_decl_body_with_visibility<'pr>(
 /// body Ruby evaluates it in. The loop leaves the body; each string's source comes back to be walked as one.
 // Not a loop over anything but a literal of Strings or Symbols, nor a string that reads anything else: the text is
 // known now only then.
-// Each string comes with the loop's span and its element's: one run of the
-// string is one statement, apart from the next element's.
-#[allow(clippy::type_complexity)]
-fn unroll_class_eval_loops<'pr>(
-    statements: Vec<ruby_prism::Node<'pr>>,
-) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), (u32, u32), String)>) {
+fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<ruby_prism::Node<'pr>>, Vec<((u32, u32), String)>) {
     let mut kept = Vec::with_capacity(statements.len());
     let mut evaled = Vec::new();
     let lists = class_attribute_lists(&statements);
@@ -4662,7 +4655,7 @@ fn unroll_class_eval_loops<'pr>(
         match class_eval_loop_sources(&s, &lists) {
             Some(sources) => {
                 let at = (s.location().start_offset() as u32, s.location().end_offset() as u32);
-                evaled.extend(sources.into_iter().map(|(element, source)| (at, element, source)));
+                evaled.extend(sources.into_iter().map(|source| (at, source)));
             }
             None => kept.push(s),
         }
@@ -4854,35 +4847,23 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
 }
 
 /// The strings a `class_eval` loop [`unroll_class_eval_loops`] unrolls evaluates, one per element.
-fn class_eval_loop_sources(
-    s: &ruby_prism::Node<'_>,
-    lists: &HashMap<String, Vec<String>>,
-) -> Option<Vec<((u32, u32), String)>> {
-    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<((u32, u32), String)>> {
+fn class_eval_loop_sources(s: &ruby_prism::Node<'_>, lists: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let unrolled = |s: &ruby_prism::Node<'_>| -> Option<Vec<String>> {
         let call = s.as_call_node()?;
         if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
             return None;
         }
         let receiver = call.receiver()?;
-        // Each element with its span; one a list read elsewhere names has none, so each gets a byte of the read's:
-        // a span apart from the next element's.
-        let (elements, element_spans): (Vec<String>, Vec<(u32, u32)>) = match receiver.as_call_node() {
+        let elements: Vec<String> = match receiver.as_call_node() {
             Some(reader) if reader.receiver().is_none() && reader.arguments().is_none() && reader.block().is_none() => {
-                let start = reader.location().start_offset() as u32;
-                let list = lists.get(&*constant_id_str(&reader.name()))?.clone();
-                let spans = (0..list.len() as u32).map(|i| (start + i, start + i + 1)).collect();
-                (list, spans)
+                lists.get(&*constant_id_str(&reader.name()))?.clone()
             }
-            _ => {
-                let array = receiver.as_array_node()?;
-                let names: Vec<String> = static_name_list(&receiver, false)?.into_iter().map(|(_, n)| n).collect();
-                let spans = array
-                    .elements()
-                    .iter()
-                    .map(|e| (e.location().start_offset() as u32, e.location().end_offset() as u32))
-                    .collect();
-                (names, spans)
-            }
+            _ => receiver
+                .as_array_node()
+                .and_then(|_| static_name_list(&receiver, false))?
+                .into_iter()
+                .map(|(_, n)| n)
+                .collect(),
         };
         let block = call.block()?.as_block_node()?;
         let params: Vec<_> = block.parameters()?.as_block_parameters_node()?.parameters()?.requireds().iter().collect();
@@ -4918,13 +4899,7 @@ fn class_eval_loop_sources(
                 pieces.push(None);
             }
         }
-        Some(
-            elements
-                .iter()
-                .zip(element_spans)
-                .map(|(el, at)| (at, pieces.iter().map(|p| p.clone().unwrap_or_else(|| el.clone())).collect()))
-                .collect(),
-        )
+        Some(elements.iter().map(|el| pieces.iter().map(|p| p.clone().unwrap_or_else(|| el.clone())).collect()).collect())
     };
     unrolled(s)
 }

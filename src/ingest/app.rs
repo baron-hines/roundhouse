@@ -6834,7 +6834,6 @@ mod controller_concern_surface_tests {
             ("app/controllers/concerns/loop_a.rb", "module LoopA\n  def label\n    \"loop a\"\n  end\nend\n"),
             ("app/controllers/concerns/loop_b.rb", "module LoopB\n  def label\n    \"loop b\"\n  end\nend\n"),
             ("lib/loop_host.rb", "module LoopHost\n  %w[LoopA LoopB].each { |m| class_eval \"include #{m}\" }\n\n  def host\n    \"loop\"\n  end\nend\n"),
-            ("lib/two_statement_host.rb", "module TwoStatementHost\n  %w[LoopA].each { |m| class_eval \"include #{m}; include LoopB\" }\n\n  def host\n    \"two\"\n  end\nend\n"),
             ("lib/one_statement_host.rb", "module OneStatementHost\n  %w[LoopA].each { |m| class_eval \"include #{m}, LoopB\" }\n\n  def host\n    \"one\"\n  end\nend\n"),
             ("lib/loop_then_include_host.rb", "module LoopThenIncludeHost\n  %w[LoopA].each { |m| class_eval \"include #{m}\" }\n  include LoopB\n\n  def host\n    \"then\"\n  end\nend\n"),
             ("app/controllers/concerns/carry_a.rb", "module CarryA\n  def label\n    \"carry a\"\n  end\nend\n"),
@@ -6857,22 +6856,6 @@ mod controller_concern_surface_tests {
             .flat_map(include_statements)
             .map(|group| group.iter().map(|m| m.0.as_str().to_string()).collect())
             .collect()
-    }
-
-    /// Each run of a `class_eval` loop's string is a statement of its own
-    /// (#2211). Ruby 4.0.7: `[LoopHost, LoopB, LoopA]`.
-    #[test]
-    fn a_class_eval_loop_s_includes_are_separate_statements() {
-        let app = include_statements_app();
-        assert_eq!(statements_of(&app, "LoopHost"), vec![vec!["LoopA".to_string()], vec!["LoopB".to_string()]]);
-    }
-
-    /// Two `include` statements in one run of a `class_eval` loop's string
-    /// stay two statements (#2211). Ruby 4.0.7: `[TwoStatementHost, LoopB, LoopA]`.
-    #[test]
-    fn a_class_eval_string_s_two_includes_are_separate_statements() {
-        let app = include_statements_app();
-        assert_eq!(statements_of(&app, "TwoStatementHost"), vec![vec!["LoopA".to_string()], vec!["LoopB".to_string()]]);
     }
 
     /// One `include A, B` in a `class_eval` loop's string stays one
