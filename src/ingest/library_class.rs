@@ -175,6 +175,149 @@ pub fn ingest_library_classes(
     ingest_library_classes_impl(source, file, Walk::All)
 }
 
+/// The top-level `Const.class_eval do … end` (or `module_eval`) blocks of
+/// a file that hold nothing but `def`s, each as an opening of `Const` with
+/// the statement's start offset. In the block `self` is `Const`, so a `def`
+/// there defines what the same `def` in a `class Const` body would. A
+/// block with parameters, arguments or any other statement is not taken:
+/// a constant written there belongs to the block's lexical scope, not to
+/// `Const`, and a local it reads is the enclosing scope's. The opening is
+/// read as a class's (`is_module: false`); whoever keeps it gives it the
+/// kind of the declaration it reopens.
+///
+/// A block the ingest refuses is left out on its own: the file's other
+/// blocks are still read. Each opening comes with the bare constants its
+/// block reads (`TOKEN`, the `Helper` of `Helper.call`). Ruby looks those
+/// up in the block's lexical scope, the top level, not in `Const`.
+pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassEvalOpening>> {
+    let result = super::prism::parse_silent(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for node in program.statements().body().iter() {
+        let Some(call) = node.as_call_node() else { continue };
+        if !matches!(call.name().as_slice(), b"class_eval" | b"module_eval") || call.arguments().is_some() {
+            continue;
+        }
+        let Some(path) = call.receiver().and_then(|receiver| constant_path_of(&receiver)) else { continue };
+        let Some(block) = call.block().and_then(|block| block.as_block_node()) else { continue };
+        if block.parameters().is_some() {
+            continue;
+        }
+        let Some(statements) = block.body().and_then(|body| body.as_statements_node()) else { continue };
+        // `def Other.x` in the block defines on `Other`: only a `def` on
+        // the block's `self` is the class's.
+        if !statements.body().iter().all(|statement| {
+            statement.as_def_node().is_some_and(|def| def.receiver().is_none_or(|r| r.as_self_node().is_some()))
+        }) {
+            continue;
+        }
+        // A class variable is looked up in the block's lexical scope, the
+        // top level, where an opening would find the class's.
+        if refers_to_class_variable(&statements.as_node()) {
+            continue;
+        }
+        let owner = ClassId(Symbol::from(path.join("::")));
+        let DeclBody {
+            includes,
+            include_spans,
+            methods,
+            constants,
+            unknown_calls,
+            class_initializers,
+            class_attributes: _,
+            conditional_definitions,
+        } = match walk_decl_body(block.body(), &owner, file, DeclBodyMode::Instance) {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let (bare_constants, rooted_constants) = constant_reads(&statements.as_node());
+        let opening = LibraryClass {
+            name: owner,
+            is_module: false,
+            parent: None,
+            parent_span: Span::synthetic(),
+            includes,
+            include_spans,
+            methods,
+            nullable_columns: Vec::new(),
+            origin: None,
+            constants,
+            conditional_definitions,
+            unknown_calls,
+            class_ivar_initializers: class_initializers,
+        };
+        out.push(ClassEvalOpening { start: node.location().start_offset() as u32, opening, bare_constants, rooted_constants });
+    }
+    Ok(out)
+}
+
+/// Whether `node` reads or writes a class variable anywhere, `defined?(@@x)` included.
+fn refers_to_class_variable(node: &ruby_prism::Node<'_>) -> bool {
+    struct Found(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Found {
+        fn visit_class_variable_read_node(&mut self, _: &ruby_prism::ClassVariableReadNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_write_node(&mut self, _: &ruby_prism::ClassVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_target_node(&mut self, _: &ruby_prism::ClassVariableTargetNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_operator_write_node(&mut self, _: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_and_write_node(&mut self, _: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_or_write_node(&mut self, _: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut found = Found(false);
+    ruby_prism::Visit::visit(&mut found, node);
+    found.0
+}
+
+/// The constants `node` reads: bare (`TOKEN`, the `Helper` of
+/// `Helper.call`), which Ruby looks up lexically, and rooted (`::Helper`),
+/// which name the top level's. Each sorted, without repeats.
+pub(crate) fn constant_reads(node: &ruby_prism::Node<'_>) -> (Vec<String>, Vec<String>) {
+    struct Reads(Vec<String>, Vec<String>);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            self.0.push(constant_id_str(&node.name()).to_string());
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if node.parent().is_none() {
+                if let Some(name) = node.name() {
+                    self.1.push(constant_id_str(&name).to_string());
+                }
+            }
+            ruby_prism::visit_constant_path_node(self, node);
+        }
+    }
+    let mut reads = Reads(Vec::new(), Vec::new());
+    ruby_prism::Visit::visit(&mut reads, node);
+    for list in [&mut reads.0, &mut reads.1] {
+        list.sort();
+        list.dedup();
+    }
+    (reads.0, reads.1)
+}
+
+/// One opening [`class_eval_openings`] reads.
+pub struct ClassEvalOpening {
+    /// The statement's start offset in its file.
+    pub start: u32,
+    pub opening: LibraryClass,
+    /// The bare constant names the block reads, sorted.
+    pub bare_constants: Vec<String>,
+    /// The top-level names it reads rooted (`::Helper`), sorted.
+    pub rooted_constants: Vec<String>,
+}
+
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads
 /// (`app/models`, the autoloaded support dirs): a file that declares no
 /// class or module but writes file-level constants still defines them,

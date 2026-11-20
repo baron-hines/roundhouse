@@ -314,15 +314,9 @@ fn order_openings_by_load(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
-/// The file an opening was read from: the first of its spans that points
-/// at a source.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file(lc: &LibraryClass, app: &App) -> Option<String> {
-    let span = std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())?;
+    let span = lc.source_span()?;
     let source = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
     Some(normalize_path(&source.path))
 }

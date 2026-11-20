@@ -273,14 +273,21 @@ pub(super) const FRAMEWORK_ROOTS: &[&str] = &[
 /// Bundler loads the gem before Rails runs the initializer, so the class
 /// holds both, and a method both define is the initializer's. The emit
 /// writes the openings into one file, the gem's first.
+///
+/// A `Const.class_eval do … end` of `def`s on such a name
+/// (`library_class::class_eval_openings`) is the same opening and is kept
+/// the same way, as a module when the gem declares one. Its statement is
+/// returned, so the initializer ledger stops reporting it as having no
+/// effect; one on any other name is left on the ledger.
 fn keep_initializer_defined(
     app: &mut App,
     dir: &Path,
     sources: &[crate::span::SourceFile],
     gem_mounts: &[PathBuf],
     candidates: Vec<LibraryClass>,
+    class_evals: Vec<((String, u32), super::library_class::ClassEvalOpening)>,
     callback_constants: &std::collections::HashSet<String>,
-) {
+) -> Vec<(String, u32)> {
     const CORE: &[&str] = &[
         "Object", "BasicObject", "Kernel", "Module", "Class", "Comparable",
         "Enumerable", "Integer", "Float", "Numeric", "String", "Symbol",
@@ -318,46 +325,164 @@ fn keep_initializer_defined(
     let from_gem = |lc: &LibraryClass| {
         opening_file(lc, sources).is_some_and(|file| gem_mounts.iter().any(|mount| Path::new(file).starts_with(mount)))
     };
-    let gem_declared: HashSet<String> =
-        app.library_classes.iter().filter(|c| from_gem(c)).map(|c| c.name.0.as_str().to_string()).collect();
-    for lc in candidates {
-        let name = lc.name.0.as_str().to_string();
-        if gem_declared.contains(&name) {
-            app.library_classes.push(lc);
+    let gem_declared: HashMap<String, bool> =
+        app.library_classes.iter().filter(|c| from_gem(c)).map(|c| (c.name.0.as_str().to_string(), c.is_module)).collect();
+    // The names a gem's class or module defines in itself or in a gem
+    // superclass or included module: their constants and nested classes,
+    // the gem's or an initializer reopen's. A block reading one of them
+    // bare reads the top level's in Ruby, which the kept opening, looking
+    // through its ancestors, would not.
+    let gem_owns_itself = |owner: &str, name: &str| {
+        let nested = format!("{owner}::{name}");
+        let reopens = candidates.iter().filter(|c| gem_declared.contains_key(c.name.0.as_str()));
+        app.library_classes.iter().filter(|c| from_gem(c)).chain(reopens).any(|c| {
+            (c.name.0.as_str() == owner && c.constants.iter().any(|(n, _)| n.as_str() == name))
+                || c.name.0.as_str() == nested
+        })
+    };
+    // Every name the gem declares, with the namespaces its nested names
+    // open: a class holding only a nested module is no opening of its own.
+    let gem_namespaces: crate::det::HashSet<String> = gem_declared
+        .keys()
+        .flat_map(|name| name.match_indices("::").map(|(at, _)| name[..at].to_string()).chain([name.clone()]))
+        .collect();
+    let gem_owned = |owner: &str, name: &str| {
+        let mut pending = vec![owner.to_string()];
+        let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if gem_owns_itself(&current, name) {
+                return true;
+            }
+            for opening in app.library_classes.iter().filter(|c| from_gem(c) && c.name.0.as_str() == current) {
+                for ancestor in opening.parent.iter().chain(&opening.includes) {
+                    // A bare ancestor is looked up from the opening's namespaces outward.
+                    let written = ancestor.0.as_str().trim_start_matches("::");
+                    let mut scopes: Vec<&str> = current.match_indices("::").map(|(at, _)| &current[..at]).collect();
+                    scopes.reverse();
+                    let found = if ancestor.0.as_str().starts_with("::") {
+                        None
+                    } else {
+                        scopes.iter().map(|scope| format!("{scope}::{written}")).find(|n| gem_namespaces.contains(n))
+                    };
+                    pending.push(found.unwrap_or_else(|| written.to_string()));
+                }
+            }
+        }
+        false
+    };
+    // Where each kept reopen of a gem's name runs: its initializer, which
+    // Rails runs in sorted order, and its place in that file. A later one
+    // stands over an earlier one, a `class_eval` block or not.
+    let at = |lc: &LibraryClass| {
+        lc.source_span().and_then(|span| {
+            let file = sources.get((span.file.0 as usize).checked_sub(1)?)?;
+            Some((super::sources::relative_path(&file.path), span.start))
+        })
+    };
+    let mut gem_reopens: Vec<(Option<(String, u32)>, LibraryClass)> = Vec::new();
+    let mut taken = Vec::new();
+    // What the kept blocks' methods read: a helper the initializer defines
+    // for them is live, whether or not the app names it.
+    let mut read_by_kept: crate::det::HashSet<String> = crate::det::HashSet::default();
+    for (statement, eval) in class_evals {
+        let mut lc = eval.opening;
+        let Some(&is_module) = gem_declared.get(lc.name.0.as_str()) else { continue };
+        if eval.bare_constants.iter().any(|name| gem_owned(lc.name.0.as_str(), name)) {
             continue;
         }
-        if name.contains("::")
-            || FRAMEWORK_ROOTS.contains(&name.as_str())
-            || CORE.contains(&name.as_str())
-            || app.library_classes.iter().any(|c| c.name == lc.name)
-            || app.models.iter().any(|m| m.name == lc.name)
-            || app.controllers.iter().any(|c| c.name == lc.name)
-            || !referenced(&name)
-        {
-            continue;
-        }
-        app.library_classes.push(lc);
+        lc.is_module = is_module;
+        read_by_kept.extend(eval.bare_constants);
+        read_by_kept.extend(eval.rooted_constants);
+        gem_reopens.push((Some(statement.clone()), lc));
+        taken.push(statement);
     }
+    let mut rest = Vec::new();
+    for lc in candidates {
+        if gem_declared.contains_key(lc.name.0.as_str()) {
+            // Kept whatever the app names, so what it reads is live too.
+            read_by_kept.extend(opening_constant_reads(&lc, sources));
+            gem_reopens.push((at(&lc), lc));
+        } else {
+            rest.push(lc);
+        }
+    }
+    // A reopen whose place is unknown (one holding only nested classes)
+    // goes first, in its order: the sort is stable.
+    gem_reopens.sort_by(|(a, _), (b, _)| a.cmp(b));
+    app.library_classes.extend(gem_reopens.into_iter().map(|(_, lc)| lc));
+    let eligible: Vec<LibraryClass> = rest
+        .into_iter()
+        .filter(|lc| {
+            let name = lc.name.0.as_str();
+            !(name.contains("::")
+                || FRAMEWORK_ROOTS.contains(&name)
+                || CORE.contains(&name)
+                || app.library_classes.iter().any(|c| c.name == lc.name)
+                || app.models.iter().any(|m| m.name == lc.name)
+                || app.controllers.iter().any(|c| c.name == lc.name))
+        })
+        .collect();
+    // A kept definition's methods can call another the initializer
+    // defines (`LabelHelper.tag` calling `TagSource.tag`): what each kept
+    // one reads is live too, until nothing more is.
+    let mut kept = vec![false; eligible.len()];
+    loop {
+        let mut grew = false;
+        for (at, lc) in eligible.iter().enumerate() {
+            let name = lc.name.0.as_str();
+            if kept[at] || !(referenced(name) || read_by_kept.contains(name)) {
+                continue;
+            }
+            kept[at] = true;
+            grew = true;
+            read_by_kept.extend(opening_constant_reads(lc, sources));
+        }
+        if !grew {
+            break;
+        }
+    }
+    app.library_classes.extend(eligible.into_iter().zip(kept).filter(|(_, kept)| *kept).map(|(lc, _)| lc));
+    taken
 }
 
-/// The first of an opening's spans that points at a source.
-fn opening_span(lc: &LibraryClass) -> Option<crate::span::Span> {
-    std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        // A method's name before its body: an `attr_reader`'s reader has
-        // a synthesized body but the name it was written with.
-        .chain(lc.methods.iter().map(|m| m.name_span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        // A body that only sets a class-level variable (`@configured = true`).
-        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())
+/// The constants an opening reads, bare or rooted: its superclass and the
+/// modules it includes, which Ruby resolves when the opening runs, and,
+/// from their source text, its methods' bodies and parameter defaults,
+/// its constants' values, its class ivars' initializers and the
+/// body-level calls it keeps as written (`extend TagSource`).
+fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
+    let mut out: Vec<String> = lc.parent.iter().chain(&lc.includes).map(|named| named.0.as_str().trim_start_matches("::").to_string()).collect();
+    let spans = lc
+        .methods
+        .iter()
+        .flat_map(|method| {
+            std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
+        })
+        .chain(lc.constants.iter().map(|(_, value)| value.span))
+        .chain(lc.class_ivar_initializers.iter().map(|value| value.span))
+        // A body-level call the opening keeps as written, such as
+        // `extend TagSource`, reads its arguments when the class loads.
+        .chain(lc.unknown_calls.iter().map(|call| call.span));
+    for span in spans {
+        if span.is_synthetic() {
+            continue;
+        }
+        let Some(file) = (span.file.0 as usize).checked_sub(1).and_then(|at| sources.get(at)) else { continue };
+        let Some(text) = file.text.get(span.start as usize..span.end as usize) else { continue };
+        let parsed = ruby_prism::parse(text.as_bytes());
+        let (bare, rooted) = super::library_class::constant_reads(&parsed.node());
+        out.extend(bare);
+        out.extend(rooted);
+    }
+    out
 }
 
-/// The file an opening was read from.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file<'s>(lc: &LibraryClass, sources: &'s [crate::span::SourceFile]) -> Option<&'s str> {
-    let span = opening_span(lc)?;
+    let span = lc.source_span()?;
     sources.get((span.file.0 as usize).checked_sub(1)?).map(|f| f.path.as_str())
 }
 
@@ -2203,6 +2328,10 @@ end
     // kept or dropped after every app file is read (see
     // `keep_initializer_defined`).
     let mut initializer_defined: Vec<LibraryClass> = Vec::new();
+    // An initializer's top-level `Const.class_eval do … end` of `def`s,
+    // by the statement it is (path, start): kept or left on the ledger
+    // with `initializer_defined` (see `keep_initializer_defined`).
+    let mut class_eval_openings: Vec<((String, u32), super::library_class::ClassEvalOpening)> = Vec::new();
     let mut rate_limit_stores = Vec::new();
     // `ActionController::Base.prepend_view_path …`, applied with the class
     // bodies' own once every class is read (see `view_paths`).
@@ -2259,6 +2388,10 @@ end
                             initializer_defined.push(lc);
                         }
                     }
+                }
+                if let Ok(openings) = super::library_class::class_eval_openings(&bytes, &path_str) {
+                    let relative = super::sources::relative_path(&path_str);
+                    class_eval_openings.extend(openings.into_iter().map(|opening| ((relative.clone(), opening.start), opening)));
                 }
                 rate_limit_stores.extend(super::rate_limit::initializer_stores(&bytes, &path_str));
                 app.module_mixins.extend(mixins);
@@ -3146,7 +3279,7 @@ end
     enum_constants.validate_consumed_sources(&app, &sources, &observed)?;
     let gem_mounts: Vec<PathBuf> = source_gems.iter().map(|gem| gem.mount.clone()).collect();
     let callback_constants = super::after_initialize::named_constants(&callbacks);
-    keep_initializer_defined(&mut app, dir, &sources, &gem_mounts, initializer_defined, &callback_constants);
+    let class_evals_taken = keep_initializer_defined(&mut app, dir, &sources, &gem_mounts, initializer_defined, class_eval_openings, &callback_constants);
     // `self.queue_adapter =` on ApplicationJob (see `App::queue_adapter`).
     apply_application_job_queue_adapter(&mut app);
     let const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
@@ -3183,6 +3316,7 @@ end
     let gem_lock = app.gem_lock.clone();
     let mut boot_taken = super::boot_program::build(vfs, dir, &path_gems, &mut app, gem_lock.as_ref(), &app_namespaces, &rate_limit_store_values)?;
     boot_taken.extend(super::engine_config::carry(&mut app, dir));
+    boot_taken.extend(class_evals_taken);
     boot_taken.extend(stacked_application_uses.iter().map(|start| ("config/application.rb".to_string(), *start)));
     super::boot_program::apply_call_sites(&mut app);
     super::initializer_ledger::record(

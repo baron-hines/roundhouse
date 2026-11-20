@@ -569,6 +569,18 @@ impl Overlay {
         diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
     }
 
+    /// Every diagnostic ingest reports for the overlaid tree, warnings included.
+    #[allow(dead_code)]
+    pub fn ingest_diagnostics(self) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        // A failed ingest also reports no warnings: an absence check on them
+        // must not pass for that.
+        app.expect("ingest the overlaid fixture");
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags
+    }
+
     /// The warnings the target-aware lowering reports for `target`
     /// (`session::analyze_and_lower_for`): a construct the target's lowering
     /// doesn't reach, kept a reported gap there.
