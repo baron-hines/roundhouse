@@ -111,6 +111,7 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
             definition(stmt).is_some()
                 || conditional_accessor(stmt).is_some()
                 || self_write(stmt).is_some()
+                || branch_load(stmt).is_some()
                 || conditional_definition(stmt).is_some()
                 || stmt.as_class_node().is_some()
                 || stmt.as_module_node().is_some()
@@ -187,6 +188,24 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
 }
 
 /// `self.error_status = :ok`: a write through the class's own writer, as a branch runs it.
+/// `include Mod` (of a constant) or `require "lib"` in a load-time conditional's branch (method_source's
+/// `include ReeSourceLocation` / `require 'java'`): it runs only when the branch does, as a `def` there does.
+pub(super) fn branch_load<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    match constant_id_str(&call.name()).as_ref() {
+        "include" => (arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some()).then_some(call),
+        "require" => arg.as_string_node().is_some().then_some(call),
+        // `private :trace_func` after the branch's `def`: the visibility it gives, where the branch runs.
+        "private" | "public" | "protected" => arg.as_symbol_node().is_some().then_some(call),
+        _ => None,
+    }
+}
+
 pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
     let call = stmt.as_call_node()?;
     let name = constant_id_str(&call.name());

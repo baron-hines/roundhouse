@@ -2282,6 +2282,13 @@ impl Run<'_> {
     }
 
     fn slot(&mut self, value: Expr) -> Symbol {
+        // Not a slot of a slot (`_2 = _1`): the body would hoist that alias above the value it names.
+        if let ExprNode::Const { path } = &*value.node
+            && let [name] = path.as_slice()
+            && name.as_str().starts_with(self.prefix)
+        {
+            return name.clone();
+        }
         self.counter += 1;
         let name = Symbol::from(format!("{}_{}", self.prefix, self.counter));
         let span = value.span;

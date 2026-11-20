@@ -1457,8 +1457,9 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
             s.consts.push((s.context.map(|c| c.0.to_string()), name));
         }
         // A gem class named by a string, as `constantize` takes one (Devise's `@@mailer = "Devise::Mailer"`).
+        // Rooted too (doorkeeper's `default = "::Doorkeeper::SecretStoring::Sha256Hash"`).
         ExprNode::Lit { value: Literal::Str { value } }
-            if value.starts_with(|c: char| c.is_ascii_uppercase())
+            if value.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase())
                 && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
                 && s.gems.is_some_and(|g| g.known(value.trim_start_matches("::"))) =>
         {

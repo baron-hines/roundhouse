@@ -2930,7 +2930,7 @@ fn conditional_definitions(
             statements: Vec::new(),
         };
         for stmt in stmts {
-            if visibility::self_write(&stmt).is_some() {
+            if visibility::self_write(&stmt).is_some() || visibility::branch_load(&stmt).is_some() {
                 arm.statements.push(ingest_expr(&stmt, file)?);
                 continue;
             }

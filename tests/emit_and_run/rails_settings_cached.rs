@@ -32,7 +32,7 @@ fn files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::path:
     }
 }
 
-const SETTING: &str = "class Setting < RailsSettings::Base\n  field :site_name, type: :string, default: \"Blog\"\n  field :open_signup, type: :boolean, default: false\nend\n";
+const SETTING: &str = "class Setting < RailsSettings::Base\n  field :site_name, type: :string, default: ENV.fetch(\"PROBE_SITE_NAME\", \"Blog\")\n  field :open_signup, type: :boolean, default: false\nend\n";
 
 const SCRIPT: &str = r#"
 got = [Setting.site_name, Setting.open_signup, Setting.open_signup?]

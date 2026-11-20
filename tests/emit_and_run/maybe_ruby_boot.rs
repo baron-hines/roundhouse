@@ -99,3 +99,20 @@ puts "record validate! passed"
     run.assert_passes();
     assert!(run.stdout.contains("record validate! passed"), "{}", run.stdout);
 }
+
+/// method_source's `source_location.rb`: a load-time conditional whose branches `include` a module, or define a
+/// method and make it `private`, runs the branch Ruby takes (no `Proc#__file__` on this Ruby).
+#[test]
+fn a_load_time_conditionals_include_and_private_run_in_its_branch() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/located.rb",
+            "module Located\n  module Ree\n    def where_from\n      \"ree\"\n    end\n  end\n\n  module Methods\n    if Proc.method_defined? :__file__\n      include Ree\n    else\n      def where_from\n        helper\n      end\n\n      def helper\n        \"mri\"\n      end\n\n      private :helper\n    end\n  end\nend\n",
+        )
+        .write("app/models/located_probe.rb", "class LocatedProbe\n  include Located::Methods\nend\n")
+        .run_ruby(
+            "got = [LocatedProbe.new.where_from, LocatedProbe.private_method_defined?(:helper)]\nraise \"got #{got.inspect}\" unless got == [\"mri\", true]\nputs \"conditional branch passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("conditional branch passed"), "{}", run.stdout);
+}

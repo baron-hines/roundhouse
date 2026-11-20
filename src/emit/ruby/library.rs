@@ -10044,6 +10044,7 @@ fn emit_library_class_decl_inner(
                 Method(&'a MethodDef),
                 Nested(&'a crate::dialect::ConditionalDefinitions),
                 Declared(&'a ClassId),
+                Statement(&'a crate::expr::Expr),
             }
             let mut parts: Vec<(u32, Part<'_>)> = Vec::new();
             for member in &arm.methods {
@@ -10053,12 +10054,17 @@ fn emit_library_class_decl_inner(
             }
             parts.extend(arm.nested.iter().map(|n| (n.span.start, Part::Nested(n))));
             parts.extend(arm.declarations.iter().map(|d| (d.start, Part::Declared(&d.name))));
+            // A branch's `include` / `require`, which runs where the branch does.
+            parts.extend(arm.statements.iter().filter(|st| matches!(&*st.node,
+                crate::expr::ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "require" | "private" | "public" | "protected")))
+                .map(|st| (st.span.start, Part::Statement(st))));
             parts.sort_by_key(|(start, _)| *start);
             for (_, part) in parts {
                 match part {
                     Part::Method(method) => render_library_method(s, method, &inner),
                     Part::Nested(nested) => write(s, nested, lc, &inner, require_of),
                     Part::Declared(name) => writeln!(s, "{inner}{}", require_of(name)).unwrap(),
+                    Part::Statement(st) => writeln!(s, "{inner}{}", super::emit_expr(st)).unwrap(),
                 }
             }
         }
