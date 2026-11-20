@@ -107,11 +107,11 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
     }
     let defines = arms.iter().any(|(_, stmts)| !stmts.is_empty());
     let only_defs = arms.iter().all(|(_, stmts)| {
-        stmts.iter().all(|stmt| {
+        stmts.iter().enumerate().all(|(at, stmt)| {
             definition(stmt).is_some()
                 || conditional_accessor(stmt).is_some()
                 || self_write(stmt).is_some()
-                || branch_load(stmt).is_some()
+                || (branch_load(stmt).is_some() && marks_an_earlier_def(stmt, &stmts[..at]))
                 || conditional_definition(stmt).is_some()
                 || stmt.as_class_node().is_some()
                 || stmt.as_module_node().is_some()
@@ -204,6 +204,18 @@ pub(super) fn branch_load<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
         "private" | "public" | "protected" => arg.as_symbol_node().is_some().then_some(call),
         _ => None,
     }
+}
+
+/// A branch's `private :name` names a method the branch defined before it: Ruby raises NameError for one not yet
+/// defined, which the output, writing the class's own methods first, would not.
+fn marks_an_earlier_def(stmt: &Node<'_>, before: &[Node<'_>]) -> bool {
+    let Some(call) = stmt.as_call_node() else { return true };
+    if !matches!(constant_id_str(&call.name()).as_ref(), "private" | "public" | "protected") {
+        return true;
+    }
+    let Some(sym) = call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| a.as_symbol_node()) else { return false };
+    let name = sym.unescaped();
+    before.iter().any(|b| b.as_def_node().is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == name))
 }
 
 pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {

@@ -1501,7 +1501,7 @@ module ActiveRecord
 
     # Not ActiveModel's `ValidationError`: on a record Rails raises the `RecordInvalid` that `save!` does.
     def validate!
-      raise ActiveRecord::RecordInvalid.new(self) unless valid?
+      raise RecordInvalid, self unless valid?
       true
     end
 
