@@ -26,6 +26,7 @@ use crate::vfs::Vfs;
 
 pub const OBSERVER: &str = include_str!("../runtime/observe/shape_observer.rb");
 pub const CACHE: &str = ".roundhouse/observed_shapes.json";
+pub const APP_CACHE: &str = ".roundhouse/observed_app_shapes";
 
 thread_local! {
     static INSTALLED: std::cell::RefCell<Option<std::rc::Rc<Patches>>> = const { std::cell::RefCell::new(None) };
@@ -82,14 +83,125 @@ pub struct Cached {
 
 /// The Ruby and gem paths a boot runs with, read in the app's directory: a failed boot is reused only under the same.
 pub fn environment(dir: &Path) -> String {
-    let out = std::process::Command::new("ruby")
+    fingerprint(dir, Boot::Tree(&|_| Ok(()))).unwrap_or_else(|| "no ruby".into())
+}
+
+/// What a `boot` runs with, read through its own launcher; `None` when the probe fails, which no cache entry matches.
+fn fingerprint(dir: &Path, boot: Boot<'_>) -> Option<String> {
+    let mut probe = launcher(boot);
+    probe
         .args(["-e", "print RUBY_DESCRIPTION, \"\\n\", Gem.path.join(\":\"), \"\\n\", Gem::Specification.map(&:full_name).sort.join(\" \")"])
-        .current_dir(dir)
-        .output();
-    match out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned() + &std::env::var("GEM_PATH").unwrap_or_default() + &std::env::var("GEM_HOME").unwrap_or_default(),
-        Err(_) => "no ruby".into(),
+        .current_dir(dir);
+    let out = output_within(probe, PROBE_SECS).ok().filter(|out| out.status.success())?;
+    let mut env = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &std::env::var("GEM_PATH").unwrap_or_default()
+        + &std::env::var("GEM_HOME").unwrap_or_default();
+    if let Boot::App(_) = boot {
+        env += &std::env::var(BOOT_BUNDLE_PATH).unwrap_or_default();
+        // Not one observation for every environment: Rails boots what `RAILS_ENV` names, else `RACK_ENV`.
+        env += &std::env::var("RAILS_ENV").or_else(|_| std::env::var("RACK_ENV")).unwrap_or_else(|_| "development".into());
+        // Nor for every bundle: the Gemfile Bundler selects, and its lockfile, as they read now.
+        let gemfile = std::env::var_os("BUNDLE_GEMFILE").map(std::path::PathBuf::from).unwrap_or_else(|| dir.join("Gemfile"));
+        let lockfile = gemfile.with_file_name(format!("{}.lock", gemfile.file_name()?.to_string_lossy()));
+        env += &gemfile.display().to_string();
+        env += &String::from_utf8_lossy(&std::fs::read(&lockfile).unwrap_or_default());
     }
+    Some(env)
+}
+
+const PROBE_SECS: u64 = 60;
+
+/// A subprocess's output, or an error once it runs past `secs`: a Ruby that stalls must not hold the check.
+// Not pipes: a child that fills one waits for a reader, and a descendant holding one open keeps it from closing.
+fn output_within(mut command: std::process::Command, secs: u64) -> Result<std::process::Output, String> {
+    let dir = private_dir("roundhouse-probe")?;
+    let result = (|| {
+        let out_path = dir.join("stdout");
+        let err_path = dir.join("stderr");
+        let mut child = command
+            .stdout(std::fs::File::create(&out_path).map_err(|e| e.to_string())?)
+            .stderr(std::fs::File::create(&err_path).map_err(|e| e.to_string())?)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(secs) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("it did not finish in {secs} s"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: std::fs::read(&out_path).unwrap_or_default(),
+            stderr: std::fs::read(&err_path).unwrap_or_default(),
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// A fresh directory only this user reads, under the temporary directory.
+fn private_dir(prefix: &str) -> Result<std::path::PathBuf, String> {
+    (0..16)
+        .map(|attempt| {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos:x}-{attempt}", std::process::id()))
+        })
+        .find(|dir| {
+            let mut builder = std::fs::DirBuilder::new();
+            // Not readable by other users: the boot's log and Bundler's settings are the app's.
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).is_ok()
+        })
+        .ok_or_else(|| format!("no fresh temporary directory for {prefix}"))
+}
+
+/// The bundle only the app's own boot reads (`ROUNDHOUSE_BOOT_BUNDLE_PATH`): the app's whole bundle, which the compiler
+/// must not read as installed gems it could compile from source.
+pub const BOOT_BUNDLE_PATH: &str = "ROUNDHOUSE_BOOT_BUNDLE_PATH";
+
+/// The Ruby a `boot` runs: the caller's for the tree, the app's own bundle (`bundle exec`) for the app, under the boot
+/// bundle and the settings `App` was given when `ROUNDHOUSE_BOOT_BUNDLE_PATH` names one.
+fn launcher(boot: Boot<'_>) -> std::process::Command {
+    let Boot::App(config) = boot else { return std::process::Command::new("ruby") };
+    let mut command = std::process::Command::new("bundle");
+    command.args(["exec", "ruby"]);
+    if let Some(bundle) = std::env::var_os(BOOT_BUNDLE_PATH).filter(|p| !p.is_empty()) {
+        // Not the caller's pinned Ruby: the app's `.ruby-version` names the one its bundle was installed for.
+        command.env_remove("RBENV_VERSION");
+        command.env("BUNDLE_PATH", bundle);
+        if let Some(config) = config {
+            command.env("BUNDLE_APP_CONFIG", config);
+        }
+    }
+    command
+}
+
+/// The app's Bundler settings without its `BUNDLE_PATH`, which Bundler ranks above the environment's, in a fresh
+/// private directory the caller removes: `BUNDLE_WITHOUT` and the rest still say which gems the bundle holds.
+fn bundle_config(input: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    if std::env::var_os(BOOT_BUNDLE_PATH).is_none_or(|p| p.is_empty()) {
+        return Ok(None);
+    }
+    let dir = private_dir("roundhouse-boot-bundle-config")?;
+    let local = std::fs::read_to_string(input.join(".bundle/config")).unwrap_or_default();
+    let kept: String = local.lines().filter(|l| !l.trim_start().starts_with("BUNDLE_PATH:")).map(|l| format!("{l}\n")).collect();
+    std::fs::write(dir.join("config"), kept).map_err(|e| e.to_string())?;
+    Ok(Some(dir))
+}
+
+/// What the boot runs: the emitted CRuby tree a closure writes (the Spinel build's), or the app itself under its bundle.
+#[derive(Clone, Copy)]
+pub enum Boot<'a> {
+    Tree(&'a dyn Fn(&Path) -> Result<(), String>),
+    /// The app's own boot, with the Bundler settings `bundle_config` wrote, if any.
+    App(Option<&'a Path>),
 }
 
 /// The source edits an observation makes: statements written after an app file's offset, and gem statements that read `nil`.
@@ -401,3 +513,183 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     e.node.for_each_child(&mut |c| visit(c, f));
 }
+
+/// What `gems` do to the app's classes as the emitted tree boots: the cached observation under `key`, or a `boot`,
+/// cached for the next build.
+pub fn observe(input: &Path, gems: &[String], key: &str, boot: Boot<'_>) -> Result<Patches, String> {
+    let observation = observed(input, gems, key, boot, &input.join(CACHE));
+    patches(&observation, &input.canonicalize().map_err(|e| e.to_string())?)
+}
+
+/// The app's own boot, once per gem: what each gem does to the app's classes, from the gems whose doings it could
+/// write as source; each other gem with the first reason it could not, whose calls stay as they were.
+pub fn observe_app(input: &Path, gems: &[String], key: &str) -> (Result<Patches, String>, Vec<(String, String)>) {
+    let mut merged = Observation::default();
+    let mut refused = Vec::new();
+    let dir = match input.canonicalize() {
+        Ok(dir) => dir,
+        Err(e) => return (Err(e.to_string()), refused),
+    };
+    // The class-body statements whose effects a gem already merged: each gem's boot is separate, so the order of two
+    // gems' effects behind one statement is not known.
+    let mut triggers: std::collections::BTreeSet<Trigger> = std::collections::BTreeSet::new();
+    let config = match bundle_config(input) {
+        Ok(config) => config,
+        Err(why) => return (Err(why), refused),
+    };
+    for gem in gems {
+        // Not one boot for all: a gem whose doing cannot be written (view_component's generated slot module) would
+        // keep every other gem's from being read.
+        let observation = observed(input, std::slice::from_ref(gem), key, Boot::App(config.as_deref()), &input.join(APP_CACHE).join(format!("{gem}.json")));
+        if let Some(why) = observation.refusals.first() {
+            refused.push((gem.clone(), why.clone()));
+            continue;
+        }
+        // Not merged before its own patches apply: a gem whose trigger reads two ways would drop every other's.
+        if let Err(why) = patches(&observation, &dir) {
+            refused.push((gem.clone(), why));
+            continue;
+        }
+        let own: std::collections::BTreeSet<Trigger> = observation.effects.iter().filter_map(|e| e.trigger.clone()).collect();
+        if let Some(shared) = own.iter().find(|t| triggers.contains(*t)) {
+            refused.push((gem.clone(), format!("{}: another gem's effects come from `{}` too, in an order the separate boots do not keep", shared.file, shared.text)));
+            continue;
+        }
+        triggers.extend(own);
+        merged.effects.extend(observation.effects);
+        merged.loaded.extend(observation.loaded);
+    }
+    if let Some(config) = &config {
+        let _ = std::fs::remove_dir_all(config);
+    }
+    (patches(&merged, &dir), refused)
+}
+
+fn observed(input: &Path, gems: &[String], key: &str, boot: Boot<'_>, cache: &Path) -> Observation {
+    use self as obs;
+    let app = matches!(boot, Boot::App(_));
+    let now = if app { fingerprint(input, boot) } else { Some(obs::environment(input)) };
+    let cached = now.as_ref().and_then(|now| {
+        std::fs::read(cache)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<obs::Cached>(&b).ok())
+            .filter(|c| c.key == key && c.env.as_ref().is_none_or(|env| env == now))
+    });
+    if let Some(c) = cached {
+        return c.observation;
+    }
+    // Not reused once the Ruby or its gems differ: a failed boot may be the machine's, and a gem may shape a class by the Ruby it runs on.
+    let booted = boot_observer(input, gems, boot);
+    let after = if app { fingerprint(input, boot) } else { Some(obs::environment(input)) };
+    let env = now.filter(|before| after.as_ref() == Some(before));
+    // Not the app's failed boot kept: a database or service that was down may be up on the next check, which asked for it.
+    let keep = booted.is_ok() || !app;
+    let observation = booted.unwrap_or_else(|why| obs::Observation { effects: Vec::new(), refusals: vec![why], loaded: Vec::new() });
+    // Not only a boot that answered: one that failed would otherwise be tried again on every build.
+    // Nor one whose Ruby or gems changed while it ran: which of them it saw is not known.
+    if env.is_some() && keep {
+        if let Some(dir) = cache.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(
+            cache,
+            serde_json::to_vec_pretty(&obs::Cached { key: key.to_string(), observation: observation.clone(), env }).unwrap_or_default(),
+        );
+    }
+    observation
+}
+
+fn boot_observer(input: &Path, gems: &[String], boot: Boot<'_>) -> Result<Observation, String> {
+    // Not a name another user can guess and create first: the boot runs the Ruby files in it.
+    let tmp = private_dir("roundhouse-observe")?;
+    let observed = boot_observer_in(input, gems, &tmp, boot);
+    if std::env::var_os("ROUNDHOUSE_OBSERVE_KEEP").is_none() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    observed
+}
+
+fn boot_observer_in(input: &Path, gems: &[String], tmp: &Path, boot: Boot<'_>) -> Result<Observation, String> {
+    use self as obs;
+    let tmp = tmp.to_path_buf();
+    let ruby = || launcher(boot);
+    {
+        {
+            if let Boot::Tree(emit_ruby) = boot {
+                emit_ruby(&tmp)?;
+            }
+            let mut roots = Vec::new();
+            for gem in gems {
+                let (name, version) = gem
+                    .rsplit_once('-')
+                    .ok_or_else(|| format!("`{gem}` names no version"))?;
+                // In the app's directory: its `.ruby-version` names the Ruby whose gems the app runs on.
+                let mut lookup = ruby();
+                lookup
+                    .args([
+                        "-e",
+                        &format!(
+                            "print Gem::Specification.find_by_name({name:?}, {version:?}).gem_dir"
+                        ),
+                    ])
+                    .current_dir(input);
+                let found = output_within(lookup, PROBE_SECS).map_err(|e| format!("looking up {gem}: {e}"))?;
+                if !found.status.success() {
+                    let stderr = String::from_utf8_lossy(&found.stderr);
+                    // Not always a missing gem: under `bundle exec` the bundle itself may not set up.
+                    let first = stderr.lines().next().unwrap_or("").chars().take(300).collect::<String>();
+                    return Err(if stderr.contains("Gem::MissingSpecError") {
+                        format!("CRuby does not have {gem} installed")
+                    } else {
+                        format!("looking up {gem}: {first}")
+                    });
+                }
+                roots.push(String::from_utf8_lossy(&found.stdout).into_owned());
+            }
+            let observer = tmp.join(".roundhouse-shape-observer.rb");
+            let out = tmp.join(".roundhouse-shapes.json");
+            std::fs::write(&observer, obs::OBSERVER).map_err(|e| e.to_string())?;
+            // The app's own boot loads every class as production does (`eager_load!`), where the tree's boot file loads its own.
+            let script = match boot {
+                Boot::Tree(_) => format!("require {:?}", tmp.join("boot").display().to_string()),
+                Boot::App(_) => "require File.expand_path(\"config/environment\"); Rails.application.eager_load!".to_string(),
+            };
+            let app_root = if matches!(boot, Boot::App(_)) { input.to_path_buf() } else { tmp.clone() };
+            let mut child = ruby()
+                .arg(format!("-r{}", observer.display()))
+                .args(["-e", &script])
+                .current_dir(input)
+                .env("RH_SHAPE_OUT", &out)
+                .env("RH_SHAPE_APP", &app_root)
+                .env("RH_SHAPE_GEMS", roots.join(":"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(tmp.join(".roundhouse-boot.log")).map_err(|e| e.to_string())?)
+                .spawn()
+                .map_err(|e| format!("ruby: {e}"))?;
+            let started = std::time::Instant::now();
+            // Not left to run: a boot that waits on a server or a socket would hold the build.
+            let status = loop {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    break status;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(120) {
+                    let _ = child.kill();
+                    return Err("the boot did not finish in 120 s".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            if !status.success() {
+                let stderr = std::fs::read_to_string(tmp.join(".roundhouse-boot.log")).unwrap_or_default();
+                return Err(format!(
+                    "the boot failed: {}",
+                    stderr.lines().next().unwrap_or("")
+                ));
+            }
+            let observation: obs::Observation =
+                serde_json::from_slice(&std::fs::read(&out).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            Ok(observation)
+        }
+    }
+}
+

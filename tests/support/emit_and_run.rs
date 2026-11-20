@@ -75,21 +75,21 @@ fn to_completion(script: &str) -> String {
 
 /// Start from `fixtures/real-blog`.
 pub fn real_blog() -> Overlay {
-    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new() }
+    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new(), observe_boot: false }
 }
 
 /// Start from `fixtures/tiny-blog-uuid`: `posts.id` a uuid and
 /// `comments.post_id` a uuid foreign key.
 pub fn tiny_blog_uuid() -> Overlay {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog-uuid");
-    Overlay { base, scratch_base: false, edits: Vec::new() }
+    Overlay { base, scratch_base: false, edits: Vec::new(), observe_boot: false }
 }
 
 /// Start from an empty tree and `write` the app file by file, for a
 /// shape the blog cannot be edited into, such as an app with no views.
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
-    Overlay { base, scratch_base: true, edits: Vec::new() }
+    Overlay { base, scratch_base: true, edits: Vec::new(), observe_boot: false }
 }
 
 pub struct Overlay {
@@ -97,6 +97,8 @@ pub struct Overlay {
     /// `base` is this overlay's own scratch tree, removed once copied.
     scratch_base: bool,
     edits: Vec<Edit>,
+    /// Ingest with what the gems do to the app's classes as the app itself boots (`check`'s observation).
+    observe_boot: bool,
 }
 
 enum Edit {
@@ -106,6 +108,13 @@ enum Edit {
 }
 
 impl Overlay {
+    /// Ingest the app as `roundhouse check` does once its own boot is observed: the bundle the boot runs under is
+    /// `ROUNDHOUSE_BOOT_BUNDLE_PATH`'s, and the observation must answer, or the test fails.
+    pub fn with_observed_boot(mut self) -> Self {
+        self.observe_boot = true;
+        self
+    }
+
     /// Add a file, or replace one outright.
     pub fn write(mut self, path: &str, content: &str) -> Self {
         self.edits.push(Edit::Write { path: path.into(), content: content.as_bytes().to_vec() });
@@ -264,12 +273,13 @@ impl Overlay {
     fn run_spinel_with_flags(self, script: &str, flags: &[&str]) -> Run {
         // Before the bundle's key: a recorded case and its lookup hash the same script.
         let script = &to_completion(script);
-        if let Some(dir) = bundle::collect_dir() {
+        // Not bundled when the boot is observed: the shared build ingests without the observation.
+        if let Some(dir) = bundle::collect_dir().filter(|_| !self.observe_boot) {
             bundle::record(&dir, &self, script, flags);
             panic!("spinel bundle collect: recorded, not run");
         }
         // Not the bundled run's failure as the test's: another case's added method or route rides in that build, so it is judged again alone.
-        let shared = bundle::run_shared(&self, script, flags).filter(|run| run.success);
+        let shared = if self.observe_boot { None } else { bundle::run_shared(&self, script, flags).filter(|run| run.success) };
         // Nor the bundle's errors as the case's: the group is checked merged, where another case's
         // added method can answer a call this one leaves unresolved. A case with errors of its own
         // runs alone, so its `Run` carries them and the program is its own.
@@ -503,6 +513,19 @@ impl Overlay {
                         .unwrap_or_else(|e| panic!("overlay remove: cannot remove {path}: {e}"));
                 }
             }
+        }
+        // Not another overlay's patches: a test thread may run an observed overlay before this one.
+        roundhouse::observed_shapes::uninstall();
+        if self.observe_boot {
+            let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+            let app = app.expect("ingest the overlaid fixture before observing its boot");
+            let gems = roundhouse::observed_shapes::needed(&app);
+            assert!(!gems.is_empty(), "no gem the app reaches changes a class held in a variable");
+            let dir = source.canonicalize().expect("canonical app dir");
+            let key = roundhouse::observed_shapes::key(&dir);
+            let (patches, refused) = roundhouse::observed_shapes::observe_app(&dir, &gems, &key);
+            assert!(refused.is_empty(), "the observed boot did not answer: {refused:?}");
+            roundhouse::observed_shapes::install(patches.expect("the observed boot's patches apply"));
         }
 
         (scratch, source)
@@ -978,7 +1001,7 @@ pub mod bundle {
     fn build_http(cases: &[&Case]) -> Option<PathBuf> {
         let edits = merged_edits(cases)?;
         let empty = cases[0].base.as_os_str() == EMPTY;
-        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits };
+        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits, observe_boot: false };
         let (emitted, errors) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay.emit_tree(BuildTarget::Spinel))).ok()?;
         if !errors.is_empty() || spin_build(&emitted).is_err() {
             remove_scratch(&emitted);
@@ -1127,7 +1150,7 @@ pub mod bundle {
         // Not merged blindly: two cases writing one path differently would leave only the last (`merged_edits`).
         let edits = merged_edits(cases)?;
         let empty = cases[0].base.as_os_str() == EMPTY;
-        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits };
+        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits, observe_boot: false };
         let (emitted, errors) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay.emit_tree(BuildTarget::Spinel))).ok()?;
         if !errors.is_empty() {
             remove_scratch(&emitted);

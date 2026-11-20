@@ -429,6 +429,11 @@ fn assigned(e: &Expr, name: &str) -> bool {
             pattern.bound_names(&mut bound);
             bound.iter().any(|n| n.as_str() == name)
         }
+        ExprNode::CaseMatch { arms, .. } => arms.iter().any(|arm| {
+            let mut bound = Vec::new();
+            arm.pattern.bound_names(&mut bound);
+            bound.iter().any(|n| n.as_str() == name)
+        }),
         _ => false,
     };
     e.node.for_each_child(&mut |c| found = found || assigned(c, name));

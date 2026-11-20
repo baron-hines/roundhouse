@@ -3480,6 +3480,8 @@ end
     drop_modelled_included_hooks(&mut app);
     let splice_resolver = const_resolver.for_sources(&app.sources);
     splice_concerns_into_controllers(&mut app, &splice_resolver);
+    // After the splice: each controller's copy of a concern's body names that controller's model.
+    super::controller_name_constants::fold(&mut app);
     // After the splice: a concern's filter reads the key as the controller's own body does.
     crate::lower::primary_key_send::rewrite_guarded(&mut app);
     // After the splice: an action a concern provides is not implicit.
