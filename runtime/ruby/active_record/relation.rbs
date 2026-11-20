@@ -483,6 +483,7 @@ module ActiveRecord
     def integer_list_predicate: (String qcol, Array[untyped] vals, Integer limit) -> String
     def uuid_query_column?: (String col) -> bool
     def uuid_value_predicate: (String qcol, String | Integer | Float | bool val) -> String
+    def uuid_record_key: (Base record) -> Integer?
     def uuid_list_predicate: (String qcol, Array[untyped] vals) -> String
     def substitute_binds: (String sql, Array[untyped] args) -> String
     def substitute_named_binds: (String sql, Hash[Symbol, untyped] binds) -> String

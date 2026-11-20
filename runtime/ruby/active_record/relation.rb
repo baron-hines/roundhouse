@@ -4050,12 +4050,11 @@ module ActiveRecord
         # static `v && v.id` narrowing was dropped in favor of this
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
-        # On a uuid column the id casts as any other value there does. An
-        # unsaved record has no id, which Rails writes `IS NULL`; its
-        # emitted id is "", which the cast would bind as `= NULL`.
+        # On a uuid column the id casts as any other value there does; an
+        # unsaved record's is nil (`uuid_record_key`), which is `IS NULL`.
         if uuid_query_column?(col)
-          return "#{qcol} IS NULL" if val.new_record? && val._primary_key_value.to_s.empty?
-          return uuid_value_predicate(qcol, val._primary_key_value)
+          key = uuid_record_key(val)
+          return key.nil? ? "#{qcol} IS NULL" : uuid_value_predicate(qcol, key)
         end
         "#{qcol} = #{bind_literal(val._primary_key_value)}"
       elsif enum_column?(col)
@@ -4098,6 +4097,14 @@ module ActiveRecord
     # Range its own arm; one other value is an Equality (`= NULL` when it
     # is no uuid), and several a HomogeneousIn, which drops the values
     # that are no uuid and writes `IN (NULL)` when none is left.
+    # A record's id under a uuid column. An unsaved record has none, which
+    # Rails writes `IS NULL` (alone or as an IN list's nil arm); its
+    # emitted id is "", which the cast would drop, so it reads as nil.
+    def uuid_record_key(record)
+      key = record._primary_key_value
+      record.new_record? && key.to_s.empty? ? nil : key
+    end
+
     def uuid_list_predicate(qcol, vals)
       scalars = []
       ranges = []
@@ -4237,11 +4244,12 @@ module ActiveRecord
     # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
     # `mark_null!` from `none` / lasting positive `where` only.
     def list_predicate(col, qcol, val)
-      ids = val.map { |x| x.is_a?(Base) ? x._primary_key_value : column_bound_value(col, x) }
+      uuid = uuid_query_column?(col)
+      ids = val.map { |x| x.is_a?(Base) ? (uuid ? uuid_record_key(x) : x._primary_key_value) : column_bound_value(col, x) }
       limit = integer_query_limit(col)
       if ids.empty?
         "1=0"
-      elsif uuid_query_column?(col)
+      elsif uuid
         uuid_list_predicate(qcol, ids)
       elsif limit > 0
         integer_list_predicate(qcol, ids, limit)

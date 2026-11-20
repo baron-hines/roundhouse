@@ -705,7 +705,10 @@ fn untyped_subexpressions_baseline() {
     // record arm reads `new_record?` and the key's `to_s` before casting
     // (+2 in active_record/relation.rb), so an unsaved record is
     // `IS NULL` as in Rails.
-    const CEILING: usize = 1467;
+    // MEASURED 1470 on an unsaved record in a uuid IN list (1467): the
+    // list's untyped elements reach `uuid_record_key` (+3 in
+    // active_record/relation.rb), so the record is the list's nil arm.
+    const CEILING: usize = 1470;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
