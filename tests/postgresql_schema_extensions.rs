@@ -6,7 +6,8 @@
 //! The emitted-tree checks need no server. The boot run reads
 //! ROUNDHOUSE_PG_TEST_URL through tests/support/pg_test_url.rs, skipping
 //! without it unless ROUNDHOUSE_PG_TEST_REQUIRED is set, and needs the pg
-//! gem and a server that ships pgcrypto.
+//! gem, a server that ships pgcrypto, and a role that may create
+//! databases: the run makes one of its own and drops it.
 //!
 //!   ROUNDHOUSE_PG_TEST_URL=postgres://postgres@127.0.0.1:5432/postgres \
 //!   cargo test --test postgresql_schema_extensions
@@ -112,8 +113,52 @@ fn rails_answers(url: &str, search_path: &str, schema: &str, test_schema: &str) 
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Runs `sql` against `url`, or fails the test with the server's error.
+fn exec(url: &str, sql: &str) {
+    let output = std::process::Command::new("ruby")
+        .args(["-rpg", "-e", "PG.connect(ARGV[0]).exec(ARGV[1])", url, sql])
+        .output()
+        .expect("ruby with the pg gem");
+    assert!(output.status.success(), "{sql}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// `url` with its database replaced by `name`, keeping the query.
+fn with_database(url: &str, name: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("a postgres:// URL");
+    let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let query = tail.split_once('?').map(|(_, query)| format!("?{query}")).unwrap_or_default();
+    format!("{scheme}://{authority}/{name}{query}")
+}
+
+/// A database of the run's own on the configured server, created from
+/// `template0` and dropped when this is dropped, also while a failed
+/// assertion unwinds. An extension is one per database, so what the run
+/// creates or drops, `pgcrypto` and what depends on it, never reaches the
+/// configured database or a concurrent run's.
+struct OwnDatabase {
+    admin_url: String,
+    name: String,
+    url: String,
+}
+
+impl OwnDatabase {
+    fn create(admin_url: &str, name: &str) -> Self {
+        exec(admin_url, &format!("CREATE DATABASE \"{name}\" TEMPLATE template0"));
+        OwnDatabase { admin_url: admin_url.to_string(), name: name.to_string(), url: with_database(admin_url, name) }
+    }
+}
+
+impl Drop for OwnDatabase {
+    fn drop(&mut self) {
+        // No assertion here: this also runs while a failed assertion unwinds.
+        // FORCE ends a connection the emitted app left open.
+        let sql = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name);
+        let _ = std::process::Command::new("ruby").args(["-rpg", "-e", "PG.connect(ARGV[0]).exec(ARGV[1])", &self.admin_url, &sql]).output();
+    }
+}
+
 /// Runs `sql` against `url` when dropped, so a run that panics still
-/// removes its schemas, and the extension in them, before the next run.
+/// removes its schemas, and the extension in them, before the next case.
 struct DropOnExit<'a> {
     url: &'a str,
     sql: String,
@@ -128,24 +173,17 @@ impl Drop for DropOnExit<'_> {
 
 /// Boot (`Main.configure_default_adapter!`) on an empty schema creates
 /// the extension, so the model's SQL reaches its function, as it does on
-/// Rails after `db:schema:load`. Both forms run in this one test, one
-/// after the other: an extension is one per database, so two tests
-/// creating pgcrypto at once would race. Rails runs first on each form,
-/// in a schema of its own, which is dropped (with the extension) before
-/// the emitted app boots, also when the run fails. Each run first drops
-/// any pgcrypto already in the database: `CREATE EXTENSION IF NOT EXISTS`
-/// would keep one left in another schema (by a run that was killed), off
-/// this run's search path.
+/// Rails after `db:schema:load`. The run has a database of its own
+/// ([`OwnDatabase`]), so a pgcrypto the configured database has, and what
+/// depends on it there, is neither read nor dropped. Both forms run in
+/// this one test, one after the other, as the extension is one per
+/// database. Rails runs first on each form, in a schema of its own, which
+/// is dropped (with the extension) before the emitted app boots, also when
+/// the run fails.
 #[test]
 fn boot_creates_the_extension_the_models_sql_calls() {
     let Some(db) = pg_test_url::pg_test_db("postgresql_schema_extensions") else { return };
-    let on_server = |sql: String| {
-        let output = std::process::Command::new("ruby")
-            .args(["-rpg", "-e", "PG.connect(ARGV[0]).exec(ARGV[1])", &db.url, &sql])
-            .output()
-            .expect("ruby with the pg gem");
-        assert!(output.status.success(), "{sql}: {}", String::from_utf8_lossy(&output.stderr));
-    };
+    let own = OwnDatabase::create(&db.url, &db.schema);
     // `enable_extension "pgcrypto"` goes into the first schema on the
     // search path; `extensions.pgcrypto` into its own schema, which the
     // search path then names.
@@ -160,17 +198,17 @@ fn boot_creates_the_extension_the_models_sql_calls() {
                 ("  enable_extension \"pgcrypto\"".to_string(), schema.clone())
             };
             let schema_rb = schema_rb(&preamble);
-            on_server(format!("DROP EXTENSION IF EXISTS pgcrypto CASCADE; CREATE SCHEMA {schema}"));
-            let cleanup = DropOnExit { url: &db.url, sql: format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP SCHEMA IF EXISTS {ext_schema} CASCADE") };
+            exec(&own.url, &format!("CREATE SCHEMA {schema}"));
+            let cleanup = DropOnExit { url: &own.url, sql: format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP SCHEMA IF EXISTS {ext_schema} CASCADE") };
             let answers = if side == "rails" {
-                let answers = rails_answers(&db.url, &search_path, &schema_rb, &schema);
+                let answers = rails_answers(&own.url, &search_path, &schema_rb, &schema);
                 drop(cleanup);
                 answers
             } else {
                 let options = format!("-c search_path={search_path}");
                 let run = app(Some(POSTGRESQL_DATABASE_YML), &schema_rb).run_ruby_env(
                     PROBE,
-                    &[("DATABASE_URL", db.url.as_str()), ("PGOPTIONS", options.as_str()), ("RH_TEST_SCHEMA", schema.as_str())],
+                    &[("DATABASE_URL", own.url.as_str()), ("PGOPTIONS", options.as_str()), ("RH_TEST_SCHEMA", schema.as_str())],
                 );
                 drop(cleanup);
                 run.assert_passes();
