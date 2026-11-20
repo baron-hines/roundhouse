@@ -106,13 +106,14 @@ const PROBE: &str = r##"class UuidProbe
       "abstract parent child find_by: #{try { Box.find_by(id: "legacy-1")&.name }}",
       "record no uuid: #{try { Widget.where(owner_id: part).count }}",
       "record uuid: #{try { Widget.where(id: Widget.find(REAL)).pluck(:name) }}",
+      "record unsaved: #{try { Widget.where(owner_id: Widget.new).pluck(:name) }}",
     ]
   end
 end
 "##;
 
 /// Native Rails 8.1.4's answers on PostgreSQL 18.
-const EXPECTED: [&str; 31] = [
+const EXPECTED: [&str; 32] = [
     "find_by blank: nil",
     "find_by junk: nil",
     "where blank count: 0",
@@ -144,6 +145,9 @@ const EXPECTED: [&str; 31] = [
     r#"abstract parent child find_by: "old""#,
     "record no uuid: 0",
     r#"record uuid: ["sprocket"]"#,
+    // An unsaved record has no id: Rails writes `IS NULL`, which finds
+    // the widget without an owner.
+    r#"record unsaved: ["cog"]"#,
 ];
 
 const LOADS: [&str; 6] = [
