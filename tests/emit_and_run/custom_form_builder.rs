@@ -165,6 +165,47 @@ puts "field helpers passed"
     assert!(run.stdout.contains("field helpers passed"), "{}", run.stdout);
 }
 
+/// A list the class body adds to (`self.text_field_helpers += [:label]`) is the one the loop walks, as the body runs it.
+#[test]
+fn a_field_helpers_loop_walks_the_list_as_the_body_adds_to_it() {
+    let builder = FIELD_HELPERS_BUILDER.replace("\n\n  text_field_helpers.each", "\n  self.text_field_helpers += [:label]\n\n  text_field_helpers.each");
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/styled_probe_builder.rb", &builder)
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: StyledProbeBuilder) do |form| %>\n<%= form.label :title %>\n<%= form.text_field :title %>\n<% end %>\n")
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+[
+  "<div class=\"field\"><label for=\"article_title\">Title</label></div>",
+  "<div class=\"field\"><input type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>",
+].each { |want| raise "missing #{want}:\n#{io}" unless io.include?(want) }
+puts "added list passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("added list passed"), "{}", run.stdout);
+}
+
+/// A write after the loop (`self.text_field_helpers += [:label]` below it) leaves the list the loop walked: Rails 8.1.4
+/// wraps `text_field` and not `label`.
+#[test]
+fn a_write_after_the_loop_leaves_the_list_it_walked() {
+    let builder = FIELD_HELPERS_BUILDER.replace("\n\n  def select", "\n  self.text_field_helpers += [:label]\n\n  def select");
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/styled_probe_builder.rb", &builder)
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: StyledProbeBuilder) do |form| %>\n<%= form.label :title %>|<%= form.text_field :title %>\n<% end %>\n")
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = "<label for=\"article_title\">Title</label>|<div class=\"field\"><input type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>"
+raise "missing #{want}:\n#{io}" unless io.include?(want)
+puts "late write passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("late write passed"), "{}", run.stdout);
+}
+
 /// Rails hands `fields_for` the form's `builder:`, so a nested `text_field` runs the override too, on a builder for
 /// the nested name. Expected strings are Rails 8.1.4's.
 #[test]
@@ -184,6 +225,28 @@ puts "nested passed"
         );
     run.assert_passes();
     assert!(run.stdout.contains("nested passed"), "{}", run.stdout);
+}
+
+/// maybe's `render "accounts/form" do |form| form.fields_for :accountable do |nested| … end end` over a partial that
+/// yields its builder: the nested block's parameter is the nested builder, not the yield copy's nil-started locals.
+#[test]
+fn fields_for_in_a_block_a_partial_yields_the_builder_to_runs_the_override() {
+    let shell = "<%# locals: (article:) %>\n<%= form_with(model: article, builder: WrappingFormBuilder) do |form| %>\n<%= yield form %>\n<% end %>\n";
+    let form = "<%= render \"articles/shell\", article: article do |form| %>\n<%= form.fields_for :meta, article do |nested| %>\n<%= nested.text_field :title %>\n<% end %>\n<% end %>\n";
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
+        .write("app/views/articles/_shell.html.erb", shell)
+        .write("app/views/articles/_form.html.erb", form)
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = "<div class=\"wrap\"><input class=\"input\" type=\"text\" value=\"Hi\" name=\"article[meta][title]\" id=\"article_meta_title\" /></div>"
+raise "missing #{want}:\n#{io}" unless io.include?(want)
+puts "yielded nested passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("yielded nested passed"), "{}", run.stdout);
 }
 
 /// The same builder in a Rails 7.2 app (its `Gemfile.lock`): `field_helpers` spells `text_area`/`check_box` there, so
@@ -221,6 +284,22 @@ fn partial_app(form: &str) -> emit_and_run::Overlay {
         .write("app/helpers/wrapping_form_builder.rb", OVERRIDING_BUILDER)
         .write("app/views/articles/_form.html.erb", form)
         .write("app/views/articles/_fields.html.erb", "<%= f.text_field :title %>\n<%= f.text_area :body %>\n")
+}
+
+/// Two stock forms that differ only in literal options (`url:`) hand the partial the same builder.
+#[test]
+fn forms_differing_in_options_share_a_partial_handed_the_builder() {
+    let form = "<%= form_with(model: article, url: \"/a\") do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n\
+<%= form_with(model: article, url: \"/b\") do |form| %>\n<%= render \"articles/fields\", f: form %>\n<% end %>\n";
+    let run = partial_app(form).run_ruby(&format!(
+        r##"{ATTRS}io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+raise "forms:\n#{{io}}" unless io.scan("name=\"article[title]\"").size == 2 && io.include?("action=\"/a\"") && io.include?("action=\"/b\"")
+puts "two forms passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("two forms passed"), "{}", run.stdout);
 }
 
 #[test]
@@ -352,7 +431,8 @@ puts "namespace passed"
 
 /// `fields_for :comments` over a has_many's nested attributes: Rails 8.1.4 writes each child under
 /// `article[comments_attributes][i]`, counting `i` from 0, with the persisted child's hidden id after its fields, and
-/// an explicit `child_index:` for one record given. Attribute sets, since order is not markup.
+/// an explicit `child_index:` for one record given, and a later call continuing the count. Attribute sets, since order
+/// is not markup.
 #[test]
 fn fields_for_over_a_has_many_nested_attribute_names_as_rails() {
     let run = nested_many_app().run_ruby(&nested_many_script());
@@ -371,7 +451,7 @@ fn fields_for_over_a_has_many_nested_attribute_names_as_rails_on_spinel() {
 fn nested_many_app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  accepts_nested_attributes_for :comments\n")
-        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"New\"), child_index: \"IDX\" do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article) do |form| %>\n<%= form.fields_for :comments do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"New\"), child_index: \"IDX\" do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<%= form.fields_for :comments, Comment.new(body: \"Third\") do |c| %>\n<%= c.text_field :body %>\n<% end %>\n<% end %>\n")
 }
 
 fn nested_many_script() -> String {
@@ -387,6 +467,7 @@ Views::Articles.form_into(io, Article.find(a.id), nil, nil)
   "article[comments_attributes][1][body]" => {{ "type" => "text", "value" => "Two", "id" => "article_comments_attributes_1_body" }},
   "article[comments_attributes][1][id]" => {{ "type" => "hidden", "value" => two.id.to_s, "id" => "article_comments_attributes_1_id" }},
   "article[comments_attributes][IDX][body]" => {{ "type" => "text", "value" => "New", "id" => "article_comments_attributes_IDX_body" }},
+  "article[comments_attributes][2][body]" => {{ "type" => "text", "value" => "Third", "id" => "article_comments_attributes_2_body" }},
 }}.each do |name, want|
   got = attrs(io, name)
   raise "#{{name}}: #{{got}}" unless got == want.merge("name" => name)

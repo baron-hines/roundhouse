@@ -1,6 +1,7 @@
 //! Relation calls through a has_many: `sum(:col)` sums the saved rows
 //! (not the held unsaved ones), `from(...)` keeps the association's key,
-//! and `extract_associated(:name)` preloads and maps the association.
+//! `extract_associated(:name)` preloads and maps the association, and a
+//! class method building with `new` builds under the association's scope.
 //! The probe's expected values are ActiveRecord 8.1.4's answers (the sums
 //! compare equal, though ours are Floats where Rails' are Integers: the
 //! runtime's `Relation#sum`).
@@ -15,10 +16,28 @@ end
 "##)
         .write("app/models/author.rb", r##"class Author < ApplicationRecord
   has_many :posts
+
+  def draft_title
+    posts.draft.title
+  end
+
+  def blank_words
+    posts.blank_one.tap { |p| p.title = "z" }.words
+  end
 end
 "##)
         .write("app/models/post.rb", r##"class Post < ApplicationRecord
   belongs_to :author, optional: true
+
+  class << self
+    def draft
+      new(title: "draft")
+    end
+  end
+
+  def self.blank_one
+    new(words: 3)
+  end
 end
 "##)
         .write("app/models/probe.rb", r##"module Probe
@@ -55,6 +74,14 @@ end
     [a.posts.extract_associated(:author).map(&:name), b.posts.extract_associated(:author).map(&:name)]
   end
 
+  # Rails: ["draft", true, true, "z", 3, true, nil, "draft", 3]
+  def self.new_in_a_class_method_through_a_has_many
+    a = Author.create!(name: "a")
+    d = a.posts.draft
+    b = a.posts.blank_one.tap { |p| p.title = "z" }
+    [d.title, d.author_id == a.id, d.new_record?, b.title, b.words, b.author_id == a.id, Post.draft.author_id, a.draft_title, a.blank_words]
+  end
+
   def self.run
     reset
     check("sum_on_association_ignores_unsaved", sum_on_association_ignores_unsaved == [10, 10, 10])
@@ -64,6 +91,8 @@ end
     check("extract_associated", extract_associated == [["1", "3"], ["2"]])
     reset
     check("extract_associated_through_a_has_many", extract_associated_through_a_has_many == [["a", "a"], ["b"]])
+    reset
+    check("new_in_a_class_method_through_a_has_many", new_in_a_class_method_through_a_has_many == ["draft", true, true, "z", 3, true, nil, "draft", 3])
   end
 end
 "##)

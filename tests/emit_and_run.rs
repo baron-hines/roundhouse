@@ -22223,6 +22223,8 @@ mod custom_form_builder;
 mod controller_name_constantize;
 #[path = "emit_and_run/class_macro_keyword_rest.rs"]
 mod class_macro_keyword_rest;
+#[path = "emit_and_run/nested_form_child.rs"]
+mod nested_form_child;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
