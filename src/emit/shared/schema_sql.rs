@@ -262,7 +262,7 @@ pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
 /// unsupported generated expressions and virtual tables on PostgreSQL.
 pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result<Vec<String>, String> {
     validate_schema_for_dialect(schema, dialect)?;
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<String> = database_object_statements(schema, dialect);
     for (_name, table) in &schema.tables {
         // A virtual table is built by its MODULE, not from a column
         // list: no types, no NOT NULL, no AUTOINCREMENT key, and the
@@ -1247,6 +1247,25 @@ fn postgres_type(ct: &ColumnType) -> String {
         ColumnType::Uuid => "uuid".into(),
         ColumnType::Interval => "interval".into(),
     }
+}
+
+/// The schemas and extensions `db/schema.rb` declares, as Rails'
+/// PostgreSQL adapter creates them ahead of the tables: each
+/// `create_schema`, then each `enable_extension` (`CREATE EXTENSION IF
+/// NOT EXISTS "pgcrypto"`, with ` SCHEMA <name>` unquoted for a qualified
+/// one, as Rails writes it). A schema is `IF NOT EXISTS`, as every
+/// statement here is, because boot runs these on every start. SQLite
+/// has neither, so it gets none.
+fn database_object_statements(schema: &Schema, dialect: Dialect) -> Vec<String> {
+    if dialect != Dialect::Postgres {
+        return Vec::new();
+    }
+    let schemas = schema.schemas.iter().map(|s| format!("CREATE SCHEMA IF NOT EXISTS {}", dialect.ident(s.as_str())));
+    let extensions = schema.extensions.iter().map(|e| match &e.schema {
+        Some(s) => format!("CREATE EXTENSION IF NOT EXISTS {} SCHEMA {}", dialect.ident(e.name.as_str()), s.as_str()),
+        None => format!("CREATE EXTENSION IF NOT EXISTS {}", dialect.ident(e.name.as_str())),
+    });
+    schemas.chain(extensions).collect()
 }
 
 #[cfg(test)]
