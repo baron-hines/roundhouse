@@ -4799,8 +4799,13 @@ fn prefixed_table(arg: &Node<'_>) -> Option<String> {
 }
 
 /// The table a class body declares (`self.table_name = "entries"`), read leniently for the model prepass.
-pub(super) fn table_name_decl(body: Node<'_>, file: &str) -> Option<String> {
-    parse_table_name_decl(body, file).ok().flatten().map(|(name, _)| name)
+pub(super) fn table_name_decl(class: &ruby_prism::ClassNode<'_>, file: &str) -> Option<String> {
+    let name = parse_table_name_decl(class.body()?, file).ok().flatten().map(|(name, _)| name)?;
+    // Not the marked name: the prepass reads it as a table, so the prefix the class body sets (else none) goes in front.
+    Some(match name.strip_prefix(TABLE_PREFIX_MARK) {
+        Some(rest) => format!("{}{rest}", class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default()),
+        None => name,
+    })
 }
 
 fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(String, usize)>> {

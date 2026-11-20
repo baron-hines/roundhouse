@@ -188,7 +188,7 @@ impl Names<'_> {
         // Nor a shorter one for a longer path: `Article::Parts::Taxonomy` answered as the top-level `Parts::Taxonomy`
         // (a controller's `Parts::` namespace) lost `Article` the same way.
         if path.len() > 1 && name.split("::").count() < path.len() {
-            return None;
+            return self.resolved_prefix(span, &path, text);
         }
         (name.rsplit("::").next() == Some(last)).then(|| class.clone())
     }
@@ -235,7 +235,8 @@ impl Names<'_> {
             }
             let class = self.resolver.namespace(Span { file: span.file, start: start as u32, end: end as u32 }, prefix)?;
             let name = class.0.as_str();
-            if name.rsplit("::").next() != Some(last) {
+            // Nor a shorter answer for the prefix: `Article::Parts` answered as the top-level `Parts` lost `Article`.
+            if name.rsplit("::").next() != Some(last) || name.split("::").count() < keep {
                 return None;
             }
             let rest = path[keep..].iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");

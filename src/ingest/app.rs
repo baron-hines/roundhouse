@@ -1342,7 +1342,9 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // A gem's file runs more than its declaration when
                         // it loads: a require written below the class runs
                         // after it (`file_program`), a model's file as any.
-                        if gem_libs.iter().any(|lib| entry.starts_with(lib)) {
+                        // An app `lib/` model file (maybe's `Money`) keeps
+                        // the declarations beside it too.
+                        if gem_libs.iter().any(|lib| entry.starts_with(lib)) || sub == "lib" {
                             let mut carried: crate::det::HashSet<String> = Default::default();
                             carried.insert(outer.0.as_str().to_string());
                             if let Ok(nested) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {

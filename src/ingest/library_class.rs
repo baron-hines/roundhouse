@@ -5845,7 +5845,7 @@ impl ModelBases {
             let Some(parent) = self.resolve_class_superclass(&scope, &nesting, &class) else { continue };
             let mut full = scope.clone();
             full.extend(path);
-            let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
+            let table = super::model::table_name_decl(&class, file);
             // A bare parent is kept with the modules it is looked up through ([`superclass_enclosing`]): a concrete `Admin::Base` is found from `module Admin`, and from `module Ledger; class ::Special < Item` its `Ledger::Item`.
             let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { superclass_enclosing(&scope, &nesting, &class) } else { Vec::new() };
             if file.contains(super::source_gems::MOUNT) {
@@ -6106,7 +6106,17 @@ pub fn is_app_tableless_active_model(source: &[u8]) -> bool {
             })
         })
     });
-    !framework && class.superclass().is_none() && validations_only && includes_active_model(&class)
+    let includes_model = class.body().and_then(|b| b.as_statements_node()).is_some_and(|stmts| {
+        stmts.body().iter().any(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none() && call.name().as_slice() == b"include"
+                    && call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| {
+                        constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveModel::Model")
+                    }))
+            })
+        })
+    });
+    !framework && class.superclass().is_none() && validations_only && !includes_model && includes_active_model(&class)
 }
 
 pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKind> {
