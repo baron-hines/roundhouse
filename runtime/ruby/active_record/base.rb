@@ -1499,6 +1499,12 @@ module ActiveRecord
       ok
     end
 
+    # Not ActiveModel's `ValidationError`: on a record Rails raises the `RecordInvalid` that `save!` does.
+    def validate!
+      raise RecordInvalid, self unless valid?
+      true
+    end
+
     # ---- Equality ---------------------------------------------------
     #
     # Ruby's `==` / `eql?` / `hash` equality protocol is intentionally

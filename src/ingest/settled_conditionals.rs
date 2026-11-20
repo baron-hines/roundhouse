@@ -246,7 +246,27 @@ fn drop_other_arms(lc: &mut LibraryClass, record: &ConditionalDefinitions, kept:
         if i != kept {
             lc.methods.retain(|m| !arm.methods.iter().any(|member| member.is(m)));
         } else {
-            lc.unknown_calls.extend(arm.statements.iter().cloned());
+            for st in &arm.statements {
+                // Not left as a call: `private :helper` in the arm Ruby runs is the visibility of the arm's `helper`.
+                if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*st.node
+                    && let Some(visibility) = match method.as_str() {
+                        "private" => Some(crate::dialect::MethodVisibility::Private),
+                        "protected" => Some(crate::dialect::MethodVisibility::Protected),
+                        "public" => Some(crate::dialect::MethodVisibility::Public),
+                        _ => None,
+                    }
+                    && let [arg] = args.as_slice()
+                    && let ExprNode::Lit { value: crate::expr::Literal::Sym { value: name } } = &*arg.node
+                {
+                    for m in lc.methods.iter_mut() {
+                        if m.name == *name && m.receiver == crate::dialect::MethodReceiver::Instance && arm.methods.iter().any(|member| member.is(m)) {
+                            m.visibility = visibility.clone();
+                        }
+                    }
+                    continue;
+                }
+                lc.unknown_calls.push(st.clone());
+            }
         }
     }
 }

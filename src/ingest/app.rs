@@ -969,6 +969,27 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             }
             lock.source = app.extensions.source_gems.clone();
             lock.source.extend(auto_sourced.iter().cloned());
+            // A Rails engine the app depends on (a gem that depends on railties, rails-settings-cached): requiring it
+            // loads Rails, which no emitted tree carries, so it reads as a `rails_dependent` fact would say.
+            for gem in &lock.dependencies {
+                let sourced = lock.version_of(gem).is_some_and(|v| {
+                    let dir = format!("{gem}-{v}");
+                    source_gems.iter().any(|g| g.mount.file_name().is_some_and(|n| n == dir.as_str()))
+                });
+                if crate::gems::fate_of(gem) == crate::gems::GemFate::Unknown
+                    && !sourced
+                    && !lock.source.contains(gem)
+                    && !lock.is_in_repo(gem)
+                    && !app.extensions.is_rails_dependent(gem)
+                    && lock.reaches(gem, "railties")
+                {
+                    app.extensions.rails_dependent.push(crate::extensions::RailsDependentGem {
+                        gem: gem.clone(),
+                        why: "it depends on railties".to_string(),
+                        inferred: true,
+                    });
+                }
+            }
             app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
                 let version = lock.specs.iter().find(|(n, _)| n == "actionview").or_else(|| lock.specs.iter().find(|(n, _)| n == "rails"));
@@ -1422,9 +1443,10 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             // So is a gem's own ActiveModel class (`include
             // ActiveModel::Validations` with no superclass): no runtime
             // port defines the module to include, and the gem's
-            // validations compile as a model's do. An app `lib/` class
-            // keeps `lower::active_model_model`'s treatment (it may reopen
-            // a framework class).
+            // validations compile as a model's do, and so do an app `lib/`
+            // class's of its own (maybe's `Money`); one under a framework
+            // namespace keeps `lower::active_model_model`'s treatment (it
+            // may reopen a framework class).
             //
             // Only an explicit `Model` classification routes this way.
             // `None` — a file with no class, a bare module — stays a
@@ -1432,6 +1454,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             // directory itself is the app saying what the file is.
             if super::library_class::has_active_record_base(&source, &model_bases)
                 || (gem_libs.iter().any(|lib| entry.starts_with(lib)) && super::library_class::is_tableless_active_model(&source))
+                || (sub == "lib" && super::library_class::is_app_tableless_active_model(&source))
             {
                 match ingest_model_with_enum_constants(
                     &source, &path_str, &app.schema, &table_prefixes, &base_prefixes, &enum_constants,
@@ -1444,7 +1467,9 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                         // A gem's file runs more than its declaration when
                         // it loads: a require written below the class runs
                         // after it (`file_program`), a model's file as any.
-                        if gem_libs.iter().any(|lib| entry.starts_with(lib)) {
+                        // An app `lib/` model file (maybe's `Money`) keeps
+                        // the declarations beside it too.
+                        if gem_libs.iter().any(|lib| entry.starts_with(lib)) || sub == "lib" {
                             let mut carried: crate::det::HashSet<String> = Default::default();
                             carried.insert(outer.0.as_str().to_string());
                             if let Ok(nested) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
@@ -1536,6 +1561,9 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             app.library_classes.extend(nested);
                         }
                         super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
+                        // A concern declared beside the model carries its `included do` filters, as a library file's does.
+                        let beside: crate::det::HashSet<crate::ident::ClassId> = beside_names.iter().cloned().collect();
+                        record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |id| beside.contains(id));
                         continue;
                     }
                     Ok(None) => {}

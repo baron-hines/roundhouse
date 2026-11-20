@@ -58,6 +58,14 @@ class Enumerator < Object\nend\n";
 /// `core_rbs()` emits the RBS; `core_value_type` answers the type.
 const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("Float", "INFINITY", || Ty::Float),
+    // `2 * Math::PI * radius` (maybe's progress circle).
+    ("Math", "PI", || Ty::Float),
+    ("Math", "E", || Ty::Float),
+    // `Date::ABBR_MONTHNAMES.compact` (maybe's budget picker): index 0 is nil, as Ruby's are.
+    ("Date", "MONTHNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }) }),
+    ("Date", "ABBR_MONTHNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }) }),
+    ("Date", "DAYNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+    ("Date", "ABBR_DAYNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
     ("Float", "NAN", || Ty::Float),
     ("Float", "EPSILON", || Ty::Float),
     ("Float", "MAX", || Ty::Float),
@@ -167,7 +175,7 @@ const CORE_TOP_CONSTS: &[&str] = &["STDIN", "STDOUT", "STDERR"];
 
 /// `if RUBY_VERSION >= "2.7.1"` (aasm, hashie): the running Ruby's own
 /// version, which a compile-time answer would freeze to the wrong one.
-const CORE_TOP_STR_CONSTS: &[&str] = &["RUBY_VERSION", "RUBY_PLATFORM"];
+const CORE_TOP_STR_CONSTS: &[&str] = &["RUBY_VERSION", "RUBY_PLATFORM", "RUBY_ENGINE"];
 
 fn io_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![].into() }
@@ -196,6 +204,8 @@ fn rbs_type_name(ty: &Ty) -> &'static str {
         Ty::Str => "String",
         Ty::Class { id, .. } if id.0.as_str() == "Encoding" => "Encoding",
         Ty::Hash { key, value } if matches!((&**key, &**value), (Ty::Str, Ty::Str)) => "Hash[String, String]",
+        Ty::Array { elem } if matches!(&**elem, Ty::Str) => "Array[String]",
+        Ty::Array { elem } if matches!(&**elem, Ty::Union { variants } if variants.len() == 2 && variants.contains(&Ty::Str) && variants.contains(&Ty::Nil)) => "Array[String?]",
         _ => "untyped",
     }
 }

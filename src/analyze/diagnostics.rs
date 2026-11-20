@@ -2303,7 +2303,9 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
 fn unsettled_conditional_writes(app: &App) -> Vec<Diagnostic> {
     fn writes<'a>(conditional: &'a crate::dialect::ConditionalDefinitions, out: &mut Vec<&'a Expr>) {
         for arm in &conditional.arms {
-            out.extend(arm.statements.iter());
+            // Not a branch's `include` / `require` / visibility marker: the emitted conditional writes those in it.
+            out.extend(arm.statements.iter().filter(|st| !matches!(&*st.node,
+                ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "require" | "private" | "public" | "protected"))));
             for nested in &arm.nested {
                 writes(nested, out);
             }

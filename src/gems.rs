@@ -537,6 +537,24 @@ impl Lockfile {
         out
     }
 
+    /// Whether `name` depends on `target`, directly or through its own dependencies.
+    pub fn reaches(&self, name: &str, target: &str) -> bool {
+        let mut seen = crate::det::HashSet::default();
+        let mut pending = vec![name];
+        while let Some(gem) = pending.pop() {
+            if !seen.insert(gem) {
+                continue;
+            }
+            for dep in self.spec_deps.get(gem).into_iter().flatten() {
+                if dep == target {
+                    return true;
+                }
+                pending.push(dep.as_str());
+            }
+        }
+        false
+    }
+
     /// Is `name` resolved from a `GIT` source?
     pub fn is_from_git(&self, name: &str) -> bool {
         self.git_source_of(name).is_some()
@@ -1169,10 +1187,12 @@ pub fn loads_by_gem_name(gem: &str) -> bool {
 /// which, by definition, it cannot have here.
 pub(crate) fn namespace_candidates(gem: &str) -> Vec<String> {
     let mut candidates = vec![namespace_of(gem)];
-    if let Some((head, _)) = gem.split_once('-') {
-        let first = camelize(head);
-        if !candidates.contains(&first) {
-            candidates.push(first);
+    // Each run of leading words as one name too: rails-settings-cached's is `RailsSettings`.
+    let words: Vec<&str> = gem.split('-').collect();
+    for n in 1..words.len() {
+        let joined = camelize(&words[..n].join("-"));
+        if !candidates.contains(&joined) {
+            candidates.push(joined);
         }
     }
     candidates
@@ -1605,7 +1625,11 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
                 span,
                 None,
                 "gem_requires_rails",
-                format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why),
+                if row.inferred {
+                    format!("{path}: gem {} {}, so requiring it loads Rails, which no emitted tree carries", row.gem, row.why)
+                } else {
+                    format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why)
+                },
             )),
             Owner::Native(owner) => {
                 let target = refuser.target?;
@@ -1977,6 +2001,12 @@ mod tests {
         assert_eq!(lock_gems_owning_constant(&lock, "OmniAuth::Strategies"), ["omniauth"]);
         assert_eq!(lock_gems_owning_constant(&lock, "Sentry"), ["sentry-rails", "sentry-ruby"]);
         assert!(lock_gems_owning_constant(&lock, "Devise").is_empty());
+    }
+
+    #[test]
+    fn a_gem_may_name_its_namespace_by_its_leading_words_joined() {
+        let lock = Lockfile::parse("GEM\n  specs:\n    rails-settings-cached (2.9.6)\n\nDEPENDENCIES\n  rails-settings-cached\n");
+        assert_eq!(lock_gems_owning_constant(&lock, "RailsSettings::Base"), ["rails-settings-cached"]);
     }
 
     #[test]

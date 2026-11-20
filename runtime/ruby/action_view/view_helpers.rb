@@ -2055,3 +2055,14 @@ module ActionView
     end
   end
 end
+
+# turbo-rails' helper modules, which a component includes for `turbo_frame_tag` / `turbo_stream_from` (maybe's
+# ApplicationComponent). Not their methods here: a template's calls are lowered where they are written, and a call
+# from Ruby code stays an unknown method.
+module Turbo
+  module FramesHelper
+  end
+
+  module StreamsHelper
+  end
+end

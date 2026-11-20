@@ -348,6 +348,11 @@ fn include_closure(app: &App, id: ClassId, included: &mut HashSet<ClassId>) {
 /// needs the original signature: destructuring and anonymous rest may
 /// otherwise disappear altogether and look like a simpler valid macro.
 pub(super) fn supported_source_signature(def: &MethodDef, sources: &[SourceFile], optionals: bool, rest: bool, block: bool) -> bool {
+    supported_source_signature_with(def, sources, optionals, rest, block, false)
+}
+
+/// [`supported_source_signature`], with a named keyword rest (`**opts`) admitted when `kwrest`.
+pub(super) fn supported_source_signature_with(def: &MethodDef, sources: &[SourceFile], optionals: bool, rest: bool, block: bool, kwrest: bool) -> bool {
     let Some(source) = def
         .name_span
         .file
@@ -362,6 +367,7 @@ pub(super) fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]
         optionals: bool,
         rest: bool,
         block: bool,
+        kwrest: bool,
         valid: bool,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Signature {
@@ -371,7 +377,7 @@ pub(super) fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]
             }
             self.valid = def.parameters().is_none_or(|params| {
                 params.rest().is_none_or(|r| self.rest && r.as_rest_parameter_node().is_some_and(|r| r.name().is_some()))
-                    && params.keyword_rest().is_none()
+                    && params.keyword_rest().is_none_or(|k| self.kwrest && k.as_keyword_rest_parameter_node().is_some_and(|k| k.name().is_some()))
                     // Not an anonymous `&`: the expansion binds the block by its name.
                     && params.block().is_none_or(|b| self.block && b.as_block_parameter_node().is_some_and(|b| b.name().is_some()))
                     && (self.optionals || params.optionals().iter().next().is_none())
@@ -393,6 +399,7 @@ pub(super) fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]
         optionals,
         rest,
         block,
+        kwrest,
         valid: false,
     };
     ruby_prism::Visit::visit(&mut signature, &parsed.node());
