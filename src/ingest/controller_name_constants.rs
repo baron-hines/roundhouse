@@ -14,14 +14,30 @@ pub(super) fn fold(app: &mut App) {
         .chain(app.library_classes.iter().map(|c| c.name.0.as_str().to_string()))
         .collect();
     let parents: crate::det::HashSet<ClassId> = app.controllers.iter().filter_map(|c| c.parent.clone()).collect();
+    let defines_name = |c: &crate::dialect::Controller| c.body.iter().any(|item| matches!(item,
+        crate::dialect::ControllerBodyItem::Action { action, .. } if action.name.as_str() == "controller_name"));
+    let by_name: crate::det::HashMap<ClassId, (Option<ClassId>, bool)> =
+        app.controllers.iter().map(|c| (c.name.clone(), (c.parent.clone(), defines_name(c)))).collect();
+    // Not a controller that defines `controller_name`, or inherits one: the call reads that, not the name.
+    let renamed = |name: &ClassId| {
+        let mut cur = Some(name.clone());
+        let mut seen = crate::det::HashSet::default();
+        while let Some(c) = cur {
+            if !seen.insert(c.clone()) {
+                break;
+            }
+            let Some((parent, defines)) = by_name.get(&c) else { break };
+            if *defines {
+                return true;
+            }
+            cur = parent.clone();
+        }
+        false
+    };
+    let renamed: crate::det::HashSet<ClassId> = app.controllers.iter().map(|c| c.name.clone()).filter(|n| renamed(n)).collect();
     for controller in &mut app.controllers {
         // Not a controller others inherit from: the body runs as each subclass, whose names differ.
-        if parents.contains(&controller.name) {
-            continue;
-        }
-        let own_name = controller.body.iter().any(|item| matches!(item,
-            crate::dialect::ControllerBodyItem::Action { action, .. } if action.name.as_str() == "controller_name"));
-        if own_name {
+        if parents.contains(&controller.name) || renamed.contains(&controller.name) {
             continue;
         }
         let model = crate::naming::classify_path(&crate::analyze::controller_name_of(&controller.name));
@@ -51,6 +67,16 @@ fn rewrite(e: &mut Expr, model: &str) {
         read.decisions |= crate::expr::GENERATED_CONST_REF;
         *e = read;
         return;
+    }
+    // Not into a lambda literal: whatever later runs it (`instance_exec(&callback)`) gives it its `self`.
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return;
+    }
+    if let ExprNode::Send { block: Some(block), method, .. } = &mut *e.node
+        && !matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec")
+        && let ExprNode::Lambda { body, .. } = &mut *block.node
+    {
+        rewrite(body, model);
     }
     // Not into a block another `self` runs (`other.instance_exec { controller_name … }`): it names that one's model.
     if let ExprNode::Send { recv, method, args, block: Some(_), .. } = &mut *e.node

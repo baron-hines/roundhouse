@@ -37,3 +37,17 @@ fn a_concerns_controller_name_constantize_names_each_controllers_model_on_spinel
     run.assert_passes();
     assert!(run.stdout.contains("constantize passed"), "{}", run.stdout);
 }
+
+/// A `controller_name` a parent defines is what the call reads, not the controller's own name: the call is kept, and
+/// stays reported.
+#[test]
+fn an_inherited_controller_name_keeps_the_call() {
+    let errors = app()
+        .edit(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n",
+            "class ApplicationController < ActionController::Base\n  def controller_name\n    \"comments\"\n  end\n\n",
+        )
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("constantize")), "{errors:#?}");
+}
