@@ -135,7 +135,8 @@ fn with_database(url: &str, name: &str) -> String {
 
 /// The rebuilt URL names the run's database whatever the configured one
 /// looks like: with or without a path, and with a query, which libpq
-/// reads after the path, so a `dbname` there would win over it.
+/// reads after the path, so a `dbname` there, also percent-encoded, would
+/// win over it.
 #[test]
 fn the_own_database_url_names_only_the_run_s_database() {
     let cases = [
@@ -145,6 +146,9 @@ fn the_own_database_url_names_only_the_run_s_database() {
         ("postgres://postgres@localhost?connect_timeout=5", "postgres://postgres@localhost/own?connect_timeout=5"),
         ("postgres://h/db?dbname=postgres&sslmode=disable", "postgres://h/own?sslmode=disable"),
         ("postgres://h?dbname=postgres", "postgres://h/own"),
+        ("postgres://h/db?%64bname=postgres&sslmode=disable", "postgres://h/own?sslmode=disable"),
+        ("postgres://h?dbna%6De=postgres", "postgres://h/own"),
+        ("postgres://h/db?dbnames=x", "postgres://h/own?dbnames=x"),
     ];
     for (configured, own) in cases {
         assert_eq!(with_database(configured, "own"), own, "{configured}");
