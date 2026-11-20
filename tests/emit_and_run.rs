@@ -22764,6 +22764,9 @@ mod module_method_missing_includer;
 // Declarations: a rooted class or module name inside a module.
 #[path = "emit_and_run/rooted_class_declarations.rs"]
 mod rooted_class_declarations;
+// A model whose include defines `method_missing`: ActiveRecord's own methods still answer.
+#[path = "emit_and_run/model_method_missing_active_record.rs"]
+mod model_method_missing_active_record;
 #[path = "emit_and_run/token_for_string_key.rs"]
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
