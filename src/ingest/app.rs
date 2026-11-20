@@ -328,12 +328,14 @@ fn keep_initializer_defined(
     let gem_declared: HashMap<String, bool> =
         app.library_classes.iter().filter(|c| from_gem(c)).map(|c| (c.name.0.as_str().to_string(), c.is_module)).collect();
     // The names a gem's class or module defines in itself or in a gem
-    // superclass or included module: their constants and nested classes.
-    // A block reading one of them bare reads the top level's in Ruby,
-    // which the kept opening, looking through its ancestors, would not.
+    // superclass or included module: their constants and nested classes,
+    // the gem's or an initializer reopen's. A block reading one of them
+    // bare reads the top level's in Ruby, which the kept opening, looking
+    // through its ancestors, would not.
     let gem_owns_itself = |owner: &str, name: &str| {
         let nested = format!("{owner}::{name}");
-        app.library_classes.iter().filter(|c| from_gem(c)).any(|c| {
+        let reopens = candidates.iter().filter(|c| gem_declared.contains_key(c.name.0.as_str()));
+        app.library_classes.iter().filter(|c| from_gem(c)).chain(reopens).any(|c| {
             (c.name.0.as_str() == owner && c.constants.iter().any(|(n, _)| n.as_str() == name))
                 || c.name.0.as_str() == nested
         })
