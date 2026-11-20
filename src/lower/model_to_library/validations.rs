@@ -583,6 +583,41 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
             block_param: None,
         });
     }
+    // Rails' `validate!`: `valid? || raise ActiveModel::ValidationError`, whose message joins the full messages.
+    if !defines("validate!") {
+        let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>| {
+            Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true })
+        };
+        let lit_str = |s: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: s.to_string() } });
+        let message = send(Some(lit_str("Validation failed: ")), "+", vec![send(Some(send(None, "errors", vec![])), "join", vec![lit_str(", ")])]);
+        let error = send(
+            Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from(""), Symbol::from("ActiveModel"), Symbol::from("ValidationError")] })),
+            "new",
+            vec![message],
+        );
+        let body = Expr::new(span, ExprNode::If {
+            cond: send(None, "valid?", vec![]),
+            then_branch: Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: true } }),
+            else_branch: send(None, "raise", vec![error]),
+        });
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("validate!"),
+            receiver: MethodReceiver::Instance,
+            params: Vec::new(),
+            body,
+            signature: Some(fn_sig(vec![], Ty::Bool)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: true,
+            block_param: None,
+        });
+    }
     if !defines("errors") {
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,

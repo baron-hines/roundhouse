@@ -52,7 +52,8 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
         if lock.is_in_repo(gem)
             || lock.is_from_git(gem)
             || lock.is_source(gem)
-            || app.extensions.is_rails_dependent(gem)
+            // Not a Rails engine the lockfile alone marks: compiled from source, it no longer loads Rails.
+            || app.extensions.rails_dependent.iter().any(|row| row.gem == *gem && !row.inferred)
             || carried.contains(&crate::gems::namespace_of(gem))
         {
             return;

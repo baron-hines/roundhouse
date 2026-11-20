@@ -22221,6 +22221,10 @@ mod class_eval_definer_call;
 mod custom_form_builder;
 #[path = "emit_and_run/nested_form_child.rs"]
 mod nested_form_child;
+#[path = "emit_and_run/implicit_namespace_include.rs"]
+mod implicit_namespace_include;
+#[path = "emit_and_run/maybe_ruby_boot.rs"]
+mod maybe_ruby_boot;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]

@@ -95,8 +95,16 @@ pub(super) fn ingest_model_with_enum_constants(
     // prefix comes from the nearest module parent that declares one,
     // searched innermost-out the way `module_parents` walks.
     let table_decl = class.body().map(|body| parse_table_name_decl(body, file)).transpose()?.flatten();
-    let table_name = if let Some((name, _)) = &table_decl {
+    let table_name = if let Some((name, _)) = &table_decl
+        && !name.starts_with(TABLE_PREFIX_MARK)
+    {
         name.clone()
+    } else if let Some((name, _)) = &table_decl {
+        // The class attribute as Rails reads it: the class body's own `table_name_prefix =`, else the base's.
+        let prefix = class.body().and_then(table_prefix::explicit_table_prefix)
+            .or_else(|| model_bases.resolve_class_superclass(&scope, &nesting, &class).and_then(|parent| base_prefixes.get(&parent).cloned()))
+            .unwrap_or_default();
+        format!("{prefix}{}", name.trim_start_matches(TABLE_PREFIX_MARK))
     } else {
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
@@ -4753,6 +4761,27 @@ fn nested_table(name: &str, prefix: &str, schema: &Schema, bases: &super::librar
     schema.tables.contains_key(&Symbol::from(table.as_str())).then_some(table)
 }
 
+/// `table_name_prefix + "settings"` (rails-settings-cached's `RailsSettings::Base`): the class's own prefix, which the
+/// caller knows, in front of the literal, marked to be filled in.
+const TABLE_PREFIX_MARK: char = '\u{1}';
+
+fn prefixed_table(arg: &Node<'_>) -> Option<String> {
+    let call = arg.as_call_node()?;
+    if constant_id_str(&call.name()) != "+" {
+        return None;
+    }
+    let reader = call.receiver()?.as_call_node()?;
+    if constant_id_str(&reader.name()) != "table_name_prefix" || reader.arguments().is_some()
+        || reader.receiver().is_some_and(|r| r.as_self_node().is_none())
+    {
+        return None;
+    }
+    let args = call.arguments()?;
+    let rest: Vec<_> = args.arguments().iter().collect();
+    let [rest] = rest.as_slice() else { return None };
+    Some(format!("{TABLE_PREFIX_MARK}{}", string_value(rest)?))
+}
+
 /// The table a class body declares (`self.table_name = "entries"`), read leniently for the model prepass.
 pub(super) fn table_name_decl(body: Node<'_>, file: &str) -> Option<String> {
     parse_table_name_decl(body, file).ok().flatten().map(|(name, _)| name)
@@ -4774,8 +4803,11 @@ fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(Str
                 let name = valid.then_some(())
                     .and_then(|_| call.arguments())
                     .filter(|args| args.arguments().len() == 1)
-                    .and_then(|args| symbol_or_string_value(&args.arguments().iter().next()?))
-                    .filter(|name| bare_table_identifier(name));
+                    .and_then(|args| {
+                        let arg = args.arguments().iter().next()?;
+                        symbol_or_string_value(&arg).or_else(|| prefixed_table(&arg))
+                    })
+                    .filter(|name| bare_table_identifier(name.trim_start_matches(TABLE_PREFIX_MARK)));
                 self.writes.push(name.map(|name| (name, offset)));
             } else {
                 let name = node.as_call_and_write_node().map(|w| w.write_name())

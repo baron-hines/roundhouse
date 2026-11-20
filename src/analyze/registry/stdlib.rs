@@ -274,6 +274,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("broadcast_replace_to", Ty::Nil), ("broadcast_update_to", Ty::Nil),
         ("broadcast_remove_to", Ty::Nil),
     ], &[]);
+    // turbo-rails' helper modules, which a component includes (maybe's ApplicationComponent); the runtime defines
+    // them empty, as a template's `turbo_frame_tag` is lowered where it is written.
+    register_stdlib_class(classes, "Turbo::FramesHelper", &[], &[]);
+    register_stdlib_class(classes, "Turbo::StreamsHelper", &[], &[]);
     // `ENV` — a Rails app's configuration seam, and the one stdlib
     // object whose values have a single concrete type: every entry is
     // a String. `fetch` narrows to that, which is right for the two

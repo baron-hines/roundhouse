@@ -6054,6 +6054,25 @@ pub fn is_tableless_active_model(source: &[u8]) -> bool {
     class.superclass().is_none() && includes_active_model(&class)
 }
 
+/// `is_tableless_active_model` for an app `lib/` file whose class is the app's own (maybe's `Money`), not one it opens
+/// under a framework namespace (`ActionText::Attachment::OpengraphEmbed`), which `lower::active_model_model` keeps.
+pub fn is_app_tableless_active_model(source: &[u8]) -> bool {
+    let result = parse(source);
+    let root = result.node();
+    let Some((scope, class)) = super::util::primary_class_with_scope(&root) else {
+        return false;
+    };
+    let Some(path) = class_name_path(&class) else { return false };
+    let top = scope.first().or(path.first()).map(String::as_str).unwrap_or("");
+    let framework = matches!(
+        top,
+        "Rails" | "ActiveSupport" | "ActiveRecord" | "ActiveModel" | "ActiveJob" | "ActionPack" | "ActionController"
+            | "ActionDispatch" | "AbstractController" | "ActionView" | "ActionMailer" | "ActionCable" | "ActionText"
+            | "ActiveStorage" | "ActionMailbox"
+    );
+    !framework && class.superclass().is_none() && includes_active_model(&class)
+}
+
 pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKind> {
     let result = parse(source);
     let root = result.node();

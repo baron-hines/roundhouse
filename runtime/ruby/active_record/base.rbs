@@ -362,6 +362,7 @@ module ActiveRecord
     def stamps_timestamps?: () -> bool
 
     def valid?: () -> bool
+    def validate!: () -> bool
 
     # Equality protocol intentionally not defined here — see comment
     # in base.rb for the cross-target rationale.

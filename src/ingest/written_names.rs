@@ -185,7 +185,9 @@ impl Names<'_> {
         // NameError). Rubydex does when the app reopens `A` without
         // declaring `B` (a gem's `A::B`), and its answer `Object` would
         // replace the real, undeclared `A::B`.
-        if path.len() > 1 && !name.contains("::") {
+        // Nor a shorter one for a longer path: `Article::Parts::Taxonomy` answered as the top-level `Parts::Taxonomy`
+        // (a controller's `Parts::` namespace) lost `Article` the same way.
+        if path.len() > 1 && name.split("::").count() < path.len() {
             return None;
         }
         (name.rsplit("::").next() == Some(last)).then(|| class.clone())
