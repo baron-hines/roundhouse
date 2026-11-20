@@ -5660,6 +5660,28 @@ struct Ancestry<'a> {
     /// Per module, its own ancestors below it and the concerns it defers
     /// to its includer: the same for every includer, so walked once.
     expanded: std::cell::RefCell<HashMap<crate::ident::ClassId, std::rc::Rc<Expanded>>>,
+    /// The modules each walk is in the middle of. A cycle of includes is a
+    /// load error in Ruby; a walk that meets one of its own stops there,
+    /// however long a chain without one is.
+    walking: std::cell::RefCell<crate::det::HashSet<(Walk, crate::ident::ClassId)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Walk {
+    Include,
+    Hook,
+}
+
+impl Ancestry<'_> {
+    /// Runs `body` unless `walk` is already in the middle of `module`.
+    fn guarded<T>(&self, walk: Walk, module: &crate::ident::ClassId, body: impl FnOnce() -> T) -> Option<T> {
+        if !self.walking.borrow_mut().insert((walk, module.clone())) {
+            return None;
+        }
+        let out = body();
+        self.walking.borrow_mut().remove(&(walk, module.clone()));
+        Some(out)
+    }
 }
 
 /// A module's ancestors below it, nearest first, and, for a concern, the
@@ -5681,7 +5703,7 @@ impl Ancestry<'_> {
         let mut chain = Vec::new();
         for statement in statements {
             for module in statement.iter().rev() {
-                self.include(&mut chain, module, inherited, 0);
+                self.include(&mut chain, module, inherited);
             }
         }
         chain
@@ -5707,30 +5729,31 @@ impl Ancestry<'_> {
             inherited: &crate::det::HashSet<crate::ident::ClassId>,
             chain: &mut Vec<crate::ident::ClassId>,
             out: &mut Vec<crate::ident::ClassId>,
-            depth: usize,
         ) {
-            if depth > 64 || inherited.contains(module) || chain.contains(module) {
+            if inherited.contains(module) || chain.contains(module) {
                 return;
             }
-            for dependency in &ancestry.expanded(module, depth).dependencies {
-                visit(ancestry, dependency, inherited, chain, out, depth + 1);
-            }
-            if !out.contains(module) {
-                out.push(module.clone());
-            }
-            ancestry.include(chain, module, inherited, depth);
+            ancestry.guarded(Walk::Hook, module, || {
+                for dependency in &ancestry.expanded(module).dependencies {
+                    visit(ancestry, dependency, inherited, chain, out);
+                }
+                if !out.contains(module) {
+                    out.push(module.clone());
+                }
+                ancestry.include(chain, module, inherited);
+            });
         }
         let mut chain = Vec::new();
         let mut out = Vec::new();
         for statement in statements {
             for module in statement.iter().rev() {
-                visit(self, module, inherited, &mut chain, &mut out, 0);
+                visit(self, module, inherited, &mut chain, &mut out);
             }
         }
         out
     }
 
-    fn expanded(&self, module: &crate::ident::ClassId, depth: usize) -> std::rc::Rc<Expanded> {
+    fn expanded(&self, module: &crate::ident::ClassId) -> std::rc::Rc<Expanded> {
         let cached = self.expanded.borrow().get(module).cloned();
         if let Some(done) = cached {
             return done;
@@ -5744,7 +5767,7 @@ impl Ancestry<'_> {
                 if concern && self.concerns.contains(nested) {
                     dependencies.push(nested.clone());
                 } else {
-                    self.include(&mut own, nested, &none, depth + 1);
+                    self.include(&mut own, nested, &none);
                 }
             }
         }
@@ -5758,21 +5781,21 @@ impl Ancestry<'_> {
         chain: &mut Vec<crate::ident::ClassId>,
         module: &crate::ident::ClassId,
         inherited: &crate::det::HashSet<crate::ident::ClassId>,
-        depth: usize,
     ) {
-        // A cycle of includes is a load error in Ruby; it stops here.
-        if depth > 64 {
-            return;
-        }
         // A concern its includer has already, through the superclass too,
         // adds nothing, its dependencies included.
         if self.concerns.contains(module) && (chain.contains(module) || inherited.contains(module)) {
             return;
         }
-        let expanded = self.expanded(module, depth);
-        for dependency in &expanded.dependencies {
-            self.include(chain, dependency, inherited, depth + 1);
-        }
+        let Some(expanded) = self.guarded(Walk::Include, module, || {
+            let expanded = self.expanded(module);
+            for dependency in &expanded.dependencies {
+                self.include(chain, dependency, inherited);
+            }
+            expanded
+        }) else {
+            return;
+        };
         let mut at = 0;
         for ancestor in std::iter::once(module).chain(expanded.own.iter()) {
             if inherited.contains(ancestor) {
@@ -5889,7 +5912,7 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         }
     }
     let filter_edges = filter_dependency_edges(app, &module_includes);
-    let ancestry = Ancestry { statements: &module_statements, concerns: &concerns, expanded: Default::default() };
+    let ancestry = Ancestry { statements: &module_statements, concerns: &concerns, expanded: Default::default(), walking: Default::default() };
     // Each controller's statements across its openings, and its
     // superclass, for the modules a child finds in its superclass's chain.
     let mut controller_groups: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
@@ -5901,6 +5924,13 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .extend(crate::analyze::controller_include_statements(controller).into_iter().map(|(_, group)| group));
         if let Some(parent) = &controller.parent {
             controller_parent.entry(controller.name.clone()).or_insert_with(|| parent.clone());
+        }
+    }
+    // A superclass that isn't a controller (a class in lib/) has its own
+    // includes and superclass, from its openings.
+    for lc in &app.library_classes {
+        if let Some(parent) = &lc.parent {
+            controller_parent.entry(lc.name.clone()).or_insert_with(|| parent.clone());
         }
     }
     // The modules of the superclass's chain, nearest first: each
@@ -5919,7 +5949,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         let mut above: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
         let mut levels: Vec<Vec<crate::ident::ClassId>> = Vec::new();
         for p in parents.into_iter().rev() {
-            let chain = ancestry.of_statements(controller_groups.get(p).map(Vec::as_slice).unwrap_or(&[]), &above);
+            let groups = controller_groups.get(p).or_else(|| module_statements.get(p));
+            let chain = ancestry.of_statements(groups.map(Vec::as_slice).unwrap_or(&[]), &above);
             above.extend(chain.iter().cloned());
             levels.push(chain);
         }
@@ -6796,7 +6827,7 @@ mod controller_concern_surface_tests {
         let mut statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
         statements.insert(id("X"), vec![vec![id("C")], vec![id("B")], vec![id("A")]]);
         let concerns = crate::det::HashSet::default();
-        let ancestry = Ancestry { statements: &statements, concerns: &concerns, expanded: Default::default() };
+        let ancestry = Ancestry { statements: &statements, concerns: &concerns, expanded: Default::default(), walking: Default::default() };
         let class = [vec![id("A")], vec![id("B")], vec![id("X")]];
         assert_eq!(names(ancestry.of_statements(&class, &Default::default())), ["X", "B", "A", "C"]);
     }
