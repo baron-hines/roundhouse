@@ -1380,7 +1380,7 @@ pub(super) fn library_class_and_struct_base(
     };
     let base = struct_members
         .as_ref()
-        .map(|members| struct_base_class(&owner, members));
+        .map(|(members, keyword_init)| struct_base_class(&owner, members, *keyword_init));
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok((
         LibraryClass {
@@ -2152,7 +2152,7 @@ fn synth_struct_equality(owner: &ClassId, members: &[SorbetStructMember]) -> Met
 /// end` carrying a body: both mean something this synthesis does not
 /// supply, and answering as though they were the positional form would
 /// build a class with the wrong constructor.
-fn struct_superclass_members(node: &ruby_prism::Node<'_>) -> Option<Vec<Symbol>> {
+fn struct_superclass_members(node: &ruby_prism::Node<'_>) -> Option<(Vec<Symbol>, bool)> {
     let call = node.as_call_node()?;
     if call.name().as_slice() != b"new" || call.block().is_some() {
         return None;
@@ -2163,16 +2163,29 @@ fn struct_superclass_members(node: &ruby_prism::Node<'_>) -> Option<Vec<Symbol>>
     }
     let args = call.arguments()?;
     let mut members = Vec::new();
+    let mut keyword_init = false;
     for arg in args.arguments().iter() {
-        // Symbol literals only — a `keyword_init:` keyword arrives as a
-        // KeywordHashNode and lands here as a non-symbol, which is what
-        // makes this a rejection rather than a silent drop.
+        // A trailing `keyword_init: true` alone (rails-settings-cached's `Fields::Base`); any other keyword is a
+        // constructor this synthesis does not supply, so it rejects.
+        if let Some(hash) = arg.as_keyword_hash_node() {
+            let pairs: Vec<_> = hash.elements().iter().collect();
+            let [pair] = pairs.as_slice() else { return None };
+            let pair = pair.as_assoc_node()?;
+            if symbol_value(&pair.key()).as_deref() != Some("keyword_init") || pair.value().as_true_node().is_none() {
+                return None;
+            }
+            keyword_init = true;
+            continue;
+        }
+        if keyword_init {
+            return None;
+        }
         members.push(Symbol::from(symbol_value(&arg)?));
     }
     if members.is_empty() {
         return None;
     }
-    Some(members)
+    Some((members, keyword_init))
 }
 
 /// The name given to the anonymous struct that stood in superclass
@@ -2198,11 +2211,11 @@ fn struct_base_id(owner: &ClassId) -> ClassId {
 ///
 /// Every parameter defaults to nil, matching Struct: `Point.new(1)`
 /// leaves `y` nil rather than raising.
-fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
+fn struct_base_class(owner: &ClassId, members: &[Symbol], keyword_init: bool) -> LibraryClass {
     struct_class(
         struct_base_id(owner),
         members,
-        false,
+        keyword_init,
         crate::dialect::LibraryClassOrigin::StructSuperclass {
             owner: owner.0.clone(),
             members: members.to_vec(),
@@ -5711,6 +5724,8 @@ pub struct ModelBases {
     /// Every concrete model under `app/models`, with the table its body declares (`concrete_model_table`).
     concrete: crate::det::HashMap<String, Option<String>>,
     concrete_pairs: Vec<(String, Vec<String>, String, Option<String>)>,
+    /// The concrete models a source gem's files declare (rails-settings-cached's `RailsSettings::Base`).
+    gem_concrete: crate::det::HashSet<String>,
 }
 
 impl ModelBases {
@@ -5833,8 +5848,16 @@ impl ModelBases {
             let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
             // A bare parent is kept with the modules it is looked up through ([`superclass_enclosing`]): a concrete `Admin::Base` is found from `module Admin`, and from `module Ledger; class ::Special < Item` its `Ledger::Item`.
             let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { superclass_enclosing(&scope, &nesting, &class) } else { Vec::new() };
+            if file.contains(super::source_gems::MOUNT) {
+                self.gem_concrete.insert(full.join("::"));
+            }
             self.concrete_pairs.push((full.join("::"), lexical, parent, table));
         }
+    }
+
+    /// A concrete model a source gem declares, which an app class subclasses as Rails does its own models.
+    pub fn is_gem_concrete_model(&self, name: &str) -> bool {
+        self.gem_concrete.contains(name) && self.concrete.contains_key(name)
     }
 
     /// The concrete models: a class whose parent is a base, or (single-table inheritance) another concrete model.
@@ -6127,6 +6150,9 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
         // Resolved through the app's own bases, not against two
         // literals: `Gauge < PkgRecord < ApplicationRecord` is a model.
         Some(p) if bases.contains(p) => ClassKind::Model,
+        // A subclass of a concrete model a gem defines (maybe's `Setting < RailsSettings::Base`): a model, on its table.
+        // Not the app's own (single-table inheritance has its own path), only a gem's.
+        Some(p) if bases.is_gem_concrete_model(p) => ClassKind::Model,
         // A superclass-less class that `include`s the ActiveModel
         // validation surface (lobsters' Search) is a tableless model:
         // the model path lowers its `validates` DSL and synthesizes

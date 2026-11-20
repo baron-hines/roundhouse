@@ -1269,7 +1269,7 @@ impl Run<'_> {
             return Err("its calls nest too deep".into());
         }
         let def = self.method_def(name).cloned().ok_or_else(|| format!("`{}` is not one of the class's methods", name.as_str()))?;
-        if !super::model_macros::supported_source_signature(&def, self.sources, true, true, true) {
+        if !super::model_macros::supported_source_signature_with(&def, self.sources, true, true, true, true) {
             return Err(format!("`{}`'s parameters are not ones it binds", name.as_str()));
         }
         let mut bound = self.bind(&def, args, block, env)?;
@@ -1296,9 +1296,6 @@ impl Run<'_> {
     }
 
     fn bind(&mut self, def: &MethodDef, args: &[Expr], block: Option<&Expr>, env: &Env) -> Result<Env, String> {
-        if def.params.iter().any(|p| p.from_kwrest) {
-            return Err("its parameters include a keyword rest".into());
-        }
         let mut bound = Env::default();
         // The block is captured as written: the defined bodies run it where they `instance_eval` or pass it.
         match (&def.block_param, block) {
@@ -1311,7 +1308,33 @@ impl Run<'_> {
             (None, Some(_)) => return Err("it is passed a block it does not name".into()),
             (None, None) => {}
         }
-        let takes_keywords = def.params.iter().any(|p| p.keyword || p.from_keyword);
+        let takes_keywords = def.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest);
+        // A `**opts` handed on (`_define_field(key, **opts)`): the keywords it holds, as the call's own.
+        let spread: Vec<Expr>;
+        let args: &[Expr] = if args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. })) {
+            let mut positional = Vec::new();
+            let mut entries: Vec<(Expr, Expr)> = Vec::new();
+            for a in args {
+                match &*a.node {
+                    ExprNode::KeywordSplat { value } => match self.eval(value, env)? {
+                        Val::Lit(e) => match &*e.node {
+                            ExprNode::Hash { entries: held, .. } => entries.extend(held.iter().cloned()),
+                            _ => return Err("a `**` hands on a value that is not a Hash literal".into()),
+                        },
+                        _ => return Err("a `**` hands on a value known only when it runs".into()),
+                    },
+                    ExprNode::Hash { entries: own, kwargs: true } => entries.extend(own.iter().cloned()),
+                    _ if entries.is_empty() => positional.push(a.clone()),
+                    _ => return Err("a positional argument follows a `**`".into()),
+                }
+            }
+            let span = args.last().map_or(def.name_span, |a| a.span);
+            positional.push(Expr::new(span, ExprNode::Hash { entries, kwargs: true }));
+            spread = positional;
+            &spread
+        } else {
+            args
+        };
         // Not split off without keyword parameters: Ruby hands the trailing Hash to the last positional (`opts = {}`) or a `*rest`.
         let as_hash: Vec<Expr>;
         let args: &[Expr] = match args.last().map(|a| &*a.node) {
@@ -1337,10 +1360,15 @@ impl Run<'_> {
             }
             _ => (args, Vec::new()),
         };
+        let order: Vec<Symbol> = keywords.iter().map(|(k, _)| k.clone()).collect();
         let mut keywords: HashMap<Symbol, Expr> = keywords.into_iter().collect();
         let mut positional = positional.iter();
         let required_after_rest = |at: usize| def.params[at + 1..].iter().filter(|p| !p.keyword && !p.from_keyword && p.default.is_none() && !p.rest).count();
         for (at, p) in def.params.iter().enumerate() {
+            // Not bound in order: a `**opts` holds the keywords no named parameter takes, which are known after them.
+            if p.from_kwrest {
+                continue;
+            }
             if p.rest {
                 let mut rest = Vec::new();
                 while positional.len() > required_after_rest(at) {
@@ -1361,6 +1389,18 @@ impl Run<'_> {
                 (None, None) => return Err(format!("`{}` is not given", p.name.as_str())),
             };
             bound.insert(p.name.clone(), val);
+        }
+        if let Some(p) = def.params.iter().find(|p| p.from_kwrest) {
+            let mut rest: Vec<(Expr, Expr)> = Vec::new();
+            for name in order.iter().filter(|n| keywords.contains_key(*n)).cloned().collect::<Vec<_>>() {
+                let e = keywords.remove(&name).expect("listed");
+                let v = match self.eval(&e, env)? {
+                    Val::Lit(v) => v,
+                    v => self.read(&v, e.span),
+                };
+                rest.push((lit(e.span, Literal::Sym { value: name }), v));
+            }
+            bound.insert(p.name.clone(), Val::Lit(Expr::new(def.name_span, ExprNode::Hash { entries: rest, kwargs: false })));
         }
         if positional.next().is_some() || !keywords.is_empty() {
             return Err("it is given an argument it does not take".into());
@@ -1910,6 +1950,11 @@ impl Run<'_> {
             ExprNode::Lit { .. } | ExprNode::SelfRef => Some(Val::Lit(e.clone())),
             // A module this program defines is itself (`borrow(Gadget, :label)`).
             ExprNode::Const { path } if self.resolve_module(path).is_some() => Some(Val::Lit(e.clone())),
+            // A constant of the class's line assigned a literal list (rails-settings-cached's `PROTECTED_KEYS`), as the
+            // guard that reads it sees it.
+            ExprNode::Const { path } if let [name] = path.as_slice() && let Some(value) = self.constants.get(name) => {
+                Some(Val::Lit(Expr { span: e.span, ..value.clone() }))
+            }
             ExprNode::Var { name, .. } => env.get(name).cloned(),
             ExprNode::Send { recv: Some(r), method, args, block: None, .. }
                 if args.is_empty()

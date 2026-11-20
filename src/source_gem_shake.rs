@@ -523,6 +523,16 @@ impl<'a> Gems<'a> {
         self.entries.contains_key(name)
     }
 
+    /// The gem classes directly under `namespace` (`RailsSettings::Fields`).
+    fn children_of(&self, namespace: &str) -> Vec<String> {
+        let prefix = format!("{namespace}::");
+        self.entries
+            .keys()
+            .filter(|name| name.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")))
+            .map(|name| name.to_string())
+            .collect()
+    }
+
     /// A name read inside `context` may be any enclosing namespace's (`Atoms::Entity` in `Parslet`).
     fn resolve(&self, context: Option<&str>, name: &str) -> Option<String> {
         let name = name.trim_start_matches("::");
@@ -1453,6 +1463,19 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
                 && s.gems.is_some_and(|g| g.known(value.trim_start_matches("::"))) =>
         {
             s.consts.push((None, value.trim_start_matches("::").to_string()));
+        }
+        // A gem class named by a string built on a namespace (`"::RailsSettings::Fields::#{field_class_name}"` that
+        // rails-settings-cached `const_get`s): any class directly under it may be the one.
+        ExprNode::StringInterp { parts }
+            if let Some(crate::expr::InterpPart::Text { value }) = parts.first()
+                && let Some(namespace) = value.trim_start_matches("::").strip_suffix("::")
+                && namespace.starts_with(|c: char| c.is_ascii_uppercase())
+                && namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+                && let Some(gems) = s.gems =>
+        {
+            for child in gems.children_of(namespace) {
+                s.consts.push((None, child));
+            }
         }
         ExprNode::Send { recv, method, args, block, .. } => {
             let target = match recv {

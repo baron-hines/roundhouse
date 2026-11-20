@@ -22229,6 +22229,8 @@ mod nested_form_child;
 mod implicit_namespace_include;
 #[path = "emit_and_run/maybe_ruby_boot.rs"]
 mod maybe_ruby_boot;
+#[path = "emit_and_run/rails_settings_cached.rs"]
+mod rails_settings_cached;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]

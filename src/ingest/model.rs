@@ -3806,6 +3806,14 @@ fn parse_callback(
                 let assoc = el.as_assoc_node()?;
                 let key = symbol_value(&assoc.key())?;
                 match key.as_str() {
+                    // Every lifecycle listed (rails-settings-cached's `on: %i[create update destroy]`) is no `on:`
+                    // at all; a subset of them is not modeled, so it rejects.
+                    "on" if assoc.value().as_array_node().is_some_and(|list| {
+                        let mut named: Vec<String> = list.elements().iter().filter_map(|e| symbol_value(&e)).collect();
+                        named.sort();
+                        named.dedup();
+                        list.elements().iter().count() >= 3 && named == ["create", "destroy", "update"]
+                    }) => {}
                     "on" => {
                         on = Some(match symbol_value(&assoc.value())?.as_str() {
                             "create" => CallbackOn::Create,
