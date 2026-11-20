@@ -133,6 +133,11 @@ module RoundhouseShapeObserver
       ok ? value.inspect : nil
     end
 
+    def record_base_loaded?
+      Object.const_defined?(:ActiveRecord, false) && !Object.autoload?(:ActiveRecord) && !ActiveRecord.autoload?(:Base) &&
+        ActiveRecord.const_defined?(:Base, false)
+    end
+
     def refuse(why)
       @refusals << why
       nil
@@ -147,7 +152,8 @@ module RoundhouseShapeObserver
     # The same as a lambda literal, for a macro handed one.
     def lambda_literal(name, proc_)
       parts = body_of(name, proc_) or return nil
-      "->(#{parts[0]}) { #{parts[1]} }"
+      # Not the brace on the body's last line: a trailing comment there would swallow it.
+      "->(#{parts[0]}) {\n#{parts[1]}\n}"
     end
 
     MUTATORS = %i[<< push append unshift prepend concat insert []= store update merge! replace clear delete delete_if keep_if select! reject! map! collect! compact! flatten! uniq! sort! sort_by! shift pop fill transform_values! transform_keys!].freeze
@@ -214,7 +220,11 @@ module RoundhouseShapeObserver
       body = node.body
       return nil if body && !walk.call(body, 0)
       source = File.binread(path)
-      text = body ? source.byteslice(body.location.start_offset, body.location.end_offset - body.location.start_offset) : "nil"
+      # Not a body holding `=begin`/`=end`: written into the class body indented, they would no longer be comments.
+      return refuse("#{name}: an embedded `=begin` comment") if source.byteslice(node.location.start_offset, node.location.end_offset - node.location.start_offset).match?(/^=begin\b/)
+      # Not the body's own end: Prism ends a statement list before the `)` of a last call handed `&block`.
+      finish = node.closing_loc ? node.closing_loc.start_offset : body&.location&.end_offset
+      text = body ? source.byteslice(body.location.start_offset, finish - body.location.start_offset).rstrip : "nil"
       base = body ? body.location.start_offset : 0
       edits.sort_by { |s, _, _| -s }.each { |s, e, t| text = text.byteslice(0, s - base) + t + text.byteslice(e - base..) }
       signature = params ? source.byteslice(params.location.start_offset, params.location.end_offset - params.location.start_offset) : ""
@@ -311,8 +321,10 @@ Module.prepend(RoundhouseShapeObserver::Recorder)
 # A class macro a gem's code calls on a model (`base.after_initialize :aasm_ensure_initial_state`).
 RoundhouseShapeObserver::MACRO = /\A(?:(?:after|before|around)_\w+|validates?|validates_\w+|scope|attribute|enum|serialize|store_accessor|has_many|has_one|belongs_to|has_and_belongs_to_many|delegate|alias_attribute)\z/
 TracePoint.new(:call) do |tp|
-  next unless tp.self.is_a?(Class) && RoundhouseShapeObserver::MACRO.match?(tp.method_id.to_s)
-  next unless defined?(ActiveRecord::Base) && tp.self < ActiveRecord::Base
+  # Not `tp.self.is_a?` or `<`: a deprecated constant's proxy (ActiveSupport's) answers those through method_missing.
+  next unless Class === tp.self && RoundhouseShapeObserver::MACRO.match?(tp.method_id.to_s)
+  # Not `defined?(ActiveRecord::Base)`: in the app's own boot that autoloads Base while ActiveRecord is still loading.
+  next unless RoundhouseShapeObserver.record_base_loaded? && ActiveRecord::Base > tp.self
   caller_frame = caller_locations(2, 1).first
   next unless caller_frame && RoundhouseShapeObserver.gem_file?(caller_frame.path)
   next if RoundhouseShapeObserver.gem_file?(tp.path)
