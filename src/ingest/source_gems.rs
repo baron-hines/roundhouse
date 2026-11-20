@@ -418,7 +418,9 @@ fn requires(text: &str) -> Vec<(bool, String)> {
             let embedded = head.as_embedded_statements_node()?.statements()?;
             let body: Vec<_> = embedded.body().iter().collect();
             let [inner] = body.as_slice() else { return None };
-            let dir = file_dir(inner) || inner.as_local_variable_read_node().is_some_and(|l| self.2.iter().any(|n| n.as_slice() == l.name().as_slice()));
+            // Not a local inside a `def`: that is the method's own binding (a parameter, say), not the file's.
+            let dir = file_dir(inner)
+                || (self.1 == 0 && inner.as_local_variable_read_node().is_some_and(|l| self.2.iter().any(|n| n.as_slice() == l.name().as_slice())));
             let rest = String::from_utf8_lossy(rest.as_string_node()?.unescaped()).into_owned();
             (dir && rest.starts_with('/')).then(|| rest.trim_start_matches('/').to_string())
         }
@@ -431,8 +433,13 @@ fn requires(text: &str) -> Vec<(bool, String)> {
         }
 
         fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
-            if self.1 == 0 && file_dir(&node.value()) {
-                self.2.push(node.name().as_slice().to_vec());
+            if self.1 == 0 {
+                let name = node.name().as_slice().to_vec();
+                // A later write to another value ends what the local held: a require after it is not file-relative.
+                self.2.retain(|n| *n != name);
+                if file_dir(&node.value()) {
+                    self.2.push(name);
+                }
             }
             ruby_prism::visit_local_variable_write_node(self, node);
         }
@@ -770,6 +777,21 @@ mod tests {
     fn a_require_built_on_the_files_directory_is_relative() {
         let found = super::requires("direc = File.dirname(__FILE__)\nrequire \"#{direc}/method_source/version\"\nrequire \"#{__dir__}/other\"\nrequire \"#{name}/no\"\n");
         assert_eq!(found, vec![(true, "method_source/version".to_string()), (true, "other".to_string())]);
+    }
+
+    #[test]
+    fn a_directory_local_is_the_files_only_where_it_holds() {
+        let found = super::requires(
+            "dir = __dir__
+def load_plugin(dir)
+  require \"#{dir}/plugin\"
+end
+require \"#{dir}/kept\"
+dir = ENV[\"X\"]
+require \"#{dir}/gone\"
+",
+        );
+        assert_eq!(found, vec![(true, "kept".to_string())]);
     }
 
     #[test]

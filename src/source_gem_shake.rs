@@ -479,7 +479,7 @@ impl<'a> Gems<'a> {
         written_consts.retain(|w| !w.ends_with("::*"));
         for namespace in built {
             let prefix = format!("{namespace}::");
-            written_consts.extend(entries.keys().filter(|k| k.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::"))).map(|k| k.to_string()));
+            written_consts.extend(entries.keys().filter(|k| k.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")) && !unloadable.contains(k.as_str())).map(|k| k.to_string()));
         }
         let mut gems = Gems { names, written_consts, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes, unloadable, model_copies };
         gems.app_mixins = gems.mixed_into_the_app(app);
@@ -552,6 +552,8 @@ impl<'a> Gems<'a> {
         self.entries
             .keys()
             .filter(|name| name.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")))
+            // Not a class whose file requires a feature that is absent: it never exists for a string to name.
+            .filter(|name| !self.unloadable.contains(name.as_str()))
             .map(|name| name.to_string())
             .collect()
     }

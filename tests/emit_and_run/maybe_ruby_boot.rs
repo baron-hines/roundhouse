@@ -142,3 +142,20 @@ fn a_guard_asking_for_a_later_nested_module_keeps_its_branch() {
     run.assert_passes();
     assert!(run.stdout.contains("guard passed"), "{}", run.stdout);
 }
+
+/// `private :helper` in a branch settled at load (`defined?` of a class the app carries) makes the branch's
+/// `helper` private, as Ruby runs it there.
+#[test]
+fn a_settled_branchs_private_marker_hides_its_method() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/settled_helpers.rb",
+            "module SettledHelpers\n  if defined?(Article)\n    def helper\n      \"ok\"\n    end\n    private :helper\n\n    def open_one\n      helper\n    end\n  end\nend\n",
+        )
+        .write("app/models/settled_probe.rb", "class SettledProbe\n  include SettledHelpers\nend\n")
+        .run_ruby(
+            "got = [SettledProbe.new.open_one, SettledProbe.private_method_defined?(:helper), SettledProbe.public_method_defined?(:helper)]\nraise \"got #{got.inspect}\" unless got == [\"ok\", true, false]\nputs \"settled private passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("settled private passed"), "{}", run.stdout);
+}
