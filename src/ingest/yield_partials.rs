@@ -279,7 +279,8 @@ fn specialized(stmt: &Expr, cx: &mut Cx) -> Option<(Expr, crate::span::Span)> {
     let params: Vec<Symbol> = params.iter().map(|p| renamed(p.as_str())).collect();
     let mut copy = partial.clone();
     copy.name = Symbol::from(format!("{pdir}/_{base}__yield{k}"));
-    replace_yields(&mut copy.body, &params, &owned, &inlined);
+    let original = copy.body.clone();
+    replace_yields(&mut copy.body, &params, &owned, &inlined, &original);
     if let Some(strict) = &mut copy.strict_locals {
         for n in free.iter().chain(&called) {
             strict.push(crate::dialect::Param { name: renamed(n), default: None, keyword: true, rest: false, forwarding: false, from_keyword: false, from_kwrest: false });
@@ -358,10 +359,10 @@ fn only_output_yields(e: &Expr, counts: &mut Vec<usize>) -> bool {
     ok
 }
 
-fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr) {
+fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr, partial: &Expr) {
     if matches!(appended(e).map(|c| &*c.node), Some(ExprNode::Yield { .. })) {
         let mut seq = Expr::new(e.span, ExprNode::Seq { exprs: vec![e.clone()] });
-        replace_yields(&mut seq, params, owned, body);
+        replace_yields(&mut seq, params, owned, body, partial);
         *e = seq;
         return;
     }
@@ -373,7 +374,7 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
                 _ => None,
             };
             let Some(args) = yielded else {
-                replace_yields(&mut stmt, params, owned, body);
+                replace_yields(&mut stmt, params, owned, body, partial);
                 out.push(stmt);
                 continue;
             };
@@ -384,14 +385,12 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
                 let value = args.get(i).cloned().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
                 match params.get(i) {
                     // Not copied into the parameter: a `form_with` builder is no value at runtime, only its calls are lowered.
-                    // Not past a later argument that runs code: a lambda it calls may assign the local too.
-                    Some(p) if matches!(&*value.node, ExprNode::Var { name, .. } if local(name.as_str())
-                        && args[i + 1..].iter().all(|a| matches!(&*a.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Lit { .. })))
+                    // Only a local the partial never assigns (a block's parameter), which nothing can change before the read.
+                    Some(p) if matches!(&*value.node, ExprNode::Var { name, .. } if local(name.as_str()) && !assigned(partial, name.as_str()))
                         && !assigned(&body, p.as_str()) =>
                     {
                         let ExprNode::Var { name: arg, .. } = &*value.node else { unreachable!() };
-                        let (p, arg) = (p.clone(), arg.clone());
-                        rename(&mut body, &|n| if n == p.as_str() { arg.clone() } else { Symbol::from(n) });
+                        substitute(&mut body, p, arg);
                     }
                     Some(p) => out.push(Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: p.clone() }, value })),
                     None => out.push(value),
@@ -408,7 +407,17 @@ fn replace_yields(e: &mut Expr, params: &[Symbol], owned: &[Symbol], body: &Expr
         *exprs = out;
         return;
     }
-    e.node.for_each_child_mut(&mut |c| replace_yields(c, params, owned, body));
+    e.node.for_each_child_mut(&mut |c| replace_yields(c, params, owned, body, partial));
+}
+
+/// Reads of `from` as `to`, not under a nested block that binds `from` again, whose parameters stay as they are.
+fn substitute(e: &mut Expr, from: &Symbol, to: &Symbol) {
+    match &mut *e.node {
+        ExprNode::Lambda { params, .. } if params.iter().any(|p| p == from) => return,
+        ExprNode::Var { name, .. } if name == from => *name = to.clone(),
+        _ => {}
+    }
+    e.node.for_each_child_mut(&mut |c| substitute(c, from, to));
 }
 
 fn assigned(e: &Expr, name: &str) -> bool {

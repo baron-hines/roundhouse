@@ -4716,9 +4716,10 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
     });
     fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
         // `self.list += [:x]`, `||=` and `&&=` write the attribute too, though they are no CallNode.
-        if let Some(name) = node.as_call_operator_write_node().map(|w| w.read_name())
-            .or_else(|| node.as_call_or_write_node().map(|w| w.read_name()))
-            .or_else(|| node.as_call_and_write_node().map(|w| w.read_name()))
+        let own = |r: Option<ruby_prism::Node<'_>>| r.is_none_or(|r| r.as_self_node().is_some());
+        if let Some(name) = node.as_call_operator_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name())
+            .or_else(|| node.as_call_or_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
+            .or_else(|| node.as_call_and_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
         {
             redefined.insert(constant_id_str(&name).to_string());
             return;
@@ -4738,10 +4739,20 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             redefined.insert(constant_id_str(&reader.name()).to_string());
         }
     }
+    // Not a write's list for a loop before it, which ran over the list as it was then.
+    let mut walked: HashSet<String> = HashSet::default();
     for s in statements {
         if let Some(def) = s.as_def_node() {
             redefined.insert(constant_id_str(&def.name()).trim_end_matches('=').to_string());
             continue;
+        }
+        if let Some(call) = s.as_call_node()
+            && constant_id_str(&call.name()) == "each"
+            && let Some(reader) = call.receiver().and_then(|r| r.as_call_node())
+            && reader.receiver().is_none()
+            && reader.arguments().is_none()
+        {
+            walked.insert(constant_id_str(&reader.name()).to_string());
         }
         // `self.list += [:x]` / `-= [:x]` with a literal list changes the list the later loop walks, as the body runs.
         if let Some(write) = s.as_call_operator_write_node()
@@ -4749,6 +4760,10 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             && let Some(Some(list)) = declared.get_mut(&*constant_id_str(&write.read_name()))
             && let Some(right) = static_name_list(&write.value(), framework_helpers)
         {
+            // Not applied after the loop walked the list: that loop ran over the list as it was.
+            if walked.contains(&*constant_id_str(&write.read_name())) && matches!(&*constant_id_str(&write.binary_operator()), "+" | "-") {
+                continue;
+            }
             match &*constant_id_str(&write.binary_operator()) {
                 "+" => {
                     list.extend(right);

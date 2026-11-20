@@ -12,7 +12,7 @@ fn app() -> emit_and_run::Overlay {
     .edit(
         "app/views/articles/show.html.erb",
         "rounded\" %>\n<% end %>",
-        "rounded\" %>\n<% end %>\n<p id=\"held\"><%= @article.comments.size %></p>\n<%= form_with model: [@article, Comment.new], url: \"/custom\" do |f| %><%= f.text_field :body %><% end %>",
+        "rounded\" %>\n<% end %>\n<p id=\"held\"><%= @article.comments.size %></p>\n<%= form_with model: [@article, Comment.new], url: \"/custom\" do |f| %><%= f.text_field :body %><% end %>\n<%= form_with model: [@article, Comment.new], url: nil, id: \"nil-url\" do |f| %><%= f.text_field :body %><% end %>",
     )
 }
 
@@ -26,6 +26,7 @@ body = r[1].is_a?(Array) ? r[1].join : r[1].to_s
 raise body[0, 3000] unless body.include?("<form action=\"/articles/#{hello.id}/comments\"")
 raise body[0, 3000] unless body.include?("<p id=\"held-before\">0</p>") && body.include?("<p id=\"held\">1</p>")
 raise body[-3000, 3000] unless body.include?("<form action=\"/custom\"")
+raise body[-3000, 3000] unless body.include?("<form id=\"nil-url\" action=\"/articles/#{hello.id}/comments\"") || body.include?("action=\"/articles/#{hello.id}/comments\" accept-charset=\"UTF-8\" method=\"post\" id=\"nil-url\"")
 puts "nested child passed"
 "#;
 

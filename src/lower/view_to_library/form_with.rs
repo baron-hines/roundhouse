@@ -1026,10 +1026,13 @@ fn classify_form_with_components(
         return Some(FormWithComponents {
             model: nested_model,
             model_name: nested_name,
-            // Not the nested route when `url:` is given: Rails' form_with takes the url first.
+            // Not the nested route when `url:` is given: Rails' form_with takes the url first. A `nil` is `url ||=`'s
+            // fallback; a Hash `url:` keeps the nested route, which `route_helperize` does not resolve (the plain form's gap).
             action: match &url_expr {
-                Some(url) => route_helperize(url.clone(), &route_helpers, ctx),
-                None => nested_action,
+                Some(url) if !matches!(&*url.node, ExprNode::Lit { value: Literal::Nil } | ExprNode::Hash { .. }) => {
+                    route_helperize(url.clone(), &route_helpers, ctx)
+                }
+                _ => nested_action,
             },
             method,
             opts_entries,

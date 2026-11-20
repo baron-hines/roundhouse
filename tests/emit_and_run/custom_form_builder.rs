@@ -186,6 +186,26 @@ puts "added list passed"
     assert!(run.stdout.contains("added list passed"), "{}", run.stdout);
 }
 
+/// A write after the loop (`self.text_field_helpers += [:label]` below it) leaves the list the loop walked: Rails 8.1.4
+/// wraps `text_field` and not `label`.
+#[test]
+fn a_write_after_the_loop_leaves_the_list_it_walked() {
+    let builder = FIELD_HELPERS_BUILDER.replace("\n\n  def select", "\n  self.text_field_helpers += [:label]\n\n  def select");
+    let run = emit_and_run::real_blog()
+        .write("app/helpers/styled_probe_builder.rb", &builder)
+        .write("app/views/articles/_form.html.erb", "<%= form_with(model: article, builder: StyledProbeBuilder) do |form| %>\n<%= form.label :title %>|<%= form.text_field :title %>\n<% end %>\n")
+        .run_ruby(
+            r##"io = +""
+Views::Articles.form_into(io, Article.new(title: "Hi", body: "Body"), nil, nil)
+want = "<label for=\"article_title\">Title</label>|<div class=\"field\"><input type=\"text\" value=\"Hi\" name=\"article[title]\" id=\"article_title\" /></div>"
+raise "missing #{want}:\n#{io}" unless io.include?(want)
+puts "late write passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("late write passed"), "{}", run.stdout);
+}
+
 /// Rails hands `fields_for` the form's `builder:`, so a nested `text_field` runs the override too, on a builder for
 /// the nested name. Expected strings are Rails 8.1.4's.
 #[test]
