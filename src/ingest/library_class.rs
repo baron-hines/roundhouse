@@ -4870,7 +4870,8 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
     });
     fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
         // `self.list += [:x]`, `||=` and `&&=` write the attribute too, though they are no CallNode.
-        let own = |r: Option<ruby_prism::Node<'_>>| r.is_none_or(|r| is_self(&r));
+        // Not only `self`: a local may hold the class (`owner = self`); a constant names another one.
+        let own = |r: Option<ruby_prism::Node<'_>>| r.is_none_or(|r| r.as_constant_read_node().is_none() && r.as_constant_path_node().is_none());
         if let Some(name) = node.as_call_operator_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name())
             .or_else(|| node.as_call_or_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
             .or_else(|| node.as_call_and_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
