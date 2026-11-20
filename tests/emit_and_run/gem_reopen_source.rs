@@ -74,6 +74,214 @@ fn the_spinel_emit_keeps_a_gem_class_reopened_in_an_initializer() {
     }
 }
 
+/// The `class_eval` form, run on the Ruby family with the gem listed.
+#[test]
+fn a_gem_class_class_evaled_in_an_initializer_answers_the_gems_methods_and_the_apps() {
+    contract::listed(contract::class_eval_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// On Spinel a `class_eval` block of `def`s on a gem's class is one more
+/// opening of it, after the gem's, and the initializer statement is no
+/// longer reported as having no effect.
+#[test]
+fn the_spinel_emit_keeps_a_gem_class_class_evaled_in_an_initializer() {
+    let unconsumed = |app: super::emit_and_run::Overlay| -> Vec<String> {
+        app.ingest_diagnostics()
+            .into_iter()
+            .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+            .map(|d| d.message)
+            .collect()
+    };
+    let source = shelf_box(contract::class_eval_app());
+    let at = |needle: &str| source.find(needle).unwrap_or_else(|| panic!("{needle:?} in\n{source}"));
+    let (kind, local) = (at("def self.kind"), at("def self.local_tag"));
+    let gem_label = at("\"shelf box\"");
+    let app_label = at("\"app box\"");
+    assert!(kind < local && gem_label < app_label, "{source}");
+    let warned = unconsumed(contract::class_eval_app());
+    assert!(!warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block after the initializer's own reopen in the same file is the
+/// later opening: its `label` stands (Ruby: `box / app box / local`).
+#[test]
+fn a_class_eval_after_a_reopen_in_the_same_initializer_stands() {
+    contract::listed(contract::reopen_then_class_eval_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// The same with the reopen in an initializer that sorts first.
+#[test]
+fn a_class_eval_in_a_later_initializer_stands_over_an_earlier_reopen() {
+    contract::listed(contract::reopen_then_class_eval_across_files_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// A helper module the initializer defines, called only from a kept
+/// block's method, is kept with it.
+#[test]
+fn a_helper_a_kept_class_eval_calls_is_kept() {
+    contract::listed(contract::class_eval_helper_app()).run_ruby(contract::HELPER_ASSERTIONS).assert_passes();
+}
+
+/// A helper that a kept helper calls is kept too.
+#[test]
+fn a_helper_a_kept_helper_calls_is_kept() {
+    contract::listed(contract::class_eval_transitive_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper a gem class's reopen in the initializer calls is kept.
+#[test]
+fn a_helper_an_initializer_reopen_calls_is_kept() {
+    contract::listed(contract::reopen_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper a kept helper's parameter default calls is kept.
+#[test]
+fn a_helper_a_parameter_default_calls_is_kept() {
+    contract::listed(contract::class_eval_default_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper a kept helper's constant value calls is kept.
+#[test]
+fn a_helper_a_constant_value_calls_is_kept() {
+    contract::listed(contract::class_eval_constant_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper module a kept helper includes is kept.
+#[test]
+fn a_helper_a_kept_helper_includes_is_kept() {
+    contract::listed(contract::class_eval_included_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper module a kept helper extends is kept.
+#[test]
+fn a_helper_a_kept_helper_extends_is_kept() {
+    contract::listed(contract::class_eval_extended_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper class a kept helper inherits from is kept.
+#[test]
+fn a_helper_a_kept_helper_inherits_from_is_kept() {
+    contract::listed(contract::class_eval_superclass_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper a kept helper's class ivar initializer calls is kept.
+#[test]
+fn a_helper_a_kept_helpers_class_ivar_calls_is_kept() {
+    contract::listed(contract::class_eval_class_ivar_helper_app()).run_ruby(contract::TRANSITIVE_ASSERTIONS).assert_passes();
+}
+
+/// A helper the block names from the top level (`::LabelHelper`) is kept.
+#[test]
+fn a_helper_a_kept_class_eval_names_from_the_top_level_is_kept() {
+    contract::listed(contract::class_eval_rooted_helper_app()).run_ruby(contract::HELPER_ASSERTIONS).assert_passes();
+}
+
+/// A block with a `def` on another receiver is not taken: that method is
+/// the other object's. It stays reported, and the class is the gem's.
+#[test]
+fn a_class_eval_defining_on_another_receiver_is_left_reported() {
+    let source = shelf_box(contract::class_eval_other_receiver_app());
+    assert!(!source.contains("local_tag") && !source.contains("\"other\""), "{source}");
+    let warned: Vec<String> = contract::class_eval_other_receiver_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block whose method reads a bare constant the gem's class defines is
+/// not taken: in Ruby the name is the top level's, and the opening would
+/// put it in the class. It stays reported, and the class is the gem's.
+#[test]
+fn a_class_eval_reading_a_constant_of_the_gems_class_is_left_reported() {
+    let source = shelf_box(contract::class_eval_bare_constant_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_bare_constant_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block whose method reads a bare name the gem's class inherits, from
+/// its superclass or a module it includes, is not taken either: Ruby
+/// reads the initializer's top-level `TokenSource` there, and the opening
+/// would read the ancestor's. It stays reported, and the class is the gem's.
+#[test]
+fn a_class_eval_reading_a_constant_the_gems_class_inherits_is_left_reported() {
+    for app in contract::class_eval_inherited_constant_apps() {
+        let source = shelf_box(app);
+        assert!(!source.contains("local_tag"), "{source}");
+    }
+    for app in contract::class_eval_inherited_constant_apps() {
+        let warned: Vec<String> = app
+            .ingest_diagnostics()
+            .into_iter()
+            .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+            .map(|d| d.message)
+            .collect();
+        assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+    }
+}
+
+/// A block whose method reads a bare name an initializer reopen defines
+/// in the gem's class is not taken either: Ruby reads the top level's
+/// `TokenSource` there, and the opening would read the reopen's. It stays
+/// reported.
+#[test]
+fn a_class_eval_reading_a_constant_an_initializer_reopen_defines_is_left_reported() {
+    let source = shelf_box(contract::class_eval_reopen_constant_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_reopen_constant_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block whose method reads a class variable is not taken: Ruby looks
+/// `@@configured` up in the block's lexical scope, the top level, and the
+/// opening would read the gem class's. It stays reported.
+#[test]
+fn a_class_eval_reading_a_class_variable_is_left_reported() {
+    let source = shelf_box(contract::class_eval_class_variable_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_class_variable_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
+/// A block the ingest refuses leaves the file's other blocks taken.
+#[test]
+fn a_refused_class_eval_block_leaves_the_files_others_kept() {
+    contract::listed(contract::refused_then_class_eval_app()).run_ruby(contract::LOCAL_ASSERTIONS).assert_passes();
+}
+
+/// A block with any statement besides `def`s is not taken: it stays
+/// reported, and the emitted class is the gem's alone.
+#[test]
+fn a_class_eval_block_that_writes_a_constant_is_left_reported() {
+    let source = shelf_box(contract::class_eval_limit_app());
+    assert!(!source.contains("local_tag"), "{source}");
+    let warned: Vec<String> = contract::class_eval_limit_app()
+        .ingest_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.kind, roundhouse::diagnostic::DiagnosticKind::UnconsumedInitializer { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert!(warned.iter().any(|m| m.contains("Shelf::Box.class_eval")), "{warned:#?}");
+}
+
 /// A controller including a gem module the initializer reopens gets both
 /// openings' methods, and the reopen's `label`, as in Ruby
 /// (`"gem / local / app label"`): with the reopen written in the

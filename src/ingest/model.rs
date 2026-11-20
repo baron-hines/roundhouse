@@ -71,9 +71,9 @@ pub(super) fn ingest_model_with_enum_constants(
     // must ingest as `Admin::Report` (the compound `class Admin::Report`
     // spelling already carries its path). Falls back to the scopeless
     // finder for shapes the scoped walk doesn't cover.
-    let (scope, class) = match super::util::primary_class_with_scope(&root) {
-        Some((s, c)) => (s, Some(c)),
-        None => (Vec::new(), find_first_class(&root)),
+    let (scope, nesting, class) = match super::util::primary_class_with_nesting(&root) {
+        Some((s, n, c)) => (s, n, Some(c)),
+        None => (Vec::new(), Vec::new(), find_first_class(&root)),
     };
     let Some(class) = class else {
         return Ok(None);
@@ -95,9 +95,32 @@ pub(super) fn ingest_model_with_enum_constants(
     // prefix comes from the nearest module parent that declares one,
     // searched innermost-out the way `module_parents` walks.
     let table_decl = class.body().map(|body| parse_table_name_decl(body, file)).transpose()?.flatten();
-    let table_name = if let Some((name, _)) = &table_decl {
+    let table_name = if let Some((name, _)) = &table_decl
+        && !name.starts_with(TABLE_PREFIX_MARK)
+    {
         name.clone()
+    } else if let Some((name, _)) = &table_decl {
+        if class.body().is_some_and(|b| table_prefix::table_prefix_definitions(b) > 1) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "`table_name_prefix + …` in a class that sets its prefix more than once reads the one before it, which is not modeled".into(),
+            });
+        }
+        // The class attribute as Rails reads it: the class body's own `table_name_prefix =`, else the base's.
+        let prefix = class.body().and_then(table_prefix::explicit_table_prefix)
+            .or_else(|| model_bases.resolve_class_superclass(&scope, &nesting, &class).and_then(|parent| base_prefixes.get(&parent).cloned()))
+            .unwrap_or_default();
+        // Not checked before the prefix is known: `"archive_" + "2026"` is a table name, `"2026"` alone is not.
+        let table = format!("{prefix}{}", name.trim_start_matches(TABLE_PREFIX_MARK));
+        if !bare_table_identifier(&table) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "table_name binding requires one direct self.table_name assignment to a literal string or symbol naming a safe bare SQL identifier".into(),
+            });
+        }
+        table
     } else {
+        let mut return_table: Option<String> = None;
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
         let mut prefix = class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default();
@@ -114,15 +137,23 @@ pub(super) fn ingest_model_with_enum_constants(
         // class attribute its abstract base set.
         if prefix.is_empty()
             && !from_module
-            && let Some(parent) = model_bases.resolve_class_superclass(&scope, &class)
+            && let Some(parent) = model_bases.resolve_class_superclass(&scope, &nesting, &class)
             && let Some(inherited) = base_prefixes.get(&parent)
         {
             prefix = inherited.clone();
         }
+        // A subclass of a gem's concrete model (maybe's `Setting < RailsSettings::Base`) is on its parent's table, as
+        // Rails' single-table inheritance keeps it.
+        if let Some(parent) = model_bases.resolve_class_superclass(&scope, &nesting, &class)
+            && model_bases.is_gem_concrete_model(&parent)
+            && let Some(Some(table)) = model_bases.concrete_model_table(&parent)
+        {
+            return_table = Some(table.to_string());
+        }
         // Rails' `compute_table_name`: a class nested in a concrete model takes that model's singular table first
         // (`Rule::Condition` is `rule_conditions`; under `self.table_name = "entries"`, `entry_notes`). Not where the
         // schema lacks the nested table: the bare name is what the tree held before.
-        nested_table(class_name.as_str(), &prefix, schema, model_bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str())))
+        return_table.unwrap_or_else(|| nested_table(class_name.as_str(), &prefix, schema, model_bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))))
     };
 
     let attributes = if let Some(table) = schema.tables.get(&Symbol::from(table_name.as_str())) {
@@ -606,7 +637,7 @@ pub(super) fn ingest_model_with_enum_constants(
         .map(|n| super::util::node_span(&n, file))
         .unwrap_or_default();
     let parent = model_bases
-        .resolve_class_superclass(&scope, &class)
+        .resolve_class_superclass(&scope, &nesting, &class)
         .map(|resolved| ClassId(Symbol::from(model_bases.emit_superclass(&resolved))));
 
     let class_loc = class.location();
@@ -3790,6 +3821,15 @@ fn parse_callback(
                 let assoc = el.as_assoc_node()?;
                 let key = symbol_value(&assoc.key())?;
                 match key.as_str() {
+                    // Every lifecycle listed (rails-settings-cached's `on: %i[create update destroy]`) is no `on:`
+                    // at all; a subset of them is not modeled, so it rejects.
+                    // Not a validation hook's: there `on:` is the validation context, which a plain `valid?` lacks.
+                    "on" if matches!(hook, CallbackHook::AfterCommit) && assoc.value().as_array_node().is_some_and(|list| {
+                        let mut named: Vec<String> = list.elements().iter().filter_map(|e| symbol_value(&e)).collect();
+                        named.sort();
+                        named.dedup();
+                        list.elements().iter().count() >= 3 && named == ["create", "destroy", "update"]
+                    }) => {}
                     "on" => {
                         on = Some(match symbol_value(&assoc.value())?.as_str() {
                             "create" => CallbackOn::Create,
@@ -4753,9 +4793,38 @@ fn nested_table(name: &str, prefix: &str, schema: &Schema, bases: &super::librar
     schema.tables.contains_key(&Symbol::from(table.as_str())).then_some(table)
 }
 
+/// `table_name_prefix + "settings"` (rails-settings-cached's `RailsSettings::Base`): the class's own prefix, which the
+/// caller knows, in front of the literal, marked to be filled in.
+const TABLE_PREFIX_MARK: char = '\u{1}';
+
+fn prefixed_table(arg: &Node<'_>) -> Option<String> {
+    let call = arg.as_call_node()?;
+    if constant_id_str(&call.name()) != "+" {
+        return None;
+    }
+    let reader = call.receiver()?.as_call_node()?;
+    if constant_id_str(&reader.name()) != "table_name_prefix" || reader.arguments().is_some()
+        || reader.receiver().is_some_and(|r| r.as_self_node().is_none())
+    {
+        return None;
+    }
+    let args = call.arguments()?;
+    let rest: Vec<_> = args.arguments().iter().collect();
+    let [rest] = rest.as_slice() else { return None };
+    Some(format!("{TABLE_PREFIX_MARK}{}", string_value(rest)?))
+}
+
 /// The table a class body declares (`self.table_name = "entries"`), read leniently for the model prepass.
-pub(super) fn table_name_decl(body: Node<'_>, file: &str) -> Option<String> {
-    parse_table_name_decl(body, file).ok().flatten().map(|(name, _)| name)
+pub(super) fn table_name_decl(class: &ruby_prism::ClassNode<'_>, file: &str) -> Option<String> {
+    let name = parse_table_name_decl(class.body()?, file).ok().flatten().map(|(name, _)| name)?;
+    if name.starts_with(TABLE_PREFIX_MARK) && class.body().is_some_and(|b| table_prefix::table_prefix_definitions(b) > 1) {
+        return None;
+    }
+    // Not the marked name: the prepass reads it as a table, so the prefix the class body sets (else none) goes in front.
+    Some(match name.strip_prefix(TABLE_PREFIX_MARK) {
+        Some(rest) => format!("{}{rest}", class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default()),
+        None => name,
+    })
 }
 
 fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(String, usize)>> {
@@ -4774,8 +4843,10 @@ fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(Str
                 let name = valid.then_some(())
                     .and_then(|_| call.arguments())
                     .filter(|args| args.arguments().len() == 1)
-                    .and_then(|args| symbol_or_string_value(&args.arguments().iter().next()?))
-                    .filter(|name| bare_table_identifier(name));
+                    .and_then(|args| {
+                        let arg = args.arguments().iter().next()?;
+                        symbol_or_string_value(&arg).filter(|name| bare_table_identifier(name)).or_else(|| prefixed_table(&arg))
+                    });
                 self.writes.push(name.map(|name| (name, offset)));
             } else {
                 let name = node.as_call_and_write_node().map(|w| w.write_name())

@@ -16318,8 +16318,18 @@ end
 
 #[path = "emit_and_run/pagy.rs"]
 mod pagy;
+#[path = "emit_and_run/pagy9.rs"]
+mod pagy9;
+#[path = "emit_and_run/yield_partial_render.rs"]
+mod yield_partial_render;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
+#[path = "emit_and_run/class_body_unknown_call.rs"]
+mod class_body_unknown_call;
+#[path = "emit_and_run/string_to_d.rs"]
+mod string_to_d;
+#[path = "emit_and_run/current_delegate_method.rs"]
+mod current_delegate_method;
 
 /// A Slim view is ingested rather than skipped, so `check` going quiet on
 /// it is a claim the emitted page renders. Swap the blog's index for a
@@ -22209,6 +22219,18 @@ mod loaded_begin;
 mod class_eval_definer_call;
 #[path = "emit_and_run/custom_form_builder.rs"]
 mod custom_form_builder;
+#[path = "emit_and_run/controller_name_constantize.rs"]
+mod controller_name_constantize;
+#[path = "emit_and_run/class_macro_keyword_rest.rs"]
+mod class_macro_keyword_rest;
+#[path = "emit_and_run/nested_form_child.rs"]
+mod nested_form_child;
+#[path = "emit_and_run/implicit_namespace_include.rs"]
+mod implicit_namespace_include;
+#[path = "emit_and_run/maybe_ruby_boot.rs"]
+mod maybe_ruby_boot;
+#[path = "emit_and_run/rails_settings_cached.rs"]
+mod rails_settings_cached;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
@@ -22402,6 +22424,8 @@ mod errors_computed_field;
 mod aasm_gem;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
+#[path = "emit_and_run/aasm_generated_methods.rs"]
+mod aasm_generated_methods;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
 mod runtime_registered_callbacks;
 #[path = "emit_and_run/reopened_alias.rs"]
@@ -22737,12 +22761,25 @@ mod concern_plain_includer;
 // Concern shapes: a namespaced prepend by its relative name.
 #[path = "emit_and_run/concern_prepended_namespaced.rs"]
 mod concern_prepended_namespaced;
+
+// A module defining `method_missing`: its receiverless reads are the includer's.
+#[path = "emit_and_run/module_method_missing_includer.rs"]
+mod module_method_missing_includer;
+// Declarations: a rooted class or module name inside a module.
+#[path = "emit_and_run/rooted_class_declarations.rs"]
+mod rooted_class_declarations;
 #[path = "emit_and_run/token_for_string_key.rs"]
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
 mod integer_times_enumerator;
 #[path = "emit_and_run/own_namespace_association.rs"]
 mod own_namespace_association;
+#[path = "emit_and_run/rooted_class_name.rs"]
+mod rooted_class_name;
+#[path = "emit_and_run/unreachable_partials.rs"]
+mod unreachable_partials;
+#[path = "emit_and_run/mixed_in_constants.rs"]
+mod mixed_in_constants;
 #[path = "emit_and_run/struct_predicate_members.rs"]
 mod struct_predicate_members;
 #[path = "emit_and_run/params_compact_blank.rs"]
@@ -22751,3 +22788,9 @@ mod params_compact_blank;
 mod computed_partial_render;
 #[path = "emit_and_run/view_raise_statement.rs"]
 mod view_raise_statement;
+#[path = "emit_and_run/params_string_filter_scalars.rs"]
+mod params_string_filter_scalars;
+#[path = "emit_and_run/hidden_field_autocomplete.rs"]
+mod hidden_field_autocomplete;
+#[path = "emit_and_run/record_as_json_in_literal.rs"]
+mod record_as_json_in_literal;

@@ -476,6 +476,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // `Rooms::Open.count`-style chains this pass would otherwise wrap
     // one hop too early.
     ("relation_ivar_materialize", &["sti_scope"]),
+    ("relation_difference_materialize", &["relation_ivar_materialize"]),
     // `defined?(@x)` → `@x_defined`, with the flag set beside every
     // assignment to `@x`. Reads a `defined?` send no other pass
     // produces and writes an ivar name no other pass reads, so no
@@ -988,6 +989,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("sti_scope");
     relation_ivar_materialize::apply_relation_ivar_materialize(app);
     ran!("relation_ivar_materialize");
+    relation_ivar_materialize::apply_relation_difference_materialize(app);
+    ran!("relation_difference_materialize");
     defined_ivar_memo::apply_defined_ivar_memo_lowering(app);
     ran!("defined_ivar_memo");
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);

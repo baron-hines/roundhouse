@@ -1026,7 +1026,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 .iter()
                 .find(|b| b.form_param == name)
             {
-                if let Some(fb) = classify_form_builder_method(method.as_str()) {
+                if let Some(fb) = classify_form_builder_method(method.as_str())
+                    && !binding.overridden.contains(method.as_str())
+                {
                     // Not for a recordless form: Trix's input id is the record's dom_id, which it has none of.
                     if !(binding.recordless && matches!(fb, FormBuilderMethod::RichTextArea)) {
                         return emit_form_builder_inline(binding, fb, sa, ctx);
@@ -1049,7 +1051,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
     {
         if let Some(name) = super::form_with::form_param_ref_name(r) {
             if let Some(binding) = ctx.form_records.iter().find(|b| b.form_param == name) {
-                if let Some(fb) = classify_form_builder_method(method.as_str()) {
+                if let Some(fb) = classify_form_builder_method(method.as_str())
+                    && !binding.overridden.contains(method.as_str())
+                {
                     if let Some(out) =
                         emit_form_builder_block_inline(binding, fb, sa, block, ctx)
                     {
@@ -2526,6 +2530,9 @@ mod tests {
             i18n: Default::default(),
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
+            builder_overrides: Default::default(),
+            hidden_autocomplete: false,
+            nested_attributes: Default::default(),
             form_with_entry: false,
             model_param_keys: Default::default(),
             stylesheets: Vec::new(),
