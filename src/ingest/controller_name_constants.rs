@@ -52,5 +52,11 @@ fn rewrite(e: &mut Expr, model: &str) {
         *e = read;
         return;
     }
+    // Not into a block another `self` runs (`other.instance_exec { controller_name … }`): it names that one's model.
+    if matches!(&*e.node, ExprNode::Send { method, block: Some(_), .. }
+        if matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec"))
+    {
+        return;
+    }
     e.node.for_each_child_mut(&mut |c| rewrite(c, model));
 }

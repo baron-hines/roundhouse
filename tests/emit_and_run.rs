@@ -22221,6 +22221,8 @@ mod class_eval_definer_call;
 mod custom_form_builder;
 #[path = "emit_and_run/controller_name_constantize.rs"]
 mod controller_name_constantize;
+#[path = "emit_and_run/class_macro_keyword_rest.rs"]
+mod class_macro_keyword_rest;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
