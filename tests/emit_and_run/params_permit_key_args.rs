@@ -135,3 +135,25 @@ fn string_keys_on_a_permitted_hash_name_its_keys() {
         .run_test("test/controllers/imports_controller_test.rb")
         .assert_passes();
 }
+
+/// The Spinel emit writes the same Symbol keys; the plain Hash keeps its String.
+#[test]
+fn the_spinel_emit_names_the_symbol_keys() {
+    let (tree, errors) = emit_and_run::real_blog()
+        .edit("config/routes.rb", "  root \"articles#index\"\n", &format!("  root \"articles#index\"\n{ROUTES}"))
+        .write("app/controllers/imports_controller.rb", CONTROLLER)
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let src = std::fs::read_to_string(tree.join("app/controllers/imports_controller.rb")).expect("controller");
+    for line in [
+        ".merge(body: \"x\").compact.except(*%i[version])",
+        ".except(:title))",
+        ".slice(:title)",
+        ".except(key.to_sym)",
+        ".except(*keys.map { |x| x.to_sym })",
+        ".merge(title: \"z\")",
+        "}.except(\"version\")",
+    ] {
+        assert!(src.contains(line), "missing `{line}`:\n{src}");
+    }
+}

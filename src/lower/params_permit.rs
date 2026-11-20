@@ -405,6 +405,7 @@ fn rewrite(expr: &mut Expr, lists: &HelperLists) {
             }
         }
     }
+    symbolize_permitted_key_args(expr);
     if parameters_on_hash(expr) {
         return;
     }
@@ -448,6 +449,119 @@ pub(crate) fn rewrite_bare_permits(expr: &mut Expr) {
         *expr = permitted;
     } else if let Some(filtered) = filtered_chain(expr) {
         *expr = filtered;
+    }
+    symbolize_permitted_key_args(expr);
+}
+
+/// Whether `e` answers the Symbol-keyed Hash a top-level `permit` lowered to (`Params.permitted`), or what a call
+/// that keeps its keys answers from it (`params.permit(%w[a b]).merge(c: 1).compact`). By how the value was built,
+/// not by its type: a `Hash[Symbol, String]` the app builds itself keeps Ruby's String-is-not-a-Symbol answers.
+fn from_permitted(e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), method, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "permitted" => matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Params"),
+        "merge" | "reverse_merge" | "with_defaults" | "compact" | "compact_blank" | "except" | "slice" => {
+            from_permitted(r)
+        }
+        _ => false,
+    }
+}
+
+/// `params.permit(%w[a b]).except("a")` → `.except(:a)`. Rails' Parameters take a String key as they take a Symbol,
+/// and the Hash `permit` lowered to holds Symbol keys, so a String key name on it is its Symbol: a String literal
+/// becomes the Symbol, `*%w[a]` becomes `*%i[a]`, another String `key.to_sym`, another splatted String Array
+/// `*keys.map { |x| x.to_sym }`, and a String-keyed Hash literal `merge` takes gets Symbol keys (#2279).
+fn symbolize_permitted_key_args(expr: &mut Expr) {
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *expr.node else { return };
+    if !from_permitted(r) {
+        return;
+    }
+    match method.as_str() {
+        "except" | "slice" | "values_at" => args.iter_mut().for_each(symbolize_key),
+        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "delete" | "dig" => {
+            args.iter_mut().take(1).for_each(symbolize_key)
+        }
+        "merge" | "reverse_merge" | "with_defaults" => {
+            for arg in args.iter_mut() {
+                let ExprNode::Hash { entries, .. } = &mut *arg.node else { continue };
+                for (key, _) in entries.iter_mut() {
+                    symbolize_literal(key);
+                }
+                let all_symbols = entries.iter().all(|(k, _)| sym_name(k).is_some());
+                if let Some(Ty::Hash { key, .. }) = &mut arg.ty
+                    && all_symbols
+                {
+                    *key = std::sync::Arc::new(Ty::Sym);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A String literal → its Symbol; false for anything else.
+fn symbolize_literal(e: &mut Expr) -> bool {
+    let ExprNode::Lit { value: Literal::Str { value } } = &*e.node else { return false };
+    let sym = Symbol::from(value.as_str());
+    *e.node = ExprNode::Lit { value: Literal::Sym { value: sym } };
+    e.ty = Some(Ty::Sym);
+    true
+}
+
+/// One key argument: a String literal, a splatted String Array literal, or another String (or splatted String Array).
+fn symbolize_key(arg: &mut Expr) {
+    if symbolize_literal(arg) {
+        return;
+    }
+    let span = arg.span;
+    let sym_array = || Some(Ty::Array { elem: std::sync::Arc::new(Ty::Sym) });
+    if let ExprNode::Splat { value } = &mut *arg.node {
+        if let ExprNode::Array { elements, style } = &mut *value.node {
+            if !elements.is_empty() && elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } })) {
+                for element in elements.iter_mut() {
+                    symbolize_literal(element);
+                }
+                if *style == crate::expr::ArrayStyle::PercentW {
+                    *style = crate::expr::ArrayStyle::PercentI;
+                }
+                value.ty = sym_array();
+                arg.ty = Some(Ty::Sym);
+            }
+            return;
+        }
+        if !matches!(&value.ty, Some(Ty::Array { elem }) if **elem == Ty::Str) {
+            return;
+        }
+        // `*keys` → `*keys.map { |x| x.to_sym }`.
+        let x = Symbol::from("x");
+        let mut var = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: x.clone() });
+        var.ty = Some(Ty::Str);
+        let mut body = send(span, Some(var), "to_sym", vec![]);
+        body.ty = Some(Ty::Sym);
+        let block = Expr::new(span, ExprNode::Lambda {
+            extra_params: Vec::new(),
+            params: vec![x],
+            rest_param: None,
+            block_param: None,
+            body,
+            block_style: crate::expr::BlockStyle::Brace,
+        });
+        let mut mapped = Expr::new(span, ExprNode::Send {
+            recv: Some(value.clone()),
+            method: Symbol::from("map"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        });
+        mapped.ty = sym_array();
+        *value = mapped;
+        arg.ty = Some(Ty::Sym);
+        return;
+    }
+    if matches!(arg.ty, Some(Ty::Str)) {
+        let mut to_sym = send(span, Some(arg.clone()), "to_sym", vec![]);
+        to_sym.ty = Some(Ty::Sym);
+        *arg = to_sym;
     }
 }
 
