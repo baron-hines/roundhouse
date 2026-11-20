@@ -424,6 +424,11 @@ fn assigned(e: &Expr, name: &str) -> bool {
     let mut found = match &*e.node {
         ExprNode::Assign { target: LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n.as_str() == name,
         ExprNode::MultiAssign { targets, .. } => targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if n.as_str() == name)),
+        ExprNode::MatchRequired { pattern, .. } | ExprNode::MatchPredicate { pattern, .. } => {
+            let mut bound = Vec::new();
+            pattern.bound_names(&mut bound);
+            bound.iter().any(|n| n.as_str() == name)
+        }
         _ => false,
     };
     e.node.for_each_child(&mut |c| found = found || assigned(c, name));

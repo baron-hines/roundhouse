@@ -4697,6 +4697,17 @@ fn static_name_list(node: &ruby_prism::Node<'_>, framework_helpers: bool) -> Opt
 /// list, which a loop over the reader (`text_field_helpers.each`) walks as the body loads.
 // Not an attribute declared twice, written (`self.x =`), handed to any call but `each`, or given a reader of the
 // class's own: the loop would then read another list than the default.
+/// `self`, or `(self)`: the parentheses change nothing about the receiver.
+fn is_self(node: &ruby_prism::Node<'_>) -> bool {
+    if node.as_self_node().is_some() {
+        return true;
+    }
+    let Some(parens) = node.as_parentheses_node() else { return false };
+    let Some(body) = parens.body() else { return false };
+    let inner = flatten_statements(body);
+    matches!(inner.as_slice(), [only] if is_self(only))
+}
+
 fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String, Vec<String>> {
     let mut declared: HashMap<String, Option<Vec<(bool, String)>>> = HashMap::default();
     let mut redefined: HashSet<String> = HashSet::default();
@@ -4716,7 +4727,7 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
     });
     fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
         // `self.list += [:x]`, `||=` and `&&=` write the attribute too, though they are no CallNode.
-        let own = |r: Option<ruby_prism::Node<'_>>| r.is_none_or(|r| r.as_self_node().is_some());
+        let own = |r: Option<ruby_prism::Node<'_>>| r.is_none_or(|r| is_self(&r));
         if let Some(name) = node.as_call_operator_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name())
             .or_else(|| node.as_call_or_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
             .or_else(|| node.as_call_and_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
@@ -4756,7 +4767,7 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
         }
         // `self.list += [:x]` / `-= [:x]` with a literal list changes the list the later loop walks, as the body runs.
         if let Some(write) = s.as_call_operator_write_node()
-            && write.receiver().is_some_and(|r| r.as_self_node().is_some())
+            && write.receiver().is_some_and(|r| is_self(&r))
             && let Some(Some(list)) = declared.get_mut(&*constant_id_str(&write.read_name()))
             && let Some(right) = static_name_list(&write.value(), framework_helpers)
         {
