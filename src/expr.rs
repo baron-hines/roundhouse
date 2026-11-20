@@ -228,6 +228,8 @@ pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
 /// The body ingest read an `ActiveRecord::Base.connected_to(role: :writing)` block as, the call dropped. An app that
 /// switches roles gets the call back (`ingest::database_ownership`): inside a reading block it is what lifts the guard.
 pub const ERASED_WRITING_SCOPE: u64 = 1 << 61;
+/// On an argument analyze typed as the relation a has_many read is (`analyze::relation_params`): the read the lowering seeds.
+pub const RELATION_ARGUMENT: u64 = 1 << 42;
 /// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 

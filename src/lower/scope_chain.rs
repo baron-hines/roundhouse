@@ -2794,6 +2794,19 @@ pub fn mentions_assoc_alias(expr: &Expr, assocs: &AssocRegistry) -> bool {
     found
 }
 
+/// True if `expr` calls a method with an argument at a position its definitions read as a relation
+/// ([`crate::analyze::relation_params`]).
+pub fn mentions_relation_argument(expr: &Expr, params: &crate::analyze::relation_params::RelationParams) -> bool {
+    if let ExprNode::Send { method, args, .. } = &*expr.node
+        && (0..args.len()).any(|i| params.chains(method, i))
+    {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found = found || mentions_relation_argument(c, params));
+    found
+}
+
 pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
     let mut found = false;
     fn walk(e: &Expr, assocs: &AssocRegistry, found: &mut bool) {
@@ -2826,7 +2839,9 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             // `post.comments.load` is a NoMethodError on the
                             // reader's Array too.
                             | "load" | "load_async" | "from" | "extract_associated"
-                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
+                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")))
+                // Array answers no `all` either; Rails' is the association's relation.
+                || (method.as_str() == "all" && args.is_empty() && block.is_none());
             // `owner.items.update(attrs)` alone in a method body is the
             // proxy's bulk update over the records the association holds
             // (`rewrite_send` lowers it to the generated
@@ -3189,6 +3204,8 @@ pub struct Ctx<'a> {
     pub instance_self: Option<ClassId>,
     /// [`Registries::owner_objects`].
     pub owner_objects: bool,
+    /// [`Registries::relation_params`].
+    pub relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
 }
 
 impl Ctx<'_> {
@@ -3259,6 +3276,7 @@ impl Ctx<'_> {
             class_self: self.class_self.clone(),
             instance_self: self.instance_self.clone(),
             owner_objects: self.owner_objects,
+            relation_params: self.relation_params,
             user_returns: self.user_returns,
         }
     }
@@ -4778,6 +4796,25 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
     }
 }
 
+/// A has_many read analyze typed as the relation a parameter takes (`analyze::relation_params`): `<read>.all`, which
+/// the seed arm lowers to the association's relation. A local analyze typed so that the pass did not see bound to such a read is refused.
+fn relation_argument(arg: &mut Expr, ctx: &Ctx, locals: &Locals) {
+    let read = self_qualified_assoc_read(arg.clone(), ctx);
+    let aliased = matches!(&*read.node, ExprNode::Var { name, .. } if locals.assoc.contains_key(&alias_key(name, false)));
+    if !aliased && seedable_assoc_read(ctx, &read, read.span).is_none() {
+        if arg.decisions & crate::expr::RELATION_ARGUMENT == 0 {
+            return;
+        }
+        crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(arg.span, None,
+            "records passed as a relation".to_owned(),
+            "the method calls a query method on this parameter, and the argument is not an association read the lowering can seed".to_owned()));
+        return;
+    }
+    let (span, ty) = (arg.span, arg.ty.clone());
+    *arg = syn(span, ExprNode::Send { recv: Some(read), method: Symbol::from("all"), args: vec![], block: None, parenthesized: false });
+    arg.ty = ty;
+}
+
 fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<ClassId> {
     let span = expr.span;
     let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
@@ -4833,7 +4870,10 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
     // constants (drop the scope-body relation), but may still read outer
     // locals.
     let arg_ctx = ctx.at_callsite();
-    for a in &mut args {
+    for (i, a) in args.iter_mut().enumerate() {
+        if ctx.relation_params.is_some_and(|p| p.chains(&method, i)) {
+            relation_argument(a, ctx, locals);
+        }
         rewrite(a, &arg_ctx, locals);
     }
     if let Some(b) = &mut block {
@@ -5247,6 +5287,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             } {
                 if ctx.scope_of(target, &method)
                     || is_relation_chain_method(method.as_str())
+                    || method.as_str() == "all"
                     || is_relation_terminal(method.as_str(), &args, block.as_ref())
                     || ctx.assoc_class_method_params(target, &method).is_some()
                     // CollectionProxy constructors too: `@subscriptions
@@ -5602,7 +5643,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             },
                             _ => None,
                         };
-                        if is_scope || is_chain || is_term || assoc_cm.is_some() || extracted.is_some() {
+                        if is_scope || is_chain || is_term || method.as_str() == "all" || assoc_cm.is_some() || extracted.is_some() {
                             let seed = build_association_seed(
                                 span, &target, fk, owner_id, type_entry.clone(), ir, aname,
                                 assoc_cm.is_some(), inverse.is_some(),
@@ -6052,6 +6093,7 @@ fn rewrite_relation_taking_body(
         instance_self: None,
         user_returns: &empty_returns,
         owner_objects: false,
+        relation_params: None,
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
@@ -6141,6 +6183,7 @@ pub fn rewrite_call_site_seeded(
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
         owner_objects: regs.owner_objects,
+        relation_params: regs.relation_params,
     };
     let mut locals = Locals::default();
     for (name, value) in seeds {
@@ -6173,6 +6216,7 @@ pub fn rewrite_call_site(
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
         owner_objects: regs.owner_objects,
+        relation_params: regs.relation_params,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -6193,6 +6237,8 @@ pub struct Registries<'a> {
     /// [`AssocRegistry::has_many_inverse`]. False keeps `room_id:
     /// room.id`, the only form a strict target's attrs bag can carry.
     pub owner_objects: bool,
+    /// Parameters an app method reads as a relation: a has_many read handed to one is its relation.
+    pub relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
 }
 
 #[cfg(test)]
@@ -6423,6 +6469,7 @@ mod tests {
             user_returns: empty_returns(),
             unique_keys: empty_unique_keys(),
             owner_objects: false,
+            relation_params: None,
         }
     }
 
@@ -6443,6 +6490,7 @@ mod tests {
             instance_self: None,
             user_returns: empty_returns(),
             owner_objects: false,
+            relation_params: None,
         }
     }
 
@@ -6793,6 +6841,7 @@ mod tests {
             user_returns: empty_returns(),
             instance_self: None,
             owner_objects: false,
+            relation_params: None,
         }
     }
 

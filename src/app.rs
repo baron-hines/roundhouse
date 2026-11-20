@@ -297,6 +297,9 @@ pub struct App {
     /// param types, `Ty::Var` where no call site contributed.
     #[serde(skip)]
     pub inferred_method_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    /// Parameters an app method reads as a relation (`analyze::relation_params`), set by analysis for the lowering.
+    #[serde(skip)]
+    pub relation_params: crate::analyze::relation_params::RelationParams,
     /// Source files the text pipeline cannot represent — every emitted
     /// file's content is a `String`, so an app's images, fonts and
     /// binary test fixtures were silently dropped on the floor. Carried
@@ -1417,6 +1420,7 @@ impl App {
             content_helper_allowed_attributes: Vec::new(),
             content_helper_allowed_tags: Vec::new(),
             inferred_method_params: HashMap::default(),
+            relation_params: Default::default(),
             helper_method_index: HashMap::default(),
             view_visible_controller_methods: BTreeSet::new(),
             generated_helper_methods: BTreeMap::new(),
