@@ -107,13 +107,14 @@ const PROBE: &str = r##"class UuidProbe
       "record no uuid: #{try { Widget.where(owner_id: part).count }}",
       "record uuid: #{try { Widget.where(id: Widget.find(REAL)).pluck(:name) }}",
       "record unsaved: #{try { Widget.where(owner_id: Widget.new).pluck(:name) }}",
+      "record list unsaved: #{try { Widget.where(owner_id: [Widget.new, OWNER]).pluck(:name).sort }}",
     ]
   end
 end
 "##;
 
 /// Native Rails 8.1.4's answers on PostgreSQL 18.
-const EXPECTED: [&str; 32] = [
+const EXPECTED: [&str; 33] = [
     "find_by blank: nil",
     "find_by junk: nil",
     "where blank count: 0",
@@ -148,6 +149,7 @@ const EXPECTED: [&str; 32] = [
     // An unsaved record has no id: Rails writes `IS NULL`, which finds
     // the widget without an owner.
     r#"record unsaved: ["cog"]"#,
+    r#"record list unsaved: ["cog", "sprocket"]"#,
 ];
 
 const LOADS: [&str; 6] = [
