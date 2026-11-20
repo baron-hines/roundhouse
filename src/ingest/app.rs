@@ -451,7 +451,8 @@ fn keep_initializer_defined(
 /// The constants an opening reads, bare or rooted: its superclass and the
 /// modules it includes, which Ruby resolves when the opening runs, and,
 /// from their source text, its methods' bodies and parameter defaults,
-/// its constants' values and its class ivars' initializers.
+/// its constants' values, its class ivars' initializers and the
+/// body-level calls it keeps as written (`extend TagSource`).
 fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]) -> Vec<String> {
     let mut out: Vec<String> = lc.parent.iter().chain(&lc.includes).map(|named| named.0.as_str().trim_start_matches("::").to_string()).collect();
     let spans = lc
@@ -461,7 +462,10 @@ fn opening_constant_reads(lc: &LibraryClass, sources: &[crate::span::SourceFile]
             std::iter::once(method.body.span).chain(method.params.iter().filter_map(|p| p.default.as_ref().map(|d| d.span)))
         })
         .chain(lc.constants.iter().map(|(_, value)| value.span))
-        .chain(lc.class_ivar_initializers.iter().map(|value| value.span));
+        .chain(lc.class_ivar_initializers.iter().map(|value| value.span))
+        // A body-level call the opening keeps as written, such as
+        // `extend TagSource`, reads its arguments when the class loads.
+        .chain(lc.unknown_calls.iter().map(|call| call.span));
     for span in spans {
         if span.is_synthetic() {
             continue;
