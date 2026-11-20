@@ -283,6 +283,9 @@ pub struct ViewLowerCtx<'a> {
     /// Helper methods that are a thin wrapper around a BUILDER-YIELDING
     /// form helper (see [`form_wrapper_helpers`]).
     form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
+    builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    hidden_autocomplete: bool,
+    nested_attributes: std::rc::Rc<crate::det::HashMap<(String, String), bool>>,
     /// See the ViewCtx field of the same name. Off unless the emitter
     /// opts in with [`ViewLowerCtx::observe_form_with_entry`].
     form_with_entry: bool,
@@ -359,7 +362,7 @@ impl<'a> ViewLowerCtx<'a> {
             bool_readers: std::rc::Rc::new(bool_reader_names(app)),
             time_columns: std::rc::Rc::new(time_column_names(app)),
             store_readers: std::rc::Rc::new(store_reader_names(app)),
-            partial_form_bindings: partial_form_bindings(&app.views),
+            partial_form_bindings: partial_form_bindings(&app.views, &app.library_classes),
             i18n: std::rc::Rc::new(crate::i18n::FormI18n::of(app)),
             route_helper_names: std::rc::Rc::new(
                 route_helpers.iter().map(|(n, _)| n.clone()).collect(),
@@ -375,10 +378,13 @@ impl<'a> ViewLowerCtx<'a> {
                     .collect(),
             ),
             route_helper_arity: std::rc::Rc::new(route_helpers.into_iter().collect()),
-            strict_locals: std::rc::Rc::new(strict_locals_by_key(&app.views)),
+            strict_locals: std::rc::Rc::new(strict_locals_by_key(&app.views, &app.library_classes)),
             yielding_partials: std::rc::Rc::new(yielding),
             collection_element_locals: std::rc::Rc::new(element_locals),
             form_wrappers: std::rc::Rc::new(form_wrapper_helpers(app)),
+            builder_overrides: std::rc::Rc::new(crate::lower::view::form_builder_overrides(app)),
+            hidden_autocomplete: app.hidden_field_autocomplete,
+            nested_attributes: std::rc::Rc::new(crate::lower::view::nested_attribute_associations(app)),
             form_with_entry: false,
         }
     }
@@ -624,7 +630,8 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     let form_binding = (is_partial)
         .then(|| view_key.as_ref().and_then(|k| lx.partial_form_bindings.get(k)))
         .flatten();
-    if let Some(binding) = form_binding {
+    // A builder that overrides a stock field is the caller's object, which the partial takes.
+    if let Some(binding) = form_binding.filter(|b| b.builder.is_none()) {
         extra_params.retain(|k| k != &binding.form_local);
     }
     // An extra is a positional param, and a positional param cannot have
@@ -747,7 +754,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // callers bind provided keyword locals by name, omitted ones default.
     // Not the declared form local of a bound partial: its `f.*` calls inline at compile time, and a caller has no builder to pass.
     let strict_without_form = view.strict_locals.as_ref().map(|sl| {
-        sl.iter().filter(|p| form_binding.is_none_or(|b| p.name.as_str() != b.form_local)).cloned().collect::<Vec<Param>>()
+        sl.iter().filter(|p| form_binding.is_none_or(|b| b.builder.is_some() || p.name.as_str() != b.form_local)).cloned().collect::<Vec<Param>>()
     });
     if let Some(sl) = strict_without_form.as_ref().filter(|sl| is_partial && !sl.is_empty()) {
         use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
@@ -902,6 +909,9 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         i18n: lx.i18n.clone(),
         route_helper_arity: lx.route_helper_arity.clone(),
         form_wrappers: lx.form_wrappers.clone(),
+        builder_overrides: lx.builder_overrides.clone(),
+        hidden_autocomplete: lx.hidden_autocomplete,
+        nested_attributes: lx.nested_attributes.clone(),
         form_with_entry: lx.form_with_entry,
         model_param_keys: lx.model_param_keys.clone(),
         stylesheets: app.stylesheets.clone(),
@@ -957,6 +967,10 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             &record_var,
         );
         rewritten = fold_defined_form_local(&rewritten, &binding.form_local);
+        let overridden = binding.builder.as_ref().and_then(|b| ctx.builder_overrides.get(b)).cloned().unwrap_or_default();
+        let builder = (!overridden.is_empty()).then(|| binding.builder.as_ref().map(|b| {
+            Expr::new(Span::synthetic(), ExprNode::Const { path: b.split("::").map(Symbol::from).collect() })
+        })).flatten();
         ctx.form_records.push(FormBuilderBinding {
             form_param: binding.form_local.clone(),
             model_name: binding.model_name.clone(),
@@ -966,7 +980,11 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
             form_method_var: form_method_var.clone(),
             id_prefix: binding.id_prefix.clone(),
             recordless: false,
+            overridden: overridden.clone(),
+            builder: builder.clone(),
+            child_counters: Default::default(),
         });
+
         let record_ref = Expr::new(
             Span::synthetic(),
             ExprNode::Var { id: VarId(0), name: record_var },
@@ -996,8 +1014,12 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
 
     let mut body_stmts: Vec<Expr> = Vec::new();
     body_stmts.push(assign_accumulator_string_new(&ctx.accumulator));
+    // The runtime's hidden inputs (the CSRF token, `_method`, `button_to`'s) follow the app, as the inline ones below do.
+    if ctx.hidden_autocomplete {
+        body_stmts.push(accumulator_append_call(view_helpers_call("keep_hidden_autocomplete", Vec::new()), &ctx));
+    }
     body_stmts.extend(prelude);
-    body_stmts.extend(walk_body(&rewritten, &ctx));
+    body_stmts.extend(walk_counting(&rewritten, &ctx));
     body_stmts.push(accumulator_result_ref(&ctx.accumulator));
 
     let mut body = seq(body_stmts);
@@ -2394,12 +2416,18 @@ pub(crate) struct PartialFormBinding {
     /// The defining `form_with`'s `namespace:` — a partial's fields
     /// belong to that form, so they carry its id prefix too.
     pub(crate) id_prefix: String,
+    /// The defining form's `builder:` class, which the partial builds again when it overrides a stock field.
+    pub(crate) builder: Option<String>,
+    /// The defining form's options with a literal value, which Rails hands the builder (`layout: :horizontal`).
+    pub(crate) builder_options: Vec<(Symbol, Literal)>,
 }
 
 pub(crate) fn partial_form_bindings(
     views: &[View],
+    library_classes: &[crate::dialect::LibraryClass],
 ) -> crate::det::HashMap<ViewKey, PartialFormBinding> {
     use crate::det::{HashMap, HashSet};
+    let overrides = crate::lower::view::form_builder_overrides_in(library_classes);
 
     // A "simple reference" — the shapes a form's record expr and a
     // locals value can share (`@story`, a bare local).
@@ -2432,6 +2460,7 @@ pub(crate) fn partial_form_bindings(
         form_param: &str,
         record_refs: &HashSet<String>,
         id_prefix: &str,
+        form: &FormScope,
         stems: &PartialStems,
         out: &mut Vec<(ViewKey, PartialFormBinding)>,
     ) {
@@ -2519,8 +2548,11 @@ pub(crate) fn partial_form_bindings(
                     if let (Some(p), Some(form_local), Some(record_local)) =
                         (partial, form_local, record_local)
                     {
-                        if let Some(key) = partial_name_to_key_from(&p, own_dir, stems) {
-                            let model_name = record_local.clone();
+                        // `ingest::form_partial_record`'s local is no model's name: the form's record names it.
+                        let model_name = if record_local.starts_with("__") { form.model_name.clone() } else { Some(record_local.clone()) };
+                        if let Some(key) = partial_name_to_key_from(&p, own_dir, stems)
+                            && let Some(model_name) = model_name
+                        {
                             out.push((
                                 key,
                                 PartialFormBinding {
@@ -2528,6 +2560,9 @@ pub(crate) fn partial_form_bindings(
                                     record_local,
                                     model_name,
                                     id_prefix: id_prefix.to_string(),
+                                    builder: form.builder.clone(),
+                                    // Not a stock builder's options: only an overriding builder is rebuilt from them, and they would split equal bindings.
+                                    builder_options: if form.builder.is_some() { form.options.clone() } else { Vec::new() },
                                 },
                             ));
                         }
@@ -2536,8 +2571,15 @@ pub(crate) fn partial_form_bindings(
             }
         }
         e.node.for_each_child(&mut |c| {
-            render_edges(c, own_dir, form_param, record_refs, id_prefix, stems, out)
+            render_edges(c, own_dir, form_param, record_refs, id_prefix, form, stems, out)
         });
+    }
+
+    /// What a form scope hands the partials it renders beside its builder.
+    struct FormScope {
+        model_name: Option<String>,
+        builder: Option<String>,
+        options: Vec<(Symbol, Literal)>,
     }
 
     /// Find `form_with ... do |f|` scopes and collect their render
@@ -2546,6 +2588,7 @@ pub(crate) fn partial_form_bindings(
         e: &Expr,
         own_dir: Option<&str>,
         stems: &PartialStems,
+        overrides: &crate::det::HashMap<String, crate::det::HashSet<String>>,
         out: &mut Vec<(ViewKey, PartialFormBinding)>,
     ) {
         if let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*e.node {
@@ -2556,6 +2599,7 @@ pub(crate) fn partial_form_bindings(
                     if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
                         let mut record_refs: HashSet<String> = HashSet::default();
                         let mut id_prefix = String::new();
+                        let mut scope = FormScope { model_name: None, builder: None, options: Vec::new() };
                         for arg in args {
                             if let ExprNode::Hash { entries, .. } = &*arg.node {
                                 for (k, v) in entries {
@@ -2564,10 +2608,38 @@ pub(crate) fn partial_form_bindings(
                                     else {
                                         continue;
                                     };
+                                    if key.as_str() != "builder"
+                                        && let ExprNode::Lit { value } = &*v.node
+                                    {
+                                        scope.options.push((key.clone(), value.clone()));
+                                    }
                                     match key.as_str() {
                                         "model" => {
+                                            // Rails' prefix is the model's `param_key`, not the reference's name (`@edit_user` → `user`).
+                                            // `model: [account, article]` names the fields after its last element, as Rails does.
+                                            let named = match &*v.node {
+                                                ExprNode::Array { elements, .. } => elements.last().unwrap_or(v),
+                                                _ => v,
+                                            };
+                                            if scope.model_name.is_none()
+                                                && let Some(crate::ty::Ty::Class { id, .. }) = named.ty.as_ref().map(|t| t.peel_nilable())
+                                            {
+                                                scope.model_name = Some(crate::naming::snake_case(&id.0.as_str().replace("::", "")));
+                                            }
                                             if let Some(r) = simple_ref(v) {
                                                 record_refs.insert(r);
+                                            }
+                                        }
+                                        "scope" => {
+                                            if let Some(s) = self::form_with::str_or_sym_literal(v) {
+                                                scope.model_name = Some(s);
+                                            }
+                                        }
+                                        "builder" => {
+                                            // Only a builder that overrides a stock field: the partial then takes the object itself.
+                                            if let ExprNode::Const { path } = &*v.node {
+                                                let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                                                scope.builder = overrides.contains_key(&name).then_some(name);
                                             }
                                         }
                                         "namespace" => {
@@ -2588,6 +2660,7 @@ pub(crate) fn partial_form_bindings(
                             form_param.as_str(),
                             &record_refs,
                             &id_prefix,
+                            &scope,
                             stems,
                             out,
                         );
@@ -2595,7 +2668,7 @@ pub(crate) fn partial_form_bindings(
                 }
             }
         }
-        e.node.for_each_child(&mut |c| seed_scopes(c, own_dir, stems, out));
+        e.node.for_each_child(&mut |c| seed_scopes(c, own_dir, stems, overrides, out));
     }
 
     let stems = PartialStems::of(views);
@@ -2603,7 +2676,7 @@ pub(crate) fn partial_form_bindings(
     for v in views {
         let (dir, _) = split_view_name(v.name.as_str());
         let own = (!dir.is_empty()).then_some(dir);
-        seed_scopes(&v.body, own, &stems, &mut edges);
+        seed_scopes(&v.body, own, &stems, &overrides, &mut edges);
     }
 
     let mut out: HashMap<ViewKey, PartialFormBinding> = HashMap::default();
@@ -2645,6 +2718,7 @@ pub(crate) fn partial_form_bindings(
                     &binding.form_local,
                     &refs,
                     &binding.id_prefix,
+                    &FormScope { model_name: Some(binding.model_name.clone()), builder: binding.builder.clone(), options: binding.builder_options.clone() },
                     &stems,
                     &mut next,
                 );
@@ -2793,7 +2867,7 @@ pub(crate) fn render_locals_keys(
     // every `f.*` call at compile time, so neither the nil-default
     // param nor the call-site arg should exist (the arg would be a
     // NameError — no FormBuilder object is ever constructed).
-    for (key, binding) in partial_form_bindings(views) {
+    for (key, binding) in partial_form_bindings(views, library_classes).into_iter().filter(|(_, b)| b.builder.is_none()) {
         if let Some(set) = acc.get_mut(&key) {
             set.remove(&binding.form_local);
         }
@@ -3026,7 +3100,7 @@ pub(crate) fn partial_call_contracts(
     let (collection_locals, _) = collection_element_locals_from_views(views, &stems);
     let ivar_records = ivar_record_partials(views, controllers, library_classes);
     let request_context = request_context_views(views);
-    let form_bindings = partial_form_bindings(views);
+    let form_bindings = partial_form_bindings(views, library_classes);
     let mut out = crate::det::HashMap::default();
     for view in views {
         let (dir, base) = split_view_name(view.name.as_str());
@@ -3041,7 +3115,7 @@ pub(crate) fn partial_call_contracts(
         let spelled = (module, base.trim_start_matches('_').to_string());
         // Strict locals declare the whole contract: the first local is
         // the positional record, the rest are keywords.
-        let form_local = form_bindings.get(&key).map(|b| b.form_local.as_str());
+        let form_local = form_bindings.get(&key).filter(|b| b.builder.is_none()).map(|b| b.form_local.as_str());
         if let Some(sl) = view.strict_locals.as_ref().filter(|sl| sl.iter().any(|p| Some(p.name.as_str()) != form_local)) {
             // Not the declared form local: the def drops it (`strict_without_form`), so a caller passing it would hand over an unknown keyword.
             let declared: Vec<String> = sl
@@ -3503,9 +3577,11 @@ pub(super) fn partial_extras_map(
     // Mirror the def site's bound-form-local drop (the defined?-extras
     // channel re-adds it here otherwise, and the call site would pass
     // an arg the def no longer has).
-    for (key, binding) in partial_form_bindings(&app.views) {
+    for (key, binding) in partial_form_bindings(&app.views, &app.library_classes) {
         if let Some(extras) = out.get_mut(&key) {
-            extras.retain(|k| k != &binding.form_local);
+            if binding.builder.is_none() {
+                extras.retain(|k| k != &binding.form_local);
+            }
         }
     }
     out
@@ -4096,14 +4172,14 @@ pub(crate) fn dynamic_partial_pools(
 /// look up whether the target declares strict locals, which closure
 /// ivars to suppress, and which names it binds by keyword. Consumers
 /// skip index 0 (the positional record) when binding keywords.
-fn strict_locals_by_key(views: &[View]) -> crate::det::HashMap<ViewKey, Vec<Param>> {
+fn strict_locals_by_key(views: &[View], library_classes: &[crate::dialect::LibraryClass]) -> crate::det::HashMap<ViewKey, Vec<Param>> {
     let stems = PartialStems::of(views);
-    let bindings = partial_form_bindings(views);
+    let bindings = partial_form_bindings(views, library_classes);
     let mut out = crate::det::HashMap::default();
     for v in views {
         let Some(sl) = v.strict_locals.as_ref() else { continue };
         let Some(key) = view_key_of(v, &stems) else { continue };
-        let form_local = bindings.get(&key).map(|b| b.form_local.as_str());
+        let form_local = bindings.get(&key).filter(|b| b.builder.is_none()).map(|b| b.form_local.as_str());
         let declared: Vec<_> = sl.iter().filter(|p| Some(p.name.as_str()) != form_local).cloned().collect();
         // Not an empty contract: the definition skips strict lowering for one, and a caller reading it as strict would bind nothing.
         if !declared.is_empty() {
@@ -5215,6 +5291,26 @@ pub(super) struct FormBuilderBinding {
     /// A `scope:` form with no record (`form_for :filter, url: ...`): its
     /// fields are named under the scope but read no attributes.
     pub(super) recordless: bool,
+    /// The stock fields the form's own builder defines again, which run on it rather than inline.
+    pub(super) overridden: crate::det::HashSet<String>,
+    /// The form's `builder:` class when it overrides a stock field, which a `fields_for` inside builds again.
+    pub(super) builder: Option<Expr>,
+    /// Rails' `nested_child_index` counters of this builder, one per has_many its `fields_for` calls count over.
+    pub(super) child_counters: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+/// The builder scope's walked body after its child counters start at -1: declared before the scope's first statement,
+/// not at the first `fields_for`, which a branch may skip.
+pub(super) fn walk_counting(body: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
+    let walked = walk_body(body, ctx);
+    let Some(binding) = ctx.form_records.last() else { return walked };
+    let counters = binding.child_counters.borrow();
+    let mut out: Vec<Expr> = counters.iter().map(|name| Expr::new(Span::synthetic(), ExprNode::Assign {
+        target: LValue::Var { id: VarId(0), name: Symbol::from(name.as_str()) },
+        value: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: -1 } }),
+    })).collect();
+    out.extend(walked);
+    out
 }
 
 impl FormBuilderBinding {
@@ -5417,6 +5513,12 @@ pub(super) struct ViewCtx {
     /// to the wrapped call so the form-builder macro-inline can see
     /// both halves at once.
     pub(super) form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
+    /// The stock fields an app builder defines again ([`crate::lower::view::form_builder_overrides`]).
+    pub(super) builder_overrides: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    /// `App::hidden_field_autocomplete`: every hidden input carries Rails' `autocomplete="off"`.
+    pub(super) hidden_autocomplete: bool,
+    /// `crate::lower::view::nested_attribute_associations`: (model, association) → whether it is a collection.
+    pub(super) nested_attributes: std::rc::Rc<crate::det::HashMap<(String, String), bool>>,
     /// Begin each `form_with` expansion with the
     /// `ActionView::Base.new.form_with` entry (Ruby family only — see
     /// `form_with::form_with_entry`).

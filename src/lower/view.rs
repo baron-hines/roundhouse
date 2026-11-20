@@ -1087,6 +1087,84 @@ pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
 
 /// Map a Ruby form method name to the lowered method kind. Rails
 /// accepts both `text_area` and `textarea` as aliases; fold them.
+/// The stock fields each app builder (`class StyledFormBuilder < ActionView::Helpers::FormBuilder`) or a builder it
+/// descends from defines again, keyed by the builder's class path: Rails dispatches them to that override.
+pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    form_builder_overrides_in(&app.library_classes)
+}
+
+pub fn form_builder_overrides_in(classes: &[crate::dialect::LibraryClass]) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    // Every declaration of a name is one class: a reopening names no superclass, and its methods are the class's.
+    let decls = |id: &crate::ident::ClassId| -> Vec<&crate::dialect::LibraryClass> {
+        classes.iter().filter(|l| l.name == *id).collect()
+    };
+    let mut out: crate::det::HashMap<String, crate::det::HashSet<String>> = crate::det::HashMap::default();
+    let mut names: Vec<&crate::ident::ClassId> = classes.iter().map(|c| &c.name).collect();
+    names.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    names.dedup();
+    for name in names {
+        let mut overrides = crate::det::HashSet::default();
+        let mut current = Some(name.clone());
+        let mut descends = false;
+        for _ in 0..32 {
+            let Some(id) = current.take() else { break };
+            // The class's own methods and its included modules', nested includes too.
+            let mut owners: Vec<&crate::dialect::LibraryClass> = decls(&id);
+            let mut seen: crate::det::HashSet<*const crate::dialect::LibraryClass> = crate::det::HashSet::default();
+            while let Some(owner) = owners.pop() {
+                if !seen.insert(owner as *const _) {
+                    continue;
+                }
+                for m in owner.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+                    if classify_form_builder_method(m.name.as_str()).is_some() {
+                        overrides.insert(m.name.as_str().to_string());
+                    }
+                }
+                owners.extend(owner.includes.iter().flat_map(|inc| decls(inc)));
+            }
+            let Some(parent) = decls(&id).iter().find_map(|c| c.parent.clone()) else { break };
+            if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
+                descends = true;
+                break;
+            }
+            current = Some(parent);
+        }
+        if descends && !overrides.is_empty() {
+            out.insert(name.0.as_str().to_string(), overrides);
+        }
+    }
+    out
+}
+
+/// The associations each model accepts nested attributes for (`accepts_nested_attributes_for`, or its generated
+/// `<assoc>_attributes=`), keyed by model class and association name, valued true for a collection (has_many).
+pub fn nested_attribute_associations(app: &crate::App) -> crate::det::HashMap<(String, String), bool> {
+    use crate::dialect::{Association, ModelBodyItem};
+    let mut out = crate::det::HashMap::default();
+    for model in &app.models {
+        let accepts = |assoc: &str| {
+            let writer = format!("{assoc}_attributes=");
+            model.body.iter().any(|item| match item {
+                ModelBodyItem::Method { method, .. } => method.name.as_str() == writer,
+                ModelBodyItem::Unknown { expr, .. } => matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, args, .. }
+                    if method.as_str() == "accepts_nested_attributes_for"
+                        && args.iter().any(|a| matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == assoc))),
+                _ => false,
+            })
+        };
+        for association in model.associations() {
+            let (name, collection) = match association {
+                Association::HasMany { name, .. } | Association::HasAndBelongsToMany { name, .. } => (name, true),
+                Association::HasOne { name, .. } | Association::BelongsTo { name, .. } => (name, false),
+            };
+            if accepts(name.as_str()) {
+                out.insert((model.name.0.as_str().to_string(), name.as_str().to_string()), collection);
+            }
+        }
+    }
+    out
+}
+
 pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
     match method {
         "label" => Some(FormBuilderMethod::Label),

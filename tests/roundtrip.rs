@@ -276,6 +276,7 @@ fn tiny_blog_round_trips() {
         controller_resolutions: roundhouse::det::HashMap::default(),
         sources: vec![],
         wrap_parameters_by_default: false,
+        hidden_field_autocomplete: false,
         active_job_retry_jitter: 0.0,
         ports_active_model_validator: false,
         each_validator_calls: Vec::new(),

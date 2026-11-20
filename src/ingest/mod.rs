@@ -19,6 +19,7 @@ mod after_initialize;
 mod alba;
 mod built_send;
 mod conditional_permit;
+mod controller_name_constants;
 pub(crate) mod unreachable_views;
 mod view_paths;
 mod uncalled_helper_copies;
@@ -175,6 +176,7 @@ pub mod vite;
 pub mod current_page;
 mod computed_partials;
 mod yield_partials;
+mod form_partial_record;
 pub mod time_tag;
 mod visibility;
 
