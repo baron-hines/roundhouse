@@ -1436,6 +1436,9 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             app.library_classes.extend(nested);
                         }
                         super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
+                        // A concern declared beside the model carries its `included do` filters, as a library file's does.
+                        let beside: crate::det::HashSet<crate::ident::ClassId> = beside_names.iter().cloned().collect();
+                        record_concern_filters(&mut app, ingest_concern_filters(&source, &path_str), |id| beside.contains(id));
                         continue;
                     }
                     Ok(None) => {}

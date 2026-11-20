@@ -213,6 +213,27 @@ pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[crate::ingest::lib
 /// `self.table_name_prefix = "three_d_secure_"` in a model body, or GitLab's
 /// `def self.table_name_prefix; 'ci_'; end` on `Ci::ApplicationRecord`: the
 /// class's own prefix, which wins over any namespace module's.
+/// How many times the class body defines or writes its `table_name_prefix`: more than one, and which one a
+/// `table_name_prefix + "x"` reads turns on where it stands.
+pub(super) fn table_prefix_definitions(body: ruby_prism::Node<'_>) -> usize {
+    let stmts = flatten_statements(body);
+    let mut count = 0;
+    for stmt in &stmts {
+        if let Some(def) = stmt.as_def_node() {
+            count += usize::from(def.receiver().is_some_and(|r| r.as_self_node().is_some()) && def.name().as_slice() == b"table_name_prefix");
+        } else if let Some(sclass) = stmt.as_singleton_class_node() {
+            if sclass.expression().as_self_node().is_none() {
+                continue;
+            }
+            let Some(body) = sclass.body() else { continue };
+            count += flatten_statements(body).iter().filter(|inner| inner.as_def_node().is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == b"table_name_prefix")).count();
+        } else if let Some(call) = stmt.as_call_node() {
+            count += usize::from(call.receiver().is_some_and(|r| r.as_self_node().is_some()) && call.name().as_slice() == b"table_name_prefix=");
+        }
+    }
+    count
+}
+
 pub(super) fn explicit_table_prefix(body: ruby_prism::Node<'_>) -> Option<String> {
     let stmts = flatten_statements(body);
     // As in Ruby, the last definition wins; a computed one is simply unknown.

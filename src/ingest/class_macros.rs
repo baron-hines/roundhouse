@@ -115,6 +115,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             continue;
         }
         let constants = literal_constants(app, &ancestors);
+        let constant_owners = literal_constant_owners(app, &ancestors);
         let model = &app.models[model_index];
         // Not one this can follow: a class that redefines the definers, or a macro also called where the class body does not always run it.
         let redefined = table.contains_key(&Symbol::from("define_method")) || table.contains_key(&Symbol::from("define_singleton_method"));
@@ -168,7 +169,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             if !macros.contains(method) || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
                 continue;
             }
-            let mut run = Run { table: &table, constants: &constants, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: model.name.0.clone(), sources, instance_methods: None, cvars: HashMap::default(), class_instance_methods: &class_instance_methods, target: None, foreign: Vec::new() };
+            let mut run = Run { table: &table, constants: &constants, constant_owners: &constant_owners, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: model.name.0.clone(), sources, instance_methods: None, cvars: HashMap::default(), class_instance_methods: &class_instance_methods, target: None, foreign: Vec::new() };
             let result = if block.as_ref().is_some_and(|b| !matches!(&*b.node, ExprNode::Lambda { .. })) {
                 Err("it is passed a block other than a literal one".to_string())
             } else if redefined {
@@ -295,6 +296,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             continue;
         }
         let constants = literal_constants(app, &lineage);
+        let constant_owners = literal_constant_owners(app, &lineage);
         // The subclass's last: Ruby's class variables are shared down the hierarchy, and its body runs after its ancestors'.
         let cvars: HashMap<Symbol, Expr> = lineage
             .iter()
@@ -355,7 +357,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             if !macros.contains(method) || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
                 continue;
             }
-            let mut run = Run { table: &table, constants: &constants, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: lc.name.0.clone(), sources, instance_methods: instance_methods.as_ref(), cvars: cvars.clone(), class_instance_methods: &class_instance_methods, target: None, foreign: Vec::new() };
+            let mut run = Run { table: &table, constants: &constants, constant_owners: &constant_owners, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: lc.name.0.clone(), sources, instance_methods: instance_methods.as_ref(), cvars: cvars.clone(), class_instance_methods: &class_instance_methods, target: None, foreign: Vec::new() };
             let result = if block.as_ref().is_some_and(|b| !matches!(&*b.node, ExprNode::Lambda { .. })) {
                 Err("it is passed a block other than a literal one".to_string())
             } else if redefined {
@@ -1167,6 +1169,17 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 
 /// Constants the ancestors assign a list of Strings or Symbols
 /// (`PROTECTED_KEYS = %w[var value].freeze`), for a guard that reads one.
+/// Which classes of the line assign each constant a literal list, by name: a method reads its own class's.
+fn literal_constant_owners(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Vec<String>> {
+    let mut out: HashMap<Symbol, Vec<String>> = HashMap::default();
+    for id in ancestors {
+        for name in literal_constants(app, std::slice::from_ref(id)).into_keys() {
+            out.entry(name).or_default().push(id.0.as_str().to_string());
+        }
+    }
+    out
+}
+
 fn literal_constants(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Expr> {
     let mut out = HashMap::default();
     for id in ancestors.iter().rev() {
@@ -1215,6 +1228,7 @@ enum Val {
 struct Run<'a> {
     table: &'a HashMap<Symbol, MethodDef>,
     constants: &'a HashMap<Symbol, Expr>,
+    constant_owners: &'a HashMap<Symbol, Vec<String>>,
     frozen: &'a HashMap<(String, Symbol), Expr>,
     cvar_readers: &'a HashMap<(String, String), Symbol>,
     /// The modules the class has included so far, by full name.
@@ -1308,7 +1322,9 @@ impl Run<'_> {
             (None, Some(_)) => return Err("it is passed a block it does not name".into()),
             (None, None) => {}
         }
-        let takes_keywords = def.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest);
+        // Both spellings of `**opts`: `from_kwrest`, or a keyword `rest` (beside `*names` or a required keyword).
+        let kwrest = |p: &crate::dialect::Param| p.from_kwrest || (p.keyword && p.rest);
+        let takes_keywords = def.params.iter().any(|p| p.keyword || p.from_keyword || kwrest(p));
         // A `**opts` handed on (`_define_field(key, **opts)`): the keywords it holds, as the call's own.
         let spread: Vec<Expr>;
         let args: &[Expr] = if args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. })) {
@@ -1329,7 +1345,10 @@ impl Run<'_> {
                 }
             }
             let span = args.last().map_or(def.name_span, |a| a.span);
-            positional.push(Expr::new(span, ExprNode::Hash { entries, kwargs: true }));
+            // Not an empty `**{}` as a positional Hash: Ruby passes no argument for it.
+            if !entries.is_empty() {
+                positional.push(Expr::new(span, ExprNode::Hash { entries, kwargs: true }));
+            }
             spread = positional;
             &spread
         } else {
@@ -1366,7 +1385,7 @@ impl Run<'_> {
         let required_after_rest = |at: usize| def.params[at + 1..].iter().filter(|p| !p.keyword && !p.from_keyword && p.default.is_none() && !p.rest).count();
         for (at, p) in def.params.iter().enumerate() {
             // Not bound in order: a `**opts` holds the keywords no named parameter takes, which are known after them.
-            if p.from_kwrest {
+            if kwrest(p) {
                 continue;
             }
             if p.rest {
@@ -1390,10 +1409,17 @@ impl Run<'_> {
             };
             bound.insert(p.name.clone(), val);
         }
-        if let Some(p) = def.params.iter().find(|p| p.from_kwrest) {
+        if let Some(p) = def.params.iter().find(|p| kwrest(p)) {
             let mut rest: Vec<(Expr, Expr)> = Vec::new();
-            for name in order.iter().filter(|n| keywords.contains_key(*n)).cloned().collect::<Vec<_>>() {
-                let e = keywords.remove(&name).expect("listed");
+            // Each name once, where it is first written, with its last value (`x: 1, x: 2` is `x: 2`).
+            let mut unique: Vec<Symbol> = Vec::new();
+            for name in &order {
+                if !unique.contains(name) {
+                    unique.push(name.clone());
+                }
+            }
+            for name in unique {
+                let Some(e) = keywords.remove(&name) else { continue };
                 let v = match self.eval(&e, env)? {
                     Val::Lit(v) => v,
                     v => self.read(&v, e.span),
@@ -1952,7 +1978,15 @@ impl Run<'_> {
             ExprNode::Const { path } if self.resolve_module(path).is_some() => Some(Val::Lit(e.clone())),
             // A constant of the class's line assigned a literal list (rails-settings-cached's `PROTECTED_KEYS`), as the
             // guard that reads it sees it.
-            ExprNode::Const { path } if let [name] = path.as_slice() && let Some(value) = self.constants.get(name) => {
+            // Only the one the running method's own class assigns: Ruby reads a constant from where the method is written.
+            ExprNode::Const { path } if let [name] = path.as_slice()
+                && let Some(value) = self.constants.get(name)
+                && self.constant_owners.get(name).is_some_and(|owners| match &self.scope {
+                    Some(scope) => owners.as_slice() == [scope.as_str().to_string()],
+                    // Not known where the method is written: only a name one class of the line assigns.
+                    None => owners.len() == 1,
+                }) =>
+            {
                 Some(Val::Lit(Expr { span: e.span, ..value.clone() }))
             }
             ExprNode::Var { name, .. } => env.get(name).cloned(),

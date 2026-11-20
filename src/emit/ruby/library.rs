@@ -10072,6 +10072,20 @@ fn emit_library_class_decl_inner(
     }
     let write_conditional = |s: &mut String, index: usize| {
         written_conditionals.borrow_mut().push(index);
+        // Not before the nested modules its branches `include`: those are written ahead of the conditional.
+        fn statements<'c>(c: &'c crate::dialect::ConditionalDefinitions, out: &mut Vec<&'c Expr>) {
+            for arm in &c.arms {
+                out.extend(arm.statements.iter());
+                for n in &arm.nested {
+                    statements(n, out);
+                }
+            }
+        }
+        let mut sts = Vec::new();
+        statements(&lc.conditional_definitions[index], &mut sts);
+        for st in sts {
+            nested.borrow_mut().write_expr(s, depth, lc, st);
+        }
         write(s, &lc.conditional_definitions[index], lc, &body_pad, &require_of);
     };
     let render_conditional = |s: &mut String, m: &MethodDef| -> bool {
