@@ -4697,6 +4697,17 @@ fn static_name_list(node: &ruby_prism::Node<'_>, framework_helpers: bool) -> Opt
 /// list, which a loop over the reader (`text_field_helpers.each`) walks as the body loads.
 // Not an attribute declared twice, written (`self.x =`), handed to any call but `each`, or given a reader of the
 // class's own: the loop would then read another list than the default.
+/// `self`, or `(self)`: the parentheses change nothing about the receiver.
+fn is_self(node: &ruby_prism::Node<'_>) -> bool {
+    if node.as_self_node().is_some() {
+        return true;
+    }
+    let Some(parens) = node.as_parentheses_node() else { return false };
+    let Some(body) = parens.body() else { return false };
+    let inner = flatten_statements(body);
+    matches!(inner.as_slice(), [only] if is_self(only))
+}
+
 fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String, Vec<String>> {
     let mut declared: HashMap<String, Option<Vec<(bool, String)>>> = HashMap::default();
     let mut redefined: HashSet<String> = HashSet::default();
@@ -4715,6 +4726,15 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             })
     });
     fn note_uses(node: &ruby_prism::Node<'_>, redefined: &mut HashSet<String>) {
+        // `self.list += [:x]`, `||=` and `&&=` write the attribute too, though they are no CallNode.
+        let own = |r: Option<ruby_prism::Node<'_>>| r.is_none_or(|r| is_self(&r));
+        if let Some(name) = node.as_call_operator_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name())
+            .or_else(|| node.as_call_or_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
+            .or_else(|| node.as_call_and_write_node().filter(|w| own(w.receiver())).map(|w| w.read_name()))
+        {
+            redefined.insert(constant_id_str(&name).to_string());
+            return;
+        }
         let Some(call) = node.as_call_node() else { return };
         let name = constant_id_str(&call.name()).to_string();
         if let Some(attr) = name.strip_suffix('=')
@@ -4730,10 +4750,42 @@ fn class_attribute_lists(statements: &[ruby_prism::Node<'_>]) -> HashMap<String,
             redefined.insert(constant_id_str(&reader.name()).to_string());
         }
     }
+    // Not a write's list for a loop before it, which ran over the list as it was then.
+    let mut walked: HashSet<String> = HashSet::default();
     for s in statements {
         if let Some(def) = s.as_def_node() {
             redefined.insert(constant_id_str(&def.name()).trim_end_matches('=').to_string());
             continue;
+        }
+        if let Some(call) = s.as_call_node()
+            && constant_id_str(&call.name()) == "each"
+            && let Some(reader) = call.receiver().and_then(|r| r.as_call_node())
+            && reader.receiver().is_none()
+            && reader.arguments().is_none()
+        {
+            walked.insert(constant_id_str(&reader.name()).to_string());
+        }
+        // `self.list += [:x]` / `-= [:x]` with a literal list changes the list the later loop walks, as the body runs.
+        if let Some(write) = s.as_call_operator_write_node()
+            && write.receiver().is_some_and(|r| is_self(&r))
+            && let Some(Some(list)) = declared.get_mut(&*constant_id_str(&write.read_name()))
+            && let Some(right) = static_name_list(&write.value(), framework_helpers)
+        {
+            // Not applied after the loop walked the list: that loop ran over the list as it was.
+            if walked.contains(&*constant_id_str(&write.read_name())) && matches!(&*constant_id_str(&write.binary_operator()), "+" | "-") {
+                continue;
+            }
+            match &*constant_id_str(&write.binary_operator()) {
+                "+" => {
+                    list.extend(right);
+                    continue;
+                }
+                "-" => {
+                    list.retain(|n| !right.contains(n));
+                    continue;
+                }
+                _ => {}
+            }
         }
         note_uses(s, &mut redefined);
         let Some(call) = s.as_call_node() else { continue };
