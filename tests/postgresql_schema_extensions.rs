@@ -122,11 +122,14 @@ fn exec(url: &str, sql: &str) {
     assert!(output.status.success(), "{sql}: {}", String::from_utf8_lossy(&output.stderr));
 }
 
-/// `url` with its database replaced by `name`, keeping the query.
+/// `url` with its database replaced by `name`, keeping the query but for
+/// a `dbname` in it, which libpq would read over the path.
 fn with_database(url: &str, name: &str) -> String {
-    let (scheme, rest) = url.split_once("://").expect("a postgres:// URL");
-    let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
-    let query = tail.split_once('?').map(|(_, query)| format!("?{query}")).unwrap_or_default();
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let (scheme, rest) = base.split_once("://").expect("a postgres:// URL");
+    let authority = rest.split_once('/').map_or(rest, |(authority, _)| authority);
+    let query: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("dbname")).collect();
+    let query = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
     format!("{scheme}://{authority}/{name}{query}")
 }
 
