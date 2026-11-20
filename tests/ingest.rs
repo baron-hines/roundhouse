@@ -3603,3 +3603,42 @@ end
     assert!(names.contains(&("/log_in", "create")), "{names:?}");
     assert!(names.contains(&("/away", "new")), "{names:?}");
 }
+
+#[test]
+fn a_rooted_class_in_a_model_body_is_walked_as_nested_not_beside() {
+    use roundhouse::ingest::library_class::{ingest_library_classes_beside, ingest_nested_library_classes};
+
+    // A gem file whose model body declares `class ::StaticFiles`: Ruby
+    // names it at the top level, but it is written inside the model,
+    // so the nested walk takes it and the walk beside the model leaves
+    // it alone. Taken by both, it was registered twice.
+    let src = br#"module Tessera
+  class Node
+    include ActiveModel::Validations
+    validate :named
+
+    class ::StaticFiles
+      def self.call(env)
+        [200, {}, ["static"]]
+      end
+    end
+
+    def named
+    end
+  end
+
+  class Helpers
+    def self.tag
+      :helpers
+    end
+  end
+end
+"#;
+    let names = |classes: Vec<roundhouse::dialect::LibraryClass>| {
+        classes.into_iter().map(|c| c.name.0.as_str().to_string()).collect::<Vec<_>>()
+    };
+    let beside = names(ingest_library_classes_beside(src, "lib/tessera/node.rb", "Tessera::Node").expect("beside"));
+    let nested = names(ingest_nested_library_classes(src, "lib/tessera/node.rb", "Tessera::Node").expect("nested"));
+    assert_eq!(beside, ["Tessera::Helpers"], "beside the model");
+    assert!(nested.contains(&"StaticFiles".to_string()), "nested in the model: {nested:?}");
+}

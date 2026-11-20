@@ -365,6 +365,26 @@ module ActiveRecord
       @shared ||= Connection.new
     end
 
+    # The pool slot this handle was taken on (-1 for the shared handle),
+    # and whether on ActiveRecord::Base: as in Rails, its pool and guard.
+    def initialize(slot = -1, base = false)
+      @slot = slot
+      @base = base
+    end
+
+    # `Base.with_connection`'s hold on the handle's slot for its block.
+    # Nothing to hold for the shared handle (-1) or one taken before the
+    # databases are open (-2): their statements stay as they were.
+    def _hold_slot
+      Db.hold_slot(@slot, @base) if @slot >= 0
+      nil
+    end
+
+    def _release_slot
+      Db.leave_slot if @slot >= 0
+      nil
+    end
+
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.
     def adapter_name
@@ -388,14 +408,24 @@ module ActiveRecord
     # simply produce zero rows. Delegates to the adapter's row loop
     # (which resolves column names once, not rows×cols times).
     def execute(sql)
-      Result.new(ActiveRecord.adapter.select_rows(sql))
+      Db.enter_slot(@slot, @base) if @slot != -1
+      begin
+        Result.new(ActiveRecord.adapter.select_rows(sql))
+      ensure
+        Db.leave_slot if @slot != -1
+      end
     end
 
     # `select_rows(sql)` — Rails' rows as Arrays of values, in column
     # order (campfire's tests read an `EXPLAIN QUERY PLAN`'s detail with
     # `select_rows(…).map(&:last)`).
     def select_rows(sql)
-      ActiveRecord.adapter.select_rows(sql).map { |row| row.values }
+      Db.enter_slot(@slot, @base) if @slot != -1
+      begin
+        ActiveRecord.adapter.select_rows(sql).map { |row| row.values }
+      ensure
+        Db.leave_slot if @slot != -1
+      end
     end
 
     # `select_value(sql)` — the first column of the first row, or nil
@@ -428,6 +458,7 @@ module ActiveRecord
     # `transaction(mode)` is reached: campfire repairs its counters in one
     # `BEGIN IMMEDIATE` write transaction.
     def raw_connection
+      raise NotImplementedError, "raw_connection is not carried in an app that routes by role and shard" if Db.connection_slot(false) >= 0
       RawConnection.new
     end
 
@@ -449,8 +480,13 @@ module ActiveRecord
     # vote save. The binds go through `sanitize_sql`, the escaping every
     # other raw-SQL entry here already uses; `name` is Rails' log label.
     def exec_update(sql, name = nil, binds = [])
-      ActiveRecord.adapter.execute_ddl(Base.sanitize_sql([sql] + binds))
-      ActiveRecord.adapter.changes
+      Db.enter_slot(@slot, @base) if @slot != -1
+      begin
+        ActiveRecord.adapter.execute_ddl(Base.sanitize_sql([sql] + binds))
+        ActiveRecord.adapter.changes
+      ensure
+        Db.leave_slot if @slot != -1
+      end
     end
 
     # lobsters' FullTextSearch drops an index row this way
@@ -497,7 +533,7 @@ module ActiveRecord
     def create_or_find_by(conditions)
       created = build(conditions)
       begin
-        ActiveRecord::Base.transaction(requires_new: true) { created.save }
+        model.transaction(requires_new: true) { created.save }
       rescue ActiveRecord::RecordNotUnique
         return find_by!(conditions)
       end
@@ -507,7 +543,7 @@ module ActiveRecord
     def create_or_find_by!(conditions)
       created = build(conditions)
       begin
-        ActiveRecord::Base.transaction(requires_new: true) { created.save! }
+        model.transaction(requires_new: true) { created.save! }
       rescue ActiveRecord::RecordNotUnique
         return find_by!(conditions)
       end
@@ -749,8 +785,31 @@ module ActiveRecord
     # stub through `connection_pool.with_connection`, which a fresh
     # instance per call would lose. Held on Connection, not on Base, so
     # `User.connection` and `ActiveRecord::Base.connection` agree.
+    # In a routed app, a handle on the pool the receiver's role and shard
+    # select now: Base's own, or the connection class's.
     def self.connection
-      ActiveRecord::Connection.shared
+      slot = Db.connection_slot(self == ActiveRecord::Base)
+      slot == -1 ? ActiveRecord::Connection.shared : ActiveRecord::Connection.new(slot, self == ActiveRecord::Base)
+    end
+
+    def self.lease_connection
+      connection
+    end
+
+    # Rails' `with_connection` holds one connection for its block: the
+    # handle's slot, leased once, so each statement through it is on that
+    # connection (a raw BEGIN carries to the next one). The block's value
+    # is bound before the slot is left, so the Spinel binary keeps it.
+    def self.with_connection
+      handle = connection
+      handle._hold_slot
+      result = nil
+      begin
+        result = yield handle
+      ensure
+        handle._release_slot
+      end
+      result
     end
 
     # Rails' `Model.sanitize_sql(["insert … values (?, ?)", a, b])` —
@@ -989,6 +1048,9 @@ module ActiveRecord
     end
 
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
+      if self == ActiveRecord::Base && Db.connection_slot(true) != Db.connection_slot(false)
+        raise NotImplementedError, "ActiveRecord::Base.transaction opens its transaction on Base's own database, which the routed models are not on; open it on the model or its connection class"
+      end
       depth = Db._txn_depth
       if depth > 0
         parent_joinable = ActiveRecord::Base._txn_parent_joinable?(depth)
@@ -1171,6 +1233,55 @@ module ActiveRecord
         lock!(lock)
         yield
       end
+    end
+
+    # `#lock!` on the ruby family, where the database may be PostgreSQL
+    # (base.rb's `lock!` is the SQLite one every target shares). Rails
+    # reloads with `SELECT … FOR UPDATE`; on PostgreSQL that row lock is
+    # what makes a second `with_lock` on the same row wait for the first
+    # transaction to commit and then read its write. Without it, two
+    # concurrent read-check-write blocks both read the old row and both
+    # write. Here the lock is taken by its own `SELECT <key> … FOR
+    # UPDATE`, then `reload` reads the row: in the same transaction, and
+    # after the lock is held, so it reads what the holder committed.
+    # SQLite keeps base.rb's behaviour (`_lock_row` does nothing there).
+    def lock!(lock = nil)
+      _lock_row(lock)
+      reload
+    end
+
+    # The row lock `lock!` takes: Rails' `lock` argument, where `true`
+    # (and nil, this runtime's "not given") is `FOR UPDATE`, a String is
+    # the clause itself (`"FOR SHARE"`, `"FOR UPDATE NOWAIT"`), and
+    # `false` takes none. Only on PostgreSQL, and only for a persisted
+    # record: Rails' `lock!` reloads nothing for a new one. Outside a
+    # transaction the lock ends with the statement, as it does in Rails.
+    #
+    # `Db.exec_returning`, not a read through the statement cache: a
+    # locking read must reach the server every time (Rails never answers
+    # one from the query cache), and it also clears the lease's query
+    # cache, as Rails' `reload` does before it reads. Its rows are kept:
+    # a clause that skips (`FOR UPDATE SKIP LOCKED`) answers none for a
+    # row another transaction holds, and Rails' locked `find_by!` then
+    # raises RecordNotFound instead of going on without the lock.
+    def _lock_row(lock)
+      return nil unless Db.adapter_name == "postgresql"
+      return nil unless persisted?
+      return nil if lock == false
+      clause = lock.is_a?(String) ? lock : "FOR UPDATE"
+      key = ActiveRecord.adapter.quote_column_name(self.class.primary_key.to_s)
+      value = ActiveRecord.adapter.escape_value(_primary_key_value)
+      stmt = Db.exec_returning("SELECT #{key} FROM #{self.class._table_sql} WHERE #{key} = #{value} #{clause}")
+      found = false
+      begin
+        found = Db.step?(stmt)
+      ensure
+        Db.finalize(stmt)
+      end
+      unless found
+        raise RecordNotFound.new("Couldn't find #{self.class.name}", self.class.name, self.class.primary_key.to_s)
+      end
+      nil
     end
 
     # `Model.delete_all` for a model without the lowerer-emitted

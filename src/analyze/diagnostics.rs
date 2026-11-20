@@ -71,7 +71,9 @@ fn descends_from_form_builder(app: &App, id: &crate::ident::ClassId) -> bool {
 }
 
 fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
-    fn visit(app: &App, expr: &Expr, out: &mut Vec<Diagnostic>) {
+    type Overrides = crate::det::HashMap<String, crate::det::HashSet<String>>;
+    fn visit(app: &App, overrides: &Overrides, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        let overridden = |id: &crate::ident::ClassId, m: &str| overrides.get(id.0.as_str()).is_some_and(|o| o.contains(m));
         // A builder class of the app's or a gem's own (`builder: MoneyFormBuilder`): a method the lowering does not
         // expand runs on Rails' builder at request time, which the Ruby family's overlay carries and no other tree.
         if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
@@ -80,7 +82,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             && id.0.as_str() != "ActionView::Helpers::FormBuilder"
             && descends_from_form_builder(app, id)
             && method.as_str() != "object"
-            && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+            && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden(id, method.as_str()))
         {
             out.push(Diagnostic::unsupported(
                 expr.span,
@@ -98,9 +100,9 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
         {
             let base = id.0.as_str() == "ActionView::Helpers::FormBuilder";
             let m = method.as_str();
-            if crate::lower::classify_form_builder_method(m).is_none() {
+            if crate::lower::classify_form_builder_method(m).is_none() || overridden(id, m) {
                 if !base {
-                    expr.node.for_each_child(&mut |child| visit(app, child, out));
+                    expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
                     return;
                 }
                 out.push(Diagnostic::unsupported(
@@ -131,7 +133,7 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                 ));
             }
         }
-        expr.node.for_each_child(&mut |child| visit(app, child, out));
+        expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
     }
     /// The option of `method`'s call that Rails' `Tags::*#render`
     /// rewrites: `NumberField` (and `RangeField`) turn `in:`/`within:`
@@ -155,9 +157,148 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             rewritten.iter().find(|o| **o == key).copied()
         })
     }
+    // A `fields_for` block's builder is the outer form's class in Rails, though the analysis types one inside another as
+    // the base: carry the class in, and report an override called on it as the outer level's is.
+    fn nested(expr: &Expr, overrides: &Overrides, scope: &[(Symbol, crate::ident::ClassId)], out: &mut Vec<Diagnostic>) {
+        // A block that binds a name again (`others.each do |child|`) hides the builder of that name inside it.
+        if let ExprNode::Lambda { params, body, .. } = &*expr.node
+            && scope.iter().any(|(n, _)| params.contains(n))
+        {
+            let inner: Vec<_> = scope.iter().filter(|(n, _)| !params.contains(n)).cloned().collect();
+            nested(body, overrides, &inner, out);
+            return;
+        }
+        let class_of = |r: &Expr| -> Option<crate::ident::ClassId> {
+            match &*r.node {
+                ExprNode::Var { name, .. } => scope.iter().rev().find(|(n, _)| n == name).map(|(_, c)| c.clone()),
+                _ => None,
+            }
+            .or_else(|| match &r.ty {
+                Some(Ty::Class { id, .. }) if overrides.contains_key(id.0.as_str()) => Some(id.clone()),
+                _ => None,
+            })
+        };
+        if let ExprNode::Send { recv: Some(r), method, block, .. } = &*expr.node
+            && let Some(class) = class_of(r)
+        {
+            let typed_as_it = matches!(&r.ty, Some(Ty::Class { id, .. }) if *id == class);
+            if !typed_as_it && !expr.span.is_synthetic() && overrides.get(class.0.as_str()).is_some_and(|o| o.contains(method.as_str())) {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    format!("`form.{}` is {}'s own method, which runs on Rails' FormBuilder at request time, carried by the Ruby family's runtime only", method.as_str(), class.0.as_str()),
+                ));
+            }
+            if method.as_str() == "fields_for"
+                && let Some(b) = block
+                && let ExprNode::Lambda { params, body, .. } = &*b.node
+                && let Some(param) = params.first()
+            {
+                let mut inner = scope.to_vec();
+                inner.push((param.clone(), class));
+                nested(body, overrides, &inner, out);
+                if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                    for e in recv.iter().chain(args.iter()) {
+                        nested(e, overrides, scope, out);
+                    }
+                }
+                return;
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested(c, overrides, scope, out));
+    }
+    // Rails adds the persisted child's hidden id unless the body wrote it at render; one written only under a
+    // condition is known then, and the lowering decides at compile time.
+    fn conditional_hidden_id(e: &Expr, param: &Symbol, under: bool) -> bool {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && under
+            && method.as_str() == "hidden_field"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name == param)
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) if value.as_str() == "id")
+        {
+            return true;
+        }
+        let branch = under || matches!(&*e.node, ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } | ExprNode::BoolOp { .. } | ExprNode::Lambda { .. });
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found |= conditional_hidden_id(c, param, branch));
+        found
+    }
+    fn nested_attributes_fields(nested: &crate::det::HashMap<(String, String), bool>, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: Some(r), method, args, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let Some(Ty::Class { args: tyargs, .. }) = &r.ty
+            && let [Ty::Class { id: model, .. }] = tyargs.as_slice()
+            && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: assoc } }) = args.first().map(|a| &*a.node)
+            && nested.contains_key(&(model.0.as_str().to_string(), assoc.as_str().to_string()))
+            && let ExprNode::Lambda { params, body, .. } = &*b.node
+            && let Some(param) = params.first()
+            && conditional_hidden_id(body, param, false)
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "fields_for nested attributes",
+                format!("`fields_for :{}` writes the record's hidden id only under a condition: Rails adds it unless the body wrote it at render, which the lowering decides at compile time", assoc.as_str()),
+            ));
+        }
+        expr.node.for_each_child(&mut |c| nested_attributes_fields(nested, c, out));
+    }
+    // A `fields_for` builder handed to a partial: the partial calls the object, which only the Ruby family's overlay builds.
+    fn nested_builder_renders(expr: &Expr, params: &[Symbol], out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Lambda { params: own, body, .. } = &*expr.node
+            && params.iter().any(|p| own.contains(p))
+        {
+            let inner: Vec<_> = params.iter().filter(|p| !own.contains(p)).cloned().collect();
+            nested_builder_renders(body, &inner, out);
+            return;
+        }
+        if let ExprNode::Send { method, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let ExprNode::Lambda { params: own, body, .. } = &*b.node
+            && let Some(param) = own.first()
+        {
+            let mut inner = params.to_vec();
+            inner.push(param.clone());
+            nested_builder_renders(body, &inner, out);
+            if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                for e in recv.iter().chain(args.iter()) {
+                    nested_builder_renders(e, params, out);
+                }
+            }
+            return;
+        }
+        if let ExprNode::Send { recv: None, method, args, .. } = &*expr.node
+            && method.as_str() == "render"
+            && !expr.span.is_synthetic()
+        {
+            fn hands(e: &Expr, params: &[Symbol]) -> bool {
+                match &*e.node {
+                    ExprNode::Var { name, .. } => params.contains(name),
+                    ExprNode::Hash { entries, .. } => entries.iter().any(|(_, v)| hands(v, params)),
+                    _ => false,
+                }
+            }
+            if args.iter().any(|a| hands(a, params)) {
+                // The Ruby family builds Rails' FormBuilder for it, which no other tree carries.
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    "a `fields_for` builder handed to a partial is Rails' FormBuilder object at request time, carried by the Ruby family's runtime only".to_string(),
+                ));
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested_builder_renders(c, params, out));
+    }
     let mut out = Vec::new();
+    let overrides = crate::lower::view::form_builder_overrides(app);
+    let nested_attributes = crate::lower::view::nested_attribute_associations(app);
     for view in &app.views {
-        visit(app, &view.body, &mut out);
+        visit(app, &overrides, &view.body, &mut out);
+        nested(&view.body, &overrides, &[], &mut out);
+        nested_builder_renders(&view.body, &[], &mut out);
+        nested_attributes_fields(&nested_attributes, &view.body, &mut out);
     }
     out
 }
@@ -253,6 +394,42 @@ pub(crate) fn datetime_local_time_reads(app: &App) -> Vec<crate::span::Span> {
 /// reading (or passed) its dir-convention record local, would see the
 /// body there. Those are refused, as is any other block-form render
 /// (`render partial: "x", locals: … do` raises in Rails).
+/// A view's `render partial: <computed>` (maybe's `render partial: permitted_import_configuration_path(@import)`): the
+/// lowering dispatches a runtime name only over the pool a controller assigns an ivar, so this one was emitted as a bare
+/// `render(…)` in the view's module, which has no such method, and the page raised.
+fn unmodeled_computed_partial_renders(app: &App) -> Vec<Diagnostic> {
+    use crate::lower::view::classify_render_partial;
+    fn computed(args: &[Expr]) -> bool {
+        let Some(ExprNode::Hash { entries, .. }) = args.first().map(|a| &*a.node) else { return false };
+        entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "partial")
+                && !matches!(&*v.node, ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. })
+        })
+    }
+    fn visit(e: &Expr, unreachable: bool, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+            && method.as_str() == "render"
+            && !e.span.is_synthetic()
+            && computed(args)
+            && classify_render_partial(None, method.as_str(), args, None, &|_| true, &|_| true).is_none()
+        {
+            let why = "the partial's name is computed when the page renders, and the lowering dispatches a runtime name only over the partials a controller assigns an ivar";
+            let mut d = Diagnostic::unsupported(e.span, None, "render of a computed partial", why);
+            // A template no request reaches keeps it as a warning, as the other render reports do.
+            if unreachable {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
+        }
+        e.node.for_each_child(&mut |c| visit(c, unreachable, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(&view.body, app.unreachable_views.contains(&view.name), &mut out);
+    }
+    out
+}
+
 /// A view's `render` of an object (`render(Widget.new)`) that is not known to render itself: Rails asks the object to
 /// (`render_in(view_context)`), which only `lower::renderable` models, for an object typed as answering it. Left alone it was emitted as a bare `render(…)` in the
 /// view's module, which has no such method, so it raised when the page rendered.
@@ -1030,6 +1207,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(super::alba::diagnose(app));
     out.extend(unmodeled_block_renders(app));
     out.extend(unmodeled_object_renders(app));
+    out.extend(unmodeled_computed_partial_renders(app));
     out.extend(crate::gems::extension_gem_refusals(app, None));
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
@@ -1199,6 +1377,23 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
         None => out.extend(diagnose_helper_modules(app)),
     }
     out.extend(app.unknown_association_targets.iter().cloned());
+    // A pagy before 43's initializer settings pagy9.rb does not carry: the emitted app would paginate without them.
+    if let Some(major) = crate::ingest::pagy_locked_major(app).filter(|m| *m < 9)
+        && let Some(lock) = app.gem_lock.as_ref()
+    {
+        let version = lock.version_of("pagy").unwrap_or_default();
+        out.push(Diagnostic::unsupported(
+            crate::span::Span::synthetic(),
+            None,
+            "pagy",
+            format!("pagy {version} (major {major}) is not modeled: only 9 (runtime pagy9.rb) and 43 (pagy.rb) are"),
+        ));
+    }
+    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) && crate::ingest::pagy_locked_before_43(app) {
+        for (span, what) in &app.pagy.unmodeled {
+            out.push(Diagnostic::unsupported(*span, None, "pagy", format!("{what} is not modeled; the emitted app paginates without it")));
+        }
+    }
     out.extend(app.gem_middleware_refusals.iter().cloned());
     out.extend(app.included_hoist_conflicts.iter().cloned());
     out.extend(app.superclass_refusals.iter().cloned());

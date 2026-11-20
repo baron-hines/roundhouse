@@ -225,13 +225,21 @@ pub(super) fn find_all_classes_with_scope<'pr>(
 pub(super) fn primary_class_with_scope<'pr>(
     node: &Node<'pr>,
 ) -> Option<(Vec<String>, ruby_prism::ClassNode<'pr>)> {
-    let mut classes = find_all_classes_with_scope(node).into_iter();
+    primary_class_with_nesting(node).map(|(scope, _, class)| (scope, class))
+}
+
+/// [`primary_class_with_scope`], plus the class's lexical nesting (see
+/// [`find_all_classes_with_nesting`]).
+pub(super) fn primary_class_with_nesting<'pr>(
+    node: &Node<'pr>,
+) -> Option<(Vec<String>, Vec<String>, ruby_prism::ClassNode<'pr>)> {
+    let mut classes = find_all_classes_with_nesting(node).into_iter();
     let mut primary = classes.next()?;
-    while is_namespace_wrapper(&primary.1) {
-        let inside = primary.1.location();
+    while is_namespace_wrapper(&primary.2) {
+        let inside = primary.2.location();
         match classes.next() {
             Some(next)
-                if next.1.location().start_offset() < inside.end_offset() =>
+                if next.2.location().start_offset() < inside.end_offset() =>
             {
                 primary = next
             }
@@ -287,6 +295,7 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         // Compute the inner scope BEFORE moving `c` — scope for
         // nested classes/modules inside `c`'s body should include
         // `c`'s own name (the bare segment as written in source).
+        let scope = if is_rooted(&c.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = class_name_path(&c) {
             inner.extend(name_path);
@@ -319,6 +328,7 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         // Push the module's name onto the scope before descending —
         // bare class declarations inside qualify with the module
         // path.
+        let scope = if is_rooted(&m.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = module_name_path(&m) {
             inner.extend(name_path);
@@ -351,10 +361,41 @@ pub(super) fn class_name_path(class: &ruby_prism::ClassNode<'_>) -> Option<Vec<S
 pub(super) fn find_all_modules_with_scope<'pr>(
     node: &Node<'pr>,
 ) -> Vec<(Vec<String>, ruby_prism::ModuleNode<'pr>)> {
-    find_all_module_declarations_with_scope(node)
+    find_all_modules_with_nesting(node)
         .into_iter()
-        .filter(|(_, module)| module_has_direct_def(module))
+        .map(|(scope, _, module)| (scope, module))
         .collect()
+}
+
+/// The full names of the classes and modules declared inside `outer`'s
+/// body, at any depth, as Ruby names them: `class ::Parser` written in
+/// `class Account` is `Parser`, `class Item` there is `Account::Item`.
+pub(super) fn declared_inside(node: &Node<'_>, outer: &str) -> crate::det::HashSet<String> {
+    let mut out = crate::det::HashSet::default();
+    let full = |scope: &[String], path: Vec<String>| scope.iter().cloned().chain(path).collect::<Vec<_>>().join("::");
+    for (scope, nesting, class) in find_all_classes_with_nesting(node) {
+        if nesting.iter().any(|n| n == outer) && let Some(path) = class_name_path(&class) {
+            out.insert(full(&scope, path));
+        }
+    }
+    collect_modules(node, &[], &[], &mut |scope, nesting, module| {
+        if nesting.iter().any(|n| n == outer) && let Some(path) = module_name_path(&module) {
+            out.insert(full(scope, path));
+        }
+    });
+    out
+}
+
+/// [`find_all_modules_with_scope`], plus each module's lexical nesting
+/// at its `module` keyword (see [`find_all_classes_with_nesting`]).
+pub(super) fn find_all_modules_with_nesting<'pr>(
+    node: &Node<'pr>,
+) -> Vec<(Vec<String>, Vec<String>, ruby_prism::ModuleNode<'pr>)> {
+    let mut out = Vec::new();
+    collect_modules(node, &[], &[], &mut |scope, nesting, m| {
+        out.push((scope.to_vec(), nesting.to_vec(), m));
+    });
+    out.into_iter().filter(|(_, _, module)| module_has_direct_def(module)).collect()
 }
 
 /// Every source module declaration, including effect-only reopenings that
@@ -363,56 +404,59 @@ pub(super) fn find_all_module_declarations_with_scope<'pr>(
     node: &Node<'pr>,
 ) -> Vec<(Vec<String>, ruby_prism::ModuleNode<'pr>)> {
     let mut out = Vec::new();
-    collect_modules(node, &[], &mut |scope, m| {
+    collect_modules(node, &[], &[], &mut |scope, _, m| {
         out.push((scope.to_vec(), m));
     });
     out
 }
 
-fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
+fn collect_modules<'pr, F: FnMut(&[String], &[String], ruby_prism::ModuleNode<'pr>)>(
     node: &Node<'pr>,
     scope: &[String],
+    nesting: &[String],
     out: &mut F,
 ) {
     if let Some(m) = node.as_module_node() {
         let body = m.body();
         // Compute inner scope before moving `m`.
+        let scope = if is_rooted(&m.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = module_name_path(&m) {
             inner.extend(name_path);
         }
-        out(scope, m);
+        out(scope, nesting, m);
         if let Some(b) = body {
-            collect_modules(&b, &inner, out);
+            collect_modules(&b, &inner, &push_nesting(&inner, nesting), out);
         }
         return;
     }
     if let Some(c) = node.as_class_node() {
+        let scope = if is_rooted(&c.constant_path()) { &[][..] } else { scope };
         let mut inner = scope.to_vec();
         if let Some(name_path) = class_name_path(&c) {
             inner.extend(name_path);
         }
         if let Some(body) = c.body() {
-            collect_modules(&body, &inner, out);
+            collect_modules(&body, &inner, &push_nesting(&inner, nesting), out);
         }
         return;
     }
     if let Some(p) = node.as_program_node() {
-        collect_modules(&p.statements().as_node(), scope, out);
+        collect_modules(&p.statements().as_node(), scope, nesting, out);
         return;
     }
     if let Some(s) = node.as_statements_node() {
         for stmt in s.body().iter() {
-            collect_modules(&stmt, scope, out);
+            collect_modules(&stmt, scope, nesting, out);
         }
         return;
     }
     if let Some(body) = hoisted_singleton_body(node) {
-        collect_modules(&body, scope, out);
+        collect_modules(&body, scope, nesting, out);
         return;
     }
     if let Some(decl) = self_guarded_body(node, Some(scope)) {
-        collect_modules(&decl, scope, out);
+        collect_modules(&decl, scope, nesting, out);
     }
 }
 
@@ -505,8 +549,14 @@ fn concern_includes_module(body: Option<Node<'_>>) -> bool {
             call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
         })
     }
+    // `self.extend` is the same call.
     let extends_concern = statements.iter().any(|stmt| {
-        call_named(stmt, "extend").is_some_and(|call| {
+        let call = stmt.as_call_node().filter(|call| {
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && call.block().is_none()
+                && constant_id_str(&call.name()) == "extend"
+        });
+        call.is_some_and(|call| {
             call.arguments().is_some_and(|a| {
                 a.arguments().iter().any(|arg| {
                     constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
@@ -768,6 +818,14 @@ fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
 pub(super) fn module_name_path(m: &ruby_prism::ModuleNode<'_>) -> Option<Vec<String>> {
     let cp = m.constant_path();
     constant_path_segments_strs(&cp)
+}
+
+/// Whether a declared name starts at the top level, as `::Shelf::Box`
+/// does. Ruby defines such a class or module there wherever the
+/// declaration is written, so the enclosing scope is not part of its
+/// name, nor of the scope its body is read in.
+pub(super) fn is_rooted(path: &Node<'_>) -> bool {
+    path.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p))
 }
 
 pub(super) fn constant_path_of(node: &Node<'_>) -> Option<Vec<String>> {

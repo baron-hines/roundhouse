@@ -1594,29 +1594,42 @@ fn report_block_render_partials(app: &App, target: BuildTarget) {
     ) {
         return;
     }
-    fn visit(e: &crate::expr::Expr, unreachable: bool, target: BuildTarget) {
-        if let crate::expr::ExprNode::Send { recv, method, args, block: Some(block), .. } = &*e.node
-            && !e.span.is_synthetic()
-            && matches!(
-                crate::lower::view::classify_render_partial(recv.as_ref(), method.as_str(), args, Some(block), &|_| true, &|_| false),
-                Some(crate::lower::view::RenderPartial::LayoutBlock { .. })
-            )
-        {
+    fn visit(e: &crate::expr::Expr, unreachable: bool, target: BuildTarget, specialized: &[crate::span::Span]) {
+        // Not only the block form: `ingest::yield_partials` rewrote most into a render of a partial copy, which no
+        // target outside the ruby family has been run with.
+        let inlined = matches!(&*e.node, crate::expr::ExprNode::Send { method, block: None, .. } if method.as_str() == "render")
+            && specialized.contains(&e.span);
+        let captured = match &*e.node {
+            crate::expr::ExprNode::Send { recv, method, args, block: Some(block), .. } => {
+                !e.span.is_synthetic()
+                    && matches!(
+                        crate::lower::view::classify_render_partial(recv.as_ref(), method.as_str(), args, Some(block), &|_| true, &|_| false),
+                        Some(crate::lower::view::RenderPartial::LayoutBlock { .. })
+                    )
+            }
+            _ => false,
+        };
+        if inlined || captured {
+            let why = if inlined {
+                "the block is inlined at the yields of a copy of the partial, which this target's views have not been checked to carry"
+            } else {
+                "the block becomes the partial's `yield`, captured into a String, which this target's views don't carry"
+            };
             let mut d = crate::diagnostic::Diagnostic::unsupported(
                 e.span,
                 Some(crate::ident::Symbol::from(target.as_str())),
                 "render with a block",
-                "the block becomes the partial's `yield`, captured into a String, which this target's views don't carry",
+                why,
             );
             if unreachable {
                 d.severity = crate::diagnostic::Severity::Warning;
             }
             emit::diagnostics::push(d);
         }
-        e.node.for_each_child(&mut |c| visit(c, unreachable, target));
+        e.node.for_each_child(&mut |c| visit(c, unreachable, target, specialized));
     }
     for view in &app.views {
-        visit(&view.body, app.unreachable_views.contains(&view.name), target);
+        visit(&view.body, app.unreachable_views.contains(&view.name), target, &app.yield_specialized);
     }
 }
 
@@ -7811,6 +7824,62 @@ fn apply_database_pragmas(files: &mut [(String, String)], app: &App) {
     }
 }
 
+/// `App::database_routes` into the Spinel SQLite shim's `Db.configure`:
+/// one `route` per shard and role, under an arm per environment whose
+/// configurations the runtime can open (`Database::routable`). The
+/// primary is the database `configure` was given, so its route names no
+/// file. An environment without an arm raises at boot: a model is never
+/// left on the primary because its own database is unknown.
+fn apply_database_routes(files: &mut [(String, String)], app: &App) {
+    const MARK: &str = "    # >>> generated: database-routes\n";
+    let Some(routes) = &app.database_routes else { return };
+    let Some((_, content)) = files.iter_mut().find(|(path, content)| path == "runtime/db.rb" && content.contains(MARK)) else { return };
+    let lit = |text: &str| crate::emit::ruby::expr::ruby_str_literal(text);
+    // Bare only when Ruby reads it bare: `:2026` does not parse.
+    let symbol = |name: &str| {
+        let bare = name.starts_with(|c: char| !c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if bare { format!(":{name}") } else { format!(":{}", lit(name)) }
+    };
+    let mut envs: Vec<&str> = app.databases.iter().map(|d| d.env.as_str()).collect();
+    envs.dedup();
+    let mut generated = format!("{MARK}    case Rails.env_name.to_s\n");
+    for env in envs {
+        let config = |name: &str| app.databases.iter().find(|d| d.env == env && d.name == name);
+        let primary_is_sqlite = app.databases.iter().any(|d| d.env == env && d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3);
+        let opens = |(_, role, name): &(String, String, String)| config(name).is_some_and(|d| d.routable(role == "writing", &routes.schema_file));
+        if !primary_is_sqlite || !routes.routes.iter().all(opens) {
+            continue;
+        }
+        let names = if env == "development" { format!("{}, \"\"", lit(env)) } else { lit(env) };
+        generated.push_str(&format!("    when {names}\n"));
+        let writers = routes.routes.iter().filter(|(_, role, _)| role == "writing");
+        let readers = routes.routes.iter().filter(|(_, role, _)| role != "writing");
+        for (shard, role, name) in writers.chain(readers) {
+            let Some(database) = config(name) else { continue };
+            let file = if database.primary { "" } else { database.database.as_deref().unwrap_or("") };
+            generated.push_str(&format!(
+                "      route({}, {}, {}, {}, {}, n)\n",
+                symbol(shard),
+                symbol(role),
+                lit(file),
+                database.replica,
+                role == "writing"
+            ));
+        }
+    }
+    generated.push_str(&format!(
+        "    else\n      raise \"Db.configure: config/database.yml names no SQLite files to route `{}` in the \" + Rails.env_name.to_s + \" environment\"\n    end\n    @default_shard = {}\n",
+        routes.owner.0.as_str(),
+        symbol(&routes.default_shard)
+    ));
+    *content = content.replacen(MARK, &generated, 1);
+    *content = content.replacen(
+        "  @slots = nil\n",
+        &format!("  @slots = nil\n  @default_shard = {}\n", symbol(&routes.default_shard)),
+        1,
+    );
+}
+
 /// Write `JobRegistry` — each payload job's writer and reader, and the
 /// record locators they use — into `runtime/job_registry.rb`, from
 /// `App::job_plans`. A span replace between markers, like
@@ -10433,11 +10502,15 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             }
         }
         // The pagy gem's `pagy(scope)` is `runtime/ruby/action_controller/
-        // pagy.rb`, a Base reopen only the ruby family and spinel load. On
+        // pagy.rb` (or pagy9.rb's `pagy` / `pagy_array` / `pagy_url_for`),
+        // a Base reopen only the ruby family and spinel load. On
         // a strict target the call would reach a controller with no such
         // method; ledger it rather than emit it.
         if let crate::expr::ExprNode::Send { recv, method, .. } = &*expr.node
-            && method.as_str() == "pagy"
+            && (method.as_str() == "pagy" || method.as_str() == "pagy_array" || method.as_str() == "pagy_url_for")
+            // Only what the locked gem provides: `pagy_array` with pagy 9's array extra, `pagy_url_for` with pagy 9.
+            && (method.as_str() == "pagy"
+                || (crate::ingest::pagy_locked_before_43(app) && (method.as_str() == "pagy_url_for" || app.pagy.array)))
             && target != "spinel"
             && target != "jruby"
             && !expr.span.is_synthetic()
@@ -10448,7 +10521,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 expr.span,
                 target,
                 "pagy",
-                "the pagy gem's `pagy` is only available on the ruby family and spinel".to_string(),
+                format!("the pagy gem's `{method}` is only available on the ruby family and spinel"),
             );
         }
         // Kernel#` is the backtick / `%x` shell-out. The ruby family and
@@ -11732,6 +11805,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     // Every SQLite shim in the base set (db.rb, db_cruby.rb); the JDBC one
     // is read in later, by `ruby_family_runtime_files`.
     apply_database_pragmas(&mut files, app);
+    apply_database_routes(&mut files, app);
     apply_attachable_locate(&mut files, app);
     // Same reason: both lanes require `runtime/job_registry.rb`.
     apply_job_registry(&mut files, app);
@@ -11870,16 +11944,16 @@ fn apply_pay_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(), 
     Ok(())
 }
 
-/// The pagy gem's `pagy` / `Pagy` (runtime/ruby/action_controller/pagy.rb)
-/// ride the tree only for an app whose Gemfile.lock carries pagy: the file
-/// reopens `ActionController::Base`, and an app without the gem has no
-/// `pagy` method to model (a controller of its own named `pagy` would
-/// otherwise meet the base's).
+/// The pagy gem's `pagy` / `Pagy` (runtime/ruby/action_controller/pagy.rb,
+/// or pagy9.rb for a pagy before 43) ride the tree only for an app whose
+/// Gemfile.lock carries pagy: the file reopens `ActionController::Base`,
+/// and an app without the gem has no `pagy` method to model (a controller
+/// of its own named `pagy` would otherwise meet the base's). The overflow
+/// extra's mode, which an initializer sets, is replayed after pagy9.rb.
 fn apply_pagy_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
-    if app.gem_lock.as_ref().is_some_and(|l| l.has("pagy")) {
-        return Ok(());
-    }
     const REQUIRE: &str = "require_relative \"action_controller/pagy\"\n";
+    let locked = app.gem_lock.as_ref().is_some_and(|l| l.has("pagy"));
+    let before_43 = locked && crate::ingest::pagy_locked_before_43(app);
     let ac = files
         .iter_mut()
         .find(|(p, _)| p == "runtime/action_controller.rb")
@@ -11887,12 +11961,31 @@ fn apply_pagy_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(),
     if !ac.1.contains(REQUIRE) {
         return Err("runtime/action_controller.rb: the pagy require moved".into());
     }
-    ac.1 = ac.1.replacen(REQUIRE, "", 1);
+    if !locked {
+        ac.1 = ac.1.replacen(REQUIRE, "", 1);
+    } else if before_43 {
+        ac.1 = ac.1.replacen(REQUIRE, "require_relative \"action_controller/pagy9\"\n", 1);
+    }
+    let dropped: &[&str] = match (locked, before_43) {
+        (false, _) => &["pagy", "pagy9"],
+        (true, true) => &["pagy"],
+        (true, false) => &["pagy9"],
+    };
     files.retain(|(p, _)| {
-        p != "runtime/action_controller/pagy.rb"
-            && p != "runtime/action_controller/pagy.rbs"
-            && p != "sig/runtime/action_controller/pagy.rbs"
+        !dropped.iter().any(|stem| {
+            p == &format!("runtime/action_controller/{stem}.rb")
+                || p == &format!("runtime/action_controller/{stem}.rbs")
+                || p == &format!("sig/runtime/action_controller/{stem}.rbs")
+        })
     });
+    if before_43 && let Some((_, src)) = files.iter_mut().find(|(p, _)| p == "runtime/action_controller/pagy9.rb") {
+        if let Some(mode) = app.pagy.overflow.as_deref() {
+            src.push_str(&format!("\nPagy.overflow = :{mode}\n"));
+        }
+        if let Some(limit) = app.pagy.limit {
+            src.push_str(&format!("\nPagy.default_limit = {limit}\n"));
+        }
+    }
     Ok(())
 }
 

@@ -108,13 +108,15 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // strict mode too.
     let mut hotspots: Option<bool> = None;
 
+    // Not on by default: the boot runs the checked app's own code, which a static check never did.
+    let mut observe_boot = std::env::var_os("ROUNDHOUSE_OBSERVE_APP_BOOT").is_some_and(|v| v == "1");
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
                     "Usage: roundhouse check [--continue|--strict] [--unknown-sends]\n\
-                     \x20                  [--inventory PATH] [--hotspots|--no-hotspots] [APP]\n\n\
+                     \x20                  [--inventory PATH] [--hotspots|--no-hotspots] [--observe-boot] [APP]\n\n\
                      Analyze the Rails app at APP (default {default_app}) and print the\n\
                      diagnostics; exit 1 on parse or type errors.\n\n\
                      Options:\n\
@@ -131,7 +133,11 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
                        --hotspots   Print the ranked error/survey hotspot report (default\n\
                                     on with --continue).\n\
                        --no-hotspots\n\
-                                    Suppress the hotspot report."
+                                    Suppress the hotspot report.\n\
+                       --observe-boot\n\
+                                    Boot the app under its bundle (it runs the app's own\n\
+                                    code) to read what a gem defines on its classes as it\n\
+                                    loads (aasm's state methods). Also ROUNDHOUSE_OBSERVE_APP_BOOT=1."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -140,6 +146,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             "--strict" => continue_on_error = false,
             "--hotspots" => hotspots = Some(true),
             "--no-hotspots" => hotspots = Some(false),
+            "--observe-boot" => observe_boot = true,
             "--inventory" => {
                 let Some(path) = args.next() else {
                     eprintln!("roundhouse-check: --inventory requires a PATH argument");
@@ -189,10 +196,48 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // Ingest inside a parse-diagnostic scope so Prism syntax errors —
     // which the error-recovering parser otherwise drops — are collected
     // and reported alongside the analyze diagnostics.
-    let (ingest_result, mut parse_diags) =
+    let (mut ingest_result, mut parse_diags) =
         crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
 
     let mut survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
+
+    // What a gem does to a class it holds in a variable (aasm's `klass.send(:define_method, …)`) is read from the app's
+    // own boot under its bundle, when asked; a boot that fails leaves the app as ingested, where those calls stay reported.
+    if observe_boot
+        && let Ok(app) = &ingest_result
+        && let gems = crate::observed_shapes::needed(app)
+        && !gems.is_empty()
+        && let Ok(dir) = path.canonicalize()
+    {
+        let key = crate::observed_shapes::key(&dir);
+        let (patches, refused) = crate::timings::phase("observe shapes", || crate::observed_shapes::observe_app(&dir, &gems, &key));
+        for (gem, why) in &refused {
+            eprintln!("roundhouse-check: note: {gem} changes a class held in a variable, and observing the app's boot did not answer it: {why}");
+        }
+        match patches {
+            Ok(patches) if refused.len() < gems.len() => {
+                crate::observed_shapes::install(patches);
+                if continue_on_error {
+                    survey::activate();
+                }
+                let (patched, patched_diags) =
+                    crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
+                let patched_survey = if continue_on_error { survey::drain() } else { Vec::new() };
+                crate::observed_shapes::uninstall();
+                // Not the patched app when it does not ingest: the first one, whose report the check still gives.
+                match patched {
+                    Ok(app) => {
+                        ingest_result = Ok(app);
+                        parse_diags = patched_diags;
+                        survey_errors = patched_survey;
+                    }
+                    Err(why) => eprintln!("roundhouse-check: note: the app with the observed boot's patches does not ingest: {why}"),
+                }
+            }
+            Ok(_) => {}
+            Err(why) => eprintln!("roundhouse-check: note: the observed boot's patches do not apply: {why}"),
+        }
+    }
 
     let mut app = match ingest_result {
         Ok(app) => app,

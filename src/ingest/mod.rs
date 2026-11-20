@@ -19,6 +19,7 @@ mod after_initialize;
 mod alba;
 mod built_send;
 mod conditional_permit;
+mod controller_name_constants;
 pub(crate) mod unreachable_views;
 mod view_paths;
 mod uncalled_helper_copies;
@@ -173,12 +174,17 @@ pub mod util;
 pub mod view;
 pub mod vite;
 pub mod current_page;
+mod computed_partials;
+mod yield_partials;
+mod form_partial_record;
 pub mod time_tag;
 mod visibility;
 
 pub use app::{ingest_app, ingest_app_from_tree, ingest_app_with_vfs};
 pub use concern_accessors::{defer as defer_accessor_surface, DeferredAccessorSurface};
 pub use puma_boot::preserve_config as preserve_puma_config;
+pub use pagy::locked_before_43 as pagy_locked_before_43;
+pub use pagy::locked_major as pagy_locked_major;
 
 /// The construct an ActiveRecord class outside app/models is reported
 /// under (`app::report_unmodelled_records`): the CLI keys its per-target
