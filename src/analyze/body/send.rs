@@ -2834,7 +2834,7 @@ impl<'a> BodyTyper<'a> {
                                 )
                                 .is_none() =>
                             {
-                                return other.clone()
+                                return other.subst_self(&Ty::Class { id: id.clone(), args: vec![].into() })
                             }
                             _ => {}
                         }
@@ -3050,7 +3050,8 @@ impl<'a> BodyTyper<'a> {
                             )
                             .is_none() =>
                         {
-                            return other.clone()
+                            // Not the stored `instance`: Rails' `scoping` runs it on the model, whose `new` builds one.
+                            return other.subst_self(&Ty::Class { id: of.clone(), args: vec![].into() })
                         }
                         _ => {}
                     }

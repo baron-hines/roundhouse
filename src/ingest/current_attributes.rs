@@ -326,11 +326,13 @@ fn synthesized_source(
         }
         let (t, m) = (d.target.as_str(), d.method.as_str());
         // `to: :user` calls the method: the ivar only for a declared attribute whose reader the app left as storage.
-        let target = if t.starts_with('@') || (attrs.iter().any(|a| a.as_str() == t) && !defines(t)) {
-            format!("@{}", t.trim_start_matches('@'))
+        let target = if t.starts_with('@') {
+            t.to_string()
+        } else if attrs.iter().any(|a| a.as_str() == t) && !defines(t) {
+            format!("@{t}")
         } else if RUBY_KEYWORDS.contains(&t) {
             format!("self.{t}")
-        } else if t.starts_with(|c: char| c.is_ascii_uppercase()) {
+        } else if t.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase()) {
             t.to_string()
         } else {
             // Not bare: `__target = __target` would read the local being assigned, not the method.
