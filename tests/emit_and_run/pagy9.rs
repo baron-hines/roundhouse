@@ -305,3 +305,39 @@ puts "PASS"
         .emit(roundhouse::project::BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("pagy 8.6.3")), "{errors:#?}");
 }
+
+/// maybe's `pagy(@chat.messages.ordered)`: a scope on an association read is the target's relation, as Rails'
+/// CollectionProxy is one, so the page is its rows and the count is the owner's.
+#[test]
+fn an_association_scope_paginates() {
+    let run = emit_and_run::real_blog()
+        .edit("Gemfile.lock", "    debug (1.11.1)\n", "    pagy (9.3.5)\n    debug (1.11.1)\n")
+        .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  pagy\n")
+        .edit(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n",
+            "class ApplicationController < ActionController::Base\n  include Pagy::Backend\n",
+        )
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", "class Comment < ApplicationRecord\n  scope :ordered, -> { order(:id) }\n")
+        .edit("app/controllers/articles_controller.rb", "  def show\n  end\n", "  def show\n    @pagy, @page_comments = pagy(@article.comments.ordered, limit: 2)\n  end\n")
+        .edit(
+            "app/views/articles/show.html.erb",
+            "<hr class=\"my-8\">\n",
+            "<hr class=\"my-8\">\n<div id=\"page\"><%= @page_comments.map(&:commenter).join(\",\") %>|<%= @pagy.count %>|<%= @pagy.pages %></div>\n",
+        )
+        .run_ruby(
+            r##"
+Article.delete_all
+Comment.delete_all
+a = Article.create!(title: "One", body: "body number one is long enough")
+b = Article.create!(title: "Two", body: "body number two is long enough")
+5.times { |i| Comment.create!(article_id: a.id, commenter: "c#{i + 1}", body: "x") }
+Comment.create!(article_id: b.id, commenter: "other", body: "x")
+status, _h, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles/#{a.id}", "QUERY_STRING" => "page=2", "rack.input" => StringIO.new(""))
+got = body.join[%r{<div id="page">(.*?)</div>}m, 1]
+raise "status #{status}, page #{got.inspect}" unless status == 200 && got == "c3,c4|5|3"
+puts "PASS"
+"##,
+        );
+    run.assert_passes();
+}
