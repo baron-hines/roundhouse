@@ -130,6 +130,24 @@ fn with_database(url: &str, name: &str) -> String {
     format!("{scheme}://{authority}/{name}{query}")
 }
 
+/// The rebuilt URL names the run's database whatever the configured one
+/// looks like: with or without a path, and with a query, which libpq
+/// reads after the path, so a `dbname` there would win over it.
+#[test]
+fn the_own_database_url_names_only_the_run_s_database() {
+    let cases = [
+        ("postgres://u:p@h:5432/db", "postgres://u:p@h:5432/own"),
+        ("postgres://u@h:5432/db?sslmode=disable", "postgres://u@h:5432/own?sslmode=disable"),
+        ("postgres://postgres@localhost", "postgres://postgres@localhost/own"),
+        ("postgres://postgres@localhost?connect_timeout=5", "postgres://postgres@localhost/own?connect_timeout=5"),
+        ("postgres://h/db?dbname=postgres&sslmode=disable", "postgres://h/own?sslmode=disable"),
+        ("postgres://h?dbname=postgres", "postgres://h/own"),
+    ];
+    for (configured, own) in cases {
+        assert_eq!(with_database(configured, "own"), own, "{configured}");
+    }
+}
+
 /// A database of the run's own on the configured server, created from
 /// `template0` and dropped when this is dropped, also while a failed
 /// assertion unwinds. An extension is one per database, so what the run
