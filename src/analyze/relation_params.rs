@@ -91,14 +91,19 @@ fn aliases_of(body: &Expr, param: &Symbol) -> Option<Vec<Symbol>> {
     let mut writes: Vec<(Symbol, &Expr)> = Vec::new();
     let mut opaque = Vec::new();
     collect_writes(body, false, &mut writes, &mut opaque);
-    // Only a local the body writes unconditionally first holds a value wherever it is read.
-    let top: Vec<&Symbol> = match &*body.node {
-        ExprNode::Seq { exprs } => exprs.iter().filter_map(|e| match &*e.node {
-            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => Some(name),
-            _ => None,
-        }).collect(),
-        _ => Vec::new(),
-    };
+    // Only a local the body writes unconditionally, before any statement reads it, holds a value wherever it is read.
+    let mut top: Vec<&Symbol> = Vec::new();
+    if let ExprNode::Seq { exprs } = &*body.node {
+        for (i, e) in exprs.iter().enumerate() {
+            if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node
+                && !top.contains(&name)
+                && !reads(value, name)
+                && !exprs[..i].iter().any(|before| reads(before, name))
+            {
+                top.push(name);
+            }
+        }
+    }
     let mut aliases = vec![param.clone()];
     loop {
         let before = aliases.len();
@@ -128,6 +133,10 @@ fn collect_writes<'a>(expr: &'a Expr, in_block: bool, out: &mut Vec<(Symbol, &'a
             }
             collect_writes(value, in_block, out, opaque);
         }
+        ExprNode::OpAssign { target: LValue::Var { name, .. }, value, .. } => {
+            opaque.push(name.clone());
+            collect_writes(value, in_block, out, opaque);
+        }
         ExprNode::MultiAssign { targets, value } => {
             opaque.extend(targets.iter().filter_map(|t| match t {
                 LValue::Var { name, .. } => Some(name.clone()),
@@ -138,6 +147,15 @@ fn collect_writes<'a>(expr: &'a Expr, in_block: bool, out: &mut Vec<(Symbol, &'a
         ExprNode::Lambda { .. } => expr.node.for_each_child(&mut |c| collect_writes(c, true, out, opaque)),
         _ => expr.node.for_each_child(&mut |c| collect_writes(c, in_block, out, opaque)),
     }
+}
+
+fn reads(expr: &Expr, local: &Symbol) -> bool {
+    if matches!(&*expr.node, ExprNode::Var { name, .. } if name == local) {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found = found || reads(c, local));
+    found
 }
 
 fn chain_on(expr: &Expr, aliases: &[Symbol]) -> bool {
@@ -217,6 +235,14 @@ mod tests {
         assert!(!block.chains(&Symbol::from("f"), 0), "{block:?}");
         let multi = params_of("class S\n  def self.f(scope, q)\n    query = scope\n    query, other = q\n    query.where(a: 1)\n  end\nend\n");
         assert!(!multi.chains(&Symbol::from("f"), 0), "{multi:?}");
+    }
+
+    #[test]
+    fn a_local_read_before_its_write_or_compound_assigned_is_no_alias() {
+        let early = params_of("class S\n  def self.f(scope, query, early)\n    return query if early\n    query = scope\n    query.where(a: 1)\n  end\nend\n");
+        assert!(!early.returns(&Symbol::from("f"), 0), "{early:?}");
+        let compound = params_of("class S\n  def self.f(scope)\n    scope.where(a: 1)\n    scope &&= []\n    scope\n  end\nend\n");
+        assert!(!compound.chains(&Symbol::from("f"), 0), "{compound:?}");
     }
 
     #[test]

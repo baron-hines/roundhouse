@@ -206,7 +206,7 @@ pub struct Ctx {
     /// `self` on the class side), not one `Class.new` is building.
     pub live_class_locals: crate::det::HashSet<Symbol>,
     /// Locals a statement of this body last assigned a has_many read the lowering seeds (`analyze::relation_params`).
-    pub has_many_locals: crate::det::HashSet<Symbol>,
+    pub has_many_locals: HashMap<Symbol, Vec<Symbol>>,
     /// Typing an `app/helpers` module's body. Its `self` may be the
     /// module's sole includer (a controller), but the emitted body runs
     /// in the view, where a bare `render` is ActionView's String.
@@ -4139,8 +4139,10 @@ impl<'a> BodyTyper<'a> {
                             local_ctx.query_class_objects.remove(name);
                             local_ctx.live_class_locals.remove(name);
                             local_ctx.has_many_locals.remove(name);
+                            // A parked read is seeded from its owner when used, so rebinding the owner drops it.
+                            local_ctx.has_many_locals.retain(|_, owners| !owners.contains(name));
                             if self.seeded_has_many_read(value, if local_ctx.class_side { None } else { local_ctx.self_ty.as_ref() }) {
-                                local_ctx.has_many_locals.insert(name.clone());
+                                local_ctx.has_many_locals.insert(name.clone(), locals_read(value));
                             }
                             if proven { local_ctx.class_objects.insert(name.clone()); }
                             // `flag ? A : B` has no single identity to write
@@ -4153,6 +4155,21 @@ impl<'a> BodyTyper<'a> {
                             // Before the binding insert below: the lambda body
                             // was typed in this `local_ctx`, without its own name.
                             lambda_local::remember(&mut lambda_locals, i, e, &local_ctx);
+                        }
+                        match &*e.node {
+                            ExprNode::MultiAssign { targets, .. } => {
+                                for t in targets {
+                                    if let LValue::Var { name, .. } = t {
+                                        local_ctx.has_many_locals.remove(name);
+                                        local_ctx.has_many_locals.retain(|_, owners| !owners.contains(name));
+                                    }
+                                }
+                            }
+                            ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => {
+                                local_ctx.has_many_locals.remove(name);
+                                local_ctx.has_many_locals.retain(|_, owners| !owners.contains(name));
+                            }
+                            _ => {}
                         }
                         // Warden's `strategy ||= Class.new(Base)` over a `strategy = nil` parameter: a class either way, of no one identity.
                         if let ExprNode::OpAssign { target: LValue::Var { name, .. }, op: crate::expr::OpAssignOp::OrOr, value } = &*e.node
@@ -8776,4 +8793,17 @@ fn declare_dropped_locals(kept: Expr, dropped: &Expr, cond: &Expr, ctx: &Ctx) ->
         .collect();
     exprs.push(kept);
     Expr::new(span, ExprNode::Seq { exprs })
+}
+
+/// The locals `expr` reads.
+fn locals_read(expr: &Expr) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<Symbol>) {
+        if let ExprNode::Var { name, .. } = &*e.node {
+            out.push(name.clone());
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    walk(expr, &mut out);
+    out
 }

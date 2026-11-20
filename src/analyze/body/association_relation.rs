@@ -45,18 +45,23 @@ impl<'a> BodyTyper<'a> {
     /// An argument a relation parameter takes (`relation_params`): a has_many read, or a local this body last bound to
     /// one, is lowered to its relation. Other records of a model there are ones Rails' `where` would not answer either.
     pub(super) fn relation_argument(&self, arg: &Expr, ctx: &Ctx) -> Option<Result<Ty, ()>> {
-        let Some(Ty::Array { elem }) = arg.ty.as_ref() else { return None };
+        let is_model = |id: &ClassId| self.classes().get(id).is_some_and(|c| c.table.is_some() || c.active_record_model);
+        let Some(Ty::Array { elem }) = arg.ty.as_ref() else {
+            // A union holding records may be them at run time, and they answer no `where`.
+            let records = matches!(arg.ty.as_ref(), Some(Ty::Union { variants }) if variants.iter().any(|v| matches!(v,
+                Ty::Array { elem } if matches!(&**elem, Ty::Class { id, .. } if is_model(id)))));
+            return records.then_some(Err(()));
+        };
         let Ty::Class { id: target, .. } = &**elem else { return None };
         let self_ty = if ctx.class_side { None } else { ctx.self_ty.as_ref() };
         let seeded = match &*arg.node {
-            ExprNode::Var { name, .. } => ctx.has_many_locals.contains(name),
+            ExprNode::Var { name, .. } => ctx.has_many_locals.contains_key(name),
             _ => self.seeded_has_many_read(arg, self_ty),
         };
         if seeded {
             return Some(Ok(Ty::Relation { of: target.clone() }));
         }
-        let model = self.classes().get(target).is_some_and(|c| c.table.is_some() || c.active_record_model);
-        (model && matches!(&*arg.node, ExprNode::Var { .. })).then_some(Err(()))
+        is_model(target).then_some(Err(()))
     }
 
     /// The call whose every return is its relation argument or a chain on it answers that argument's relation.

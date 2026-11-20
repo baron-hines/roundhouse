@@ -4615,6 +4615,30 @@ pub(crate) struct Locals {
 /// Alias-map key for a name. Ivars and locals share one map, so the
 /// ivar spelling is prefixed — `@room` and a local `room` are different
 /// bindings and must not overwrite each other.
+fn lvalue_key(target: &crate::expr::LValue) -> Option<Symbol> {
+    match target {
+        crate::expr::LValue::Var { name, .. } => Some(alias_key(name, false)),
+        crate::expr::LValue::Ivar { name } => Some(alias_key(name, true)),
+        _ => None,
+    }
+}
+
+/// An association read parked on a name reads its owner when it is seeded, so the owner's rebinding drops it.
+fn forget_owner(locals: &mut Locals, key: &Symbol) {
+    locals.assoc.retain(|_, (_, read)| !mentions_name(read, key));
+}
+
+fn mentions_name(expr: &Expr, key: &Symbol) -> bool {
+    let hit = match &*expr.node {
+        ExprNode::Var { name, .. } => alias_key(name, false) == *key,
+        ExprNode::Ivar { name } => alias_key(name, true) == *key,
+        _ => false,
+    };
+    let mut found = hit;
+    expr.node.for_each_child(&mut |c| found = found || mentions_name(c, key));
+    found
+}
+
 fn alias_key(name: &Symbol, ivar: bool) -> Symbol {
     if ivar { Symbol::from(format!("@{}", name.as_str())) } else { name.clone() }
 }
@@ -4765,6 +4789,7 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
                 crate::expr::LValue::Ivar { name } => Some(alias_key(name, true)),
                 _ => None,
             } {
+                forget_owner(locals, &key);
                 match seedable_assoc_read(ctx, &value, expr.span) {
                     Some(model) => {
                         locals.assoc.insert(key, (model, value.clone()));
@@ -4776,6 +4801,24 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             }
             *expr.node = ExprNode::Assign { target, value };
             m
+        }
+        // A rebinding this pass does not follow leaves no relation or association behind the names it writes.
+        ExprNode::MultiAssign { .. } | ExprNode::OpAssign { .. } => {
+            let mut names = Vec::new();
+            match &*expr.node {
+                ExprNode::MultiAssign { targets, .. } => names.extend(targets.iter().filter_map(lvalue_key)),
+                ExprNode::OpAssign { target, .. } => names.extend(lvalue_key(target)),
+                _ => {}
+            }
+            expr.node.for_each_child_mut(&mut |c| {
+                rewrite(c, ctx, locals);
+            });
+            for key in names {
+                locals.rel.remove(&key);
+                locals.assoc.remove(&key);
+                forget_owner(locals, &key);
+            }
+            None
         }
         ExprNode::Send { .. } => {
             let model = rewrite_send(expr, ctx, locals);
@@ -5782,7 +5825,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 *expr = put(span, Some(filtered), Symbol::from(terminal), vec![], None, false);
                                 return None;
                             }
-                            let keeps_model = is_chain;
+                            let keeps_model = is_chain || method.as_str() == "all";
                             let method = counted_terminal(&method, &args, block.as_ref())
                                 .unwrap_or(method);
                             *expr = put(span, Some(seed), method, args, block, parenthesized);
