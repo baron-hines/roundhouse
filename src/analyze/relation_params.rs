@@ -168,7 +168,17 @@ fn chain_on(expr: &Expr, aliases: &[Symbol]) -> bool {
     }
 }
 
+/// Whether a block's own parameter names one of `aliases`: inside it the name is the block's, not the method's.
+fn shadows(expr: &Expr, aliases: &[Symbol]) -> bool {
+    matches!(&*expr.node, ExprNode::Lambda { params, rest_param, extra_params, block_param, .. }
+        if params.iter().chain(rest_param.iter()).chain(block_param.iter()).chain(extra_params.iter().map(|p| &p.name))
+            .any(|p| aliases.contains(p)))
+}
+
 fn calls_builder(expr: &Expr, aliases: &[Symbol]) -> bool {
+    if shadows(expr, aliases) {
+        return false;
+    }
     if let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
         && crate::catalog::is_relation_builder_name(method.as_str())
         && chain_on(recv, aliases)
@@ -243,6 +253,12 @@ mod tests {
         assert!(!early.returns(&Symbol::from("f"), 0), "{early:?}");
         let compound = params_of("class S\n  def self.f(scope)\n    scope.where(a: 1)\n    scope &&= []\n    scope\n  end\nend\n");
         assert!(!compound.chains(&Symbol::from("f"), 0), "{compound:?}");
+    }
+
+    #[test]
+    fn a_block_parameter_of_the_same_name_is_the_blocks() {
+        let got = params_of("class S\n  def self.f(children)\n    [1].each { |children| children.order(:id) }\n    children\n  end\nend\n");
+        assert!(!got.chains(&Symbol::from("f"), 0), "{got:?}");
     }
 
     #[test]
