@@ -128,9 +128,34 @@ fn with_database(url: &str, name: &str) -> String {
     let (base, query) = url.split_once('?').unwrap_or((url, ""));
     let (scheme, rest) = base.split_once("://").expect("a postgres:// URL");
     let authority = rest.split_once('/').map_or(rest, |(authority, _)| authority);
-    let query: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("dbname")).collect();
+    let query: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && percent_decoded(pair.split('=').next().unwrap_or("")) != "dbname")
+        .collect();
     let query = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
     format!("{scheme}://{authority}/{name}{query}")
+}
+
+/// `text` with its `%XX` escapes decoded, as libpq decodes a URI's query
+/// keys before matching them. A malformed escape is kept as written.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes.get(at + 1..at + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The rebuilt URL names the run's database whatever the configured one
