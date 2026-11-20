@@ -22410,6 +22410,8 @@ mod errors_computed_field;
 mod aasm_gem;
 #[path = "emit_and_run/aasm_source.rs"]
 mod aasm_source;
+#[path = "emit_and_run/aasm_generated_methods.rs"]
+mod aasm_generated_methods;
 #[path = "emit_and_run/runtime_registered_callbacks.rs"]
 mod runtime_registered_callbacks;
 #[path = "emit_and_run/reopened_alias.rs"]

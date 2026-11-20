@@ -189,10 +189,39 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // Ingest inside a parse-diagnostic scope so Prism syntax errors —
     // which the error-recovering parser otherwise drops — are collected
     // and reported alongside the analyze diagnostics.
-    let (ingest_result, mut parse_diags) =
+    let (mut ingest_result, mut parse_diags) =
         crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
 
     let mut survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
+
+    // What a gem does to a class it holds in a variable (aasm's `klass.send(:define_method, …)`) is read from the app's
+    // own boot under its bundle; a boot that fails leaves the app as ingested, where those calls stay reported.
+    if let Ok(app) = &ingest_result
+        && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0")
+        && let gems = crate::observed_shapes::needed(app)
+        && !gems.is_empty()
+        && let Ok(dir) = path.canonicalize()
+    {
+        let key = crate::observed_shapes::key(&dir);
+        let (patches, refused) = crate::timings::phase("observe shapes", || crate::observed_shapes::observe_app(&dir, &gems, &key));
+        for (gem, why) in &refused {
+            eprintln!("roundhouse-check: note: {gem} changes a class held in a variable, and observing the app's boot did not answer it: {why}");
+        }
+        match patches {
+            Ok(patches) if refused.len() < gems.len() => {
+                crate::observed_shapes::install(patches);
+                if continue_on_error {
+                    survey::activate();
+                }
+                (ingest_result, parse_diags) =
+                    crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
+                survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
+                crate::observed_shapes::uninstall();
+            }
+            Ok(_) => {}
+            Err(why) => eprintln!("roundhouse-check: note: the observed boot's patches do not apply: {why}"),
+        }
+    }
 
     let mut app = match ingest_result {
         Ok(app) => app,
