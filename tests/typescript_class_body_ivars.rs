@@ -59,3 +59,42 @@ fn the_blogs_view_helpers_declare_the_hidden_autocomplete_flag() {
     assert!(helpers.contains("this.hidden_autocomplete === true"), "{helpers}");
     assert!(helpers.contains("static hidden_autocomplete: boolean = false;"), "{helpers}");
 }
+
+fn emit_one(rb: &str, rbs: &str, name: &str) -> String {
+    let classes = parse_library_with_rbs(rb.as_bytes(), rbs, "widget.rb").expect("parse");
+    let class = classes.iter().find(|c| c.name.0.as_str() == name).unwrap_or_else(|| panic!("no {name}"));
+    emit_library_class(class).expect("emit")
+}
+
+#[test]
+fn a_class_side_reader_over_a_class_body_ivar_starts_at_the_bodys_value() {
+    let ts = emit_one(
+        "module Widget\n  @armed = true\n\n  class << self\n    attr_reader :armed\n  end\nend\n",
+        "module Widget\n  def self.armed: () -> bool\nend\n",
+        "Widget",
+    );
+    assert!(ts.contains("static armed: boolean = true;"), "{ts}");
+    assert_eq!(ts.matches("static armed").count(), 1, "{ts}");
+}
+
+#[test]
+fn a_child_class_body_ivar_is_a_field_of_its_own_not_a_declaration() {
+    let ts = emit_one(
+        "class Widget\nend\n\nclass Gizmo < Widget\n  @armed = true\n\n  def self.status\n    @armed == true ? \"armed\" : \"idle\"\n  end\nend\n",
+        "class Widget\nend\n\nclass Gizmo < Widget\n  def self.status: () -> String\nend\n",
+        "Gizmo",
+    );
+    assert!(ts.contains("static armed: boolean = true;"), "{ts}");
+    assert!(!ts.lines().any(|l| l.contains("armed:") && l.contains("declare")), "{ts}");
+}
+
+#[test]
+fn a_class_body_ivar_read_only_by_a_parameter_default_is_a_static_field() {
+    let ts = emit_one(
+        "module Widget\n  @armed = true\n\n  def self.status(value = @armed)\n    value == true ? \"armed\" : \"idle\"\n  end\nend\n",
+        "module Widget\n  def self.status: (?bool) -> String\nend\n",
+        "Widget",
+    );
+    assert!(ts.contains("this.armed"), "{ts}");
+    assert!(ts.contains("static armed: boolean = true;"), "{ts}");
+}

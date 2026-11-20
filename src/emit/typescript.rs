@@ -2054,10 +2054,14 @@ pub(super) fn js_library_class(
         // initializer when the field is `declare`d (parent provides
         // backing).
         let memo = memoized.get(&(name.clone(), *is_static));
-        let needs_declare = needs_declare && memo.is_none();
-        let init = if let Some(literal) = memo {
-            Some(expr::js_expr(literal))
-        } else if *is_static && *from_ivar && !needs_declare && let Some(literal) = static_ivar_initial.get(name) {
+        // A class-side field the class body writes starts at the body's
+        // value, whichever pass declared it (a class-side `attr_reader`
+        // too), and is this class's own, so never only `declare`d: the
+        // class object's ivar is not its parent's.
+        let body = if *is_static { static_ivar_initial.get(name) } else { None };
+        let literal = memo.or(body);
+        let needs_declare = needs_declare && literal.is_none();
+        let init = if let Some(literal) = literal {
             Some(expr::js_expr(literal))
         } else if *is_static && !needs_declare {
             ts_default_for_type(ty)
@@ -2936,6 +2940,11 @@ fn class_body_static_ivars<'a>(
     let mut read = crate::det::HashSet::default();
     for m in class.methods.iter().filter(|m| matches!(m.receiver, crate::dialect::MethodReceiver::Class)) {
         reads(&m.body, &mut read);
+        // A parameter default (`def self.status(value = @armed)`) reads
+        // it too.
+        for default in m.params.iter().filter_map(|p| p.default.as_ref()) {
+            reads(default, &mut read);
+        }
     }
     let mut out: Vec<(String, Ty, Option<&'a Expr>)> = Vec::new();
     for init in &class.class_ivar_initializers {
