@@ -39,7 +39,7 @@ const CONCERNS: &[(&str, &str)] = &[
     ("cursor_a", "module CursorA\n  def label\n    \"cursor a\"\n  end\nend\n"),
     ("cursor_b", "module CursorB\n  def other_label\n    \"cursor b\"\n  end\nend\n"),
     ("cursor_c", "module CursorC\n  def label\n    \"cursor c\"\n  end\nend\n"),
-    ("cursor_x", "module CursorX\n  include CursorC\n  include CursorB\n  include CursorA\nend\n"),
+    ("cursor_x", "module CursorX\n  include CursorC\n  include CursorB\n  include CursorA\n\n  def cursor_x\n    \"cursor x\"\n  end\nend\n"),
     // A module the superclass includes, and another.
     ("super_m", "module SuperM\n  def label\n    \"super m\"\n  end\nend\n"),
     ("super_n", "module SuperN\n  def label\n    \"super n\"\n  end\nend\n"),
@@ -153,6 +153,13 @@ const SPECIAL: &[(&str, &str, &str)] = &[
     // [LoopInclude, LoopThenInclude, LoopLabelC, LoopLabelB]: the loop runs
     // where it stands, so the later `include LoopLabelC` is nearer.
     ("loop_include", "class LoopIncludeController < ApplicationController\n  include LoopThenInclude\n\n  def show\n    render json: { label: label }\n  end\nend\n", "loop c"),
+    // [LibParentChild, SuperN, SuperLibParent, SuperM]: the superclass is a
+    // class in lib/, not a controller, and its SuperM still makes the
+    // child's `include SuperM` add nothing.
+    ("lib_parent_child", "class LibParentChildController < SuperLibParent\n  include SuperN\n  include SuperM\n\n  def show\n    render json: { label: label }\n  end\nend\n", "super n"),
+    // [DeepChain, Deep0, Deep1, …, Deep65]: a chain of 66 modules, each
+    // including the next; only the last defines `label`.
+    ("deep_chain", "class DeepChainController < ApplicationController\n  include Deep0\n\n  def show\n    render json: { label: label }\n  end\nend\n", "deep 65"),
     // DelegateTwo's hook runs last, so its `delegate` defines `label`.
     ("delegated", "class DelegatedController < ApplicationController\n  include DelegateOne\n  include DelegateTwo\n\n  def show\n    render json: { label: label }\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n", "source two"),
 ];
@@ -170,7 +177,18 @@ fn app() -> emit_and_run::Overlay {
     app = app
         .write("app/controllers/super_parent_controller.rb", "class SuperParentController < ApplicationController\n  include SuperM\nend\n")
         .write("app/controllers/super_pair_parent_controller.rb", "class SuperPairParentController < ApplicationController\n  include SuperM\n  include SuperN\nend\n")
+        .write("lib/super_lib_parent.rb", "class SuperLibParent < ApplicationController\n  include SuperM\nend\n")
         .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
+    // Deep0 includes Deep1, … Deep64 includes Deep65; each has a method of
+    // its own, so each is kept.
+    for i in 0..66 {
+        let body = if i < 65 {
+            format!("  include Deep{}\n\n  def deep{i}\n    \"deep {i}\"\n  end\n", i + 1)
+        } else {
+            "  def label\n    \"deep 65\"\n  end\n".to_string()
+        };
+        app = app.write(&format!("app/controllers/concerns/deep{i}.rb"), &format!("module Deep{i}\n{body}end\n"));
+    }
     let mut routes = String::from("Rails.application.routes.draw do\n");
     for (name, source, _) in SPECIAL {
         app = app.write(&format!("app/controllers/{name}_controller.rb"), source);
