@@ -802,7 +802,18 @@ impl<'a> BodyTyper<'a> {
         // of the name answers a class-side call instead, and may yield
         // anything; a relation still runs Rails' batches.
         if matches!(method.as_str(), "find_each" | "find_in_batches" | "in_batches") {
-            let is_model = |id: &ClassId| self.classes().get(id).is_some_and(|c| c.table.is_some());
+            // An STI subclass is a library class on its parent's table, so the table is read up the chain.
+            let is_model = |id: &ClassId| {
+                let mut at = self.classes().get(id);
+                for _ in 0..32 {
+                    match at {
+                        Some(c) if c.table.is_some() => return true,
+                        Some(c) => at = c.parent.as_ref().and_then(|p| self.classes().get(p)),
+                        None => return false,
+                    }
+                }
+                false
+            };
             let of = match recv_ty {
                 Ty::Relation { of } => Some(of.clone()),
                 Ty::Array { elem } => match &**elem {

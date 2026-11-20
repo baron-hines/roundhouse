@@ -43,3 +43,36 @@ fn a_records_as_json_inside_a_literal_to_json_on_spinel() {
     assert!(run.stdout.contains("as_json in to_json passed"), "{}", run.stdout);
 }
 
+
+/// maybe's `@family.merchants.find_each { |merchant| … merchant.as_json }`: `merchants` is
+/// `class_name: "FamilyMerchant"`, an STI subclass on its parent's table, and `find_each`
+/// yields its records as it does the parent's.
+fn sti_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit("db/schema.rb", "    t.string \"commenter\"\n", "    t.string \"commenter\"\n    t.string \"type\"\n")
+        .write("app/models/special_comment.rb", "class SpecialComment < Comment\nend\n")
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  has_many :specials, class_name: \"SpecialComment\"\n\n  def export_specials\n    lines = []\n    specials.find_each { |c| lines << { type: \"Special\", data: c.as_json }.to_json }\n    lines\n  end\n",
+        )
+}
+
+const STI_ASSERTIONS: &str = r##"
+require "json"
+a = Article.create!(title: "Hello", body: "A body long enough for validation.")
+SpecialComment.create!(article: a, commenter: "Ann", body: "special")
+Comment.create!(article: a, commenter: "Bob", body: "plain")
+lines = a.export_specials
+raise lines.inspect unless lines.size == 1
+data = JSON.parse(lines.first)["data"]
+raise lines.first unless data["commenter"] == "Ann" && data["type"] == "SpecialComment" && data["article_id"] == a.id
+puts "sti find_each as_json passed"
+"##;
+
+#[test]
+fn an_sti_associations_find_each_yields_records_as_json_reads() {
+    let run = sti_app().run_ruby(STI_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("sti find_each as_json passed"), "{}", run.stdout);
+}
