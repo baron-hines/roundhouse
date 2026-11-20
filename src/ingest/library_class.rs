@@ -212,6 +212,11 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
         }) {
             continue;
         }
+        // A class variable is looked up in the block's lexical scope, the
+        // top level, where an opening would find the class's.
+        if refers_to_class_variable(&statements.as_node()) {
+            continue;
+        }
         let owner = ClassId(Symbol::from(path.join("::")));
         let DeclBody {
             includes,
@@ -245,6 +250,34 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
         out.push(ClassEvalOpening { start: node.location().start_offset() as u32, opening, bare_constants, rooted_constants });
     }
     Ok(out)
+}
+
+/// Whether `node` reads or writes a class variable anywhere, `defined?(@@x)` included.
+fn refers_to_class_variable(node: &ruby_prism::Node<'_>) -> bool {
+    struct Found(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Found {
+        fn visit_class_variable_read_node(&mut self, _: &ruby_prism::ClassVariableReadNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_write_node(&mut self, _: &ruby_prism::ClassVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_target_node(&mut self, _: &ruby_prism::ClassVariableTargetNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_operator_write_node(&mut self, _: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_and_write_node(&mut self, _: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_or_write_node(&mut self, _: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut found = Found(false);
+    ruby_prism::Visit::visit(&mut found, node);
+    found.0
 }
 
 /// The constants `node` reads: bare (`TOKEN`, the `Helper` of
