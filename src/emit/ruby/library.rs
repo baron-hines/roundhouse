@@ -314,15 +314,9 @@ fn order_openings_by_load(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
-/// The file an opening was read from: the first of its spans that points
-/// at a source.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file(lc: &LibraryClass, app: &App) -> Option<String> {
-    let span = std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())?;
+    let span = lc.source_span()?;
     let source = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
     Some(normalize_path(&source.path))
 }
@@ -4817,6 +4811,8 @@ fn is_framework_view_helper(name: &str) -> bool {
     matches!(
         name,
         "image_tag"
+            // pagy9.rb's `Pagy::Frontend#pagy_url_for`, shipped only for an app locking a pagy before 43.
+            | "pagy_url_for"
             // `include ActionView::RecordIdentifier` brings `dom_id`
             // (below) and its sibling `dom_class` into non-view classes.
             | "dom_class"

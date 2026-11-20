@@ -240,6 +240,7 @@ module ActionView
       opts.to_h.each do |k, v|
         attrs[k] = v
       end
+      attrs[:autocomplete] = "off" unless hidden_autocomplete_attr.empty? || attrs.key?(:autocomplete) || attrs.key?("autocomplete")
       "<input#{render_attrs(attrs)} />"
     end
 

@@ -682,7 +682,18 @@ fn untyped_subexpressions_baseline() {
     // them for the RBS-paired gate.
     // MEASURED 1451 on merging main 2d02f862f (1448) with the routed
     // connection handles' +3, which add up.
-    const CEILING: usize = 1451;
+    // MEASURED 1439 on PostgreSQL row locking (main 1a54a7397: 1433):
+    // the ruby family's `lock!` / `_lock_row` (active_record/connection.rb)
+    // add 6. Four read the `lock` argument, typed only by connection.rbs,
+    // which this RBS-less probe does not load; the other two are the `Db`
+    // receivers of `Db.adapter_name` and `Db.exec`, as in `Relation#lock`.
+    // MEASURED 1446 on the #2201 review (1439 above): `_lock_row` keeps
+    // the lock's row through `Db.exec_returning` / `Db.step?` /
+    // `Db.finalize` (+7). The `stmt` local, its begin/ensure and the three
+    // `Db` results read as untyped on this RBS-less probe, as `Db.exec` did.
+    // MEASURED 1464 on merging main 7d9513597 (1451) with the row locking's
+    // +13 (1446 less main 1a54a7397's 1433), which add up.
+    const CEILING: usize = 1464;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

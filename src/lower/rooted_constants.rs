@@ -140,6 +140,59 @@ pub(crate) fn unroot_for_target(app: &mut App, target: BuildTarget) {
     crate::lower::for_each_emit_body(app, &mut |expr| unroot(expr, &mut |path, _| strip(path)));
 }
 
+/// Roots a lowered model's class constant whose bare first segment the class itself would reach elsewhere: `Note`
+/// (the top-level model `class_name: "::Note"` names) inside `class Article`, beside an `Article::Note`. The IR's
+/// class paths are absolute already, so the root changes no meaning; it is added only where the bare spelling would.
+pub(crate) fn root_shadowed(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
+    let declared: crate::det::HashSet<String> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str().to_string())
+        .chain(app.library_classes.iter().map(|c| c.name.0.as_str().to_string()))
+        .chain(lcs.iter().map(|c| c.name.0.as_str().to_string()))
+        .collect();
+    let parents: crate::det::HashMap<String, String> = app
+        .models
+        .iter()
+        .filter_map(|m| m.parent.as_ref().map(|p| (m.name.0.as_str().to_string(), p.0.as_str().trim_start_matches("::").to_string())))
+        .chain(app.library_classes.iter().filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str().to_string(), p.0.as_str().trim_start_matches("::").to_string()))))
+        .collect();
+    for lc in lcs.iter_mut() {
+        let owner = lc.name.0.as_str().to_string();
+        // Each scope a bare name is looked up in before the top level: the class, its lexical namespaces (the
+        // emitter may nest them), and its superclasses.
+        let mut scopes: Vec<String> = vec![owner.clone()];
+        scopes.extend(owner.match_indices("::").map(|(i, _)| owner[..i].to_string()));
+        // Not `scopes` as the visited set: a parent that is also a lexical namespace (`Account::Archive < Account`)
+        // still has superclasses of its own.
+        let mut visited: crate::det::HashSet<String> = crate::det::HashSet::default();
+        let mut current = parents.get(&owner);
+        while let Some(parent) = current {
+            if !visited.insert(parent.clone()) {
+                break;
+            }
+            scopes.push(parent.clone());
+            current = parents.get(parent);
+        }
+        let mut root = |path: &mut Vec<Symbol>, _: crate::span::Span| {
+            if path.first().is_none_or(|s| s.as_str().is_empty()) {
+                return;
+            }
+            let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            let first = path[0].as_str();
+            if declared.contains(&joined) && scopes.iter().any(|scope| declared.contains(&format!("{scope}::{first}"))) {
+                path.insert(0, Symbol::from(""));
+            }
+        };
+        for method in &mut lc.methods {
+            unroot(&mut method.body, &mut root);
+        }
+        for e in lc.class_ivar_initializers.iter_mut().chain(lc.constants.iter_mut().map(|(_, e)| e)).chain(lc.unknown_calls.iter_mut()) {
+            unroot(e, &mut root);
+        }
+    }
+}
+
 /// For a rooted `path` read in `owner`'s body, the enclosing namespace
 /// (`Api` for `Api::Report`) that declares a class or namespace named
 /// like the path's first segment, which a bare name would reach first.

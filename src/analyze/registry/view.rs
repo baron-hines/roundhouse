@@ -88,6 +88,11 @@ pub(in crate::analyze) fn register(
     // `form.object` is the form's model (unknown model → gradual);
     // nested `fields_for`/`fields` yield another builder.
     form_builder.instance_methods.insert(Symbol::from("object"), Ty::Untyped);
+    // Rails' `class_attribute :field_helpers`, which a builder subclass reads in its body (maybe's `StyledFormBuilder`);
+    // the Ruby family's overlay answers it (`action_view_form_builder.rb`).
+    let symbols = Ty::Array { elem: std::sync::Arc::new(Ty::Sym) };
+    form_builder.class_methods.insert(Symbol::from("field_helpers"), symbols.clone());
+    form_builder.instance_methods.insert(Symbol::from("field_helpers"), symbols);
     for m in ["fields_for", "fields"] {
         form_builder
             .instance_methods
@@ -309,6 +314,17 @@ pub(in crate::analyze) fn register(
                 action_view.instance_methods.remove(&name);
             }
         }
+    }
+    // pagy9.rb's `Pagy::Frontend#pagy_url_for`, for an app whose helper includes the module, as Rails' views see it.
+    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy"))
+        && crate::ingest::pagy_locked_before_43(app)
+        && app
+            .library_classes
+            .iter()
+            .filter(|c| app.helper_modules.contains(&c.name) || c.name.0.as_str() == "ActionView::Base")
+            .any(|c| c.includes.iter().any(|m| m.0.as_str().trim_start_matches("::") == "Pagy::Frontend"))
+    {
+        action_view.instance_methods.insert(Symbol::from("pagy_url_for"), Ty::Str);
     }
     classes.insert(ClassId(Symbol::from("ActionView::Base")), action_view);
 

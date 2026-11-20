@@ -240,6 +240,8 @@ module ActionView
     # expansions. See view_helpers.rb for the runtime/macro split
     # rationale.
     def self.csrf_token_hidden_input: () -> String
+    def self.hidden_autocomplete_attr: () -> String
+    def self.keep_hidden_autocomplete: () -> String
     def self.cache_scope: () -> String
     def self.begin_broadcast_render: () -> String
     def self.broadcast_render: (String _armed, String html) -> String
