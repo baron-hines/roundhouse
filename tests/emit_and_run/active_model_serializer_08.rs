@@ -318,6 +318,19 @@ fn an_active_model_serializer_08_beside_a_sending_serialization_reader_lowers() 
     }
 }
 
+/// A mixin outside the subset is ledgered at the serializer's `include`: a gap in the mixin's own file would claim
+/// that file's findings.
+#[test]
+fn an_active_model_serializer_08_mixin_refusal_is_ledgered_at_the_include() {
+    let mut tree = tree("class ASerializer < ActiveModel::Serializer\n  include Helpers\nend\n");
+    tree.insert("app/helpers/helpers.rb".into(), b"module Helpers\n  include Comparable\n\n  def x\n    1\n  end\nend\n".to_vec());
+    roundhouse::ingest::survey::activate();
+    roundhouse::ingest::ingest_app_from_tree(tree).expect("survey ingest");
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    let entry = ledger.iter().find(|e| e.contains("`include Helpers`")).unwrap_or_else(|| panic!("{ledger:#?}"));
+    assert!(entry.contains("app/serializers/serializers.rb") && !entry.contains("app/helpers"), "{entry}");
+}
+
 /// Under a 0.10 lockfile the 0.8 expansion stays out: a direct `ActiveModel::Serializer` child is 0.10's.
 #[test]
 fn an_active_model_serializer_08_needs_the_08_lockfile() {

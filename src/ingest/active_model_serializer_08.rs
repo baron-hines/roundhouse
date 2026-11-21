@@ -656,7 +656,12 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                     ctx.hook_seen = false;
                     // A module's own `private` does not carry into the class.
                     let visible = std::mem::replace(&mut ctx.visible, true);
-                    walk(ctx, mbody, msource, Mode::Module)?;
+                    // Ledgered at the `include`, not in the mixin: a gap there would claim the mixin file's own findings.
+                    walk(ctx, mbody, msource, Mode::Module).map_err(|e| {
+                        let inner = e.to_string();
+                        let inner = inner.split("ActiveModel::Serializer subset: ").last().unwrap_or(&inner).to_string();
+                        fail(&format!("`include {written}`: {inner}"))
+                    })?;
                     ctx.visible = visible;
                     if ctx.hook_seen && !ctx.hooked.contains(&module) {
                         ctx.hooked.push(module);
