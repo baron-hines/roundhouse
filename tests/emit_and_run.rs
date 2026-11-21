@@ -22297,6 +22297,10 @@ mod has_many_writer;
 mod association_scopes;
 #[path = "emit_and_run/association_relation_calls.rs"]
 mod association_relation_calls;
+#[path = "emit_and_run/concern_association_includers.rs"]
+mod concern_association_includers;
+#[path = "emit_and_run/concern_includer_definitions.rs"]
+mod concern_includer_definitions;
 #[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
 mod polymorphic_belongs_to_scope;
 #[path = "emit_and_run/belongs_to_scope_join.rs"]
@@ -22764,6 +22768,9 @@ mod module_method_missing_includer;
 // Declarations: a rooted class or module name inside a module.
 #[path = "emit_and_run/rooted_class_declarations.rs"]
 mod rooted_class_declarations;
+// A model whose include defines `method_missing`: ActiveRecord's own methods still answer.
+#[path = "emit_and_run/model_method_missing_active_record.rs"]
+mod model_method_missing_active_record;
 #[path = "emit_and_run/token_for_string_key.rs"]
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
@@ -22790,3 +22797,7 @@ mod params_string_filter_scalars;
 mod hidden_field_autocomplete;
 #[path = "emit_and_run/record_as_json_in_literal.rs"]
 mod record_as_json_in_literal;
+#[path = "emit_and_run/empty_base_list_override.rs"]
+mod empty_base_list_override;
+#[path = "emit_and_run/relation_argument.rs"]
+mod relation_argument;
