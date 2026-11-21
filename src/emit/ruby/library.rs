@@ -2496,8 +2496,9 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             // winner's `super(...)` calls that copy: a model's own def is
             // rewritten in place, a module's winner gets a lowered copy of
             // its own. Only one level: a reached definition that calls
-            // `super` itself, a bare `super`, a block, or a definition
-            // behind a load-time condition all stay as they were.
+            // `super` itself, a bare `super`, a block, a definition that
+            // reads its own name (`__method__`), or one behind a load-time
+            // condition all stay as they were.
             let instance_def = |module: &crate::dialect::LibraryClass, name: &Symbol| {
                 module.methods.iter().rev().find(|m| m.receiver == MethodReceiver::Instance && m.name == *name).cloned()
             };
@@ -14330,11 +14331,19 @@ fn replace_supers(expr: &mut Expr, private: &Symbol) {
     expr.node.for_each_child_mut(&mut |child| replace_supers(child, private));
 }
 
-/// Any `yield` or `block_given?` in `expr`, at any depth.
+/// Any `yield`, `block_given?` (bare or on `self`), `__method__` or
+/// `__callee__` in `expr`, at any depth: what a definition called under
+/// another name, without the caller's block, would answer differently.
 fn contains_yield_or_block(expr: &Expr) -> bool {
-    if matches!(&*expr.node, ExprNode::Yield { .. })
-        || matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "block_given?")
-    {
+    let on_self = |recv: &Option<Expr>| recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+    let found_here = match &*expr.node {
+        ExprNode::Yield { .. } => true,
+        ExprNode::Send { recv, method, .. } => {
+            on_self(recv) && matches!(method.as_str(), "block_given?" | "__method__" | "__callee__")
+        }
+        _ => false,
+    };
+    if found_here {
         return true;
     }
     let mut found = false;
