@@ -2969,8 +2969,10 @@ impl<'a> BodyTyper<'a> {
                         return ty;
                     }
                 }
-                if let Some(refusal) = multi_json_dump_refusal(recv.as_ref(), method, args) {
-                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(refusal));
+                // Recomputed on each pass: a lambda analyzed again with a value the stand-in writes drops the earlier refusal.
+                let refusal = multi_json_dump_refusal(recv.as_ref(), method, args);
+                if refusal.is_some() || crate::expr::ExprCold::diagnostic(&expr.cold).as_ref().is_some_and(|d| matches!(d, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "MultiJson.dump")) {
+                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, refusal);
                 }
                 if let Some(refusal) = self.pagy_object_refusal(recv_ty.as_ref(), method, args) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(refusal));

@@ -8,7 +8,7 @@ pub(super) const PAYLOAD: &str = r##"class Payload
   end
 
   def self.floats
-    MultiJson.dump([1.0, 1e20, 1.0e-5, 0.1 + 0.2, 100.0, 1e17, 123456789.123456789, -0.0, 2.5e-7, 9.2e18, 9.3e18, 1e300, 1.0 / 3, 5e-324])
+    MultiJson.dump([1.0, 1e20, 1.0e-5, 0.1 + 0.2, 100.0, 1e17, 123456789.123456789, -0.0, 2.5e-7, 9.2e18, 9.3e18, 1e300, 1.0 / 3, 5e-324, 0.10000000000000009, 1.0000000000000002, 0.19999999999999998, 2.0000000000000005e-05, 9.9206327263])
   end
 
   def self.special
@@ -35,6 +35,10 @@ pub(super) const PAYLOAD: &str = r##"class Payload
     [MultiJson.dump(nil), MultiJson.dump(true), MultiJson.dump("x"), MultiJson.dump(:sym), MultiJson.dump(12), MultiJson.dump(2.5)].join(" ")
   end
 
+  def self.positional
+    MultiJson.dump([1], { pretty: true })
+  end
+
   def self.kwargs
     MultiJson.dump(html_content: "<p>", text_content: "t")
   end
@@ -51,18 +55,19 @@ end
 /// discourse's initializer sets them up) answers for `Payload`'s method of that name.
 pub(super) const ASSERTIONS: &str = r##"expected = {
   flat: "{\"a\":1,\"b\":[1,2,3],\"s\":\"<a>&'\u2028é\\\"\\\\\\n/\"}",
-  floats: "[1.0,1e+20,1e-05,0.3,100.0,100000000000000000.0,123456789.1234568,0.0,2.5e-07,9200000000000000000.0,9.3e+18,1e+300,0.3333333333333333,4.940656458412465e-324]",
+  floats: "[1.0,1e+20,1e-05,0.3,100.0,100000000000000000.0,123456789.1234568,0.0,2.5e-07,9200000000000000000.0,9.3e+18,1e+300,0.3333333333333333,4.940656458412465e-324,0.10000000000000009,1,0.2,2.000000000000001e-05,9.9206327263]",
   special: "[NaN,Infinity,-Infinity]",
   time: "{\"at\":\"2024-01-02T03:04:05.000Z\"}",
   pretty: "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"e\": {},\n  \"f\": [],\n  \"g\": {\n    \"h\": \"i\"\n  }\n}",
   pretty_false: "[\n  1,\n  [\n    2\n  ]\n]",
   symbols: "{\"a\":{\"b\":\"c\"},\"l\":[\"x\",\"y\"]}",
   scalars: "null true \"x\" \"sym\" 12 2.5",
+  positional: "[\n  1\n]",
   kwargs: "{\"html_content\":\"<p>\",\"text_content\":\"t\"}",
 }
 actual = {
   flat: Payload.flat, floats: Payload.floats, special: Payload.special, time: Payload.time, pretty: Payload.pretty,
-  pretty_false: Payload.pretty_false, symbols: Payload.symbols, scalars: Payload.scalars, kwargs: Payload.kwargs,
+  pretty_false: Payload.pretty_false, positional: Payload.positional, symbols: Payload.symbols, scalars: Payload.scalars, kwargs: Payload.kwargs,
 }
 raise "rescued" unless Payload.rescued == "[1]"
 raise "aliases" unless MultiJson::ParseError.new("x").is_a?(MultiJson::LoadError) && MultiJson::ParseError.new("x").is_a?(MultiJson::DecodeError)
@@ -97,7 +102,7 @@ fn multi_json_dump_runs_as_ojs_compat_dump_on_spinel() {
 /// writes it, which the stand-in does not model.
 #[test]
 fn multi_json_dump_of_an_object_is_refused() {
-    let lib = "class Dumped\n  def self.record\n    MultiJson.dump(Article.first)\n  end\n\n  def self.mixed\n    MultiJson.dump({ a: Article.first })\n  end\nend\n";
+    let lib = "class Dumped\n  def self.record\n    MultiJson.dump(Article.first)\n  end\n\n  def self.mixed\n    MultiJson.dump({ a: Article.first })\n  end\n\n  def self.through_lambda\n    encode = ->(value) { MultiJson.dump(value) }\n    encode.call(1)\n  end\nend\n";
     let (_emitted, errors) = overlay(emit_and_run::real_blog())
         .write("lib/dumped.rb", lib)
         .emit(roundhouse::project::BuildTarget::Ruby);
@@ -152,6 +157,8 @@ fn multi_json_unmodeled_configurations_are_refused() {
         (LOCK, "Oj.default_options = Oj.default_options.merge(mode: :compat, float_precision: 4)\nMultiJson.use(:oj)\n", dump, "sets more than the mode", false),
         (LOCK, "MultiJson.dump_options = { pretty: true }\nMultiJson.use(:oj)\n", dump, "`MultiJson.dump_options=`", false),
         (old_lock.as_str(), "MultiJson.use(:oj)\n", dump, "multi_json 1.15.0 is not the version modeled", false),
+        (LOCK, "Oj.default_options = Oj.default_options.merge({ mode: :compat }, { escape_mode: :ascii })\nMultiJson.use(:oj)\n", dump, "sets more than the mode", false),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.out(v)\n    MultiJSON.dump(v)\n  end\nend\n", "only the `MultiJson` spelling is lowered", true),
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.out(v)\n    MultiJson.use(:json_gem)\n    MultiJson.dump(v)\n  end\nend\n", "`MultiJson.use`", true),
     ] {
         let tree = tree(lock, init, lib);

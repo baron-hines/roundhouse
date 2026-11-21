@@ -154,7 +154,11 @@ fn configuration_calls(text: &str) -> Vec<Configuration> {
                 let options = args.into_iter().next().and_then(|a| match a.as_call_node() {
                     Some(merge) if String::from_utf8_lossy(merge.name().as_slice()) == "merge"
                         && merge.receiver().is_some_and(|r| matches!(text_of(&r).as_str(), "Oj.default_options" | "::Oj.default_options")) =>
-                        merge.arguments().and_then(|m| m.arguments().iter().next()),
+                        // One operand: a second merged after it may set more than the mode.
+                        merge.arguments().and_then(|m| {
+                            let operands: Vec<ruby_prism::Node<'_>> = m.arguments().iter().collect();
+                            if operands.len() == 1 { operands.into_iter().next() } else { None }
+                        }),
                     _ => Some(a),
                 });
                 let only_mode = options.as_ref().is_some_and(|o| {
@@ -201,13 +205,23 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
                 match method.as_str() {
                     // The initializer's own call, read above; anywhere else it would switch the adapter as the app runs.
                     "use" | "adapter=" | "engine=" if self.initializer => {}
+                    // The stand-in is `MultiJson` only: the analysis resolves no constant alias in a stand-in.
+                    _ if receiver.trim_start_matches("::") == "MultiJSON" => {
+                        self.found.push(format!("`{receiver}.{method}`: only the `MultiJson` spelling is lowered"));
+                    }
                     "dump" | "generate" | "encode" => {
                         // The object is the first argument, a braceless Hash included; a second is the options.
                         let options_ok = match args.get(1) {
                             None => true,
-                            Some(options) => options.as_keyword_hash_node().is_some_and(|h| {
-                                h.elements().iter().all(|e| e.as_assoc_node().is_some_and(|p| literal_name(&p.key()).as_deref() == Some("pretty")))
-                            }),
+                            Some(options) => {
+                                let elements: Option<Vec<ruby_prism::Node<'_>>> = options
+                                    .as_keyword_hash_node()
+                                    .map(|h| h.elements().iter().collect())
+                                    .or_else(|| options.as_hash_node().map(|h| h.elements().iter().collect()));
+                                elements.is_some_and(|elements| {
+                                    elements.iter().all(|e| e.as_assoc_node().is_some_and(|p| literal_name(&p.key()).as_deref() == Some("pretty")))
+                                })
+                            }
                         };
                         if args.is_empty() || args.len() > 2 || !options_ok || node.block().is_some() {
                             self.found.push(format!("`{}`", text_of(&node.as_node()).lines().next().unwrap_or_default()));
@@ -294,7 +308,9 @@ fn stand_ins() -> Vec<LibraryClass> {
     return "0.0" if value == 0.0
     # Not `to_i`: 2**63 itself is written whole, and it does not fit an Integer every target has.
     return format("%.1f", value) if value == value.floor && value.abs <= 9223372036854775808.0
-    format("%.16g", value)
+    written = format("%.16g", value)
+    # oj's own fallback: a 17-character result ending so is a rounding artefact, and Ruby's shortest form is written.
+    written.length >= 17 && (written.end_with?("0001") || written.end_with?("9999")) ? value.to_s : written
   end
 
   def self.use(adapter)
