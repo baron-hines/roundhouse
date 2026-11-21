@@ -328,6 +328,7 @@ fn core_value_type(name: &str) -> Option<Ty> {
     if CORE_TOP_STR_CONSTS.contains(&name.trim_start_matches("Object::")) {
         return Some(Ty::Str);
     }
+    let name = name.trim_start_matches("Object::");
     CORE_VALUE_CONSTS.iter().find_map(|(owner, field, ty)| {
         let need = owner.len() + 2 + field.len();
         (name.len() == need

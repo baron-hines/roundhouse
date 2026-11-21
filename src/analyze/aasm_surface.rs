@@ -18,16 +18,20 @@ pub fn instance_methods(model: &Model) -> Vec<(Symbol, Ty)> {
         return Vec::new();
     }
     let calls: Vec<&Expr> = model.body.iter().filter_map(|item| match item {
-        ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "aasm") => Some(expr),
+        ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, ExprNode::Send { recv, method, .. }
+            if method.as_str() == "aasm" && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))) => Some(expr),
         _ => None,
     }).collect();
     // A second `aasm` call reopens the machine with what the first configured (a namespace, say): not read alone.
     let [call] = calls.as_slice() else { return Vec::new() };
-    machine_names(call).unwrap_or_default().into_iter().map(|n| (Symbol::from(n.as_str()), Ty::Bool)).collect()
+    // A method the model writes itself is its own, whatever the block would define.
+    let own: Vec<&Symbol> = model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| &m.name).collect();
+    machine_names(call).unwrap_or_default().into_iter().map(|n| Symbol::from(n.as_str())).filter(|n| !own.contains(&n))
+        .map(|n| (n, Ty::Bool)).collect()
 }
 
 fn machine_names(expr: &Expr) -> Option<Vec<String>> {
-    let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*expr.node else { return None };
+    let ExprNode::Send { method, args, block: Some(block), .. } = &*expr.node else { return None };
     if method.as_str() != "aasm" {
         return None;
     }
@@ -36,7 +40,8 @@ fn machine_names(expr: &Expr) -> Option<Vec<String>> {
         return None;
     }
     if let Some(ExprNode::Hash { entries, .. }) = args.first().map(|a| &*a.node)
-        && entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "namespace"))
+        // `with_klass:` builds the machine with another DSL, whose methods are not these.
+        && entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "namespace" | "with_klass")))
     {
         return None;
     }
