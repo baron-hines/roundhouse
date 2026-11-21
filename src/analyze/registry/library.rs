@@ -253,6 +253,14 @@ pub(in crate::analyze) fn register(
             id: ClassId(Symbol::from("ActionMailer::MessageDelivery")),
             args: vec![].into(),
         };
+        // Rails' mailers include the routes' url helpers; a bare one is given `RouteHelpers` as its receiver
+        // (`lower::route_helper_receiver`). Not on each mailer: an app mailer ancestor's method of the name comes first.
+        {
+            let base = classes.entry(ClassId(Symbol::from("ActionMailer::Base"))).or_default();
+            for name in route_helper_names {
+                base.instance_methods.entry(Symbol::from(name.as_str())).or_insert(Ty::Str);
+            }
+        }
         let own_with = crate::lower::mailer_class_side::defines_with(app);
         for lc in &app.library_classes {
             if lc.is_file_constants() || !is_mailer(&lc.name) {
@@ -260,11 +268,6 @@ pub(in crate::analyze) fn register(
             }
             let cls = classes.entry(lc.name.clone()).or_default();
             cls.parent = lc.parent.clone();
-            // Rails' mailers include the routes' url helpers; a bare one is given `RouteHelpers` as its receiver
-            // (`lower::route_helper_receiver`), as in any library class.
-            for name in route_helper_names {
-                cls.instance_methods.entry(Symbol::from(name.as_str())).or_insert(Ty::Str);
-            }
             for method in &lc.methods {
                 // Only source-defined instance actions become
                 // class-callable. Real `def self.x` (Class receiver),

@@ -213,8 +213,11 @@ pub(crate) fn parse(
 /// A mailer action's `t(".key")`: `"<scope>.<action>.key"` with `:"<scope>.key"` in front of any `default:`, as
 /// AbstractController::Translation reads it for the action being processed.
 fn parse_mailer_args(args: &[Expr], scope: &str, action: &str) -> Result<Call, String> {
-    let lazy = args.first().and_then(literal_text).and_then(|k| k.strip_prefix('.').map(str::to_string));
-    let Some(rest) = lazy else { return parse_args(args, None, false) };
+    let Some(key) = args.first().and_then(literal_text) else {
+        // A key known only when it runs may be lazy (`.fallback`), and the run-time lookup has no mailer-level default.
+        return Err("a mailer action's key computed when it runs".into());
+    };
+    let Some(rest) = key.strip_prefix('.').map(str::to_string) else { return parse_args(args, None, false) };
     if rest.ends_with("_html") || rest.ends_with(".html") {
         return Err("an `_html` key in a mailer: Rails returns it html-safe, which no String here carries".into());
     }
@@ -679,7 +682,8 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
         .map(|lc| (lc.name.clone(), mailer_scope(lc.name.0.as_str())))
         .collect();
     super::for_each_owned_hook_body(app, &mut |owner, body| {
-        if owner.is_some_and(|o| controllers.contains_key(o) || mailers.contains_key(o)) {
+        // A mailer's own roots too (`default subject: I18n.t(…)`): its methods' bare `t` is left by this site for the pass below.
+        if owner.is_some_and(|o| controllers.contains_key(o)) {
             return;
         }
         rewrite(body, &catalog, Site::Other)
@@ -783,10 +787,30 @@ fn translates(app: &App, controller: &crate::dialect::Controller) -> bool {
 pub(crate) fn mailer_translates(app: &App, lc: &crate::dialect::LibraryClass) -> bool {
     let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().filter(|c| !c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
+    let modules: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().filter(|c| c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
+    let defines_t = |c: &crate::dialect::LibraryClass| {
+        c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && matches!(m.name.as_str(), "t" | "translate"))
+    };
+    // An included app module sits ahead of AbstractController::Translation, so its `t` is the one that runs.
+    fn module_defines_t(
+        id: &str,
+        modules: &crate::det::HashMap<&str, &crate::dialect::LibraryClass>,
+        defines_t: &dyn Fn(&crate::dialect::LibraryClass) -> bool,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        let id = id.trim_start_matches("::");
+        if seen.iter().any(|s| s == id) {
+            return false;
+        }
+        seen.push(id.to_string());
+        let Some(m) = modules.get(id) else { return false };
+        defines_t(m) || m.includes.iter().any(|i| module_defines_t(i.0.as_str(), modules, defines_t, seen))
+    }
     let mut current = Some(lc);
     for _ in 0..32 {
         let Some(c) = current else { return false };
-        if c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && matches!(m.name.as_str(), "t" | "translate")) {
+        if defines_t(c) || c.includes.iter().any(|i| module_defines_t(i.0.as_str(), &modules, &defines_t, &mut Vec::new())) {
             return false;
         }
         let Some(parent) = c.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::")) else { return false };

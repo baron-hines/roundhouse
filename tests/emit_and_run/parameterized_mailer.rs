@@ -86,3 +86,14 @@ fn a_mailer_helpers_lazy_translation_is_refused() {
         .check_errors();
     assert!(errors.iter().any(|e| e.contains("mailer translation outside an action")), "{errors:#?}");
 }
+
+/// A key known only when the action runs may be a lazy `.key`, whose mailer-level fallback the run-time lookup does
+/// not carry: refused.
+#[test]
+fn a_mailer_actions_computed_key_is_refused() {
+    let errors = lazy_app()
+        .write("app/mailers/title_mailer.rb", "class TitleMailer < ApplicationMailer\n  default from: \"from@example.com\"\n\n  def titled(article)\n    key = article.title.present? ? \".cta\" : \".fallback\"\n    @cta = t(key)\n    mail(to: \"reader@example.com\", subject: \"Titled\")\n  end\nend\n")
+        .write("app/views/title_mailer/titled.text.erb", "<%= @cta %>\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("a mailer action's key computed when it runs")), "{errors:#?}");
+}
