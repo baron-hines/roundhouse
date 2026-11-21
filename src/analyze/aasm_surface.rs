@@ -25,14 +25,23 @@ pub fn instance_methods(model: &Model) -> Vec<(Symbol, Ty)> {
 /// gem calls `scope` with it as the class loads, which the ruby family's runtime defines on the class and its
 /// relation (`active_record_runtime_macros`). Not with `create_scopes: false`, nor over a class method or scope the
 /// model has of the name, which aasm leaves alone.
-pub fn scope_names(model: &Model) -> Vec<Symbol> {
+pub fn scope_names(model: &Model, models: &[Model]) -> Vec<Symbol> {
     let Some((call, scopes)) = machine_call(model) else { return Vec::new() };
     if !scopes || machine_names(call).is_none() {
         return Vec::new();
     }
-    let own: Vec<&Symbol> = model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class).map(|m| &m.name)
-        .chain(model.scopes().map(|s| &s.name)).collect();
-    states(call).into_iter().map(|n| Symbol::from(n.as_str())).filter(|n| !own.contains(&n)).collect()
+    // aasm asks `respond_to?`: the class's own and its app ancestors' class methods and scopes, and Active Record's.
+    let mut own: Vec<Symbol> = Vec::new();
+    let mut current = Some(model);
+    for _ in 0..32 {
+        let Some(m) = current else { break };
+        own.extend(m.methods().filter(|d| d.receiver == crate::dialect::MethodReceiver::Class).map(|d| d.name.clone()));
+        own.extend(m.scopes().map(|s| s.name.clone()));
+        current = m.parent.as_ref().and_then(|p| models.iter().find(|o| &o.name == p));
+    }
+    let framework = |n: &Symbol| crate::catalog::AR_CATALOG.iter()
+        .any(|e| e.receiver == crate::catalog::ReceiverContext::Class && e.name == n.as_str());
+    states(call).into_iter().map(|n| Symbol::from(n.as_str())).filter(|n| !own.contains(n) && !framework(n)).collect()
 }
 
 /// The model's one `aasm` call, and whether it creates scopes.

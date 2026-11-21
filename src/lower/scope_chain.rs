@@ -2073,7 +2073,7 @@ pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {
 pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
     let mut reg = AssocRegistry::default();
     for model in models {
-        for name in crate::analyze::aasm_surface::scope_names(model) {
+        for name in crate::analyze::aasm_surface::scope_names(model, models) {
             reg.runtime_scopes.insert((model.name.clone(), name));
         }
         let mut info = crate::analyze::ClassInfo::default();
