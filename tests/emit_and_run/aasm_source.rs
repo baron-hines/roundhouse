@@ -17,3 +17,27 @@ fn aasm_fires_events_and_persists_the_state_on_ruby() {
     assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("aasm passed"), "{}", run.stdout);
 }
+
+/// maybe's `@account.active?` / `@account.disable!` from a controller: the methods aasm's block defines as the
+/// class loads are known to the analysis (`analyze::aasm_surface`), so the controller's calls to them are typed and
+/// run as aasm 5.5.1 answers them, on a machine the size of maybe's `Account` (four states, four events).
+#[test]
+fn a_controllers_calls_to_aasm_methods_are_typed_and_run() {
+    let Some(app) = app() else { return };
+    let run = app
+        .edit("app/models/article.rb", "    state :published\n", "    state :published\n    state :archived\n    state :removed\n\n    event :archive do\n      transitions from: [:draft, :published], to: :archived\n    end\n\n    event :restore do\n      transitions from: :archived, to: :draft\n    end\n\n    event :remove do\n      transitions from: [:draft, :published, :archived], to: :removed\n    end\n")
+        .edit("app/controllers/articles_controller.rb", "  def show\n  end\n", "  def show\n    @article.publish! if @article.draft? && @article.may_publish?\n    @article.archive!\n    @review = [@article.published?, @article.archived?, @article.may_restore?, @article.may_publish?].join(\",\")\n  end\n")
+        .edit("app/views/articles/show.html.erb", "<hr class=\"my-8\">\n", "<hr class=\"my-8\">\n<div id=\"review\"><%= @review %></div>\n")
+        .run_ruby(r##"
+article = Article.create!(title: "Hello", body: "A body long enough")
+status, _h, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles/#{article.id}", "rack.input" => StringIO.new(""))
+got = body.join[%r{<div id="review">(.*?)</div>}m, 1]
+raise "status #{status}, review #{got.inspect}" unless status == 200 && got == "false,true,true,false"
+raise "status column" unless Article.find(article.id).status == "archived"
+puts "typed aasm calls passed"
+"##);
+    let unknown: Vec<_> = run.errors.iter().filter(|e| !KNOWN_GAPS.iter().any(|gap| e.contains(gap))).collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("typed aasm calls passed"), "{}", run.stdout);
+}
