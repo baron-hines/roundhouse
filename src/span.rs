@@ -62,10 +62,7 @@ impl SourceFile {
     /// panic a diagnostics printer. (Not `str::floor_char_boundary`:
     /// MSRV is 1.89, which predates its stabilization.)
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
-        let mut offset = (offset as usize).min(self.text.len());
-        while offset > 0 && !self.text.is_char_boundary(offset) {
-            offset -= 1;
-        }
+        let offset = self.char_start(offset);
         let before = &self.text.as_bytes()[..offset];
         let line = before.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
         let line_start = before
@@ -73,10 +70,59 @@ impl SourceFile {
             .rposition(|&b| b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        // Column counts characters, not bytes, so editors that treat
-        // col as a character offset land on the right spot in UTF-8.
-        let col = self.text[line_start..offset].chars().count() as u32 + 1;
-        (line, col)
+        (line, self.column(line_start, offset))
+    }
+
+    /// This file with where each of its lines starts, for many
+    /// `line_col` lookups: [`LineIndex::line_col`] answers the same by a
+    /// binary search, where `line_col` counts the newlines before the
+    /// offset on every call (a source map asks once per mapped node,
+    /// which on a large file is quadratic).
+    pub fn line_index(&self) -> LineIndex<'_> {
+        let after_newlines =
+            self.text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(i, _)| i + 1);
+        LineIndex { file: self, starts: std::iter::once(0).chain(after_newlines).collect() }
+    }
+
+    /// The offset clamped to the text and snapped back to the start of
+    /// the character it lands in.
+    fn char_start(&self, offset: u32) -> usize {
+        let mut offset = (offset as usize).min(self.text.len());
+        while offset > 0 && !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    /// 1-based column of `offset` on the line starting at `line_start`.
+    /// Column counts characters, not bytes, so editors that treat col as
+    /// a character offset land on the right spot in UTF-8.
+    fn column(&self, line_start: usize, offset: usize) -> u32 {
+        self.text[line_start..offset].chars().count() as u32 + 1
+    }
+}
+
+/// A [`SourceFile`] with the byte offset where each of its lines starts
+/// (the first is 0, then one after each newline), from
+/// [`SourceFile::line_index`]. It borrows its file, so an index is never
+/// read against another file's text.
+#[derive(Clone, Debug)]
+pub struct LineIndex<'a> {
+    file: &'a SourceFile,
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    /// The file this index is of.
+    pub fn file(&self) -> &'a SourceFile {
+        self.file
+    }
+
+    /// [`SourceFile::line_col`] of the same offset, by a binary search.
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let offset = self.file.char_start(offset);
+        let line = self.starts.partition_point(|&start| start <= offset);
+        (line as u32, self.file.column(self.starts[line - 1], offset))
     }
 }
 
@@ -116,5 +162,21 @@ mod tests {
         let f = SourceFile { path: "a.rb".into(), text: "é = 1".into() };
         assert!(!f.text.is_char_boundary(1), "test setup: byte 1 must be mid-character");
         assert_eq!(f.line_col(1), f.line_col(0));
+    }
+
+    /// The line index answers `line_col` for every offset: at line
+    /// starts and ends, inside multi-byte characters (four bytes too),
+    /// on empty lines, with `\r\n` and a lone `\r`, without a final
+    /// newline, and past the end.
+    #[test]
+    fn line_index_answers_as_line_col_for_every_offset() {
+        let texts = ["", "\n", "\n\n", "ab\ncd\nef", "ab\n", "é\nàx\n\nü", "a\r\nb\r\n", "日本\n語x", "x", "😀a\n\r😀\nb"];
+        for text in texts {
+            let f = SourceFile { path: "a.rb".into(), text: text.into() };
+            let index = f.line_index();
+            for offset in 0..text.len() as u32 + 3 {
+                assert_eq!(index.line_col(offset), f.line_col(offset), "{text:?} at {offset}");
+            }
+        }
     }
 }
