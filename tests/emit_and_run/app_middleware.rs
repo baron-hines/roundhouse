@@ -206,7 +206,13 @@ fn the_spinel_tree_carries_the_body_proxy_port() {
     let mut loaded = false;
     for entry in walk(&tree) {
         if entry.extension().is_some_and(|e| e == "rb")
-            && std::fs::read_to_string(&entry).is_ok_and(|t| t.contains("Clearing") && t.contains("rack_body_proxy"))
+            && std::fs::read_to_string(&entry).is_ok_and(|t| {
+                t.contains("class Clearing")
+                    && t.lines().any(|l| {
+                        let l = l.trim_start();
+                        (l.starts_with("require ") || l.starts_with("require_relative ")) && l.contains("rack_body_proxy")
+                    })
+            })
         {
             loaded = true;
         }
