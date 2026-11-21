@@ -149,6 +149,8 @@ struct Def {
     name: String,
     at: usize,
     visible: bool,
+    /// Whether its body calls `super`.
+    supers: bool,
 }
 
 struct Own {
@@ -268,50 +270,64 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             );
         }
     }
-    // A refused class takes down its descendants: they inherit what it would have defined.
-    loop {
-        let more: Vec<String> = chains
-            .iter()
-            .filter(|(n, chain)| !refused.contains_key(*n) && chain.iter().any(|a| refused.contains_key(a)))
-            .map(|(n, _)| n.clone())
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        for name in more {
-            let chain = &chains[&name];
-            let ancestor = chain.iter().find(|a| refused.contains_key(*a)).cloned().unwrap_or_default();
-            refused.insert(
-                name.clone(),
-                IngestError::Unsupported {
-                    file: owns.get(&name).map(|o| sources[o.source_index].path.clone()).unwrap_or_default(),
-                    message: format!("ActiveModel::Serializer subset: {name} inherits from {ancestor}, which is refused"),
-                },
-            );
+    // The root's `super` from an override of the gem's API reaches the gem's class, which the expansion removes.
+    for (name, chain) in &chains {
+        let (1, Some(own)) = (chain.len(), owns.get(name)) else { continue };
+        let api = PER_CLASS_API.iter().chain(ROOT_API).map(|(m, _)| *m).chain(["include?"]);
+        if let Some(d) = own.defs.iter().find(|d| d.supers && api.clone().any(|m| m == d.name)) {
+            let reason = format!("`super` in `def {}` reaches the gem's class, which the expansion removes", d.name);
+            refused.entry(name.clone()).or_insert_with(|| refuse(&sources[own.source_index], own.offset, &reason));
         }
     }
-    // A class whose association names a refused serializer would call the gem's class.
+    // The gem reads an attribute through the record's `read_attribute_for_serialization`, which the expansion calls
+    // by the attribute's own reader: an app that defines its own would read differently.
+    if let Some(source) = sources.iter().find(|s| {
+        s.text.contains("def read_attribute_for_serialization") || s.text.contains("alias read_attribute_for_serialization")
+            || s.text.contains("alias_method :read_attribute_for_serialization")
+    }) {
+        let offset = source.text.find("read_attribute_for_serialization").unwrap_or(0);
+        for name in &tree {
+            refused.entry(name.clone()).or_insert_with(|| {
+                refuse(source, offset, "the app defines its own `read_attribute_for_serialization`, which the gem reads attributes through")
+            });
+        }
+    }
+    // One fixed point over both: a refused class takes down its descendants, which inherit what it would have
+    // defined, and every class with an association serializing through it, which would call the gem's class.
     loop {
-        let more: Vec<(String, String)> = owns
-            .iter()
-            .filter(|(n, _)| !refused.contains_key(*n))
-            .filter_map(|(n, own)| {
+        let mut more: Vec<(String, IngestError)> = Vec::new();
+        for (name, chain) in &chains {
+            if refused.contains_key(name) || more.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let file = owns.get(name).map(|o| sources[o.source_index].path.clone()).unwrap_or_default();
+            if let Some(ancestor) = chain.iter().find(|a| refused.contains_key(*a)) {
+                more.push((
+                    name.clone(),
+                    IngestError::Unsupported {
+                        file,
+                        message: format!("ActiveModel::Serializer subset: {name} inherits from {ancestor}, which is refused"),
+                    },
+                ));
+                continue;
+            }
+            let through = chain.iter().filter_map(|c| owns.get(c)).find_map(|own| {
                 own.stmts.iter().find_map(|s| match s {
-                    Stmt::Association(a, _) if refused.contains_key(&a.serializer) => Some((n.clone(), a.serializer.clone())),
+                    Stmt::Association(a, _) if refused.contains_key(&a.serializer) => Some(a.serializer.clone()),
                     _ => None,
                 })
-            })
-            .collect();
+            });
+            if let (Some(target), Some(own)) = (through, owns.get(name)) {
+                more.push((
+                    name.clone(),
+                    refuse(&sources[own.source_index], own.offset, &format!("an association serializes through {target}, which is refused")),
+                ));
+            }
+        }
         if more.is_empty() {
             break;
         }
-        for (name, target) in more {
-            let own = &owns[&name];
-            refused.insert(
-                name,
-                refuse(&sources[own.source_index], own.offset, &format!("an association serializes through {target}, which is refused")),
-            );
-        }
+        refused.extend(more);
     }
     let refused_names: HashSet<String> = refused.keys().cloned().collect();
     if !refused.is_empty() {
@@ -373,7 +389,20 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             super::survey::record(&e);
         }
     }
-    let done: HashSet<String> = lowered.into_iter().filter(|n| !failed.contains(n)).collect();
+    let mut done: HashSet<String> = lowered.into_iter().filter(|n| !failed.contains(n)).collect();
+    // The rewrite reads `each_serializer:` by its spelling, not from where it is written: a name another
+    // namespace also defines (`Admin::ItemSerializer` beside `ItemSerializer`) may be that one, so it stays the gem's.
+    let all: Vec<String> = app
+        .library_classes
+        .iter()
+        .map(|c| c.name.0.as_str().to_string())
+        .chain(app.models.iter().map(|m| m.name.0.as_str().to_string()))
+        .chain(app.controllers.iter().map(|c| c.name.0.as_str().to_string()))
+        .collect();
+    done.retain(|n| !all.iter().any(|o| o != n && o.ends_with(&format!("::{n}"))));
+    if all.iter().any(|o| o == "ActiveModel::ArraySerializer" || o.ends_with("::ActiveModel::ArraySerializer")) {
+        done.clear();
+    }
     for_each_rewritten_body(app, &mut |body| rewrite_arrays(body, &done));
     Ok(())
 }
@@ -419,12 +448,12 @@ fn collect(
             if method == "initialize" || method.starts_with("ams_") || GEM_ONLY.contains(&method.as_str()) {
                 return Err(fail(&format!("`def {method}` would be replaced by the expansion")));
             }
-            let mut calls = GemCalls { found: None };
+            let mut calls = GemCalls { found: None, supers: false };
             ruby_prism::Visit::visit(&mut calls, &stmt);
             if let Some((call, at)) = calls.found {
                 return Err(refuse(source, at, &format!("`{call}` is the gem's, outside the subset")));
             }
-            defs.push(Def { name: method, at, visible });
+            defs.push(Def { name: method, at, visible, supers: calls.supers });
             continue;
         }
         if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_constant_write_node().is_some() {
@@ -494,7 +523,7 @@ fn collect(
                 let mut assoc_names = Vec::new();
                 for n in names {
                     let n = symbol_value(n).ok_or_else(|| fail(&format!("`{method}` takes Symbols")))?;
-                    if !is_plain(&n) || DEFINED.contains(&n.as_str()) {
+                    if !is_plain(&n) || n.starts_with("ams_") || DEFINED.contains(&n.as_str()) {
                         return Err(fail(&format!("an association named `{n}` is outside the subset")));
                     }
                     assoc_names.push(n);
@@ -562,6 +591,9 @@ fn collect(
                     _ => return Err(fail("`embed` takes a type and options")),
                 };
                 let embed = embed_value(kind).ok_or_else(|| fail("an `embed` other than :ids or :objects"))?;
+                if opts.is_some_and(|o| o.as_keyword_hash_node().is_none() && o.as_hash_node().is_none()) {
+                    return Err(fail("`embed` options other than a literal Hash"));
+                }
                 let mut include = false;
                 for el in opts.map(|o| option_elements(o)).unwrap_or_default() {
                     let assoc = el.as_assoc_node().ok_or_else(|| fail("a splatted `embed` option"))?;
@@ -604,7 +636,7 @@ fn collect(
 fn attribute(attr: &str, key: Option<Key>, offset: usize, at: usize, source: &SourceFile) -> IngestResult<Stmt> {
     let fail = |reason: &str| refuse(source, offset, reason);
     let reader = attr.strip_suffix('?').unwrap_or(attr);
-    if !is_plain(reader) || (DEFINED.contains(&attr) && !PROVIDED.contains(&attr)) {
+    if !is_plain(reader) || reader.starts_with("ams_") || (DEFINED.contains(&attr) && !PROVIDED.contains(&attr)) {
         return Err(fail(&format!("an attribute named `{attr}` is outside the subset")));
     }
     let key = match key {
@@ -703,6 +735,7 @@ const GEM_ONLY: &[&str] = &[
 
 struct GemCalls {
     found: Option<(String, usize)>,
+    supers: bool,
 }
 
 impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
@@ -713,6 +746,14 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
             self.found = Some((name.to_string(), node.location().start_offset()));
         }
         ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        self.supers = true;
+        ruby_prism::visit_super_node(self, node);
+    }
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        self.supers = true;
+        ruby_prism::visit_forwarding_super_node(self, node);
     }
 }
 
@@ -734,8 +775,15 @@ fn defined_before(name: &str, class: &str, at: usize, chain: &[String], owns: &H
 
 fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &Flat) -> String {
     let mut src = format!("class {name}\n");
-    if chain.len() == 1 {
-        src.push_str(ROOT_API);
+    // An own `def` of the name is the class's, as it overrides the gem's.
+    let own: HashSet<&str> = owns[name].defs.iter().map(|d| d.name.as_str()).collect();
+    // Per class, not once on the root: an `object` the whole tree shares is a union of every serializer's records,
+    // which the analysis reads per class but the lowering of `object.comments.order(:id)` does not.
+    for (method, body) in PER_CLASS_API.iter().chain(if chain.len() == 1 { ROOT_API } else { &[] }) {
+        if !own.contains(method) {
+            src.push('\n');
+            src.push_str(body);
+        }
     }
     // What an ancestor's declarations defined, which `method_defined?` sees here.
     let mut generated: HashSet<(String, String)> = HashSet::default();
@@ -771,10 +819,31 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
         Root::Name(key) => key.ruby(),
     };
     src.push_str(&format!("\n  def ams_root_name\n    {root}\n  end\n"));
+    if !own.contains("include?") {
+        src.push_str("\n  def include?(name)\n");
+        src.push_str("    return false if @options.key?(:only) && !Array(@options[:only]).include?(name)\n");
+        src.push_str("    return false if @options.key?(:except) && Array(@options[:except]).include?(name)\n");
+        let mut gated: Vec<&str> = flat.attributes.iter().map(|(a, _)| a.as_str()).collect();
+        gated.extend(flat.assocs.iter().map(|a| a.name.as_str()));
+        let mut seen = HashSet::default();
+        gated.retain(|a| seen.insert(*a));
+        let unknown = "raise NoMethodError, \"undefined method 'include_#{name}?' for an instance of #{self.class}\"";
+        if gated.is_empty() {
+            src.push_str(&format!("    {unknown}\n  end\n"));
+        } else {
+            src.push_str("    case name\n");
+            for attr in gated {
+                // `include_long??` is no name a `def` can write: the gate the gem defines for it is always true.
+                let gate = if attr.ends_with('?') { "true".to_string() } else { format!("include_{attr}?") };
+                src.push_str(&format!("    when {} then {gate}\n", Key::Sym(attr.to_string()).ruby()));
+            }
+            src.push_str(&format!("    else\n      {unknown}\n    end\n  end\n"));
+        }
+    }
     src.push_str("\n  def ams_attributes(h)\n");
     for (attr, key) in &flat.attributes {
-        let gate = if attr.ends_with('?') { String::new() } else { format!(" && include_{attr}?") };
-        src.push_str(&format!("    h[{}] = {attr} if include?({}){gate}\n", Key::Sym(key.clone()).ruby(), Key::Sym(attr.clone()).ruby()));
+        // `self.h`, not `h()`: the Ruby emit drops the parentheses, and an attribute named `h` then reads the Hash.
+        src.push_str(&format!("    h[{}] = self.{attr} if include?({})\n", Key::Sym(key.clone()).ruby(), Key::Sym(attr.clone()).ruby()));
     }
     src.push_str("    h\n  end\n");
     src.push_str("\n  def ams_associations(node)\n");
@@ -806,19 +875,21 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
 
 fn association(a: &Assoc, flat: &Flat) -> String {
     let name = &a.name;
+    // `self.node`, not `node`: an association called `node` or `side` would read the local.
+    let read = format!("self.{name}");
     let sym = Key::Sym(name.clone()).ruby();
     let target = format!("::{}", a.serializer);
     let embed = a.embed.unwrap_or(flat.embed);
     let nested = |value: &str| format!("{target}.new({value}, @options).ams_adopt(@ams_side, @ams_unique)");
-    let mut out = format!("    if include?({sym}) && include_{name}?\n");
+    let mut out = format!("    if include?({sym})\n");
     match (embed, a.many) {
         (Embed::Objects, true) => {
             let key = a.key.clone().unwrap_or(Key::Sym(name.clone())).ruby();
-            out.push_str(&format!("      node[{key}] = {name}.map {{ |item| {}.serializable_hash }}\n", nested("item")));
+            out.push_str(&format!("      node[{key}] = {read}.map {{ |item| {}.serializable_hash }}\n", nested("item")));
         }
         (Embed::Objects, false) => {
             let key = a.key.clone().unwrap_or(Key::Sym(name.clone())).ruby();
-            out.push_str(&format!("      value = {name}\n      node[{key}] = value ? {}.serializable_hash : nil\n", nested("value")));
+            out.push_str(&format!("      value = {read}\n      node[{key}] = value ? {}.serializable_hash : nil\n", nested("value")));
         }
         (Embed::Ids, many) => {
             let default = match a.include {
@@ -831,11 +902,11 @@ fn association(a: &Assoc, flat: &Flat) -> String {
             if many {
                 let key = a.key.clone().unwrap_or_else(|| Key::Sym(format!("{}_ids", crate::naming::singularize(name)))).ruby();
                 out.push_str(&format!("      included = ams_include_option({sym}, {default})\n"));
-                out.push_str(&format!("      node[{key}] = {name}.map {{ |item| item.{embed_key} }}\n"));
+                out.push_str(&format!("      node[{key}] = {read}.map {{ |item| item.{embed_key} }}\n"));
             } else {
                 let key = a.key.clone().unwrap_or_else(|| Key::Sym(format!("{name}_id"))).ruby();
                 out.push_str(&format!("      included = ams_include_option({sym}, {default})\n"));
-                out.push_str(&format!("      node[{key}] = {name} ? {name}.{embed_key} : nil\n"));
+                out.push_str(&format!("      node[{key}] = {read} ? {read}.{embed_key} : nil\n"));
             }
             out.push_str("      if included\n");
             out.push_str("        side = @ams_side\n");
@@ -844,9 +915,9 @@ fn association(a: &Assoc, flat: &Flat) -> String {
             ));
             // has_many sideloads nothing for a nil collection; has_one always opens its root.
             if many {
-                out.push_str(&format!("        ams_merge(side, {root}, {name}.map {{ |item| {} }}) unless {name}.nil?\n", nested("item")));
+                out.push_str(&format!("        ams_merge(side, {root}, {read}.map {{ |item| {} }}) unless {read}.nil?\n", nested("item")));
             } else {
-                out.push_str(&format!("        value = {name}\n        ams_merge(side, {root}, value ? [{}] : [])\n", nested("value")));
+                out.push_str(&format!("        value = {read}\n        ams_merge(side, {root}, value ? [{}] : [])\n", nested("value")));
             }
             out.push_str("      end\n");
         }
@@ -855,105 +926,28 @@ fn association(a: &Assoc, flat: &Flat) -> String {
     out
 }
 
-/// The gem's instance API, on the class under `ActiveModel::Serializer`.
-/// The Hash the root and the sideloaded records share is held apart from
-/// `options`, where the gem keeps it, so the Hash the app passes keeps the
-/// type it was built with.
-const ROOT_API: &str = r#"
-  def initialize(object, options = {})
-    @object = object
-    @options = options
-    @ams_side = nil
-    @ams_unique = nil
-  end
+/// The gem's constructor and readers, on every class of the tree, by name.
+const PER_CLASS_API: &[(&str, &str)] = &[
+    ("initialize", "  def initialize(object, options = {})\n    @object = object\n    @options = options\n    @ams_side = nil\n    @ams_unique = nil\n  end\n"),
+    ("object", "  def object\n    @object\n  end\n"),
+    ("options", "  def options\n    @options\n  end\n"),
+    ("scope", "  def scope\n    @options[:scope]\n  end\n"),
+];
 
-  def object
-    @object
-  end
-
-  def options
-    @options
-  end
-
-  def scope
-    @options[:scope]
-  end
-
-  def ams_adopt(side, unique)
-    @ams_side = side
-    @ams_unique = unique
-    self
-  end
-
-  def root_name
-    ams_root_name
-  end
-
-  def meta_key
-    key = @options[:meta_key]
-    key.respond_to?(:to_sym) ? key.to_sym : :meta
-  end
-
-  def include_meta(hash)
-    hash[meta_key] = @options[:meta] if @options.has_key?(:meta)
-  end
-
-  def include?(name)
-    return false if @options.key?(:only) && !Array(@options[:only]).include?(name)
-    return false if @options.key?(:except) && Array(@options[:except]).include?(name)
-    true
-  end
-
-  def ams_include_option(name, default)
-    if @options.key?(:include)
-      @options[:include].include?(name)
-    elsif @options.include?(:exclude)
-      !@options[:exclude].include?(name)
-    else
-      default
-    end
-  end
-
-  def ams_merge(side, key, serializables)
-    unique = (@ams_unique ||= {})
-    seen = (unique[key] ||= {})
-    list = (side[key] ||= [])
-    serializables.each do |serializable|
-      unless seen.include?(serializable.object)
-        seen[serializable.object] = true
-        list << serializable.serializable_hash
-      end
-    end
-  end
-
-  def attributes
-    h = {}
-    ams_attributes(h)
-  end
-
-  def serializable_hash
-    return nil if @object.nil?
-    node = attributes
-    ams_associations(node) if @object.present?
-    node
-  end
-
-  def as_json(options = {})
-    options ||= {}
-    root = options.fetch(:root, @options.fetch(:root, root_name))
-    if root
-      hash = {}
-      @ams_side = hash
-      @ams_unique = {}
-      body = serializable_hash
-      hash[root] = body
-      include_meta(hash)
-      hash
-    else
-      serializable_hash
-    end
-  end
-"#;
+/// The rest of the gem's instance API, on the class under `ActiveModel::Serializer`, by name. The Hash the root
+/// and the sideloaded records share is held apart from `options`, where the gem keeps it, so the Hash the app
+/// passes keeps the type it was built with.
+const ROOT_API: &[(&str, &str)] = &[
+    ("ams_adopt", "  def ams_adopt(side, unique)\n    @ams_side = side\n    @ams_unique = unique\n    self\n  end\n"),
+    ("root_name", "  def root_name\n    ams_root_name\n  end\n"),
+    ("meta_key", "  def meta_key\n    key = @options[:meta_key]\n    key.respond_to?(:to_sym) ? key.to_sym : :meta\n  end\n"),
+    ("include_meta", "  def include_meta(hash)\n    hash[meta_key] = @options[:meta] if @options.has_key?(:meta)\n  end\n"),
+    ("ams_include_option", "  def ams_include_option(name, default)\n    if @options.key?(:include)\n      @options[:include].include?(name)\n    elsif @options.include?(:exclude)\n      !@options[:exclude].include?(name)\n    else\n      default\n    end\n  end\n"),
+    ("ams_merge", "  def ams_merge(side, key, serializables)\n    unique = (@ams_unique ||= {})\n    seen = (unique[key] ||= {})\n    list = (side[key] ||= [])\n    serializables.each do |serializable|\n      unless seen.include?(serializable.object)\n        seen[serializable.object] = true\n        list << serializable.serializable_hash\n      end\n    end\n  end\n"),
+    ("attributes", "  def attributes\n    h = {}\n    ams_attributes(h)\n  end\n"),
+    ("serializable_hash", "  def serializable_hash\n    return nil if @object.nil?\n    node = attributes\n    ams_associations(node) if @object.present?\n    node\n  end\n"),
+    ("as_json", "  def as_json(options = {})\n    options ||= {}\n    root = options.fetch(:root, @options.fetch(:root, root_name))\n    if root\n      hash = {}\n      @ams_side = hash\n      @ams_unique = {}\n      body = serializable_hash\n      hash[root] = body\n      include_meta(hash)\n      hash\n    else\n      serializable_hash\n    end\n  end\n"),
+];
 
 fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> IngestResult<()> {
     let (parsed, diags) = super::prism::scope(|| super::ingest_library_classes(src.as_bytes(), "<active_model_serializers>"));

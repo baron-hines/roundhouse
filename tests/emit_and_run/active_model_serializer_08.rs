@@ -4,7 +4,9 @@
 //! include: true`, inherited attributes, an `include_<name>?` override, a
 //! `?` attribute losing its `?` in the key, ids with their records
 //! sideloaded beside the root, embedded objects, `key:`, `root:`, a class
-//! `root`, and `ActiveModel::ArraySerializer` with `each_serializer:`.
+//! `root`, and `ActiveModel::ArraySerializer` with `each_serializer:`; an
+//! association reading `object.comments.order(:id)` beside a serializer of
+//! comments, and names (`h`, `node`) the expansion's own locals share.
 
 use super::emit_and_run;
 
@@ -14,8 +16,16 @@ class ApplicationSerializer < ActiveModel::Serializer
 end
 
 class CommentSerializer < ApplicationSerializer
-  attributes :id, :commenter
+  attributes :id, :commenter, :h
   attribute :body, key: :text
+
+  def h
+    commenter.upcase
+  end
+
+  def commenter
+    object.commenter
+  end
 end
 
 class BasicArticleSerializer < ApplicationSerializer
@@ -46,20 +56,25 @@ class ArticleSerializer < BasicArticleSerializer
   end
 
   def first_comment
-    object.comments.first
+    object.comments.order(:id).first
   end
 
   def last_comment
-    object.comments.last
+    object.comments.order(:id).last
   end
 
   def recent
-    [object.comments.last]
+    [object.comments.order(:id).last]
   end
 end
 
 class ScopedArticleSerializer < ArticleSerializer
   root :post
+  attributes :title_shown
+
+  def title_shown
+    include?(:title)
+  end
 
   def include_title?
     scope == "admin"
@@ -70,6 +85,11 @@ class PlainArticleSerializer < ActiveModel::Serializer
   root false
   attributes :id, :title
   has_many :comments, serializer: CommentSerializer
+  has_one :node, serializer: CommentSerializer, embed: :objects
+
+  def node
+    object.comments.order(:id).last
+  end
 end
 "#;
 
@@ -114,12 +134,12 @@ end
 /// What active_model_serializers 0.8.4 renders for the same records
 /// (articles 101 and 102, comments 201 and 202), from the real gem.
 const EXPECTED: &[(&str, &str)] = &[
-    ("show", r#"{"comments":[{"id":201,"commenter":"ann","text":"first"},{"id":202,"commenter":"bob","text":"second"}],"article":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","text":"first"},"latest":[{"id":202,"commenter":"bob","text":"second"}],"last_comment_id":202}}"#),
+    ("show", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"article":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
     ("draft", r#"{"comments":[],"article":{"id":102,"title":"Draft one","long":false,"draft":true,"comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}}"#),
-    ("admin", r#"{"comments":[{"id":201,"commenter":"ann","text":"first"},{"id":202,"commenter":"bob","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","text":"first"},"latest":[{"id":202,"commenter":"bob","text":"second"}],"last_comment_id":202}}"#),
-    ("guest", r#"{"comments":[{"id":201,"commenter":"ann","text":"first"},{"id":202,"commenter":"bob","text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","text":"first"},"latest":[{"id":202,"commenter":"bob","text":"second"}],"last_comment_id":202}}"#),
-    ("plain", r#"{"id":101,"title":"Hello","comments":[{"id":201,"commenter":"ann","text":"first"},{"id":202,"commenter":"bob","text":"second"}]}"#),
-    ("index", r#"{"comments":[{"id":201,"commenter":"ann","text":"first"},{"id":202,"commenter":"bob","text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","text":"first"},"latest":[{"id":202,"commenter":"bob","text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
+    ("admin", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"title_shown":true,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("guest", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"title_shown":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("plain", r#"{"id":101,"title":"Hello","comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"node":{"id":202,"commenter":"bob","h":"BOB","text":"second"}}"#),
+    ("index", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
     ("bare", r#"[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]"#),
     ("rootless", r#"Cannot serialize comments when ArticleSerializer does not have a root!"#),
 ];
@@ -221,6 +241,11 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  cached\nend\n\nclass BSerializer < ASerializer\nend\n", "inherits from ASerializer", &["ASerializer", "BSerializer"]),
         ("class ASerializer < BaseSerializer\n  cached\nend\n\nclass BSerializer < BaseSerializer\n  has_one :a, serializer: ASerializer\nend\n", "serializes through ASerializer", &["ASerializer", "BSerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :a, serializer: CommentSerializer\nend\n", "`serializer: CommentSerializer` is not a serializer of the app", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  attributes :ams_attributes\nend\n", "an attribute named `ams_attributes`", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  embed :ids, EMBED\nend\n", "`embed` options other than a literal Hash", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  def read_attribute_for_serialization(name)\n    name\n  end\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
+        ("class CSerializer < ActiveModel::Serializer\n  def attributes\n    super.merge(extra: 1)\n  end\nend\n", "`super` in `def attributes` reaches the gem's class", &["CSerializer"]),
+        ("class BSerializer < BaseSerializer\nend\n\nclass CSerializer < ActiveModel::Serializer\n  cached\nend\n\nclass ASerializer < BSerializer\nend\n\nclass BSerializer\n  has_one :c, serializer: CSerializer\nend\n", "a reopened serializer", &["BSerializer", "ASerializer"]),
     ] {
         let tree = tree(&format!("{base}{body}"));
         assert!(roundhouse::ingest::ingest_app_from_tree(tree.clone()).is_err(), "{body}: strict ingest passed");
@@ -234,9 +259,13 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
             })
         };
         for name in refused {
+            let class = app.library_classes.iter().find(|lc| lc.name.0.as_str() == *name).unwrap_or_else(|| panic!("{body}: {name} is gone"));
+            assert!(class.parent.is_some(), "{body}: {name} lost its parent");
             assert!(!lowered(name), "{body}: {name} was lowered");
         }
-        assert!(lowered("BaseSerializer"), "{body}: the base was not lowered");
+        if !refused.contains(&"BaseSerializer") {
+            assert!(lowered("BaseSerializer"), "{body}: the base was not lowered");
+        }
     }
 }
 
