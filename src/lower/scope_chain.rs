@@ -4849,8 +4849,19 @@ fn relation_argument(arg: &mut Expr, ctx: &Ctx, locals: &Locals) {
         _ => Some(e.clone()),
     };
     // Not through `.all` when the association defines its own: that call is the extension's, not the relation.
-    let own_all = seeded(&read).is_some_and(|r| matches!(&*r.node, ExprNode::Send { method: aname, .. }
-        if ctx.assocs.is_assoc_extension(None, aname, &Symbol::from("all"))));
+    // The owner's association, when its model is known; any of the name's otherwise.
+    let all = Symbol::from("all");
+    let own_all = seeded(&read).is_some_and(|r| {
+        let ExprNode::Send { recv, method: aname, .. } = &*r.node else { return false };
+        let owners = match recv.as_ref().map(|o| &*o.node) {
+            Some(ExprNode::SelfRef) | None => ctx.instance_self.as_ref().map(|m| vec![m]),
+            Some(_) => recv.as_ref().and_then(|o| ctx.assocs.owner_models(o, aname)),
+        };
+        match owners {
+            Some(owners) => owners.iter().any(|m| ctx.assocs.is_assoc_extension(Some(&[*m]), aname, &all)),
+            None => ctx.assocs.is_assoc_extension(None, aname, &all),
+        }
+    });
     if own_all || (!aliased && seedable_assoc_read(ctx, &read, read.span).is_none()) {
         if arg.decisions & crate::expr::RELATION_ARGUMENT == 0 {
             return;
