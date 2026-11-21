@@ -92,6 +92,7 @@ fn multi_json_dump_runs_as_ojs_compat_dump() {
 }
 
 #[test]
+#[ignore = "requires the Spinel toolchain"]
 fn multi_json_dump_runs_as_ojs_compat_dump_on_spinel() {
     let run = overlay(emit_and_run::real_blog()).run_spinel(ASSERTIONS);
     run.assert_passes();
