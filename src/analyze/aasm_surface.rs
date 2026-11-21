@@ -43,6 +43,12 @@ pub fn scope_names(model: &Model, app: &crate::App) -> Vec<Symbol> {
             for lc in app.library_classes.iter().filter(|lc| lc.name == id) {
                 own.extend(lc.methods.iter().filter(|d| d.receiver == crate::dialect::MethodReceiver::Class).map(|d| d.name.clone()));
             }
+            // And the scopes its `included do` declares.
+            for item in app.concern_model_items.get(&id).into_iter().flatten() {
+                if let ModelBodyItem::Scope { scope, .. } = item {
+                    own.push(scope.name.clone());
+                }
+            }
         }
         for item in &m.body {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
