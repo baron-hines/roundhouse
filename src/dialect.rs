@@ -1462,6 +1462,8 @@ pub enum LibraryClassOrigin {
     Oj,
     /// The `MultiJson` stand-in an app on multi_json's oj adapter reaches (`ingest::multi_json`).
     MultiJson,
+    /// A serializer of an app on active_model_serializers 0.8, its body expanded (`ingest::active_model_serializer_08`).
+    ActiveModelSerializer08,
     /// Not a class: an autoloaded app file that declares no class or
     /// module and holds only file-level constants (`RemoteThing =
     /// Thing`, `Labels = LabelFactory.build(...)`). Named for the

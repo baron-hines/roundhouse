@@ -61,10 +61,31 @@ pub fn without_unrun_stand_in(app: &App, target: BuildTarget) -> Option<App> {
     .into_iter()
     .filter(|(origin, _)| installed(origin))
     .collect();
-    if refusals.is_empty() {
+    // Each lowered serializer is its own root: the expansion leaves no class of the gem's to refuse instead.
+    let mut serializers: Vec<String> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.origin == Some(LibraryClassOrigin::ActiveModelSerializer08))
+        .map(|lc| lc.name.0.as_str().split("::").next().unwrap_or_default().to_string())
+        .collect();
+    serializers.sort();
+    serializers.dedup();
+    if refusals.is_empty() && serializers.is_empty() {
         return None;
     }
     let mut app = app.clone();
+    if !serializers.is_empty() {
+        app.library_classes.retain(|lc| lc.origin != Some(LibraryClassOrigin::ActiveModelSerializer08));
+        for root in &serializers {
+            crate::lower::gem_refusal::refuse_references(&mut app, target.as_str(), &crate::lower::gem_refusal::Refusal {
+                root,
+                construct: root,
+                why: "is an active_model_serializers 0.8 serializer, expanded for the Ruby family only. \
+                      The reference is refused instead of being written against a missing class",
+                raised: "active_model_serializers 0.8 serializer is not emitted on this target",
+            });
+        }
+    }
     for (origin, refusal) in &refusals {
         // Drop the class before the walk so its own `JSON.parse` is not refused,
         // and so a later emit cannot write the class the calls no longer reach.

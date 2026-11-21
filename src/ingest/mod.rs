@@ -61,6 +61,7 @@ mod dry_monads;
 mod dry_validation;
 mod representable;
 mod active_model_serializer;
+mod active_model_serializer_08;
 mod action_cable_config;
 mod recurring_commands;
 mod session_config;
