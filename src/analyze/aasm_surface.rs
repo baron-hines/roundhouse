@@ -25,7 +25,8 @@ pub fn instance_methods(model: &Model) -> Vec<(Symbol, Ty)> {
 /// gem calls `scope` with it as the class loads, which the ruby family's runtime defines on the class and its
 /// relation (`active_record_runtime_macros`). Not with `create_scopes: false`, nor over a class method or scope the
 /// model has of the name, which aasm leaves alone.
-pub fn scope_names(model: &Model, models: &[Model]) -> Vec<Symbol> {
+pub fn scope_names(model: &Model, app: &crate::App) -> Vec<Symbol> {
+    let models = &app.models;
     let Some((call, scopes)) = machine_call(model) else { return Vec::new() };
     if !scopes || machine_names(call).is_none() {
         return Vec::new();
@@ -37,6 +38,29 @@ pub fn scope_names(model: &Model, models: &[Model]) -> Vec<Symbol> {
         let Some(m) = current else { break };
         own.extend(m.methods().filter(|d| d.receiver == crate::dialect::MethodReceiver::Class).map(|d| d.name.clone()));
         own.extend(m.scopes().map(|s| s.name.clone()));
+        // A concern's class-side methods (`class_methods do … end`) and an extended module's instance methods too.
+        for id in super::model_includes(m) {
+            for lc in app.library_classes.iter().filter(|lc| lc.name == id) {
+                own.extend(lc.methods.iter().filter(|d| d.receiver == crate::dialect::MethodReceiver::Class).map(|d| d.name.clone()));
+            }
+        }
+        for item in &m.body {
+            let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if method.as_str() != "extend" {
+                continue;
+            }
+            for arg in args {
+                let ExprNode::Const { path } = &*arg.node else { return Vec::new() };
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                if name == "ActiveSupport::Concern" {
+                    continue;
+                }
+                // A module the app does not define may answer any name.
+                let Some(lc) = app.library_classes.iter().find(|lc| lc.name.0.as_str() == name) else { return Vec::new() };
+                own.extend(lc.methods.iter().filter(|d| d.receiver == crate::dialect::MethodReceiver::Instance).map(|d| d.name.clone()));
+            }
+        }
         current = m.parent.as_ref().and_then(|p| models.iter().find(|o| &o.name == p));
     }
     let framework = |n: &Symbol| crate::catalog::AR_CATALOG.iter()

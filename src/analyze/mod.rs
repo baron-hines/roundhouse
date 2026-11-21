@@ -736,7 +736,7 @@ impl Analyzer {
             for (name, ty) in aasm_surface::instance_methods(model) {
                 cls.instance_methods.entry(name).or_insert(ty);
             }
-            for name in aasm_surface::scope_names(model, &app.models) {
+            for name in aasm_surface::scope_names(model, app) {
                 cls.class_methods.entry(name.clone()).or_insert_with(|| Ty::Relation { of: model.name.clone() });
                 cls.relation_derived.insert(name);
             }

@@ -74,3 +74,21 @@ puts "aasm scopes passed"
     assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("aasm scopes passed"), "{}", run.stdout);
 }
+
+/// A state named like a class method an extended module gives the model (`extend Finder` with `Finder#approved`):
+/// aasm creates no scope over it, so the call stays the module's.
+#[test]
+fn an_extended_modules_method_of_a_states_name_is_not_a_scope() {
+    let Some(app) = app() else { return };
+    let errors = app
+        .edit("db/schema.rb", "  create_table \"comments\", force: :cascade do |t|\n", "  create_table \"comments\", force: :cascade do |t|\n    t.string \"status\"\n")
+        .write("app/models/finder.rb", "module Finder\n  def approved\n    7\n  end\nend\n")
+        .edit(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n",
+            "class Comment < ApplicationRecord\n  include AASM\n  extend Finder\n\n  aasm column: :status do\n    state :pending, initial: true\n    state :approved\n  end\n\n  def self.approved_plus_one = approved + 1\n\n",
+        )
+        .check_errors();
+    let unknown: Vec<_> = errors.iter().filter(|e| !KNOWN_GAPS.iter().any(|gap| e.contains(gap))).collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+}

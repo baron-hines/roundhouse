@@ -2067,15 +2067,18 @@ pub fn belongs_to_inverse(models: &[Model], owner: &Model, assoc: &Association) 
 
 pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {
     let resolver = app.const_resolver.for_sources(&app.sources);
-    build_assoc_registry(&app.models).with_finder_classes(&crate::analyze::source_finder_classes(app, &resolver))
+    let mut reg = build_assoc_registry(&app.models).with_finder_classes(&crate::analyze::source_finder_classes(app, &resolver));
+    for model in &app.models {
+        for name in crate::analyze::aasm_surface::scope_names(model, app) {
+            reg.runtime_scopes.insert((model.name.clone(), name));
+        }
+    }
+    reg
 }
 
 pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
     let mut reg = AssocRegistry::default();
     for model in models {
-        for name in crate::analyze::aasm_surface::scope_names(model, models) {
-            reg.runtime_scopes.insert((model.name.clone(), name));
-        }
         let mut info = crate::analyze::ClassInfo::default();
         info.parent = model.parent.clone();
         info.attributes = model.attributes.clone();
