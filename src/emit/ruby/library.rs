@@ -1061,11 +1061,31 @@ struct NestedEmitter<'a> {
 
 impl NestedEmitter<'_> {
     fn write_names(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>) {
-        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name)) {
+        self.write_names_except(out, depth, names, &BTreeSet::new());
+    }
+
+    /// `kept` names the modules left pending, with what needs them: a guard that asks whether they are defined yet.
+    fn write_names_except(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>, kept: &BTreeSet<String>) {
+        let kept_block = |name: &str| kept.contains(name.rsplit("::").next().unwrap_or(name));
+        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name) && !kept_block(&block.name)) {
+            if self.pending[at].requires.iter().any(|r| kept_block(r)) {
+                let skipped = self.pending[at].name.clone();
+                let mut kept = kept.clone();
+                kept.insert(skipped.rsplit("::").next().unwrap_or(&skipped).to_string());
+                return self.write_names_except(out, depth, names, &kept);
+            }
             let block = self.pending.remove(at);
-            self.write_names(out, depth, &block.requires);
+            self.write_names_except(out, depth, &block.requires, kept);
             writeln!(out, "{}", indent_lines(&block.content, depth)).unwrap();
         }
+    }
+
+    fn write_expr_except(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr, kept: &BTreeSet<String>) {
+        if self.pending.is_empty() { return; }
+        let mut paths = BTreeSet::new();
+        walk_load_time_paths(expr, owner, &mut BTreeSet::new(), &mut paths);
+        let names = nested_names_in_paths(owner, &paths, &self.names);
+        self.write_names_except(out, depth, &names, kept);
     }
 
     fn write_expr(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr) {
@@ -10234,11 +10254,8 @@ fn emit_library_class_decl_inner(
         for c in conds {
             names_in(c, &mut asked);
         }
-        let guarded = nested.borrow().names.iter().any(|n| asked.contains(n.rsplit("::").next().unwrap_or(n)));
-        if !guarded {
-            for st in sts {
-                nested.borrow_mut().write_expr(s, depth, lc, st);
-            }
+        for st in sts {
+            nested.borrow_mut().write_expr_except(s, depth, lc, st, &asked);
         }
         write(s, &lc.conditional_definitions[index], lc, &body_pad, &require_of);
     };

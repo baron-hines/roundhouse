@@ -22,8 +22,9 @@ fn installed() -> Option<std::path::PathBuf> {
 }
 
 fn files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
+    // A gem tree that cannot be read would leave files out of the overlay and fail far from the cause.
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.unwrap_or_else(|e| panic!("read {}: {e}", dir.display())).path();
         if path.is_dir() {
             files(root, &path, out);
         } else {
@@ -63,7 +64,7 @@ fn app() -> Option<emit_and_run::Overlay> {
     let mut list = Vec::new();
     files(&gem, &gem.join("lib"), &mut list);
     for file in list {
-        let Ok(text) = std::fs::read_to_string(gem.join(&file)) else { continue };
+        let text = std::fs::read_to_string(gem.join(&file)).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         overlay = overlay.write(&format!("vendor/bundle/ruby/3.4.0/gems/rails-settings-cached-{VERSION}/{}", file.display()), &text);
     }
     Some(overlay)
@@ -75,4 +76,16 @@ fn rails_settings_fields_read_their_defaults_and_save_values_on_ruby() {
     let run = app.run_ruby(SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("settings passed"), "{}", run.stdout);
+}
+
+/// `class Local < Base` written inside `module RailsSettings`: the bare `Base` is the gem's concrete model, looked up
+/// lexically as Ruby does, so the class is a model on its table too.
+#[test]
+fn a_lexical_base_in_the_gems_namespace_is_its_model() {
+    let Some(app) = app() else { return };
+    let run = app
+        .write("app/models/rails_settings/local.rb", "module RailsSettings\n  class Local < Base\n    field :motto, type: :string, default: \"hi\"\n  end\nend\n")
+        .run_ruby("got = [RailsSettings::Local.motto]\nRailsSettings::Local.motto = \"yo\"\ngot << RailsSettings::Local.motto\nraise \"got #{got.inspect}\" unless got == [\"hi\", \"yo\"]\nputs \"lexical base passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("lexical base passed"), "{}", run.stdout);
 }

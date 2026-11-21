@@ -188,3 +188,18 @@ fn an_inherited_list_constant_folds_from_where_the_macro_is_written() {
     run.assert_passes();
     assert!(run.stdout.contains("inherited constant passed"), "{}", run.stdout);
 }
+
+/// The class the macro is written in assigns the name a value that does not fold: that value hides the root's, so the
+/// root's list is not read in its place and the macro is not expanded from it.
+#[test]
+fn a_nearer_unfoldable_list_hides_the_inherited_one() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .write("app/models/macro_root.rb", "class MacroRoot\n  NAMES = %i[alpha beta].freeze\nend\n")
+        .write(
+            "app/models/macro_leaf.rb",
+            "class MacroLeaf < MacroRoot\n  NAMES = ENV.fetch(\"NAMES\", \"gamma\").split(\",\").map(&:to_sym)\n\n  def self.install\n    NAMES.each do |n|\n      define_method(\"#{n}_name\") { n.to_s }\n    end\n  end\nend\n",
+        )
+        .write("app/models/macro_thing.rb", "class MacroThing < MacroLeaf\n  install\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("`install` defines methods this call does not expand")), "{errors:#?}");
+}
