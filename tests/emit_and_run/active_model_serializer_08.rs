@@ -244,6 +244,7 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  attributes :ams_attributes\nend\n", "an attribute named `ams_attributes`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  embed :ids, EMBED\nend\n", "`embed` options other than a literal Hash", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  def read_attribute_for_serialization(name)\n    name\n  end\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
+        ("class ASerializer < BaseSerializer\n  def read_attribute_for_serialization(name)\n    send(name)\n  end\nend\n", "`def read_attribute_for_serialization` would be replaced", &["ASerializer"]),
         ("class CSerializer < ActiveModel::Serializer\n  def attributes\n    super.merge(extra: 1)\n  end\nend\n", "`super` in `def attributes` reaches the gem's class", &["CSerializer"]),
         ("class BSerializer < BaseSerializer\nend\n\nclass CSerializer < ActiveModel::Serializer\n  cached\nend\n\nclass ASerializer < BSerializer\nend\n\nclass BSerializer\n  has_one :c, serializer: CSerializer\nend\n", "a reopened serializer", &["BSerializer", "ASerializer"]),
     ] {
@@ -266,6 +267,20 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         if !refused.contains(&"BaseSerializer") {
             assert!(lowered("BaseSerializer"), "{body}: the base was not lowered");
         }
+    }
+}
+
+/// A record whose `read_attribute_for_serialization` only sends the name reads as its reader does: no refusal.
+#[test]
+fn an_active_model_serializer_08_beside_a_sending_serialization_reader_lowers() {
+    for reader in [
+        "  alias read_attribute_for_serialization send\n",
+        "  def read_attribute_for_serialization(attribute)\n    public_send(attribute)\n  end\n",
+    ] {
+        let tree = tree(&format!("class ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n\nclass Thing\n{reader}end\n"));
+        let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+        let a = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "ASerializer").expect("ASerializer");
+        assert_eq!(a.origin, Some(roundhouse::dialect::LibraryClassOrigin::ActiveModelSerializer08), "{reader}");
     }
 }
 

@@ -281,11 +281,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     }
     // The gem reads an attribute through the record's `read_attribute_for_serialization`, which the expansion calls
     // by the attribute's own reader: an app that defines its own would read differently.
-    if let Some(source) = sources.iter().find(|s| {
-        s.text.contains("def read_attribute_for_serialization") || s.text.contains("alias read_attribute_for_serialization")
-            || s.text.contains("alias_method :read_attribute_for_serialization")
-    }) {
-        let offset = source.text.find("read_attribute_for_serialization").unwrap_or(0);
+    if let Some((source, offset)) = sources.iter().find_map(|s| own_serialization_reader(s, &tree)) {
         for name in &tree {
             refused.entry(name.clone()).or_insert_with(|| {
                 refuse(source, offset, "the app defines its own `read_attribute_for_serialization`, which the gem reads attributes through")
@@ -405,6 +401,54 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     }
     for_each_rewritten_body(app, &mut |body| rewrite_arrays(body, &done));
     Ok(())
+}
+
+/// Where `source` defines a `read_attribute_for_serialization` other than one that sends the name, as Active Record's
+/// alias does (`alias read_attribute_for_serialization send`, `def …(name) = public_send(name)`): the expansion reads
+/// an attribute by its reader, which only those match. A serializer's own is refused with its class.
+fn own_serialization_reader<'s>(source: &'s SourceFile, tree: &HashSet<String>) -> Option<(&'s SourceFile, usize)> {
+    if !source.text.contains("read_attribute_for_serialization") {
+        return None;
+    }
+    let sends = regex::Regex::new(
+        r"^\s*(?:alias\s+read_attribute_for_serialization\s+(?:send|__send__|public_send)|alias_method\s+:read_attribute_for_serialization,\s*:(?:send|__send__|public_send))\s*$",
+    )
+    .unwrap();
+    let def = regex::Regex::new(
+        r"^\s*def read_attribute_for_serialization\((\w+)\)\s*\n\s*(?:send|__send__|public_send)\((\w+)\)\s*\n\s*end",
+    )
+    .unwrap();
+    let parsed = super::prism::parse_silent(source.text.as_bytes());
+    let mut classes = Vec::new();
+    collect_classes(&parsed.node(), &mut Vec::new(), &mut classes);
+    let in_serializer = |offset: usize| {
+        classes.iter().any(|(path, class)| {
+            tree.contains(&path.join("::"))
+                && class.location().start_offset() <= offset
+                && offset < class.location().end_offset()
+        })
+    };
+    let mut at = 0;
+    while let Some(found) = source.text[at..].find("read_attribute_for_serialization") {
+        let offset = at + found;
+        at = offset + 1;
+        let line_start = source.text[..offset].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = source.text[offset..].find('\n').map_or(source.text.len(), |i| offset + i);
+        let line = &source.text[line_start..line_end];
+        if !line.trim_start().starts_with("def ") && !line.trim_start().starts_with("alias") {
+            continue;
+        }
+        if sends.is_match(line) || in_serializer(offset) {
+            continue;
+        }
+        if let Some(c) = def.captures(&source.text[line_start..]) {
+            if c[1] == c[2] {
+                continue;
+            }
+        }
+        return Some((source, offset));
+    }
+    None
 }
 
 /// The class a superclass reference names from inside `owner`: the
