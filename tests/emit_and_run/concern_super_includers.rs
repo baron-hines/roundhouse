@@ -7,6 +7,17 @@
 use super::emit_and_run;
 
 fn app(booth: bool) -> emit_and_run::Overlay {
+    app_holding(booth, r##"module TokenHolder
+  extend ActiveSupport::Concern
+
+  def issue_token!(name)
+    tokens.create!(name: name)
+  end
+end
+"##)
+}
+
+fn app_holding(booth: bool, holder: &str) -> emit_and_run::Overlay {
     let app = emit_and_run::empty_app()
         .write("app/models/application_record.rb", r##"class ApplicationRecord < ActiveRecord::Base
   self.abstract_class = true
@@ -16,14 +27,7 @@ end
   belongs_to :bearer, polymorphic: true
 end
 "##)
-        .write("app/models/concerns/token_holder.rb", r##"module TokenHolder
-  extend ActiveSupport::Concern
-
-  def issue_token!(name)
-    tokens.create!(name: name)
-  end
-end
-"##)
+        .write("app/models/concerns/token_holder.rb", holder)
         .write("app/models/concerns/audited.rb", r##"module Audited
   extend ActiveSupport::Concern
 
@@ -149,4 +153,37 @@ fn a_super_into_a_concern_one_model_includes_is_unchanged() {
         r#"[Cart.create!.issue_token!("a")].map { |t| [t.bearer_type, t.name] }"#,
         r#"[["Cart", "audited a"]]"#,
     );
+}
+
+/// A reached definition that reads its own name keeps it: `__method__`
+/// there is `:issue_token!`, as Rails answers.
+#[test]
+fn a_reached_definition_reading_its_own_name_keeps_it() {
+    let holder = r##"module TokenHolder
+  extend ActiveSupport::Concern
+
+  def issue_token!(name)
+    return __method__ if name == "audited probe"
+    tokens.create!(name: name)
+  end
+end
+"##;
+    check(app_holding(true, holder), r#"Cart.create!.issue_token!("probe")"#, ":issue_token!");
+}
+
+/// A reached definition asking `self.block_given?` still sees the block
+/// the caller passed, which Ruby's `super(...)` forwards: Rails answers
+/// `:with_block`.
+#[test]
+fn a_reached_definition_asking_self_block_given_still_sees_the_block() {
+    let holder = r##"module TokenHolder
+  extend ActiveSupport::Concern
+
+  def issue_token!(name)
+    return :with_block if self.block_given?
+    tokens.create!(name: name)
+  end
+end
+"##;
+    check(app_holding(true, holder), r#"Cart.create!.issue_token!("x") { }"#, ":with_block");
 }
