@@ -89,3 +89,16 @@ fn a_lexical_base_in_the_gems_namespace_is_its_model() {
     run.assert_passes();
     assert!(run.stdout.contains("lexical base passed"), "{}", run.stdout);
 }
+
+/// A nearer app class of the name wins over the gem's: `class Local < Base` in `RailsSettings::Tenant`, where the app
+/// writes `RailsSettings::Tenant::Base`, subclasses that one, as Ruby's lookup finds it first.
+#[test]
+fn a_nearer_app_base_wins_over_the_gems() {
+    let Some(app) = app() else { return };
+    let run = app
+        .write("app/models/rails_settings/tenant/base.rb", "module RailsSettings\n  module Tenant\n    class Base < RailsSettings::Base\n      def self.tenant_scoped?\n        true\n      end\n    end\n  end\nend\n")
+        .write("app/models/rails_settings/tenant/local.rb", "module RailsSettings\n  module Tenant\n    class Local < Base\n      def self.scoped_here\n        tenant_scoped?\n      end\n    end\n  end\nend\n")
+        .run_ruby("got = [RailsSettings::Tenant::Local.scoped_here, RailsSettings::Tenant::Local.superclass.name]\nraise \"got #{got.inspect}\" unless got == [true, \"RailsSettings::Tenant::Base\"]\nputs \"nearer base passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("nearer base passed"), "{}", run.stdout);
+}

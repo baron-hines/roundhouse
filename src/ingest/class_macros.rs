@@ -2248,7 +2248,7 @@ impl Run<'_> {
                     ("in?", _, [list]) => {
                         let ExprNode::Const { path } = &*list.node else { return None };
                         let [name] = path.as_slice() else { return None };
-                        let ExprNode::Array { elements, .. } = &*self.constants.get(name)?.node else { return None };
+                        let ExprNode::Array { elements, .. } = &*self.constant_owners.lookup(self.scope.as_ref(), name)?.node else { return None };
                         let mut found = false;
                         for el in elements {
                             let ExprNode::Lit { value: o } = &*el.node else { return None };

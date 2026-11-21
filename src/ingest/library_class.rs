@@ -5959,8 +5959,9 @@ impl ModelBases {
             let bare = &parent_path[0];
             for outer in superclass_enclosing(scope, nesting, class) {
                 let candidate = format!("{outer}::{bare}");
-                // A gem's concrete model too (`class Setting < Base` in `module RailsSettings`), which the bases set does not hold.
-                if own.as_deref() != Some(candidate.as_str()) && (self.contains(&candidate) || self.is_gem_concrete_model(&candidate)) {
+                // A concrete model too (`class Local < Base` in `module RailsSettings`), which the bases set does not hold: the
+                // nearest class of the name, the app's or a gem's, as Ruby looks it up.
+                if own.as_deref() != Some(candidate.as_str()) && (self.contains(&candidate) || self.concrete.contains_key(&candidate)) {
                     return Some(candidate);
                 }
             }

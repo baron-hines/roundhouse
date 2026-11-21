@@ -1064,18 +1064,25 @@ impl NestedEmitter<'_> {
         self.write_names_except(out, depth, names, &BTreeSet::new());
     }
 
-    /// `kept` names the modules left pending, with what needs them: a guard that asks whether they are defined yet.
+    /// `kept` names the modules left pending (a guard asks whether they are defined yet), and with them every
+    /// pending module that needs one, however far down: writing that one first would write the kept one too.
     fn write_names_except(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>, kept: &BTreeSet<String>) {
-        let kept_block = |name: &str| kept.contains(name.rsplit("::").next().unwrap_or(name));
-        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name) && !kept_block(&block.name)) {
-            if self.pending[at].requires.iter().any(|r| kept_block(r)) {
-                let skipped = self.pending[at].name.clone();
-                let mut kept = kept.clone();
-                kept.insert(skipped.rsplit("::").next().unwrap_or(&skipped).to_string());
-                return self.write_names_except(out, depth, names, &kept);
+        let last = |name: &str| name.rsplit("::").next().unwrap_or(name).to_string();
+        let mut blocked: BTreeSet<String> = kept.clone();
+        loop {
+            let before = blocked.len();
+            for block in &self.pending {
+                if block.requires.iter().any(|r| blocked.contains(&last(r))) {
+                    blocked.insert(last(&block.name));
+                }
             }
+            if blocked.len() == before {
+                break;
+            }
+        }
+        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name) && !blocked.contains(&last(&block.name))) {
             let block = self.pending.remove(at);
-            self.write_names_except(out, depth, &block.requires, kept);
+            self.write_names_except(out, depth, &block.requires, &blocked);
             writeln!(out, "{}", indent_lines(&block.content, depth)).unwrap();
         }
     }
