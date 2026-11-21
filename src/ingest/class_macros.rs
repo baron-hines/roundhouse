@@ -1427,7 +1427,14 @@ impl Run<'_> {
             let given = if p.keyword || p.from_keyword { keywords.remove(&p.name) } else { positional.next().cloned() };
             let val = match (given, &p.default) {
                 (Some(e), _) => self.eval(&e, env)?,
-                (None, Some(default)) => self.eval(default, &bound)?,
+                // A default is written in its method's class, so its constants are read from there, not from the caller.
+                (None, Some(default)) => {
+                    let inner = def.enclosing_class.clone().or_else(|| self.scope.clone());
+                    let outer = std::mem::replace(&mut self.scope, inner);
+                    let val = self.eval(default, &bound);
+                    self.scope = outer;
+                    val?
+                }
                 (None, None) => return Err(format!("`{}` is not given", p.name.as_str())),
             };
             bound.insert(p.name.clone(), val);
