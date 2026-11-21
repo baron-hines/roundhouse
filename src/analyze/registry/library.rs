@@ -260,6 +260,11 @@ pub(in crate::analyze) fn register(
             }
             let cls = classes.entry(lc.name.clone()).or_default();
             cls.parent = lc.parent.clone();
+            // Rails' mailers include the routes' url helpers; a bare one is given `RouteHelpers` as its receiver
+            // (`lower::route_helper_receiver`), as in any library class.
+            for name in route_helper_names {
+                cls.instance_methods.entry(Symbol::from(name.as_str())).or_insert(Ty::Str);
+            }
             for method in &lc.methods {
                 // Only source-defined instance actions become
                 // class-callable. Real `def self.x` (Class receiver),

@@ -687,6 +687,47 @@ impl<'a> BodyTyper<'a> {
     /// `AbstractController::Translation`'s `t`: one descending from
     /// `ActionController::Base` that defines no `t` / `translate` of its
     /// own (see `lower::i18n_translate`).
+    /// The lazy-lookup scope and action of a public instance method of a mailer with `AbstractController::Translation`'s
+    /// `t` (`lower::i18n_translate::mailer_translates`): the action is the method whose body this is.
+    fn translating_mailer(&self, ctx: &Ctx) -> Option<(String, String)> {
+        let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return None };
+        let (owner, name, false) = ctx.super_method.as_ref()? else { return None };
+        if ["t", "translate"].iter().any(|m| self.app_defines(ctx.self_ty.as_ref(), &Symbol::from(*m))) {
+            return None;
+        }
+        let action = match name.as_str().strip_prefix(crate::ingest::mailer_callbacks::ACTION_PREFIX) {
+            Some(action) => action.to_string(),
+            None if self.classes.get(owner).is_some_and(|c| c.public_instance_methods.contains(name)) => name.as_str().to_string(),
+            None => return None,
+        };
+        let mut current = id;
+        for _ in 0..32 {
+            let parent = self.classes.get(current)?.parent.as_ref()?;
+            if parent.0.as_str().trim_start_matches("::") == "ActionMailer::Base" {
+                return Some((crate::lower::i18n_translate::mailer_scope(id.0.as_str()), action));
+            }
+            current = parent;
+        }
+        None
+    }
+
+    /// A mailer with `AbstractController::Translation`'s `t` (not one it or an app ancestor defines).
+    fn is_translating_mailer_class(&self, self_ty: Option<&Ty>) -> bool {
+        let Some(Ty::Class { id, .. }) = self_ty else { return false };
+        if ["t", "translate"].iter().any(|m| self.app_defines(self_ty, &Symbol::from(*m))) {
+            return false;
+        }
+        let mut current = id;
+        for _ in 0..32 {
+            let Some(parent) = self.classes.get(current).and_then(|c| c.parent.as_ref()) else { return false };
+            if parent.0.as_str().trim_start_matches("::") == "ActionMailer::Base" {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
     fn translating_controller(&self, self_ty: Option<&Ty>) -> Option<String> {
         let Some(Ty::Class { id, .. }) = self_ty else { return None };
         if ["t", "translate"].iter().any(|m| self.app_defines(self_ty, &Symbol::from(*m))) {
@@ -3584,8 +3625,24 @@ impl<'a> BodyTyper<'a> {
                 let in_helper = !ctx.class_side
                     && matches!(ctx.self_ty.as_ref(), Some(Ty::Class { id, .. }) if self.helper_modules.is_some_and(|h| h.contains(id)));
                 let helper_copy = expr.decisions & (crate::expr::HELPER_COPY_TRANSLATE | crate::expr::HELPER_BODY_TRANSLATE) != 0;
+                let mailer = match (translate && !ctx.in_view && recv.is_none() && !ctx.class_side, &scope) {
+                    (true, None) => self.translating_mailer(ctx),
+                    _ => None,
+                };
+                // A mailer's bare `t` outside an action reads the action that called it, which this site does not know.
+                if translate && mailer.is_none() && scope.is_none() && recv.is_none() && !ctx.in_view
+                    && self.is_translating_mailer_class(ctx.self_ty.as_ref())
+                    && crate::expr::ExprCold::diagnostic(&expr.cold).is_none()
+                {
+                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None,
+                        construct: Symbol::from("mailer translation outside an action"),
+                        detail: "a mailer's `t` reads its lazy key under the action being processed, which a method other than an action does not know".to_string(),
+                    }));
+                }
                 let site = match (&scope, ctx.in_view) {
                     (_, true) => crate::lower::i18n_translate::Site::View(ctx.view_name.as_ref().map(|v| v.as_str())),
+                    (None, false) if let Some((scope, action)) = &mailer => crate::lower::i18n_translate::Site::Mailer(scope, action),
                     _ if helper_copy => crate::lower::i18n_translate::Site::View(None),
                     (None, false) if in_helper => crate::lower::i18n_translate::Site::View(None),
                     (Some(scope), false) => crate::lower::i18n_translate::Site::Controller(scope),
