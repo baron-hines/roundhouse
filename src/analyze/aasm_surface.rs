@@ -17,14 +17,13 @@ pub fn instance_methods(model: &Model) -> Vec<(Symbol, Ty)> {
     if !super::model_includes(model).iter().any(|id| id.0.as_str() == "AASM") {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    for item in &model.body {
-        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-        if let Some(names) = machine_names(expr) {
-            out.extend(names.into_iter().map(|n| (Symbol::from(n.as_str()), Ty::Bool)));
-        }
-    }
-    out
+    let calls: Vec<&Expr> = model.body.iter().filter_map(|item| match item {
+        ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "aasm") => Some(expr),
+        _ => None,
+    }).collect();
+    // A second `aasm` call reopens the machine with what the first configured (a namespace, say): not read alone.
+    let [call] = calls.as_slice() else { return Vec::new() };
+    machine_names(call).unwrap_or_default().into_iter().map(|n| (Symbol::from(n.as_str()), Ty::Bool)).collect()
 }
 
 fn machine_names(expr: &Expr) -> Option<Vec<String>> {
