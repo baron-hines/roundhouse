@@ -224,4 +224,12 @@ fn the_emitted_model_casts_its_uuid_columns() {
         child.contains("def self.schema_uuid_query_columns\n    []\n"),
         "a child on a table without uuid columns lists none:\n{child}"
     );
+    // A uuid key is a String, so the record's key helper answers one.
+    let sig = std::fs::read_to_string(emitted.join("sig/runtime/active_record/relation.rbs"))
+        .expect("emitted relation signatures");
+    assert!(
+        sig.contains("def uuid_record_key: (Base record) -> (Integer | String)?\n"),
+        "uuid_record_key widens with the key:\n{}",
+        sig.lines().filter(|l| l.contains("uuid_record_key")).collect::<Vec<_>>().join("\n")
+    );
 }
