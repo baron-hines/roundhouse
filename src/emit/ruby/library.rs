@@ -11913,6 +11913,8 @@ fn require_path_for_body_const(
         // `runtime/ruby/rack_utils.rb` for spinel and the rack gem's own
         // on the ruby family (`project::ruby_runtime_files`). Anchored so
         // a file that names it loads the one its tree has.
+        // `Rack::BodyProxy` has a port of its own (`runtime/ruby/rack_body_proxy.rb`).
+        "Rack" if path.get(1).is_some_and(|n| n == "BodyProxy") => Some("runtime/rack_body_proxy".to_string()),
         "Rack" => Some("runtime/rack_utils".to_string()),
         // `SQLite3::Database` — the gem on the ruby family, the FFI port
         // (`runtime/spinel/sqlite3_database.rb`) on spinel; one require

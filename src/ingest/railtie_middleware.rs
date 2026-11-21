@@ -197,6 +197,13 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
             ));
         }
     }
+    // Blocks are kept per class, not per entry: a class stacked twice with different blocks is refused rather than given one twice.
+    for (i, (class, _, span, block, _, _)) in out.iter().enumerate() {
+        if out[..i].iter().any(|(c, _, _, b, _, _)| c == class && b != block) {
+            diags.push(Diagnostic::unsupported(*span, None, "railtie middleware",
+                format!("`{class}` is stacked twice with different construction blocks: the emitted stack keeps one per class")));
+        }
+    }
     let blocks = out.iter().filter_map(|(class, _, _, block, _, _)| block.clone().map(|b| (class.clone(), b))).collect();
     let classes: Vec<String> = out.into_iter().map(|(class, _, _, _, _, _)| class).collect();
     let env_writes_by_class = env_writes_by_class(vfs, &every_lib_file, &every_gem_defines);
@@ -901,6 +908,11 @@ mod tests {
         let twice = "module Gem\n  class A\n  end\n  class B\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n      app.middleware.insert_after ActionDispatch::RequestId, B\n    end\n  end\nend\n";
         let (classes, diags) = read(&[("/gem/lib/gem.rb", twice)]);
         assert_eq!(classes, ["Gem::B", "Gem::A"], "{diags:?}");
+        // The same class stacked again with another block keeps one block per class: refused.
+        let blocks = "module Gem\n  class A\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n    end\n  end\nend\n";
+        let application = "module Blog\n  class Application < Rails::Application\n    config.middleware.use Gem::A do |a|\n      a.x = 1\n    end\n  end\nend\n";
+        let (_, diags) = read(&[("/gem/lib/gem.rb", blocks), ("/app/config/application.rb", application)]);
+        assert!(diags.iter().any(|d| d.contains("stacked twice with different construction blocks")), "{diags:?}");
     }
 
     /// The app's own `config.middleware.use` of a class in its lib/ sits where a source gem's class would.

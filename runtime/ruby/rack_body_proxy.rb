@@ -4,7 +4,8 @@
 #
 # A middleware wraps the body it hands up so its block runs once the server is done with the body (request_store's
 # `RequestStore.clear!`): the server closes it, as Rack's SPEC asks, and `close` runs the block. rack's proxy forwards every other method to the body through `method_missing`; here the body is the Array
-# of Strings the emitted stack answers, and `each` is what the server reads it with.
+# of Strings the emitted stack answers, or another middleware's proxy over it, and `each` is what the server reads it
+# with.
 module Rack
   class BodyProxy
     def initialize(body, &block)
@@ -21,8 +22,13 @@ module Rack
     def close
       return nil if @closed
       @closed = true
-      # Not the body's own close first, as rack's does: the emitted stack's body is an Array of Strings, which has none.
-      @block.call
+      # A body another middleware wrapped is closed first, as rack's is; the emitted stack's own Array has no close.
+      begin
+        inner = @body
+        inner.close if inner.is_a?(BodyProxy)
+      ensure
+        @block.call
+      end
       nil
     end
 

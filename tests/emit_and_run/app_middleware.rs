@@ -202,4 +202,27 @@ fn the_spinel_tree_carries_the_body_proxy_port() {
     assert!(errors.is_empty(), "{errors:#?}");
     let port = std::fs::read_to_string(tree.join("runtime/rack_body_proxy.rb")).expect("rack_body_proxy.rb");
     assert!(port.contains("class BodyProxy"), "{port}");
+    // Loaded where the middleware names it, not only copied.
+    let mut loaded = false;
+    for entry in walk(&tree) {
+        if entry.extension().is_some_and(|e| e == "rb")
+            && std::fs::read_to_string(&entry).is_ok_and(|t| t.contains("Clearing") && t.contains("rack_body_proxy"))
+        {
+            loaded = true;
+        }
+    }
+    assert!(loaded, "no file naming Clearing requires runtime/rack_body_proxy");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
