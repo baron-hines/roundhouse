@@ -2042,6 +2042,8 @@ impl<'a> BodyTyper<'a> {
                                     }
                                     ctx.constants.get_own(leaf).cloned()
                                 })
+                                // A core value (`Math::PI` in a view), which no app or runtime document declares.
+                                .or_else(|| const_resolution::core_value_constant_type(name.0.as_str()))
                         };
                         // Otherwise retain the written class path, but
                         // never guess another class by its suffix.
@@ -3463,11 +3465,16 @@ impl<'a> BodyTyper<'a> {
                     );
                 }
                 if let Some(receiver) = recv.as_mut() {
-                    receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
-                    if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")
-                        && self.owns_operator(recv_ty.as_ref(), method, self.is_class_object(receiver, ctx))
-                    {
-                        receiver.decisions |= crate::expr::RESOLVED_OPERATOR_RECEIVER;
+                    receiver.decisions &= !(crate::expr::RESOLVED_OPERATOR_RECEIVER | crate::expr::NILABLE_OPERATOR_RECEIVER);
+                    if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=") {
+                        let class_object = self.is_class_object(receiver, ctx);
+                        if self.owns_operator(recv_ty.as_ref(), method, class_object) {
+                            receiver.decisions |= crate::expr::RESOLVED_OPERATOR_RECEIVER;
+                        } else if let Some(ty) = recv_ty.as_ref().filter(|t| t.peel_nilable() != *t)
+                            && self.owns_operator(Some(ty.peel_nilable()), method, class_object)
+                        {
+                            receiver.decisions |= crate::expr::NILABLE_OPERATOR_RECEIVER;
+                        }
                     }
                 }
                 // `include ActionView::RecordIdentifier` is a marker include

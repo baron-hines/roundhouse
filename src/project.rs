@@ -3088,7 +3088,8 @@ fn report_partial_binops(app: &App, target: BuildTarget) {
     }
     fn visit(expr: &crate::expr::Expr, target: BuildTarget) {
         if let Some(crate::diagnostic::DiagnosticKind::IncompatibleBinop { op, lhs_ty, rhs_ty }) = &expr.diagnostic()
-            && crate::analyze::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+            && (crate::analyze::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+                || matches!(&*expr.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if r.decisions & crate::expr::NILABLE_OPERATOR_RECEIVER != 0))
         {
             crate::emit::diagnostics::report_unsupported(
                 expr.span, target.as_str(), "operator on some of its operands' types",

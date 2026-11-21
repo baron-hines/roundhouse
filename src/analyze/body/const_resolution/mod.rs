@@ -312,6 +312,11 @@ pub(crate) fn is_core_value_constant(name: &str) -> bool {
     core_value_type(name).is_some()
 }
 
+/// The type of a value constant `core_rbs()` declares (`Math::PI`), for a reference no source document answers.
+pub(crate) fn core_value_constant_type(name: &str) -> Option<Ty> {
+    core_value_type(name)
+}
+
 /// The value contract contributed by a constant declared in `core_rbs()`.
 fn core_value_type(name: &str) -> Option<Ty> {
     if name.trim_start_matches("Object::") == "ENV" {

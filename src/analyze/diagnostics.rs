@@ -1980,7 +1980,8 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             let severity = match kind {
                 // Not an error where some operand arm takes it: Ruby raises for the others, which the ruby family runs as written and a strict target reports or checks (`lower::nil_operand`)
                 DiagnosticKind::IncompatibleBinop { op, lhs_ty, rhs_ty }
-                    if crate::analyze::body::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty) =>
+                    if crate::analyze::body::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+                        || matches!(&*expr.node, ExprNode::Send { recv: Some(r), .. } if r.decisions & crate::expr::NILABLE_OPERATOR_RECEIVER != 0) =>
                 {
                     crate::diagnostic::Severity::Warning
                 }

@@ -230,6 +230,8 @@ pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
 pub const ERASED_WRITING_SCOPE: u64 = 1 << 61;
 /// On an argument analyze typed as the relation a has_many read is (`analyze::relation_params`): the read the lowering seeds.
 pub const RELATION_ARGUMENT: u64 = 1 << 42;
+/// On an operator's receiver whose non-nil arm defines the operator (`Money? * 2`): Ruby raises only for nil.
+pub const NILABLE_OPERATOR_RECEIVER: u64 = 1 << 43;
 /// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 
