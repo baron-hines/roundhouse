@@ -1061,11 +1061,38 @@ struct NestedEmitter<'a> {
 
 impl NestedEmitter<'_> {
     fn write_names(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>) {
-        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name)) {
+        self.write_names_except(out, depth, names, &BTreeSet::new());
+    }
+
+    /// `kept` names the modules left pending (a guard asks whether they are defined yet), and with them every
+    /// pending module that needs one, however far down: writing that one first would write the kept one too.
+    fn write_names_except(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>, kept: &BTreeSet<String>) {
+        let last = |name: &str| name.rsplit("::").next().unwrap_or(name).to_string();
+        let mut blocked: BTreeSet<String> = kept.clone();
+        loop {
+            let before = blocked.len();
+            for block in &self.pending {
+                if block.requires.iter().any(|r| blocked.contains(&last(r))) {
+                    blocked.insert(last(&block.name));
+                }
+            }
+            if blocked.len() == before {
+                break;
+            }
+        }
+        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name) && !blocked.contains(&last(&block.name))) {
             let block = self.pending.remove(at);
-            self.write_names(out, depth, &block.requires);
+            self.write_names_except(out, depth, &block.requires, &blocked);
             writeln!(out, "{}", indent_lines(&block.content, depth)).unwrap();
         }
+    }
+
+    fn write_expr_except(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr, kept: &BTreeSet<String>) {
+        if self.pending.is_empty() { return; }
+        let mut paths = BTreeSet::new();
+        walk_load_time_paths(expr, owner, &mut BTreeSet::new(), &mut paths);
+        let names = nested_names_in_paths(owner, &paths, &self.names);
+        self.write_names_except(out, depth, &names, kept);
     }
 
     fn write_expr(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr) {
@@ -10234,11 +10261,8 @@ fn emit_library_class_decl_inner(
         for c in conds {
             names_in(c, &mut asked);
         }
-        let guarded = nested.borrow().names.iter().any(|n| asked.contains(n.rsplit("::").next().unwrap_or(n)));
-        if !guarded {
-            for st in sts {
-                nested.borrow_mut().write_expr(s, depth, lc, st);
-            }
+        for st in sts {
+            nested.borrow_mut().write_expr_except(s, depth, lc, st, &asked);
         }
         write(s, &lc.conditional_definitions[index], lc, &body_pad, &require_of);
     };

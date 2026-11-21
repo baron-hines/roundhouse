@@ -1496,7 +1496,7 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
             if let Some(crate::expr::InterpPart::Text { value }) = parts.first()
                 && let Some(namespace) = value.trim_start_matches("::").strip_suffix("::")
                 && namespace.starts_with(|c: char| c.is_ascii_uppercase())
-                && namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+                && namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_')
                 && let Some(gems) = s.gems =>
         {
             for child in gems.children_of(namespace) {

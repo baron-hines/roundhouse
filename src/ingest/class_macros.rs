@@ -1173,7 +1173,8 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 /// the class it is written in, as Ruby's lexical-then-ancestor lookup does.
 struct ConstantOwners {
     line: Vec<String>,
-    assigned: HashMap<String, HashMap<Symbol, Expr>>,
+    /// `None` for a name the class assigns a value that does not fold: it hides the ancestors' as Ruby's lookup does.
+    assigned: HashMap<String, HashMap<Symbol, Option<Expr>>>,
 }
 
 impl ConstantOwners {
@@ -1181,13 +1182,13 @@ impl ConstantOwners {
         match scope {
             Some(scope) => {
                 let from = self.line.iter().position(|c| c == scope.as_str())?;
-                self.line[from..].iter().find_map(|c| self.assigned.get(c)?.get(name))
+                self.line[from..].iter().find_map(|c| self.assigned.get(c)?.get(name))?.as_ref()
             }
             // Not known where the method is written: only a name one class of the line assigns.
             None => {
                 let mut found = self.assigned.values().filter_map(|a| a.get(name));
                 let one = found.next()?;
-                found.next().is_none().then_some(one)
+                found.next().is_none().then_some(one.as_ref()).flatten()
             }
         }
     }
@@ -1196,11 +1197,15 @@ impl ConstantOwners {
 fn literal_constant_owners(app: &App, line: &[ClassId]) -> ConstantOwners {
     ConstantOwners {
         line: line.iter().map(|id| id.0.as_str().to_string()).collect(),
-        assigned: line.iter().map(|id| (id.0.as_str().to_string(), literal_constants(app, std::slice::from_ref(id)))).collect(),
+        assigned: line.iter().map(|id| (id.0.as_str().to_string(), assigned_constants(app, std::slice::from_ref(id)))).collect(),
     }
 }
 
 fn literal_constants(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Expr> {
+    assigned_constants(app, ancestors).into_iter().filter_map(|(name, value)| Some((name, value?))).collect()
+}
+
+fn assigned_constants(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Option<Expr>> {
     let mut out = HashMap::default();
     for id in ancestors.iter().rev() {
         let assigned: Vec<(Symbol, Expr)> = match app.models.iter().find(|m| &m.name == id) {
@@ -1222,11 +1227,9 @@ fn literal_constants(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Expr> 
                 ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "freeze" && args.is_empty() => r,
                 _ => value,
             };
-            if let ExprNode::Array { elements, .. } = &*value.node
-                && elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } }))
-            {
-                out.insert(name.clone(), value.clone());
-            }
+            let folds = matches!(&*value.node, ExprNode::Array { elements, .. }
+                if elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })));
+            out.insert(name.clone(), folds.then(|| value.clone()));
         }
     }
     out
@@ -1424,7 +1427,14 @@ impl Run<'_> {
             let given = if p.keyword || p.from_keyword { keywords.remove(&p.name) } else { positional.next().cloned() };
             let val = match (given, &p.default) {
                 (Some(e), _) => self.eval(&e, env)?,
-                (None, Some(default)) => self.eval(default, &bound)?,
+                // A default is written in its method's class, so its constants are read from there, not from the caller.
+                (None, Some(default)) => {
+                    let inner = def.enclosing_class.clone().or_else(|| self.scope.clone());
+                    let outer = std::mem::replace(&mut self.scope, inner);
+                    let val = self.eval(default, &bound);
+                    self.scope = outer;
+                    val?
+                }
                 (None, None) => return Err(format!("`{}` is not given", p.name.as_str())),
             };
             bound.insert(p.name.clone(), val);
@@ -2245,7 +2255,7 @@ impl Run<'_> {
                     ("in?", _, [list]) => {
                         let ExprNode::Const { path } = &*list.node else { return None };
                         let [name] = path.as_slice() else { return None };
-                        let ExprNode::Array { elements, .. } = &*self.constants.get(name)?.node else { return None };
+                        let ExprNode::Array { elements, .. } = &*self.constant_owners.lookup(self.scope.as_ref(), name)?.node else { return None };
                         let mut found = false;
                         for el in elements {
                             let ExprNode::Lit { value: o } = &*el.node else { return None };

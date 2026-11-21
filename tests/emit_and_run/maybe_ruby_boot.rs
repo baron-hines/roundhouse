@@ -143,6 +143,36 @@ fn a_guard_asking_for_a_later_nested_module_keeps_its_branch() {
     assert!(run.stdout.contains("guard passed"), "{}", run.stdout);
 }
 
+/// Only the module the guard asks for stays after it: `Other`, which the other branch includes, is still written
+/// ahead of the conditional, as the source defines it there.
+#[test]
+fn a_guard_keeps_back_only_the_module_it_asks_for() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/guarded_pair.rb",
+            "class GuardedPair\n  module Other\n    def other\n      \"o\"\n    end\n  end\n\n  if const_defined?(:Feature, false)\n    include Feature\n  else\n    include Other\n  end\n\n  module Feature\n    def feature\n      \"f\"\n    end\n  end\nend\n",
+        )
+        .run_ruby(
+            "got = [GuardedPair.new.other, GuardedPair.include?(GuardedPair::Feature)]\nraise \"got #{got.inspect}\" unless got == [\"o\", false]\nputs \"pair passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("pair passed"), "{}", run.stdout);
+}
+
+/// A module the guarded branch includes, which needs the asked-for one through another (`A` includes `B`, which
+/// includes `Feature`), waits with it: writing `A` first would need `B` and so `Feature` too.
+#[test]
+fn a_module_needing_the_asked_one_through_another_waits_too() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/guarded_chain.rb",
+            "class GuardedChain\n  if const_defined?(:Feature, false)\n    include A\n  end\n\n  module Feature\n    def feature\n      \"f\"\n    end\n  end\n\n  module B\n    include Feature\n\n    def b\n      \"b\"\n    end\n  end\n\n  module A\n    include B\n\n    def a\n      \"a\"\n    end\n  end\nend\n",
+        )
+        .run_ruby("got = [GuardedChain.include?(GuardedChain::A), GuardedChain::A.include?(GuardedChain::Feature)]\nraise \"got #{got.inspect}\" unless got == [false, true]\nputs \"chain passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("chain passed"), "{}", run.stdout);
+}
+
 /// `private :helper` in a branch settled at load (`defined?` of a class the app carries) makes the branch's
 /// `helper` private, as Ruby runs it there.
 #[test]
