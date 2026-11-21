@@ -6,16 +6,45 @@
 //! sideloaded beside the root, embedded objects, `key:`, `root:`, a class
 //! `root`, and `ActiveModel::ArraySerializer` with `each_serializer:`; an
 //! association reading `object.comments.order(:id)` beside a serializer of
-//! comments, and names (`h`, `node`) the expansion's own locals share.
+//! comments, and names (`h`, `node`) the expansion's own locals share; a
+//! mixin whose `self.included` declares an attribute and whose gate and
+//! private gate meet the gem's own, and one that only adds a method.
 
 use super::emit_and_run;
 
 const SERIALIZERS: &str = r#"
+module CommenterMixin
+  def self.included(klass)
+    klass.attributes :shout
+  end
+
+  def shout
+    object.commenter.upcase + "!"
+  end
+
+  def include_shout?
+    object.commenter != "bob"
+  end
+
+  private
+
+  def include_body?
+    false
+  end
+end
+
+module NoteHelpers
+  def summary_note
+    "note"
+  end
+end
+
 class ApplicationSerializer < ActiveModel::Serializer
   embed :ids, include: true
 end
 
 class CommentSerializer < ApplicationSerializer
+  include CommenterMixin
   attributes :id, :commenter, :h
   attribute :body, key: :text
 
@@ -37,7 +66,8 @@ class BasicArticleSerializer < ApplicationSerializer
 end
 
 class ArticleSerializer < BasicArticleSerializer
-  attributes :summary, :draft
+  include NoteHelpers
+  attributes :summary, :draft, :summary_note
   has_many :comments, serializer: CommentSerializer
   has_one :first_comment, serializer: CommentSerializer, embed: :objects
   has_many :recent, serializer: CommentSerializer, embed: :objects, key: :latest
@@ -134,12 +164,12 @@ end
 /// What active_model_serializers 0.8.4 renders for the same records
 /// (articles 101 and 102, comments 201 and 202), from the real gem.
 const EXPECTED: &[(&str, &str)] = &[
-    ("show", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"article":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
-    ("draft", r#"{"comments":[],"article":{"id":102,"title":"Draft one","long":false,"draft":true,"comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}}"#),
-    ("admin", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"title_shown":true,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
-    ("guest", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"title_shown":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
-    ("plain", r#"{"id":101,"title":"Hello","comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"node":{"id":202,"commenter":"bob","h":"BOB","text":"second"}}"#),
-    ("index", r#"{"comments":[{"id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"comment_ids":[201,202],"first_comment":{"id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
+    ("show", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"article":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("draft", r#"{"comments":[],"article":{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}}"#),
+    ("admin", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("guest", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":false,"comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("plain", r#"{"id":101,"title":"Hello","comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"node":{"id":202,"commenter":"bob","h":"BOB","text":"second"}}"#),
+    ("index", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
     ("bare", r#"[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]"#),
     ("rootless", r#"Cannot serialize comments when ArticleSerializer does not have a root!"#),
 ];
@@ -241,6 +271,10 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  cached\nend\n\nclass BSerializer < ASerializer\nend\n", "inherits from ASerializer", &["ASerializer", "BSerializer"]),
         ("class ASerializer < BaseSerializer\n  cached\nend\n\nclass BSerializer < BaseSerializer\n  has_one :a, serializer: ASerializer\nend\n", "serializes through ASerializer", &["ASerializer", "BSerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :a, serializer: CommentSerializer\nend\n", "`serializer: CommentSerializer` is not a serializer of the app", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  include Missing\nend\n", "`include Missing`: not a module of the app", &["ASerializer"]),
+        ("module M\n  include Comparable\n\n  def x\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "a mixin body may hold only", &["ASerializer"]),
+        ("module M\n  def self.included(klass)\n    klass.attributes :x\n    puts klass\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "may only declare on `klass`", &["ASerializer"]),
+        ("module M\n  def self.included(klass)\n    klass.attributes :x\n  end\nend\n\nclass Other\n  include M\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "also runs for Other", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  attributes :ams_attributes\nend\n", "an attribute named `ams_attributes`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  embed :ids, EMBED\nend\n", "`embed` options other than a literal Hash", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  def read_attribute_for_serialization(name)\n    name\n  end\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),

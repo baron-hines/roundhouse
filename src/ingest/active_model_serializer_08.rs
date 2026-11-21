@@ -151,11 +151,15 @@ struct Def {
     visible: bool,
     /// Whether its body calls `super`.
     supers: bool,
+    /// From an included mixin: an ancestor of the class, not the class.
+    from_module: bool,
 }
 
 struct Own {
     stmts: Vec<Stmt>,
     defs: Vec<Def>,
+    /// The mixins whose `self.included` declared into the class.
+    hooked: Vec<String>,
     span: Span,
     source_index: usize,
     offset: usize,
@@ -216,6 +220,18 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         return Ok(());
     }
     let tree: HashSet<String> = chains.keys().cloned().collect();
+    // Where each module of the app is defined, for a serializer's `include`.
+    let mut modules: HashMap<String, usize> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|c| c.is_module) {
+        let name = lc.name.0.as_str();
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        let found = sources.iter().position(|src| {
+            src.text.contains(&format!("module {leaf}")) && module_body(&super::prism::parse_silent(src.text.as_bytes()).node(), name).is_some()
+        });
+        if let Some(index) = found {
+            modules.insert(name.to_string(), index);
+        }
+    }
     let mut owns: HashMap<String, Own> = HashMap::default();
     let mut refused: HashMap<String, IngestError> = HashMap::default();
     for (index, source) in sources.iter().enumerate() {
@@ -235,10 +251,10 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 refused.insert(name, refuse(source, offset, "a reopened serializer is not supported"));
                 continue;
             }
-            match collect(&class, source, &name, &tree) {
-                Ok((stmts, defs)) => {
+            match collect(&class, source, &name, &tree, &modules, sources) {
+                Ok((stmts, defs, hooked)) => {
                     let span = Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
-                    owns.insert(name, Own { stmts, defs, span, source_index: index, offset });
+                    owns.insert(name, Own { stmts, defs, hooked, span, source_index: index, offset });
                 }
                 Err(e) => {
                     refused.insert(name, e);
@@ -277,6 +293,25 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         if let Some(d) = own.defs.iter().find(|d| d.supers && api.clone().any(|m| m == d.name)) {
             let reason = format!("`super` in `def {}` reaches the gem's class, which the expansion removes", d.name);
             refused.entry(name.clone()).or_insert_with(|| refuse(&sources[own.source_index], own.offset, &reason));
+        }
+    }
+    // A mixin's hook declares into whatever includes it, and the expansion removes it: a class outside the tree that
+    // includes it would lose what the hook gave it.
+    let includers: Vec<(String, String)> = app
+        .library_classes
+        .iter()
+        .flat_map(|c| c.includes.iter().map(move |i| (c.name.0.as_str().to_string(), i.0.as_str().to_string())))
+        .chain(app.models.iter().flat_map(|m| crate::analyze::model_includes(m).into_iter().map(move |i| (m.name.0.as_str().to_string(), i.0.as_str().to_string()))))
+        .collect();
+    for (name, own) in &owns {
+        for module in &own.hooked {
+            let leaf = module.rsplit("::").next().unwrap_or(module);
+            if let Some((other, _)) = includers.iter().find(|(c, i)| {
+                !tree.contains(c) && (i == module || i.rsplit("::").next() == Some(leaf))
+            }) {
+                let reason = format!("`include {module}`, whose `self.included` also runs for {other}, which is not a serializer");
+                refused.entry(name.clone()).or_insert_with(|| refuse(&sources[own.source_index], own.offset, &reason));
+            }
         }
     }
     // The gem reads an attribute through the record's `read_attribute_for_serialization`, which the expansion calls
@@ -386,6 +421,11 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         }
     }
     let mut done: HashSet<String> = lowered.into_iter().filter(|n| !failed.contains(n)).collect();
+    // The hook's declarations are expanded into each includer; replayed, `klass.attributes` has no gem to answer it.
+    let unhook: HashSet<String> = owns.iter().filter(|(n, _)| done.contains(*n)).flat_map(|(_, o)| o.hooked.iter().cloned()).collect();
+    for lc in app.library_classes.iter_mut().filter(|c| c.is_module && unhook.contains(c.name.0.as_str())) {
+        lc.methods.retain(|m| !(m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "included"));
+    }
     // The rewrite reads `each_serializer:` by its spelling, not from where it is written: a name another
     // namespace also defines (`Admin::ItemSerializer` beside `ItemSerializer`) may be that one, so it stays the gem's.
     let all: Vec<String> = app
@@ -467,26 +507,84 @@ fn resolve(written: &str, owner: &str, names: &HashSet<String>) -> String {
     written.to_string()
 }
 
+struct Walk<'a> {
+    name: &'a str,
+    tree: &'a HashSet<String>,
+    /// Each module of the app, with the index of the source that defines it.
+    modules: &'a HashMap<String, usize>,
+    sources: &'a [SourceFile],
+    stmts: Vec<Stmt>,
+    defs: Vec<Def>,
+    visible: bool,
+    at: usize,
+    /// The mixins whose `self.included` hook the walk read as declarations.
+    hooked: Vec<String>,
+    hook_seen: bool,
+}
+
+enum Mode<'m> {
+    Class,
+    Module,
+    /// The body of a mixin's `def self.included(klass)`, `klass` its parameter.
+    Hook(&'m str),
+}
+
 fn collect(
     class: &ruby_prism::ClassNode<'_>,
     source: &SourceFile,
     name: &str,
     tree: &HashSet<String>,
-) -> IngestResult<(Vec<Stmt>, Vec<Def>)> {
-    let mut stmts = Vec::new();
-    let mut defs = Vec::new();
-    let Some(body) = class.body() else { return Ok((stmts, defs)) };
+    modules: &HashMap<String, usize>,
+    sources: &[SourceFile],
+) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>)> {
     let class_text = &source.text[class.location().start_offset()..class.location().end_offset()];
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut visible = true;
-    for (at, stmt) in flatten_statements(body).into_iter().enumerate() {
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false };
+    if let Some(body) = class.body() {
+        walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
+    }
+    let Walk { stmts, defs, hooked, .. } = ctx;
+    // A private `def` the declaration's own reader or gate replaces, which the expansion would keep beside it.
+    for stmt in &stmts {
+        let (attr, at) = match stmt {
+            Stmt::Attribute { name, at, .. } => (name.as_str(), *at),
+            Stmt::Association(a, at) => (a.name.as_str(), *at),
+            _ => continue,
+        };
+        let gate = format!("include_{attr}?");
+        if defs.iter().any(|d| !d.visible && !d.from_module && d.at < at && (d.name == attr || d.name == gate)) {
+            return Err(refuse(source, class.location().start_offset(), &format!("a private `{attr}` before its declaration is outside the subset")));
+        }
+    }
+    Ok((stmts, defs, hooked))
+}
+
+fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile, mode: Mode<'_>) -> IngestResult<()> {
+    for stmt in body {
+        ctx.at += 1;
+        let at = ctx.at;
         let offset = stmt.location().start_offset();
         let fail = |reason: &str| refuse(source, offset, reason);
         if let Some(def) = stmt.as_def_node() {
             let method = constant_id_str(&def.name()).to_string();
+            if matches!(mode, Mode::Hook(_)) {
+                return Err(fail("a `def` in a mixin's `self.included`"));
+            }
             if def.receiver().is_some() {
+                if !matches!(mode, Mode::Module) || method != "included" {
+                    continue;
+                }
+                let params: Vec<String> = def
+                    .parameters()
+                    .map(|p| p.requireds().iter().filter_map(|r| r.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string())).collect())
+                    .unwrap_or_default();
+                let [param] = params.as_slice() else { return Err(fail("a `self.included` taking other than the class")) };
+                if let Some(hook) = def.body() {
+                    walk(ctx, flatten_statements(hook), source, Mode::Hook(param))?;
+                }
+                ctx.hook_seen = true;
                 continue;
             }
             if method == "initialize" || method.starts_with("ams_") || GEM_ONLY.contains(&method.as_str()) {
@@ -497,10 +595,12 @@ fn collect(
             if let Some((call, at)) = calls.found {
                 return Err(refuse(source, at, &format!("`{call}` is the gem's, outside the subset")));
             }
-            defs.push(Def { name: method, at, visible, supers: calls.supers });
+            ctx.defs.push(Def { name: method, at, visible: ctx.visible, supers: calls.supers, from_module: matches!(mode, Mode::Module) });
             continue;
         }
-        if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_constant_write_node().is_some() {
+        if !matches!(mode, Mode::Hook(_))
+            && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_constant_write_node().is_some())
+        {
             continue;
         }
         let Some(call) = stmt.as_call_node() else {
@@ -508,26 +608,71 @@ fn collect(
         };
         let method = constant_id_str(&call.name());
         let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
-        let on_self = call.receiver().is_some_and(|r| r.as_self_node().is_some());
-        if on_self && method == "root=" {
-            stmts.push(Stmt::Root(root_value(&args[0]).ok_or_else(|| fail("a root other than a literal"))?));
-            continue;
-        }
-        if call.receiver().is_some() {
-            return Err(fail("a receiver on a serializer declaration"));
-        }
         if call.block().is_some() {
             return Err(fail(&format!("a block on `{method}`")));
         }
+        match mode {
+            Mode::Hook(param) => {
+                let on_klass = call
+                    .receiver()
+                    .and_then(|r| r.as_local_variable_read_node())
+                    .is_some_and(|r| constant_id_str(&r.name()) == param);
+                if !on_klass {
+                    return Err(fail(&format!("a mixin's `self.included` may only declare on `{param}`")));
+                }
+            }
+            Mode::Module => {
+                if call.receiver().is_none() && matches!(method, "private" | "protected" | "public") && args.is_empty() {
+                    ctx.visible = method != "private";
+                    continue;
+                }
+                return Err(fail("a mixin body may hold only methods, constants, visibility and `self.included`"));
+            }
+            Mode::Class => {
+                let on_self = call.receiver().is_some_and(|r| r.as_self_node().is_some());
+                if on_self && method == "root=" {
+                    ctx.stmts.push(Stmt::Root(root_value(&args[0]).ok_or_else(|| fail("a root other than a literal"))?));
+                    continue;
+                }
+                if call.receiver().is_some() {
+                    return Err(fail("a receiver on a serializer declaration"));
+                }
+                if matches!(method, "private" | "protected" | "public") && args.is_empty() {
+                    ctx.visible = method != "private";
+                    continue;
+                }
+                if method == "include" {
+                    let [arg] = args.as_slice() else { return Err(fail("`include` of other than one module")) };
+                    let written = super::util::constant_path_of(arg).map(|p| p.join("::")).ok_or_else(|| fail("`include` of other than a constant"))?;
+                    let module = if is_rooted(arg) { written.clone() } else { lexical_in(&written, ctx.name, ctx.modules) };
+                    let Some(&index) = ctx.modules.get(&module) else {
+                        return Err(fail(&format!("`include {written}`: not a module of the app")));
+                    };
+                    let msource = &ctx.sources[index];
+                    let parsed = super::prism::parse_silent(msource.text.as_bytes());
+                    let Some(mbody) = module_body(&parsed.node(), &module) else {
+                        return Err(fail(&format!("`include {written}`: its source is not found")));
+                    };
+                    ctx.hook_seen = false;
+                    // A module's own `private` does not carry into the class.
+                    let visible = std::mem::replace(&mut ctx.visible, true);
+                    walk(ctx, mbody, msource, Mode::Module)?;
+                    ctx.visible = visible;
+                    if ctx.hook_seen && !ctx.hooked.contains(&module) {
+                        ctx.hooked.push(module);
+                    }
+                    continue;
+                }
+            }
+        }
         match method {
-            "private" | "protected" | "public" if args.is_empty() => visible = method != "private",
             "attributes" => {
                 for arg in &args {
                     if let Some(attr) = symbol_value(arg) {
-                        stmts.push(attribute(&attr, None, offset, at, source)?);
+                        ctx.stmts.push(attribute(&attr, None, offset, at, source)?);
                     } else if let Some(pairs) = hash_pairs(arg) {
                         for (attr, key) in pairs.map_err(|r| fail(&r))? {
-                            stmts.push(attribute(&attr, Some(key), offset, at, source)?);
+                            ctx.stmts.push(attribute(&attr, Some(key), offset, at, source)?);
                         }
                     } else {
                         return Err(fail("`attributes` takes Symbols and a Hash of keys"));
@@ -556,7 +701,7 @@ fn collect(
                     },
                     _ => return Err(fail("`attribute` takes a Symbol, or one name with its key")),
                 };
-                stmts.push(attribute(&attr, key, offset, at, source)?);
+                ctx.stmts.push(attribute(&attr, key, offset, at, source)?);
             }
             "has_one" | "has_many" => {
                 let many = method == "has_many";
@@ -590,8 +735,8 @@ fn collect(
                                 .or_else(|| value.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
                                 .ok_or_else(|| fail("a `serializer:` other than a constant"))?;
                             let rooted = is_rooted(&value) || value.as_string_node().is_some();
-                            let target = if rooted { written.clone() } else { lexical(&written, name, tree) };
-                            if !tree.contains(&target) {
+                            let target = if rooted { written.clone() } else { lexical(&written, ctx.name, ctx.tree) };
+                            if !ctx.tree.contains(&target) {
                                 return Err(fail(&format!("`serializer: {written}` is not a serializer of the app")));
                             }
                             serializer = Some(target);
@@ -622,7 +767,7 @@ fn collect(
                     Key::Sym(if many { first.clone() } else { crate::naming::pluralize(first) })
                 });
                 for n in assoc_names {
-                    stmts.push(Stmt::Association(
+                    ctx.stmts.push(Stmt::Association(
                         Assoc { many, name: n, serializer: serializer.clone(), embed, include, key: key.clone(), root: root.clone(), embed_key: embed_key.clone() },
                         at,
                     ));
@@ -653,28 +798,62 @@ fn collect(
                         return Err(fail("an `include:` other than true or false"));
                     };
                 }
-                stmts.push(Stmt::Embed(embed, include));
+                ctx.stmts.push(Stmt::Embed(embed, include));
             }
             "root" => {
                 let [value] = args.as_slice() else { return Err(fail("`root` takes one value")) };
-                stmts.push(Stmt::Root(root_value(value).ok_or_else(|| fail("a root other than a literal"))?));
+                ctx.stmts.push(Stmt::Root(root_value(value).ok_or_else(|| fail("a root other than a literal"))?));
             }
             other => return Err(fail(&format!("`{other}` is outside the ActiveModel::Serializer 0.8 subset"))),
         }
     }
-    // A private `def` the declaration's own reader or gate replaces, which the expansion would keep beside it.
-    for stmt in &stmts {
-        let (attr, at) = match stmt {
-            Stmt::Attribute { name, at, .. } => (name.as_str(), *at),
-            Stmt::Association(a, at) => (a.name.as_str(), *at),
-            _ => continue,
+    Ok(())
+}
+
+/// The statements of module `path`'s body in a parsed file.
+fn module_body<'pr>(node: &ruby_prism::Node<'pr>, path: &str) -> Option<Vec<ruby_prism::Node<'pr>>> {
+    fn find<'pr>(node: &ruby_prism::Node<'pr>, scope: &mut Vec<String>, path: &str) -> Option<Vec<ruby_prism::Node<'pr>>> {
+        let stmts: Vec<ruby_prism::Node<'pr>> = if let Some(p) = node.as_program_node() {
+            p.statements().body().iter().collect()
+        } else if let Some(s) = node.as_statements_node() {
+            s.body().iter().collect()
+        } else if let Some(m) = node.as_module_node() {
+            let name = super::util::constant_path_of(&m.constant_path())?;
+            let depth = scope.len();
+            scope.extend(name);
+            let found = if scope.join("::") == path {
+                Some(m.body().map(flatten_statements).unwrap_or_default())
+            } else {
+                m.body().and_then(|b| find(&b, scope, path))
+            };
+            scope.truncate(depth);
+            return found;
+        } else if let Some(c) = node.as_class_node() {
+            let name = super::util::constant_path_of(&c.constant_path())?;
+            let depth = scope.len();
+            scope.extend(name);
+            let found = c.body().and_then(|b| find(&b, scope, path));
+            scope.truncate(depth);
+            return found;
+        } else {
+            return None;
         };
-        let gate = format!("include_{attr}?");
-        if defs.iter().any(|d| !d.visible && d.at < at && (d.name == attr || d.name == gate)) {
-            return Err(refuse(source, class.location().start_offset(), &format!("a private `{attr}` before its declaration is outside the subset")));
-        }
+        stmts.iter().find_map(|s| find(s, scope, path))
     }
-    Ok((stmts, defs))
+    find(node, &mut Vec::new(), path)
+}
+
+/// A module written inside `owner`'s body: its lexical scopes, then the top level.
+fn lexical_in(written: &str, owner: &str, modules: &HashMap<String, usize>) -> String {
+    let mut scope: Vec<&str> = owner.split("::").collect();
+    while !scope.is_empty() {
+        let candidate = format!("{}::{written}", scope.join("::"));
+        if modules.contains_key(&candidate) {
+            return candidate;
+        }
+        scope.pop();
+    }
+    written.to_string()
 }
 
 fn attribute(attr: &str, key: Option<Key>, offset: usize, at: usize, source: &SourceFile) -> IngestResult<Stmt> {
