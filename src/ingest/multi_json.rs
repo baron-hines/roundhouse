@@ -55,12 +55,6 @@ pub(super) fn lower_multi_json(
         return Ok(());
     }
     let refuse = |message: String| IngestError::Unsupported { file: "config/initializers".into(), message };
-    if lock.version_of("multi_json").is_none_or(|v| !v.starts_with("1.21.")) {
-        return survey::continue_or_fail(refuse(format!(
-            "MultiJson not lowered: multi_json {} is not the version modeled (1.21)",
-            lock.version_of("multi_json").unwrap_or("?")
-        )));
-    }
     let mut adapters = Vec::new();
     let mut refusals = Vec::new();
     for text in initializers.iter().filter(|t| t.contains("MultiJson") || t.contains("MultiJSON") || t.contains("Oj")) {
@@ -77,6 +71,12 @@ pub(super) fn lower_multi_json(
     if adapters.is_empty() && refusals.is_empty() {
         return Ok(());
     }
+    if lock.version_of("multi_json").is_none_or(|v| !v.starts_with("1.21.")) {
+        return survey::continue_or_fail(refuse(format!(
+            "MultiJson not lowered: multi_json {} is not the version modeled (1.21)",
+            lock.version_of("multi_json").unwrap_or("?")
+        )));
+    }
     if !lock.has("oj") || adapters.iter().any(|a| a != "oj") || adapters.len() != 1 {
         refusals.push(refuse(format!("MultiJson not lowered: adapter {adapters:?}; only the oj adapter is modeled")));
     }
@@ -87,7 +87,8 @@ pub(super) fn lower_multi_json(
         return Ok(());
     }
     for source in sources.iter().filter(|s| s.text.contains("MultiJson") || s.text.contains("MultiJSON")) {
-        for reason in unmodeled_calls(&source.text) {
+        let initializer = source.path.starts_with("config/initializers/") || source.path.contains("/config/initializers/");
+        for reason in unmodeled_calls(&source.text, initializer) {
             survey::continue_or_fail(IngestError::Unsupported {
                 file: source.path.clone(),
                 message: format!("MultiJson not lowered: {reason}"),
@@ -185,9 +186,10 @@ fn configuration_calls(text: &str) -> Vec<Configuration> {
 }
 
 /// The `MultiJson.*` calls in `text` this does not model, described.
-fn unmodeled_calls(text: &str) -> Vec<String> {
+fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
     struct Finder {
         found: Vec<String>,
+        initializer: bool,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -197,8 +199,8 @@ fn unmodeled_calls(text: &str) -> Vec<String> {
                 let args: Vec<ruby_prism::Node<'_>> =
                     node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
                 match method.as_str() {
-                    // The initializer's own call, read above.
-                    "use" | "adapter=" | "engine=" => {}
+                    // The initializer's own call, read above; anywhere else it would switch the adapter as the app runs.
+                    "use" | "adapter=" | "engine=" if self.initializer => {}
                     "dump" | "generate" | "encode" => {
                         // The object is the first argument, a braceless Hash included; a second is the options.
                         let options_ok = match args.get(1) {
@@ -221,7 +223,7 @@ fn unmodeled_calls(text: &str) -> Vec<String> {
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder { found: Vec::new() };
+    let mut finder = Finder { found: Vec::new(), initializer };
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.found
 }

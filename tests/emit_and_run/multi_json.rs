@@ -152,6 +152,7 @@ fn multi_json_unmodeled_configurations_are_refused() {
         (LOCK, "Oj.default_options = Oj.default_options.merge(mode: :compat, float_precision: 4)\nMultiJson.use(:oj)\n", dump, "sets more than the mode", false),
         (LOCK, "MultiJson.dump_options = { pretty: true }\nMultiJson.use(:oj)\n", dump, "`MultiJson.dump_options=`", false),
         (old_lock.as_str(), "MultiJson.use(:oj)\n", dump, "multi_json 1.15.0 is not the version modeled", false),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.out(v)\n    MultiJson.use(:json_gem)\n    MultiJson.dump(v)\n  end\nend\n", "`MultiJson.use`", true),
     ] {
         let tree = tree(lock, init, lib);
         assert!(roundhouse::ingest::ingest_app_from_tree(tree.clone()).is_err(), "{init} {lib}: strict ingest passed");
@@ -161,4 +162,7 @@ fn multi_json_unmodeled_configurations_are_refused() {
         assert!(ledger.iter().any(|e| e.contains(expected)), "{init} {lib}: {ledger:#?}");
         assert_eq!(app.library_classes.iter().any(|lc| lc.name.0.as_str() == "MultiJson"), installed, "{init} {lib}");
     }
+    // A version this does not model is no refusal while nothing picks the adapter.
+    let tree = tree(&old_lock, "# nothing\n", "class Codec\n  def self.out\n    \"MultiJson\"\n  end\nend\n");
+    assert!(roundhouse::ingest::ingest_app_from_tree(tree).is_ok());
 }
