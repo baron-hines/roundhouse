@@ -556,11 +556,13 @@ fn defines(c: &Controller, name: &str, modules: &HashMap<&str, HashSet<&str>>) -
     })
 }
 
-/// The methods a module the runtime models (not a library class here) defines: pagy's backends.
+/// The methods a module the runtime models (not a library class here) defines: pagy's backends, Rails' record identifier.
 fn modeled_module(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "Pagy::Backend" => Some(&["pagy", "pagy_array", "pagy_get_count", "pagy_get_items", "pagy_get_limit", "pagy_get_page"]),
         "Pagy::Method" => Some(&["pagy"]),
+        // Rails' own: it defines the dom id helpers, no action.
+        "ActionView::RecordIdentifier" => Some(&["dom_id", "dom_class", "record_key_for_dom_id"]),
         _ => None,
     }
 }
