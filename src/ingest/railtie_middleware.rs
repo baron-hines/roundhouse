@@ -183,7 +183,8 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
     let out: Vec<_> = {
         let (front, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.5);
         let (load, init): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.4);
-        front.into_iter().chain(load).chain(app_uses).chain(init).collect()
+        // Each `insert_after RequestId` lands right after it, ahead of the ones inserted before: Rails' order is the reverse.
+        front.into_iter().rev().chain(load).chain(app_uses).chain(init).collect()
     };
     // Not stacked in reading order when initializers order themselves: Rails sorts them by `before:` and `after:`.
     if out.len() > 1 {
@@ -897,6 +898,9 @@ mod tests {
         ]);
         assert_eq!(classes, ["Store::Middleware", "Store::Later"], "{diags:?}");
         assert!(diags.is_empty(), "{diags:?}");
+        let twice = "module Gem\n  class A\n  end\n  class B\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n      app.middleware.insert_after ActionDispatch::RequestId, B\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", twice)]);
+        assert_eq!(classes, ["Gem::B", "Gem::A"], "{diags:?}");
     }
 
     /// The app's own `config.middleware.use` of a class in its lib/ sits where a source gem's class would.
