@@ -157,6 +157,31 @@ fn an_operator_on_a_nilable_receiver_whose_class_defines_it_runs() {
     assert!(run.stdout.contains("nilable operator passed"), "{}", run.stdout);
 }
 
+/// maybe's `qty * avg_cost` (Float * Money): Float#* asks the Money to `coerce`, and Money's own `*` answers with
+/// a Money, as Ruby's numeric coercion protocol runs it.
+#[test]
+fn a_number_times_an_operand_that_coerces_is_the_operands_answer() {
+    let run = coerce_app().run_ruby(COERCE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("coerce passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_number_times_an_operand_that_coerces_on_spinel() {
+    let run = coerce_app().run_spinel_with_db(COERCE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("coerce passed"), "{}", run.stdout);
+}
+
+fn coerce_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/models/price.rb", "class Price\n  Coerced = Struct.new(:value)\n\n  attr_reader :cents\n\n  def initialize(cents)\n    @cents = cents\n  end\n\n  def *(other)\n    value = other.is_a?(Coerced) ? other.value : other\n    Price.new(cents * value)\n  end\n\n  def coerce(other)\n    [self, Coerced.new(other)]\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  def totals\n    [(2.5 * Price.new(400)).cents, (3 * Price.new(400)).cents]\n  end\n\n")
+}
+
+const COERCE_SCRIPT: &str = "got = Article.new.totals\nraise \"got #{got.inspect}\" unless got == [1000.0, 1200]\nputs \"coerce passed\"\n";
+
 /// A branch that `include`s a nested module declared after the conditional, under a guard that asks for it, is
 /// skipped as Ruby skips it: the module is not written ahead of the guard.
 #[test]

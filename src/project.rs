@@ -3096,6 +3096,15 @@ fn report_partial_binops(app: &App, target: BuildTarget) {
                 format!("`{}` takes only some of the types its operands may hold; the ruby family raises for the rest as Ruby does, this target for all", op.as_str()),
             );
         }
+        if let crate::expr::ExprNode::Send { method, args, .. } = &*expr.node
+            && let [operand] = args.as_slice()
+            && operand.decisions & crate::expr::COERCED_OPERAND != 0
+        {
+            crate::emit::diagnostics::report_unsupported(
+                expr.span, target.as_str(), "numeric coercion",
+                format!("a number's `{}` with an operand that answers `coerce`: the ruby family runs Ruby's coercion, this target has no such dispatch", method.as_str()),
+            );
+        }
         expr.node.for_each_child(&mut |child| visit(child, target));
     }
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target));

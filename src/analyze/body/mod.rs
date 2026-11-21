@@ -1840,6 +1840,27 @@ impl<'a> BodyTyper<'a> {
             && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes.get(id).is_some_and(|c| c.is_module && c.class_methods.contains_key(method)))
     }
 
+    /// `2.5 * money`: a number's operator asks an operand it does not know to `coerce`, and the operand's own
+    /// operator answers (Ruby's numeric coercion protocol). The operand is marked for the operator classifiers.
+    fn coerced_operator(&self, recv_ty: Option<&Ty>, method: &Symbol, args: &mut [Expr]) -> Option<Ty> {
+        let [operand] = args else { return None };
+        operand.decisions &= !crate::expr::COERCED_OPERAND;
+        if !matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%")
+            || !recv_ty.is_some_and(crate::emit::shared::operand::is_number)
+        {
+            return None;
+        }
+        let ty = operand.ty.clone()?;
+        if !matches!(ty, Ty::Class { .. })
+            || !self.owns_operator(Some(&ty), &Symbol::from("coerce"), false)
+            || !self.owns_operator(Some(&ty), method, false)
+        {
+            return None;
+        }
+        operand.decisions |= crate::expr::COERCED_OPERAND;
+        Some(self.dispatch_on(Some(&ty), method, None, std::slice::from_ref(operand), true))
+    }
+
     fn owns_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
         match ty {
             Some(Ty::Union { variants }) => !variants.is_empty()
@@ -3372,6 +3393,9 @@ impl<'a> BodyTyper<'a> {
                 let mut dispatched =
                     self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver
                         || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
+                if let Some(rel) = self.coerced_operator(recv_ty.as_ref(), method, args) {
+                    dispatched = rel;
+                }
                 if block.is_none()
                     && let Some(r) = recv.as_ref()
                     && let Some(rel) = self.association_scope_relation(r, method, &dispatched)
