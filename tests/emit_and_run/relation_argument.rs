@@ -54,3 +54,19 @@ fn loaded_records_handed_to_a_relation_parameter_are_refused() {
         .check_errors();
     assert_eq!(errors.iter().filter(|e| e.contains("records passed as a relation")).count(), 4, "{errors:#?}");
 }
+
+/// Another model's `comments` defining its own `all` extension does not make `Article#comments` one: the owner's
+/// association is the one read, so the argument is still the association's relation.
+#[test]
+fn another_owners_all_extension_leaves_this_association_seeded() {
+    let run = app()
+        .edit(
+            "db/schema.rb",
+            "  create_table \"articles\", force: :cascade do |t|\n",
+            "  create_table \"photos\", force: :cascade do |t|\n    t.string \"name\"\n  end\n\n  create_table \"articles\", force: :cascade do |t|\n",
+        )
+        .write("app/models/photo.rb", "class Photo < ApplicationRecord\n  has_many :comments, foreign_key: :article_id do\n    def all\n      []\n    end\n  end\nend\n")
+        .run_ruby(ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("relation argument passed"), "{}", run.stdout);
+}
