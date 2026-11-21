@@ -146,3 +146,60 @@ puts "cookies passed"
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("cookies passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
 }
+
+/// request_store's middleware shape: the body handed up is wrapped in `Rack::BodyProxy`, whose block runs once the
+/// server closes it (the rack gem's on the ruby family, `runtime/ruby/rack_body_proxy.rb` on Spinel).
+const CLEARING: &str = r#"class Clearing
+  def self.cleared
+    @cleared || 0
+  end
+
+  def self.clear!
+    @cleared = cleared + 1
+  end
+
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    status, headers, body = @app.call(env)
+    body = Rack::BodyProxy.new(body) do
+      Clearing.clear!
+    end
+    [status, headers, body]
+  end
+end
+"#;
+
+#[test]
+fn a_body_proxys_block_runs_when_the_body_is_closed() {
+    let run = emit_and_run::real_blog()
+        .write("lib/clearing.rb", CLEARING)
+        .edit("config/application.rb", AUTOLOAD, &format!("{AUTOLOAD}    config.middleware.use Clearing\n"))
+        .run_ruby(r#"
+env = { "REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles", "QUERY_STRING" => "", "REMOTE_ADDR" => "127.0.0.1",
+        "HTTP_HOST" => "localhost", "rack.input" => StringIO.new("") }
+status, _headers, body = Main.run_rack(env)
+before = Clearing.cleared
+text = +""
+body.each { |part| text << part }
+body.close
+body.close
+raise "status #{status}, cleared #{before} then #{Clearing.cleared}" unless status == 200 && before == 0 && Clearing.cleared == 1 && text.include?("Articles")
+puts "body proxy passed"
+"#);
+    run.assert_passes();
+    assert!(run.stdout.contains("body proxy passed"), "{}", run.stdout);
+}
+
+#[test]
+fn the_spinel_tree_carries_the_body_proxy_port() {
+    let (tree, errors) = emit_and_run::real_blog()
+        .write("lib/clearing.rb", CLEARING)
+        .edit("config/application.rb", AUTOLOAD, &format!("{AUTOLOAD}    config.middleware.use Clearing\n"))
+        .emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let port = std::fs::read_to_string(tree.join("runtime/rack_body_proxy.rb")).expect("rack_body_proxy.rb");
+    assert!(port.contains("class BodyProxy"), "{port}");
+}

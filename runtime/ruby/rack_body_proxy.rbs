@@ -1,0 +1,11 @@
+module Rack
+  class BodyProxy
+    @body: Array[String]
+    @block: ^() -> void
+    @closed: bool
+    def initialize: (Array[String] body) { () -> void } -> void
+    def each: () { (String) -> void } -> BodyProxy
+    def close: () -> nil
+    def closed?: () -> bool
+  end
+end

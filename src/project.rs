@@ -5451,6 +5451,15 @@ fn ruby_family_runtime_files(
                         require \"rack/utils\"\n"
                 .to_string();
         }
+        // `Rack::BodyProxy`: the rack gem's own, as for `Rack::Utils`.
+        if path == "runtime/rack_body_proxy.rb" {
+            *content = "# The rack gem's own Rack::BodyProxy — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/rack_body_proxy.rb exists for the targets\n\
+                        # that have no rack to load.\n\
+                        require \"rack\"\n\
+                        require \"rack/body_proxy\"\n"
+                .to_string();
+        }
         if path == "runtime/zlib.rb" {
             *content = "# Ruby's own zlib — see `project::ruby_runtime_files`.\n\
                         # The port at runtime/ruby/zlib.rb exists for the targets\n\
@@ -9657,7 +9666,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "JSON::GeneratorError"
         // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
         // the ruby family; no strict target loads either.
-        | "Rack::Utils"
+        | "Rack::Utils" | "Rack::BodyProxy"
         // `runtime/ruby/active_support_ext.rb` ships to the ruby family
         // and spinel only.
         | "ActiveSupport::JSON" | "ActiveSupport::Deprecation" | "ActiveSupport::Deprecation::DeprecatedConstantAccessor"
@@ -11555,6 +11564,8 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         // spinel (no rack gem to load); the ruby family swaps it for
         // `require "rack/utils"` below, as ipaddr and zlib are swapped.
         "rack_utils",
+        // rack's `BodyProxy`, ported the same way (request_store's middleware wraps the body in one).
+        "rack_body_proxy",
         // Ruby's `Logger` plus the two ActiveSupport wrappers in front
         // of it. Same arrangement as ipaddr, with one difference the
         // file's header gives: NOT swapped for Ruby's own on the
