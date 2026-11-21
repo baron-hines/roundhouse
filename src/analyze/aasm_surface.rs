@@ -68,6 +68,10 @@ fn machine_names(expr: &Expr) -> Option<Vec<String>> {
                 }
                 names.extend([format!("{event}!"), format!("{event}_without_validation!"), format!("may_{event}?"), event]);
             }
+            // A machine-wide callback (`after_all_transitions :handle_transition`) names no method.
+            "after_all_transitions" | "before_all_transactions" | "after_all_transactions" | "before_all_events"
+            | "after_all_events" | "ensure_on_all_events" | "error_on_all_events" | "after_all_commits"
+                if block.is_none() && symbols(args).len() == args.len() => {}
             _ => return None,
         }
     }
