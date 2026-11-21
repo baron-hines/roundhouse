@@ -1341,6 +1341,9 @@ fn catalog_answers_relation(method: &Symbol) -> Option<bool> {
 #[derive(Default)]
 pub struct AssocRegistry {
     finder_classes: HashMap<ClassId, crate::analyze::ClassInfo>,
+    /// (model, scope) a gem's code defines as the class loads (aasm's per-state scope, `analyze::aasm_surface`): a
+    /// chain hop on the model's relation, which the runtime's `scope` gives the relation too.
+    runtime_scopes: HashSet<(ClassId, Symbol)>,
     /// (model, association name) -> `"<target_table> ON <cond>"`; the
     /// rewrite prefixes `INNER JOIN` / `LEFT OUTER JOIN` by call. Direct
     /// `belongs_to`/`has_many`/`has_one`, plus resolvable `has_many
@@ -1816,6 +1819,7 @@ impl AssocRegistry {
     fn forget(&mut self, model: &ClassId, name: &Symbol) {
         let Self {
             finder_classes: _,
+            runtime_scopes: _,
             join_tails,
             unrenderable_join_scopes,
             belongs_to_fk,
@@ -2063,7 +2067,13 @@ pub fn belongs_to_inverse(models: &[Model], owner: &Model, assoc: &Association) 
 
 pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {
     let resolver = app.const_resolver.for_sources(&app.sources);
-    build_assoc_registry(&app.models).with_finder_classes(&crate::analyze::source_finder_classes(app, &resolver))
+    let mut reg = build_assoc_registry(&app.models).with_finder_classes(&crate::analyze::source_finder_classes(app, &resolver));
+    for model in &app.models {
+        for name in crate::analyze::aasm_surface::scope_names(model, app) {
+            reg.runtime_scopes.insert((model.name.clone(), name));
+        }
+    }
+    reg
 }
 
 pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
@@ -2841,7 +2851,9 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             | "load" | "load_async" | "from" | "extract_associated"
                     ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")))
                 // `owner.items.all`: Array answers no `all` either.
-                || (method.as_str() == "all" && args.is_empty() && block.is_none());
+                || (method.as_str() == "all" && args.is_empty() && block.is_none())
+                // Nor a scope a gem defines as the class loads (aasm's per-state scope).
+                || assocs.runtime_scopes.iter().any(|(_, name)| name == method);
             // `owner.items.update(attrs)` alone in a method body is the
             // proxy's bulk update over the records the association holds
             // (`rewrite_send` lowers it to the generated
@@ -5348,6 +5360,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             } {
                 if ctx.scope_of(target, &method)
                     || is_relation_chain_method(method.as_str())
+                    || ctx.assocs.runtime_scopes.contains(&(target.clone(), method.clone()))
                     || method.as_str() == "all"
                     || is_relation_terminal(method.as_str(), &args, block.as_ref())
                     || ctx.assoc_class_method_params(target, &method).is_some()
@@ -5685,7 +5698,8 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         // `all` on the association is its relation, as
                         // a chain hop with nothing to add.
                         let is_chain = is_relation_chain_method(method.as_str())
-                            || (method.as_str() == "all" && args.is_empty() && block.is_none());
+                            || (method.as_str() == "all" && args.is_empty() && block.is_none())
+                            || ctx.assocs.runtime_scopes.contains(&(target.clone(), method.clone()));
                         let is_term =
                             is_relation_terminal(method.as_str(), &args, block.as_ref());
                         // A registered class method takes the same

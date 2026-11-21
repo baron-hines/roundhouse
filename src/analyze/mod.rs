@@ -23,7 +23,7 @@
 //!
 //! Each of those comes when a fixture forces it.
 
-mod aasm_surface;
+pub(crate) mod aasm_surface;
 mod alba;
 pub mod relation_params;
 pub(crate) mod assoc_pluck;
@@ -735,6 +735,10 @@ impl Analyzer {
             // What aasm's block defines as the class loads (`aasm_surface`); a method the app writes itself wins.
             for (name, ty) in aasm_surface::instance_methods(model) {
                 cls.instance_methods.entry(name).or_insert(ty);
+            }
+            for name in aasm_surface::scope_names(model, app) {
+                cls.class_methods.entry(name.clone()).or_insert_with(|| Ty::Relation { of: model.name.clone() });
+                cls.relation_derived.insert(name);
             }
             // `has_rich_text :body` declares two preload scopes beside
             // the association (`with_rich_text_body`,

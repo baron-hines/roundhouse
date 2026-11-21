@@ -14,8 +14,70 @@ use crate::ty::Ty;
 /// The model's aasm instance methods and their types: each a Bool, as aasm's predicates, `may_*?` and event
 /// methods answer (an event method answers `true`, or `false` when a guard stops it; the bang raises instead).
 pub fn instance_methods(model: &Model) -> Vec<(Symbol, Ty)> {
-    if !super::model_includes(model).iter().any(|id| id.0.as_str() == "AASM") {
+    let Some((call, _)) = machine_call(model) else { return Vec::new() };
+    // A method the model writes itself is its own, whatever the block would define.
+    let own: Vec<&Symbol> = model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| &m.name).collect();
+    machine_names(call).unwrap_or_default().into_iter().map(|n| Symbol::from(n.as_str())).filter(|n| !own.contains(&n))
+        .map(|n| (n, Ty::Bool)).collect()
+}
+
+/// The scope aasm creates per state (`Account.active`, `family.accounts.active`), each the model's relation: the
+/// gem calls `scope` with it as the class loads, which the ruby family's runtime defines on the class and its
+/// relation (`active_record_runtime_macros`). Not with `create_scopes: false`, nor over a class method or scope the
+/// model has of the name, which aasm leaves alone.
+pub fn scope_names(model: &Model, app: &crate::App) -> Vec<Symbol> {
+    let models = &app.models;
+    let Some((call, scopes)) = machine_call(model) else { return Vec::new() };
+    if !scopes || machine_names(call).is_none() {
         return Vec::new();
+    }
+    // aasm asks `respond_to?`: the class's own and its app ancestors' class methods and scopes, and Active Record's.
+    let mut own: Vec<Symbol> = Vec::new();
+    let mut current = Some(model);
+    for _ in 0..32 {
+        let Some(m) = current else { break };
+        own.extend(m.methods().filter(|d| d.receiver == crate::dialect::MethodReceiver::Class).map(|d| d.name.clone()));
+        own.extend(m.scopes().map(|s| s.name.clone()));
+        // A concern's class-side methods (`class_methods do … end`) and an extended module's instance methods too.
+        for id in super::model_includes(m) {
+            for lc in app.library_classes.iter().filter(|lc| lc.name == id) {
+                own.extend(lc.methods.iter().filter(|d| d.receiver == crate::dialect::MethodReceiver::Class).map(|d| d.name.clone()));
+            }
+            // And the scopes its `included do` declares.
+            for item in app.concern_model_items.get(&id).into_iter().flatten() {
+                if let ModelBodyItem::Scope { scope, .. } = item {
+                    own.push(scope.name.clone());
+                }
+            }
+        }
+        for item in &m.body {
+            let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if method.as_str() != "extend" {
+                continue;
+            }
+            for arg in args {
+                let ExprNode::Const { path } = &*arg.node else { return Vec::new() };
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                if name == "ActiveSupport::Concern" {
+                    continue;
+                }
+                // A module the app does not define may answer any name.
+                let Some(lc) = app.library_classes.iter().find(|lc| lc.name.0.as_str() == name) else { return Vec::new() };
+                own.extend(lc.methods.iter().filter(|d| d.receiver == crate::dialect::MethodReceiver::Instance).map(|d| d.name.clone()));
+            }
+        }
+        current = m.parent.as_ref().and_then(|p| models.iter().find(|o| &o.name == p));
+    }
+    let framework = |n: &Symbol| crate::catalog::AR_CATALOG.iter()
+        .any(|e| e.receiver == crate::catalog::ReceiverContext::Class && e.name == n.as_str());
+    states(call).into_iter().map(|n| Symbol::from(n.as_str())).filter(|n| !own.contains(n) && !framework(n)).collect()
+}
+
+/// The model's one `aasm` call, and whether it creates scopes.
+fn machine_call(model: &Model) -> Option<(&Expr, bool)> {
+    if !super::model_includes(model).iter().any(|id| id.0.as_str() == "AASM") {
+        return None;
     }
     let calls: Vec<&Expr> = model.body.iter().filter_map(|item| match item {
         ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, ExprNode::Send { recv, method, .. }
@@ -23,11 +85,26 @@ pub fn instance_methods(model: &Model) -> Vec<(Symbol, Ty)> {
         _ => None,
     }).collect();
     // A second `aasm` call reopens the machine with what the first configured (a namespace, say): not read alone.
-    let [call] = calls.as_slice() else { return Vec::new() };
-    // A method the model writes itself is its own, whatever the block would define.
-    let own: Vec<&Symbol> = model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| &m.name).collect();
-    machine_names(call).unwrap_or_default().into_iter().map(|n| Symbol::from(n.as_str())).filter(|n| !own.contains(&n))
-        .map(|n| (n, Ty::Bool)).collect()
+    let [call] = calls.as_slice() else { return None };
+    let ExprNode::Send { args, .. } = &*call.node else { return None };
+    let scopes = !args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(k, v)|
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "create_scopes")
+            && !matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: true } }))));
+    Some((*call, scopes))
+}
+
+/// The states the block declares, in order.
+fn states(expr: &Expr) -> Vec<String> {
+    let ExprNode::Send { block: Some(block), .. } = &*expr.node else { return Vec::new() };
+    let ExprNode::Lambda { body, .. } = &*block.node else { return Vec::new() };
+    let statements: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    statements.into_iter().filter_map(|s| match &*s.node {
+        ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "state" => Some(symbols(args)),
+        _ => None,
+    }).flatten().collect()
 }
 
 fn machine_names(expr: &Expr) -> Option<Vec<String>> {

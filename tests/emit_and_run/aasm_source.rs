@@ -43,3 +43,52 @@ puts "typed aasm calls passed"
     assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("typed aasm calls passed"), "{}", run.stdout);
 }
+
+/// maybe's `family.accounts.active` / `Sync.failed`: the scope aasm creates per state, on the class, on a relation
+/// and after an association read, which is lowered to the association's relation so the runtime's scope answers it.
+#[test]
+fn aasm_state_scopes_answer_on_a_class_a_relation_and_an_association() {
+    let Some(app) = app() else { return };
+    let run = app
+        .edit("db/schema.rb", "  create_table \"comments\", force: :cascade do |t|\n", "  create_table \"comments\", force: :cascade do |t|\n    t.string \"status\"\n")
+        .edit(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n",
+            "class Comment < ApplicationRecord\n  include AASM\n\n  aasm column: :status do\n    state :pending, initial: true\n    state :approved\n\n    event :approve do\n      transitions from: :pending, to: :approved\n    end\n  end\n\n",
+        )
+        .edit("app/controllers/articles_controller.rb", "  def show\n  end\n", "  def show\n    @approved = @article.comments.approved.map(&:commenter).join(\",\")\n    @pending = Comment.pending.where(article_id: @article.id).count\n  end\n")
+        .edit("app/views/articles/show.html.erb", "<hr class=\"my-8\">\n", "<hr class=\"my-8\">\n<div id=\"scopes\"><%= @approved %>|<%= @pending %></div>\n")
+        .run_ruby(r##"
+a = Article.create!(title: "Hello", body: "A body long enough")
+b = Article.create!(title: "Other", body: "A body long enough")
+Comment.create!(article: a, commenter: "Ann", body: "x").approve!
+Comment.create!(article: a, commenter: "Bob", body: "y")
+Comment.create!(article: b, commenter: "Cy", body: "z").approve!
+status, _h, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles/#{a.id}", "rack.input" => StringIO.new(""))
+got = body.join[%r{<div id="scopes">(.*?)</div>}m, 1]
+raise "status #{status}, scopes #{got.inspect}" unless status == 200 && got == "Ann|1"
+puts "aasm scopes passed"
+"##);
+    let unknown: Vec<_> = run.errors.iter().filter(|e| !KNOWN_GAPS.iter().any(|gap| e.contains(gap))).collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("aasm scopes passed"), "{}", run.stdout);
+}
+
+/// A state named like a class method an extended module gives the model (`extend Finder` with `Finder#approved`):
+/// aasm creates no scope over it, so the call stays the module's.
+#[test]
+fn an_extended_modules_method_of_a_states_name_is_not_a_scope() {
+    let Some(app) = app() else { return };
+    let errors = app
+        .edit("db/schema.rb", "  create_table \"comments\", force: :cascade do |t|\n", "  create_table \"comments\", force: :cascade do |t|\n    t.string \"status\"\n")
+        .write("app/models/finder.rb", "module Finder\n  def approved\n    7\n  end\nend\n")
+        .edit(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n",
+            "class Comment < ApplicationRecord\n  include AASM\n  extend Finder\n\n  aasm column: :status do\n    state :pending, initial: true\n    state :approved\n  end\n\n  def self.approved_plus_one = approved + 1\n\n",
+        )
+        .check_errors();
+    let unknown: Vec<_> = errors.iter().filter(|e| !KNOWN_GAPS.iter().any(|gap| e.contains(gap))).collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+}
