@@ -200,10 +200,35 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
         initializer: bool,
         /// Inside a `begin` whose `rescue` reads the exception it binds (or `$!`).
         observed: usize,
+        /// Every local read in the file, with where; and the methods' ranges, innermost last.
+        reads: Vec<(String, usize)>,
+        defs: Vec<(usize, usize)>,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.defs.push((node.location().start_offset(), node.location().end_offset()));
+            ruby_prism::visit_def_node(self, node);
+            self.defs.pop();
+        }
+        fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+            struct Bang(bool);
+            impl<'pr> ruby_prism::Visit<'pr> for Bang {
+                fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
+                    self.0 |= node.name().as_slice() == b"$!";
+                }
+            }
+            let mut bang = Bang(false);
+            ruby_prism::Visit::visit(&mut bang, &node.rescue_expression());
+            self.observed += usize::from(bang.0);
+            ruby_prism::Visit::visit(self, &node.expression());
+            self.observed -= usize::from(bang.0);
+            ruby_prism::Visit::visit(self, &node.rescue_expression());
+        }
         fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
-            let reads = node.rescue_clause().is_some_and(|r| rescue_reads_exception(&r));
+            // The exception a rescue binds is read in its body, or anywhere after it the variable lives.
+            let (from, to) = (node.location().start_offset(), self.defs.last().map_or(usize::MAX, |d| d.1));
+            let later = |name: &str| self.reads.iter().any(|(n, at)| n == name && *at > from && *at < to);
+            let reads = node.rescue_clause().is_some_and(|r| rescue_reads_exception(&r) || rescue_bindings(&r).iter().any(|n| later(n)));
             if let Some(statements) = node.statements() {
                 self.observed += usize::from(reads);
                 ruby_prism::Visit::visit_statements_node(self, &statements);
@@ -284,9 +309,32 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder { found: Vec::new(), initializer, observed: 0 };
+    struct Reads(Vec<(String, usize)>);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.0.push((String::from_utf8_lossy(node.name().as_slice()).to_string(), node.location().start_offset()));
+        }
+    }
+    let parsed_reads = super::prism::parse_silent(text.as_bytes());
+    let mut reads = Reads(Vec::new());
+    ruby_prism::Visit::visit(&mut reads, &parsed_reads.node());
+    let mut finder = Finder { found: Vec::new(), initializer, observed: 0, reads: reads.0, defs: Vec::new() };
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.found
+}
+
+/// The variables a `rescue` chain binds the exception to.
+fn rescue_bindings(node: &ruby_prism::RescueNode<'_>) -> Vec<String> {
+    let name = |r: &ruby_prism::RescueNode<'_>| {
+        r.reference().and_then(|t| t.as_local_variable_target_node().map(|t| String::from_utf8_lossy(t.name().as_slice()).to_string()))
+    };
+    let mut out: Vec<String> = name(node).into_iter().collect();
+    let mut next = node.subsequent();
+    while let Some(r) = next {
+        out.extend(name(&r));
+        next = r.subsequent();
+    }
+    out
 }
 
 /// Whether a `rescue` chain reads the exception: the variable one binds, or `$!`.
@@ -400,11 +448,13 @@ fn stand_ins() -> Vec<LibraryClass> {
     source = source.read if source.respond_to?(:read)
     return nil if source.nil?
     text = source.to_s
-    return nil if text.empty? || (!text.start_with?("{", "[") && text.match?(/\A\s*\z/))
+    # Bytes, not characters: oj takes a String's invalid UTF-8 as it is.
+    bytes = text.b
+    return nil if text.empty? || (!text.start_with?("{", "[") && bytes.match?(/\A\s*\z/))
     symbolize = options[:symbolize_names] == true || (!options.key?(:symbolize_names) && options[:symbolize_keys] == true)
     # Not JSON.parse alone: oj's strict mode reads `01` as 1, a decimal of more than 16 digits as a BigDecimal, and
     # refuses a lone surrogate; each sends the text to the parser below, which reads it as oj does.
-    unless MultiJson.long_decimal?(text) || text.match?(/\\u[dD][89a-fA-F]/)
+    unless MultiJson.long_decimal?(bytes) || bytes.match?(/\\u[dD][89a-fA-F]/) || MultiJson.commented?(bytes)
       begin
         return JSON.parse(text, symbolize_names: symbolize, max_nesting: false)
       rescue JSON::ParserError
@@ -414,13 +464,21 @@ fn stand_ins() -> Vec<LibraryClass> {
     MultiJson::Strict.new(text, symbolize).document
   end
 
-  # A number with a fraction or exponent whose digits, leading zeros aside, are more than 16 (a String's text counts too).
+  # A number oj reads as a BigDecimal: a fraction or exponent with more than 16 digits leading zeros aside, or an
+  # exponent of 100000 or more (a String's text counts too).
   def self.long_decimal?(text)
+    return true if text.match?(/[eE][-+]?0*[1-9]\d{5}/)
     return false unless text.match?(/\d(?:\.?\d){16}/)
     text.scan(/\d+(?:\.\d+)?(?:[eE][-+]?\d+)?/).any? do |number|
       (number.include?(".") || number.include?("e") || number.include?("E")) &&
         number.sub(/[eE].*\z/, "").delete(".").sub(/\A0+/, "").length > 16
     end
+  end
+
+  # A comment outside the strings: oj reads one only ahead of a value, where JSON.parse takes one anywhere.
+  def self.commented?(text)
+    return false unless text.include?("/")
+    text.scan(/"(?:[^"\\]|\\.)*"|\/[\/*]/).any? { |token| token.start_with?("/") }
   end
 
   def self.parse(source, options = {})
@@ -441,10 +499,16 @@ fn stand_ins() -> Vec<LibraryClass> {
 
     def document
       blank
+      return nil if @at >= @size
       value = read_value
-      blank
+      # Whitespace alone after the value: oj reads no comment there.
+      @at += 1 while @at < @size && space?(byte)
       raise MultiJson::ParseError, "unexpected characters after the JSON document" if @at < @size
       value
+    end
+
+    def space?(b)
+      b == 32 || b == 9 || b == 10 || b == 13 || b == 12
     end
 
     def byte(offset = 0)
@@ -458,15 +522,17 @@ fn stand_ins() -> Vec<LibraryClass> {
     def blank
       while @at < @size
         b = byte
-        if b == 32 || b == 9 || b == 10 || b == 13
+        if space?(b)
           @at += 1
         elsif b == 47 && byte(1) == 47
           @at += 2
-          @at += 1 while @at < @size && byte != 10
+          @at += 1 while @at < @size && byte != 10 && byte != 13 && byte != 12 && byte != 0
         elsif b == 47 && byte(1) == 42
+          # Not refused unclosed: oj reads it to the end.
           close = @text.byteindex("*/", @at + 2)
-          raise MultiJson::ParseError, "comment not terminated" if close.nil?
-          @at = close + 2
+          @at = close.nil? ? @size : close + 2
+        elsif b == 47
+          raise MultiJson::ParseError, "invalid comment format"
         else
           break
         end
@@ -521,7 +587,8 @@ fn stand_ins() -> Vec<LibraryClass> {
       written = @text.byteslice(start, @at - start)
       return Integer(written, 10) unless decimal
       significant = written.sub(/[eE].*\z/, "").delete("-.").sub(/\A0+/, "")
-      significant.length > 16 ? BigDecimal(written) : Float(written)
+      power = written.include?("e") || written.include?("E") ? written.sub(/\A.*[eE][-+]?/, "").sub(/\A0+/, "") : ""
+      significant.length > 16 || power.length > 5 ? BigDecimal(written) : Float(written)
     end
 
     def hex4(offset)
@@ -537,6 +604,7 @@ fn stand_ins() -> Vec<LibraryClass> {
       while true
         b = byte
         raise MultiJson::ParseError, "quoted string not terminated" if b.nil?
+        raise MultiJson::ParseError, "NULL byte in string" if b == 0
         if b == 34
           out << @text.byteslice(segment, @at - segment)
           @at += 1
