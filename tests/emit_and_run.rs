@@ -21,6 +21,8 @@ mod native_http;
 mod multi_json;
 #[path = "emit_and_run/active_model_serializer_08.rs"]
 mod active_model_serializer_08;
+#[path = "emit_and_run/respond_to_core_class.rs"]
+mod respond_to_core_class;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
 #[path = "emit_and_run/fixture_explicit_id.rs"]

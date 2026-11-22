@@ -1441,6 +1441,24 @@ impl<'a> BodyTyper<'a> {
         Some(answer)
     }
 
+    /// Whether the program reopens a core class `ty` may be with its own `respond_to?` or `respond_to_missing?`.
+    fn builtin_reopens_respond_to(&self, ty: &Ty) -> bool {
+        let class = |t: &Ty| match t {
+            Ty::Array { .. } => Some("Array"),
+            Ty::Hash { .. } => Some("Hash"),
+            Ty::Str => Some("String"),
+            _ => None,
+        };
+        let variants: Vec<&Ty> = match ty {
+            Ty::Union { variants } => variants.iter().collect(),
+            t => vec![t],
+        };
+        variants.iter().filter_map(|t| class(t)).any(|name| {
+            let id = ClassId(Symbol::from(name));
+            self.chain_defines(&id, &Symbol::from("respond_to?")) || self.chain_defines(&id, &Symbol::from("respond_to_missing?"))
+        })
+    }
+
     fn constant_predicate_leaf(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
         let predicates = self.constant_predicates?;
         // `respond_to?(:disable_warnings)` in a class method (OmniAuth's `KeyStore.override_logging`): true where the
@@ -1477,6 +1495,9 @@ impl<'a> BodyTyper<'a> {
                     Some(false)
                 }
                 Some(t) if builtin_never_answers(t, &asked) => Some(false),
+                // `obj.respond_to?(:to_ary)` on an Array: the branch for anything else never runs, and typed, its
+                // `S.new(obj, …)` hands the serializer an Array it never sees.
+                Some(t) if builtin_always_answers(t, &asked) && !self.builtin_reopens_respond_to(t) => Some(true),
                 _ => None,
             };
         }
@@ -8839,6 +8860,23 @@ fn set_discarded(e: &mut Expr, discarded: bool) {
 
 /// Whether no value of `ty`, of Ruby's built-in kinds only, answers `method`: a conversion protocol whose answering
 /// classes are known (`to_proc` only Symbol, Hash, Method and Proc answer). Any other method is not known here.
+/// Whether every value `ty` may be is of a core class whose own method `method` is.
+fn builtin_always_answers(ty: &Ty, method: &Symbol) -> bool {
+    let answers = |t: &Ty| -> bool {
+        let names: &[&str] = match t {
+            Ty::Array { .. } => &["to_ary", "to_a", "each", "map", "size", "length", "empty?", "first", "last"],
+            Ty::Hash { .. } => &["to_hash", "to_h", "each", "keys", "values", "size", "length", "empty?"],
+            Ty::Str => &["to_str", "to_s", "size", "length", "empty?"],
+            _ => return false,
+        };
+        names.contains(&method.as_str())
+    };
+    match ty {
+        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(answers),
+        t => answers(t),
+    }
+}
+
 fn builtin_never_answers(ty: &Ty, method: &Symbol) -> bool {
     let answers: &[&str] = match method.as_str() {
         "to_proc" => &["Symbol", "Hash", "Proc", "Method"],
