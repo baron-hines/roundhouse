@@ -120,3 +120,16 @@ fn a_sig_declaration_types_a_computed_name() {
         .run_ruby("raise Article.next_limit.inspect unless Article.next_limit == 41\nputs \"sig passed\"\n")
         .assert_passes();
 }
+
+/// A local the statement assigns from the outer one (`names = names.map { … }`), or a block parameter's name read outside the block, is the outer local: not carried.
+#[test]
+fn a_compound_statement_reading_the_outer_value_of_a_local_it_assigns_keeps_the_class_closed() {
+    for body in [
+        "  names = %w[title_limit]\n  if ENV[\"X\"].nil?\n    names = names.map { |n| n }\n    names.each { |n| setting(n, 40) }\n  end\n",
+        "  name = \"title_limit\"\n  if ENV[\"X\"].nil?\n    ignored = ->(name) { name }\n    setting(name, 40)\n  end\n",
+        "  name = \"title_limit\"\n  if ENV[\"X\"].nil?\n    name = \"other\" if ENV[\"Y\"]\n    setting(name, 40)\n  end\n",
+    ] {
+        let errors = app().edit("app/models/article.rb", "  setting :title_limit, 40\n", body).check_errors();
+        assert!(errors.iter().any(|e| e.contains("title_limit")), "{body}\n{errors:#?}");
+    }
+}

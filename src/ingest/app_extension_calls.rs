@@ -336,7 +336,7 @@ fn inherited_class_methods(
 
 /// A condition or loop whose every call on the class is to an extended
 /// module's method, at least one of them, and which reads only locals
-/// it binds itself.
+/// it has assigned before the read, in scope.
 fn whole_statement(expr: &crate::expr::Expr, reaches: &dyn Fn(&str) -> bool) -> bool {
     let compound = match &*expr.node {
         ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } => true,
@@ -346,7 +346,6 @@ fn whole_statement(expr: &crate::expr::Expr, reaches: &dyn Fn(&str) -> bool) -> 
     if !compound {
         return false;
     }
-    let mut bound: HashSet<crate::ident::Symbol> = HashSet::default();
     let mut calls = 0usize;
     let mut clean = true;
     walk(expr, &mut |e| match &*e.node {
@@ -354,24 +353,55 @@ fn whole_statement(expr: &crate::expr::Expr, reaches: &dyn Fn(&str) -> bool) -> 
             if reaches(method.as_str()) { calls += 1 } else { clean = false }
         }
         // A `yield`, `return` or `super` in a class body means another frame than the replayed one.
-        ExprNode::Yield { .. } | ExprNode::Return { .. } | ExprNode::Super { .. } | ExprNode::ForwardArgs | ExprNode::Retry | ExprNode::Redo => clean = false,
-        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. } => { bound.insert(name.clone()); }
-        ExprNode::MultiAssign { .. } => clean = false,
-        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
-            bound.extend(params.iter().cloned());
-            bound.extend(rest_param.iter().cloned());
-            bound.extend(extra_params.iter().map(|p| p.name.clone()));
-            bound.extend(block_param.iter().cloned());
+        ExprNode::Yield { .. } | ExprNode::Return { .. } | ExprNode::Super { .. } | ExprNode::ForwardArgs | ExprNode::Retry | ExprNode::Redo
+        | ExprNode::MultiAssign { .. } => clean = false,
+        _ => {}
+    });
+    clean && calls > 0 && initialized_reads(expr, &mut Vec::new())
+}
+
+/// Every local `expr` reads is one assigned earlier on its path, or a parameter of an enclosing block.
+// Not one assigned anywhere in the statement: the replay drops the body's own assignment before it, so
+// `names = names.map { … }` or a read after a branch that may not have run would read another value.
+fn initialized_reads(expr: &crate::expr::Expr, bound: &mut Vec<crate::ident::Symbol>) -> bool {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => bound.contains(name),
+        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, value, .. } => bound.contains(name) && initialized_reads(value, bound),
+        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
+            let ok = initialized_reads(value, bound);
+            bound.push(name.clone());
+            ok
         }
-        _ => {}
-    });
-    let mut reads_outer = false;
-    walk(expr, &mut |e| match &*e.node {
-        ExprNode::Var { name, .. } if !bound.contains(name) => reads_outer = true,
-        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } if !bound.contains(name) => reads_outer = true,
-        _ => {}
-    });
-    clean && calls > 0 && !reads_outer
+        ExprNode::Seq { exprs } => exprs.iter().all(|e| initialized_reads(e, bound)),
+        ExprNode::Defined { operand } => scoped(bound, |b| initialized_reads(operand, b)),
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => scoped(bound, |b| {
+            b.extend(params.iter().cloned());
+            b.extend(rest_param.iter().cloned());
+            b.extend(block_param.iter().cloned());
+            extra_params.iter().all(|p| {
+                let ok = p.default.as_ref().is_none_or(|d| initialized_reads(d, b));
+                b.push(p.name.clone());
+                ok
+            }) && initialized_reads(body, b)
+        }),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            initialized_reads(cond, bound)
+                && scoped(bound, |b| initialized_reads(then_branch, b))
+                && scoped(bound, |b| initialized_reads(else_branch, b))
+        }
+        _ => {
+            let mut ok = true;
+            expr.node.for_each_child(&mut |c| ok &= scoped(bound, |b| initialized_reads(c, b)));
+            ok
+        }
+    }
+}
+
+fn scoped(bound: &mut Vec<crate::ident::Symbol>, f: impl FnOnce(&mut Vec<crate::ident::Symbol>) -> bool) -> bool {
+    let depth = bound.len();
+    let ok = f(bound);
+    bound.truncate(depth);
+    ok
 }
 
 fn walk(e: &crate::expr::Expr, f: &mut dyn FnMut(&crate::expr::Expr)) {

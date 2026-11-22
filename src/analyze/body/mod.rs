@@ -4366,10 +4366,12 @@ impl<'a> BodyTyper<'a> {
                                     local_ctx.local_bindings.remove(&mark);
                                 }
                             }
+                            // A refined seed too, restarted from its stamp: this pass's writes stamp it again.
+                            let refined_seed = value.decisions & crate::expr::REFINED_EMPTY_SEED != 0;
                             let empty_seed = matches!(&*value.node,
                                     ExprNode::Array { elements, .. } if elements.is_empty())
                                 && matches!(e.ty.as_ref(),
-                                    Some(Ty::Array { elem }) if matches!(&**elem, Ty::Var { .. }));
+                                    Some(Ty::Array { elem }) if refined_seed || matches!(&**elem, Ty::Var { .. }));
                             if empty_seed {
                                 array_seed_idx.insert((is_ivar, name.clone()), i);
                             } else {
@@ -4380,7 +4382,7 @@ impl<'a> BodyTyper<'a> {
                                     ExprNode::Hash { entries, .. } if entries.is_empty())
                                 && matches!(e.ty.as_ref(),
                                     Some(Ty::Hash { value, .. })
-                                        if matches!(&**value, Ty::Var { .. }));
+                                        if refined_seed || matches!(&**value, Ty::Var { .. }));
                             if empty_hash_seed {
                                 hash_seed_idx.insert((is_ivar, name.clone()), i);
                             } else {
