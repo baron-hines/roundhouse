@@ -12,9 +12,11 @@
 //! same ordered replay only for value-only class state. Dispatching methods
 //! and unverified order retain the existing dropped-call warning.
 //!
-//! Only top-level statements are marked: a call inside a block or
-//! condition (`plugins.each { |p| load_settings(p) }`) is not one the
-//! replay can carry whole, and stays dropped and reported.
+//! A call inside a condition or loop (`if GlobalSetting.load_plugins?`
+//! over `Dir[…].each { |file| load_settings(file) }`) is carried with
+//! the whole statement, when the statement's every call on the class is
+//! to an extended module's method and it reads only locals it binds;
+//! otherwise it stays dropped and reported.
 
 use crate::det::HashSet;
 
@@ -197,6 +199,11 @@ pub(super) fn mark(app: &mut App) {
                 }
                 continue;
             }
+            let reaches = |m: &str| extended.iter().any(|&i| modules[i].1.contains(m));
+            if !expr.span.is_synthetic() && whole_statement(expr, &reaches) {
+                expr.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+                continue;
+            }
             let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
             if method.as_str() == "extend" {
                 let found: Option<Vec<usize>> = args
@@ -325,6 +332,55 @@ fn inherited_class_methods(
         if before == after { break; }
     }
     (parents, methods, redefined, dispatching)
+}
+
+/// A condition or loop whose every call on the class is to an extended
+/// module's method, at least one of them, and which reads only locals
+/// it binds itself.
+fn whole_statement(expr: &crate::expr::Expr, reaches: &dyn Fn(&str) -> bool) -> bool {
+    let compound = match &*expr.node {
+        ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } => true,
+        ExprNode::Send { block: Some(_), .. } => true,
+        _ => false,
+    };
+    if !compound {
+        return false;
+    }
+    let mut bound: HashSet<crate::ident::Symbol> = HashSet::default();
+    let mut calls = 0usize;
+    let mut clean = true;
+    walk(expr, &mut |e| match &*e.node {
+        ExprNode::Send { recv, method, .. } if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) => {
+            if reaches(method.as_str()) { calls += 1 } else { clean = false }
+        }
+        // A `yield`, `return` or `super` in a class body means another frame than the replayed one.
+        ExprNode::Yield { .. } | ExprNode::Return { .. } | ExprNode::Super { .. } | ExprNode::ForwardArgs | ExprNode::Retry | ExprNode::Redo => clean = false,
+        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. } => { bound.insert(name.clone()); }
+        ExprNode::MultiAssign { .. } => clean = false,
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+            bound.extend(params.iter().cloned());
+            bound.extend(rest_param.iter().cloned());
+            bound.extend(extra_params.iter().map(|p| p.name.clone()));
+            bound.extend(block_param.iter().cloned());
+        }
+        _ => {}
+    });
+    let mut reads_outer = false;
+    walk(expr, &mut |e| match &*e.node {
+        ExprNode::Var { name, .. } if !bound.contains(name) => reads_outer = true,
+        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } if !bound.contains(name) => reads_outer = true,
+        _ => {}
+    });
+    clean && calls > 0 && !reads_outer
+}
+
+fn walk(e: &crate::expr::Expr, f: &mut dyn FnMut(&crate::expr::Expr)) {
+    f(e);
+    // Not left to `for_each_child` alone, which does not enter a `defined?` operand.
+    if let ExprNode::Defined { operand } = &*e.node {
+        walk(operand, f);
+    }
+    e.node.for_each_child(&mut |c| walk(c, f));
 }
 
 fn mixin_statement(expr: &crate::expr::Expr) -> bool {
