@@ -715,14 +715,16 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                     return Err(fail("a mixin's `self.append_features` changes what including it adds"));
                 }
                 // `def self.can_attributes = %i[…]`: a list the body may read as it loads.
-                if matches!(mode, Mode::Class)
-                    && def.receiver().is_some_and(|r| r.as_self_node().is_some())
-                    && def.parameters().is_none()
-                    && let Some(body) = def.body()
-                    && let [only] = flatten_statements(body).as_slice()
-                    && let Some(names) = symbol_list(only)
-                {
-                    ctx.lists.insert(format!("self.{method}"), names);
+                if matches!(mode, Mode::Class) && def.receiver().is_some_and(|r| r.as_self_node().is_some()) {
+                    // A later definition replaces the earlier: Ruby calls the latest.
+                    ctx.lists.remove(&format!("self.{method}"));
+                    if def.parameters().is_none()
+                        && let Some(body) = def.body()
+                        && let [only] = flatten_statements(body).as_slice()
+                        && let Some(names) = symbol_list(only)
+                    {
+                        ctx.lists.insert(format!("self.{method}"), names);
+                    }
                 }
                 if !matches!(mode, Mode::Module) || method != "included" {
                     continue;
@@ -773,7 +775,10 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             let (Some(to), Some(from)) = (symbol_value(&alias.new_name()), symbol_value(&alias.old_name())) else {
                 return Err(fail("`alias` of other than two names"));
             };
-            let Some(origin) = ctx.defs.iter().find(|d| d.name == from && !d.from_module) else {
+            if to.starts_with("ams_") || GEM_ONLY.contains(&to.as_str()) {
+                return Err(fail(&format!("`alias {to}` would be replaced by the expansion")));
+            }
+            let Some(origin) = ctx.defs.iter().rev().find(|d| d.name == from && !d.from_module) else {
                 return Err(fail(&format!("`alias {to} {from}` of a method the body does not define")));
             };
             let visible = origin.visible;
@@ -868,7 +873,10 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 if method == "alias_method" {
                     let names: Option<Vec<String>> = args.iter().map(|a| symbol_value(a).or_else(|| a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))).collect();
                     let Some([to, from]) = names.as_deref() else { return Err(fail("`alias_method` of other than two names")) };
-                    let Some(origin) = ctx.defs.iter().find(|d| d.name == *from && !d.from_module) else {
+                    if to.starts_with("ams_") || GEM_ONLY.contains(&to.as_str()) {
+                        return Err(fail(&format!("`alias_method :{to}` would be replaced by the expansion")));
+                    }
+                    let Some(origin) = ctx.defs.iter().rev().find(|d| d.name == *from && !d.from_module) else {
                         return Err(fail(&format!("`alias_method :{to}, :{from}` of a method the body does not define")));
                     };
                     let visible = origin.visible;
@@ -1076,7 +1084,7 @@ fn delegated_names(args: &[ruby_prism::Node<'_>]) -> Result<Vec<(String, bool)>,
 /// A class macro's one required parameter, when it takes that alone.
 fn macro_single(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     let params = def.parameters()?;
-    if params.optionals().iter().next().is_some() || params.keywords().iter().next().is_some() || params.rest().is_some() || params.block().is_some() {
+    if params.optionals().iter().next().is_some() || params.keywords().iter().next().is_some() || params.rest().is_some() || params.keyword_rest().is_some() || params.block().is_some() {
         return None;
     }
     let requireds: Vec<_> = params.requireds().iter().collect();
@@ -1087,7 +1095,7 @@ fn macro_single(def: &ruby_prism::DefNode<'_>) -> Option<String> {
 /// A class macro's rest parameter, when it takes that alone.
 fn macro_rest(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     let params = def.parameters()?;
-    if params.requireds().iter().next().is_some() || params.optionals().iter().next().is_some() || params.keywords().iter().next().is_some() {
+    if params.requireds().iter().next().is_some() || params.optionals().iter().next().is_some() || params.keywords().iter().next().is_some() || params.keyword_rest().is_some() || params.block().is_some() {
         return None;
     }
     let rest = params.rest()?.as_rest_parameter_node()?;
@@ -1260,6 +1268,9 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
         for stmt in stmts {
             let fail = |reason: &str| refuse(source, stmt.location().start_offset(), reason);
             if let Some(w) = stmt.as_local_variable_write_node() {
+                if constant_id_str(&w.name()) == param {
+                    return Err(fail("a declaring loop reassigning its name"));
+                }
                 let value = spelled(&w.value(), name, &locals).ok_or_else(|| fail("a loop local other than a name spelled from the loop's"))?;
                 locals.insert(constant_id_str(&w.name()).to_string(), value);
                 continue;
