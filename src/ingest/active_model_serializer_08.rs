@@ -160,6 +160,8 @@ struct Own {
     defs: Vec<Def>,
     /// The mixins whose `self.included` declared into the class.
     hooked: Vec<String>,
+    /// Methods a literal-list loop in the body defines, as Ruby source.
+    extra: Vec<String>,
     span: Span,
     source_index: usize,
     offset: usize,
@@ -252,9 +254,9 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 continue;
             }
             match collect(&class, source, &name, &tree, &modules, sources) {
-                Ok((stmts, defs, hooked)) => {
+                Ok((stmts, defs, hooked, extra)) => {
                     let span = Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
-                    owns.insert(name, Own { stmts, defs, hooked, span, source_index: index, offset });
+                    owns.insert(name, Own { stmts, defs, hooked, extra, span, source_index: index, offset });
                 }
                 Err(e) => {
                     refused.insert(name, e);
@@ -520,6 +522,10 @@ struct Walk<'a> {
     /// The mixins whose `self.included` hook the walk read as declarations.
     hooked: Vec<String>,
     hook_seen: bool,
+    /// Methods a literal-list loop defines (`define_method`, `attr_accessor`), as Ruby source for the expansion.
+    extra: Vec<String>,
+    /// Constants the body assigns a literal list of Symbols, by name.
+    lists: HashMap<String, Vec<String>>,
 }
 
 enum Mode<'m> {
@@ -536,16 +542,16 @@ fn collect(
     tree: &HashSet<String>,
     modules: &HashMap<String, usize>,
     sources: &[SourceFile],
-) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>)> {
+) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>, Vec<String>)> {
     let class_text = &source.text[class.location().start_offset()..class.location().end_offset()];
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
-    let Walk { stmts, defs, hooked, .. } = ctx;
+    let Walk { stmts, defs, hooked, extra, .. } = ctx;
     // A private `def` the declaration's own reader or gate replaces, which the expansion would keep beside it.
     for stmt in &stmts {
         let (attr, at) = match stmt {
@@ -558,7 +564,7 @@ fn collect(
             return Err(refuse(source, class.location().start_offset(), &format!("a private `{attr}` before its declaration is outside the subset")));
         }
     }
-    Ok((stmts, defs, hooked))
+    Ok((stmts, defs, hooked, extra))
 }
 
 fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile, mode: Mode<'_>) -> IngestResult<()> {
@@ -598,9 +604,22 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             ctx.defs.push(Def { name: method, at, visible: ctx.visible, supers: calls.supers, from_module: matches!(mode, Mode::Module) });
             continue;
         }
+        if let Some(w) = stmt.as_constant_write_node()
+            && let Some(names) = symbol_list(&w.value())
+        {
+            ctx.lists.insert(constant_id_str(&w.name()).to_string(), names);
+        }
         if !matches!(mode, Mode::Hook(_))
             && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_constant_write_node().is_some())
         {
+            continue;
+        }
+        if matches!(mode, Mode::Class)
+            && let Some(call) = stmt.as_call_node()
+            && constant_id_str(&call.name()) == "each"
+            && call.block().is_some()
+        {
+            unroll(ctx, &call, source, offset)?;
             continue;
         }
         let Some(call) = stmt.as_call_node() else {
@@ -619,6 +638,12 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                     .is_some_and(|r| constant_id_str(&r.name()) == param);
                 if !on_klass {
                     return Err(fail(&format!("a mixin's `self.included` may only declare on `{param}`")));
+                }
+                // `klass.include UserFlairMixin`: the class includes it as the hook runs.
+                if method == "include" {
+                    let [arg] = args.as_slice() else { return Err(fail("`include` of other than one module")) };
+                    include_into(ctx, arg, source, offset)?;
+                    continue;
                 }
             }
             Mode::Module => {
@@ -641,31 +666,22 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                     ctx.visible = method != "private";
                     continue;
                 }
+                // The ingest writes their methods; `method_defined?` sees them from here on.
+                if matches!(method, "attr_reader" | "attr_writer" | "attr_accessor") {
+                    for arg in &args {
+                        let name = symbol_value(arg).ok_or_else(|| fail(&format!("`{method}` of other than Symbols")))?;
+                        if method != "attr_writer" {
+                            ctx.defs.push(Def { name: name.clone(), at, visible: ctx.visible, supers: false, from_module: false });
+                        }
+                        if method != "attr_reader" {
+                            ctx.defs.push(Def { name: format!("{name}="), at, visible: ctx.visible, supers: false, from_module: false });
+                        }
+                    }
+                    continue;
+                }
                 if method == "include" {
                     let [arg] = args.as_slice() else { return Err(fail("`include` of other than one module")) };
-                    let written = super::util::constant_path_of(arg).map(|p| p.join("::")).ok_or_else(|| fail("`include` of other than a constant"))?;
-                    let module = if is_rooted(arg) { written.clone() } else { lexical_in(&written, ctx.name, ctx.modules) };
-                    let Some(&index) = ctx.modules.get(&module) else {
-                        return Err(fail(&format!("`include {written}`: not a module of the app")));
-                    };
-                    let msource = &ctx.sources[index];
-                    let parsed = super::prism::parse_silent(msource.text.as_bytes());
-                    let Some(mbody) = module_body(&parsed.node(), &module) else {
-                        return Err(fail(&format!("`include {written}`: its source is not found")));
-                    };
-                    ctx.hook_seen = false;
-                    // A module's own `private` does not carry into the class.
-                    let visible = std::mem::replace(&mut ctx.visible, true);
-                    // Ledgered at the `include`, not in the mixin: a gap there would claim the mixin file's own findings.
-                    walk(ctx, mbody, msource, Mode::Module).map_err(|e| {
-                        let inner = e.to_string();
-                        let inner = inner.split("ActiveModel::Serializer subset: ").last().unwrap_or(&inner).to_string();
-                        fail(&format!("`include {written}`: {inner}"))
-                    })?;
-                    ctx.visible = visible;
-                    if ctx.hook_seen && !ctx.hooked.contains(&module) {
-                        ctx.hooked.push(module);
-                    }
+                    include_into(ctx, arg, source, offset)?;
                     continue;
                 }
             }
@@ -812,6 +828,160 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             other => return Err(fail(&format!("`{other}` is outside the ActiveModel::Serializer 0.8 subset"))),
         }
     }
+    Ok(())
+}
+
+/// The Symbols a literal list holds (`%i[a b]`, `[:a, :b]`).
+fn symbol_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    let array = node.as_array_node()?;
+    array.elements().iter().map(|e| symbol_value(&e)).collect()
+}
+
+/// `%i[a b].each { |name| … }` (or a constant the body assigned such a list): its body once per name, the block's
+/// parameter read as that Symbol. Declarations land as written; `define_method` and `attr_accessor` are written as
+/// methods for the expansion, as the loop defines them when the class loads.
+fn unroll(ctx: &mut Walk<'_>, call: &ruby_prism::CallNode<'_>, source: &SourceFile, offset: usize) -> IngestResult<()> {
+    let fail = |reason: &str| refuse(source, offset, reason);
+    let receiver = call.receiver().ok_or_else(|| fail("`each` without a list"))?;
+    let names = match symbol_list(&receiver) {
+        Some(names) => names,
+        None => receiver
+            .as_constant_read_node()
+            .and_then(|c| ctx.lists.get(constant_id_str(&c.name())).cloned())
+            .ok_or_else(|| fail("`each` over other than a literal list of Symbols"))?,
+    };
+    if !ctx.visible {
+        return Err(fail("a loop defining methods after `private`"));
+    }
+    let block = call.block().and_then(|b| b.as_block_node()).ok_or_else(|| fail("`each` without a literal block"))?;
+    let params: Vec<String> = block
+        .parameters()
+        .and_then(|p| p.as_block_parameters_node())
+        .and_then(|p| p.parameters())
+        .map(|p| p.requireds().iter().filter_map(|r| r.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string())).collect())
+        .unwrap_or_default();
+    let [param] = params.as_slice() else { return Err(fail("an `each` block taking other than one name")) };
+    let Some(body) = block.body() else { return Ok(()) };
+    let stmts = flatten_statements(body);
+    // The source of `node` with each read of the parameter written as `name`'s Symbol.
+    let text_of = |node: &ruby_prism::Node<'_>, name: &str| -> String {
+        struct Reads<'a> {
+            param: &'a str,
+            found: Vec<(usize, usize)>,
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Reads<'_> {
+            fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+                if constant_id_str(&node.name()) == self.param {
+                    self.found.push((node.location().start_offset(), node.location().end_offset()));
+                }
+            }
+        }
+        let mut reads = Reads { param, found: Vec::new() };
+        ruby_prism::Visit::visit(&mut reads, node);
+        let (start, end) = (node.location().start_offset(), node.location().end_offset());
+        let mut text = source.text[start..end].to_string();
+        reads.found.sort();
+        for (a, b) in reads.found.into_iter().rev() {
+            text.replace_range(a - start..b - start, &format!(":{name}"));
+        }
+        text
+    };
+    let is_param = |n: &ruby_prism::Node<'_>| n.as_local_variable_read_node().is_some_and(|r| constant_id_str(&r.name()) == param);
+    for name in &names {
+        for stmt in &stmts {
+            let fail = |reason: &str| refuse(source, stmt.location().start_offset(), reason);
+            let Some(inner) = stmt.as_call_node() else { return Err(fail("a loop body holding other than calls")) };
+            if inner.receiver().is_some() {
+                return Err(fail("a receiver in a declaring loop"));
+            }
+            let method = constant_id_str(&inner.name());
+            let args: Vec<_> = inner.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            ctx.at += 1;
+            let at = ctx.at;
+            match (method, args.as_slice()) {
+                ("attributes" | "attribute", [arg]) if is_param(arg) && inner.block().is_none() => {
+                    ctx.stmts.push(attribute(name, None, stmt.location().start_offset(), at, source)?);
+                }
+                ("define_method", [arg]) => {
+                    // The name as written, its interpolations of the parameter answered.
+                    let method_name = if is_param(arg) {
+                        name.clone()
+                    } else if let Some(s) = arg.as_interpolated_string_node().or_else(|| None) {
+                        let mut out = String::new();
+                        for part in s.parts().iter() {
+                            if let Some(t) = part.as_string_node() {
+                                out.push_str(&String::from_utf8_lossy(t.unescaped()));
+                            } else if let Some(e) = part.as_embedded_statements_node()
+                                && let Some(st) = e.statements()
+                                && let [one] = st.body().iter().collect::<Vec<_>>().as_slice()
+                                && is_param(one)
+                            {
+                                out.push_str(name);
+                            } else {
+                                return Err(fail("a `define_method` name interpolating other than the loop's name"));
+                            }
+                        }
+                        out
+                    } else {
+                        return Err(fail("a `define_method` name other than the loop's name"));
+                    };
+                    let Some(mblock) = inner.block().and_then(|b| b.as_block_node()) else {
+                        return Err(fail("a `define_method` without a literal block"));
+                    };
+                    if mblock.parameters().is_some() {
+                        return Err(fail("a `define_method` block with parameters"));
+                    }
+                    let body = mblock.body().map(|b| text_of(&b, name)).unwrap_or_else(|| "nil".to_string());
+                    if method_name.starts_with("ams_") || method_name == "initialize" || GEM_ONLY.contains(&method_name.as_str()) {
+                        return Err(fail(&format!("`define_method` of `{method_name}`, which the expansion writes")));
+                    }
+                    ctx.defs.push(Def { name: method_name.clone(), at, visible: true, supers: false, from_module: false });
+                    ctx.extra.push(format!("  def {method_name}\n    {body}\n  end\n"));
+                }
+                ("public_send" | "send", [what, arg]) if symbol_value(what).as_deref() == Some("attr_accessor") && is_param(arg) => {
+                    for (m, body) in [(name.clone(), format!("@{name}")), (format!("{name}="), String::new())] {
+                        ctx.defs.push(Def { name: m.clone(), at, visible: true, supers: false, from_module: false });
+                        if body.is_empty() {
+                            ctx.extra.push(format!("  def {m}(value)\n    @{name} = value\n  end\n"));
+                        } else {
+                            ctx.extra.push(format!("  def {m}\n    {body}\n  end\n"));
+                        }
+                    }
+                }
+                _ => return Err(fail(&format!("`{method}` in a declaring loop is outside the subset"))),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `include M` at the walk's place: M's methods are an ancestor's from here on, and its `self.included` declares here.
+fn include_into(ctx: &mut Walk<'_>, arg: &ruby_prism::Node<'_>, source: &SourceFile, offset: usize) -> IngestResult<()> {
+    let fail = |reason: &str| refuse(source, offset, reason);
+    let written = super::util::constant_path_of(arg).map(|p| p.join("::")).ok_or_else(|| fail("`include` of other than a constant"))?;
+    let module = if is_rooted(arg) { written.clone() } else { lexical_in(&written, ctx.name, ctx.modules) };
+    let Some(&index) = ctx.modules.get(&module) else {
+        return Err(fail(&format!("`include {written}`: not a module of the app")));
+    };
+    let msource = &ctx.sources[index];
+    let parsed = super::prism::parse_silent(msource.text.as_bytes());
+    let Some(mbody) = module_body(&parsed.node(), &module) else {
+        return Err(fail(&format!("`include {written}`: its source is not found")));
+    };
+    let outer_hook = std::mem::replace(&mut ctx.hook_seen, false);
+    // A module's own `private` does not carry into the class.
+    let visible = std::mem::replace(&mut ctx.visible, true);
+    // Ledgered at the `include`, not in the mixin: a gap there would claim the mixin file's own findings.
+    walk(ctx, mbody, msource, Mode::Module).map_err(|e| {
+        let inner = e.to_string();
+        let inner = inner.split("ActiveModel::Serializer subset: ").last().unwrap_or(&inner).to_string();
+        fail(&format!("`include {written}`: {inner}"))
+    })?;
+    ctx.visible = visible;
+    if ctx.hook_seen && !ctx.hooked.contains(&module) {
+        ctx.hooked.push(module);
+    }
+    ctx.hook_seen = outer_hook;
     Ok(())
 }
 
@@ -1003,6 +1173,10 @@ fn defined_before(name: &str, class: &str, at: usize, chain: &[String], owns: &H
 
 fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &Flat) -> String {
     let mut src = format!("class {name}\n");
+    for method in &owns[name].extra {
+        src.push('\n');
+        src.push_str(method);
+    }
     // An own `def` of the name is the class's, as it overrides the gem's.
     let own: HashSet<&str> = owns[name].defs.iter().map(|d| d.name.as_str()).collect();
     // Per class, not once on the root: an `object` the whole tree shares is a union of every serializer's records,

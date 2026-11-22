@@ -13,8 +13,19 @@
 use super::emit_and_run;
 
 const SERIALIZERS: &str = r#"
+module FlairMixin
+  def self.included(klass)
+    klass.attributes :flair
+  end
+
+  def flair
+    "f"
+  end
+end
+
 module CommenterMixin
   def self.included(klass)
+    klass.include FlairMixin
     klass.attributes :shout
   end
 
@@ -45,7 +56,20 @@ end
 
 class CommentSerializer < ApplicationSerializer
   include CommenterMixin
-  attributes :id, :commenter, :h
+  attr_accessor :note
+  attributes :id, :commenter, :h, :note
+  TAGS = %i[tag]
+  TAGS.each { |v| public_send(:attr_accessor, v) }
+  attributes :tag
+
+  %i[body_length].each do |m|
+    attributes m
+    define_method m do
+      object.body.to_s.public_send(:length)
+    end
+  end
+
+  %i[commenter].each { |a| define_method("include_#{a}?") { object.commenter != "bob" } }
   attribute :body, key: :text
 
   def h
@@ -192,14 +216,14 @@ end
 /// What active_model_serializers 0.8.4 renders for the same records
 /// (articles 101 and 102, comments 201 and 202), from the real gem.
 const EXPECTED: &[(&str, &str)] = &[
-    ("show", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"article":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("show", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"article":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
     ("draft", r#"{"comments":[],"article":{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}}"#),
-    ("admin", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
-    ("guest", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":false,"comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
-    ("plain", r#"{"id":101,"title":"Hello","comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"node":{"id":202,"commenter":"bob","h":"BOB","text":"second"}}"#),
-    ("index", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
+    ("admin", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
+    ("guest", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":false,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
+    ("plain", r#"{"id":101,"title":"Hello","comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"node":{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}}"#),
+    ("index", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
     ("bare", r#"[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]"#),
-    ("helper_show", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("helper_show", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
     ("helper_index", r#"{"articles":[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]}"#),
     ("rootless", r#"Cannot serialize comments when ArticleSerializer does not have a root!"#),
 ];
@@ -306,6 +330,9 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("module M\n  include Comparable\n\n  def x\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "a mixin body may hold only", &["ASerializer"]),
         ("module M\n  def self.included(klass)\n    klass.attributes :x\n    puts klass\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "may only declare on `klass`", &["ASerializer"]),
         ("module M\n  def self.included(klass)\n    klass.attributes :x\n  end\nend\n\nclass Other\n  include M\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "also runs for Other", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  private\n\n  %i[a].each { |n| define_method(n) { 1 } }\nend\n", "a loop defining methods after `private`", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  %i[a].each { |n| define_method(\"#{n}_#{object}\") { 1 } }\nend\n", "interpolating other than the loop's name", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  names.each { |n| attributes n }\nend\n", "over other than a literal list of Symbols", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  attributes :ams_attributes\nend\n", "an attribute named `ams_attributes`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  embed :ids, EMBED\nend\n", "`embed` options other than a literal Hash", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  def read_attribute_for_serialization(name)\n    name\n  end\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
