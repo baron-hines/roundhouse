@@ -1597,7 +1597,8 @@ pub(super) fn emit_send_base(
         (None, _) => {
             // A capitalized name without parens reads as a constant:
             // `Success()` is a call, `Success` is not.
-            if args_s.is_empty() && method.as_str().starts_with(|c: char| c.is_ascii_uppercase()) {
+            // As written, `h()`: bare, the name reads a local of the same name where one is in scope.
+            if args_s.is_empty() && (parenthesized || method.as_str().starts_with(|c: char| c.is_ascii_uppercase())) {
                 format!("{method}()")
             } else if args_s.is_empty() {
                 method.to_string()
