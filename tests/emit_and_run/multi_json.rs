@@ -356,7 +356,7 @@ fn multi_json_load_runs_as_ojs_strict_load_on_spinel() {
 /// writes it, which the stand-in does not model.
 #[test]
 fn multi_json_dump_of_an_object_is_refused() {
-    let lib = "class Dumped\n  def self.record\n    MultiJson.dump(Article.first)\n  end\n\n  def self.mixed\n    MultiJson.dump({ a: Article.first })\n  end\n\n  def self.through_lambda\n    encode = ->(value) { MultiJson.dump(value) }\n    encode.call(1)\n  end\n\n  def self.splatted\n    MultiJson.dump([*{ Article.first => 1 }])\n  end\nend\n";
+    let lib = "class Dumped\n  def self.record\n    MultiJson.dump(Article.first)\n  end\n\n  def self.mixed\n    MultiJson.dump({ a: Article.first })\n  end\n\n  def self.through_lambda\n    encode = ->(value) { MultiJson.dump(value) }\n    encode.call(1)\n  end\n\n  def self.splatted\n    MultiJson.dump([*{ Article.first => 1 }])\n  end\n\n  def self.optional(extra)\n    MultiJson.dump([0, *extra])\n  end\n\n  def self.optionals\n    [optional([1]), optional(nil)]\n  end\nend\n";
     let (_emitted, errors) = overlay(emit_and_run::real_blog())
         .write("lib/dumped.rb", lib)
         .emit(roundhouse::project::BuildTarget::Ruby);

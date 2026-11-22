@@ -800,7 +800,18 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             if method.starts_with("ams_") || GEM_ONLY.contains(&method.as_str()) {
                 return Err(fail(&format!("`def {method}` would be replaced by the expansion")));
             }
-            let mut calls = GemCalls { found: None, supers: false };
+            // `def initialize(object, options = {})`: its second parameter is the options Hash.
+            let option_locals: Vec<String> = if method == "initialize" {
+                def.parameters().into_iter().flat_map(|p| {
+                    let names: Vec<String> = p.requireds().iter().filter_map(|r| r.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()))
+                        .chain(p.optionals().iter().filter_map(|o| o.as_optional_parameter_node().map(|o| constant_id_str(&o.name()).to_string())))
+                        .collect();
+                    names.into_iter().nth(1)
+                }).collect()
+            } else {
+                Vec::new()
+            };
+            let mut calls = GemCalls { found: None, supers: false, option_locals };
             ruby_prism::Visit::visit(&mut calls, &stmt);
             if let Some((call, at)) = calls.found {
                 return Err(refuse(source, at, &format!("`{call}` is the gem's, outside the subset")));
@@ -1535,7 +1546,7 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                     if method_name.starts_with("ams_") || method_name == "initialize" || GEM_ONLY.contains(&method_name.as_str()) {
                         return Err(fail(&format!("`define_method` of `{method_name}`, which the expansion writes")));
                     }
-                    let mut calls = GemCalls { found: None, supers: false };
+                    let mut calls = GemCalls { found: None, supers: false, option_locals: Vec::new() };
                     ruby_prism::Visit::visit(&mut calls, &mblock.as_node());
                     if let Some((call, _)) = calls.found {
                         return Err(fail(&format!("`{call}` in a `define_method` block is the gem's, outside the subset")));
@@ -1557,7 +1568,7 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                         let Some(def) = d.as_def_node().filter(|d| d.receiver().is_none()) else {
                             return Err(fail("a `class_eval` string holding other than methods"));
                         };
-                        let mut calls = GemCalls { found: None, supers: false };
+                        let mut calls = GemCalls { found: None, supers: false, option_locals: Vec::new() };
                         ruby_prism::Visit::visit(&mut calls, d);
                         if let Some((call, _)) = calls.found {
                             return Err(fail(&format!("`{call}` in a `class_eval` string is the gem's, outside the subset")));
@@ -1825,9 +1836,23 @@ const GEM_ONLY: &[&str] = &[
     "read_attribute_for_serialization", "url_options", "_fast_attributes",
 ];
 
+/// `options`, `self.options`, `@options` or a local assigned one of them: the Hash the serializer was built with.
+fn options_read(node: &ruby_prism::Node<'_>, locals: &[String]) -> bool {
+    if let Some(ivar) = node.as_instance_variable_read_node() {
+        return constant_id_str(&ivar.name()) == "@options";
+    }
+    if let Some(local) = node.as_local_variable_read_node() {
+        return locals.iter().any(|l| l == constant_id_str(&local.name()));
+    }
+    node.as_call_node().is_some_and(|c| {
+        constant_id_str(&c.name()) == "options" && c.receiver().is_none_or(|r| r.as_self_node().is_some()) && c.arguments().is_none()
+    })
+}
+
 struct GemCalls {
     found: Option<(String, usize)>,
     supers: bool,
+    option_locals: Vec<String>,
 }
 
 impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
@@ -1838,14 +1863,27 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
             self.found = Some((name.to_string(), node.location().start_offset()));
         }
         // The gem's `as_json` writes these into the options a serializer is built with; the expansion holds them apart.
-        let first = node.arguments().and_then(|a| a.arguments().iter().next());
+        let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        // Every key of a multi-key reader; only the first of `fetch` and the like, whose second is a default.
+        let keys: &[ruby_prism::Node<'_>] = match name {
+            "values_at" | "slice" | "except" => &args,
+            "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" => &args[..args.len().min(1)],
+            _ => &[],
+        };
+        let shared = keys.iter().filter_map(symbol_value).find(|k| matches!(k.as_str(), "hash" | "unique_values"));
         if self.found.is_none()
-            && matches!(name, "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" | "values_at" | "slice" | "except")
-            && first.as_ref().and_then(symbol_value).is_some_and(|k| matches!(k.as_str(), "hash" | "unique_values"))
+            && let Some(key) = shared
+            && node.receiver().is_some_and(|r| options_read(&r, &self.option_locals))
         {
-            self.found = Some((format!("{name}(:{})", first.as_ref().and_then(symbol_value).unwrap_or_default()), node.location().start_offset()));
+            self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
         }
         ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        if options_read(&node.value(), &self.option_locals) {
+            self.option_locals.push(constant_id_str(&node.name()).to_string());
+        }
+        ruby_prism::visit_local_variable_write_node(self, node);
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         self.supers = true;
@@ -2172,17 +2210,58 @@ fn writes_each_serializer(e: &Expr) -> bool {
     found
 }
 
-/// Whether `e` hands `local`'s Hash on (an assignment, an argument, an element) rather than only calling on it.
-fn aliases(e: &Expr, local: &str, as_receiver: bool) -> bool {
-    if let ExprNode::Var { name, .. } = &*e.node {
-        return name.as_str() == local && !as_receiver;
+/// The locals `e` hands on (an assignment, an argument, an element) rather than only calling on, and the locals it
+/// assigns one of them: either name may then write the Hash.
+fn escaped_locals(e: &Expr, out: &mut HashSet<String>) {
+    fn walk(e: &Expr, as_receiver: bool, out: &mut HashSet<String>) {
+        match &*e.node {
+            ExprNode::Var { name, .. } => {
+                if !as_receiver {
+                    out.insert(name.as_str().to_string());
+                }
+            }
+            ExprNode::Send { recv: Some(r), args, block, .. } => {
+                walk(r, true, out);
+                args.iter().for_each(|a| walk(a, false, out));
+                if let Some(b) = block {
+                    walk(b, false, out);
+                }
+            }
+            ExprNode::Assign { target: crate::expr::LValue::Index { recv, index }, value }
+            | ExprNode::OpAssign { target: crate::expr::LValue::Index { recv, index }, value, .. } => {
+                walk(recv, true, out);
+                walk(index, false, out);
+                walk(value, false, out);
+            }
+            ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
+                walk(value, false, out);
+                let mut held = HashSet::default();
+                value_locals(value, &mut held);
+                if !held.is_empty() {
+                    out.insert(name.as_str().to_string());
+                }
+            }
+            _ => e.node.for_each_child(&mut |c| walk(c, false, out)),
+        }
     }
-    if let ExprNode::Send { recv: Some(r), args, block, .. } = &*e.node {
-        return aliases(r, local, true) || args.iter().any(|a| aliases(a, local, false)) || block.as_ref().is_some_and(|b| aliases(b, local, false));
+    walk(e, false, out);
+}
+
+/// The locals whose Hash `e` may evaluate to: itself, a branch of a condition, or the receiver of a call answering
+/// its receiver (`opts.merge!(…)`), not a copy (`{ a: 1 }.merge!(opts)`).
+fn value_locals(e: &Expr, out: &mut HashSet<String>) {
+    match &*e.node {
+        ExprNode::Var { name, .. } => {
+            out.insert(name.as_str().to_string());
+        }
+        ExprNode::BoolOp { .. } | ExprNode::If { .. } | ExprNode::Seq { .. } => e.node.for_each_child(&mut |c| value_locals(c, out)),
+        ExprNode::Send { recv: Some(r), method, .. }
+            if matches!(method.as_str(), "merge!" | "update" | "tap" | "itself" | "reverse_merge!" | "with_indifferent_access" | "compact!" | "reject!" | "select!" | "delete_if" | "keep_if" | "except!" | "slice!" | "freeze" | "then" | "replace") =>
+        {
+            value_locals(r, out)
+        }
+        _ => {}
     }
-    let mut found = false;
-    e.node.for_each_child(&mut |c| found |= aliases(c, local, false));
-    found
 }
 
 fn local_reads(e: &Expr, out: &mut HashSet<String>) {
@@ -2225,6 +2304,8 @@ fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
 fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<String, String>, read_after: &HashSet<String>) {
     if let ExprNode::Seq { exprs } = &mut *expr.node {
         let mut known = locals.clone();
+        // Locals whose Hash another name may hold: never registered, as a write through that name is not seen.
+        let mut escaped: HashSet<String> = HashSet::default();
         for i in 0..exprs.len() {
             let mut after = read_after.clone();
             for later in &exprs[i + 1..] {
@@ -2240,20 +2321,38 @@ fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<S
                 if writes_each_serializer(e) {
                     known.clear();
                 }
-                known.retain(|local, _| !writes_local(e, local) && !aliases(e, local, false));
+                known.retain(|local, _| !writes_local(e, local));
             }
+            escaped_locals(e, &mut escaped);
+            known.retain(|local, _| !escaped.contains(local));
         }
         return;
     }
+    let mut base = read_after.clone();
     // Not a loop body's: a read before the call in the source may run after it.
-    let looping = matches!(&*expr.node, ExprNode::While { .. }) || matches!(&*expr.node, ExprNode::Lambda { .. });
-    if looping {
-        let mut after = read_after.clone();
-        local_reads(expr, &mut after);
-        expr.node.for_each_child_mut(&mut |c| rewrite_arrays_in(c, done, locals, &after));
-    } else {
-        expr.node.for_each_child_mut(&mut |c| rewrite_arrays_in(c, done, locals, read_after));
+    if matches!(&*expr.node, ExprNode::While { .. }) || matches!(&*expr.node, ExprNode::Lambda { .. }) {
+        local_reads(expr, &mut base);
     }
+    // Each child sees what its later siblings read: `{ body: …as_json, shared: opts[:hash] }`.
+    let mut reads: Vec<HashSet<String>> = Vec::new();
+    expr.node.for_each_child(&mut |c| {
+        let mut r = HashSet::default();
+        local_reads(c, &mut r);
+        reads.push(r);
+    });
+    // Not a branch's alternatives, which never run after it.
+    let branches = matches!(&*expr.node, ExprNode::If { .. } | ExprNode::Case { .. });
+    let mut at = 0usize;
+    expr.node.for_each_child_mut(&mut |c| {
+        let mut after = base.clone();
+        if !branches {
+            for r in reads.iter().skip(at + 1) {
+                after.extend(r.iter().cloned());
+            }
+        }
+        at += 1;
+        rewrite_arrays_in(c, done, locals, &after);
+    });
     let ExprNode::Send { recv: Some(array), method, args, block: None, .. } = &*expr.node else { return };
     if method.as_str() != "as_json" || !args.is_empty() {
         return;

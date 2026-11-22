@@ -9019,17 +9019,23 @@ fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) 
             _ => false,
         }
     }
+    // What a splat of `ty` puts in an Array: a Hash's entries as `[k, v]` pairs, an Array's elements, nothing for nil.
+    fn splatted(ty: &Ty) -> bool {
+        match ty {
+            Ty::Hash { key, value } => written(key) && written(value),
+            Ty::Array { elem } => written(elem),
+            Ty::Nil => true,
+            Ty::Union { variants } => variants.iter().all(splatted),
+            _ => false,
+        }
+    }
     // A literal by its elements: an empty `{}` or `[]` in it leaves an unresolved element in the literal's own type.
     fn written_expr(expr: &Expr) -> bool {
         match &*expr.node {
             ExprNode::Hash { entries, .. } => entries.iter().all(|(_, v)| written_expr(v)),
             ExprNode::Array { elements, .. } => elements.iter().all(written_expr),
             // `[*{k => v}]` writes each entry as a `[k, v]` Array: its key is a value there, not a Hash key.
-            ExprNode::Splat { value } => match value.ty.as_ref() {
-                Some(Ty::Hash { key, value }) => written(key) && written(value),
-                Some(Ty::Array { elem }) => written(elem),
-                _ => false,
-            },
+            ExprNode::Splat { value } => value.ty.as_ref().is_some_and(splatted),
             _ => expr.ty.as_ref().is_some_and(written),
         }
     }
