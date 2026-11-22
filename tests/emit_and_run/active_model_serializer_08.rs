@@ -44,6 +44,20 @@ module CommenterMixin
   end
 end
 
+module StampMixin
+  extend ActiveSupport::Concern
+
+  included { attributes :stamp, :stamp_size }
+
+  def stamp
+    "st-" + object.title
+  end
+
+  def stamp_size
+    stamp.length
+  end
+end
+
 module NoteBase
   def summary_note
     "note"
@@ -212,6 +226,7 @@ end
 
 class PlainArticleSerializer < ActiveModel::Serializer
   root false
+  include StampMixin
   attributes :id, :title, :greeting
 
   def self.flags
@@ -225,6 +240,16 @@ class PlainArticleSerializer < ActiveModel::Serializer
     "g2"
   end
 
+  def self.shouted(*list)
+    [list].flatten.each do |attribute|
+      attributes(attribute)
+      class_eval %{def #{attribute}
+        object.#{attribute}.to_s.upcase
+      end}
+    end
+  end
+  shouted :body
+
   def initialize(object, options = {})
     super
     @greeting = "hi " + object.title
@@ -235,7 +260,7 @@ class PlainArticleSerializer < ActiveModel::Serializer
   end
 
   has_many :comments, serializer: CommentSerializer
-  has_one :node, serializer: CommentSerializer, embed: :objects
+  has_one :node, serializer: CommentSerializer, embed: :object, if: -> { false }
   has_one :first_c, embed: :objects
 
   def first_c
@@ -321,7 +346,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("draft", r#"{"comments":[],"older":[],"implicit_comments":[],"article":{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"},"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null,"older_ids":[],"implicit_comment_ids":[]}}"#),
     ("admin", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"older":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}],"implicit_comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"},"summary":"A lon","draft":false,"summary_note":"note","secret":"s","heading":"H","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202,"older_ids":[201],"implicit_comment_ids":[201,202]}}"#),
     ("guest", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"older":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}],"implicit_comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"},"summary":"A lon","draft":false,"summary_note":"note","title_shown":false,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202,"older_ids":[201],"implicit_comment_ids":[201,202]}}"#),
-    ("plain", r#"{"id":101,"title":"Hello","greeting":"hi Hello","flag_a":true,"flag_b":false,"greeting2":"g2","comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"node":{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"},"first_c":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}}"#),
+    ("plain", r#"{"stamp":"st-Hello","stamp_size":8,"id":101,"title":"Hello","greeting":"hi Hello","flag_a":true,"flag_b":false,"greeting2":"g2","body":"A LONG BODY","comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"node":{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"},"first_c":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}}"#),
     ("index", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"older":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}],"implicit_comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"},"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202,"older_ids":[201],"implicit_comment_ids":[201,202]},{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"},"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null,"older_ids":[],"implicit_comment_ids":[]}]}"#),
     ("bare", r#"[{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"}},{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"}}]"#),
     ("helper_show", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"older":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}],"implicit_comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"},"summary":"A lon","draft":false,"summary_note":"note","secret":"s","heading":"H","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202,"older_ids":[201],"implicit_comment_ids":[201,202]}}"#),
@@ -346,6 +371,62 @@ fn overlay() -> emit_and_run::Overlay {
             ),
         )
 }
+
+/// An app's copy of the gem's `include!` with the rootless branch's `raise` dropped (0.9's behavior, as
+/// discourse's `lib/freedom_patches/ams_include_without_root.rb` loads it).
+const ROOTLESS_PATCH: &str = r#"module ActiveModel
+  class Serializer
+      def include!(name, options={})
+        unique_values =
+          if hash = options[:hash]
+            if @options[:hash] == hash
+              @options[:unique_values] ||= {}
+            else
+              {}
+            end
+          else
+            hash = @options[:hash]
+            @options[:unique_values] ||= {}
+          end
+  
+        node = options[:node] ||= @node
+        value = options[:value]
+  
+        if options[:include] == nil
+          if @options.key?(:include)
+            options[:include] = @options[:include].include?(name)
+          elsif @options.include?(:exclude)
+            options[:include] = !@options[:exclude].include?(name)
+          end
+        end
+  
+        association_class =
+          if klass = _associations[name]
+            klass
+          elsif value.respond_to?(:to_ary)
+            Associations::HasMany
+          else
+            Associations::HasOne
+          end
+  
+        association = association_class.new(name, self, options)
+  
+        if association.embed_ids?
+          node[association.key] = association.serialize_ids
+  
+          if association.embed_in_root? && hash.nil?
+            # 0.9 skips what 0.8 raises for
+          elsif association.embed_in_root? && association.embeddable?
+            merge_association hash, association.root, association.serializables, unique_values
+          end
+        elsif association.embed_objects?
+          node[association.key] = association.serialize
+        end
+      end
+  
+  end
+end
+"#;
 
 fn assertions() -> String {
     let mut out = String::from(
@@ -372,6 +453,27 @@ run = ->(action, id) { c = ArticleAmsController.new; c.params = id ? {"id" => id
     }
     out.push_str("puts \"ams 0.8 passed\"\n");
     out
+}
+
+#[test]
+fn an_active_model_serializer_08_under_the_app_s_rootless_patch_skips_the_sideload() {
+    let script = assertions().replace(&serde_json::to_string("Cannot serialize comments when ArticleSerializer does not have a root!").unwrap(), "\"no error\"");
+    assert!(script.contains("\"no error\""));
+    let run = overlay()
+        .write("lib/freedom_patches/ams_include_without_root.rb", ROOTLESS_PATCH)
+        .write("config/initializers/002-freedom_patches.rb", "require Rails.root.join(\"lib/freedom_patches/ams_include_without_root\").to_s\n")
+        .run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("ams 0.8 passed"));
+}
+
+#[test]
+fn an_active_model_serializer_08_under_another_reopening_of_the_gem_is_refused() {
+    let tree = tree(&format!("{}\n\nclass ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n", ROOTLESS_PATCH.replace("# 0.9 skips what 0.8 raises for", "nil")));
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree).expect("survey ingest");
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("the app reopens `ActiveModel::Serializer`")), "{ledger:#?}");
 }
 
 #[test]
@@ -418,6 +520,10 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  attributes :display\nend\n", "an attribute named `display`", &["ASerializer"][..]),
         ("class ASerializer < BaseSerializer\n  cached\nend\n", "`cached` is outside", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :author, serializer: BaseSerializer, polymorphic: true\nend\n", "`polymorphic:` is outside", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  has_one :author, serializer: BaseSerializer, if: check\nend\n", "`if:` is outside", &["ASerializer"]),
+        ("module M\n  included { attributes :x }\n\n  def x\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "does not `extend ActiveSupport::Concern`", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  def self.m(*list)\n    list.each { |a| class_eval %{def #{a}\n  1\nend\nputs 1} }\n  end\n  m :x\nend\n", "a `class_eval` string holding other than methods", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  def self.m(*list)\n    list.each { |a| class_eval %{def #{a}_#{object}\n  1\nend} }\n  end\n  m :x\nend\n", "a `class_eval` string interpolating other than the loop's name", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def initialize(object, *rest)\n    super\n  end\nend\n", "hands a keyword or splat on through `super`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def link\n    url_options\n  end\nend\n", "`url_options` is the gem's", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def include!(name)\n    name\n  end\nend\n", "`def include!` would be replaced", &["ASerializer"]),

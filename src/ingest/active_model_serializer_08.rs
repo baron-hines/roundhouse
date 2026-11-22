@@ -181,11 +181,13 @@ struct Flat {
     embed: Embed,
     root_embed: bool,
     root: Root,
+    /// The app's `include!` (0.9's): a sideload with no root to merge into is skipped, not raised.
+    rootless_skips: bool,
 }
 
 impl Default for Flat {
     fn default() -> Self {
-        Flat { attributes: Vec::new(), assocs: Vec::new(), embed: Embed::Objects, root_embed: false, root: Root::Unset }
+        Flat { attributes: Vec::new(), assocs: Vec::new(), embed: Embed::Objects, root_embed: false, root: Root::Unset, rootless_skips: false }
     }
 }
 
@@ -304,6 +306,15 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     };
     let mut owns: HashMap<String, Own> = HashMap::default();
     let mut refused: HashMap<String, IngestError> = HashMap::default();
+    let (reopened, rootless_skips) = match reopened_gem(sources) {
+        Ok(found) => found,
+        Err((index, offset, reason)) => {
+            for name in &tree {
+                refused.insert(name.clone(), refuse(&sources[index], offset, &reason));
+            }
+            (false, false)
+        }
+    };
     for (index, source) in sources.iter().enumerate() {
         if !tree.iter().any(|n| source.text.contains(n.rsplit("::").next().unwrap_or(n))) {
             continue;
@@ -481,6 +492,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 Stmt::Root(root) => flat.root = root.clone(),
             }
         }
+        flat.rootless_skips = rootless_skips;
         flats.insert(name.clone(), flat);
     }
     let mut failed: HashSet<String> = HashSet::default();
@@ -528,6 +540,11 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         done.clear();
     }
     for_each_rewritten_body(app, &mut |body| rewrite_arrays(body, &done));
+    // The app's copy of `include!` is the gem's, which nothing reaches once every serializer is expanded; a refused one
+    // still runs through it.
+    if reopened && tree.iter().all(|n| done.contains(n)) {
+        app.library_classes.retain(|c| c.name.0.as_str() != SERIALIZER);
+    }
     Ok(())
 }
 
@@ -649,6 +666,8 @@ struct Walk<'a> {
     lineage: Vec<String>,
     /// The macros the body ran, by the class that defines each.
     expanded: Vec<(String, String)>,
+    /// Whether the module being walked does `extend ActiveSupport::Concern`.
+    concern: bool,
 }
 
 enum Mode<'m> {
@@ -674,7 +693,7 @@ fn collect(
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new(), implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new(), concern: false, implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
@@ -698,7 +717,8 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
     let module = matches!(mode, Mode::Module);
     // A mixin's hook runs once every method of it is the class's ancestor's: `include` appends the features first.
     let (hooks, body): (Vec<_>, Vec<_>) = body.into_iter().partition(|stmt| {
-        module && stmt.as_def_node().is_some_and(|d| d.receiver().is_some() && constant_id_str(&d.name()) == "included")
+        module && (stmt.as_def_node().is_some_and(|d| d.receiver().is_some() && constant_id_str(&d.name()) == "included")
+            || concern_included(stmt).is_some())
     });
     for stmt in body.into_iter().chain(hooks) {
         ctx.at += 1;
@@ -785,11 +805,26 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             ctx.defs.push(Def { name: to, at, visible, supers: false, from_module: false });
             continue;
         }
+        // `if Rails.env.test? … end` writing the module's constants: nothing the class including it defines or declares.
+        if module && (stmt.as_if_node().is_some() || stmt.as_unless_node().is_some()) && !declares_anything(&stmt) {
+            continue;
+        }
         let Some(call) = stmt.as_call_node() else {
             return Err(fail("a serializer body may hold only the gem's declarations, methods, constants and classes"));
         };
         let method = constant_id_str(&call.name());
         let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        // ActiveSupport::Concern's `included do … end`: the block runs in the class once the module's methods are its.
+        if module && let Some(block) = concern_included(&stmt) {
+            if !ctx.concern {
+                return Err(fail("`included` with a block in a module that does not `extend ActiveSupport::Concern`"));
+            }
+            let visible = std::mem::replace(&mut ctx.visible, true);
+            walk(ctx, block.body().map(flatten_statements).unwrap_or_default(), source, Mode::Class)?;
+            ctx.visible = visible;
+            ctx.hook_seen = true;
+            continue;
+        }
         if call.block().is_some() {
             return Err(fail(&format!("a block on `{method}`")));
         }
@@ -810,6 +845,19 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 }
             }
             Mode::Module => {
+                if call.receiver().is_none() && method == "extend" && args.len() == 1
+                    && super::util::constant_path_of(&args[0]).is_some_and(|p| p.join("::") == "ActiveSupport::Concern")
+                {
+                    ctx.concern = true;
+                    continue;
+                }
+                if call.receiver().is_none() && method == "private_constant" && args.iter().all(|a| symbol_value(a).is_some()) {
+                    continue;
+                }
+                // `extend self` gives the module its own methods; the class including it is untouched.
+                if call.receiver().is_none() && method == "extend" && matches!(args.as_slice(), [a] if a.as_self_node().is_some()) {
+                    continue;
+                }
                 if call.receiver().is_none() && matches!(method, "private" | "protected" | "public") && args.is_empty() {
                     ctx.visible = method != "private";
                     continue;
@@ -982,6 +1030,10 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                         "embed_key" => {
                             embed_key = symbol_value(&value).filter(|k| is_plain(k)).ok_or_else(|| fail("an `embed_key:` other than a Symbol"))?
                         }
+                        // 0.8.4 reads none of these (`if:` is 0.10's), so the class loading only builds the value.
+                        other if !matches!(other, "name" | "value" | "polymorphic")
+                            && (value.as_lambda_node().is_some() || value.as_symbol_node().is_some() || value.as_string_node().is_some()
+                                || value.as_true_node().is_some() || value.as_false_node().is_some() || value.as_nil_node().is_some()) => {}
                         other => return Err(fail(&format!("the association option `{other}:` is outside the subset"))),
                     }
                 }
@@ -1081,6 +1133,61 @@ fn delegated_names(args: &[ruby_prism::Node<'_>]) -> Result<Vec<(String, bool)>,
     Ok(names.into_iter().map(|n| (format!("{prefix}{n}"), public)).collect())
 }
 
+/// The gem's `include!` as 0.8.4 writes it, comments dropped, with its rootless branch's body left out: the
+/// `raise IncludeError` there is what an app's copy (discourse's `ams_include_without_root.rb`, 0.9's behavior) drops.
+const GEM_INCLUDE: &str = r#"def include!(name, options={})
+unique_values = if hash = options[:hash] if @options[:hash] == hash @options[:unique_values] ||= {} else {} end else hash = @options[:hash] @options[:unique_values] ||= {} end
+node = options[:node] ||= @node value = options[:value]
+if options[:include] == nil if @options.key?(:include) options[:include] = @options[:include].include?(name) elsif @options.include?(:exclude) options[:include] = !@options[:exclude].include?(name) end end
+association_class = if klass = _associations[name] klass elsif value.respond_to?(:to_ary) Associations::HasMany else Associations::HasOne end
+association = association_class.new(name, self, options)
+if association.embed_ids? node[association.key] = association.serialize_ids
+if association.embed_in_root? && hash.nil? RAISE elsif association.embed_in_root? && association.embeddable? merge_association hash, association.root, association.serializables, unique_values end
+elsif association.embed_objects? node[association.key] = association.serialize end end"#;
+
+/// Whether the app reopens the gem's class with a copy of its `include!`, and whether that copy skips a rootless
+/// sideload; any other reopening is refused, with where.
+fn reopened_gem(sources: &[SourceFile]) -> Result<(bool, bool), (usize, usize, String)> {
+    let normal = |text: &str| -> String {
+        text.lines()
+            .map(|l| l.split_once('#').filter(|(_, rest)| !rest.starts_with('{')).map_or(l, |(code, _)| code))
+            .flat_map(|l| l.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("options = {}", "options={}")
+    };
+    let (mut found_any, mut skips) = (false, false);
+    for (index, source) in sources.iter().enumerate() {
+        if !source.text.contains("Serializer") {
+            continue;
+        }
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
+        let mut found = Vec::new();
+        collect_classes(&parsed.node(), &mut Vec::new(), &mut found);
+        for (path, class) in found.into_iter().filter(|(p, _)| p.join("::") == SERIALIZER) {
+            let _ = path;
+            let offset = class.location().start_offset();
+            let reopened = || (index, offset, "the app reopens `ActiveModel::Serializer`, which the expansion replaces".to_string());
+            let stmts = class.body().map(flatten_statements).unwrap_or_default();
+            let [only] = stmts.as_slice() else { return Err(reopened()) };
+            let Some(def) = only.as_def_node().filter(|d| d.receiver().is_none() && constant_id_str(&d.name()) == "include!") else {
+                return Err(reopened());
+            };
+            let text = normal(&source.text[def.location().start_offset()..def.location().end_offset()]);
+            found_any = true;
+            if text == normal(&GEM_INCLUDE.replace("RAISE ", "raise IncludeError.new(self.class, association.name) ")) {
+                continue;
+            }
+            if text == normal(&GEM_INCLUDE.replace("RAISE ", "")) {
+                skips = true;
+                continue;
+            }
+            return Err(reopened());
+        }
+    }
+    Ok((found_any, skips))
+}
+
 /// A class macro's one required parameter, when it takes that alone.
 fn macro_single(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     let params = def.parameters()?;
@@ -1142,7 +1249,8 @@ fn expand_macro(ctx: &mut Walk<'_>, method: &str, class: &str, index: usize, nam
                     ctx.stmts.push(attribute(n, None, offset, at, source)?);
                 }
             }
-            ("each", Some(r), []) if is_rest(&r) => {
+            // `[list].flatten`: the names are Symbols, which flatten leaves as they are.
+            ("each", Some(r), []) if is_rest(&r) || flattened(&r).is_some_and(|e| is_rest(&e)) => {
                 let block = call.block().and_then(|b| b.as_block_node()).ok_or_else(|| fail("`each` without a literal block"))?;
                 unroll_block(ctx, names, &block, source, offset)?;
             }
@@ -1152,6 +1260,63 @@ fn expand_macro(ctx: &mut Walk<'_>, method: &str, class: &str, index: usize, nam
     Ok(())
 }
 
+
+/// Whether a statement holds a `def`, a call on no receiver (a declaration on the module), or a write to anything but
+/// a constant or a local.
+fn declares_anything(node: &ruby_prism::Node<'_>) -> bool {
+    struct Finds(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Finds {
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.0 |= node.receiver().is_none() && !node.is_variable_call();
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_instance_variable_write_node(&mut self, _: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_write_node(&mut self, _: &ruby_prism::ClassVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_global_variable_write_node(&mut self, _: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut finds = Finds(false);
+    ruby_prism::Visit::visit(&mut finds, node);
+    finds.0
+}
+
+/// `[x].flatten`'s `x`.
+fn flattened<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let call = node.as_call_node().filter(|c| constant_id_str(&c.name()) == "flatten" && c.arguments().is_none() && c.block().is_none())?;
+    let array = call.receiver()?.as_array_node()?;
+    let mut elements = array.elements().iter();
+    let (Some(only), None) = (elements.next(), elements.next()) else { return None };
+    match only.as_splat_node() {
+        Some(splat) => splat.expression(),
+        None => Some(only),
+    }
+}
+
+/// The block of a module's `included do … end`.
+fn concern_included<'pr>(stmt: &ruby_prism::Node<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.arguments().is_some() || constant_id_str(&call.name()) != "included" {
+        return None;
+    }
+    call.block()?.as_block_node().filter(|b| b.parameters().is_none())
+}
 
 /// The Symbols a list the body reads holds: a literal, a constant the body assigned one, or a class method of the body
 /// answering one, called on no receiver.
@@ -1315,6 +1480,30 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                     ctx.defs.push(Def { name: method_name.clone(), at, visible: true, supers: false, from_module: false });
                     ctx.extra.push(format!("  def {method_name}\n    {body}\n  end\n"));
                 }
+                // `class_eval %{def #{attribute} … end}`: the source the string spells, which must be methods alone.
+                ("class_eval", [arg]) if inner.block().is_none() && arg.as_interpolated_string_node().is_some() => {
+                    let text = spelled(arg, name, &locals).ok_or_else(|| fail("a `class_eval` string interpolating other than the loop's name"))?;
+                    let parsed = super::prism::parse_silent(text.as_bytes());
+                    if parsed.errors().count() != 0 {
+                        return Err(fail("a `class_eval` string that does not parse"));
+                    }
+                    let program = parsed.node();
+                    let body: Vec<_> = program.as_program_node().map(|p| p.statements().body().iter().collect()).unwrap_or_default();
+                    let mut defined = Vec::new();
+                    for d in &body {
+                        let Some(def) = d.as_def_node().filter(|d| d.receiver().is_none()) else {
+                            return Err(fail("a `class_eval` string holding other than methods"));
+                        };
+                        defined.push(constant_id_str(&def.name()).to_string());
+                    }
+                    for m in defined {
+                        if m.starts_with("ams_") || m == "initialize" || GEM_ONLY.contains(&m.as_str()) {
+                            return Err(fail(&format!("`class_eval` of `{m}`, which the expansion writes")));
+                        }
+                        ctx.defs.push(Def { name: m, at, visible: true, supers: false, from_module: false });
+                    }
+                    ctx.extra.push(format!("{text}\n"));
+                }
                 ("public_send" | "send", [what, arg]) if symbol_value(what).as_deref() == Some("attr_accessor") && is_param(arg) => {
                     for (m, body) in [(name.clone(), format!("@{name}")), (format!("{name}="), String::new())] {
                         ctx.defs.push(Def { name: m.clone(), at, visible: true, supers: false, from_module: false });
@@ -1365,6 +1554,7 @@ fn include_into(ctx: &mut Walk<'_>, arg: &ruby_prism::Node<'_>, source: &SourceF
         return Err(fail(&format!("`include {written}`: its source is not found")));
     };
     let outer_hook = std::mem::replace(&mut ctx.hook_seen, false);
+    let outer_concern = std::mem::replace(&mut ctx.concern, false);
     // A module's own `private` does not carry into the class.
     let visible = std::mem::replace(&mut ctx.visible, true);
     // Ledgered at the `include`, not in the mixin: a gap there would claim the mixin file's own findings.
@@ -1378,6 +1568,7 @@ fn include_into(ctx: &mut Walk<'_>, arg: &ruby_prism::Node<'_>, source: &SourceF
         ctx.hooked.push(module);
     }
     ctx.hook_seen = outer_hook;
+    ctx.concern = outer_concern;
     Ok(())
 }
 
@@ -1773,11 +1964,15 @@ fn association(a: &Assoc, flat: &Flat) -> String {
                 out.push_str(&format!("      included = ams_include_option({sym}, {default})\n"));
                 out.push_str(&format!("      node[{key}] = {read} ? {read}.{embed_key} : nil\n"));
             }
-            out.push_str("      if included\n");
-            out.push_str("        side = @ams_side\n");
-            out.push_str(&format!(
-                "        raise \"Cannot serialize {name} when #{{self.class}} does not have a root!\" if side.nil?\n"
-            ));
+            if flat.rootless_skips {
+                out.push_str("      side = @ams_side\n      if included && !side.nil?\n");
+            } else {
+                out.push_str("      if included\n");
+                out.push_str("        side = @ams_side\n");
+                out.push_str(&format!(
+                    "        raise \"Cannot serialize {name} when #{{self.class}} does not have a root!\" if side.nil?\n"
+                ));
+            }
             // has_many sideloads nothing for a nil collection; has_one always opens its root.
             if many {
                 out.push_str(&format!("        ams_merge(side, {root}, {read}.map {{ |item| {} }}) unless {read}.nil?\n", nested("item")));
