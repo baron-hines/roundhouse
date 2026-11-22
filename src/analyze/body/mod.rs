@@ -1646,6 +1646,31 @@ impl<'a> BodyTyper<'a> {
         false
     }
 
+    /// The core collection (`Hash`, `Array`, `String`) a source class directly subclasses, when neither it nor a
+    /// module it includes registers `method` on either side or answers through `method_missing`.
+    // Not through an intermediate class: a gem's (`Hashie::Mash` under OmniAuth's AuthHash) answers its readers by
+    // `method_missing`, which its RBS does not show.
+    fn core_ancestor(&self, class: &ClassId, method: &Symbol) -> Option<&'static str> {
+        let classes = self.classes();
+        let info = classes.get(class)?;
+        if info.source_instance_methods.is_empty() && info.source_class_methods.is_empty() {
+            return None;
+        }
+        let missing = Symbol::from("method_missing");
+        let mut chain = std::iter::once(info).chain(info.includes.iter().filter_map(|m| classes.get(m)));
+        if chain.any(|c| {
+            c.instance_methods.contains_key(method) || c.class_methods.contains_key(method) || c.instance_methods.contains_key(&missing) || !c.missing_readers.is_empty()
+        }) {
+            return None;
+        }
+        match info.parent.as_ref()?.0.as_str().trim_start_matches("::") {
+            "Hash" => Some("Hash"),
+            "Array" => Some("Array"),
+            "String" => Some("String"),
+            _ => None,
+        }
+    }
+
     /// Whether a source definition of `method` is in `class`'s chain: itself, its parents, the modules they include.
     fn chain_defines(&self, class: &ClassId, method: &Symbol) -> bool {
         let classes = self.classes();

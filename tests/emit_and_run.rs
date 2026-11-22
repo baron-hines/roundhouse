@@ -20921,6 +20921,10 @@ mod console_only_definitions;
 mod open_classes;
 #[path = "emit_and_run/class_arg_specialize.rs"]
 mod class_arg_specialize;
+#[path = "emit_and_run/scope_hash_tail.rs"]
+mod scope_hash_tail;
+#[path = "emit_and_run/core_subclass_dispatch.rs"]
+mod core_subclass_dispatch;
 #[path = "emit_and_run/parameterized_mailer.rs"]
 mod parameterized_mailer;
 #[path = "emit_and_run/change_table_migrations.rs"]

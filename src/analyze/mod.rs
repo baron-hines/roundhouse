@@ -7963,7 +7963,20 @@ pub(crate) fn scope_return_seed(
     if let Some(kind) = body_tail_terminal_kind(body, model_id, scope_names) {
         return instantiate_return_kind(kind, model_id);
     }
-    Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: model_id.clone(), args: vec![].into() }) }
+    let record = Ty::Class { id: model_id.clone(), args: vec![].into() };
+    // `group_by(&:group)` over this model's relation: Rails' `scope` hands back the body's Hash as it is.
+    let tail = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.last().unwrap_or(body),
+        _ => body,
+    };
+    if let ExprNode::Send { recv: Some(recv), method, block: Some(_), .. } = &*tail.node
+        && matches!(method.as_str(), "group_by" | "index_by")
+        && body_tail_yields_relation(recv, model_id, scope_names)
+    {
+        let value = if method.as_str() == "group_by" { Ty::Array { elem: std::sync::Arc::new(record) } } else { record };
+        return Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(value) };
+    }
+    Ty::Array { elem: std::sync::Arc::new(record) }
 }
 
 /// Did [`scope_return_seed`] actually classify this body, or fall back?

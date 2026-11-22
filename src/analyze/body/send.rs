@@ -1616,6 +1616,19 @@ impl<'a> BodyTyper<'a> {
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
         }
+        // An app class under a core collection (discourse's `class Enum < Hash`): what its own chain does not define is
+        // the core class's, over values the analysis does not follow.
+        if let Some(Ty::Class { id, .. }) = recv_ty
+            && method.as_str() != "new"
+            && let Some(core) = self.core_ancestor(id, method)
+        {
+            let as_core = match core {
+                "Hash" => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+                "Array" => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
+                _ => Ty::Str,
+            };
+            return self.dispatch(Some(&as_core), method, block_ret, args);
+        }
         // What `errors` does not answer itself it delegates to its Array of `ActiveModel::Error`, as Rails' Enumerable does.
         if let Some(Ty::Class { id, .. }) = recv_ty {
             if id.0.as_str() == "ActiveModel::Errors"
