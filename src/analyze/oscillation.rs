@@ -98,9 +98,77 @@ impl<K, V> Default for Entries<K, V> {
 
 trait Joinable: Clone + PartialEq {
     fn join(&self, other: &Self, depth: Option<usize>) -> Option<Self>;
+    /// Whether `next` is this value, which did not know everything, knowing more: every arm it knew is still there,
+    /// and no unknown arm is new. A fact travelling down a long call chain moves each entry on it that way, round after
+    /// round; counted as oscillation, the join kept the first rounds' unknown arms beside the answer.
+    fn refined_by(&self, next: &Self) -> bool;
+}
+
+/// `ty` with every unknown arm dropped, at every level.
+fn known_part(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Union { variants } => {
+            let kept: Vec<Ty> = variants.iter().filter(|v| !v.is_unknown()).map(known_part).collect();
+            match kept.len() {
+                0 => Ty::Untyped,
+                1 => kept.into_iter().next().unwrap(),
+                _ => kept.into_iter().reduce(body::union_of).unwrap(),
+            }
+        }
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(known_part(elem)) },
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(known_part(key)), value: std::sync::Arc::new(known_part(value)) },
+        Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(known_part).collect() },
+        other => other.clone(),
+    }
+}
+
+/// Whether every value `known` describes `next` describes too, read through the structure rather than through a
+/// union (two Hash types union into one only sometimes).
+fn covered(known: &Ty, next: &Ty) -> bool {
+    if known == next || known.is_unknown() {
+        return true;
+    }
+    if let Ty::Union { variants } = known {
+        return variants.iter().all(|v| covered(v, next));
+    }
+    if let Ty::Union { variants } = next {
+        return variants.iter().any(|v| covered(known, v));
+    }
+    match (known, next) {
+        (Ty::Array { elem: a }, Ty::Array { elem: b }) => covered(a, b),
+        (Ty::Hash { key: ka, value: va }, Ty::Hash { key: kb, value: vb }) => covered(ka, kb) && covered(va, vb),
+        (Ty::Tuple { elems: a }, Ty::Tuple { elems: b }) => a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| covered(x, y)),
+        _ => false,
+    }
+}
+
+/// How many unknown arms `ty` holds, at every level.
+fn unknown_arms(ty: &Ty) -> usize {
+    match ty {
+        Ty::Untyped | Ty::Var { .. } => 1,
+        // One for a union's unknown arms however many: `untyped | untyped` (an `Untyped` and a `Var`) knows no less.
+        Ty::Union { variants } => {
+            usize::from(variants.iter().any(Ty::is_unknown))
+                + variants.iter().filter(|v| !v.is_unknown()).map(unknown_arms).sum::<usize>()
+        }
+        Ty::Array { elem } => unknown_arms(elem),
+        Ty::Hash { key, value } => unknown_arms(key) + unknown_arms(value),
+        Ty::Tuple { elems } => elems.iter().map(unknown_arms).sum(),
+        _ => 0,
+    }
 }
 
 impl Joinable for Ty {
+    fn refined_by(&self, next: &Self) -> bool {
+        // Not a value that knew everything: a move that only grows known arms (`Integer` to `Integer | nil`, or a
+        // recursive type nesting deeper) may be half of a cycle, or never stop.
+        let before = unknown_arms(self);
+        if before == 0 || unknown_arms(next) > before || self == next {
+            return false;
+        }
+        covered(&known_part(self), next)
+    }
+
     fn join(&self, other: &Self, depth: Option<usize>) -> Option<Self> {
         let joined = body::union_of(self.clone(), other.clone());
         let joined = match depth {
@@ -112,6 +180,11 @@ impl Joinable for Ty {
 }
 
 impl Joinable for Vec<Ty> {
+    fn refined_by(&self, next: &Self) -> bool {
+        self.len() == next.len() && self.iter().zip(next).all(|(a, b)| a == b || a.refined_by(b))
+            && self.iter().zip(next).any(|(a, b)| a != b)
+    }
+
     /// Position by position; rows of different arity are not one entry
     /// moving but two shapes of call, so they are left to unification.
     fn join(&self, other: &Self, depth: Option<usize>) -> Option<Self> {
@@ -148,6 +221,10 @@ impl<K: Clone + Eq + std::hash::Hash, V: Joinable> Entries<K, V> {
         for (key, value) in now.iter_mut() {
             let Some(old) = prev.get(key) else { continue };
             if old == value {
+                continue;
+            }
+            // Not a move toward a pin: what it did not know answered, as a fact reaches it down a call chain.
+            if old.refined_by(value) && self.tracks.get(key).is_none_or(|t| t.pinned.is_none()) {
                 continue;
             }
             let track = self.tracks.entry(key.clone()).or_insert_with(|| Track {
@@ -335,6 +412,24 @@ mod tests {
             [nilable(Ty::Int), nilable(Ty::Int), nilable(Ty::Int)]
         );
         assert_eq!((entries.cycles, entries.widened), (1, 0));
+    }
+
+    // A fact arriving down a long call chain answers one more unknown arm each round, more rounds in a row than a
+    // streak: pinned, the join kept the first rounds' `untyped` beside the answer.
+    #[test]
+    fn an_entry_answering_its_unknown_arms_round_after_round_is_not_pinned() {
+        let hash = |v: Ty| Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(v) };
+        let values = [
+            hash(Ty::Untyped),
+            hash(body::union_of(Ty::Int, Ty::Untyped)),
+            hash(body::union_of(body::union_of(Ty::Int, Ty::Str), Ty::Untyped)),
+            hash(body::union_of(body::union_of(body::union_of(Ty::Int, Ty::Str), Ty::Bool), Ty::Untyped)),
+            hash(body::union_of(body::union_of(body::union_of(Ty::Int, Ty::Str), Ty::Bool), Ty::Nil)),
+            hash(body::union_of(body::union_of(body::union_of(Ty::Int, Ty::Str), Ty::Bool), Ty::Nil)),
+        ];
+        let (held, entries) = rounds(&values);
+        assert_eq!(held.last(), values.last());
+        assert_eq!((entries.cycles, entries.widened), (0, 0));
     }
 
     #[test]

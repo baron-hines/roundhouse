@@ -184,7 +184,7 @@ const CONTROLLER: &str = r#"class ArticleAmsController < ApplicationController
   end
 
   def render_json_dump(obj, opts = nil)
-    render json: obj
+    render json: MultiJson.dump(obj)
   end
 end
 "#;
@@ -206,7 +206,8 @@ const EXPECTED: &[(&str, &str)] = &[
 
 fn overlay() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
-        .edit("Gemfile.lock", "  specs:\n", "  specs:\n    active_model_serializers (0.8.4)\n")
+        .edit("Gemfile.lock", "  specs:\n", "  specs:\n    active_model_serializers (0.8.4)\n    multi_json (1.21.1)\n    oj (3.17.6)\n")
+        .write("config/initializers/100-oj.rb", "MultiJson.use(:oj)\n")
         .write("app/serializers/article_serializers.rb", SERIALIZERS)
         .write("app/controllers/article_ams_controller.rb", CONTROLLER)
         .edit(
