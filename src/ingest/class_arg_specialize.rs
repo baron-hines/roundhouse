@@ -239,7 +239,8 @@ fn candidates(app: &crate::App) -> HashSet<(usize, String, usize)> {
                 // Not one a default reads (`opts = { serializer: klass }`): the copy has no formal left for it.
                 let defaulted = action.opt_params.iter().map(|(_, d)| d).chain(action.kw_params.iter().filter_map(|(_, d)| d.as_ref()))
                     .any(|d| uses(d, param).0 > 0);
-                if total > 0 && total == ok && !defaulted && !assigned(&action.body, param) {
+                // Not one with a `super`: in the renamed copy it would reach a parent method of the copy's name.
+                if total > 0 && total == ok && !defaulted && !assigned(&action.body, param) && !supers(&action.body) {
                     out.insert((ci, action.name.as_str().to_string(), k));
                 }
             }
@@ -280,11 +281,19 @@ fn uses(e: &Expr, name: &Symbol) -> (usize, usize) {
 fn assigned(e: &Expr, name: &Symbol) -> bool {
     let here = match &*e.node {
         ExprNode::Assign { target: LValue::Var { name: n, .. }, .. } | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n == name,
-        ExprNode::Lambda { params, .. } => params.contains(name),
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+            params.contains(name) || rest_param.as_ref() == Some(name) || block_param.as_ref() == Some(name) || extra_params.iter().any(|p| &p.name == name)
+        }
         _ => false,
     };
     let mut found = here;
     e.node.for_each_child(&mut |c| found |= assigned(c, name));
+    found
+}
+
+fn supers(e: &Expr) -> bool {
+    let mut found = matches!(&*e.node, ExprNode::Super { .. });
+    e.node.for_each_child(&mut |c| found |= supers(c));
     found
 }
 
@@ -312,6 +321,8 @@ fn rewrite_sites(e: &mut Expr, f: &mut dyn FnMut(&str, &[Expr]) -> Option<(Strin
 fn mentions(e: &Expr, method: &str) -> bool {
     let mut found = match &*e.node {
         ExprNode::Send { method: m, .. } => m.as_str() == method,
+        // `method(:build)` ingested as a bound-method reference, whose name is not a child.
+        ExprNode::MethodRef { name, .. } => name.as_str() == method,
         ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => value.as_str() == method,
         ExprNode::Lit { value: crate::expr::Literal::Str { value } } => value.as_str() == method,
         _ => false,
