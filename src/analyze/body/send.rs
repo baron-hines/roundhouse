@@ -4033,7 +4033,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
                 value: std::sync::Arc::new(unknown()),
             },
         },
-        "to_a" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
+        "to_a" | "to_ary" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
         "join" => Ty::Str,
         // `[0, 0, 0].pack("CCC")` — binary packing (lobsters'
         // confidence_order byte strings).

@@ -2,7 +2,23 @@
 
 use super::emit_and_run;
 
-pub(super) const PAYLOAD: &str = r##"class Payload
+pub(super) const PAYLOAD: &str = r##"class Held
+  def initialize(n)
+    @n = n
+  end
+
+  def row
+    h = {}
+    h[:n] = @n.succ
+    h
+  end
+end
+
+class Payload
+  def self.held
+    MultiJson.dump(Held.new(41).row)
+  end
+
   def self.flat
     MultiJson.dump({ "a" => 1, :b => [1, 2, 3], :s => "<a>&' é\"\\\n/" })
   end
@@ -35,6 +51,10 @@ pub(super) const PAYLOAD: &str = r##"class Payload
     [MultiJson.dump(nil), MultiJson.dump(true), MultiJson.dump("x"), MultiJson.dump(:sym), MultiJson.dump(12), MultiJson.dump(2.5)].join(" ")
   end
 
+  def self.keys
+    MultiJson.dump({ 1 => 2, nil => 3, true => 4, 1.5 => 5, :s => 7, "s2" => 8 })
+  end
+
   def self.positional
     MultiJson.dump([1], { pretty: true })
   end
@@ -62,12 +82,14 @@ pub(super) const ASSERTIONS: &str = r##"expected = {
   pretty_false: "[\n  1,\n  [\n    2\n  ]\n]",
   symbols: "{\"a\":{\"b\":\"c\"},\"l\":[\"x\",\"y\"]}",
   scalars: "null true \"x\" \"sym\" 12 2.5",
+  held: "{\"n\":42}",
+  keys: "{\"1\":2,\"\":3,\"true\":4,\"1.5\":5,\"s\":7,\"s2\":8}",
   positional: "[\n  1\n]",
   kwargs: "{\"html_content\":\"<p>\",\"text_content\":\"t\"}",
 }
 actual = {
   flat: Payload.flat, floats: Payload.floats, special: Payload.special, time: Payload.time, pretty: Payload.pretty,
-  pretty_false: Payload.pretty_false, positional: Payload.positional, symbols: Payload.symbols, scalars: Payload.scalars, kwargs: Payload.kwargs,
+  pretty_false: Payload.pretty_false, positional: Payload.positional, symbols: Payload.symbols, scalars: Payload.scalars, keys: Payload.keys, held: Payload.held, kwargs: Payload.kwargs,
 }
 raise "rescued" unless Payload.rescued == "[1]"
 raise "aliases" unless MultiJson::ParseError.new("x").is_a?(MultiJson::LoadError) && MultiJson::ParseError.new("x").is_a?(MultiJson::DecodeError)

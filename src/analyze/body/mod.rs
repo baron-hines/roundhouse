@@ -4308,6 +4308,21 @@ impl<'a> BodyTyper<'a> {
                         last = unknown();
                     }
                     let e = &mut exprs[i];
+                    // A seed this body's writes refined before starts from the seed again: its stamp holds what the
+                    // writes held then, an earlier round's untyped arms among them, which joining would keep.
+                    if let ExprNode::Assign { value, .. } = &*e.node
+                        && value.decisions & crate::expr::REFINED_EMPTY_SEED != 0
+                    {
+                        match &*value.node {
+                            ExprNode::Hash { entries, .. } if entries.is_empty() => {
+                                e.ty = Some(Ty::Hash { key: std::sync::Arc::new(unknown()), value: std::sync::Arc::new(unknown()) });
+                            }
+                            ExprNode::Array { elements, .. } if elements.is_empty() => {
+                                e.ty = Some(Ty::Array { elem: std::sync::Arc::new(unknown()) });
+                            }
+                            _ => {}
+                        }
+                    }
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
                             LValue::Ivar { name } => Some((true, name.clone())),
@@ -4583,6 +4598,7 @@ impl<'a> BodyTyper<'a> {
                                     let seed = &mut exprs[si];
                                     if let ExprNode::Assign { value, .. } = &mut *seed.node {
                                         value.ty = Some(refined.clone());
+                                        value.decisions |= crate::expr::REFINED_EMPTY_SEED;
                                     }
                                     seed.ty = Some(refined);
                                 }
@@ -4614,6 +4630,7 @@ impl<'a> BodyTyper<'a> {
                                 let seed = &mut exprs[si];
                                 if let ExprNode::Assign { value, .. } = &mut *seed.node {
                                     value.ty = Some(refined.clone());
+                                    value.decisions |= crate::expr::REFINED_EMPTY_SEED;
                                 }
                                 seed.ty = Some(refined);
                             }
@@ -8914,7 +8931,8 @@ fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) 
         match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Nil | Ty::Time => true,
             Ty::Array { elem } => written(elem),
-            Ty::Hash { key, value } => written(key) && written(value),
+            // A key of any class: oj's compat dump writes its `to_s`, as the stand-in does.
+            Ty::Hash { value, .. } => written(value),
             Ty::Tuple { elems } => elems.iter().all(written),
             Ty::Record { row } => row.rest.is_none() && row.fields.values().all(written),
             Ty::Union { variants } => variants.iter().all(written),
@@ -8924,7 +8942,7 @@ fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) 
     // A literal by its elements: an empty `{}` or `[]` in it leaves an unresolved element in the literal's own type.
     fn written_expr(expr: &Expr) -> bool {
         match &*expr.node {
-            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| written_expr(k) && written_expr(v)),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(_, v)| written_expr(v)),
             ExprNode::Array { elements, .. } => elements.iter().all(written_expr),
             _ => expr.ty.as_ref().is_some_and(written),
         }
