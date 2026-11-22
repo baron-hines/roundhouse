@@ -126,6 +126,33 @@ impl<'a> LineIndex<'a> {
     }
 }
 
+/// An app's source files (`App::sources`) with their line indexes, each
+/// built at its file's first lookup, for a caller that resolves many
+/// spans across files: the playground asks two positions per diagnostic
+/// and per hover type, where [`SourceFile::line_col`] alone counts the
+/// newlines from the top of the file on every call.
+pub struct SourcePositions<'a> {
+    sources: &'a [SourceFile],
+    indexes: Vec<Option<LineIndex<'a>>>,
+}
+
+impl<'a> SourcePositions<'a> {
+    pub fn new(sources: &'a [SourceFile]) -> Self {
+        SourcePositions { sources, indexes: vec![None; sources.len()] }
+    }
+
+    /// The span's file with the 1-based (line, column) of its start and
+    /// of its end, as [`SourceFile::line_col`] answers them; `None` when
+    /// the span names no file of the sources (`FileId(0)`, or past the
+    /// last one).
+    pub fn of(&mut self, span: Span) -> Option<(&'a SourceFile, (u32, u32), (u32, u32))> {
+        let n = (span.file.0 as usize).checked_sub(1)?;
+        let file = self.sources.get(n)?;
+        let index = self.indexes[n].get_or_insert_with(|| file.line_index());
+        Some((file, index.line_col(span.start), index.line_col(span.end)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +205,28 @@ mod tests {
                 assert_eq!(index.line_col(offset), f.line_col(offset), "{text:?} at {offset}");
             }
         }
+    }
+
+    /// Each span's positions come from its own file: the two files break
+    /// lines at different offsets (every span below answers differently
+    /// against the other file), and the spans alternate between them. A
+    /// span of no file, the synthetic `FileId(0)` or one past the last
+    /// file, has none.
+    #[test]
+    fn source_positions_answer_each_span_from_its_own_file() {
+        let sources = vec![
+            SourceFile { path: "a.rb".into(), text: "x\ny\nz".into() },
+            SourceFile { path: "b.rb".into(), text: "ab\ncd\n".into() },
+        ];
+        let mut positions = SourcePositions::new(&sources);
+        for (file, start, end) in [(1, 0, 2), (2, 3, 4), (1, 2, 4), (2, 4, 6), (1, 4, 5)] {
+            let span = Span { file: FileId(file), start, end };
+            let own = &sources[file as usize - 1];
+            let (found, start_at, end_at) = positions.of(span).expect("a span of a source file");
+            assert_eq!(found.path, own.path, "{span:?}");
+            assert_eq!((start_at, end_at), (own.line_col(start), own.line_col(end)), "{span:?}");
+        }
+        assert!(positions.of(Span::synthetic()).is_none());
+        assert!(positions.of(Span { file: FileId(3), start: 0, end: 0 }).is_none());
     }
 }
