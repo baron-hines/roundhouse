@@ -3525,7 +3525,6 @@ end
     super::class_arg_specialize::specialize(&mut app);
     super::active_model_serializer::lower_active_model_serializers(&mut app, &sources)?;
     super::active_model_serializer_08::lower(&mut app, &sources)?;
-    super::site_settings_yml::lower(&mut app, &sources, vfs.read_to_string(&dir.join("config/site_settings.yml")).ok());
     // After it, not before: `Current`'s own `delegate` reads an
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
