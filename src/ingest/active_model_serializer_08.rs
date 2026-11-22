@@ -261,7 +261,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 }
                 if let Some(def) = stmt.as_def_node()
                     && def.receiver().is_some_and(|r| r.as_self_node().is_some())
-                    && macro_rest(&def).is_some()
+                    && (macro_rest(&def).is_some() || macro_single(&def).is_some())
                 {
                     macros.entry(constant_id_str(&def.name()).to_string()).or_default().push((name.clone(), index));
                 }
@@ -714,6 +714,16 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 if matches!(mode, Mode::Module) && method == "append_features" {
                     return Err(fail("a mixin's `self.append_features` changes what including it adds"));
                 }
+                // `def self.can_attributes = %i[…]`: a list the body may read as it loads.
+                if matches!(mode, Mode::Class)
+                    && def.receiver().is_some_and(|r| r.as_self_node().is_some())
+                    && def.parameters().is_none()
+                    && let Some(body) = def.body()
+                    && let [only] = flatten_statements(body).as_slice()
+                    && let Some(names) = symbol_list(only)
+                {
+                    ctx.lists.insert(format!("self.{method}"), names);
+                }
                 if !matches!(mode, Mode::Module) || method != "included" {
                     continue;
                 }
@@ -755,6 +765,19 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             && call.block().is_some()
         {
             unroll(ctx, &call, source, offset)?;
+            continue;
+        }
+        if matches!(mode, Mode::Class)
+            && let Some(alias) = stmt.as_alias_method_node()
+        {
+            let (Some(to), Some(from)) = (symbol_value(&alias.new_name()), symbol_value(&alias.old_name())) else {
+                return Err(fail("`alias` of other than two names"));
+            };
+            let Some(origin) = ctx.defs.iter().find(|d| d.name == from && !d.from_module) else {
+                return Err(fail(&format!("`alias {to} {from}` of a method the body does not define")));
+            };
+            let visible = origin.visible;
+            ctx.defs.push(Def { name: to, at, visible, supers: false, from_module: false });
             continue;
         }
         let Some(call) = stmt.as_call_node() else {
@@ -831,6 +854,16 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                     include_into(ctx, arg, source, offset)?;
                     continue;
                 }
+                // The declaration stays for the app's delegate expansion, which runs after this one.
+                if method == "delegate" {
+                    for (name, visible) in delegated_names(&args).map_err(|r| fail(&r))? {
+                        if name.starts_with("ams_") || GEM_ONLY.contains(&name.as_str()) || DEFINED.contains(&name.as_str()) {
+                            return Err(fail(&format!("`delegate` of `{name}`, which the expansion defines")));
+                        }
+                        ctx.defs.push(Def { name, at, visible, supers: false, from_module: false });
+                    }
+                    continue;
+                }
                 // The ingest copies an alias of a method the body defined: a method of its own from here on.
                 if method == "alias_method" {
                     let names: Option<Vec<String>> = args.iter().map(|a| symbol_value(a).or_else(|| a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))).collect();
@@ -849,6 +882,10 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 for arg in &args {
                     if let Some(attr) = symbol_value(arg) {
                         ctx.stmts.push(attribute(&attr, None, offset, at, source)?);
+                    } else if let Some(names) = arg.as_splat_node().and_then(|s| s.expression()).and_then(|e| listed_names(ctx, &e)) {
+                        for attr in names {
+                            ctx.stmts.push(attribute(&attr, None, offset, at, source)?);
+                        }
                     } else if let Some(pairs) = hash_pairs(arg) {
                         for (attr, key) in pairs.map_err(|r| fail(&r))? {
                             ctx.stmts.push(attribute(&attr, Some(key), offset, at, source)?);
@@ -1006,6 +1043,47 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
     Ok(())
 }
 
+/// The methods a literal `delegate :a, :b, to: :t` defines, each with whether it is public: Rails' `module_eval`
+/// leaves a surrounding `private` alone, so only `private: true` hides them.
+fn delegated_names(args: &[ruby_prism::Node<'_>]) -> Result<Vec<(String, bool)>, String> {
+    let Some((options, names)) = args.split_last().filter(|(o, _)| o.as_keyword_hash_node().is_some()) else {
+        return Err("`delegate` without `to:`".into());
+    };
+    let names: Vec<String> = names.iter().map(symbol_value).collect::<Option<_>>().ok_or("`delegate` of other than Symbols")?;
+    let (mut to, mut prefix, mut public) = (None, None, true);
+    for el in option_elements(options) {
+        let assoc = el.as_assoc_node().ok_or("a splatted `delegate` option")?;
+        let value = assoc.value();
+        match symbol_value(&assoc.key()).as_deref() {
+            Some("to") => to = Some(symbol_value(&value).ok_or("a `to:` other than a Symbol")?),
+            Some("prefix") if value.as_true_node().is_some() => prefix = Some(None),
+            Some("prefix") if value.as_false_node().is_some() || value.as_nil_node().is_some() => prefix = None,
+            Some("prefix") => prefix = Some(Some(symbol_value(&value).ok_or("a `prefix:` other than true or a Symbol")?)),
+            Some("allow_nil") if value.as_true_node().is_some() || value.as_false_node().is_some() => {}
+            Some("private") if value.as_true_node().is_some() || value.as_false_node().is_some() => public = value.as_false_node().is_some(),
+            _ => return Err("a `delegate` option other than a literal `to:`, `prefix:`, `allow_nil:` or `private:`".into()),
+        }
+    }
+    let to = to.ok_or("`delegate` without `to:`")?;
+    let prefix = match prefix {
+        None => String::new(),
+        Some(None) => format!("{to}_"),
+        Some(Some(p)) => format!("{p}_"),
+    };
+    Ok(names.into_iter().map(|n| (format!("{prefix}{n}"), public)).collect())
+}
+
+/// A class macro's one required parameter, when it takes that alone.
+fn macro_single(def: &ruby_prism::DefNode<'_>) -> Option<String> {
+    let params = def.parameters()?;
+    if params.optionals().iter().next().is_some() || params.keywords().iter().next().is_some() || params.rest().is_some() || params.block().is_some() {
+        return None;
+    }
+    let requireds: Vec<_> = params.requireds().iter().collect();
+    let [one] = requireds.as_slice() else { return None };
+    Some(constant_id_str(&one.as_required_parameter_node()?.name()).to_string())
+}
+
 /// A class macro's rest parameter, when it takes that alone.
 fn macro_rest(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     let params = def.parameters()?;
@@ -1034,6 +1112,12 @@ fn expand_macro(ctx: &mut Walk<'_>, method: &str, class: &str, index: usize, nam
     else {
         return Err(refuse(source, 0, "the macro's `def` is not found"));
     };
+    // `add_compared_field :wiki`: the body runs as a loop's would, its parameter the one name.
+    if let Some(param) = macro_single(&def) {
+        let [name] = names else { return Err(refuse(source, def.location().start_offset(), "a one-parameter macro called with other than one name")) };
+        let stmts = def.body().map(flatten_statements).unwrap_or_default();
+        return unroll_stmts(ctx, std::slice::from_ref(name), &param, &stmts, source, def.location().start_offset());
+    }
     let rest = macro_rest(&def).ok_or_else(|| refuse(source, def.location().start_offset(), "a macro taking other than a rest parameter"))?;
     let is_rest = |n: &ruby_prism::Node<'_>| n.as_local_variable_read_node().is_some_and(|r| constant_id_str(&r.name()) == rest);
     for stmt in def.body().map(flatten_statements).unwrap_or_default() {
@@ -1061,6 +1145,22 @@ fn expand_macro(ctx: &mut Walk<'_>, method: &str, class: &str, index: usize, nam
 }
 
 
+/// The Symbols a list the body reads holds: a literal, a constant the body assigned one, or a class method of the body
+/// answering one, called on no receiver.
+fn listed_names(ctx: &Walk<'_>, node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    if let Some(names) = symbol_list(node) {
+        return Some(names);
+    }
+    if let Some(c) = node.as_constant_read_node() {
+        return ctx.lists.get(constant_id_str(&c.name())).cloned();
+    }
+    let call = node.as_call_node()?;
+    if call.receiver().is_some() || call.arguments().is_some() || call.block().is_some() {
+        return None;
+    }
+    ctx.lists.get(&format!("self.{}", constant_id_str(&call.name()))).cloned()
+}
+
 /// The Symbols a literal list holds (`%i[a b]`, `[:a, :b]`).
 fn symbol_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
     let array = node.as_array_node()?;
@@ -1073,13 +1173,7 @@ fn symbol_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
 fn unroll(ctx: &mut Walk<'_>, call: &ruby_prism::CallNode<'_>, source: &SourceFile, offset: usize) -> IngestResult<()> {
     let fail = |reason: &str| refuse(source, offset, reason);
     let receiver = call.receiver().ok_or_else(|| fail("`each` without a list"))?;
-    let names = match symbol_list(&receiver) {
-        Some(names) => names,
-        None => receiver
-            .as_constant_read_node()
-            .and_then(|c| ctx.lists.get(constant_id_str(&c.name())).cloned())
-            .ok_or_else(|| fail("`each` over other than a literal list of Symbols"))?,
-    };
+    let names = listed_names(ctx, &receiver).ok_or_else(|| fail("`each` over other than a literal list of Symbols"))?;
     let block = call.block().and_then(|b| b.as_block_node()).ok_or_else(|| fail("`each` without a literal block"))?;
     unroll_block(ctx, &names, &block, source, offset)
 }
@@ -1098,7 +1192,15 @@ fn unroll_block(ctx: &mut Walk<'_>, names: &[String], block: &ruby_prism::BlockN
         .unwrap_or_default();
     let [param] = params.as_slice() else { return Err(fail("an `each` block taking other than one name")) };
     let Some(body) = block.body() else { return Ok(()) };
-    let stmts = flatten_statements(body);
+    unroll_stmts(ctx, names, param, &flatten_statements(body), source, offset)
+}
+
+/// Statements run once per name in `names`, `param` read as that name's Symbol.
+fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby_prism::Node<'_>], source: &SourceFile, offset: usize) -> IngestResult<()> {
+    let fail = |reason: &str| refuse(source, offset, reason);
+    if !ctx.visible {
+        return Err(fail("a loop defining methods after `private`"));
+    }
     // The source of `node` with each read of the parameter written as `name`'s Symbol.
     let text_of = |node: &ruby_prism::Node<'_>, name: &str| -> String {
         struct Reads<'a> {
@@ -1124,13 +1226,23 @@ fn unroll_block(ctx: &mut Walk<'_>, names: &[String], block: &ruby_prism::BlockN
     };
     let is_param = |n: &ruby_prism::Node<'_>| n.as_local_variable_read_node().is_some_and(|r| constant_id_str(&r.name()) == param);
     // The name a `"include_#{attr}?"` spells for `name`, or none if it reads anything but the loop's name.
-    let spelled = |node: &ruby_prism::Node<'_>, name: &str| -> Option<String> {
-        if is_param(node) {
-            return Some(name.to_string());
+    let spelled = |node: &ruby_prism::Node<'_>, name: &str, locals: &HashMap<String, String>| -> Option<String> {
+        let read = |n: &ruby_prism::Node<'_>| -> Option<String> {
+            if is_param(n) {
+                return Some(name.to_string());
+            }
+            locals.get(constant_id_str(&n.as_local_variable_read_node()?.name())).cloned()
+        };
+        if let Some(value) = read(node) {
+            return Some(value);
         }
-        let s = node.as_interpolated_string_node()?;
+        let parts: Vec<_> = match (node.as_interpolated_string_node(), node.as_interpolated_symbol_node()) {
+            (Some(s), _) => s.parts().iter().collect(),
+            (_, Some(s)) => s.parts().iter().collect(),
+            _ => return None,
+        };
         let mut out = String::new();
-        for part in s.parts().iter() {
+        for part in parts {
             if let Some(t) = part.as_string_node() {
                 out.push_str(&String::from_utf8_lossy(t.unescaped()));
             } else {
@@ -1138,20 +1250,17 @@ fn unroll_block(ctx: &mut Walk<'_>, names: &[String], block: &ruby_prism::BlockN
                 let st = e.statements()?;
                 let body: Vec<_> = st.body().iter().collect();
                 let [one] = body.as_slice() else { return None };
-                if !is_param(one) {
-                    return None;
-                }
-                out.push_str(name);
+                out.push_str(&read(one)?);
             }
         }
         Some(out)
     };
     for name in names {
         let mut locals: HashMap<String, String> = HashMap::default();
-        for stmt in &stmts {
+        for stmt in stmts {
             let fail = |reason: &str| refuse(source, stmt.location().start_offset(), reason);
             if let Some(w) = stmt.as_local_variable_write_node() {
-                let value = spelled(&w.value(), name).ok_or_else(|| fail("a loop local other than a name spelled from the loop's"))?;
+                let value = spelled(&w.value(), name, &locals).ok_or_else(|| fail("a loop local other than a name spelled from the loop's"))?;
                 locals.insert(constant_id_str(&w.name()).to_string(), value);
                 continue;
             }
@@ -1164,23 +1273,29 @@ fn unroll_block(ctx: &mut Walk<'_>, names: &[String], block: &ruby_prism::BlockN
             ctx.at += 1;
             let at = ctx.at;
             match (method, args.as_slice()) {
-                ("attributes" | "attribute", [arg]) if is_param(arg) && inner.block().is_none() => {
-                    ctx.stmts.push(attribute(name, None, stmt.location().start_offset(), at, source)?);
+                ("attributes" | "attribute", [arg]) if inner.block().is_none() && (is_param(arg) || arg.as_local_variable_read_node().is_some()) => {
+                    let attr = spelled(arg, name, &locals).ok_or_else(|| fail("an attribute named by other than the loop's name"))?;
+                    ctx.stmts.push(attribute(&attr, None, stmt.location().start_offset(), at, source)?);
                 }
                 ("define_method", [arg]) => {
                     // The name as written, its interpolations of the parameter answered.
-                    let method_name = match arg.as_local_variable_read_node() {
-                        Some(r) if !is_param(arg) => locals
-                            .get(constant_id_str(&r.name()))
-                            .cloned()
-                            .ok_or_else(|| fail("a `define_method` name other than the loop's name"))?,
-                        _ => spelled(arg, name).ok_or_else(|| fail("a `define_method` name interpolating other than the loop's name"))?,
-                    };
+                    let method_name = spelled(arg, name, &locals).ok_or_else(|| fail("a `define_method` name spelled from other than the loop's name"))?;
                     let Some(mblock) = inner.block().and_then(|b| b.as_block_node()) else {
                         return Err(fail("a `define_method` without a literal block"));
                     };
                     if mblock.parameters().is_some() {
                         return Err(fail("a `define_method` block with parameters"));
+                    }
+                    struct LocalReads<'a>(&'a HashMap<String, String>, bool);
+                    impl<'pr> ruby_prism::Visit<'pr> for LocalReads<'_> {
+                        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+                            self.1 |= self.0.contains_key(constant_id_str(&node.name()));
+                        }
+                    }
+                    let mut reads = LocalReads(&locals, false);
+                    ruby_prism::Visit::visit(&mut reads, &mblock.as_node());
+                    if reads.1 {
+                        return Err(fail("a `define_method` body reading a loop local"));
                     }
                     let body = mblock.body().map(|b| text_of(&b, name)).unwrap_or_else(|| "nil".to_string());
                     if method_name.starts_with("ams_") || method_name == "initialize" || GEM_ONLY.contains(&method_name.as_str()) {
@@ -1742,7 +1857,7 @@ fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> Inges
     if root {
         class.parent = None;
     }
-    class.unknown_calls.clear();
+    class.unknown_calls.retain(super::delegate::is_delegate_declaration);
     class.origin = Some(LibraryClassOrigin::ActiveModelSerializer08);
     Ok(())
 }
