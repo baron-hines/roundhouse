@@ -383,6 +383,12 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  private\n\n  %i[a].each { |n| define_method(n) { 1 } }\nend\n", "a loop defining methods after `private`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  %i[a].each { |n| define_method(\"#{n}_#{object}\") { 1 } }\nend\n", "interpolating other than the loop's name", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  names.each { |n| attributes n }\nend\n", "over other than a literal list of Symbols", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  def read_attribute_for_serialization(name) = \"masked\"\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
+        ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  private def read_attribute_for_serialization(name)\n    \"masked\"\n  end\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
+        ("class ASerializer < BaseSerializer\nend\n\nclass Caller\n  def self.go(x)\n    ASerializer.new(x, scope_name: :viewer)\n  end\nend\n", "`scope_name:`", &["ASerializer", "BaseSerializer"]),
+        ("module M\n  def self.included(klass)\n    klass.attributes :x\n  end\nend\n\nmodule M\n  def y\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "reopened in more than one body", &["ASerializer"]),
+        ("module M\n  def self.append_features(base)\n    super\n  end\n\n  def x\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "`self.append_features`", &["ASerializer"]),
+        ("class CSerializer < BaseSerializer\nend\n\nclass ASerializer < BaseSerializer\n  CSerializer = ::BaseSerializer\n  has_one :c, serializer: CSerializer\nend\n", "`serializer: CSerializer` is not a serializer of the app", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  attributes :ams_attributes\nend\n", "an attribute named `ams_attributes`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  embed :ids, EMBED\nend\n", "`embed` options other than a literal Hash", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  def read_attribute_for_serialization(name)\n    name\n  end\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
@@ -418,6 +424,7 @@ fn an_active_model_serializer_08_beside_a_sending_serialization_reader_lowers() 
     for reader in [
         "  alias read_attribute_for_serialization send\n",
         "  def read_attribute_for_serialization(attribute)\n    public_send(attribute)\n  end\n",
+        "  def read_attribute_for_serialization(name) = public_send(name)\n",
     ] {
         let tree = tree(&format!("class ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n\nclass Thing\n{reader}end\n"));
         let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
@@ -437,6 +444,18 @@ fn an_active_model_serializer_08_mixin_refusal_is_ledgered_at_the_include() {
     let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
     let entry = ledger.iter().find(|e| e.contains("`include Helpers`")).unwrap_or_else(|| panic!("{ledger:#?}"));
     assert!(entry.contains("app/serializers/serializers.rb") && !entry.contains("app/helpers"), "{entry}");
+}
+
+/// The gem's API an ancestor of the app's defines is inherited, not written again on the child; and a mixin included
+/// after a declaration sits above the class, whose generated reader still answers.
+#[test]
+fn an_active_model_serializer_08_keeps_what_the_app_defines_above_it() {
+    let tree = tree("module Fields\n  def title\n    \"mixin\"\n  end\nend\n\nclass BaseSerializer < ActiveModel::Serializer\n  def include?(name)\n    name != :email\n  end\nend\n\nclass ASerializer < BaseSerializer\n  attributes :email, :title\n  include Fields\nend\n");
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let a = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "ASerializer").expect("ASerializer");
+    let names: Vec<&str> = a.methods.iter().map(|m| m.name.as_str()).collect();
+    assert!(!names.contains(&"include?"), "{names:?}");
+    assert!(names.contains(&"title"), "{names:?}");
 }
 
 /// Under a 0.10 lockfile the 0.8 expansion stays out: a direct `ActiveModel::Serializer` child is 0.10's.

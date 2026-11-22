@@ -209,7 +209,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             if parent == SERIALIZER {
                 break true;
             }
-            if !names.contains(parent) || chain.contains(parent) || chain.len() > 32 {
+            if !names.contains(parent) || chain.contains(parent) {
                 break false;
             }
             chain.push(parent.clone());
@@ -238,8 +238,10 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     }
     // Class macros the tree's classes define: `def self.staff_attributes(*attrs)` with a rest parameter alone.
     let mut macros: HashMap<String, Vec<(String, usize)>> = HashMap::default();
+    // The constants the tree's class bodies assign, by full name: one may stand for a serializer (`Item = Other`).
+    let mut consts: HashSet<String> = HashSet::default();
     for (index, source) in sources.iter().enumerate() {
-        if !source.text.contains("def self.") || !tree.iter().any(|n| source.text.contains(n.rsplit("::").next().unwrap_or(n))) {
+        if !tree.iter().any(|n| source.text.contains(n.rsplit("::").next().unwrap_or(n))) {
             continue;
         }
         let parsed = super::prism::parse_silent(source.text.as_bytes());
@@ -251,6 +253,9 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 continue;
             }
             for stmt in class.body().map(flatten_statements).unwrap_or_default() {
+                if let Some(w) = stmt.as_constant_write_node() {
+                    consts.insert(format!("{name}::{}", constant_id_str(&w.name())));
+                }
                 if let Some(def) = stmt.as_def_node()
                     && def.receiver().is_some_and(|r| r.as_self_node().is_some())
                     && macro_rest(&def).is_some()
@@ -280,7 +285,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 continue;
             }
             let lineage: Vec<String> = chains[&name].iter().rev().cloned().collect();
-            match collect(&class, source, &name, &tree, &modules, sources, &macros, lineage) {
+            match collect(&class, source, &name, &tree, &modules, sources, &macros, &consts, lineage) {
                 Ok((stmts, defs, hooked, extra, expanded)) => {
                     let span = Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
                     owns.insert(name, Own { stmts, defs, hooked, extra, expanded, span, source_index: index, offset });
@@ -351,6 +356,13 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             refused.entry(name.clone()).or_insert_with(|| {
                 refuse(source, offset, "the app defines its own `read_attribute_for_serialization`, which the gem reads attributes through")
             });
+        }
+    }
+    // `scope_name:` makes the gem alias the scope under that name on the instance, which the expansion does not.
+    if let Some(source) = sources.iter().find(|s| s.text.contains("scope_name:") || s.text.contains(":scope_name")) {
+        let offset = source.text.find("scope_name").unwrap_or(0);
+        for name in &tree {
+            refused.entry(name.clone()).or_insert_with(|| refuse(source, offset, "the app passes `scope_name:`, which the gem aliases the scope under"));
         }
     }
     // One fixed point over both: a refused class takes down its descendants, which inherit what it would have
@@ -484,48 +496,74 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
 /// alias does (`alias read_attribute_for_serialization send`, `def …(name) = public_send(name)`): the expansion reads
 /// an attribute by its reader, which only those match. A serializer's own is refused with its class.
 fn own_serialization_reader<'s>(source: &'s SourceFile, tree: &HashSet<String>) -> Option<(&'s SourceFile, usize)> {
-    if !source.text.contains("read_attribute_for_serialization") {
+    const NAME: &str = "read_attribute_for_serialization";
+    const SENDS: &[&str] = &["send", "__send__", "public_send"];
+    if !source.text.contains(NAME) {
         return None;
     }
-    let sends = regex::Regex::new(
-        r"^\s*(?:alias\s+read_attribute_for_serialization\s+(?:send|__send__|public_send)|alias_method\s+:read_attribute_for_serialization,\s*:(?:send|__send__|public_send))\s*$",
-    )
-    .unwrap();
-    let def = regex::Regex::new(
-        r"^\s*def read_attribute_for_serialization\((\w+)\)\s*\n\s*(?:send|__send__|public_send)\((\w+)\)\s*\n\s*end",
-    )
-    .unwrap();
+    // Every definition, whatever wraps it (`private def …`, an endless `def … = …`), read from the tree.
+    struct Find {
+        found: Vec<(usize, bool)>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Find {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if constant_id_str(&node.name()) == NAME {
+                let param = node.parameters().and_then(|p| {
+                    let req: Vec<_> = p.requireds().iter().collect();
+                    let only = p.optionals().iter().next().is_none() && p.rest().is_none() && p.keywords().iter().next().is_none();
+                    match (req.as_slice(), only) {
+                        ([one], true) => one.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()),
+                        _ => None,
+                    }
+                });
+                let body: Vec<_> = node.body().map(flatten_statements).unwrap_or_default();
+                let sends = match (param, body.as_slice()) {
+                    (Some(param), [one]) => one.as_call_node().is_some_and(|c| {
+                        SENDS.contains(&constant_id_str(&c.name()))
+                            && c.receiver().is_none_or(|r| r.as_self_node().is_some())
+                            && c.block().is_none()
+                            && c.arguments().is_some_and(|a| {
+                                let args: Vec<_> = a.arguments().iter().collect();
+                                matches!(args.as_slice(), [arg] if arg.as_local_variable_read_node().is_some_and(|r| constant_id_str(&r.name()) == param))
+                            })
+                    }),
+                    _ => false,
+                };
+                self.found.push((node.location().start_offset(), sends));
+            }
+            ruby_prism::visit_def_node(self, node);
+        }
+        fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
+            let name = |n: ruby_prism::Node<'pr>| n.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+            if name(node.new_name()).as_deref() == Some(NAME) {
+                let sends = name(node.old_name()).is_some_and(|o| SENDS.contains(&o.as_str()));
+                self.found.push((node.location().start_offset(), sends));
+            }
+            ruby_prism::visit_alias_method_node(self, node);
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let method = constant_id_str(&node.name());
+            if matches!(method, "alias_method" | "define_method") {
+                let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if args.first().and_then(symbol_value).as_deref() == Some(NAME) {
+                    let sends = method == "alias_method" && args.get(1).and_then(symbol_value).is_some_and(|o| SENDS.contains(&o.as_str()));
+                    self.found.push((node.location().start_offset(), sends));
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
     let parsed = super::prism::parse_silent(source.text.as_bytes());
+    let mut find = Find { found: Vec::new() };
+    ruby_prism::Visit::visit(&mut find, &parsed.node());
     let mut classes = Vec::new();
     collect_classes(&parsed.node(), &mut Vec::new(), &mut classes);
     let in_serializer = |offset: usize| {
         classes.iter().any(|(path, class)| {
-            tree.contains(&path.join("::"))
-                && class.location().start_offset() <= offset
-                && offset < class.location().end_offset()
+            tree.contains(&path.join("::")) && class.location().start_offset() <= offset && offset < class.location().end_offset()
         })
     };
-    let mut at = 0;
-    while let Some(found) = source.text[at..].find("read_attribute_for_serialization") {
-        let offset = at + found;
-        at = offset + 1;
-        let line_start = source.text[..offset].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = source.text[offset..].find('\n').map_or(source.text.len(), |i| offset + i);
-        let line = &source.text[line_start..line_end];
-        if !line.trim_start().starts_with("def ") && !line.trim_start().starts_with("alias") {
-            continue;
-        }
-        if sends.is_match(line) || in_serializer(offset) {
-            continue;
-        }
-        if let Some(c) = def.captures(&source.text[line_start..]) {
-            if c[1] == c[2] {
-                continue;
-            }
-        }
-        return Some((source, offset));
-    }
-    None
+    find.found.into_iter().find(|(offset, sends)| !sends && !in_serializer(*offset)).map(|(offset, _)| (source, offset))
 }
 
 /// The class a superclass reference names from inside `owner`: the
@@ -563,6 +601,8 @@ struct Walk<'a> {
     lists: HashMap<String, Vec<String>>,
     /// Each class macro a tree class defines (`def self.staff_attributes(*attrs)`): its classes and their sources.
     macros: &'a HashMap<String, Vec<(String, usize)>>,
+    /// The constants the tree's class bodies assign, by full name.
+    consts: &'a HashSet<String>,
     /// The class and its ancestors, nearest first.
     lineage: Vec<String>,
     /// The macros the body ran, by the class that defines each.
@@ -584,13 +624,14 @@ fn collect(
     modules: &HashMap<String, usize>,
     sources: &[SourceFile],
     macros: &HashMap<String, Vec<(String, usize)>>,
+    consts: &HashSet<String>,
     lineage: Vec<String>,
 ) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>, Vec<String>, Vec<(String, String)>)> {
     let class_text = &source.text[class.location().start_offset()..class.location().end_offset()];
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, lineage, expanded: Vec::new() };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
@@ -611,7 +652,12 @@ fn collect(
 }
 
 fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile, mode: Mode<'_>) -> IngestResult<()> {
-    for stmt in body {
+    let module = matches!(mode, Mode::Module);
+    // A mixin's hook runs once every method of it is the class's ancestor's: `include` appends the features first.
+    let (hooks, body): (Vec<_>, Vec<_>) = body.into_iter().partition(|stmt| {
+        module && stmt.as_def_node().is_some_and(|d| d.receiver().is_some() && constant_id_str(&d.name()) == "included")
+    });
+    for stmt in body.into_iter().chain(hooks) {
         ctx.at += 1;
         let at = ctx.at;
         let offset = stmt.location().start_offset();
@@ -622,6 +668,9 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 return Err(fail("a `def` in a mixin's `self.included`"));
             }
             if def.receiver().is_some() {
+                if matches!(mode, Mode::Module) && method == "append_features" {
+                    return Err(fail("a mixin's `self.append_features` changes what including it adds"));
+                }
                 if !matches!(mode, Mode::Module) || method != "included" {
                     continue;
                 }
@@ -822,10 +871,10 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                                 .or_else(|| value.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
                                 .ok_or_else(|| fail("a `serializer:` other than a constant"))?;
                             let rooted = is_rooted(&value) || value.as_string_node().is_some();
-                            let target = if rooted { written.clone() } else { lexical(&written, ctx.name, ctx.tree) };
-                            if !ctx.tree.contains(&target) {
+                            let target = if rooted { Some(written.clone()) } else { constant_in(&written, ctx) };
+                            let Some(target) = target.filter(|t| ctx.tree.contains(t)) else {
                                 return Err(fail(&format!("`serializer: {written}` is not a serializer of the app")));
-                            }
+                            };
                             serializer = Some(target);
                         }
                         "embed" => embed = Some(embed_value(&value).ok_or_else(|| fail("an `embed:` other than :ids or :objects"))?),
@@ -1129,6 +1178,16 @@ fn include_into(ctx: &mut Walk<'_>, arg: &ruby_prism::Node<'_>, source: &SourceF
     let Some(index) = found else {
         return Err(fail(&format!("`include {written}`: not a module of the app")));
     };
+    // One body only: a later one may define another `self.included` or methods, and Ruby takes them all.
+    let bodies = ctx
+        .sources
+        .iter()
+        .filter(|src| src.text.contains(&format!("module {leaf}")))
+        .map(|src| count_module_bodies(&super::prism::parse_silent(src.text.as_bytes()).node(), &module))
+        .sum::<usize>();
+    if bodies > 1 {
+        return Err(fail(&format!("`include {written}`: a module reopened in more than one body")));
+    }
     let msource = &ctx.sources[index];
     let parsed = super::prism::parse_silent(msource.text.as_bytes());
     let Some(mbody) = module_body(&parsed.node(), &module) else {
@@ -1149,6 +1208,35 @@ fn include_into(ctx: &mut Walk<'_>, arg: &ruby_prism::Node<'_>, source: &SourceF
     }
     ctx.hook_seen = outer_hook;
     Ok(())
+}
+
+/// How many bodies of module `path` a parsed file holds.
+fn count_module_bodies(node: &ruby_prism::Node<'_>, path: &str) -> usize {
+    fn go(node: &ruby_prism::Node<'_>, scope: &mut Vec<String>, path: &str) -> usize {
+        let stmts: Vec<ruby_prism::Node<'_>> = if let Some(p) = node.as_program_node() {
+            p.statements().body().iter().collect()
+        } else if let Some(s) = node.as_statements_node() {
+            s.body().iter().collect()
+        } else if let Some(m) = node.as_module_node() {
+            let Some(name) = super::util::constant_path_of(&m.constant_path()) else { return 0 };
+            let depth = scope.len();
+            scope.extend(name);
+            let here = usize::from(scope.join("::") == path) + m.body().map_or(0, |b| go(&b, scope, path));
+            scope.truncate(depth);
+            return here;
+        } else if let Some(c) = node.as_class_node() {
+            let Some(name) = super::util::constant_path_of(&c.constant_path()) else { return 0 };
+            let depth = scope.len();
+            scope.extend(name);
+            let here = c.body().map_or(0, |b| go(&b, scope, path));
+            scope.truncate(depth);
+            return here;
+        } else {
+            return 0;
+        };
+        stmts.iter().map(|s| go(s, scope, path)).sum()
+    }
+    go(node, &mut Vec::new(), path)
 }
 
 /// The statements of module `path`'s body in a parsed file.
@@ -1224,17 +1312,27 @@ fn is_plain(s: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A constant written inside `owner`'s body: its lexical scopes, then the top level.
-fn lexical(written: &str, owner: &str, tree: &HashSet<String>) -> String {
-    let mut scope: Vec<&str> = owner.split("::").collect();
+/// The serializer a constant written in the class body names, as Ruby looks it up: the lexical scopes, then the
+/// class's ancestors, then the top level. None where a constant the tree assigns comes first, which may stand for
+/// any class.
+fn constant_in(written: &str, ctx: &Walk<'_>) -> Option<String> {
+    let mut scopes: Vec<String> = Vec::new();
+    let mut scope: Vec<&str> = ctx.name.split("::").collect();
     while !scope.is_empty() {
-        let candidate = format!("{}::{written}", scope.join("::"));
-        if tree.contains(&candidate) {
-            return candidate;
-        }
+        scopes.push(scope.join("::"));
         scope.pop();
     }
-    written.to_string()
+    scopes.extend(ctx.lineage.iter().skip(1).cloned());
+    for scope in scopes {
+        let candidate = format!("{scope}::{written}");
+        if ctx.consts.contains(&candidate) {
+            return None;
+        }
+        if ctx.tree.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    Some(written.to_string())
 }
 
 fn option_elements<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>> {
@@ -1344,7 +1442,8 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
         src.push_str(method);
     }
     // An own `def` of the name is the class's, as it overrides the gem's.
-    let own: HashSet<&str> = owns[name].defs.iter().map(|d| d.name.as_str()).collect();
+    // And an ancestor's: the class inherits it, as it does from the gem's base, and a copy here would hide it.
+    let own: HashSet<&str> = chain.iter().flat_map(|c| owns[c].defs.iter().map(|d| d.name.as_str())).collect();
     // Per class, not once on the root: an `object` the whole tree shares is a union of every serializer's records,
     // which the analysis reads per class but the lowering of `object.comments.order(:id)` does not.
     for (method, body) in PER_CLASS_API.iter().chain(if chain.len() == 1 { ROOT_API } else { &[] }) {
@@ -1368,7 +1467,8 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
                 }
                 generated.insert((ancestor.clone(), m.to_string()));
                 // A later `def` of the name replaces what the declaration defined.
-                if ancestor == name && !owns[ancestor].defs.iter().any(|d| d.name == m && d.at > at) {
+                // Not a mixin's: one included after the declaration sits above the class, whose reader wins.
+                if ancestor == name && !owns[ancestor].defs.iter().any(|d| d.name == m && d.at > at && !d.from_module) {
                     src.push_str(&format!("\n  def {m}\n    {body}\n  end\n"));
                 }
             };
