@@ -258,6 +258,14 @@ pub fn emit_expr(e: &Expr) -> String {
             }
         }
     }
+    // `h()` as written, not a synthesized call's default: bare, it would read a local of the same name.
+    if let ExprNode::Send { recv: None, method, args, block: None, parenthesized: true } = &*e.node
+        && args.is_empty()
+        && !e.span.is_synthetic()
+        && method.as_str().chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+    {
+        return format!("{method}()");
+    }
     emit_node(&e.node)
 }
 
@@ -1597,8 +1605,7 @@ pub(super) fn emit_send_base(
         (None, _) => {
             // A capitalized name without parens reads as a constant:
             // `Success()` is a call, `Success` is not.
-            // As written, `h()`: bare, the name reads a local of the same name where one is in scope.
-            if args_s.is_empty() && (parenthesized || method.as_str().starts_with(|c: char| c.is_ascii_uppercase())) {
+            if args_s.is_empty() && method.as_str().starts_with(|c: char| c.is_ascii_uppercase()) {
                 format!("{method}()")
             } else if args_s.is_empty() {
                 method.to_string()
