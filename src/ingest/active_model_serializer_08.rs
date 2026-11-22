@@ -124,8 +124,11 @@ enum Root {
 struct Assoc {
     many: bool,
     name: String,
-    /// The target serializer's full name.
+    /// The target serializer's full name; empty where the association names none.
     serializer: String,
+    /// Without `serializer:`, the record's own `active_model_serializer`: each class whose instances have one, with
+    /// it, most derived first.
+    implicit: Option<Vec<(String, String)>>,
     embed: Option<Embed>,
     include: Option<bool>,
     key: Option<Key>,
@@ -265,6 +268,40 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             }
         }
     }
+    // `active_model_serializer`: Active Record's records (and a class including `ActiveModel::SerializerSupport`)
+    // answer `"#{self.class.name}Serializer".safe_constantize`, each class its own, a subclass included.
+    let implicit: (Option<Vec<(String, String)>>, String) = {
+        let support: Vec<String> = app
+            .library_classes
+            .iter()
+            .filter(|c| c.includes.iter().any(|i| i.0.as_str().trim_start_matches("::") == "ActiveModel::SerializerSupport"))
+            .map(|c| c.name.0.as_str().to_string())
+            .collect();
+        let depth = |m: &str| {
+            let mut d = 0;
+            let mut current = app.models.iter().find(|x| x.name.0.as_str() == m);
+            while let Some(model) = current {
+                d += 1;
+                current = model.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
+            }
+            d
+        };
+        let mut pairs: Vec<(String, String)> = app
+            .models
+            .iter()
+            .map(|m| m.name.0.as_str().to_string())
+            .chain(support)
+            .filter_map(|m| {
+                let s = format!("{m}Serializer");
+                tree.contains(&s).then_some((m, s))
+            })
+            .collect();
+        pairs.sort_by(|a, b| depth(&b.0).cmp(&depth(&a.0)).then(a.0.cmp(&b.0)));
+        match sources.iter().find(|s| s.text.contains("def active_model_serializer") || s.text.contains("def self.active_model_serializer")) {
+            Some(_) => (None, "an association without `serializer:`, where the app defines its own `active_model_serializer`".to_string()),
+            None => (Some(pairs), String::new()),
+        }
+    };
     let mut owns: HashMap<String, Own> = HashMap::default();
     let mut refused: HashMap<String, IngestError> = HashMap::default();
     for (index, source) in sources.iter().enumerate() {
@@ -285,7 +322,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 continue;
             }
             let lineage: Vec<String> = chains[&name].iter().rev().cloned().collect();
-            match collect(&class, source, &name, &tree, &modules, sources, &macros, &consts, lineage) {
+            match collect(&class, source, &name, &tree, &modules, sources, &macros, &consts, &implicit, lineage) {
                 Ok((stmts, defs, hooked, extra, expanded)) => {
                     let span = Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
                     owns.insert(name, Own { stmts, defs, hooked, extra, expanded, span, source_index: index, offset });
@@ -386,7 +423,9 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             }
             let through = chain.iter().filter_map(|c| owns.get(c)).find_map(|own| {
                 own.stmts.iter().find_map(|s| match s {
-                    Stmt::Association(a, _) if refused.contains_key(&a.serializer) => Some(a.serializer.clone()),
+                    // Not an implicit one's candidates: which record reaches it is not known here, and a refused
+                    // candidate is reported on its own.
+                    Stmt::Association(a, _) if a.implicit.is_none() && refused.contains_key(&a.serializer) => Some(a.serializer.clone()),
                     _ => None,
                 })
             });
@@ -603,6 +642,9 @@ struct Walk<'a> {
     macros: &'a HashMap<String, Vec<(String, usize)>>,
     /// The constants the tree's class bodies assign, by full name.
     consts: &'a HashSet<String>,
+    /// The classes whose records answer `active_model_serializer` with a lowered serializer, or none and why.
+    implicit: Option<Vec<(String, String)>>,
+    implicit_refusal: String,
     /// The class and its ancestors, nearest first.
     lineage: Vec<String>,
     /// The macros the body ran, by the class that defines each.
@@ -625,13 +667,14 @@ fn collect(
     sources: &[SourceFile],
     macros: &HashMap<String, Vec<(String, usize)>>,
     consts: &HashSet<String>,
+    implicit: &(Option<Vec<(String, String)>>, String),
     lineage: Vec<String>,
 ) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>, Vec<String>, Vec<(String, String)>)> {
     let class_text = &source.text[class.location().start_offset()..class.location().end_offset()];
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new() };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new(), implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
@@ -897,16 +940,18 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                         other => return Err(fail(&format!("the association option `{other}:` is outside the subset"))),
                     }
                 }
-                let serializer = serializer.ok_or_else(|| {
-                    fail("an association without `serializer:` (the record's own `active_model_serializer`) is outside the subset")
-                })?;
+                let implicit = match serializer {
+                    Some(_) => None,
+                    None => Some(ctx.implicit.clone().ok_or_else(|| fail(ctx.implicit_refusal.as_str()))?),
+                };
+                let serializer = serializer.unwrap_or_default();
                 // The gem's `refine` writes the first name's root into the options all the names share.
                 let root = root.unwrap_or_else(|| {
                     Key::Sym(if many { first.clone() } else { crate::naming::pluralize(first) })
                 });
                 for n in assoc_names {
                     ctx.stmts.push(Stmt::Association(
-                        Assoc { many, name: n, serializer: serializer.clone(), embed, include, key: key.clone(), root: root.clone(), embed_key: embed_key.clone() },
+                        Assoc { many, name: n, serializer: serializer.clone(), implicit: implicit.clone(), embed, include, key: key.clone(), root: root.clone(), embed_key: embed_key.clone() },
                         at,
                     ));
                 }
@@ -1515,6 +1560,20 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
         src.push_str(&format!("    h[{}] = self.{attr} if include?({})\n", Key::Sym(key.clone()).ruby(), Key::Sym(attr.clone()).ruby()));
     }
     src.push_str("    h\n  end\n");
+    for a in &flat.assocs {
+        let Some(pairs) = &a.implicit else { continue };
+        // `instance_of?`, not `is_a?`: the gem asks for the record's own class's serializer, a subclass's by its name.
+        src.push_str(&format!("\n  def ams_find_{}(value)\n", a.name));
+        for (i, (class, serializer)) in pairs.iter().enumerate() {
+            let kw = if i == 0 { "if" } else { "elsif" };
+            src.push_str(&format!("    {kw} value.instance_of?(::{class})\n      ::{serializer}.new(value, @options).ams_adopt(@ams_side, @ams_unique)\n"));
+        }
+        if pairs.is_empty() {
+            src.push_str("    value\n  end\n");
+        } else {
+            src.push_str("    else\n      value\n    end\n  end\n");
+        }
+    }
     src.push_str("\n  def ams_serializable_hash\n    node = attributes\n");
     if !flat.assocs.is_empty() {
         src.push_str("    if @object.present?\n");
@@ -1557,7 +1616,10 @@ fn association(a: &Assoc, flat: &Flat) -> String {
     let sym = Key::Sym(name.clone()).ruby();
     let target = format!("::{}", a.serializer);
     let embed = a.embed.unwrap_or(flat.embed);
-    let nested = |value: &str| format!("{target}.new({value}, @options).ams_adopt(@ams_side, @ams_unique)");
+    let nested = |value: &str| match &a.implicit {
+        Some(_) => format!("ams_find_{name}({value})"),
+        None => format!("{target}.new({value}, @options).ams_adopt(@ams_side, @ams_unique)"),
+    };
     let mut out = format!("    if include?({sym})\n");
     match (embed, a.many) {
         (Embed::Objects, true) => {
