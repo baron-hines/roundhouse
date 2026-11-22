@@ -158,6 +158,34 @@ const CONTROLLER: &str = r#"class ArticleAmsController < ApplicationController
   rescue StandardError => e
     render plain: e.message
   end
+
+  def helper_show
+    render_serialized(Article.find(params[:id]), ScopedArticleSerializer)
+  end
+
+  def helper_index
+    render_serialized(Article.order(:id).to_a, BasicArticleSerializer, root: "articles")
+  end
+
+  private
+
+  def serialize_data(obj, serializer, opts = nil)
+    serializer_opts = { scope: "admin" }.merge!(opts || {})
+    if obj.respond_to?(:to_ary)
+      serializer_opts[:each_serializer] = serializer
+      ActiveModel::ArraySerializer.new(obj.to_ary, serializer_opts).as_json
+    else
+      serializer.new(obj, serializer_opts).as_json
+    end
+  end
+
+  def render_serialized(obj, serializer, opts = nil)
+    render_json_dump(serialize_data(obj, serializer, opts), opts)
+  end
+
+  def render_json_dump(obj, opts = nil)
+    render json: obj
+  end
 end
 "#;
 
@@ -171,6 +199,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ("plain", r#"{"id":101,"title":"Hello","comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"node":{"id":202,"commenter":"bob","h":"BOB","text":"second"}}"#),
     ("index", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
     ("bare", r#"[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]"#),
+    ("helper_show", r#"{"comments":[{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"shout":"ANN!","id":201,"commenter":"ann","h":"ANN","text":"first"},"latest":[{"id":202,"commenter":"bob","h":"BOB","text":"second"}],"last_comment_id":202}}"#),
+    ("helper_index", r#"{"articles":[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]}"#),
     ("rootless", r#"Cannot serialize comments when ArticleSerializer does not have a root!"#),
 ];
 
@@ -183,8 +213,8 @@ fn overlay() -> emit_and_run::Overlay {
             "config/routes.rb",
             "  resources :articles do",
             &format!(
-                "  get \"article_ams\" => \"article_ams#index\"\n  get \"article_ams/bare\" => \"article_ams#bare\"\n{}  resources :articles do",
-                ["show", "draft", "admin", "guest", "plain", "rootless"]
+                "  get \"article_ams\" => \"article_ams#index\"\n  get \"article_ams/bare\" => \"article_ams#bare\"\n  get \"article_ams/helper_index\" => \"article_ams#helper_index\"\n{}  resources :articles do",
+                ["show", "draft", "admin", "guest", "plain", "rootless", "helper_show"]
                     .map(|a| format!("  get \"article_ams/:id/{a}\" => \"article_ams#{a}\"\n"))
                     .concat()
             ),
@@ -206,7 +236,7 @@ run = ->(action, id) { c = ArticleAmsController.new; c.params = id ? {"id" => id
     for (name, expected) in EXPECTED {
         let id = match *name {
             "draft" => "d.id",
-            "index" | "bare" => "nil",
+            "index" | "bare" | "helper_index" => "nil",
             _ => "a.id",
         };
         out.push_str(&format!(

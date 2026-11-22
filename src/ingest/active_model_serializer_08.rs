@@ -1068,15 +1068,20 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
             src.push_str(&format!("    else\n      {unknown}\n    end\n  end\n"));
         }
     }
-    src.push_str("\n  def ams_attributes(h)\n");
+    // Each Hash built in the one method that fills it: one a callee writes into types without what it wrote.
+    src.push_str("\n  def ams_attributes\n    h = {}\n");
     for (attr, key) in &flat.attributes {
         // `self.h`, not `h()`: the Ruby emit drops the parentheses, and an attribute named `h` then reads the Hash.
         src.push_str(&format!("    h[{}] = self.{attr} if include?({})\n", Key::Sym(key.clone()).ruby(), Key::Sym(attr.clone()).ruby()));
     }
     src.push_str("    h\n  end\n");
-    src.push_str("\n  def ams_associations(node)\n");
-    for a in &flat.assocs {
-        src.push_str(&association(a, flat));
+    src.push_str("\n  def ams_serializable_hash\n    node = attributes\n");
+    if !flat.assocs.is_empty() {
+        src.push_str("    if @object.present?\n");
+        for a in &flat.assocs {
+            src.push_str(&association(a, flat).lines().map(|l| format!("  {l}\n")).collect::<String>());
+        }
+        src.push_str("    end\n");
     }
     src.push_str("    node\n  end\n");
     src.push_str(&format!(
@@ -1085,15 +1090,19 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
     hash = {{}}
     unique = {{}}
     root = options[:root]
-    items = objects.map {{ |item| new(item, options).ams_adopt(hash, unique).serializable_hash }}
+    items = objects.map {{ |item| ::{name}.new(item, options).ams_adopt(hash, unique).serializable_hash }}
     if root
       hash[root] = items
-      meta_key = options[:meta_key]
-      hash[meta_key.respond_to?(:to_sym) ? meta_key.to_sym : :meta] = options[:meta] if options.has_key?(:meta)
+      ams_array_meta(hash, options)
       hash
     else
       items
     end
+  end
+
+  def self.ams_array_meta(hash, options)
+    meta_key = options[:meta_key]
+    hash[meta_key.respond_to?(:to_sym) ? meta_key.to_sym : :meta] = options[:meta] if options.has_key?(:meta)
   end
 "#
     ));
@@ -1154,27 +1163,28 @@ fn association(a: &Assoc, flat: &Flat) -> String {
     out
 }
 
-/// The gem's constructor and readers, on every class of the tree, by name.
+/// The gem's constructor, readers and the methods answering the class's Hash, on every class of the tree, by name:
+/// one on the root alone is typed with the root's own declarations, whatever subclass it answers for.
 const PER_CLASS_API: &[(&str, &str)] = &[
     ("initialize", "  def initialize(object, options = {})\n    @object = object\n    @options = options\n    @ams_side = nil\n    @ams_unique = nil\n  end\n"),
     ("object", "  def object\n    @object\n  end\n"),
     ("options", "  def options\n    @options\n  end\n"),
     ("scope", "  def scope\n    @options[:scope]\n  end\n"),
+    ("ams_adopt", "  def ams_adopt(side, unique)\n    @ams_side = side\n    @ams_unique = unique\n    self\n  end\n"),
+    ("root_name", "  def root_name\n    ams_root_name\n  end\n"),
+    ("attributes", "  def attributes\n    ams_attributes\n  end\n"),
+    ("serializable_hash", "  def serializable_hash\n    return nil if @object.nil?\n    ams_serializable_hash\n  end\n"),
+    ("as_json", "  def as_json(options = {})\n    options ||= {}\n    root = options.fetch(:root, @options.fetch(:root, root_name))\n    if root\n      hash = {}\n      @ams_side = hash\n      @ams_unique = {}\n      body = serializable_hash\n      hash[root] = body\n      include_meta(hash)\n      hash\n    else\n      serializable_hash\n    end\n  end\n"),
 ];
 
 /// The rest of the gem's instance API, on the class under `ActiveModel::Serializer`, by name. The Hash the root
 /// and the sideloaded records share is held apart from `options`, where the gem keeps it, so the Hash the app
 /// passes keeps the type it was built with.
 const ROOT_API: &[(&str, &str)] = &[
-    ("ams_adopt", "  def ams_adopt(side, unique)\n    @ams_side = side\n    @ams_unique = unique\n    self\n  end\n"),
-    ("root_name", "  def root_name\n    ams_root_name\n  end\n"),
     ("meta_key", "  def meta_key\n    key = @options[:meta_key]\n    key.respond_to?(:to_sym) ? key.to_sym : :meta\n  end\n"),
     ("include_meta", "  def include_meta(hash)\n    hash[meta_key] = @options[:meta] if @options.has_key?(:meta)\n  end\n"),
     ("ams_include_option", "  def ams_include_option(name, default)\n    if @options.key?(:include)\n      @options[:include].include?(name)\n    elsif @options.include?(:exclude)\n      !@options[:exclude].include?(name)\n    else\n      default\n    end\n  end\n"),
     ("ams_merge", "  def ams_merge(side, key, serializables)\n    unique = (@ams_unique ||= {})\n    seen = (unique[key] ||= {})\n    list = (side[key] ||= [])\n    serializables.each do |serializable|\n      unless seen.include?(serializable.object)\n        seen[serializable.object] = true\n        list << serializable.serializable_hash\n      end\n    end\n  end\n"),
-    ("attributes", "  def attributes\n    h = {}\n    ams_attributes(h)\n  end\n"),
-    ("serializable_hash", "  def serializable_hash\n    return nil if @object.nil?\n    node = attributes\n    ams_associations(node) if @object.present?\n    node\n  end\n"),
-    ("as_json", "  def as_json(options = {})\n    options ||= {}\n    root = options.fetch(:root, @options.fetch(:root, root_name))\n    if root\n      hash = {}\n      @ams_side = hash\n      @ams_unique = {}\n      body = serializable_hash\n      hash[root] = body\n      include_meta(hash)\n      hash\n    else\n      serializable_hash\n    end\n  end\n"),
 ];
 
 fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> IngestResult<()> {
@@ -1204,12 +1214,63 @@ fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> Inges
     Ok(())
 }
 
+/// `opts[:each_serializer] = S`, S a constant: the local and S's name.
+fn each_serializer_write(e: &Expr) -> Option<(String, String)> {
+    let (recv, index, value) = match &*e.node {
+        ExprNode::Assign { target: crate::expr::LValue::Index { recv, index }, value } => (recv, index, value),
+        ExprNode::Send { recv: Some(recv), method, args, .. } if method.as_str() == "[]=" && args.len() == 2 => (recv, &args[0], &args[1]),
+        _ => return None,
+    };
+    let ExprNode::Var { name, .. } = &*recv.node else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*index.node else { return None };
+    let ExprNode::Const { path } = &*value.node else { return None };
+    (key.as_str() == "each_serializer")
+        .then(|| (name.as_str().to_string(), path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")))
+}
+
+/// Whether `e` rebinds `local` or writes into it other than a constant `each_serializer:`.
+fn writes_local(e: &Expr, local: &str) -> bool {
+    let here = match &*e.node {
+        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. }
+        | ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } => name.as_str() == local,
+        ExprNode::Assign { target: crate::expr::LValue::Index { recv, .. }, .. } => {
+            matches!(&*recv.node, ExprNode::Var { name, .. } if name.as_str() == local)
+        }
+        ExprNode::Send { recv: Some(r), method, .. } => {
+            matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == local)
+                && matches!(method.as_str(), "merge!" | "update" | "delete" | "store" | "clear" | "replace" | "[]=")
+        }
+        _ => false,
+    };
+    let mut found = here;
+    e.node.for_each_child(&mut |c| found |= writes_local(c, local));
+    found
+}
+
 /// `ActiveModel::ArraySerializer.new(xs, {each_serializer: S, …}).as_json`
 /// → `S.ams_array_as_json(xs, {each_serializer: S, …})`, S a lowered
 /// serializer written as a constant; the options, `each_serializer:`
 /// among them, reach each item's serializer as the gem passes them.
 fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_arrays(c, done));
+    rewrite_arrays_in(expr, done, &HashMap::default());
+}
+
+/// `locals`: the options locals an earlier statement gave a constant `each_serializer:` (`opts[:each_serializer] = S`),
+/// which no statement since has written over.
+fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<String, String>) {
+    if let ExprNode::Seq { exprs } = &mut *expr.node {
+        let mut known = locals.clone();
+        for e in exprs.iter_mut() {
+            rewrite_arrays_in(e, done, &known);
+            if let Some((local, class)) = each_serializer_write(e) {
+                known.insert(local, class);
+            } else {
+                known.retain(|local, _| !writes_local(e, local));
+            }
+        }
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |c| rewrite_arrays_in(c, done, locals));
     let ExprNode::Send { recv: Some(array), method, args, block: None, .. } = &*expr.node else { return };
     if method.as_str() != "as_json" || !args.is_empty() {
         return;
@@ -1221,8 +1282,15 @@ fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
         return;
     }
     let [objects, options] = args.as_slice() else { return };
-    let ExprNode::Hash { entries, .. } = &*options.node else { return };
     let mut serializer = None;
+    let entries = match &*options.node {
+        ExprNode::Hash { entries, .. } => entries.as_slice(),
+        ExprNode::Var { name, .. } => {
+            serializer = locals.get(name.as_str()).cloned();
+            &[]
+        }
+        _ => return,
+    };
     for (k, v) in entries {
         let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node else { return };
         if value.as_str() == "each_serializer" {

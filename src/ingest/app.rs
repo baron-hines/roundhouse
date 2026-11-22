@@ -3521,6 +3521,8 @@ end
     super::representable::lower_representable_decorators(&mut app, &sources)?;
     // ActiveModel::Serializer classes, the same way; their controllers'
     // `render json: x, serializer: S` sites call the expansion.
+    // Before the serializers, so a copy's `each_serializer:` is a constant the array rewrite reads.
+    super::class_arg_specialize::specialize(&mut app);
     super::active_model_serializer::lower_active_model_serializers(&mut app, &sources)?;
     super::active_model_serializer_08::lower(&mut app, &sources)?;
     // After it, not before: `Current`'s own `delegate` reads an
