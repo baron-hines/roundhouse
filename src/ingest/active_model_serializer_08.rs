@@ -162,6 +162,8 @@ struct Own {
     hooked: Vec<String>,
     /// Methods a literal-list loop in the body defines, as Ruby source.
     extra: Vec<String>,
+    /// The class macros the body ran: (defining class, name).
+    expanded: Vec<(String, String)>,
     span: Span,
     source_index: usize,
     offset: usize,
@@ -234,6 +236,30 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             modules.insert(name.to_string(), index);
         }
     }
+    // Class macros the tree's classes define: `def self.staff_attributes(*attrs)` with a rest parameter alone.
+    let mut macros: HashMap<String, Vec<(String, usize)>> = HashMap::default();
+    for (index, source) in sources.iter().enumerate() {
+        if !source.text.contains("def self.") || !tree.iter().any(|n| source.text.contains(n.rsplit("::").next().unwrap_or(n))) {
+            continue;
+        }
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
+        let mut found = Vec::new();
+        collect_classes(&parsed.node(), &mut Vec::new(), &mut found);
+        for (path, class) in found {
+            let name = path.join("::");
+            if !tree.contains(&name) {
+                continue;
+            }
+            for stmt in class.body().map(flatten_statements).unwrap_or_default() {
+                if let Some(def) = stmt.as_def_node()
+                    && def.receiver().is_some_and(|r| r.as_self_node().is_some())
+                    && macro_rest(&def).is_some()
+                {
+                    macros.entry(constant_id_str(&def.name()).to_string()).or_default().push((name.clone(), index));
+                }
+            }
+        }
+    }
     let mut owns: HashMap<String, Own> = HashMap::default();
     let mut refused: HashMap<String, IngestError> = HashMap::default();
     for (index, source) in sources.iter().enumerate() {
@@ -253,10 +279,11 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
                 refused.insert(name, refuse(source, offset, "a reopened serializer is not supported"));
                 continue;
             }
-            match collect(&class, source, &name, &tree, &modules, sources) {
-                Ok((stmts, defs, hooked, extra)) => {
+            let lineage: Vec<String> = chains[&name].iter().rev().cloned().collect();
+            match collect(&class, source, &name, &tree, &modules, sources, &macros, lineage) {
+                Ok((stmts, defs, hooked, extra, expanded)) => {
                     let span = Span { file: super::sources::file_id(&source.path), start: offset as u32, end: offset as u32 };
-                    owns.insert(name, Own { stmts, defs, hooked, extra, span, source_index: index, offset });
+                    owns.insert(name, Own { stmts, defs, hooked, extra, expanded, span, source_index: index, offset });
                 }
                 Err(e) => {
                     refused.insert(name, e);
@@ -424,6 +451,13 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         }
     }
     let mut done: HashSet<String> = lowered.into_iter().filter(|n| !failed.contains(n)).collect();
+    // A macro the expansion ran leaves its class: it ran as the class loaded, and kept, its `define_method` reads to
+    // the analysis as a class whose constructor it cannot verify.
+    let ran: HashSet<(String, String)> = owns.iter().filter(|(n, _)| done.contains(*n)).flat_map(|(_, o)| o.expanded.iter().cloned()).collect();
+    for lc in app.library_classes.iter_mut().filter(|c| done.contains(c.name.0.as_str())) {
+        let class = lc.name.0.as_str().to_string();
+        lc.methods.retain(|m| !(m.receiver == crate::dialect::MethodReceiver::Class && ran.contains(&(class.clone(), m.name.as_str().to_string()))));
+    }
     // The hook's declarations are expanded into each includer; replayed, `klass.attributes` has no gem to answer it.
     let unhook: HashSet<String> = owns.iter().filter(|(n, _)| done.contains(*n)).flat_map(|(_, o)| o.hooked.iter().cloned()).collect();
     for lc in app.library_classes.iter_mut().filter(|c| c.is_module && unhook.contains(c.name.0.as_str())) {
@@ -527,6 +561,12 @@ struct Walk<'a> {
     extra: Vec<String>,
     /// Constants the body assigns a literal list of Symbols, by name.
     lists: HashMap<String, Vec<String>>,
+    /// Each class macro a tree class defines (`def self.staff_attributes(*attrs)`): its classes and their sources.
+    macros: &'a HashMap<String, Vec<(String, usize)>>,
+    /// The class and its ancestors, nearest first.
+    lineage: Vec<String>,
+    /// The macros the body ran, by the class that defines each.
+    expanded: Vec<(String, String)>,
 }
 
 enum Mode<'m> {
@@ -543,16 +583,18 @@ fn collect(
     tree: &HashSet<String>,
     modules: &HashMap<String, usize>,
     sources: &[SourceFile],
-) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>, Vec<String>)> {
+    macros: &HashMap<String, Vec<(String, usize)>>,
+    lineage: Vec<String>,
+) -> IngestResult<(Vec<Stmt>, Vec<Def>, Vec<String>, Vec<String>, Vec<(String, String)>)> {
     let class_text = &source.text[class.location().start_offset()..class.location().end_offset()];
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default() };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, lineage, expanded: Vec::new() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
-    let Walk { stmts, defs, hooked, extra, .. } = ctx;
+    let Walk { stmts, defs, hooked, extra, expanded, .. } = ctx;
     // A private `def` the declaration's own reader or gate replaces, which the expansion would keep beside it.
     for stmt in &stmts {
         let (attr, at) = match stmt {
@@ -565,7 +607,7 @@ fn collect(
             return Err(refuse(source, class.location().start_offset(), &format!("a private `{attr}` before its declaration is outside the subset")));
         }
     }
-    Ok((stmts, defs, hooked, extra))
+    Ok((stmts, defs, hooked, extra, expanded))
 }
 
 fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile, mode: Mode<'_>) -> IngestResult<()> {
@@ -652,6 +694,18 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                     ctx.visible = method != "private";
                     continue;
                 }
+                // A mixin's own `include`: its methods are the class's ancestors too. Not one with a hook, which
+                // Ruby runs for the including mixin, not the class.
+                if call.receiver().is_none() && method == "include" && let [arg] = args.as_slice() {
+                    let outer = ctx.hooked.len();
+                    let outer_hook = ctx.hook_seen;
+                    include_into(ctx, arg, source, offset)?;
+                    if ctx.hooked.len() != outer {
+                        return Err(fail("a mixin including a mixin with its own `self.included`"));
+                    }
+                    ctx.hook_seen = outer_hook;
+                    continue;
+                }
                 return Err(fail("a mixin body may hold only methods, constants, visibility and `self.included`"));
             }
             Mode::Class => {
@@ -683,6 +737,17 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 if method == "include" {
                     let [arg] = args.as_slice() else { return Err(fail("`include` of other than one module")) };
                     include_into(ctx, arg, source, offset)?;
+                    continue;
+                }
+                // The ingest copies an alias of a method the body defined: a method of its own from here on.
+                if method == "alias_method" {
+                    let names: Option<Vec<String>> = args.iter().map(|a| symbol_value(a).or_else(|| a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))).collect();
+                    let Some([to, from]) = names.as_deref() else { return Err(fail("`alias_method` of other than two names")) };
+                    let Some(origin) = ctx.defs.iter().find(|d| d.name == *from && !d.from_module) else {
+                        return Err(fail(&format!("`alias_method :{to}, :{from}` of a method the body does not define")));
+                    };
+                    let visible = origin.visible;
+                    ctx.defs.push(Def { name: to.clone(), at, visible, supers: false, from_module: false });
                     continue;
                 }
             }
@@ -774,6 +839,8 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                             })
                         }
                         "key" => key = Some(key_value(&value).ok_or_else(|| fail("a `key:` other than a Symbol or String"))?),
+                        // `option(:root) || @name`: a false or nil root is no root given.
+                        "root" if value.as_false_node().is_some() || value.as_nil_node().is_some() => {}
                         "root" => root = Some(key_value(&value).ok_or_else(|| fail("a `root:` other than a Symbol or String"))?),
                         "embed_key" => {
                             embed_key = symbol_value(&value).filter(|k| is_plain(k)).ok_or_else(|| fail("an `embed_key:` other than a Symbol"))?
@@ -826,11 +893,79 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 let [value] = args.as_slice() else { return Err(fail("`root` takes one value")) };
                 ctx.stmts.push(Stmt::Root(root_value(value).ok_or_else(|| fail("a root other than a literal"))?));
             }
-            other => return Err(fail(&format!("`{other}` is outside the ActiveModel::Serializer 0.8 subset"))),
+            other => {
+                let owner = ctx.lineage.iter().find_map(|c| ctx.macros.get(other)?.iter().find(|(n, _)| n == c).cloned());
+                match (owner, args.iter().map(symbol_value).collect::<Option<Vec<String>>>()) {
+                    (Some((class, index)), Some(names)) if matches!(mode, Mode::Class) => {
+                        ctx.expanded.push((class.clone(), other.to_string()));
+                        expand_macro(ctx, other, &class, index, &names).map_err(|e| {
+                            let inner = e.to_string();
+                            let inner = inner.split("ActiveModel::Serializer subset: ").last().unwrap_or(&inner).to_string();
+                            fail(&format!("`{other}`: {inner}"))
+                        })?;
+                    }
+                    _ => return Err(fail(&format!("`{other}` is outside the ActiveModel::Serializer 0.8 subset"))),
+                }
+            }
         }
     }
     Ok(())
 }
+
+/// A class macro's rest parameter, when it takes that alone.
+fn macro_rest(def: &ruby_prism::DefNode<'_>) -> Option<String> {
+    let params = def.parameters()?;
+    if params.requireds().iter().next().is_some() || params.optionals().iter().next().is_some() || params.keywords().iter().next().is_some() {
+        return None;
+    }
+    let rest = params.rest()?.as_rest_parameter_node()?;
+    Some(constant_id_str(&rest.name()?).to_string())
+}
+
+/// `staff_attributes :a, :b` in a body: the macro's own body with its rest parameter the literal names, as the
+/// class runs it when it loads. `attributes(*attrs)` declares them, and `attrs.each do |attr| … end` runs per name.
+fn expand_macro(ctx: &mut Walk<'_>, method: &str, class: &str, index: usize, names: &[String]) -> IngestResult<()> {
+    let source = &ctx.sources[index];
+    let parsed = super::prism::parse_silent(source.text.as_bytes());
+    let mut found = Vec::new();
+    collect_classes(&parsed.node(), &mut Vec::new(), &mut found);
+    let Some((_, node)) = found.into_iter().find(|(p, _)| p.join("::") == class) else {
+        return Err(refuse(source, 0, "the macro's class is not found"));
+    };
+    let stmts = node.body().map(flatten_statements).unwrap_or_default();
+    let Some(def) = stmts
+        .iter()
+        .filter_map(|s| s.as_def_node())
+        .find(|d| d.receiver().is_some() && constant_id_str(&d.name()) == method)
+    else {
+        return Err(refuse(source, 0, "the macro's `def` is not found"));
+    };
+    let rest = macro_rest(&def).ok_or_else(|| refuse(source, def.location().start_offset(), "a macro taking other than a rest parameter"))?;
+    let is_rest = |n: &ruby_prism::Node<'_>| n.as_local_variable_read_node().is_some_and(|r| constant_id_str(&r.name()) == rest);
+    for stmt in def.body().map(flatten_statements).unwrap_or_default() {
+        let offset = stmt.location().start_offset();
+        let fail = |reason: &str| refuse(source, offset, reason);
+        let call = stmt.as_call_node().ok_or_else(|| fail("a macro body holding other than calls"))?;
+        let name = constant_id_str(&call.name());
+        let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        ctx.at += 1;
+        let at = ctx.at;
+        match (name, call.receiver(), args.as_slice()) {
+            ("attributes", None, [splat]) if splat.as_splat_node().and_then(|s| s.expression()).is_some_and(|e| is_rest(&e)) => {
+                for n in names {
+                    ctx.stmts.push(attribute(n, None, offset, at, source)?);
+                }
+            }
+            ("each", Some(r), []) if is_rest(&r) => {
+                let block = call.block().and_then(|b| b.as_block_node()).ok_or_else(|| fail("`each` without a literal block"))?;
+                unroll_block(ctx, names, &block, source, offset)?;
+            }
+            _ => return Err(fail(&format!("`{name}` in a class macro is outside the subset"))),
+        }
+    }
+    Ok(())
+}
+
 
 /// The Symbols a literal list holds (`%i[a b]`, `[:a, :b]`).
 fn symbol_list(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
@@ -851,10 +986,16 @@ fn unroll(ctx: &mut Walk<'_>, call: &ruby_prism::CallNode<'_>, source: &SourceFi
             .and_then(|c| ctx.lists.get(constant_id_str(&c.name())).cloned())
             .ok_or_else(|| fail("`each` over other than a literal list of Symbols"))?,
     };
+    let block = call.block().and_then(|b| b.as_block_node()).ok_or_else(|| fail("`each` without a literal block"))?;
+    unroll_block(ctx, &names, &block, source, offset)
+}
+
+/// A loop's block run once per name in `names`.
+fn unroll_block(ctx: &mut Walk<'_>, names: &[String], block: &ruby_prism::BlockNode<'_>, source: &SourceFile, offset: usize) -> IngestResult<()> {
+    let fail = |reason: &str| refuse(source, offset, reason);
     if !ctx.visible {
         return Err(fail("a loop defining methods after `private`"));
     }
-    let block = call.block().and_then(|b| b.as_block_node()).ok_or_else(|| fail("`each` without a literal block"))?;
     let params: Vec<String> = block
         .parameters()
         .and_then(|p| p.as_block_parameters_node())
@@ -888,9 +1029,38 @@ fn unroll(ctx: &mut Walk<'_>, call: &ruby_prism::CallNode<'_>, source: &SourceFi
         text
     };
     let is_param = |n: &ruby_prism::Node<'_>| n.as_local_variable_read_node().is_some_and(|r| constant_id_str(&r.name()) == param);
-    for name in &names {
+    // The name a `"include_#{attr}?"` spells for `name`, or none if it reads anything but the loop's name.
+    let spelled = |node: &ruby_prism::Node<'_>, name: &str| -> Option<String> {
+        if is_param(node) {
+            return Some(name.to_string());
+        }
+        let s = node.as_interpolated_string_node()?;
+        let mut out = String::new();
+        for part in s.parts().iter() {
+            if let Some(t) = part.as_string_node() {
+                out.push_str(&String::from_utf8_lossy(t.unescaped()));
+            } else {
+                let e = part.as_embedded_statements_node()?;
+                let st = e.statements()?;
+                let body: Vec<_> = st.body().iter().collect();
+                let [one] = body.as_slice() else { return None };
+                if !is_param(one) {
+                    return None;
+                }
+                out.push_str(name);
+            }
+        }
+        Some(out)
+    };
+    for name in names {
+        let mut locals: HashMap<String, String> = HashMap::default();
         for stmt in &stmts {
             let fail = |reason: &str| refuse(source, stmt.location().start_offset(), reason);
+            if let Some(w) = stmt.as_local_variable_write_node() {
+                let value = spelled(&w.value(), name).ok_or_else(|| fail("a loop local other than a name spelled from the loop's"))?;
+                locals.insert(constant_id_str(&w.name()).to_string(), value);
+                continue;
+            }
             let Some(inner) = stmt.as_call_node() else { return Err(fail("a loop body holding other than calls")) };
             if inner.receiver().is_some() {
                 return Err(fail("a receiver in a declaring loop"));
@@ -905,26 +1075,12 @@ fn unroll(ctx: &mut Walk<'_>, call: &ruby_prism::CallNode<'_>, source: &SourceFi
                 }
                 ("define_method", [arg]) => {
                     // The name as written, its interpolations of the parameter answered.
-                    let method_name = if is_param(arg) {
-                        name.clone()
-                    } else if let Some(s) = arg.as_interpolated_string_node().or_else(|| None) {
-                        let mut out = String::new();
-                        for part in s.parts().iter() {
-                            if let Some(t) = part.as_string_node() {
-                                out.push_str(&String::from_utf8_lossy(t.unescaped()));
-                            } else if let Some(e) = part.as_embedded_statements_node()
-                                && let Some(st) = e.statements()
-                                && let [one] = st.body().iter().collect::<Vec<_>>().as_slice()
-                                && is_param(one)
-                            {
-                                out.push_str(name);
-                            } else {
-                                return Err(fail("a `define_method` name interpolating other than the loop's name"));
-                            }
-                        }
-                        out
-                    } else {
-                        return Err(fail("a `define_method` name other than the loop's name"));
+                    let method_name = match arg.as_local_variable_read_node() {
+                        Some(r) if !is_param(arg) => locals
+                            .get(constant_id_str(&r.name()))
+                            .cloned()
+                            .ok_or_else(|| fail("a `define_method` name other than the loop's name"))?,
+                        _ => spelled(arg, name).ok_or_else(|| fail("a `define_method` name interpolating other than the loop's name"))?,
                     };
                     let Some(mblock) = inner.block().and_then(|b| b.as_block_node()) else {
                         return Err(fail("a `define_method` without a literal block"));
@@ -961,7 +1117,16 @@ fn include_into(ctx: &mut Walk<'_>, arg: &ruby_prism::Node<'_>, source: &SourceF
     let fail = |reason: &str| refuse(source, offset, reason);
     let written = super::util::constant_path_of(arg).map(|p| p.join("::")).ok_or_else(|| fail("`include` of other than a constant"))?;
     let module = if is_rooted(arg) { written.clone() } else { lexical_in(&written, ctx.name, ctx.modules) };
-    let Some(&index) = ctx.modules.get(&module) else {
+    // A module of no methods (`module NoteHelpers; include NoteBase; end`) is no class the ingest keeps: read where
+    // its source defines it.
+    let leaf = module.rsplit("::").next().unwrap_or(&module);
+    let found = ctx.modules.get(&module).copied().or_else(|| {
+        ctx.sources.iter().position(|src| {
+            src.text.contains(&format!("module {leaf}"))
+                && module_body(&super::prism::parse_silent(src.text.as_bytes()).node(), &module).is_some()
+        })
+    });
+    let Some(index) = found else {
         return Err(fail(&format!("`include {written}`: not a module of the app")));
     };
     let msource = &ctx.sources[index];
