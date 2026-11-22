@@ -2158,6 +2158,33 @@ fn each_serializer_write(e: &Expr) -> Option<(String, String)> {
         .then(|| (name.as_str().to_string(), path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")))
 }
 
+/// Whether `e` writes an `:each_serializer` key through any receiver.
+fn writes_each_serializer(e: &Expr) -> bool {
+    let key = |k: &Expr| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "each_serializer");
+    let here = match &*e.node {
+        ExprNode::Assign { target: crate::expr::LValue::Index { index, .. }, .. }
+        | ExprNode::OpAssign { target: crate::expr::LValue::Index { index, .. }, .. } => key(index),
+        ExprNode::Send { method, args, .. } => matches!(method.as_str(), "[]=" | "store") && args.first().is_some_and(key),
+        _ => false,
+    };
+    let mut found = here;
+    e.node.for_each_child(&mut |c| found |= writes_each_serializer(c));
+    found
+}
+
+/// Whether `e` hands `local`'s Hash on (an assignment, an argument, an element) rather than only calling on it.
+fn aliases(e: &Expr, local: &str, as_receiver: bool) -> bool {
+    if let ExprNode::Var { name, .. } = &*e.node {
+        return name.as_str() == local && !as_receiver;
+    }
+    if let ExprNode::Send { recv: Some(r), args, block, .. } = &*e.node {
+        return aliases(r, local, true) || args.iter().any(|a| aliases(a, local, false)) || block.as_ref().is_some_and(|b| aliases(b, local, false));
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found |= aliases(c, local, false));
+    found
+}
+
 fn local_reads(e: &Expr, out: &mut HashSet<String>) {
     if let ExprNode::Var { name, .. } = &*e.node {
         out.insert(name.as_str().to_string());
@@ -2205,10 +2232,15 @@ fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<S
             }
             rewrite_arrays_in(&mut exprs[i], done, &known, &after);
             let e = &exprs[i];
+            // Not only writes through the same local: another local may be the same Hash.
             if let Some((local, class)) = each_serializer_write(e) {
+                known.retain(|l, _| *l == local);
                 known.insert(local, class);
             } else {
-                known.retain(|local, _| !writes_local(e, local));
+                if writes_each_serializer(e) {
+                    known.clear();
+                }
+                known.retain(|local, _| !writes_local(e, local) && !aliases(e, local, false));
             }
         }
         return;

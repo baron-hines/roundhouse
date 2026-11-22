@@ -229,17 +229,21 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
             let (from, to) = (node.location().start_offset(), self.defs.last().map_or(usize::MAX, |d| d.1));
             let later = |name: &str| self.reads.iter().any(|(n, at)| n == name && *at > from && *at < to);
             let reads = node.rescue_clause().is_some_and(|r| rescue_reads_exception(&r) || rescue_bindings(&r).iter().any(|n| later(n)));
+            // An `ensure` reading `$!` sees what the body, a rescue or the else raises on its way out.
+            let ensure_reads = node.ensure_clause().and_then(|e| e.statements()).is_some_and(|s| reads_bang(&s.as_node()));
             if let Some(statements) = node.statements() {
-                self.observed += usize::from(reads);
+                self.observed += usize::from(reads || ensure_reads);
                 ruby_prism::Visit::visit_statements_node(self, &statements);
-                self.observed -= usize::from(reads);
+                self.observed -= usize::from(reads || ensure_reads);
             }
+            self.observed += usize::from(ensure_reads);
             if let Some(r) = node.rescue_clause() {
                 ruby_prism::Visit::visit_rescue_node(self, &r);
             }
             if let Some(e) = node.else_clause() {
                 ruby_prism::Visit::visit_else_node(self, &e);
             }
+            self.observed -= usize::from(ensure_reads);
             if let Some(e) = node.ensure_clause() {
                 ruby_prism::Visit::visit_ensure_node(self, &e);
             }
@@ -338,6 +342,18 @@ fn rescue_bindings(node: &ruby_prism::RescueNode<'_>) -> Vec<String> {
 }
 
 /// Whether a `rescue` chain reads the exception: the variable one binds, or `$!`.
+fn reads_bang(node: &ruby_prism::Node<'_>) -> bool {
+    struct Bang(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Bang {
+        fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
+            self.0 |= node.name().as_slice() == b"$!";
+        }
+    }
+    let mut bang = Bang(false);
+    ruby_prism::Visit::visit(&mut bang, node);
+    bang.0
+}
+
 fn rescue_reads_exception(node: &ruby_prism::RescueNode<'_>) -> bool {
     struct Reads(Vec<String>, bool);
     impl<'pr> ruby_prism::Visit<'pr> for Reads {
@@ -446,8 +462,9 @@ fn stand_ins() -> Vec<LibraryClass> {
 
   def self.load(source, options = {})
     source = source.read if source.respond_to?(:read)
-    return nil if source.nil?
-    text = source.to_s
+    # Not `to_s`: the adapter's own blank check asks `empty?`, which an Integer answers with NoMethodError.
+    return nil if source.nil? || source.empty?
+    text = source
     # Bytes, not characters: oj takes a String's invalid UTF-8 as it is.
     bytes = text.b
     return nil if text.empty? || (!text.start_with?("{", "[") && bytes.match?(/\A\s*\z/))
@@ -628,14 +645,12 @@ fn stand_ins() -> Vec<LibraryClass> {
         elsif escape == 117
           code = hex4(@at)
           @at += 4
-          if code >= 0xD800 && code <= 0xDBFF
+          # Not checked for a low half: oj takes any `\u` after one from the surrogate range and keeps its low ten bits.
+          if code >= 0xD800 && code <= 0xDFFF
             raise MultiJson::ParseError, "invalid escaped character" unless byte == 92 && byte(1) == 117
             low = hex4(@at + 2)
-            raise MultiJson::ParseError, "invalid escaped character" unless low >= 0xDC00 && low <= 0xDFFF
             @at += 6
-            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
-          elsif code >= 0xDC00 && code <= 0xDFFF
-            raise MultiJson::ParseError, "invalid escaped character"
+            code = ((((code - 0xD800) & 0x3FF) << 10) | ((low - 0xDC00) & 0x3FF)) + 0x10000
           end
           out << code.chr(Encoding::UTF_8)
         else

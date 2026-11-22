@@ -665,7 +665,8 @@ fn an_active_model_serializer_08_child_initialize_keeps_its_parent_s() {
 }
 
 /// `ArraySerializer.new(xs, opts).as_json` lowers to the serializer `opts[:each_serializer]` holds, not after a
-/// compound write changed it, and not when `opts` is read again (the gem writes `:hash` into it).
+/// compound write or a write through another local holding the same Hash changed it, and not when `opts` is read
+/// again (the gem writes `:hash` into it).
 #[test]
 fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_nothing_else_sees_it() {
     let serializers = "class ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n\nclass BSerializer < ActiveModel::Serializer\n  attributes :id\nend\n";
@@ -679,5 +680,8 @@ fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_no
     };
     assert!(lowered("    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    opts[:each_serializer] &&= BSerializer\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
+    assert!(!lowered("    other = opts\n    other[:each_serializer] = BSerializer\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
+    assert!(!lowered("    other = opts\n    other.store(:each_serializer, BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
+    assert!(!lowered("    other = opts\n    other.merge!(each_serializer: BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: opts[:hash] }\n"));
 }

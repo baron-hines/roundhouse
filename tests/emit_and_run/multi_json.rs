@@ -162,7 +162,7 @@ const LOADS: &str = r##"class Loads
 end
 "##;
 
-const LOAD_ASSERTIONS: &str = r##"CASES2 = ["\"a\xffb\"", "[\"\xc3\"]", "\"\x7f\"", "\"\t\"", "\"a\nb\"", "\"\x1f\"", "{\"\":1}", "[\"\\/\"]", "\"\\u00E9\\u00e9\"", ("[" * 3000) + ("]" * 3000), "1e100000", "[1e-100000]", "{\"u\":\"http://x/*y*/\"}", "[\"a\\\"//b\"]", "1 /* c */", "[1] // c", "/* x", "// only", "[1\f]", "\f1", "// c\r[1]", "// c\f[1]", "[\"a\u0000b\"]", "1 // c\u0000 2"]
+const LOAD_ASSERTIONS: &str = r##"CASES2 = ["\"a\xffb\"", "[\"\xc3\"]", "\"\x7f\"", "\"\t\"", "\"a\nb\"", "\"\x1f\"", "{\"\":1}", "[\"\\/\"]", "\"\\u00E9\\u00e9\"", ("[" * 3000) + ("]" * 3000), "1e100000", "[1e-100000]", "{\"u\":\"http://x/*y*/\"}", "[\"a\\\"//b\"]", "1 /* c */", "[1] // c", "/* x", "// only", "[1\f]", "\f1", "// c\r[1]", "// c\f[1]", "[\"a\u0000b\"]", "1 // c\u0000 2", "\"\\uD800\\u0041\"", "\"\\uDC00\\u0041\"", "\"\\uDC00\\uDC00\"", "\"\\uDBFF\\uFFFF\""]
 CASES = ['01', '-01', '007', '-00', '00.5', '-012.5', '1.0', '1.5', '0.1', '1.23456789012345', '1.234567890123456', '1.2345678901234567',
   '12345678901234567890', '1e2', '1E400', '-0', '-0.0', '1.0e-5', '1.0E+2', '0.000000000000000001', '1.20000000000000000', '1234567890123456.0',
   '[1.2345678901234567, 0.5, "x"]', '{"a":1.23456789012345678e5,"b":[01,2]}',
@@ -289,6 +289,10 @@ expected = [
   "Array [1]",
   "ERR",
   "ERR",
+  "String \"𐁁\"",
+  "String \"𐁁\"",
+  "String \"𐀀\"",
+  "String \"\\u{10FFFF}\"",
   "Integer 1",
   "Integer -1",
   "Integer 7",
@@ -352,12 +356,12 @@ fn multi_json_load_runs_as_ojs_strict_load_on_spinel() {
 /// writes it, which the stand-in does not model.
 #[test]
 fn multi_json_dump_of_an_object_is_refused() {
-    let lib = "class Dumped\n  def self.record\n    MultiJson.dump(Article.first)\n  end\n\n  def self.mixed\n    MultiJson.dump({ a: Article.first })\n  end\n\n  def self.through_lambda\n    encode = ->(value) { MultiJson.dump(value) }\n    encode.call(1)\n  end\nend\n";
+    let lib = "class Dumped\n  def self.record\n    MultiJson.dump(Article.first)\n  end\n\n  def self.mixed\n    MultiJson.dump({ a: Article.first })\n  end\n\n  def self.through_lambda\n    encode = ->(value) { MultiJson.dump(value) }\n    encode.call(1)\n  end\n\n  def self.splatted\n    MultiJson.dump([*{ Article.first => 1 }])\n  end\nend\n";
     let (_emitted, errors) = overlay(emit_and_run::real_blog())
         .write("lib/dumped.rb", lib)
         .emit(roundhouse::project::BuildTarget::Ruby);
     let refused: Vec<&String> = errors.iter().filter(|e| e.contains("MultiJson.dump")).collect();
-    assert_eq!(refused.len(), 2, "{errors:#?}");
+    assert_eq!(refused.len(), 3, "{errors:#?}");
     assert!(refused.iter().all(|e| e.contains("Article")), "{refused:#?}");
 }
 
@@ -405,6 +409,7 @@ fn multi_json_unmodeled_configurations_are_refused() {
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    begin\n      MultiJson.load(v)\n    rescue MultiJson::ParseError\n      $!.class\n    end\n  end\nend\n", "under a `rescue` that reads the exception", true),
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v, o)\n    MultiJson.load(v, symbolize_keys: o)\n  end\nend\n", "`MultiJson.load(v, symbolize_keys: o)`", true),
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    MultiJson.load(v) rescue $!.message\n  end\nend\n", "under a `rescue` that reads the exception", true),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    begin\n      MultiJson.load(v)\n    ensure\n      warn($!.message) if $!\n    end\n  end\nend\n", "under a `rescue` that reads the exception", true),
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    begin\n      MultiJson.load(v)\n    rescue => e\n      nil\n    end\n    e&.message\n  end\nend\n", "under a `rescue` that reads the exception", true),
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.out(v)\n    MultiJson.dump(v, indent: 4)\n  end\nend\n", "`MultiJson.dump(v, indent: 4)`", true),
         (LOCK, "MultiJson.use(:json_gem)\n", dump, "only the oj adapter is modeled", false),

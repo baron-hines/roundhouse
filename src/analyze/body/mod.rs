@@ -1441,8 +1441,9 @@ impl<'a> BodyTyper<'a> {
         Some(answer)
     }
 
-    /// Whether the program reopens a core class `ty` may be with its own `respond_to?` or `respond_to_missing?`.
-    fn builtin_reopens_respond_to(&self, ty: &Ty) -> bool {
+    /// Whether the program reopens a core class `ty` may be with its own `respond_to?` or `respond_to_missing?`, or
+    /// its own `asked`, whose visibility it may change.
+    fn builtin_reopens_respond_to(&self, ty: &Ty, asked: &Symbol) -> bool {
         let class = |t: &Ty| match t {
             Ty::Array { .. } => Some("Array"),
             Ty::Hash { .. } => Some("Hash"),
@@ -1455,7 +1456,7 @@ impl<'a> BodyTyper<'a> {
         };
         variants.iter().filter_map(|t| class(t)).any(|name| {
             let id = ClassId(Symbol::from(name));
-            self.chain_defines(&id, &Symbol::from("respond_to?")) || self.chain_defines(&id, &Symbol::from("respond_to_missing?"))
+            self.chain_defines(&id, &Symbol::from("respond_to?")) || self.chain_defines(&id, &Symbol::from("respond_to_missing?")) || self.chain_defines(&id, asked)
         })
     }
 
@@ -1497,7 +1498,7 @@ impl<'a> BodyTyper<'a> {
                 Some(t) if builtin_never_answers(t, &asked) => Some(false),
                 // `obj.respond_to?(:to_ary)` on an Array: the branch for anything else never runs, and typed, its
                 // `S.new(obj, …)` hands the serializer an Array it never sees.
-                Some(t) if builtin_always_answers(t, &asked) && !self.builtin_reopens_respond_to(t) => Some(true),
+                Some(t) if builtin_always_answers(t, &asked) && !self.builtin_reopens_respond_to(t, &asked) => Some(true),
                 _ => None,
             };
         }
@@ -8998,6 +8999,12 @@ fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) 
         match &*expr.node {
             ExprNode::Hash { entries, .. } => entries.iter().all(|(_, v)| written_expr(v)),
             ExprNode::Array { elements, .. } => elements.iter().all(written_expr),
+            // `[*{k => v}]` writes each entry as a `[k, v]` Array: its key is a value there, not a Hash key.
+            ExprNode::Splat { value } => match value.ty.as_ref() {
+                Some(Ty::Hash { key, value }) => written(key) && written(value),
+                Some(Ty::Array { elem }) => written(elem),
+                _ => false,
+            },
             _ => expr.ty.as_ref().is_some_and(written),
         }
     }

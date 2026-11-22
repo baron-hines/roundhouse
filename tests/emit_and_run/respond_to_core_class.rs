@@ -23,3 +23,12 @@ fn respond_to_on_a_reopened_array_is_left_to_run() {
     run.assert_passes();
     assert!(run.stdout.contains("kept passed"));
 }
+
+/// Nor where the program reopens the class with its own definition of the asked method, which may be private.
+#[test]
+fn respond_to_of_a_method_the_program_redefines_is_left_to_run() {
+    let lib = "class Array\n  private\n\n  def to_ary\n    self\n  end\nend\n\nclass Sizer\n  def self.size_of(xs)\n    xs.respond_to?(:to_ary) ? xs.size : 0\n  end\n\n  def self.go\n    size_of([1, 2])\n  end\nend\n";
+    let run = emit_and_run::real_blog().write("lib/sizer.rb", lib).run_ruby("raise Sizer.go.inspect unless Sizer.go == 0\nputs \"private kept passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("private kept passed"));
+}
