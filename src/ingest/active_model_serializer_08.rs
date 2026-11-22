@@ -807,6 +807,18 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
         }
         // `if Rails.env.test? … end` writing the module's constants: nothing the class including it defines or declares.
         if module && (stmt.as_if_node().is_some() || stmt.as_unless_node().is_some()) && !declares_anything(&stmt) {
+            struct Writes(Vec<String>);
+            impl<'pr> ruby_prism::Visit<'pr> for Writes {
+                fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+                    self.0.push(constant_id_str(&node.name()).to_string());
+                    ruby_prism::visit_constant_write_node(self, node);
+                }
+            }
+            let mut writes = Writes(Vec::new());
+            ruby_prism::Visit::visit(&mut writes, &stmt);
+            if let Some(name) = writes.0.iter().find(|n| ctx.lists.contains_key(n.as_str())) {
+                return Err(fail(&format!("a conditional write of `{name}`, a list the body declares from")));
+            }
             continue;
         }
         let Some(call) = stmt.as_call_node() else {
@@ -1174,6 +1186,10 @@ fn reopened_gem(sources: &[SourceFile]) -> Result<(bool, bool), (usize, usize, S
                 return Err(reopened());
             };
             let text = normal(&source.text[def.location().start_offset()..def.location().end_offset()]);
+            // Which runs last is the files' load order, which is not read here.
+            if found_any {
+                return Err((index, offset, "`ActiveModel::Serializer#include!` reopened more than once".to_string()));
+            }
             found_any = true;
             if text == normal(&GEM_INCLUDE.replace("RAISE ", "raise IncludeError.new(self.class, association.name) ")) {
                 continue;
@@ -1477,7 +1493,12 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                     if method_name.starts_with("ams_") || method_name == "initialize" || GEM_ONLY.contains(&method_name.as_str()) {
                         return Err(fail(&format!("`define_method` of `{method_name}`, which the expansion writes")));
                     }
-                    ctx.defs.push(Def { name: method_name.clone(), at, visible: true, supers: false, from_module: false });
+                    let mut calls = GemCalls { found: None, supers: false };
+                    ruby_prism::Visit::visit(&mut calls, &mblock.as_node());
+                    if let Some((call, _)) = calls.found {
+                        return Err(fail(&format!("`{call}` in a `define_method` block is the gem's, outside the subset")));
+                    }
+                    ctx.defs.push(Def { name: method_name.clone(), at, visible: true, supers: calls.supers, from_module: false });
                     ctx.extra.push(format!("  def {method_name}\n    {body}\n  end\n"));
                 }
                 // `class_eval %{def #{attribute} … end}`: the source the string spells, which must be methods alone.
@@ -1494,13 +1515,18 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                         let Some(def) = d.as_def_node().filter(|d| d.receiver().is_none()) else {
                             return Err(fail("a `class_eval` string holding other than methods"));
                         };
-                        defined.push(constant_id_str(&def.name()).to_string());
+                        let mut calls = GemCalls { found: None, supers: false };
+                        ruby_prism::Visit::visit(&mut calls, d);
+                        if let Some((call, _)) = calls.found {
+                            return Err(fail(&format!("`{call}` in a `class_eval` string is the gem's, outside the subset")));
+                        }
+                        defined.push((constant_id_str(&def.name()).to_string(), calls.supers));
                     }
-                    for m in defined {
+                    for (m, supers) in defined {
                         if m.starts_with("ams_") || m == "initialize" || GEM_ONLY.contains(&m.as_str()) {
                             return Err(fail(&format!("`class_eval` of `{m}`, which the expansion writes")));
                         }
-                        ctx.defs.push(Def { name: m, at, visible: true, supers: false, from_module: false });
+                        ctx.defs.push(Def { name: m, at, visible: true, supers, from_module: false });
                     }
                     ctx.extra.push(format!("{text}\n"));
                 }

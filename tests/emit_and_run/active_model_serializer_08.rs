@@ -468,6 +468,15 @@ fn an_active_model_serializer_08_under_the_app_s_rootless_patch_skips_the_sidelo
 }
 
 #[test]
+fn an_active_model_serializer_08_under_two_reopenings_of_include_is_refused() {
+    let tree = tree(&format!("{ROOTLESS_PATCH}\n{ROOTLESS_PATCH}\n\nclass ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n"));
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree).expect("survey ingest");
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("reopened more than once")), "{ledger:#?}");
+}
+
+#[test]
 fn an_active_model_serializer_08_under_another_reopening_of_the_gem_is_refused() {
     let tree = tree(&format!("{}\n\nclass ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n", ROOTLESS_PATCH.replace("# 0.9 skips what 0.8 raises for", "nil")));
     roundhouse::ingest::survey::activate();
@@ -524,6 +533,8 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("module M\n  included { attributes :x }\n\n  def x\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "does not `extend ActiveSupport::Concern`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def self.m(*list)\n    list.each { |a| class_eval %{def #{a}\n  1\nend\nputs 1} }\n  end\n  m :x\nend\n", "a `class_eval` string holding other than methods", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def self.m(*list)\n    list.each { |a| class_eval %{def #{a}_#{object}\n  1\nend} }\n  end\n  m :x\nend\n", "a `class_eval` string interpolating other than the loop's name", &["ASerializer"]),
+        ("module M\n  extend ActiveSupport::Concern\n  FIELDS = %i[id]\n  if true\n    FIELDS = %i[title]\n  end\n  included { attributes(*FIELDS) }\n\n  def x\n    1\n  end\nend\n\nclass ASerializer < BaseSerializer\n  include M\nend\n", "a conditional write of `FIELDS`", &["ASerializer"]),
+        ("class CSerializer < ActiveModel::Serializer\n  def self.m(*list)\n    list.each { |a| class_eval %{def attributes\n  super.merge(#{a}: 1)\nend} }\n  end\n  m :x\nend\n", "`super` in `def attributes` reaches the gem's class", &["CSerializer"]),
         ("class ASerializer < BaseSerializer\n  def initialize(object, *rest)\n    super\n  end\nend\n", "hands a keyword or splat on through `super`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def link\n    url_options\n  end\nend\n", "`url_options` is the gem's", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def include!(name)\n    name\n  end\nend\n", "`def include!` would be replaced", &["ASerializer"]),
