@@ -24,10 +24,14 @@
 //! initializer's top level, and an `Oj.default_options` that sets more than
 //! the mode (`float_precision:`, `escape_mode:`, … reach the dump).
 //!
-//! `MultiJson.load` is refused: oj's strict parser answers a BigDecimal for a
-//! decimal of more than 15 digits and reads `01` as 1, where `JSON.parse`
-//! answers a Float and raises. Each other call is a refusal of its own,
-//! through `survey::continue_or_fail`.
+//! `MultiJson.load` (and `parse`, `decode`) is oj's strict load: `JSON.parse`
+//! where that answers alike, and otherwise a parser written as oj reads, for
+//! the text where they differ (a decimal of more than 16 digits is a
+//! BigDecimal, `01` is 1, a sign alone is 0, a lone surrogate raises). Its
+//! options are `symbolize_keys:`/`symbolize_names:` alone, and a call under a
+//! `rescue` that reads the exception is refused: oj's messages are not the
+//! stand-in's. Each other call is a refusal of its own, through
+//! `survey::continue_or_fail`.
 //!
 //! Checked against multi_json 1.21.1 and oj 3.17.6 with ActiveSupport.
 //!
@@ -194,8 +198,27 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
     struct Finder {
         found: Vec<String>,
         initializer: bool,
+        /// Inside a `begin` whose `rescue` reads the exception it binds (or `$!`).
+        observed: usize,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+            let reads = node.rescue_clause().is_some_and(|r| rescue_reads_exception(&r));
+            if let Some(statements) = node.statements() {
+                self.observed += usize::from(reads);
+                ruby_prism::Visit::visit_statements_node(self, &statements);
+                self.observed -= usize::from(reads);
+            }
+            if let Some(r) = node.rescue_clause() {
+                ruby_prism::Visit::visit_rescue_node(self, &r);
+            }
+            if let Some(e) = node.else_clause() {
+                ruby_prism::Visit::visit_else_node(self, &e);
+            }
+            if let Some(e) = node.ensure_clause() {
+                ruby_prism::Visit::visit_ensure_node(self, &e);
+            }
+        }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             let receiver = node.receiver().map(|r| text_of(&r)).unwrap_or_default();
             if RECEIVERS.contains(&receiver.as_str()) {
@@ -227,9 +250,33 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
                             self.found.push(format!("`{}`", text_of(&node.as_node()).lines().next().unwrap_or_default()));
                         }
                     }
-                    "load" | "decode" | "parse" => self.found.push(format!(
-                        "`{receiver}.{method}`: oj's strict parser answers a BigDecimal for a decimal of more than 15 digits and reads `01` as 1, which `JSON.parse` does not"
-                    )),
+                    "load" | "decode" | "parse" => {
+                        // The options the stand-in reads: the keys' spelling, as literals.
+                        let options_ok = match args.get(1) {
+                            None => true,
+                            Some(options) => {
+                                let elements: Option<Vec<ruby_prism::Node<'_>>> = options
+                                    .as_keyword_hash_node()
+                                    .map(|h| h.elements().iter().collect())
+                                    .or_else(|| options.as_hash_node().map(|h| h.elements().iter().collect()));
+                                elements.is_some_and(|elements| {
+                                    elements.iter().all(|e| {
+                                        e.as_assoc_node().is_some_and(|p| {
+                                            matches!(literal_name(&p.key()).as_deref(), Some("symbolize_keys" | "symbolize_names"))
+                                                && (p.value().as_true_node().is_some() || p.value().as_false_node().is_some())
+                                        })
+                                    })
+                                })
+                            }
+                        };
+                        if args.is_empty() || args.len() > 2 || !options_ok || node.block().is_some() {
+                            self.found.push(format!("`{}`", text_of(&node.as_node()).lines().next().unwrap_or_default()));
+                        } else if self.observed > 0 {
+                            self.found.push(format!(
+                                "`{receiver}.{method}` under a `rescue` that reads the exception: the stand-in's ParseError message is not oj's"
+                            ));
+                        }
+                    }
                     other => self.found.push(format!("`{receiver}.{other}`")),
                 }
             }
@@ -237,9 +284,41 @@ fn unmodeled_calls(text: &str, initializer: bool) -> Vec<String> {
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder { found: Vec::new(), initializer };
+    let mut finder = Finder { found: Vec::new(), initializer, observed: 0 };
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.found
+}
+
+/// Whether a `rescue` chain reads the exception: the variable one binds, or `$!`.
+fn rescue_reads_exception(node: &ruby_prism::RescueNode<'_>) -> bool {
+    struct Reads(Vec<String>, bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.1 |= self.0.contains(&String::from_utf8_lossy(node.name().as_slice()).to_string());
+        }
+        fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
+            self.1 |= node.name().as_slice() == b"$!";
+        }
+    }
+    fn one(r: &ruby_prism::RescueNode<'_>) -> bool {
+        let bound: Vec<String> = r
+            .reference()
+            .and_then(|t| t.as_local_variable_target_node().map(|t| String::from_utf8_lossy(t.name().as_slice()).to_string()))
+            .into_iter()
+            .collect();
+        let mut visitor = Reads(bound, false);
+        if let Some(statements) = r.statements() {
+            ruby_prism::Visit::visit_statements_node(&mut visitor, &statements);
+        }
+        visitor.1
+    }
+    let mut reads = one(node);
+    let mut next = node.subsequent();
+    while let Some(r) = next {
+        reads |= one(&r);
+        next = r.subsequent();
+    }
+    reads
 }
 
 /// What the lowered calls reach once multi_json is not there.
@@ -315,6 +394,233 @@ fn stand_ins() -> Vec<LibraryClass> {
 
   def self.use(adapter)
     nil
+  end
+
+  def self.load(source, options = {})
+    source = source.read if source.respond_to?(:read)
+    return nil if source.nil?
+    text = source.to_s
+    return nil if text.empty? || (!text.start_with?("{", "[") && text.match?(/\A\s*\z/))
+    symbolize = options[:symbolize_names] == true || (!options.key?(:symbolize_names) && options[:symbolize_keys] == true)
+    # Not JSON.parse alone: oj's strict mode reads `01` as 1, a decimal of more than 16 digits as a BigDecimal, and
+    # refuses a lone surrogate; each sends the text to the parser below, which reads it as oj does.
+    unless MultiJson.long_decimal?(text) || text.match?(/\\u[dD][89a-fA-F]/)
+      begin
+        return JSON.parse(text, symbolize_names: symbolize, max_nesting: false)
+      rescue JSON::ParserError
+        nil
+      end
+    end
+    MultiJson::Strict.new(text, symbolize).document
+  end
+
+  # A number with a fraction or exponent whose digits, leading zeros aside, are more than 16 (a String's text counts too).
+  def self.long_decimal?(text)
+    return false unless text.match?(/\d(?:\.?\d){16}/)
+    text.scan(/\d+(?:\.\d+)?(?:[eE][-+]?\d+)?/).any? do |number|
+      (number.include?(".") || number.include?("e") || number.include?("E")) &&
+        number.sub(/[eE].*\z/, "").delete(".").sub(/\A0+/, "").length > 16
+    end
+  end
+
+  def self.parse(source, options = {})
+    MultiJson.load(source, options)
+  end
+
+  def self.decode(source, options = {})
+    MultiJson.load(source, options)
+  end
+
+  class Strict
+    def initialize(text, symbolize)
+      @text = text
+      @at = 0
+      @size = text.bytesize
+      @symbolize = symbolize
+    end
+
+    def document
+      blank
+      value = read_value
+      blank
+      raise MultiJson::ParseError, "unexpected characters after the JSON document" if @at < @size
+      value
+    end
+
+    def byte(offset = 0)
+      @text.getbyte(@at + offset)
+    end
+
+    def digit?(b)
+      !b.nil? && b >= 48 && b <= 57
+    end
+
+    def blank
+      while @at < @size
+        b = byte
+        if b == 32 || b == 9 || b == 10 || b == 13
+          @at += 1
+        elsif b == 47 && byte(1) == 47
+          @at += 2
+          @at += 1 while @at < @size && byte != 10
+        elsif b == 47 && byte(1) == 42
+          close = @text.byteindex("*/", @at + 2)
+          raise MultiJson::ParseError, "comment not terminated" if close.nil?
+          @at = close + 2
+        else
+          break
+        end
+      end
+    end
+
+    def read_value
+      b = byte
+      if b == 123 then read_object
+      elsif b == 91 then read_array
+      elsif b == 34 then read_string
+      elsif b == 116 then read_word("true", true)
+      elsif b == 102 then read_word("false", false)
+      elsif b == 110 then read_word("null", nil)
+      elsif b == 45 || digit?(b) then read_number
+      else raise MultiJson::ParseError, "unexpected character"
+      end
+    end
+
+    def read_word(word, value)
+      raise MultiJson::ParseError, "not a number or other value" unless @text.byteslice(@at, word.bytesize) == word
+      @at += word.bytesize
+      value
+    end
+
+    def read_number
+      start = @at
+      @at += 1 if byte == 45
+      digits = @at
+      @at += 1 while digit?(byte)
+      if @at == digits
+        # oj reads a sign with no digits after it as 0, unless a fraction or exponent follows.
+        raise MultiJson::ParseError, "not a number" if byte == 46 || byte == 101 || byte == 69
+        return 0
+      end
+      decimal = false
+      if byte == 46
+        decimal = true
+        @at += 1
+        fraction = @at
+        @at += 1 while digit?(byte)
+        raise MultiJson::ParseError, "not a number" if @at == fraction
+      end
+      if byte == 101 || byte == 69
+        decimal = true
+        @at += 1
+        @at += 1 if byte == 43 || byte == 45
+        exponent = @at
+        @at += 1 while digit?(byte)
+        raise MultiJson::ParseError, "not a number" if @at == exponent
+      end
+      written = @text.byteslice(start, @at - start)
+      return Integer(written, 10) unless decimal
+      significant = written.sub(/[eE].*\z/, "").delete("-.").sub(/\A0+/, "")
+      significant.length > 16 ? BigDecimal(written) : Float(written)
+    end
+
+    def hex4(offset)
+      digits = @text.byteslice(offset, 4)
+      raise MultiJson::ParseError, "invalid hex character" unless digits && digits.match?(/\A\h{4}\z/)
+      digits.to_i(16)
+    end
+
+    def read_string
+      @at += 1
+      out = +""
+      segment = @at
+      while true
+        b = byte
+        raise MultiJson::ParseError, "quoted string not terminated" if b.nil?
+        if b == 34
+          out << @text.byteslice(segment, @at - segment)
+          @at += 1
+          return out
+        end
+        unless b == 92
+          @at += 1
+          next
+        end
+        out << @text.byteslice(segment, @at - segment)
+        escape = byte(1)
+        @at += 2
+        if escape == 34 then out << "\""
+        elsif escape == 92 then out << "\\"
+        elsif escape == 47 then out << "/"
+        elsif escape == 98 then out << "\b"
+        elsif escape == 102 then out << "\f"
+        elsif escape == 110 then out << "\n"
+        elsif escape == 114 then out << "\r"
+        elsif escape == 116 then out << "\t"
+        elsif escape == 117
+          code = hex4(@at)
+          @at += 4
+          if code >= 0xD800 && code <= 0xDBFF
+            raise MultiJson::ParseError, "invalid escaped character" unless byte == 92 && byte(1) == 117
+            low = hex4(@at + 2)
+            raise MultiJson::ParseError, "invalid escaped character" unless low >= 0xDC00 && low <= 0xDFFF
+            @at += 6
+            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+          elsif code >= 0xDC00 && code <= 0xDFFF
+            raise MultiJson::ParseError, "invalid escaped character"
+          end
+          out << code.chr(Encoding::UTF_8)
+        else
+          raise MultiJson::ParseError, "invalid escaped character"
+        end
+        segment = @at
+      end
+    end
+
+    def read_object
+      @at += 1
+      hash = {}
+      blank
+      if byte == 125
+        @at += 1
+        return hash
+      end
+      while true
+        blank
+        raise MultiJson::ParseError, "expected hash key" unless byte == 34
+        key = read_string
+        blank
+        raise MultiJson::ParseError, "expected colon" unless byte == 58
+        @at += 1
+        blank
+        value = read_value
+        hash[@symbolize ? key.to_sym : key] = value
+        blank
+        b = byte
+        @at += 1
+        return hash if b == 125
+        raise MultiJson::ParseError, "expected comma or hash close" unless b == 44
+      end
+    end
+
+    def read_array
+      @at += 1
+      array = []
+      blank
+      if byte == 93
+        @at += 1
+        return array
+      end
+      while true
+        blank
+        array << read_value
+        blank
+        b = byte
+        @at += 1
+        return array if b == 93
+        raise MultiJson::ParseError, "expected comma or array close" unless b == 44
+      end
+    end
   end
 end
 "#;

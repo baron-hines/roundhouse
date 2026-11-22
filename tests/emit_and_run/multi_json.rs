@@ -121,6 +121,208 @@ fn multi_json_dump_runs_as_ojs_compat_dump_on_spinel() {
     assert!(run.stdout.contains("multi_json passed"));
 }
 
+/// `MultiJson.load` over inputs where oj's strict load and `JSON.parse` part (`01`, a sign alone, a decimal of more
+/// than 16 digits, lone surrogates, comments, blank text), each line what multi_json 1.21.1 over oj 3.17.6 answers.
+const LOADS: &str = r##"class Loads
+  def self.show(value)
+    "#{value.class} #{value.inspect}"
+  end
+
+  def self.plain(text)
+    Loads.show(MultiJson.load(text))
+  rescue MultiJson::ParseError
+    "ERR"
+  end
+
+  def self.symbolized(text)
+    Loads.show(MultiJson.load(text, symbolize_keys: true))
+  rescue MultiJson::ParseError
+    "ERR"
+  end
+
+  def self.names(text)
+    Loads.show(MultiJson.load(text, symbolize_names: true))
+  rescue MultiJson::LoadError
+    "ERR"
+  end
+
+  def self.parsed(text)
+    Loads.show(MultiJson.parse(text))
+  rescue MultiJson::DecodeError
+    "ERR"
+  end
+
+  def self.io(text)
+    Loads.show(MultiJson.load(StringIO.new(text)))
+  end
+
+  def self.none
+    Loads.show(MultiJson.load(nil))
+  end
+end
+"##;
+
+const LOAD_ASSERTIONS: &str = r##"CASES = ['01', '-01', '007', '-00', '00.5', '-012.5', '1.0', '1.5', '0.1', '1.23456789012345', '1.234567890123456', '1.2345678901234567',
+  '12345678901234567890', '1e2', '1E400', '-0', '-0.0', '1.0e-5', '1.0E+2', '0.000000000000000001', '1.20000000000000000', '1234567890123456.0',
+  '[1.2345678901234567, 0.5, "x"]', '{"a":1.23456789012345678e5,"b":[01,2]}',
+  'NaN', 'Infinity', '-Infinity', '[1,]', '{"a":1,}', "// c\n1", '/* c */ 1', '[1, /* c */ 2]', '{"a":1,"a":2}', '"é"', '"\\u00e9"',
+  '"\\ud800"', '"\\udc00"', '"\\ud83d\\ude00"', '"a\\u0000b"', ' 1 ', "﻿1", 'true', 'null', 'false', '"x"', '[1 2]', "{'a':1}", '{"a" 1}', '1 2',
+  '', '   ', "\n\t", '.5', '5.', '+1', '0x10', '1_000', "\"\t\"", '[]', '{}', '{"a":{"b":[1,{"c":null}]}}', '"\\x"', '"abc', '[', '{',
+  'tru', 'nul', '-', '1.', '1e', '1e+', '[1]x', '{}{}', '{"k":"v\\n\\t\\"\\\\\\/"}', ('[' * 120) + (']' * 120)]
+MINUS = ['[-]', '-a', '- 1', '[-,1]', '-.5', '-e5', '[-]x', '{"a":-}', '-]', '--1', '-00', '[-1, -]', '-E2', '-1.', '- ', ' -']
+all = CASES + MINUS
+got = all.map { |c| Loads.plain(c) } + all.first(30).map { |c| Loads.symbolized(c) } + [Loads.names('{"a":{"b":1}}'), Loads.parsed("[01, 1.2345678901234567]"), Loads.io('{"x":[1]}'), Loads.none]
+expected = [
+  "Integer 1",
+  "Integer -1",
+  "Integer 7",
+  "Integer 0",
+  "Float 0.5",
+  "Float -12.5",
+  "Float 1.0",
+  "Float 1.5",
+  "Float 0.1",
+  "Float 1.23456789012345",
+  "Float 1.234567890123456",
+  "BigDecimal 0.12345678901234567e1",
+  "Integer 12345678901234567890",
+  "Float 100.0",
+  "Float Infinity",
+  "Integer 0",
+  "Float -0.0",
+  "Float 1.0e-05",
+  "Float 100.0",
+  "Float 1.0e-18",
+  "BigDecimal 0.12e1",
+  "BigDecimal 0.1234567890123456e16",
+  "Array [0.12345678901234567e1, 0.5, \"x\"]",
+  "Hash {\"a\" => 0.123456789012345678e6, \"b\" => [1, 2]}",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "Integer 1",
+  "Integer 1",
+  "Array [1, 2]",
+  "Hash {\"a\" => 2}",
+  "String \"é\"",
+  "String \"é\"",
+  "ERR",
+  "ERR",
+  "String \"😀\"",
+  "String \"a\\u0000b\"",
+  "Integer 1",
+  "ERR",
+  "TrueClass true",
+  "NilClass nil",
+  "FalseClass false",
+  "String \"x\"",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "NilClass nil",
+  "NilClass nil",
+  "NilClass nil",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "String \"\\t\"",
+  "Array []",
+  "Hash {}",
+  "Hash {\"a\" => {\"b\" => [1, {\"c\" => nil}]}}",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "Integer 0",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "Hash {\"k\" => \"v\\n\\t\\\"\\\\/\"}",
+  "Array [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+  "Array [0]",
+  "ERR",
+  "ERR",
+  "Array [0, 1]",
+  "ERR",
+  "ERR",
+  "ERR",
+  "Hash {\"a\" => 0}",
+  "ERR",
+  "ERR",
+  "Integer 0",
+  "Array [-1, 0]",
+  "ERR",
+  "ERR",
+  "Integer 0",
+  "Integer 0",
+  "Integer 1",
+  "Integer -1",
+  "Integer 7",
+  "Integer 0",
+  "Float 0.5",
+  "Float -12.5",
+  "Float 1.0",
+  "Float 1.5",
+  "Float 0.1",
+  "Float 1.23456789012345",
+  "Float 1.234567890123456",
+  "BigDecimal 0.12345678901234567e1",
+  "Integer 12345678901234567890",
+  "Float 100.0",
+  "Float Infinity",
+  "Integer 0",
+  "Float -0.0",
+  "Float 1.0e-05",
+  "Float 100.0",
+  "Float 1.0e-18",
+  "BigDecimal 0.12e1",
+  "BigDecimal 0.1234567890123456e16",
+  "Array [0.12345678901234567e1, 0.5, \"x\"]",
+  "Hash {a: 0.123456789012345678e6, b: [1, 2]}",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "ERR",
+  "Integer 1",
+  "Hash {a: {b: 1}}",
+  "Array [1, 0.12345678901234567e1]",
+  "Hash {\"x\" => [1]}",
+  "NilClass nil"
+]
+raise "count #{got.size}" unless got.size == expected.size
+got.each_with_index { |g, i| raise "#{all[i % all.size].inspect}: #{g} (want #{expected[i]})" unless g == expected[i] }
+puts "multi_json load passed"
+"##;
+
+fn load_overlay() -> emit_and_run::Overlay {
+    overlay(emit_and_run::real_blog()).write("lib/loads.rb", LOADS)
+}
+
+#[test]
+fn multi_json_load_runs_as_ojs_strict_load() {
+    let run = load_overlay().run_ruby(LOAD_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("multi_json load passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn multi_json_load_runs_as_ojs_strict_load_on_spinel() {
+    let run = load_overlay().run_spinel(LOAD_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("multi_json load passed"));
+}
+
 /// A value oj would write through its `to_json` (a record, an object, an untyped value) is refused: Rails' encoder
 /// writes it, which the stand-in does not model.
 #[test]
@@ -173,7 +375,10 @@ fn multi_json_unmodeled_configurations_are_refused() {
     let dump = "class Codec\n  def self.out(v)\n    MultiJson.dump(v)\n  end\nend\n";
     let old_lock = LOCK.replace("multi_json (1.21.1)", "multi_json (1.15.0)");
     for (lock, init, lib, expected, installed) in [
-        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    MultiJson.load(v)\n  end\n\n  def self.out(v)\n    MultiJson.dump(v)\n  end\nend\n", "`MultiJson.load`: oj's strict parser", true),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    MultiJson.load(v, mode: :compat)\n  end\nend\n", "`MultiJson.load(v, mode: :compat)`", true),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    MultiJson.load(v)\n  rescue => e\n    e.message\n  end\nend\n", "under a `rescue` that reads the exception", true),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v)\n    begin\n      MultiJson.load(v)\n    rescue MultiJson::ParseError\n      $!.class\n    end\n  end\nend\n", "under a `rescue` that reads the exception", true),
+        (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.in(v, o)\n    MultiJson.load(v, symbolize_keys: o)\n  end\nend\n", "`MultiJson.load(v, symbolize_keys: o)`", true),
         (LOCK, "MultiJson.use(:oj)\n", "class Codec\n  def self.out(v)\n    MultiJson.dump(v, indent: 4)\n  end\nend\n", "`MultiJson.dump(v, indent: 4)`", true),
         (LOCK, "MultiJson.use(:json_gem)\n", dump, "only the oj adapter is modeled", false),
         (LOCK, "MultiJson.use(:oj) if ENV[\"OJ\"]\n", dump, "not chosen at an initializer's top level", false),
