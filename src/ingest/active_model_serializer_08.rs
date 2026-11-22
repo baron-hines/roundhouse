@@ -291,7 +291,8 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     // The root's `super` from an override of the gem's API reaches the gem's class, which the expansion removes.
     for (name, chain) in &chains {
         let (1, Some(own)) = (chain.len(), owns.get(name)) else { continue };
-        let api = PER_CLASS_API.iter().chain(ROOT_API).map(|(m, _)| *m).chain(["include?"]);
+        // `initialize`'s `super` is the expansion's own, below.
+        let api = PER_CLASS_API.iter().chain(ROOT_API).map(|(m, _)| *m).filter(|m| *m != "initialize").chain(["include?"]);
         if let Some(d) = own.defs.iter().find(|d| d.supers && api.clone().any(|m| m == d.name)) {
             let reason = format!("`super` in `def {}` reaches the gem's class, which the expansion removes", d.name);
             refused.entry(name.clone()).or_insert_with(|| refuse(&sources[own.source_index], own.offset, &reason));
@@ -593,7 +594,7 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
                 ctx.hook_seen = true;
                 continue;
             }
-            if method == "initialize" || method.starts_with("ams_") || GEM_ONLY.contains(&method.as_str()) {
+            if method.starts_with("ams_") || GEM_ONLY.contains(&method.as_str()) {
                 return Err(fail(&format!("`def {method}` would be replaced by the expansion")));
             }
             let mut calls = GemCalls { found: None, supers: false };
@@ -1340,7 +1341,8 @@ fn association(a: &Assoc, flat: &Flat) -> String {
 /// The gem's constructor, readers and the methods answering the class's Hash, on every class of the tree, by name:
 /// one on the root alone is typed with the root's own declarations, whatever subclass it answers for.
 const PER_CLASS_API: &[(&str, &str)] = &[
-    ("initialize", "  def initialize(object, options = {})\n    @object = object\n    @options = options\n    @ams_side = nil\n    @ams_unique = nil\n  end\n"),
+    ("ams_initialize", "  def ams_initialize(object, options = {})\n    @object = object\n    @options = options\n    @ams_side = nil\n    @ams_unique = nil\n  end\n"),
+    ("initialize", "  def initialize(object, options = {})\n    ams_initialize(object, options)\n  end\n"),
     ("object", "  def object\n    @object\n  end\n"),
     ("options", "  def options\n    @options\n  end\n"),
     ("scope", "  def scope\n    @options[:scope]\n  end\n"),
@@ -1380,6 +1382,36 @@ fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> Inges
         method.name_span = span;
     }
     class.methods.append(&mut methods);
+    // An own `initialize`'s `super` is the gem's constructor, which `ams_initialize` is here: it writes the class's
+    // own ivars, so each class types its record apart.
+    for method in class.methods.iter_mut().filter(|m| m.name.as_str() == "initialize" && m.receiver == crate::dialect::MethodReceiver::Instance) {
+        let params: Vec<Symbol> = method.params.iter().map(|p| p.name.clone()).collect();
+        fn bare_super(e: &Expr) -> bool {
+            let mut found = matches!(&*e.node, ExprNode::Super { args: None });
+            e.node.for_each_child(&mut |c| found |= bare_super(c));
+            found
+        }
+        // A bare `super` hands on every parameter as it was declared: a keyword or splat is not one positional argument.
+        if method.params.iter().any(|p| p.keyword || p.rest || p.forwarding) && bare_super(&method.body) {
+            return Err(IngestError::Unsupported {
+                file: "<active_model_serializers>".into(),
+                message: format!("ActiveModel::Serializer subset: {}'s `initialize` hands a keyword or splat on through `super`", class.name.0),
+            });
+        }
+        fn rewrite(e: &mut Expr, params: &[Symbol]) {
+            e.node.for_each_child_mut(&mut |c| rewrite(c, params));
+            if let ExprNode::Super { args } = &*e.node {
+                let args = args.clone().unwrap_or_else(|| {
+                    params
+                        .iter()
+                        .map(|p| Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(0), name: p.clone() }))
+                        .collect()
+                });
+                *e.node = ExprNode::Send { recv: None, method: Symbol::from("ams_initialize"), args, block: None, parenthesized: true };
+            }
+        }
+        rewrite(&mut method.body, &params);
+    }
     if root {
         class.parent = None;
     }

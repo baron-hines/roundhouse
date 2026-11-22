@@ -124,6 +124,11 @@ end
 
 class ScopedArticleSerializer < ArticleSerializer
   root :post
+
+  def initialize(object, opts = {})
+    super(object, opts)
+    @scoped = true
+  end
   attributes :title_shown
 
   def title_shown
@@ -137,7 +142,17 @@ end
 
 class PlainArticleSerializer < ActiveModel::Serializer
   root false
-  attributes :id, :title
+  attributes :id, :title, :greeting
+
+  def initialize(object, options = {})
+    super
+    @greeting = "hi " + object.title
+  end
+
+  def greeting
+    @greeting
+  end
+
   has_many :comments, serializer: CommentSerializer
   has_one :node, serializer: CommentSerializer, embed: :objects
 
@@ -220,7 +235,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("draft", r#"{"comments":[],"article":{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}}"#),
     ("admin", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
     ("guest", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":false,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
-    ("plain", r#"{"id":101,"title":"Hello","comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"node":{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}}"#),
+    ("plain", r#"{"id":101,"title":"Hello","greeting":"hi Hello","comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"node":{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}}"#),
     ("index", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"articles":[{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202},{"id":102,"title":"Draft one","long":false,"draft":true,"summary_note":"note","comment_ids":[],"first_comment":null,"latest":[null],"last_comment_id":null}]}"#),
     ("bare", r#"[{"id":101,"title":"Hello","long":true},{"id":102,"title":"Draft one","long":false}]"#),
     ("helper_show", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"summary":"A lon","draft":false,"summary_note":"note","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202}}"#),
@@ -318,7 +333,7 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  attributes :display\nend\n", "an attribute named `display`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  cached\nend\n", "`cached` is outside", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :author, serializer: BaseSerializer, polymorphic: true\nend\n", "`polymorphic:` is outside", &["ASerializer"]),
-        ("class ASerializer < BaseSerializer\n  def initialize(object, options = {})\n    super\n  end\nend\n", "`def initialize` would be replaced", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  def initialize(object, *rest)\n    super\n  end\nend\n", "hands a keyword or splat on through `super`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def link\n    url_options\n  end\nend\n", "`url_options` is the gem's", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def include!(name)\n    name\n  end\nend\n", "`def include!` would be replaced", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  private\n\n  def title\n    \"t\"\n  end\n\n  public\n\n  attributes :title\nend\n", "a private `title` before its declaration", &["ASerializer"]),
