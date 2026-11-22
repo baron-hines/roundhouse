@@ -114,6 +114,15 @@ fn read_yaml(source: &str) -> Result<Node, String> {
     struct Reader<'a> {
         parser: Parser<std::str::Chars<'a>>,
         anchors: HashMap<usize, Node>,
+        /// Nodes left to copy out of aliases: each copies its anchor's whole subtree.
+        budget: usize,
+    }
+    fn size(node: &Node) -> usize {
+        match node {
+            Node::Scalar(_) => 1,
+            Node::Map(entries) => 1 + entries.iter().map(|(_, v)| size(v)).sum::<usize>(),
+            Node::Seq(items) => 1 + items.iter().map(size).sum::<usize>(),
+        }
     }
     impl Reader<'_> {
         fn next(&mut self) -> Result<Event, String> {
@@ -146,7 +155,11 @@ fn read_yaml(source: &str) -> Result<Node, String> {
                             return Err("a merge key".into());
                         }
                         let value = self.node(depth + 1)?;
-                        entries.push((key, value));
+                        // Psych's Hash keeps a repeated key where it first stood, with its last value.
+                        match entries.iter_mut().find(|(k, _): &&mut (String, Node)| *k == key) {
+                            Some(entry) => entry.1 = value,
+                            None => entries.push((key, value)),
+                        }
                     }
                     self.next()?;
                     (Node::Map(entries), anchor)
@@ -159,7 +172,11 @@ fn read_yaml(source: &str) -> Result<Node, String> {
                     self.next()?;
                     (Node::Seq(items), anchor)
                 }
-                Event::Alias(id) => return self.anchors.get(&id).cloned().ok_or_else(|| "an alias".to_string()),
+                Event::Alias(id) => {
+                    let node = self.anchors.get(&id).ok_or_else(|| "an alias".to_string())?;
+                    self.budget = self.budget.checked_sub(size(node)).ok_or_else(|| "aliases copying more than the file holds".to_string())?;
+                    return Ok(node.clone());
+                }
                 other => return Err(format!("{other:?}")),
             };
             if anchor != 0 {
@@ -168,7 +185,7 @@ fn read_yaml(source: &str) -> Result<Node, String> {
             Ok(node)
         }
     }
-    let mut reader = Reader { parser: Parser::new_from_str(source), anchors: HashMap::default() };
+    let mut reader = Reader { parser: Parser::new_from_str(source), anchors: HashMap::default(), budget: source.len() };
     if reader.next()? != Event::StreamStart || reader.next()? != Event::DocumentStart {
         return Err("no document".into());
     }
@@ -265,10 +282,11 @@ fn find_loader(sources: &[SourceFile]) -> Option<Loader<'_>> {
             let [arg] = args.as_slice() else { return None };
             let name = super::util::constant_path_of(arg)?.join("::");
             let module_source = sources.iter().find(|m| m.text.contains(&format!("module {name}\n")) && m.text.contains("def setup_methods(name)"))?;
-            Some(module_source)
+            Some((module_source, name))
         })?;
         Some((path.join("::"), module))
     })?;
+    let (module, module_name) = module;
     // The module's loader is the one that yields each entry to `setting`, which defines through `setup_methods`.
     let text = &module.text;
     if !(text.contains(".load do |category, name, default, opts|") && text.contains("setting(name, default, opts.merge(") && text.contains("setup_methods(name)")) {
@@ -276,7 +294,9 @@ fn find_loader(sources: &[SourceFile]) -> Option<Loader<'_>> {
     }
     let mparsed = super::prism::parse_silent(text.as_bytes());
     let program = mparsed.node();
-    let def = program.as_program_node()?.statements().body().iter().filter_map(|s| s.as_module_node()).find_map(|m| {
+    let def = program.as_program_node()?.statements().body().iter().filter_map(|s| s.as_module_node()).filter(|m| {
+        super::util::constant_path_of(&m.constant_path()).is_some_and(|p| p.join("::") == module_name)
+    }).find_map(|m| {
         m.body().map(flatten_statements).unwrap_or_default().into_iter().find_map(|s| {
             s.as_def_node().filter(|d| d.receiver().is_none() && constant_id_str(&d.name()) == "setup_methods").map(|d| (d.location().start_offset(), d.location().end_offset()))
         })
@@ -302,10 +322,12 @@ fn answers_wrap(class: &str, sources: &[SourceFile]) -> Option<bool> {
                 continue;
             }
             // `wrap_values!`: a class method run as the class loads may define anything.
-            if let Some(call) = stmt.as_call_node()
-                && !(call.receiver().is_none() && matches!(constant_id_str(&call.name()), "private_class_method" | "public_class_method" | "private_constant"))
-            {
-                return None;
+            if let Some(call) = stmt.as_call_node() {
+                let visibility = call.receiver().is_none() && matches!(constant_id_str(&call.name()), "private_class_method" | "public_class_method" | "private_constant");
+                let names_wrap = call.arguments().is_some_and(|a| a.arguments().iter().any(|x| super::util::symbol_value(&x).as_deref() == Some("wrap")));
+                if !visibility || names_wrap {
+                    return None;
+                }
             }
         }
         let Some(parent) = node.superclass() else { return Some(false) };
@@ -345,6 +367,10 @@ fn run(stmts: &[ruby_prism::Node<'_>], entry: &Entry, env: &mut HashMap<String, 
 
 fn statement(stmt: &ruby_prism::Node<'_>, entry: &Entry, env: &mut HashMap<String, Value>, out: &mut Defined, text: &str, sources: &[SourceFile]) -> Result<Value, String> {
     if let Some(w) = stmt.as_local_variable_write_node() {
+        // A block already defined reads the local as it is when called: the later value, not the one written in.
+        if !out.is_empty() && env.contains_key(constant_id_str(&w.name())) {
+            return Err("a local rebound after a method closes over it".into());
+        }
         let v = statement(&w.value(), entry, env, out, text, sources)?;
         env.insert(constant_id_str(&w.name()).to_string(), v.clone());
         return Ok(v);
@@ -379,6 +405,17 @@ fn statement(stmt: &ruby_prism::Node<'_>, entry: &Entry, env: &mut HashMap<Strin
         let block = call.block().and_then(|b| b.as_block_node()).ok_or("`define_singleton_method` without a block")?;
         let params = match block.parameters().and_then(|p| p.as_block_parameters_node()).and_then(|p| p.parameters()) {
             Some(p) => {
+                struct Reads<'a>(&'a HashMap<String, Value>, bool);
+                impl<'pr> ruby_prism::Visit<'pr> for Reads<'_> {
+                    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+                        self.1 |= node.depth() > 0 && self.0.contains_key(constant_id_str(&node.name()));
+                    }
+                }
+                let mut reads = Reads(env, false);
+                ruby_prism::Visit::visit(&mut reads, &p.as_node());
+                if reads.1 {
+                    return Err("a parameter default reading a local the block closes over".into());
+                }
                 let l = p.location();
                 text[l.start_offset()..l.end_offset()].to_string()
             }
@@ -611,6 +648,9 @@ fn expr(node: &ruby_prism::Node<'_>, entry: &Entry, env: &HashMap<String, Value>
         return Ok(Value::Bool(matches!(entry.opt("upcoming_change"), Some(Node::Map(m)) if !m.is_empty())));
     }
     let r = expr(&recv, entry, env, sources)?;
+    if call.is_safe_navigation() && r == Value::Nil {
+        return Ok(Value::Nil);
+    }
     let a: Vec<Value> = args.iter().map(|x| expr(x, entry, env, sources)).collect::<Result<_, _>>()?;
     Ok(match (method, &r, a.as_slice()) {
         ("to_s", Value::Sym(s) | Value::Str(s), []) => Value::Str(s.clone()),
@@ -719,5 +759,48 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile], yml: Option<St
         mark(&mut method.body, span);
         method.name_span = span;
         app.models[model].body.push(ModelBodyItem::Method { method, leading_comments: Vec::new(), leading_blank_line: false });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_scalar_resolves_as_psych_does() {
+        for (text, want) in [
+            ("", Some(Value::Nil)),
+            ("~", Some(Value::Nil)),
+            ("yes", Some(Value::Bool(true))),
+            ("Off", Some(Value::Bool(false))),
+            ("5", Some(Value::Int)),
+            ("1,000", Some(Value::Int)),
+            ("0x1f", Some(Value::Int)),
+            ("1.5", Some(Value::Float)),
+            ("hello", Some(Value::Str("hello".into()))),
+            ("s3.amazonaws.com", Some(Value::Str("s3.amazonaws.com".into()))),
+            ("https://x.org/a", Some(Value::Str("https://x.org/a".into()))),
+            ("2024-01-02", None),
+            (":sym", None),
+            ("1:30", None),
+            (".inf", None),
+        ] {
+            assert_eq!(plain(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_key_keeps_its_last_value() {
+        let entries = entries("basic:\n  tags:\n    default: \"a|b\"\n    type: string\n    type: list\n").unwrap();
+        assert_eq!(entries[0].ty.as_deref(), Some("list"));
+    }
+
+    #[test]
+    fn aliases_copying_past_the_file_are_refused() {
+        let mut yml = String::from("a: &a [x, x, x, x, x, x, x, x]\n");
+        for i in 0..12 {
+            yml.push_str(&format!("b{i}: &b{i} [*{p}, *{p}, *{p}, *{p}]\n", p = if i == 0 { "a".to_string() } else { format!("b{}", i - 1) }));
+        }
+        assert!(read_yaml(&yml).is_err());
     }
 }
