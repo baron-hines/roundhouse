@@ -20919,6 +20919,8 @@ mod reset_counters;
 mod console_only_definitions;
 #[path = "emit_and_run/open_classes.rs"]
 mod open_classes;
+#[path = "emit_and_run/class_arg_specialize.rs"]
+mod class_arg_specialize;
 #[path = "emit_and_run/parameterized_mailer.rs"]
 mod parameterized_mailer;
 #[path = "emit_and_run/change_table_migrations.rs"]

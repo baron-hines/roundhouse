@@ -142,6 +142,17 @@ fn covered(known: &Ty, next: &Ty) -> bool {
     }
 }
 
+/// How many containers deep `ty` nests, at its deepest arm.
+fn depth(ty: &Ty) -> usize {
+    match ty {
+        Ty::Union { variants } => variants.iter().map(depth).max().unwrap_or(0),
+        Ty::Array { elem } => 1 + depth(elem),
+        Ty::Hash { key, value } => 1 + depth(key).max(depth(value)),
+        Ty::Tuple { elems } => 1 + elems.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// How many unknown arms `ty` holds, at every level.
 fn unknown_arms(ty: &Ty) -> usize {
     match ty {
@@ -163,7 +174,8 @@ impl Joinable for Ty {
         // Not a value that knew everything: a move that only grows known arms (`Integer` to `Integer | nil`, or a
         // recursive type nesting deeper) may be half of a cycle, or never stop.
         let before = unknown_arms(self);
-        if before == 0 || unknown_arms(next) > before || self == next {
+        // Nor one nesting deeper than the widening keeps (`Array[Array[…[untyped]]]`): it has to see that growth.
+        if before == 0 || unknown_arms(next) > before || self == next || (depth(next) > depth(self) && depth(next) > WIDEN_DEPTH) {
             return false;
         }
         covered(&known_part(self), next)
@@ -430,6 +442,19 @@ mod tests {
         let (held, entries) = rounds(&values);
         assert_eq!(held.last(), values.last());
         assert_eq!((entries.cycles, entries.widened), (0, 0));
+    }
+
+    // `Array[untyped]`, `Array[Array[untyped]]`, …: one unknown arm each round, which the exemption would let nest forever.
+    #[test]
+    fn an_entry_nesting_its_unknown_arm_deeper_is_widened() {
+        let mut values = vec![Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }];
+        for _ in 0..12 {
+            let last = values.last().unwrap().clone();
+            values.push(Ty::Array { elem: std::sync::Arc::new(last) });
+        }
+        let (held, entries) = rounds(&values);
+        assert!(entries.widened > 0, "{held:#?}");
+        assert!(depth(held.last().unwrap()) <= WIDEN_DEPTH + 1, "{held:#?}");
     }
 
     #[test]

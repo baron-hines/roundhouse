@@ -527,6 +527,11 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
     let base = "class BaseSerializer < ActiveModel::Serializer\n  attributes :id\nend\n\n";
     for (body, expected, refused) in [
         ("class ASerializer < BaseSerializer\n  attributes :display\nend\n", "an attribute named `display`", &["ASerializer"][..]),
+        ("class ASerializer < BaseSerializer\n  has_one :thing\nend\n\nclass Thing\n  def\tactive_model_serializer\n    BaseSerializer\n  end\nend\n", "defines its own `active_model_serializer`", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\nend\n\nclass Thing\n  define_method(\"read_attribute_for_serialization\") { |name| \"masked\" }\nend\n", "its own `read_attribute_for_serialization`", &["ASerializer", "BaseSerializer"]),
+        ("class ASerializer < BaseSerializer\n  FIELDS = [:title]\n  FIELDS = [].freeze\n  attributes(*FIELDS)\nend\n", "`attributes` takes Symbols and a Hash of keys", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  def self.fields(*names)\n    attributes(*names)\n  end\n\n  def self.fields(*names)\n  end\n\n  fields :title\nend\n", "the macro `fields` is defined more than once", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  def initialize(object, options = {})\n    super\n    @shared = options[:hash]\n  end\nend\n", "`[](:hash)`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  cached\nend\n", "`cached` is outside", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :author, serializer: BaseSerializer, polymorphic: true\nend\n", "`polymorphic:` is outside", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :author, serializer: BaseSerializer, if: check\nend\n", "`if:` is outside", &["ASerializer"]),
@@ -643,4 +648,36 @@ fn an_active_model_serializer_08_needs_the_08_lockfile() {
     let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
     let a = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "ASerializer").expect("ASerializer");
     assert!(matches!(a.origin, Some(roundhouse::dialect::LibraryClassOrigin::ActiveModelSerializer { .. })), "{:?}", a.origin);
+}
+
+/// A child's `super` in `initialize` reaches its parent's own `initialize` where the parent defines one; only the
+/// class whose `super` is the gem's constructor calls the expansion's.
+#[test]
+fn an_active_model_serializer_08_child_initialize_keeps_its_parent_s() {
+    let tree = tree("class BaseSerializer < ActiveModel::Serializer\n  attributes :id\n\n  def initialize(object, options = {})\n    super\n    @label = \"base\"\n  end\nend\n\nclass ASerializer < BaseSerializer\n  def initialize(object, options = {})\n    super\n    @mine = true\n  end\nend\n");
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let body = |class: &str| {
+        let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == class).expect(class);
+        format!("{:?}", lc.methods.iter().find(|m| m.name.as_str() == "initialize").expect("initialize").body)
+    };
+    assert!(body("BaseSerializer").contains("ams_initialize"), "{}", body("BaseSerializer"));
+    assert!(!body("ASerializer").contains("ams_initialize") && body("ASerializer").contains("Super"), "{}", body("ASerializer"));
+}
+
+/// `ArraySerializer.new(xs, opts).as_json` lowers to the serializer `opts[:each_serializer]` holds, not after a
+/// compound write changed it, and not when `opts` is read again (the gem writes `:hash` into it).
+#[test]
+fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_nothing_else_sees_it() {
+    let serializers = "class ASerializer < ActiveModel::Serializer\n  attributes :id\nend\n\nclass BSerializer < ActiveModel::Serializer\n  attributes :id\nend\n";
+    let lowered = |action: &str| {
+        let mut files = tree(serializers);
+        files.insert("app/controllers/things_controller.rb".into(), format!("class ThingsController < ApplicationController\n  def index\n    xs = []\n    opts = {{}}\n    opts[:each_serializer] = ASerializer\n{action}  end\nend\n").into_bytes());
+        files.insert("app/controllers/application_controller.rb".into(), b"class ApplicationController < ActionController::Base\nend\n".to_vec());
+        let app = roundhouse::ingest::ingest_app_from_tree(files).expect("ingest");
+        let c = app.controllers.iter().find(|c| c.name.0.as_str() == "ThingsController").expect("controller");
+        format!("{:?}", c.actions().find(|a| a.name.as_str() == "index").expect("index").body).contains("ams_array_as_json")
+    };
+    assert!(lowered("    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
+    assert!(!lowered("    opts[:each_serializer] &&= BSerializer\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
+    assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: opts[:hash] }\n"));
 }

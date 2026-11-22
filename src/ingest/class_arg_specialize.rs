@@ -26,6 +26,10 @@ pub(super) fn specialize(app: &mut crate::App) {
         .chain(app.models.iter().map(|m| m.name.0.as_str().to_string()))
         .collect();
     let mut made: HashSet<(String, String)> = HashSet::default();
+    // (method, slot it removes, class) → the copy's name, and back: `A::B` and `A_B` spell one suffix, so the name is allocated, not derived.
+    let mut names: HashMap<(String, Option<usize>, String), String> = HashMap::default();
+    let mut class_of_copy: HashMap<String, String> = HashMap::default();
+    let taken: HashSet<String> = app.controllers.iter().flat_map(|c| c.actions().map(|a| a.name.as_str().to_string())).collect();
     let mut originals: HashSet<(usize, String)> = HashSet::default();
     // A copy's body hands the class on (`serialize_data(obj, PostSerializer, opts)`), which the next round copies.
     for _ in 0..8 {
@@ -52,22 +56,31 @@ pub(super) fn specialize(app: &mut crate::App) {
             }
             None
         };
+        // A call the class's subclasses override is not renamed: on one of them, `build(S)` reaches their `build`.
+        let overridden = |owner: &str, name: &str| -> bool {
+            app.controllers.iter().any(|c| {
+                let mut current = c.name.0.as_str().to_string();
+                for _ in 0..16 {
+                    let Some(parent) = parents.get(&current) else { return false };
+                    if parent == owner {
+                        return c.actions().any(|a| a.name.as_str() == name);
+                    }
+                    current = parent.clone();
+                }
+                false
+            })
+        };
         // (controller, method, the parameter the class replaces or none, class): a site passing the class, or one
         // handing on what a copy for the class answers (`render_json_dump(serialize_data__PostSerializer(obj))`),
         // whose callee then sees that copy's type alone.
-        let suffixes: HashMap<String, String> = made.iter().filter_map(|(_, copy)| {
-            let (_, suffix) = copy.rsplit_once("__")?;
-            classes.iter().find(|c| c.replace("::", "_") == suffix).map(|c| (suffix.to_string(), c.clone()))
-        }).collect();
-        let handed = |args: &[Expr]| -> Option<String> {
+        let handed = |class_of_copy: &HashMap<String, String>, args: &[Expr]| -> Option<String> {
             let mut found: Option<String> = None;
             for arg in args {
                 let ExprNode::Send { recv, method, .. } = &*arg.node else { continue };
                 if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
                     continue;
                 }
-                let Some((_, suffix)) = method.as_str().rsplit_once("__") else { continue };
-                let Some(class) = suffixes.get(suffix) else { continue };
+                let Some(class) = class_of_copy.get(method.as_str()) else { continue };
                 if found.as_ref().is_some_and(|f| f != class) {
                     return None;
                 }
@@ -76,18 +89,22 @@ pub(super) fn specialize(app: &mut crate::App) {
             found
         };
         let mut wanted: Vec<(usize, String, Option<usize>, String)> = Vec::new();
-        let mut rewrites: Vec<(usize, usize)> = Vec::new();
+        let mut rewrites: Vec<(usize, usize, HashSet<(String, usize, Option<usize>, String)>)> = Vec::new();
         for (ci, controller) in app.controllers.iter().enumerate() {
             let owner = controller.name.0.as_str();
             for (ai, item) in controller.body.iter().enumerate() {
                 let ControllerBodyItem::Action { action, .. } = item else { continue };
                 let mut sites = Vec::new();
                 find_sites(&action.body, &mut |method, args| {
-                    if method.contains("__") {
+                    if method.contains("__") || overridden(owner, method) {
                         return;
                     }
                     let Some(target) = resolve(owner, method) else { return };
                     for (k, arg) in args.iter().enumerate() {
+                        // Not past a splat: which formal a later argument binds is known only when it runs.
+                        if matches!(&*arg.node, ExprNode::Splat { .. } | ExprNode::ForwardArgs) {
+                            break;
+                        }
                         if !candidates.contains(&(target, method.to_string(), k)) {
                             continue;
                         }
@@ -96,45 +113,62 @@ pub(super) fn specialize(app: &mut crate::App) {
                         sites.push((target, method.to_string(), Some(k), class));
                         return;
                     }
-                    if let Some(class) = handed(args) {
+                    if let Some(class) = handed(&class_of_copy, args) {
                         sites.push((target, method.to_string(), None, class));
                     }
                 });
                 if !sites.is_empty() {
+                    let exact = sites.iter().map(|(t, m, k, c)| (m.clone(), *t, *k, c.clone())).collect();
                     wanted.extend(sites);
-                    rewrites.push((ci, ai));
+                    rewrites.push((ci, ai, exact));
                 }
             }
         }
         if rewrites.is_empty() {
             break;
         }
+        for (_, method, k, class) in &wanted {
+            let key = (method.clone(), *k, class.clone());
+            if names.contains_key(&key) {
+                continue;
+            }
+            let base = format!("{method}__{}", class.replace("::", "_"));
+            let mut name = base.clone();
+            let mut n = 2;
+            while taken.contains(&name) || class_of_copy.contains_key(&name) {
+                name = format!("{base}_{n}");
+                n += 1;
+            }
+            class_of_copy.insert(name.clone(), class.clone());
+            names.insert(key, name);
+        }
         // The sites first: a copy inserted into a body moves the items after it.
-        for (ci, ai) in rewrites {
+        for (ci, ai, exact) in rewrites {
             let owner = app.controllers[ci].name.0.as_str().to_string();
-            // Only what this round copies: a handed site whose argument this round renamed waits for the next.
-            let targets: HashSet<(String, Option<usize>, String)> = wanted.iter().map(|(_, m, k, c)| (m.clone(), *k, c.clone())).collect();
+            // The controller each renamed method resolves to here: two controllers' `build(S)` are two copies' sites.
+            let resolved: HashMap<String, usize> = exact.iter().map(|(m, t, _, _)| (m.clone(), *t)).collect();
             let ControllerBodyItem::Action { action, .. } = &mut app.controllers[ci].body[ai] else { continue };
             rewrite_sites(&mut action.body, &mut |method, args| {
-                if method.contains("__") {
-                    return None;
-                }
+                let &target = resolved.get(method)?;
                 for (k, arg) in args.iter().enumerate() {
+                    if matches!(&*arg.node, ExprNode::Splat { .. } | ExprNode::ForwardArgs) {
+                        break;
+                    }
                     let ExprNode::Const { path } = &*arg.node else { continue };
                     let Some(class) = resolve_const(path, &owner, &classes) else { continue };
-                    if !targets.contains(&(method.to_string(), Some(k), class.clone())) {
+                    if !exact.contains(&(method.to_string(), target, Some(k), class.clone())) {
                         continue;
                     }
                     let mut args = args.to_vec();
                     args.remove(k);
-                    return Some((copy_name(method, &class), args));
+                    return Some((names[&(method.to_string(), Some(k), class)].clone(), args));
                 }
-                let class = handed(args)?;
-                targets.contains(&(method.to_string(), None, class.clone())).then(|| (copy_name(method, &class), args.to_vec()))
+                let class = handed(&class_of_copy, args)?;
+                exact.contains(&(method.to_string(), target, None, class.clone())).then(|| (names[&(method.to_string(), None, class)].clone(), args.to_vec()))
             });
         }
         for (target, method, k, class) in &wanted {
-            let copy = copy_name(method, class);
+            let copy = names[&(method.clone(), *k, class.clone())].clone();
             if !made.insert((app.controllers[*target].name.0.as_str().to_string(), copy.clone())) {
                 continue;
             }
@@ -174,10 +208,6 @@ pub(super) fn specialize(app: &mut crate::App) {
     }
 }
 
-fn copy_name(method: &str, class: &str) -> String {
-    format!("{method}__{}", class.replace("::", "_"))
-}
-
 /// The class a constant written in `owner` names: its lexical scopes, then the top level.
 fn resolve_const(path: &[Symbol], owner: &str, classes: &HashSet<String>) -> Option<String> {
     let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
@@ -206,7 +236,10 @@ fn candidates(app: &crate::App) -> HashSet<(usize, String, usize)> {
             }
             for (k, param) in action.params.fields.keys().enumerate() {
                 let (total, ok) = uses(&action.body, param);
-                if total > 0 && total == ok && !assigned(&action.body, param) {
+                // Not one a default reads (`opts = { serializer: klass }`): the copy has no formal left for it.
+                let defaulted = action.opt_params.iter().map(|(_, d)| d).chain(action.kw_params.iter().filter_map(|(_, d)| d.as_ref()))
+                    .any(|d| uses(d, param).0 > 0);
+                if total > 0 && total == ok && !defaulted && !assigned(&action.body, param) {
                     out.insert((ci, action.name.as_str().to_string(), k));
                 }
             }

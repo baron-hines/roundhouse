@@ -299,7 +299,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
             })
             .collect();
         pairs.sort_by(|a, b| depth(&b.0).cmp(&depth(&a.0)).then(a.0.cmp(&b.0)));
-        match sources.iter().find(|s| s.text.contains("def active_model_serializer") || s.text.contains("def self.active_model_serializer")) {
+        match sources.iter().find(|s| s.text.contains("active_model_serializer") && defines_method(s, "active_model_serializer")) {
             Some(_) => (None, "an association without `serializer:`, where the app defines its own `active_model_serializer`".to_string()),
             None => (Some(pairs), String::new()),
         }
@@ -504,7 +504,9 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         let src = synthesize(name, &chains[name], &owns, &flats[name]);
         let Some(index) = app.library_classes.iter().position(|c| c.name.0.as_str() == name) else { continue };
         let before = app.library_classes[index].clone();
-        if let Err(e) = install(&mut app.library_classes[index], &src, owns[name].span, chains[name].len() == 1) {
+        // An ancestor's own `initialize` is what the class's `super` reaches, not the gem's constructor.
+        let inherits_initialize = chains[name].iter().take_while(|a| *a != name).any(|a| owns[a].defs.iter().any(|d| d.name == "initialize"));
+        if let Err(e) = install(&mut app.library_classes[index], &src, owns[name].span, chains[name].len() == 1, inherits_initialize) {
             app.library_classes[index] = before;
             failed.insert(name.clone());
             if !super::survey::is_active() {
@@ -546,6 +548,41 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         app.library_classes.retain(|c| c.name.0.as_str() != SERIALIZER);
     }
     Ok(())
+}
+
+/// A method name written as a Symbol or a String (`define_method("x")`).
+fn method_name_value(node: &ruby_prism::Node<'_>) -> Option<String> {
+    symbol_value(node).or_else(|| node.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+}
+
+/// Whether `source` defines a method `name` anywhere, on either side: a `def` however spaced or wrapped, an `alias`,
+/// or an `alias_method` / `define_method` / `define_singleton_method` naming it.
+fn defines_method(source: &SourceFile, name: &str) -> bool {
+    struct Find<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Find<'_> {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.found |= constant_id_str(&node.name()) == self.name;
+            ruby_prism::visit_def_node(self, node);
+        }
+        fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
+            self.found |= method_name_value(&node.new_name()).as_deref() == Some(self.name);
+            ruby_prism::visit_alias_method_node(self, node);
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if matches!(constant_id_str(&node.name()), "alias_method" | "define_method" | "define_singleton_method") {
+                let first = node.arguments().and_then(|a| a.arguments().iter().next());
+                self.found |= first.as_ref().and_then(method_name_value).as_deref() == Some(self.name);
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let parsed = super::prism::parse_silent(source.text.as_bytes());
+    let mut find = Find { name, found: false };
+    ruby_prism::Visit::visit(&mut find, &parsed.node());
+    find.found
 }
 
 /// Where `source` defines a `read_attribute_for_serialization` other than one that sends the name, as Active Record's
@@ -601,8 +638,8 @@ fn own_serialization_reader<'s>(source: &'s SourceFile, tree: &HashSet<String>) 
             let method = constant_id_str(&node.name());
             if matches!(method, "alias_method" | "define_method") {
                 let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
-                if args.first().and_then(symbol_value).as_deref() == Some(NAME) {
-                    let sends = method == "alias_method" && args.get(1).and_then(symbol_value).is_some_and(|o| SENDS.contains(&o.as_str()));
+                if args.first().and_then(method_name_value).as_deref() == Some(NAME) {
+                    let sends = method == "alias_method" && args.get(1).and_then(method_name_value).is_some_and(|o| SENDS.contains(&o.as_str()));
                     self.found.push((node.location().start_offset(), sends));
                 }
             }
@@ -771,10 +808,13 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             ctx.defs.push(Def { name: method, at, visible: ctx.visible, supers: calls.supers, from_module: matches!(mode, Mode::Module) });
             continue;
         }
-        if let Some(w) = stmt.as_constant_write_node()
-            && let Some(names) = symbol_list(&w.value())
-        {
-            ctx.lists.insert(constant_id_str(&w.name()).to_string(), names);
+        // Every write replaces the list: `FIELDS = [].freeze` after `FIELDS = [:title]` declares nothing.
+        if let Some(w) = stmt.as_constant_write_node() {
+            let name = constant_id_str(&w.name()).to_string();
+            match symbol_list(&w.value()) {
+                Some(names) => ctx.lists.insert(name, names),
+                None => ctx.lists.remove(&name),
+            };
         }
         if !matches!(mode, Mode::Hook(_))
             && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_constant_write_node().is_some())
@@ -1236,11 +1276,13 @@ fn expand_macro(ctx: &mut Walk<'_>, method: &str, class: &str, index: usize, nam
         return Err(refuse(source, 0, "the macro's class is not found"));
     };
     let stmts = node.body().map(flatten_statements).unwrap_or_default();
-    let Some(def) = stmts
-        .iter()
-        .filter_map(|s| s.as_def_node())
-        .find(|d| d.receiver().is_some() && constant_id_str(&d.name()) == method)
-    else {
+    let defs: Vec<_> = stmts.iter().filter_map(|s| s.as_def_node()).filter(|d| d.receiver().is_some() && constant_id_str(&d.name()) == method).collect();
+    // Not the first of several: which one a call runs depends on where it sits among them.
+    let openings = ctx.macros.get(method).map_or(0, |found| found.iter().filter(|(c, _)| c == class).count());
+    if defs.len() > 1 || openings > 1 {
+        return Err(refuse(source, 0, &format!("the macro `{method}` is defined more than once")));
+    }
+    let Some(def) = defs.into_iter().next() else {
         return Err(refuse(source, 0, "the macro's `def` is not found"));
     };
     // `add_compared_field :wiki`: the body runs as a loop's would, its parameter the one name.
@@ -1795,6 +1837,14 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         if self.found.is_none() && on_self && (GEM_ONLY.contains(&name) || name.starts_with("ams_")) {
             self.found = Some((name.to_string(), node.location().start_offset()));
         }
+        // The gem's `as_json` writes these into the options a serializer is built with; the expansion holds them apart.
+        let first = node.arguments().and_then(|a| a.arguments().iter().next());
+        if self.found.is_none()
+            && matches!(name, "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" | "values_at" | "slice" | "except")
+            && first.as_ref().and_then(symbol_value).is_some_and(|k| matches!(k.as_str(), "hash" | "unique_values"))
+        {
+            self.found = Some((format!("{name}(:{})", first.as_ref().and_then(symbol_value).unwrap_or_default()), node.location().start_offset()));
+        }
         ruby_prism::visit_call_node(self, node);
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
@@ -2037,7 +2087,7 @@ const ROOT_API: &[(&str, &str)] = &[
     ("ams_merge", "  def ams_merge(side, key, serializables)\n    unique = (@ams_unique ||= {})\n    seen = (unique[key] ||= {})\n    list = (side[key] ||= [])\n    serializables.each do |serializable|\n      unless seen.include?(serializable.object)\n        seen[serializable.object] = true\n        list << serializable.serializable_hash\n      end\n    end\n  end\n"),
 ];
 
-fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> IngestResult<()> {
+fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool, inherits_initialize: bool) -> IngestResult<()> {
     let (parsed, diags) = super::prism::scope(|| super::ingest_library_classes(src.as_bytes(), "<active_model_serializers>"));
     let mut parsed = parsed?;
     if !diags.is_empty() || parsed.is_empty() {
@@ -2058,7 +2108,7 @@ fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool) -> Inges
     class.methods.append(&mut methods);
     // An own `initialize`'s `super` is the gem's constructor, which `ams_initialize` is here: it writes the class's
     // own ivars, so each class types its record apart.
-    for method in class.methods.iter_mut().filter(|m| m.name.as_str() == "initialize" && m.receiver == crate::dialect::MethodReceiver::Instance) {
+    for method in class.methods.iter_mut().filter(|m| !inherits_initialize && m.name.as_str() == "initialize" && m.receiver == crate::dialect::MethodReceiver::Instance) {
         let params: Vec<Symbol> = method.params.iter().map(|p| p.name.clone()).collect();
         fn bare_super(e: &Expr) -> bool {
             let mut found = matches!(&*e.node, ExprNode::Super { args: None });
@@ -2108,12 +2158,20 @@ fn each_serializer_write(e: &Expr) -> Option<(String, String)> {
         .then(|| (name.as_str().to_string(), path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")))
 }
 
+fn local_reads(e: &Expr, out: &mut HashSet<String>) {
+    if let ExprNode::Var { name, .. } = &*e.node {
+        out.insert(name.as_str().to_string());
+    }
+    e.node.for_each_child(&mut |c| local_reads(c, out));
+}
+
 /// Whether `e` rebinds `local` or writes into it other than a constant `each_serializer:`.
 fn writes_local(e: &Expr, local: &str) -> bool {
     let here = match &*e.node {
         ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. }
         | ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } => name.as_str() == local,
-        ExprNode::Assign { target: crate::expr::LValue::Index { recv, .. }, .. } => {
+        ExprNode::Assign { target: crate::expr::LValue::Index { recv, .. }, .. }
+        | ExprNode::OpAssign { target: crate::expr::LValue::Index { recv, .. }, .. } => {
             matches!(&*recv.node, ExprNode::Var { name, .. } if name.as_str() == local)
         }
         ExprNode::Send { recv: Some(r), method, .. } => {
@@ -2132,16 +2190,21 @@ fn writes_local(e: &Expr, local: &str) -> bool {
 /// serializer written as a constant; the options, `each_serializer:`
 /// among them, reach each item's serializer as the gem passes them.
 fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
-    rewrite_arrays_in(expr, done, &HashMap::default());
+    rewrite_arrays_in(expr, done, &HashMap::default(), &HashSet::default());
 }
 
 /// `locals`: the options locals an earlier statement gave a constant `each_serializer:` (`opts[:each_serializer] = S`),
-/// which no statement since has written over.
-fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<String, String>) {
+/// which no statement since has written over. `read_after`: the locals a later statement reads.
+fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<String, String>, read_after: &HashSet<String>) {
     if let ExprNode::Seq { exprs } = &mut *expr.node {
         let mut known = locals.clone();
-        for e in exprs.iter_mut() {
-            rewrite_arrays_in(e, done, &known);
+        for i in 0..exprs.len() {
+            let mut after = read_after.clone();
+            for later in &exprs[i + 1..] {
+                local_reads(later, &mut after);
+            }
+            rewrite_arrays_in(&mut exprs[i], done, &known, &after);
+            let e = &exprs[i];
             if let Some((local, class)) = each_serializer_write(e) {
                 known.insert(local, class);
             } else {
@@ -2150,7 +2213,15 @@ fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<S
         }
         return;
     }
-    expr.node.for_each_child_mut(&mut |c| rewrite_arrays_in(c, done, locals));
+    // Not a loop body's: a read before the call in the source may run after it.
+    let looping = matches!(&*expr.node, ExprNode::While { .. }) || matches!(&*expr.node, ExprNode::Lambda { .. });
+    if looping {
+        let mut after = read_after.clone();
+        local_reads(expr, &mut after);
+        expr.node.for_each_child_mut(&mut |c| rewrite_arrays_in(c, done, locals, &after));
+    } else {
+        expr.node.for_each_child_mut(&mut |c| rewrite_arrays_in(c, done, locals, read_after));
+    }
     let ExprNode::Send { recv: Some(array), method, args, block: None, .. } = &*expr.node else { return };
     if method.as_str() != "as_json" || !args.is_empty() {
         return;
@@ -2165,7 +2236,8 @@ fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<S
     let mut serializer = None;
     let entries = match &*options.node {
         ExprNode::Hash { entries, .. } => entries.as_slice(),
-        ExprNode::Var { name, .. } => {
+        // Not one read again: the gem's `as_json` writes `:hash` and `:unique_values` into it, the expansion does not.
+        ExprNode::Var { name, .. } if !read_after.contains(name.as_str()) => {
             serializer = locals.get(name.as_str()).cloned();
             &[]
         }
