@@ -22,8 +22,7 @@ use crate::ty::Ty;
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
 /// An empty `{}` / `[]` seed whose type a later write in its body refined and stamped back: the next analysis of
-/// the body starts it from the seed again, as the stamp carries what that pass's writes held, untyped arms of an
-/// earlier round's ivars among them.
+/// the body starts it from that stamp less its unknown arms, which an earlier round's untyped ivars left there.
 pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;

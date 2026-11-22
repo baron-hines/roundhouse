@@ -4329,20 +4329,14 @@ impl<'a> BodyTyper<'a> {
                         last = unknown();
                     }
                     let e = &mut exprs[i];
-                    // A seed this body's writes refined before starts from the seed again: its stamp holds what the
-                    // writes held then, an earlier round's untyped arms among them, which joining would keep.
+                    // Not restarted from the bare seed: the writes in a block refine it only after the reads this pass makes.
                     if let ExprNode::Assign { value, .. } = &*e.node
                         && value.decisions & crate::expr::REFINED_EMPTY_SEED != 0
+                        && matches!(&*value.node, ExprNode::Hash { entries, .. } if entries.is_empty())
+                            | matches!(&*value.node, ExprNode::Array { elements, .. } if elements.is_empty())
+                        && let Some(t) = &e.ty
                     {
-                        match &*value.node {
-                            ExprNode::Hash { entries, .. } if entries.is_empty() => {
-                                e.ty = Some(Ty::Hash { key: std::sync::Arc::new(unknown()), value: std::sync::Arc::new(unknown()) });
-                            }
-                            ExprNode::Array { elements, .. } if elements.is_empty() => {
-                                e.ty = Some(Ty::Array { elem: std::sync::Arc::new(unknown()) });
-                            }
-                            _ => {}
-                        }
+                        e.ty = Some(without_unknown_arms(t));
                     }
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
@@ -5163,6 +5157,26 @@ fn kernel_array_elem(arg: &Ty) -> Option<Ty> {
         // anything Enumerable), which `Array()` then unpacks.
         Ty::Var { .. } | Ty::Untyped | Ty::Hash { .. } | Ty::Record { .. } | Ty::Class { .. } => None,
         scalar => Some(scalar.clone()),
+    }
+}
+
+/// A refined seed's stamp with the unresolved arms of its unions dropped: what an earlier round's untyped ivar
+/// contributed, which this pass's writes join back if they still hold it.
+fn without_unknown_arms(t: &Ty) -> Ty {
+    match t {
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(without_unknown_arms(key)), value: std::sync::Arc::new(without_unknown_arms(value)) },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(without_unknown_arms(elem)) },
+        // Not kept as `Untyped`, which absorbs what this pass's writes join onto it.
+        t if t.is_unknown() => unknown(),
+        Ty::Union { variants } => {
+            let mut kept: Vec<Ty> = variants.iter().filter(|v| !v.is_unknown()).map(without_unknown_arms).collect();
+            match kept.len() {
+                0 => unknown(),
+                1 => kept.pop().expect("one"),
+                _ => Ty::Union { variants: kept.into() },
+            }
+        }
+        _ => t.clone(),
     }
 }
 
