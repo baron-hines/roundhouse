@@ -62,6 +62,7 @@ mod dry_validation;
 mod representable;
 mod active_model_serializer;
 mod active_model_serializer_08;
+mod site_settings_yml;
 mod class_arg_specialize;
 mod action_cable_config;
 mod recurring_commands;
