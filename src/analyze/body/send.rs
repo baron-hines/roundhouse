@@ -1618,8 +1618,11 @@ impl<'a> BodyTyper<'a> {
         }
         // An app class under a core collection (discourse's `class Enum < Hash`): what its own chain does not define is
         // the core class's, over values the analysis does not follow.
+        // Not the class object's own calls (`Ordinal.name`), nor a method answering the receiver itself, which keeps its
+        // class (`freeze`, `tap`).
         if let Some(Ty::Class { id, .. }) = recv_ty
-            && method.as_str() != "new"
+            && instance_receiver
+            && !matches!(method.as_str(), "freeze" | "itself" | "tap" | "dup" | "clone")
             && let Some(core) = self.core_ancestor(id, method)
         {
             let as_core = match core {

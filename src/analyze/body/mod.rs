@@ -1663,12 +1663,14 @@ impl<'a> BodyTyper<'a> {
         }) {
             return None;
         }
-        match info.parent.as_ref()?.0.as_str().trim_start_matches("::") {
-            "Hash" => Some("Hash"),
-            "Array" => Some("Array"),
-            "String" => Some("String"),
-            _ => None,
-        }
+        let core = match info.parent.as_ref()?.0.as_str().trim_start_matches("::") {
+            "Hash" => "Hash",
+            "Array" => "Array",
+            "String" => "String",
+            _ => return None,
+        };
+        // A reopening of the core class that defines it (`class Hash; def label`) answers it, not the core table.
+        (!self.chain_defines(&ClassId(Symbol::from(core)), method)).then_some(core)
     }
 
     /// Whether a source definition of `method` is in `class`'s chain: itself, its parents, the modules they include.
@@ -4354,6 +4356,13 @@ impl<'a> BodyTyper<'a> {
                         exprs[i].ty = Some(unknown());
                         last = unknown();
                     }
+                    // Not stripped where a loop reads and writes it: a read there sees an earlier iteration's `Untyped` write.
+                    let looped_read = match &*exprs[i].node {
+                        ExprNode::Assign { target: LValue::Ivar { name } | LValue::Var { name, .. }, .. } => {
+                            exprs[i + 1..].iter().any(|later| read_in_repeated(later, name))
+                        }
+                        _ => false,
+                    };
                     let e = &mut exprs[i];
                     // Not restarted from the bare seed: the writes in a block refine it only after the reads this pass makes.
                     if let ExprNode::Assign { value, .. } = &*e.node
@@ -4362,7 +4371,7 @@ impl<'a> BodyTyper<'a> {
                             | matches!(&*value.node, ExprNode::Array { elements, .. } if elements.is_empty())
                         && let Some(t) = &e.ty
                     {
-                        e.ty = Some(without_unknown_arms(t));
+                        e.ty = Some(without_unknown_arms(t, !looped_read));
                     }
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
@@ -5188,16 +5197,18 @@ fn kernel_array_elem(arg: &Ty) -> Option<Ty> {
     }
 }
 
-/// A refined seed's stamp with the unresolved arms of its unions dropped: what an earlier round's untyped ivar
-/// contributed, which this pass's writes join back if they still hold it.
-fn without_unknown_arms(t: &Ty) -> Ty {
+/// A refined seed's stamp with the unresolved (`Var`) arms of its unions dropped: what an earlier round's
+/// not-yet-typed ivar contributed, which this pass's writes join back if they still hold it.
+/// With `untyped` too, the `Untyped` arms: an ivar a parameter writes reads untyped before its call sites are read,
+/// and the write that took it joins again this pass.
+fn without_unknown_arms(t: &Ty, untyped: bool) -> Ty {
+    let drop = |v: &Ty| matches!(v, Ty::Var { .. }) || (untyped && matches!(v, Ty::Untyped));
     match t {
-        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(without_unknown_arms(key)), value: std::sync::Arc::new(without_unknown_arms(value)) },
-        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(without_unknown_arms(elem)) },
-        // Not kept as `Untyped`, which absorbs what this pass's writes join onto it.
-        t if t.is_unknown() => unknown(),
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(without_unknown_arms(key, untyped)), value: std::sync::Arc::new(without_unknown_arms(value, untyped)) },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(without_unknown_arms(elem, untyped)) },
+        t if untyped && matches!(t, Ty::Untyped) => unknown(),
         Ty::Union { variants } => {
-            let mut kept: Vec<Ty> = variants.iter().filter(|v| !v.is_unknown()).map(without_unknown_arms).collect();
+            let mut kept: Vec<Ty> = variants.iter().filter(|v| !drop(v)).map(|v| without_unknown_arms(v, untyped)).collect();
             match kept.len() {
                 0 => unknown(),
                 1 => kept.pop().expect("one"),
@@ -5206,6 +5217,37 @@ fn without_unknown_arms(t: &Ty) -> Ty {
         }
         _ => t.clone(),
     }
+}
+
+/// Whether a block or loop in `e` both writes into `name` and reads it: a read there may see a write an earlier
+/// iteration made after it.
+fn read_in_repeated(e: &Expr, name: &Symbol) -> bool {
+    fn is_name(e: &Expr, name: &Symbol) -> bool {
+        matches!(&*e.node, ExprNode::Var { name: n, .. } | ExprNode::Ivar { name: n } if n == name)
+    }
+    fn writes(e: &Expr, name: &Symbol) -> bool {
+        let here = match &*e.node {
+            ExprNode::Assign { target: LValue::Index { recv, .. }, .. } | ExprNode::OpAssign { target: LValue::Index { recv, .. }, .. } => is_name(recv, name),
+            ExprNode::Send { recv: Some(r), method, .. } => {
+                is_name(r, name) && matches!(method.as_str(), "<<" | "push" | "append" | "unshift" | "prepend" | "concat" | "[]=" | "store" | "merge!" | "update" | "insert")
+            }
+            _ => false,
+        };
+        let mut found = here;
+        e.node.for_each_child(&mut |c| found |= writes(c, name));
+        found
+    }
+    fn reads(e: &Expr, name: &Symbol) -> bool {
+        let mut found = is_name(e, name);
+        e.node.for_each_child(&mut |c| found |= reads(c, name));
+        found
+    }
+    if matches!(&*e.node, ExprNode::Lambda { .. } | ExprNode::While { .. }) && writes(e, name) && reads(e, name) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found |= read_in_repeated(c, name));
+    found
 }
 
 pub(super) fn unknown() -> Ty {
@@ -9024,9 +9066,9 @@ fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) 
         match ty {
             Ty::Hash { key, value } => written(key) && written(value),
             Ty::Array { elem } => written(elem),
-            Ty::Nil => true,
             Ty::Union { variants } => variants.iter().all(splatted),
-            _ => false,
+            // Nil adds nothing, a scalar itself.
+            other => matches!(other, Ty::Nil) || written(other),
         }
     }
     // A literal by its elements: an empty `{}` or `[]` in it leaves an unresolved element in the literal's own type.

@@ -2265,8 +2265,15 @@ fn value_locals(e: &Expr, out: &mut HashSet<String>) {
 }
 
 fn local_reads(e: &Expr, out: &mut HashSet<String>) {
-    if let ExprNode::Var { name, .. } = &*e.node {
-        out.insert(name.as_str().to_string());
+    match &*e.node {
+        ExprNode::Var { name, .. } => {
+            out.insert(name.as_str().to_string());
+        }
+        // `opts ||= {}` reads `opts`, which its target, not a child, holds.
+        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } => {
+            out.insert(name.as_str().to_string());
+        }
+        _ => {}
     }
     e.node.for_each_child(&mut |c| local_reads(c, out));
 }
@@ -2368,7 +2375,16 @@ fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<S
     let entries = match &*options.node {
         ExprNode::Hash { entries, .. } => entries.as_slice(),
         // Not one read again: the gem's `as_json` writes `:hash` and `:unique_values` into it, the expansion does not.
-        ExprNode::Var { name, .. } if !read_after.contains(name.as_str()) => {
+        // Nor one the objects argument writes or hands on, which runs before the constructor reads it.
+        ExprNode::Var { name, .. }
+            if !read_after.contains(name.as_str())
+                && !writes_local(objects, name.as_str())
+                && !{
+                    let mut escaped = HashSet::default();
+                    escaped_locals(objects, &mut escaped);
+                    escaped.contains(name.as_str())
+                } =>
+        {
             serializer = locals.get(name.as_str()).cloned();
             &[]
         }

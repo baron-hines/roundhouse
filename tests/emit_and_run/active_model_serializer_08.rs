@@ -697,6 +697,8 @@ fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_no
     assert!(!lowered("    other = opts\n    other.merge!(each_serializer: BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    render json: { body: ActiveModel::ArraySerializer.new(xs, opts).as_json, shared: opts.fetch(:hash) }\n"));
     assert!(lowered("    render json: { body: ActiveModel::ArraySerializer.new(xs, opts).as_json, shared: 1 }\n"));
+    assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: (opts ||= {})[:hash] }\n"));
+    assert!(!lowered("    render json: ActiveModel::ArraySerializer.new((opts[:each_serializer] = BSerializer; xs), opts).as_json\n"));
     assert!(!lowered("@raw\n    other = opts\n    opts[:each_serializer] = ASerializer\n    other.merge!(each_serializer: BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: opts[:hash] }\n"));
 }

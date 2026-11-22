@@ -128,6 +128,8 @@ fn a_compound_statement_reading_the_outer_value_of_a_local_it_assigns_keeps_the_
         "  names = %w[title_limit]\n  if ENV[\"X\"].nil?\n    names = names.map { |n| n }\n    names.each { |n| setting(n, 40) }\n  end\n",
         "  name = \"title_limit\"\n  if ENV[\"X\"].nil?\n    ignored = ->(name) { name }\n    setting(name, 40)\n  end\n",
         "  name = \"title_limit\"\n  if ENV[\"X\"].nil?\n    name = \"other\" if ENV[\"Y\"]\n    setting(name, 40)\n  end\n",
+        "  name = \"title_limit\"\n  if ENV[\"X\"].nil?\n    f = ->(unused = (name = \"title_limit\")) { setting(name, 40) }\n    f.call(:provided)\n  end\n",
+        "  [:body_limit].each { |setting_name| setting(setting_name(), 40) }\n",
     ] {
         let errors = app().edit("app/models/article.rb", "  setting :title_limit, 40\n", body).check_errors();
         assert!(errors.iter().any(|e| e.contains("title_limit")), "{body}\n{errors:#?}");

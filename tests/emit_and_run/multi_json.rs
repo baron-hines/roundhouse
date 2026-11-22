@@ -433,3 +433,14 @@ fn multi_json_unmodeled_configurations_are_refused() {
     let tree = tree(&old_lock, "# nothing\n", "class Codec\n  def self.out\n    \"MultiJson\"\n  end\nend\n");
     assert!(roundhouse::ingest::ingest_app_from_tree(tree).is_ok());
 }
+
+/// A seed a loop both dumps and fills with a gradual value is refused at the dump: a later iteration dumps what an
+/// earlier one pushed.
+#[test]
+fn multi_json_dump_of_a_seed_a_loop_fills_with_untyped_is_refused() {
+    let lib = "class LoopDumped\n  def self.run(blobs)\n    items = []\n    blobs.each do |b|\n      MultiJson.dump(items)\n      items << Marshal.load(b)\n    end\n  end\n\n  def self.go\n    run([Marshal.dump(1)])\n  end\nend\n";
+    let (_emitted, errors) = overlay(emit_and_run::real_blog())
+        .write("lib/loop_dumped.rb", lib)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("MultiJson.dump") && e.contains("Array[untyped]")), "{errors:#?}");
+}

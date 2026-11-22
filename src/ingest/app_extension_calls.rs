@@ -379,7 +379,8 @@ fn initialized_reads(expr: &crate::expr::Expr, bound: &mut Vec<crate::ident::Sym
             b.extend(rest_param.iter().cloned());
             b.extend(block_param.iter().cloned());
             extra_params.iter().all(|p| {
-                let ok = p.default.as_ref().is_none_or(|d| initialized_reads(d, b));
+                // Not binding what a default assigns: a caller passing the argument skips it.
+                let ok = p.default.as_ref().is_none_or(|d| scoped(b, |b| initialized_reads(d, b)));
                 b.push(p.name.clone());
                 ok
             }) && initialized_reads(body, b)
