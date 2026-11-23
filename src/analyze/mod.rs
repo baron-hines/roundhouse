@@ -6934,7 +6934,7 @@ impl Analyzer {
             let Some(key) = key else { continue };
             // Not the placed row: keyword placement pads the slots a call leaves to their defaults with the same `Var`.
             let positional = arg_tys.len().saturating_sub(usize::from(kw_tys.group));
-            let shape = params_by_method.get(&key);
+            let shape = params_by_method.get(&key).or_else(|| self.included_param_shape(&key, params_by_method));
             for (i, t) in arg_tys.iter().take(positional).enumerate() {
                 // Not skipped without a shape: a concern's method keys to the includer, which has none, and its row folds into the module's.
                 let plain = shape.is_none_or(|s| s.slots.get(i).is_some_and(|(_, kind)| matches!(kind, ParamKind::Required | ParamKind::Optional)));
@@ -6967,6 +6967,60 @@ impl Analyzer {
             observations.push((key, arg_tys));
         }
         observations
+    }
+
+    /// The shape of the module `def` a call keyed to an includer reaches.
+    ///
+    /// A concern's method keys to the class that includes it, which
+    /// declares no `def` of its own and so has no row in `param_shapes`;
+    /// `fold_concern_param_sites` moves the row onto the module later.
+    /// Without the module's shape here, `place_keyword_args` left the
+    /// call's kwargs Hash where it sits, and `def label(name: nil,
+    /// pinned: false)` called `label(name: "x", pinned: true)` typed
+    /// `name` as `Hash[Symbol, (String | bool)]`.
+    ///
+    /// Searched the way the fold searches: the class's own includes and
+    /// its ancestors', module→module includes followed. `None` when no
+    /// module defines it, or when two that do disagree on the shape:
+    /// leaving the Hash where it is was the behaviour before.
+    fn included_param_shape<'a>(
+        &self,
+        key: &ParamKey,
+        params_by_method: &'a HashMap<ParamKey, ParamShape>,
+    ) -> Option<&'a ParamShape> {
+        let (class_id, method, side) = key;
+        let mut queue: Vec<ClassId> = Vec::new();
+        let mut cur = Some(class_id.clone());
+        let mut depth = 0;
+        while let Some(cid) = cur {
+            let Some(c) = self.classes.get(&cid) else { break };
+            queue.extend(c.includes.iter().cloned());
+            depth += 1;
+            if depth > 32 {
+                break;
+            }
+            cur = c.parent.clone();
+        }
+        let mut seen: BTreeSet<ClassId> = BTreeSet::new();
+        let mut found: Option<&'a ParamShape> = None;
+        let mut qi = 0;
+        while qi < queue.len() {
+            let m = queue[qi].clone();
+            qi += 1;
+            if !seen.insert(m.clone()) {
+                continue;
+            }
+            if let Some(shape) = params_by_method.get(&(m.clone(), method.clone(), *side)) {
+                match found {
+                    Some(prev) if prev != shape => return None,
+                    _ => found = Some(shape),
+                }
+            }
+            if let Some(ci) = self.classes.get(&m) {
+                queue.extend(ci.includes.iter().cloned());
+            }
+        }
+        found
     }
 
     /// The parameter row a call of `method` on `class_id` records under.
