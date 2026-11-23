@@ -148,7 +148,7 @@ module ActiveRecord
     def self._cast_primary_key: (Integer | Float | String | nil id) -> (Integer | String | nil)
     def self.connection: () -> Connection
     def self.lease_connection: () -> Connection
-    def self.with_connection: () { (Connection) -> untyped } -> untyped
+    def self.with_connection: (?prevent_permanent_checkout: bool) { (Connection) -> untyped } -> untyped
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
     def self.sanitize_sql_for_order: (String condition) -> String

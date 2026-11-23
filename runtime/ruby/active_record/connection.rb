@@ -800,7 +800,9 @@ module ActiveRecord
     # handle's slot, leased once, so each statement through it is on that
     # connection (a raw BEGIN carries to the next one). The block's value
     # is bound before the slot is left, so the Spinel binary keeps it.
-    def self.with_connection
+    # `prevent_permanent_checkout:` is taken and not read: it keeps a connection a block leases from staying the
+    # thread's after it, and this runtime's handle holds one slot only for the block.
+    def self.with_connection(prevent_permanent_checkout: false)
       handle = connection
       handle._hold_slot
       result = nil

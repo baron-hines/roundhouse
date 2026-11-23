@@ -166,6 +166,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         base.class_methods
             .entry(Symbol::from("connection"))
             .or_insert_with(connection_ty);
+        // runtime/ruby/active_record/connection.rb's: the handle, and the block's value with one held for it.
+        base.class_methods.entry(Symbol::from("lease_connection")).or_insert_with(connection_ty);
+        base.class_methods.entry(Symbol::from("with_connection")).or_insert(Ty::Untyped);
         base.class_methods.entry(Symbol::from("configurations")).or_insert(Ty::Untyped);
         base.class_methods.entry(Symbol::from("configurations=")).or_insert(Ty::Untyped);
         for m in ["sanitize_sql", "sanitize_sql_array", "sanitize_sql_for_order", "sanitize_sql_like"] {
