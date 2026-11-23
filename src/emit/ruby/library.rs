@@ -9686,13 +9686,9 @@ fn emit_library_class_decl_inner(
         (lc.constants[i].1.span.start, BodyItem::Constant(i, &lc.constants[i].1))
     }).collect();
     body.extend(lc.class_ivar_initializers.iter().filter(|init| {
-        // Source-ordered bodies interleave only real `@ivar` writes; keep
+        // Source-ordered bodies interleave only real `@ivar` and `@@cvar` writes; keep
         // synthetic mattr/cattr `@@` seeds on the partitioned path below.
-        !ordered_body || (!init.span.is_synthetic() && matches!(
-            &*init.node,
-            ExprNode::Assign { target: LValue::Ivar { .. }, .. }
-                | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
-        ))
+        !ordered_body || source_ordered_initializer(init)
     }).map(|init| {
         (key(&init.span), BodyItem::Initializer(init))
     }));
@@ -10456,15 +10452,7 @@ fn emit_library_class_decl_inner(
     // subclasses absent; `mattr_*` / `cattr_*` seeds are `@@` and share
     // across the hierarchy by Ruby class-variable rules. Source-ordered
     // `@ivar` writes already interleaved above; remaining seeds still run.
-    let remaining_inits = |init: &Expr| {
-        !ordered_body
-            || init.span.is_synthetic()
-            || !matches!(
-                &*init.node,
-                ExprNode::Assign { target: LValue::Ivar { .. }, .. }
-                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
-            )
-    };
+    let remaining_inits = |init: &Expr| !ordered_body || !source_ordered_initializer(init);
     if lc.class_ivar_initializers.iter().any(remaining_inits) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -14239,4 +14227,15 @@ fn contains_super(expr: &Expr) -> bool {
     let mut found = false;
     expr.node.for_each_child(&mut |child| found = found || contains_super(child));
     found
+}
+
+/// A class-body write a source-ordered body places where the source has it:
+/// a written `@ivar` or `@@cvar` assignment, not a synthesized seed.
+fn source_ordered_initializer(init: &Expr) -> bool {
+    !init.span.is_synthetic()
+        && match &*init.node {
+            ExprNode::Assign { target: LValue::Ivar { .. }, .. } | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. } => true,
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => name.as_str().starts_with("@@"),
+            _ => false,
+        }
 }

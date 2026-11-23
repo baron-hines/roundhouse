@@ -219,3 +219,67 @@ fn a_default_reads_its_methods_own_constant() {
     run.assert_passes();
     assert!(run.stdout.contains("default constant passed"), "{}", run.stdout);
 }
+
+/// discourse's `DiscoursePluginRegistry.define_register`: a plain class's
+/// own macro guards on `respond_to?` of the name it defines, records it in
+/// a class variable, aliases one singleton method under another name and
+/// yields itself when given a block. The guard answers as the class body
+/// sees it at that call, the record runs in the class body, and the alias
+/// is a copy of the method as the run defined it.
+const REGISTRY: &str = r##"class PluginRegistry
+  @@register_names = Set.new
+
+  def self.define_register(register_name, type)
+    return if respond_to?(register_name)
+    @@register_names << register_name
+
+    define_singleton_method(register_name) do
+      instance_variable_get(:"@#{register_name}") ||
+        instance_variable_set(:"@#{register_name}", type.new)
+    end
+
+    define_method(register_name) { self.class.public_send(register_name) }
+  end
+
+  def self.define_filtered_register(register_name)
+    return if respond_to?(register_name)
+    define_register(register_name, Array)
+
+    singleton_class.alias_method :"_raw_#{register_name}", :"#{register_name}"
+
+    define_singleton_method(register_name) do
+      public_send(:"_raw_#{register_name}").filter_map { |h| h[:value] if h[:enabled] }.uniq
+    end
+
+    define_singleton_method("register_#{register_name.to_s.singularize}") do |value, enabled|
+      public_send(:"_raw_#{register_name}") << { enabled: enabled, value: value }
+    end
+
+    yield(self) if block_given?
+  end
+
+  define_register :javascripts, Set
+  define_register :javascripts, Hash
+  define_filtered_register :stylesheets
+end
+"##;
+
+const REGISTRY_ASSERTIONS: &str = r##"PluginRegistry.javascripts << "a.js"
+PluginRegistry.register_stylesheet("x.css", true)
+PluginRegistry.register_stylesheet("y.css", false)
+PluginRegistry.register_stylesheet("x.css", true)
+got = [PluginRegistry.javascripts.to_a, PluginRegistry.new.javascripts.class.name, PluginRegistry.stylesheets, PluginRegistry._raw_stylesheets.size, PluginRegistry.class_variable_get(:@@register_names).to_a.map(&:to_s)]
+raise got.inspect unless got == [["a.js"], "Set", ["x.css"], 3, ["javascripts", "stylesheets"]]
+puts "registry macros passed"
+"##;
+
+fn registry_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write("app/models/plugin_registry.rb", REGISTRY)
+}
+
+#[test]
+fn a_registry_macro_guarded_on_respond_to_defines_its_methods() {
+    let (_emitted, errors) = registry_app().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    registry_app().run_ruby(REGISTRY_ASSERTIONS).assert_passes();
+}
