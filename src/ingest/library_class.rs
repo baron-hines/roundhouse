@@ -4350,6 +4350,16 @@ fn walk_decl_body_with_visibility<'pr>(
                     "include" => {
                         if let Some(args) = call.arguments() {
                             let args: Vec<_> = args.arguments().iter().collect();
+                            // Not the module's own include: in `class_methods do`, it is the ClassMethods module's.
+                            if matches!(mode, DeclBodyMode::ClassMethods)
+                                && !args.is_empty()
+                                && args.iter().all(|arg| constant_path_of(arg).is_some())
+                            {
+                                let mut expr = ingest_expr(&stmt, file)?;
+                                expr.decisions |= crate::expr::CLASS_METHODS_INCLUDE;
+                                out.unknown_calls.push(expr);
+                                continue;
+                            }
                             if matches!(mode, DeclBodyMode::SingletonClass { .. })
                                 && args.iter().all(|arg| constant_path_of(arg).is_some())
                             {

@@ -3542,6 +3542,7 @@ end
     super::channel_callbacks::lower_channel_callbacks(&mut app);
     super::channel_callbacks::lower_channel_names(&mut app);
     super::on_load_reopen::apply_pending(&mut app);
+    class_methods_includes(&mut app, &mut concern_class_method_spans);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     // After both splices: a concern's `included do self.table_name = compute_…` and the class method it calls are the model's now.
@@ -5296,6 +5297,86 @@ pub(super) fn concern_class_method_copy(
 /// copy is unreachable there rather than wrong (nothing calls
 /// `Message::Attachment.create_with_attachment!`). Removing it would
 /// mean rewriting library-class emit for no behavioural gain.
+/// A Concern's `class_methods do include M end` (discourse's `Service::Base`, whose `StepsHelpers` are the DSL every
+/// service calls in its body): M's instance methods become the Concern's class methods, carried onto each includer
+/// as its `class_methods` defs are. A def of the same name in the block wins, as ClassMethods' own does over M's. A
+/// module the program does not define stays the call it was, reported.
+fn class_methods_includes(app: &mut App, carriers: &mut Vec<ConcernClassMethodSpans>) {
+    use crate::dialect::MethodReceiver;
+    use crate::expr::ExprNode;
+    let modules: HashMap<String, Vec<crate::dialect::MethodDef>> = app
+        .library_classes
+        .iter()
+        .filter(|c| c.is_module)
+        .fold(HashMap::default(), |mut acc, c| {
+            acc.entry(c.name.0.as_str().to_string())
+                .or_insert_with(Vec::new)
+                .extend(c.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).cloned());
+            acc
+        });
+    for lc in app.library_classes.iter_mut().filter(|c| c.is_module) {
+        let mut kept = Vec::new();
+        for call in std::mem::take(&mut lc.unknown_calls) {
+            let ExprNode::Send { args, .. } = &*call.node else { kept.push(call); continue };
+            if call.decisions & crate::expr::CLASS_METHODS_INCLUDE == 0 {
+                kept.push(call);
+                continue;
+            }
+            // Lexically, innermost first: `M` in `module A::B` is `A::B::M`, then `A::M`, then `M`.
+            let resolved: Option<Vec<String>> = args
+                .iter()
+                .map(|arg| {
+                    let ExprNode::Const { path } = &*arg.node else { return None };
+                    let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                    if path.first().is_some_and(|s| s.as_str().is_empty()) {
+                        return modules.contains_key(&written).then_some(written);
+                    }
+                    let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
+                    (0..=scope.len()).rev().map(|n| scope[..n].iter().copied().chain(std::iter::once(written.as_str())).collect::<Vec<_>>().join("::")).find(|c| modules.contains_key(c))
+                })
+                .collect();
+            let Some(resolved) = resolved else {
+                super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                    call.span,
+                    None,
+                    "class_methods include",
+                    "an `include` in `class_methods do` of a module this program does not define is not modeled; its methods are not the includer's class methods".to_string(),
+                ));
+                continue;
+            };
+            let carrier_index = match carriers.iter().position(|c| c.owner == lc.name) {
+                Some(i) => i,
+                None => {
+                    carriers.push(ConcernClassMethodSpans {
+                        owner: lc.name.clone(),
+                        methods: Vec::new(),
+                        bridges: Vec::new(),
+                        has_nested_carrier: false,
+                        concern_extensions: Vec::new(),
+                        concern_calls: Vec::new(),
+                        has_other_extensions: false,
+                        own_singleton: Vec::new(),
+                    });
+                    carriers.len() - 1
+                }
+            };
+            // Ruby's last include is searched first: a later module's method of a name wins over an earlier's.
+            for module in resolved.iter().rev() {
+                for method in &modules[module] {
+                    if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name == method.name) {
+                        continue;
+                    }
+                    let mut copy = method.clone();
+                    copy.receiver = MethodReceiver::Class;
+                    carriers[carrier_index].methods.push(copy.name_span);
+                    lc.methods.push(copy);
+                }
+            }
+        }
+        lc.unknown_calls = kept;
+    }
+}
+
 fn splice_concern_class_methods_into_includers(
     app: &mut App,
     carriers: &[ConcernClassMethodSpans],
