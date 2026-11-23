@@ -3567,7 +3567,15 @@ fn target_files_lent(
         return futamura_target_files(app, fixture, None);
     }
     rack_mounts::check_target(app, target)?;
-    let refusals = crate::gems::extension_gem_refusals(app, Some(target.as_str()));
+    // A Rails plugin inferred from the lockfile is analysis's error, which
+    // `--allow-unsupported` downgrades; only these refuse the whole target.
+    // Roda converts the ingest-shape app and runs no type analysis, so no
+    // analysis error reports the reference there: the boundary refuses it.
+    let refusals = if target == BuildTarget::Roda {
+        crate::gems::extension_gem_refusals(app, Some(target.as_str()))
+    } else {
+        crate::gems::extension_gem_boundary_refusals(app, target.as_str())
+    };
     if !refusals.is_empty() {
         let message = refusals.iter().map(|diagnostic| diagnostic.message.as_str()).collect::<Vec<_>>().join("\n");
         for diagnostic in refusals {

@@ -1578,6 +1578,8 @@ enum Owner<'a> {
 struct Refuser<'a> {
     app: &'a crate::App,
     target: Option<&'a str>,
+    /// Whether a `rails_dependent` row inferred from the lockfile owns a path.
+    inferred: bool,
     app_owned: AppConstants,
     owners: std::cell::RefCell<crate::det::HashMap<String, Owner<'a>>>,
 }
@@ -1589,6 +1591,7 @@ impl<'a> Refuser<'a> {
         }
         let app = self.app;
         let owner = if let Some(row) = app.extensions.rails_dependent.iter()
+            .filter(|row| self.inferred || !row.inferred)
             .find(|row| extension_owns_constant(app, &self.app_owned, &row.gem, path))
         {
             Owner::RailsDependent(row)
@@ -1608,6 +1611,19 @@ impl<'a> Refuser<'a> {
 /// Extension-owned constants need both their declared type and a runtime.
 /// `None` checks source analysis; a target also checks native availability.
 pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, target, true)
+}
+
+/// The [`extension_gem_refusals`] that refuse a whole target: not a
+/// `rails_dependent` row inferred from the lockfile (a gem that depends on
+/// railties), whose references analysis reports as errors that
+/// `--allow-unsupported` downgrades, but a row a project extension writes
+/// and a target's native-gem refusals (#2280).
+pub(crate) fn extension_gem_boundary_refusals(app: &crate::App, target: &str) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, Some(target), false)
+}
+
+fn gem_refusals(app: &crate::App, target: Option<&str>, inferred: bool) -> Vec<crate::diagnostic::Diagnostic> {
     use crate::diagnostic::Diagnostic;
     use crate::expr::{Expr, ExprNode};
     use crate::span::Span;
@@ -1659,7 +1675,7 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
         }
         expr.node.for_each_child(&mut |child| visit(child, refuser, defined, out));
     }
-    let refuser = Refuser { app, target, app_owned: AppConstants::of(app), owners: Default::default() };
+    let refuser = Refuser { app, target, inferred, app_owned: AppConstants::of(app), owners: Default::default() };
     let mut out = Vec::new();
     let resolver = app.const_resolver.for_sources(&app.sources);
     let defined = |span, path: &[crate::ident::Symbol]| resolver.has_definition(span, path);
