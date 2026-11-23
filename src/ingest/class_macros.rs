@@ -336,7 +336,9 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
         });
         // The class side is known only where every `extend` names a module of the program's, and no included module may
         // add class methods (a hook, a `ClassMethods`, a Concern's `class_methods`): `respond_to?` of another name is false.
+        // Nor past a model, whose class side is Rails' as well as the program's.
         let class_side_known = known_root
+            && !lineage.iter().any(|id| app.models.iter().any(|m| &m.name == id))
             && lineage.iter().flat_map(|id| app.library_classes.iter().filter(move |c| &c.name == id)).all(|c| {
                 extended_modules(c, &module_methods).len() == extend_candidates(c).len()
                     && c.includes.iter().all(|inc| {
