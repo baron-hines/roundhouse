@@ -464,18 +464,18 @@ fn from_permitted(e: &Expr, helpers: &crate::det::HashSet<Symbol>) -> bool {
     let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return false };
     match method.as_str() {
         "permitted" => matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Params"),
-        // A Hash merged by name may bring String keys, which a String key argument names in Ruby, so the walk
-        // stops at a `merge` that takes anything but Hash literals with literal keys.
-        "merge" | "reverse_merge" | "with_defaults" => args.iter().all(is_literal_keyed_hash) && from_permitted(r, helpers),
+        // Any other merged Hash may bring String keys, which a String key argument names in Ruby, so the walk
+        // stops at a `merge` that takes anything but Hash literals with Symbol literal keys.
+        "merge" | "reverse_merge" | "with_defaults" => args.iter().all(is_symbol_keyed_hash) && from_permitted(r, helpers),
         "compact" | "compact_blank" | "except" | "slice" => from_permitted(r, helpers),
         _ => false,
     }
 }
 
-/// A Hash literal whose keys are all String or Symbol literals (`{ "a" => 1, b: 2 }`, no `**rest`).
-fn is_literal_keyed_hash(e: &Expr) -> bool {
+/// A Hash literal whose keys are all Symbol literals (`{ a: 1 }`; no String or computed key, no `**rest`).
+fn is_symbol_keyed_hash(e: &Expr) -> bool {
     let ExprNode::Hash { entries, .. } = &*e.node else { return false };
-    entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } }))
+    entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } }))
 }
 
 /// `x_params` or `self.x_params`, with no arguments and no block, naming one of `helpers`.
@@ -531,7 +531,7 @@ pub(crate) fn symbolize_permitted_helper_reads(expr: &mut Expr, helpers: &crate:
 /// `params.permit(%w[a b]).except("a")` → `.except(:a)`. Rails' Parameters take a String key as they take a Symbol,
 /// and the Hash `permit` lowered to holds Symbol keys, so a String key name on it is its Symbol: a String literal
 /// becomes the Symbol, `*%w[a]` becomes `*%i[a]`, another String `key.to_sym`, another splatted String Array
-/// `*keys.map { |x| x.to_sym }`, and a String-keyed Hash literal `merge` takes gets Symbol keys (#2279).
+/// `*keys.map { |x| x.to_sym }` (#2279). A Hash literal `merge` takes keeps its keys as written.
 fn symbolize_permitted_key_args(expr: &mut Expr, helpers: &crate::det::HashSet<Symbol>) {
     let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *expr.node else { return };
     if !from_permitted(r, helpers) {
@@ -545,20 +545,6 @@ fn symbolize_permitted_key_args(expr: &mut Expr, helpers: &crate::det::HashSet<S
                 && !matches!(&*first.node, ExprNode::Splat { .. })
             {
                 symbolize_key(first);
-            }
-        }
-        "merge" | "reverse_merge" | "with_defaults" => {
-            for arg in args.iter_mut() {
-                let ExprNode::Hash { entries, .. } = &mut *arg.node else { continue };
-                for (key, _) in entries.iter_mut() {
-                    symbolize_literal(key);
-                }
-                let all_symbols = entries.iter().all(|(k, _)| sym_name(k).is_some());
-                if let Some(Ty::Hash { key, .. }) = &mut arg.ty
-                    && all_symbols
-                {
-                    *key = std::sync::Arc::new(Ty::Sym);
-                }
             }
         }
         _ => {}
