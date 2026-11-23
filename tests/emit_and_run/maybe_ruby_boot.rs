@@ -127,6 +127,61 @@ fn core_value_constants_read_as_rubys() {
     assert!(run.stdout.contains("core constants passed"), "{}", run.stdout);
 }
 
+/// The same constants read in a view itself (maybe's `_progress_circle` partial: `circumference = Math::PI * 2 *
+/// radius`), where no Ruby source document answers the reference.
+#[test]
+fn core_value_constants_read_in_a_view() {
+    let run = emit_and_run::real_blog()
+        .write("app/views/articles/_circle.html.erb", "<%# locals: (radius: 7) %>\n<% circumference = Math::PI * 2 * radius %>\n<span id=\"circle\"><%= circumference.round(2) %></span>\n")
+        .edit("app/views/articles/index.html.erb", "<%= render @articles %>", "<%= render @articles %>\n<%= render \"articles/circle\", radius: 3 %>")
+        .run_ruby(r##"
+Article.create!(title: "Hello", body: "A body long enough for validation.")
+status, _h, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles", "rack.input" => StringIO.new(""))
+got = body.join[%r{<span id="circle">(.*?)</span>}m, 1]
+raise "status #{status}, circle #{got.inspect}" unless status == 200 && got == "18.85"
+puts "view constants passed"
+"##);
+    run.assert_passes();
+    assert!(run.stdout.contains("view constants passed"), "{}", run.stdout);
+}
+
+/// maybe's `entry.amount_money * -1` over a `Money?`: the class defines `*`, so Ruby multiplies when the value is
+/// there and raises only for nil, which the ruby family runs as written (a strict target reports it).
+#[test]
+fn an_operator_on_a_nilable_receiver_whose_class_defines_it_runs() {
+    let run = emit_and_run::real_blog()
+        .write("app/models/price.rb", "class Price\n  attr_reader :cents\n\n  def initialize(cents)\n    @cents = cents\n  end\n\n  def *(other)\n    Price.new(cents * other)\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  def price\n    title.present? ? Price.new(250) : nil\n  end\n\n  def doubled_cents\n    (price * 2).cents\n  end\n\n")
+        .run_ruby("a = Article.new(title: \"x\")\ngot = [a.doubled_cents]\nbegin\n  Article.new.doubled_cents\nrescue NoMethodError\n  got << :raised\nend\nraise \"got #{got.inspect}\" unless got == [500, :raised]\nputs \"nilable operator passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("nilable operator passed"), "{}", run.stdout);
+}
+
+/// maybe's `qty * avg_cost` (Float * Money): Float#* asks the Money to `coerce`, and Money's own `*` answers with
+/// a Money, as Ruby's numeric coercion protocol runs it.
+#[test]
+fn a_number_times_an_operand_that_coerces_is_the_operands_answer() {
+    let run = coerce_app().run_ruby(COERCE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("coerce passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_number_times_an_operand_that_coerces_on_spinel() {
+    let run = coerce_app().run_spinel_with_db(COERCE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("coerce passed"), "{}", run.stdout);
+}
+
+fn coerce_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write("app/models/price.rb", "class Price\n  Coerced = Struct.new(:value)\n\n  attr_reader :cents\n\n  def initialize(cents)\n    @cents = cents\n  end\n\n  def *(other)\n    value = other.is_a?(Coerced) ? other.value : other\n    Price.new(cents * value)\n  end\n\n  def coerce(other)\n    [self, Coerced.new(other)]\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  def totals\n    [(2.5 * Price.new(400)).cents, (3 * Price.new(400)).cents]\n  end\n\n")
+}
+
+const COERCE_SCRIPT: &str = "got = Article.new.totals\nraise \"got #{got.inspect}\" unless got == [1000.0, 1200]\nputs \"coerce passed\"\n";
+
 /// A branch that `include`s a nested module declared after the conditional, under a guard that asks for it, is
 /// skipped as Ruby skips it: the module is not written ahead of the guard.
 #[test]
@@ -141,6 +196,36 @@ fn a_guard_asking_for_a_later_nested_module_keeps_its_branch() {
         );
     run.assert_passes();
     assert!(run.stdout.contains("guard passed"), "{}", run.stdout);
+}
+
+/// Only the module the guard asks for stays after it: `Other`, which the other branch includes, is still written
+/// ahead of the conditional, as the source defines it there.
+#[test]
+fn a_guard_keeps_back_only_the_module_it_asks_for() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/guarded_pair.rb",
+            "class GuardedPair\n  module Other\n    def other\n      \"o\"\n    end\n  end\n\n  if const_defined?(:Feature, false)\n    include Feature\n  else\n    include Other\n  end\n\n  module Feature\n    def feature\n      \"f\"\n    end\n  end\nend\n",
+        )
+        .run_ruby(
+            "got = [GuardedPair.new.other, GuardedPair.include?(GuardedPair::Feature)]\nraise \"got #{got.inspect}\" unless got == [\"o\", false]\nputs \"pair passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("pair passed"), "{}", run.stdout);
+}
+
+/// A module the guarded branch includes, which needs the asked-for one through another (`A` includes `B`, which
+/// includes `Feature`), waits with it: writing `A` first would need `B` and so `Feature` too.
+#[test]
+fn a_module_needing_the_asked_one_through_another_waits_too() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/guarded_chain.rb",
+            "class GuardedChain\n  if const_defined?(:Feature, false)\n    include A\n  end\n\n  module Feature\n    def feature\n      \"f\"\n    end\n  end\n\n  module B\n    include Feature\n\n    def b\n      \"b\"\n    end\n  end\n\n  module A\n    include B\n\n    def a\n      \"a\"\n    end\n  end\nend\n",
+        )
+        .run_ruby("got = [GuardedChain.include?(GuardedChain::A), GuardedChain::A.include?(GuardedChain::Feature)]\nraise \"got #{got.inspect}\" unless got == [false, true]\nputs \"chain passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("chain passed"), "{}", run.stdout);
 }
 
 /// `private :helper` in a branch settled at load (`defined?` of a class the app carries) makes the branch's

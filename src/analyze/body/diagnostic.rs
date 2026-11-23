@@ -31,7 +31,7 @@ pub(super) fn detect_diagnostic(expr: &mut Expr) {
             return;
         }
         let rhs = &args[0];
-        let incompatible = binop_incompatible(method.as_str(), r, rhs);
+        let incompatible = rhs.decisions & crate::expr::COERCED_OPERAND == 0 && binop_incompatible(method.as_str(), r, rhs);
         let lhs_ty = r.ty.clone().unwrap_or(Ty::Nil);
         let rhs_ty = rhs.ty.clone().unwrap_or(Ty::Nil);
         if incompatible {

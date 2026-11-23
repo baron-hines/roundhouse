@@ -802,7 +802,18 @@ impl<'a> BodyTyper<'a> {
         // of the name answers a class-side call instead, and may yield
         // anything; a relation still runs Rails' batches.
         if matches!(method.as_str(), "find_each" | "find_in_batches" | "in_batches") {
-            let is_model = |id: &ClassId| self.classes().get(id).is_some_and(|c| c.table.is_some());
+            // An STI subclass is a library class on its parent's table, so the table is read up the chain.
+            let is_model = |id: &ClassId| {
+                let mut at = self.classes().get(id);
+                for _ in 0..32 {
+                    match at {
+                        Some(c) if c.table.is_some() => return true,
+                        Some(c) => at = c.parent.as_ref().and_then(|p| self.classes().get(p)),
+                        None => return false,
+                    }
+                }
+                false
+            };
             let of = match recv_ty {
                 Ty::Relation { of } => Some(of.clone()),
                 Ty::Array { elem } => match &**elem {
@@ -1604,6 +1615,22 @@ impl<'a> BodyTyper<'a> {
                 let as_hash = params_as_hash();
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
+        }
+        // An app class under a core collection (discourse's `class Enum < Hash`): what its own chain does not define is
+        // the core class's, over values the analysis does not follow.
+        // Not the class object's own calls (`Ordinal.name`), nor a method answering the receiver itself, which keeps its
+        // class (`freeze`, `tap`).
+        if let Some(Ty::Class { id, .. }) = recv_ty
+            && instance_receiver
+            && !matches!(method.as_str(), "freeze" | "itself" | "tap" | "dup" | "clone")
+            && let Some(core) = self.core_ancestor(id, method)
+        {
+            let as_core = match core {
+                "Hash" => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+                "Array" => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
+                _ => Ty::Str,
+            };
+            return self.dispatch(Some(&as_core), method, block_ret, args);
         }
         // What `errors` does not answer itself it delegates to its Array of `ActiveModel::Error`, as Rails' Enumerable does.
         if let Some(Ty::Class { id, .. }) = recv_ty {
@@ -4022,7 +4049,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
                 value: std::sync::Arc::new(unknown()),
             },
         },
-        "to_a" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
+        "to_a" | "to_ary" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
         "join" => Ty::Str,
         // `[0, 0, 0].pack("CCC")` — binary packing (lobsters'
         // confidence_order byte strings).
@@ -4458,7 +4485,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // Operators. `+` concats; `<<` mutates in place but still returns self.
         // `*` is repetition ("a" * 3); `%` is sprintf (returns Str). Comparisons
         // uniformly return Bool.
-        "+" | "<<" | "*" | "%" | "concat" => Ty::Str,
+        "+" | "<<" | "*" | "%" | "concat" | "prepend" => Ty::Str,
         "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "eql?" | "equal?" => Ty::Bool,
         // ActiveSupport String extensions. Pluralization/inflection
         // methods all return Str; comparison-style return Bool. Match

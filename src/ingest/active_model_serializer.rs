@@ -92,6 +92,9 @@ impl ScopeReads {
 }
 
 pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[SourceFile]) -> IngestResult<()> {
+    if super::active_model_serializer_08::applies(app) {
+        return Ok(());
+    }
     // A serializer another app class inherits from is a base, not one
     // to render through: lowered, it would lose the gem's parent its
     // subclasses still need (their `attributes`, `as_json`). It stays as
@@ -284,7 +287,7 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
 }
 
 /// Every class in the file with its fully qualified path.
-fn collect_classes<'pr>(
+pub(super) fn collect_classes<'pr>(
     node: &ruby_prism::Node<'pr>,
     scope: &mut Vec<String>,
     out: &mut Vec<(Vec<String>, ruby_prism::ClassNode<'pr>)>,
@@ -752,7 +755,7 @@ fn rewrite_resources(expr: &mut Expr, lowered: &HashSet<String>) {
 /// The bodies the resource rewrite walks: controller actions and class
 /// methods, model methods, and library class methods. A resource
 /// anywhere else stays a use of the gem's class.
-fn for_each_rewritten_body(app: &mut crate::App, f: &mut dyn FnMut(&mut Expr)) {
+pub(super) fn for_each_rewritten_body(app: &mut crate::App, f: &mut dyn FnMut(&mut Expr)) {
     for controller in &mut app.controllers {
         for item in &mut controller.body {
             match item {
@@ -1033,7 +1036,7 @@ fn resource_as_json_call<'pr>(
 
 /// Whether a constant path is written from the top level (`::A::B`): its
 /// leftmost segment has no parent.
-fn is_rooted(node: &ruby_prism::Node<'_>) -> bool {
+pub(super) fn is_rooted(node: &ruby_prism::Node<'_>) -> bool {
     let Some(mut path) = node.as_constant_path_node() else { return false };
     loop {
         match path.parent() {
@@ -1053,7 +1056,7 @@ fn is_identifier(s: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn refuse(source: &SourceFile, offset: usize, reason: &str) -> IngestError {
+pub(super) fn refuse(source: &SourceFile, offset: usize, reason: &str) -> IngestError {
     let (line, column) = source.line_col(offset as u32);
     IngestError::Unsupported {
         file: source.path.clone(),

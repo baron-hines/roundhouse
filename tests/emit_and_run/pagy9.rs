@@ -365,3 +365,46 @@ puts "PASS"
         );
     run.assert_passes();
 }
+
+/// maybe's `entries = @account.entries.search(@q)`, whose `EntrySearch.apply_*_filter(scope, …)` return the scope or a
+/// query on it: the call answers its argument's relation, so the page is the association's rows.
+#[test]
+fn a_relation_handed_back_by_a_filter_method_paginates() {
+    let run = emit_and_run::real_blog()
+        .edit("Gemfile.lock", "    debug (1.11.1)\n", "    pagy (9.3.5)\n    debug (1.11.1)\n")
+        .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  pagy\n")
+        .edit(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n",
+            "class ApplicationController < ActionController::Base\n  include Pagy::Backend\n",
+        )
+        .write(
+            "app/models/comment_search.rb",
+            "class CommentSearch\n  class << self\n    def apply_filter(scope, q)\n      return scope if q.blank?\n\n      scope.where(commenter: q)\n    end\n  end\nend\n",
+        )
+        .edit("app/controllers/articles_controller.rb", "  def show\n  end\n", "  def show\n    comments = CommentSearch.apply_filter(@article.comments, params[:q]).order(:id)\n    @pagy, @page_comments = pagy(comments, limit: 2)\n  end\n")
+        .edit(
+            "app/views/articles/show.html.erb",
+            "<hr class=\"my-8\">\n",
+            "<hr class=\"my-8\">\n<div id=\"page\"><%= @page_comments.map(&:body).join(\",\") %>|<%= @pagy.count %>|<%= @pagy.pages %></div>\n",
+        )
+        .run_ruby(
+            r##"
+Article.delete_all
+Comment.delete_all
+a = Article.create!(title: "One", body: "body number one is long enough")
+b = Article.create!(title: "Two", body: "body number two is long enough")
+5.times { |i| Comment.create!(article_id: a.id, commenter: i.even? ? "even" : "odd", body: "c#{i + 1}") }
+Comment.create!(article_id: b.id, commenter: "even", body: "other")
+page = ->(query) do
+  status, _h, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles/#{a.id}", "QUERY_STRING" => query, "rack.input" => StringIO.new(""))
+  raise "status #{status}" unless status == 200
+  body.join[%r{<div id="page">(.*?)</div>}m, 1]
+end
+raise page.("page=2").inspect unless page.("page=2") == "c3,c4|5|3"
+raise page.("q=even&page=2").inspect unless page.("q=even&page=2") == "c5|3|2"
+puts "PASS"
+"##,
+        );
+    run.assert_passes();
+}

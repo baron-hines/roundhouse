@@ -900,14 +900,29 @@ pub(super) fn flatten_statements<'pr>(node: Node<'pr>) -> Vec<Node<'pr>> {
 }
 
 /// Constants every Rails this compiler reads defines before any app or gem file loads.
-const FRAMEWORK_DEFINED: &[&str] = &["ActiveSupport::CurrentAttributes"];
+const FRAMEWORK_DEFINED: &[&str] = &["ActiveSupport::CurrentAttributes", "ActionDispatch::RequestId", "Rails::Railtie", "Rails::Engine"];
 
 /// `if defined?(ActiveSupport::CurrentAttributes) … else … end` (rails-settings-cached's `RequestCache`): the branch
 /// Ruby takes, as the guarded constant is always defined; the other is for a Rails this compiler does not read.
 fn framework_defined_branch<'pr>(node: &Node<'pr>) -> Option<Vec<Node<'pr>>> {
     let branch = node.as_if_node()?;
     branch.end_keyword_loc()?;
-    let path = constant_path_of(&branch.predicate().as_defined_node()?.value())?;
+    let predicate = branch.predicate();
+    let path = match predicate.as_defined_node() {
+        Some(defined) => constant_path_of(&defined.value())?,
+        // `ActionDispatch.const_defined?(:RequestId)` (request_store's Railtie) asks the same of the owner.
+        None => {
+            let call = predicate.as_call_node()?;
+            if constant_id_str(&call.name()) != "const_defined?" {
+                return None;
+            }
+            let owner = constant_path_of(&call.receiver()?)?;
+            let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+            let [name] = args.as_slice() else { return None };
+            let name = String::from_utf8_lossy(name.as_symbol_node()?.unescaped()).into_owned();
+            owner.into_iter().chain(std::iter::once(name)).collect()
+        }
+    };
     if !FRAMEWORK_DEFINED.contains(&path.join("::").trim_start_matches("::")) {
         return None;
     }

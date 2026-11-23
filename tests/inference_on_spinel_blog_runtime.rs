@@ -693,7 +693,13 @@ fn untyped_subexpressions_baseline() {
     // `Db` results read as untyped on this RBS-less probe, as `Db.exec` did.
     // MEASURED 1464 on merging main 7d9513597 (1451) with the row locking's
     // +13 (1446 less main 1a54a7397's 1433), which add up.
-    const CEILING: usize = 1464;
+    // MEASURED 1465 on a fixpoint entry answering what it did not know (1464):
+    // `version_recorded?`'s `version` parameter in
+    // active_record/migration_runner.rb moves between two spellings of untyped (`Var`
+    // and `Untyped`) as its callers' rows settle, a move the fixpoint no
+    // longer counts toward a pin, so it stays unresolved on this RBS-less
+    // probe (+1); migration_runner.rbs types it for the RBS-paired gate.
+    const CEILING: usize = 1465;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
