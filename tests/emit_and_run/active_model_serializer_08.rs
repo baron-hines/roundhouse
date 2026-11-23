@@ -727,3 +727,17 @@ fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_no
     assert!(!lowered("@raw\n    other = opts\n    opts[:each_serializer] = ASerializer\n    other.merge!(each_serializer: BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: opts[:hash] }\n"));
 }
+
+/// A deferred ArraySerializer over an options local stays the gem's: it reads
+/// `:each_serializer` when `as_json` runs, which a later write to the Hash changes.
+#[test]
+fn an_active_model_serializer_08_deferred_array_over_an_options_local_stays_the_gem_s() {
+    let errors = overlay()
+        .edit(
+            "app/controllers/article_ams_controller.rb",
+            "  def lazy_dump\n",
+            "  def lazy_local\n    opts = { each_serializer: BasicArticleSerializer }\n    value = ActiveModel::ArraySerializer.new(Article.order(:id), opts)\n    render json: MultiJson.dump(value)\n  end\n\n  def lazy_dump\n",
+        )
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("ActiveModel::ArraySerializer")), "{errors:#?}");
+}

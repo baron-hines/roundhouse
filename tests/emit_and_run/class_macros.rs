@@ -283,3 +283,14 @@ fn a_registry_macro_guarded_on_respond_to_defines_its_methods() {
     assert!(errors.is_empty(), "{errors:#?}");
     registry_app().run_ruby(REGISTRY_ASSERTIONS).assert_passes();
 }
+
+/// A class that `extend`s a module the program does not define may answer
+/// any name on its class side: the guard is not answered, and the call is
+/// reported rather than expanded past a method the module may provide.
+#[test]
+fn a_registry_macro_beside_an_unknown_extend_is_reported() {
+    let errors = emit_and_run::real_blog()
+        .write("app/models/plugin_registry.rb", &REGISTRY.replacen("class PluginRegistry\n", "class PluginRegistry\n  extend Forwardable\n", 1))
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`define_register` defines methods this call does not expand")), "{errors:#?}");
+}

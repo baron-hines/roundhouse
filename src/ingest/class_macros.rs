@@ -334,6 +334,20 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
                 c.parent.as_ref().is_none_or(|p| app.library_classes.iter().any(|o| &o.name == p) || app.models.iter().any(|m| &m.name == p))
             })
         });
+        // The class side is known only where every `extend` names a module of the program's, and no included module may
+        // add class methods (a hook, a `ClassMethods`, a Concern's `class_methods`): `respond_to?` of another name is false.
+        let class_side_known = known_root
+            && lineage.iter().flat_map(|id| app.library_classes.iter().filter(move |c| &c.name == id)).all(|c| {
+                extended_modules(c, &module_methods).len() == extend_candidates(c).len()
+                    && c.includes.iter().all(|inc| {
+                        let full = inc.0.as_str().trim_start_matches("::");
+                        app.library_classes.iter().filter(|m| m.is_module && m.name.0.as_str() == full).any(|m| {
+                            !m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "included")
+                                && !m.unknown_calls.iter().any(|call| matches!(&*call.node, ExprNode::Send { method, .. } if matches!(method.as_str(), "class_methods" | "included" | "extend")))
+                                && !app.library_classes.iter().any(|o| o.name.0.as_str() == format!("{full}::ClassMethods"))
+                        })
+                    })
+            });
         // Not a private one: `method_defined?` answers public and protected methods only.
         let instance_methods: Option<HashSet<Symbol>> = known_root.then(|| {
             lineage
@@ -358,7 +372,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             if !macros.contains(method) || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
                 continue;
             }
-            let mut run = Run { table: &table, constants: &constants, constant_owners: &constant_owners, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: lc.name.0.clone(), sources, instance_methods: instance_methods.as_ref(), cvars: cvars.clone(), class_instance_methods: &class_instance_methods, target: None, foreign: Vec::new(), class_defined: defined.iter().filter(|(_, r)| *r == MethodReceiver::Class).map(|(n, _)| n.clone()).collect(), class_side_known: known_root, block_given: false };
+            let mut run = Run { table: &table, constants: &constants, constant_owners: &constant_owners, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: lc.name.0.clone(), sources, instance_methods: instance_methods.as_ref(), cvars: cvars.clone(), class_instance_methods: &class_instance_methods, target: None, foreign: Vec::new(), class_defined: defined.iter().filter(|(_, r)| *r == MethodReceiver::Class).map(|(n, _)| n.clone()).collect(), class_side_known, block_given: false };
             let result = if block.as_ref().is_some_and(|b| !matches!(&*b.node, ExprNode::Lambda { .. })) {
                 Err("it is passed a block other than a literal one".to_string())
             } else if redefined {

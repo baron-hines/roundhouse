@@ -3020,9 +3020,19 @@ impl<'a> BodyTyper<'a> {
                 }
                 // Recomputed on each pass: a lambda analyzed again with a value the stand-in writes drops the earlier refusal.
                 let classes = &self.classes;
-                let refusal = multi_json_dump_refusal(recv.as_ref(), method, args, &|id: &ClassId| {
+                // Not one under a core collection or scalar: the stand-in writes a Hash's or an Array's entries first.
+                let own_to_json = |id: &ClassId| {
+                    let mut at = Some(id.clone());
+                    for _ in 0..32 {
+                        let Some(current) = at.take() else { break };
+                        if matches!(current.0.as_str().trim_start_matches("::"), "Hash" | "Array" | "String" | "Symbol" | "Integer" | "Float" | "Time") {
+                            return false;
+                        }
+                        at = classes.get(&current).and_then(|c| c.parent.clone());
+                    }
                     classes.get(id).is_some_and(|c| c.public_instance_methods.contains(&Symbol::from("to_json")))
-                });
+                };
+                let refusal = multi_json_dump_refusal(recv.as_ref(), method, args, &own_to_json);
                 if refusal.is_some() || crate::expr::ExprCold::diagnostic(&expr.cold).as_ref().is_some_and(|d| matches!(d, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "MultiJson.dump")) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, refusal);
                 }

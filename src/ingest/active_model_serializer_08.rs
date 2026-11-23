@@ -496,6 +496,7 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         flats.insert(name.clone(), flat);
     }
     let mut failed: HashSet<String> = HashSet::default();
+    let mut lazy_clash: HashSet<String> = HashSet::default();
     for name in &lowered {
         if chains[name].iter().any(|a| failed.contains(a)) {
             failed.insert(name.clone());
@@ -507,7 +508,16 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         // An ancestor's own `initialize` is what the class's `super` reaches, not the gem's constructor.
         let inherits_initialize = chains[name].iter().take_while(|a| *a != name).any(|a| owns[a].defs.iter().any(|d| d.name == "initialize"));
         match install(&mut app.library_classes[index], &src, owns[name].span, chains[name].len() == 1, inherits_initialize) {
-            Ok(nested) => app.library_classes.extend(nested),
+            // Not a name the app already gives a class: its own stays, and the array is not deferred.
+            Ok(nested) => {
+                for class in nested {
+                    if app.library_classes.iter().any(|c| c.name == class.name) {
+                        lazy_clash.insert(name.clone());
+                    } else {
+                        app.library_classes.push(class);
+                    }
+                }
+            }
             Err(e) => {
                 app.library_classes[index] = before;
                 failed.insert(name.clone());
@@ -544,7 +554,8 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     if all.iter().any(|o| o == "ActiveModel::ArraySerializer" || o.ends_with("::ActiveModel::ArraySerializer")) {
         done.clear();
     }
-    for_each_rewritten_body(app, &mut |body| rewrite_arrays(body, &done));
+    let lazy_ok: HashSet<String> = done.iter().filter(|n| !lazy_clash.contains(*n)).cloned().collect();
+    for_each_rewritten_body(app, &mut |body| rewrite_arrays(body, &done, &lazy_ok));
     // The app's copy of `include!` is the gem's, which nothing reaches once every serializer is expanded; a refused one
     // still runs through it.
     if reopened && tree.iter().all(|n| done.contains(n)) {
@@ -2333,8 +2344,8 @@ fn writes_local(e: &Expr, local: &str) -> bool {
 /// → `S.ams_array_as_json(xs, {each_serializer: S, …})`, S a lowered
 /// serializer written as a constant; the options, `each_serializer:`
 /// among them, reach each item's serializer as the gem passes them.
-fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
-    rewrite_arrays_in(expr, done, &HashMap::default(), &HashSet::default(), &HashSet::default());
+fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>, lazy_ok: &HashSet<String>) {
+    rewrite_arrays_in(expr, done, lazy_ok, &HashMap::default(), &HashSet::default(), &HashSet::default());
 }
 
 /// `locals`: the options locals an earlier statement gave a constant `each_serializer:` (`opts[:each_serializer] = S`),
@@ -2342,6 +2353,7 @@ fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
 fn rewrite_arrays_in(
     expr: &mut Expr,
     done: &HashSet<String>,
+    lazy_ok: &HashSet<String>,
     locals: &HashMap<String, String>,
     read_after: &HashSet<String>,
     outer_escaped: &HashSet<String>,
@@ -2370,7 +2382,7 @@ fn rewrite_arrays_in(
             for later in &exprs[i + 1..] {
                 local_reads(later, &mut after);
             }
-            rewrite_arrays_in(&mut exprs[i], done, &known, &after, &escaped);
+            rewrite_arrays_in(&mut exprs[i], done, lazy_ok, &known, &after, &escaped);
             survive(&exprs[i], &mut known, &mut escaped);
         }
         return;
@@ -2399,7 +2411,7 @@ fn rewrite_arrays_in(
                 after.extend(r.iter().cloned());
             }
         }
-        rewrite_arrays_in(c, done, &known, &after, &escaped);
+        rewrite_arrays_in(c, done, lazy_ok, &known, &after, &escaped);
         // Not past a branch: only the condition runs before the others.
         if !branches || at == 0 {
             survive(c, &mut known, &mut escaped);
@@ -2450,6 +2462,11 @@ fn rewrite_arrays_in(
                 return;
             }
             let [objects, options] = args.as_slice() else { return };
+            // Not an options local: the gem reads `:each_serializer` when `as_json` runs, which a write to the Hash
+            // after this (a block's, a callee's) changes; a literal is a Hash nothing else holds.
+            if !matches!(&*options.node, ExprNode::Hash { .. }) {
+                return;
+            }
             (expr.span, objects, options, true)
         }
         _ => return,
@@ -2481,6 +2498,9 @@ fn rewrite_arrays_in(
         }
     }
     let Some(serializer) = serializer.filter(|s| done.contains(s)) else { return };
+    if lazy && !lazy_ok.contains(&serializer) {
+        return;
+    }
     let path: Vec<Symbol> = std::iter::once(Symbol::from("")).chain(serializer.split("::").map(Symbol::from)).collect();
     let mut options = options.clone();
     if let ExprNode::Hash { kwargs, .. } = &mut *options.node {
