@@ -460,7 +460,8 @@ impl EnumConstants {
     /// owners are `owners`, innermost first: `Some(true)` when the constant
     /// Ruby's lookup reaches is recorded, `Some(false)` when no recorded name
     /// could be it (none ends in `written`), and `None` when one could only be
-    /// reached some other way (an ancestor's constant), or a nearer owner's
+    /// reached some other way (an ancestor's constant), is one segment
+    /// (Ruby predefines such names), or a nearer owner's
     /// or one of `class`'s ancestors' first segment shadows the top level's.
     /// The caller rules out what Ruby or the framework define without a source.
     pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String], class: &str) -> Option<bool> {
@@ -482,6 +483,11 @@ impl EnumConstants {
         }
         if self.values.contains_key(bare) {
             return Some(true);
+        }
+        // One segment is never settled absent: Ruby predefines names no source
+        // records (`RUBY_VERSION`, `ENV`, `ARGV`, `DATA`, …).
+        if !bare.contains("::") {
+            return None;
         }
         let last = bare.rsplit("::").next().unwrap_or(bare);
         let suffix = format!("::{bare}");

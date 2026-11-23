@@ -221,3 +221,18 @@ fn an_ancestors_namespace_shadowing_the_guard_is_refused() {
     };
     assert!(error.contains("load-time conditional `include` or `require`"), "{error}");
 }
+
+/// A one-segment guard is not settled as absent: Ruby predefines names no
+/// source records (`RUBY_VERSION`, `ENV`, `ARGV`, …), so the branch may run.
+#[test]
+fn a_one_segment_guard_nothing_records_is_refused() {
+    let ruby_version = "  if defined?(RUBY_VERSION)\n    include Tracking::Auditable\n  end\n";
+    let absent = "  if defined?(SomeAbsentName)\n    include Tracking::Auditable\n  end\n";
+    let rooted = "  if defined?(::SomeAbsentName)\n    include Tracking::Auditable\n  end\n";
+    for head in [ruby_version, absent, rooted] {
+        for auditable in [false, true] {
+            let error = refusal(head, auditable);
+            assert!(error.contains("load-time conditional `include` or `require`"), "{head}: {error}");
+        }
+    }
+}
