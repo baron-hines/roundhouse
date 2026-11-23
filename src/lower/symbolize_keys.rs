@@ -230,6 +230,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, untyped_guard: bool) {
         *expr = guarded;
         return;
     }
+    let refused = expr.diagnostic().is_some();
     let replacement = match &mut *expr.node {
         // Rails' `ActiveSupport::JSON.encode(value, escape: false)`: the
         // document without the HTML-entity escaping, for text that is
@@ -266,7 +267,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr, untyped_guard: bool) {
             args,
             block: None,
             ..
-        } if method.as_str() == "deep_merge"
+        } if matches!(method.as_str(), "deep_merge" | "deep_merge!")
+            // Not one the analysis refused (a deep_merge! widening its receiver): the rewrite would drop the refusal.
+            && !refused
             && args.len() == 1
             && matches!(receiver.ty.as_ref(), Some(Ty::Hash { .. }))
             && matches!(args[0].ty.as_ref(), Some(Ty::Hash { .. })) =>
@@ -280,7 +283,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, untyped_guard: bool) {
                             path: vec![crate::ident::Symbol::from("ActiveSupport")],
                         },
                     )),
-                    method: crate::ident::Symbol::from("deep_merge"),
+                    method: method.clone(),
                     args: vec![receiver.clone(), args[0].clone()],
                     block: None,
                     parenthesized: true,

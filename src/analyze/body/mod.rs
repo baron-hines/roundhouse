@@ -3247,10 +3247,19 @@ impl<'a> BodyTyper<'a> {
                         "Hash#deep_merge conflict block",
                         "only the no-block Rails deep_merge form is supported",
                     )),
-                    "deep_merge!" => Some((
+                    "deep_merge!" if block.is_some() || args.len() != 1 => Some((
                         "Hash#deep_merge!",
-                        "the mutating deep_merge! form is unsupported",
+                        "only the one-argument, no-block deep_merge! form is supported",
                     )),
+                    "deep_merge!"
+                        if !matches!((&recv_ty, args.first().and_then(|arg| arg.ty.as_ref())), (Some(Ty::Hash { key, value }), Some(Ty::Hash { key: ok, value: ov }))
+                            if union_of((**key).clone(), (**ok).clone()) == **key && union_of((**value).clone(), (**ov).clone()) == **value) =>
+                    {
+                        Some((
+                            "Hash#deep_merge!",
+                            "the mutating form writes into its receiver, whose type must already hold the argument's keys and values",
+                        ))
+                    }
                     "deep_merge" if args.len() != 1 => Some((
                         "Hash#deep_merge arity",
                         "exactly one Hash argument is supported",
