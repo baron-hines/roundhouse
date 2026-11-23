@@ -12,6 +12,8 @@
 //!   other with C's `%.16g` (`0.1 + 0.2` is `0.3`, `1e20` is `1e+20`), and
 //!   `NaN` and the infinities written as such;
 //! - a Time as its `to_json`, Rails' `xmlschema(3)`;
+//! - an object of a class the program gives its own `to_json` as what that
+//!   answers, written as it is;
 //! - `pretty: <anything>` (oj reads the key, not its value) as
 //!   `JSON.pretty_generate` lays it out.
 //!
@@ -426,7 +428,8 @@ fn stand_ins() -> Vec<LibraryClass> {
     when true then "true"
     when false then "false"
     when Time then JSON.generate(ActiveSupport::JSON.time_json(value))
-    else raise ArgumentError, "MultiJson.dump: #{value.class} values are not supported yet"
+    # oj's `use_to_json`: an object of a class the program gives its own `to_json` is written as that answers.
+    else value.to_json
     end
   end
 

@@ -506,13 +506,16 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         let before = app.library_classes[index].clone();
         // An ancestor's own `initialize` is what the class's `super` reaches, not the gem's constructor.
         let inherits_initialize = chains[name].iter().take_while(|a| *a != name).any(|a| owns[a].defs.iter().any(|d| d.name == "initialize"));
-        if let Err(e) = install(&mut app.library_classes[index], &src, owns[name].span, chains[name].len() == 1, inherits_initialize) {
-            app.library_classes[index] = before;
-            failed.insert(name.clone());
-            if !super::survey::is_active() {
-                return Err(e);
+        match install(&mut app.library_classes[index], &src, owns[name].span, chains[name].len() == 1, inherits_initialize) {
+            Ok(nested) => app.library_classes.extend(nested),
+            Err(e) => {
+                app.library_classes[index] = before;
+                failed.insert(name.clone());
+                if !super::survey::is_active() {
+                    return Err(e);
+                }
+                super::survey::record(&e);
             }
-            super::survey::record(&e);
         }
     }
     let mut done: HashSet<String> = lowered.into_iter().filter(|n| !failed.contains(n)).collect();
@@ -2037,6 +2040,21 @@ fn synthesize(name: &str, chain: &[String], owns: &HashMap<String, Own>, flat: &
     meta_key = options[:meta_key]
     hash[meta_key.respond_to?(:to_sym) ? meta_key.to_sym : :meta] = options[:meta] if options.has_key?(:meta)
   end
+
+  class AmsArray
+    def initialize(objects, options)
+      @objects = objects
+      @options = options
+    end
+
+    def as_json(*args)
+      ::{name}.ams_array_as_json(@objects, @options)
+    end
+
+    def to_json(*args)
+      ActiveSupport::JSON.encode(as_json)
+    end
+  end
 "#
     ));
     src.push_str("end\n");
@@ -2128,7 +2146,7 @@ const ROOT_API: &[(&str, &str)] = &[
     ("ams_merge", "  def ams_merge(side, key, serializables)\n    unique = (@ams_unique ||= {})\n    seen = (unique[key] ||= {})\n    list = (side[key] ||= [])\n    serializables.each do |serializable|\n      unless seen.include?(serializable.object)\n        seen[serializable.object] = true\n        list << serializable.serializable_hash\n      end\n    end\n  end\n"),
 ];
 
-fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool, inherits_initialize: bool) -> IngestResult<()> {
+fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool, inherits_initialize: bool) -> IngestResult<Vec<LibraryClass>> {
     let (parsed, diags) = super::prism::scope(|| super::ingest_library_classes(src.as_bytes(), "<active_model_serializers>"));
     let mut parsed = parsed?;
     if !diags.is_empty() || parsed.is_empty() {
@@ -2147,6 +2165,13 @@ fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool, inherits
         method.name_span = span;
     }
     class.methods.append(&mut methods);
+    // The classes the source nests in the serializer (`AmsArray`), the program's beside it.
+    for nested in &mut parsed {
+        for method in &mut nested.methods {
+            mark(&mut method.body, span);
+            method.name_span = span;
+        }
+    }
     // An own `initialize`'s `super` is the gem's constructor, which `ams_initialize` is here: it writes the class's
     // own ivars, so each class types its record apart.
     for method in class.methods.iter_mut().filter(|m| !inherits_initialize && m.name.as_str() == "initialize" && m.receiver == crate::dialect::MethodReceiver::Instance) {
@@ -2182,7 +2207,10 @@ fn install(class: &mut LibraryClass, src: &str, span: Span, root: bool, inherits
     }
     class.unknown_calls.retain(super::delegate::is_delegate_declaration);
     class.origin = Some(LibraryClassOrigin::ActiveModelSerializer08);
-    Ok(())
+    for nested in &mut parsed {
+        nested.origin = Some(LibraryClassOrigin::ActiveModelSerializer08);
+    }
+    Ok(parsed)
 }
 
 /// `opts[:each_serializer] = S`, S a constant: the local and S's name.
@@ -2378,17 +2406,54 @@ fn rewrite_arrays_in(
         }
         at += 1;
     });
-    let ExprNode::Send { recv: Some(array), method, args, block: None, .. } = &*expr.node else { return };
-    if method.as_str() != "as_json" || !args.is_empty() {
+    // `S::AmsArray.new(xs, opts).as_json`, the constructor rewritten below: the value now, as the gem's is.
+    if let ExprNode::Send { recv: Some(array), method, args, block: None, .. } = &*expr.node
+        && method.as_str() == "as_json"
+        && args.is_empty()
+        && let ExprNode::Send { recv: Some(class), method: new, args: built, block: None, .. } = &*array.node
+        && new.as_str() == "new"
+        && let ExprNode::Const { path } = &*class.node
+        && path.last().is_some_and(|l| l.as_str() == "AmsArray")
+        && class.span.is_synthetic()
+        && let [objects, options] = built.as_slice()
+    {
+        let serializer: Vec<Symbol> = path[..path.len() - 1].to_vec();
+        let (objects, options) = (objects.clone(), options.clone());
+        *expr = Expr::new(
+            expr.span,
+            ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: serializer })),
+                method: Symbol::from("ams_array_as_json"),
+                args: vec![objects, options],
+                block: None,
+                parenthesized: true,
+            },
+        );
         return;
     }
-    let ExprNode::Send { recv: Some(class), method, args, block: None, .. } = &*array.node else { return };
-    let ExprNode::Const { path } = &*class.node else { return };
-    let written: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
-    if method.as_str() != "new" || written != ARRAY_SERIALIZER {
-        return;
-    }
-    let [objects, options] = args.as_slice() else { return };
+    // The constructor alone: an object whose `as_json` / `to_json` answer as the gem's do, when they are asked.
+    let (span, objects, options, lazy) = match &*expr.node {
+        ExprNode::Send { recv: Some(array), method, args, block: None, .. } if method.as_str() == "as_json" && args.is_empty() => {
+            let ExprNode::Send { recv: Some(class), method, args, block: None, .. } = &*array.node else { return };
+            let ExprNode::Const { path } = &*class.node else { return };
+            let written: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+            if method.as_str() != "new" || written != ARRAY_SERIALIZER {
+                return;
+            }
+            let [objects, options] = args.as_slice() else { return };
+            (expr.span, objects, options, false)
+        }
+        ExprNode::Send { recv: Some(class), method, args, block: None, .. } if method.as_str() == "new" => {
+            let ExprNode::Const { path } = &*class.node else { return };
+            let written: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+            if written != ARRAY_SERIALIZER {
+                return;
+            }
+            let [objects, options] = args.as_slice() else { return };
+            (expr.span, objects, options, true)
+        }
+        _ => return,
+    };
     let mut serializer = None;
     let entries = match &*options.node {
         ExprNode::Hash { entries, .. } => entries.as_slice(),
@@ -2416,18 +2481,17 @@ fn rewrite_arrays_in(
         }
     }
     let Some(serializer) = serializer.filter(|s| done.contains(s)) else { return };
-    let span = expr.span;
-    let recv = Expr::new(
-        Span::synthetic(),
-        ExprNode::Const { path: std::iter::once(Symbol::from("")).chain(serializer.split("::").map(Symbol::from)).collect() },
-    );
+    let path: Vec<Symbol> = std::iter::once(Symbol::from("")).chain(serializer.split("::").map(Symbol::from)).collect();
     let mut options = options.clone();
     if let ExprNode::Hash { kwargs, .. } = &mut *options.node {
         *kwargs = false;
     }
     let objects = objects.clone();
-    *expr = Expr::new(
-        span,
-        ExprNode::Send { recv: Some(recv), method: Symbol::from("ams_array_as_json"), args: vec![objects, options], block: None, parenthesized: true },
-    );
+    *expr = if lazy {
+        let class = Expr::new(Span::synthetic(), ExprNode::Const { path: path.into_iter().chain(std::iter::once(Symbol::from("AmsArray"))).collect() });
+        Expr::new(span, ExprNode::Send { recv: Some(class), method: Symbol::from("new"), args: vec![objects, options], block: None, parenthesized: true })
+    } else {
+        let recv = Expr::new(Span::synthetic(), ExprNode::Const { path });
+        Expr::new(span, ExprNode::Send { recv: Some(recv), method: Symbol::from("ams_array_as_json"), args: vec![objects, options], block: None, parenthesized: true })
+    };
 }
