@@ -20927,6 +20927,8 @@ mod scope_hash_tail;
 mod core_subclass_dispatch;
 #[path = "emit_and_run/paren_call_beside_local.rs"]
 mod paren_call_beside_local;
+#[path = "emit_and_run/string_prepend.rs"]
+mod string_prepend;
 #[path = "emit_and_run/parameterized_mailer.rs"]
 mod parameterized_mailer;
 #[path = "emit_and_run/change_table_migrations.rs"]

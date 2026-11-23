@@ -4485,7 +4485,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // Operators. `+` concats; `<<` mutates in place but still returns self.
         // `*` is repetition ("a" * 3); `%` is sprintf (returns Str). Comparisons
         // uniformly return Bool.
-        "+" | "<<" | "*" | "%" | "concat" => Ty::Str,
+        "+" | "<<" | "*" | "%" | "concat" | "prepend" => Ty::Str,
         "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "eql?" | "equal?" => Ty::Bool,
         // ActiveSupport String extensions. Pluralization/inflection
         // methods all return Str; comparison-style return Bool. Match
