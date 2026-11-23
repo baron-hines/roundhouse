@@ -405,9 +405,36 @@ fn statement_has_unmodeled_call(stmt: &Node<'_>) -> bool {
         if !targets_includer {
             return false;
         }
-        return !TRACKED_DECLARATIONS.contains(&constant_id_str(&call.name()));
+        return !TRACKED_DECLARATIONS.contains(&constant_id_str(&call.name())) && class_side_attribute_names(&call).is_none();
     }
     branch_has_unmodeled_call(stmt)
+}
+
+/// `class_attribute :a, :b, instance_accessor: false, instance_predicate: false`: the names, whose only methods are
+/// the class side's public `a`, `a=` and `a?`. Not one with an instance accessor or predicate, whose visibility a
+/// bare marker before it may or may not reach.
+fn class_side_attribute_names(call: &ruby_prism::CallNode<'_>) -> Option<Vec<String>> {
+    if constant_id_str(&call.name()) != "class_attribute" || call.block().is_some() {
+        return None;
+    }
+    let mut names = Vec::new();
+    let (mut accessor_off, mut predicate_off) = (false, false);
+    for arg in call.arguments()?.arguments().iter() {
+        if let Some(options) = arg.as_keyword_hash_node() {
+            for element in options.elements().iter() {
+                let pair = element.as_assoc_node()?;
+                match symbol_or_string_value(&pair.key())?.as_str() {
+                    "instance_accessor" => accessor_off = pair.value().as_false_node().is_some(),
+                    "instance_predicate" => predicate_off = pair.value().as_false_node().is_some(),
+                    "default" => {}
+                    _ => return None,
+                }
+            }
+            continue;
+        }
+        names.push(symbol_or_string_value(&arg)?);
+    }
+    (accessor_off && predicate_off && !names.is_empty()).then_some(names)
 }
 
 /// Descend into an `if`/`unless` node's branches (both arms, and an
@@ -1322,6 +1349,13 @@ impl Visibility {
                     self.walk_included(block.body(), file)?;
                 } else {
                     Self::reject_dynamic_declarations(node, file)?;
+                }
+            } else if let Some(attributes) = class_side_attribute_names(&call) {
+                // Rails defines them on the singleton class, public whatever marker stands before.
+                for attr in attributes {
+                    for method in [attr.clone(), format!("{attr}="), format!("{attr}?")] {
+                        self.define(offset, method, true, MethodVisibility::Public, file)?;
+                    }
                 }
             } else if matches!(name, "attr_reader" | "attr_writer" | "attr_accessor") {
                 if let Some(args) = call.arguments() {
