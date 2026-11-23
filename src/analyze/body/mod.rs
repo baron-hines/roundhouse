@@ -5237,7 +5237,19 @@ fn read_in_repeated(e: &Expr, name: &Symbol) -> bool {
         e.node.for_each_child(&mut |c| found |= writes(c, name));
         found
     }
+    // Not a mutating call's receiver (`items << x`): pushing does not observe what an earlier iteration pushed.
     fn reads(e: &Expr, name: &Symbol) -> bool {
+        if let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*e.node
+            && is_name(r, name)
+            && matches!(method.as_str(), "<<" | "push" | "append" | "unshift" | "prepend" | "concat" | "[]=" | "store" | "merge!" | "update" | "insert")
+        {
+            return args.iter().any(|a| reads(a, name)) || block.as_ref().is_some_and(|b| reads(b, name));
+        }
+        if let ExprNode::Assign { target: LValue::Index { recv, index }, value } = &*e.node
+            && is_name(recv, name)
+        {
+            return reads(index, name) || reads(value, name);
+        }
         let mut found = is_name(e, name);
         e.node.for_each_child(&mut |c| found |= reads(c, name));
         found

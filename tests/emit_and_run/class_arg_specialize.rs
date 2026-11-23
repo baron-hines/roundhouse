@@ -68,6 +68,10 @@ const BASE: &str = r##"class SpecBaseController < ApplicationController
     k.new
   end
 
+  def tagged(*)
+    "base"
+  end
+
   def build_super(klass)
     klass.new
   end
@@ -83,7 +87,15 @@ const CHILD: &str = r##"class SpecChildController < SpecBaseController
     render plain: build_super(Alpha).label
   end
 
+  def defaulted_super
+    render plain: tagged(Alpha)
+  end
+
   private
+
+  def tagged(klass, tag = super())
+    "#{klass.new.label} #{tag}"
+  end
 
   def build_super(klass)
     made = super
@@ -122,7 +134,7 @@ fn overlay() -> emit_and_run::Overlay {
             "config/routes.rb",
             "  resources :articles do",
             &(["run", "splat", "pairs", "gammas", "defaulted", "referenced", "shadowed", "supered"].map(|a| format!("  get \"spec_base/{a}\" => \"spec_base#{a}\"\n")).concat()
-                + "  get \"spec_child/run\" => \"spec_child#run\"\n  get \"spec_child/supered\" => \"spec_child#supered\"\n  get \"spec_other/run\" => \"spec_other#run\"\n  resources :articles do"),
+                + "  get \"spec_child/run\" => \"spec_child#run\"\n  get \"spec_child/supered\" => \"spec_child#supered\"\n  get \"spec_child/defaulted_super\" => \"spec_child#defaulted_super\"\n  get \"spec_other/run\" => \"spec_other#run\"\n  resources :articles do"),
         );
     for (path, src) in CLASSES {
         o = o.write(path, src);
@@ -148,6 +160,7 @@ run = ->(klass, action) { c = klass.new; c.params = {}; c.process_action(action)
   [SpecBaseController, :referenced] => "alpha,beta",
   [SpecBaseController, :shadowed] => "beta alpha",
   [SpecChildController, :supered] => "alpha",
+  [SpecChildController, :defaulted_super] => "alpha base",
 }.filter_map do |(klass, action), want|
   got = begin; run.(klass, action); rescue StandardError => e; e.class.name; end
   "#{klass}##{action}: #{got.inspect}" unless got == want

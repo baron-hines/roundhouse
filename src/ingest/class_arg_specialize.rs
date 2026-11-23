@@ -240,7 +240,8 @@ fn candidates(app: &crate::App) -> HashSet<(usize, String, usize)> {
                 let defaulted = action.opt_params.iter().map(|(_, d)| d).chain(action.kw_params.iter().filter_map(|(_, d)| d.as_ref()))
                     .any(|d| uses(d, param).0 > 0);
                 // Not one with a `super`: in the renamed copy it would reach a parent method of the copy's name.
-                if total > 0 && total == ok && !defaulted && !assigned(&action.body, param) && !supers(&action.body) {
+                let defaults_super = action.opt_params.iter().map(|(_, d)| d).chain(action.kw_params.iter().filter_map(|(_, d)| d.as_ref())).any(supers);
+                if total > 0 && total == ok && !defaulted && !assigned(&action.body, param) && !supers(&action.body) && !defaults_super {
                     out.insert((ci, action.name.as_str().to_string(), k));
                 }
             }

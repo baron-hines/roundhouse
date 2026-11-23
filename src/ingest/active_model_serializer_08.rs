@@ -1871,11 +1871,14 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
             _ => &[],
         };
         let shared = keys.iter().filter_map(symbol_value).find(|k| matches!(k.as_str(), "hash" | "unique_values"));
-        if self.found.is_none()
-            && let Some(key) = shared
-            && node.receiver().is_some_and(|r| options_read(&r, &self.option_locals))
-        {
-            self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
+        let on_options = node.receiver().is_some_and(|r| options_read(&r, &self.option_locals));
+        if self.found.is_none() && on_options {
+            if let Some(key) = shared {
+                self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
+            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some()) {
+                // The whole Hash (`opts.size`, `opts.keys`) or a computed key: it may see the keys the gem adds.
+                self.found = Some((format!("options.{name}"), node.location().start_offset()));
+            }
         }
         ruby_prism::visit_call_node(self, node);
     }
@@ -2289,7 +2292,7 @@ fn writes_local(e: &Expr, local: &str) -> bool {
         }
         ExprNode::Send { recv: Some(r), method, .. } => {
             matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == local)
-                && matches!(method.as_str(), "merge!" | "update" | "delete" | "store" | "clear" | "replace" | "[]=")
+                && matches!(method.as_str(), "merge!" | "update" | "delete" | "store" | "clear" | "replace" | "[]=" | "freeze")
         }
         _ => false,
     };
@@ -2303,35 +2306,44 @@ fn writes_local(e: &Expr, local: &str) -> bool {
 /// serializer written as a constant; the options, `each_serializer:`
 /// among them, reach each item's serializer as the gem passes them.
 fn rewrite_arrays(expr: &mut Expr, done: &HashSet<String>) {
-    rewrite_arrays_in(expr, done, &HashMap::default(), &HashSet::default());
+    rewrite_arrays_in(expr, done, &HashMap::default(), &HashSet::default(), &HashSet::default());
 }
 
 /// `locals`: the options locals an earlier statement gave a constant `each_serializer:` (`opts[:each_serializer] = S`),
 /// which no statement since has written over. `read_after`: the locals a later statement reads.
-fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<String, String>, read_after: &HashSet<String>) {
+fn rewrite_arrays_in(
+    expr: &mut Expr,
+    done: &HashSet<String>,
+    locals: &HashMap<String, String>,
+    read_after: &HashSet<String>,
+    outer_escaped: &HashSet<String>,
+) {
+    // What a statement or an earlier child leaves known: not a local it writes, hands on (another name may then
+    // write the Hash), or freezes (the gem's `as_json` then raises FrozenError).
+    let survive = |e: &Expr, known: &mut HashMap<String, String>, escaped: &mut HashSet<String>| {
+        if let Some((local, class)) = each_serializer_write(e) {
+            known.retain(|l, _| *l == local);
+            known.insert(local, class);
+        } else {
+            if writes_each_serializer(e) {
+                known.clear();
+            }
+            known.retain(|local, _| !writes_local(e, local));
+        }
+        escaped_locals(e, escaped);
+        known.retain(|local, _| !escaped.contains(local));
+    };
     if let ExprNode::Seq { exprs } = &mut *expr.node {
         let mut known = locals.clone();
-        // Locals whose Hash another name may hold: never registered, as a write through that name is not seen.
-        let mut escaped: HashSet<String> = HashSet::default();
+        // Locals whose Hash another name may hold, here or in an enclosing statement: never kept as known.
+        let mut escaped: HashSet<String> = outer_escaped.clone();
         for i in 0..exprs.len() {
             let mut after = read_after.clone();
             for later in &exprs[i + 1..] {
                 local_reads(later, &mut after);
             }
-            rewrite_arrays_in(&mut exprs[i], done, &known, &after);
-            let e = &exprs[i];
-            // Not only writes through the same local: another local may be the same Hash.
-            if let Some((local, class)) = each_serializer_write(e) {
-                known.retain(|l, _| *l == local);
-                known.insert(local, class);
-            } else {
-                if writes_each_serializer(e) {
-                    known.clear();
-                }
-                known.retain(|local, _| !writes_local(e, local));
-            }
-            escaped_locals(e, &mut escaped);
-            known.retain(|local, _| !escaped.contains(local));
+            rewrite_arrays_in(&mut exprs[i], done, &known, &after, &escaped);
+            survive(&exprs[i], &mut known, &mut escaped);
         }
         return;
     }
@@ -2347,18 +2359,24 @@ fn rewrite_arrays_in(expr: &mut Expr, done: &HashSet<String>, locals: &HashMap<S
         local_reads(c, &mut r);
         reads.push(r);
     });
-    // Not a branch's alternatives, which never run after it.
+    // A condition runs before either branch; the branches are alternatives, neither after the other.
     let branches = matches!(&*expr.node, ExprNode::If { .. } | ExprNode::Case { .. });
+    let mut known = locals.clone();
+    let mut escaped = outer_escaped.clone();
     let mut at = 0usize;
     expr.node.for_each_child_mut(&mut |c| {
         let mut after = base.clone();
-        if !branches {
+        if !branches || at == 0 {
             for r in reads.iter().skip(at + 1) {
                 after.extend(r.iter().cloned());
             }
         }
+        rewrite_arrays_in(c, done, &known, &after, &escaped);
+        // Not past a branch: only the condition runs before the others.
+        if !branches || at == 0 {
+            survive(c, &mut known, &mut escaped);
+        }
         at += 1;
-        rewrite_arrays_in(c, done, locals, &after);
     });
     let ExprNode::Send { recv: Some(array), method, args, block: None, .. } = &*expr.node else { return };
     if method.as_str() != "as_json" || !args.is_empty() {

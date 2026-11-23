@@ -533,6 +533,7 @@ fn an_active_model_serializer_08_outside_the_subset_is_refused() {
         ("class ASerializer < BaseSerializer\n  def self.fields(*names)\n    attributes(*names)\n  end\n\n  def self.fields(*names)\n  end\n\n  fields :title\nend\n", "the macro `fields` is defined more than once", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def initialize(object, options = {})\n    super\n    @shared = options[:hash]\n  end\nend\n", "`[](:hash)`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def rooted\n    options.values_at(:root, :hash).last.nil?\n  end\nend\n", "`values_at(:hash)`", &["ASerializer"]),
+        ("class ASerializer < BaseSerializer\n  def initialize(object, opts = {})\n    super\n    @count = opts.size\n  end\nend\n", "`options.size`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  def shared\n    o = @options\n    o.fetch(:unique_values, nil)\n  end\nend\n", "`fetch(:unique_values)`", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  cached\nend\n", "`cached` is outside", &["ASerializer"]),
         ("class ASerializer < BaseSerializer\n  has_one :author, serializer: BaseSerializer, polymorphic: true\nend\n", "`polymorphic:` is outside", &["ASerializer"]),
@@ -699,6 +700,10 @@ fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_no
     assert!(lowered("    render json: { body: ActiveModel::ArraySerializer.new(xs, opts).as_json, shared: 1 }\n"));
     assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: (opts ||= {})[:hash] }\n"));
     assert!(!lowered("    render json: ActiveModel::ArraySerializer.new((opts[:each_serializer] = BSerializer; xs), opts).as_json\n"));
+    assert!(!lowered("    if ActiveModel::ArraySerializer.new(xs, opts).as_json\n      render json: opts.key?(:hash)\n    end\n"));
+    assert!(!lowered("    render json: [opts.merge!(each_serializer: BSerializer), ActiveModel::ArraySerializer.new(xs, opts).as_json]\n"));
+    assert!(!lowered("    opts.freeze\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
+    assert!(!lowered("@raw\n    saved = opts\n    if xs\n      opts[:each_serializer] = ASerializer\n      render json: [ActiveModel::ArraySerializer.new(xs, opts).as_json, saved.key?(:hash)]\n    end\n"));
     assert!(!lowered("@raw\n    other = opts\n    opts[:each_serializer] = ASerializer\n    other.merge!(each_serializer: BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: opts[:hash] }\n"));
 }

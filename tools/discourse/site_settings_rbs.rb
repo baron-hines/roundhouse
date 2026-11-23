@@ -44,7 +44,7 @@ yaml.each_value do |settings|
     default = opts["default"]
     static = opts["type"]&.to_s
     static = "enum" if static.nil? && opts["enum"]
-    type = static && KNOWN.include?(static) ? static : default_type(default)
+    type = static && (KNOWN.include?(static) || CAST.key?(static)) ? static : default_type(default)
     next if type.nil?
     clean = name.to_s.delete("?")
     # Not typed: an upcoming change answers UpcomingChanges.enabled?, a mandatory list a joined String, an enum
