@@ -455,6 +455,29 @@ impl EnumConstants {
             && !owner.split("::").any(|segment| self.snapshot_reflected.contains(segment))
     }
 
+    /// What the recorded sources (the app's, its path gems' and its source
+    /// gems') say `defined?(written)` answers in a class body whose lexical
+    /// owners are `owners`, innermost first: `Some(true)` when one of its
+    /// spellings is recorded, `Some(false)` when no recorded name could be it
+    /// (none ends in `written`), and `None` when one could only be reached
+    /// some other way (an ancestor's constant). The caller rules out what
+    /// Ruby or the framework define without a source.
+    pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String]) -> Option<bool> {
+        let spellings: Vec<String> = match written.strip_prefix("::") {
+            Some(rooted) => vec![rooted.to_string()],
+            None => owners.iter().map(|owner| format!("{owner}::{written}")).chain(std::iter::once(written.to_string())).collect(),
+        };
+        if spellings.iter().any(|s| self.values.contains_key(s)) {
+            return Some(true);
+        }
+        let bare = written.trim_start_matches("::");
+        let last = bare.rsplit("::").next().unwrap_or(bare);
+        let suffix = format!("::{bare}");
+        let names = self.names();
+        let reachable = names.by_last.get(last).into_iter().flatten().any(|k| k == bare || k.ends_with(&suffix));
+        (!reachable).then_some(false)
+    }
+
     /// Whether any recorded source defines a constant, class or module
     /// named `name` at any depth (`Regexp`, `Admin::Regexp`).
     pub(in crate::ingest) fn defines_name(&self, name: &str) -> bool {

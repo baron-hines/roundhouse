@@ -632,6 +632,8 @@ mod hash_fetch_one_arg;
 mod numericality_unknown_option;
 #[path = "emit_and_run/belongs_to_nil_writer.rs"]
 mod belongs_to_nil_writer;
+#[path = "emit_and_run/model_defined_guard.rs"]
+mod model_defined_guard;
 #[path = "emit_and_run/inclusion_duration_literals.rs"]
 mod inclusion_duration_literals;
 #[path = "emit_and_run/validates_constant_splat.rs"]

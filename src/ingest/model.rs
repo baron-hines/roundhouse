@@ -178,13 +178,28 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut primary_key: Option<Symbol> = None;
     // A model body's load-time conditional definitions are not carried
     // (the model lowering writes no conditional), so the model stays
-    // refused for one, as before the library walk admitted them.
+    // refused for one, as before the library walk admitted them. One whose
+    // branches only load (`include` / `require`) defines nothing: it is
+    // settled here, or refused by name (`settle_load_only_conditional`).
+    let mut settled_loads: crate::det::HashMap<usize, Option<Node<'_>>> = crate::det::HashMap::default();
     if let Some(body) = class.body() {
-        if flatten_statements(body).iter().any(|stmt| super::visibility::conditional_definition(stmt).is_some()) {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "conditional or dynamic visibility declarations are not modeled".into(),
-            });
+        let lexical: Vec<String> = std::iter::once(class_name.to_string()).chain(enum_owners.iter().cloned()).collect();
+        for stmt in flatten_statements(body) {
+            if super::visibility::conditional_definition(&stmt).is_none() {
+                continue;
+            }
+            let at = stmt.location().start_offset();
+            match settle_load_only_conditional(stmt, &lexical, enum_constants, file) {
+                Some(settled) => {
+                    settled_loads.insert(at, settled?);
+                }
+                None => {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "conditional or dynamic visibility declarations are not modeled".into(),
+                    });
+                }
+            }
         }
     }
     let visibility = Visibility::resolve_carrying_inherited(class.body().as_ref(), file, None)?;
@@ -237,6 +252,13 @@ pub(super) fn ingest_model_with_enum_constants(
         }
         let mut walk: Vec<WalkStmt<'_>> = Vec::with_capacity(stmts.len());
         for (at, statement) in stmts.into_iter().enumerate() {
+            // A settled load-only conditional: the include its branch is, or nothing.
+            if let Some(settled) = settled_loads.remove(&statement.location().start_offset()) {
+                if let Some(include) = settled {
+                    walk.push(WalkStmt { node: include, file, source, hook: None });
+                }
+                continue;
+            }
             let fired = super::load_hooks::fired_by(&statement).is_some();
             walk.push(WalkStmt { node: statement, file, source, hook: None });
             if !fired {
@@ -676,6 +698,63 @@ struct WalkStmt<'a> {
     source: &'a [u8],
     /// The hook the statement came from, when it was spliced.
     hook: Option<&'a str>,
+}
+
+/// A model body's load-time conditional whose branches only load
+/// (`visibility::load_only_conditional`), as Ruby runs it, or `None` for any
+/// other conditional (#2282). `if defined?(Const)`, with at most an empty
+/// `else`, settles when the recorded sources answer the guard: when nothing
+/// could define `Const` the branch never runs (`Ok(None)`); when one of
+/// `owners`' spellings of it is defined and the branch is `include Const`
+/// alone, the branch is that include. Every other one is refused by what
+/// it is: a constant Ruby, the framework or an ancestor may define, a
+/// branch doing more than include the guarded module, or another guard.
+// Not the modifier form (`include M if defined?(M)`): no `end`, so not a
+// conditional definition, and left as it was.
+fn settle_load_only_conditional<'pr>(
+    node: Node<'pr>,
+    owners: &[String],
+    enum_constants: &EnumConstants,
+    file: &str,
+) -> Option<IngestResult<Option<Node<'pr>>>> {
+    let (negated, arms) = visibility::load_only_conditional(&node)?;
+    let refuse = |why: String| {
+        Some(Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("a load-time conditional `include` or `require` in a model body is not modeled: {why}"),
+        }))
+    };
+    let mut arms = arms.into_iter();
+    let Some((Some(predicate), stmts)) = arms.next() else { return refuse("its condition is not `defined?` of a constant".into()) };
+    if negated || !arms.all(|(condition, rest)| condition.is_none() && rest.is_empty()) {
+        return refuse("its condition is not `defined?` of a constant".into());
+    }
+    let Some(written) = predicate.as_defined_node().and_then(|d| EnumConstants::path(&d.value())) else {
+        return refuse("its condition is not `defined?` of a constant".into());
+    };
+    let segments: Vec<&str> = written.trim_start_matches("::").split("::").collect();
+    let root = segments[0];
+    // Defined by Ruby or the framework, which no recorded source declares.
+    let runtime = super::app::FRAMEWORK_ROOTS.contains(&root)
+        || crate::gems::is_stdlib_namespace(root)
+        || crate::gems::is_core_constant(&segments)
+        || crate::gems::preloaded_constant(root);
+    match (!runtime).then(|| enum_constants.guarded_constant(&written, owners)).flatten() {
+        Some(false) => Some(Ok(None)),
+        Some(true) => {
+            let includes_guarded = |stmt: &Node<'_>| {
+                stmt.as_call_node().is_some_and(|call| {
+                    constant_id_str(&call.name()) == "include"
+                        && call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| EnumConstants::path(&a)).as_deref() == Some(written.as_str())
+                })
+            };
+            match <[Node<'pr>; 1]>::try_from(stmts) {
+                Ok([only]) if includes_guarded(&only) => Some(Ok(Some(only))),
+                _ => refuse(format!("`{written}` is defined, and the branch does more than include it")),
+            }
+        }
+        None => refuse(format!("whether `{written}` is defined where the model loads is not known here")),
+    }
 }
 
 /// Where the previous statement ended, for the blank line before the next one.

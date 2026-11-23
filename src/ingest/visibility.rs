@@ -120,6 +120,18 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
     (defines && only_defs).then_some((negated, arms))
 }
 
+/// A [`conditional_definition`] whose branches only load: each statement an
+/// `include` of a constant, a `require` of a string, or a nested conditional
+/// of the same kind (#2282). It defines nothing itself.
+pub(super) fn load_only_conditional<'pr>(node: &Node<'pr>) -> Option<(bool, Vec<(Option<Node<'pr>>, Vec<Node<'pr>>)>)> {
+    let (negated, arms) = conditional_definition(node)?;
+    let loads = |stmt: &Node<'_>| {
+        branch_load(stmt).is_some_and(|call| matches!(constant_id_str(&call.name()), "include" | "require"))
+            || load_only_conditional(stmt).is_some()
+    };
+    arms.iter().all(|(_, stmts)| stmts.iter().all(loads)).then_some((negated, arms))
+}
+
 /// A class-body `if` / `unless` whose branches define a method but hold
 /// a statement [`conditional_definition`] does not admit: that statement,
 /// and why it keeps the conditional refused.
