@@ -43,6 +43,7 @@ module ActionDispatch
       # shape) so target type inference reads them as `String?`.
       @notice_was = nil
       @alert_was  = nil
+      begin_carry
       return if other.nil?
       # Iterate rather than index: the persisted store is partial ({} /
       # notice-only / alert-only), and strict targets (Crystal) raise
@@ -55,8 +56,25 @@ module ActionDispatch
         elsif k == "alert"
           @alert = v
           @alert_was = v
+        else
+          carry_other(k, v)
         end
+        carried(k)
       end
+    end
+
+    # Not a second `initialize` in the reopening that carries any key (runtime/spinel/flash_any_key.rb): it overrides
+    # these, and Spinel refuses an initialize with defaults that a later file defines again.
+    def begin_carry
+      nil
+    end
+
+    def carry_other(key, value)
+      nil
+    end
+
+    def carried(key)
+      nil
     end
 
     # `flash.now[:alert] = "…"` — a flash for THIS request only.
