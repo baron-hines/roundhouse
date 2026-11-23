@@ -7,8 +7,9 @@
 //! name the Symbol keys, as do calls on a no-argument private helper that
 //! answers such a `permit` (`def x_params = params.permit(%w[a b])`). A
 //! plain Hash the app builds, inline or in a helper, keeps Ruby's answer,
-//! as do a helper the class overrides with one, a helper with a `return`,
-//! a memoized helper, and a splatted key list on a one-key method.
+//! as do a helper the class or a subclass overrides with one, a helper
+//! with a `return`, a memoized helper, a `merge` of a Hash that is not a
+//! literal, and a splatted key list on a one-key method.
 
 use super::emit_and_run;
 
@@ -26,7 +27,9 @@ const ROUTES: &str = r#"  post "/imports/splat" => "imports#splat"
   post "/imports/early_return" => "imports#early_return"
   post "/imports/memo_helper" => "imports#memo_helper"
   post "/imports/fetch_splat" => "imports#fetch_splat"
+  post "/imports/merge_variable" => "imports#merge_variable"
   post "/override_imports/override" => "override_imports#override"
+  post "/override_imports/inherited_fetch" => "override_imports#inherited_fetch"
 "#;
 
 const CONTROLLER: &str = r#"class ImportsController < ApplicationController
@@ -103,6 +106,18 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
     render plain: memo_attrs.fetch("title")
   end
 
+  # A Hash `merge` takes by name may hold String keys, which Ruby's String except removes.
+  def merge_variable
+    extra = { "title" => "changed" }
+    attrs = params.permit(:body).merge(extra).except("title")
+    render plain: attrs.keys.map(&:to_s).sort.join(",")
+  end
+
+  # Run on OverrideImportsController, whose allowed_attrs is a plain String-keyed Hash.
+  def inherited_fetch
+    render plain: allowed_attrs.fetch("title")
+  end
+
   # Emit-only (no runtime case): the emitters cast a splatted first key as one key, on main too.
   def fetch_splat
     render plain: params.permit(%w[body]).fetch(*%w[title fallback]).inspect
@@ -111,6 +126,8 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
   private
 
   def article_params = params.permit(%w[title body])
+
+  def allowed_attrs = params.permit(%w[title body])
 
   def early_attrs
     return { "title" => "kept" } if params[:early]
@@ -127,15 +144,16 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
 end
 "#;
 
-/// Overrides the permit helper `article_params` it inherits with a plain String-keyed Hash.
+/// Overrides the permit helper `allowed_attrs` it inherits with a plain String-keyed Hash, which its own
+/// action and the inherited `inherited_fetch` read.
 const OVERRIDE: &str = r#"class OverrideImportsController < ImportsController
   def override
-    render plain: article_params.fetch("title")
+    render plain: allowed_attrs.fetch("title")
   end
 
   private
 
-  def article_params
+  def allowed_attrs
     { "title" => "kept" }
   end
 end
@@ -206,6 +224,16 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "kept", response.body
   end
 
+  test "an inherited action reads the subclass's plain Hash helper with its String key" do
+    post "/override_imports/inherited_fetch", params: PARAMS
+    assert_equal "kept", response.body
+  end
+
+  test "except with a String drops a String key a merged Hash variable brought" do
+    post "/imports/merge_variable", params: PARAMS
+    assert_equal "body", response.body
+  end
+
   test "a helper that returns a plain Hash early keeps its String key" do
     post "/imports/early_return", params: PARAMS.merge(early: "1")
     assert_equal "kept", response.body
@@ -231,7 +259,8 @@ fn string_keys_on_a_permitted_hash_name_its_keys() {
 }
 
 /// The Spinel emit writes the same Symbol keys, through a helper too; a plain Hash keeps its String, as do a
-/// helper this class overrides, one with a `return`, a memoized one, and a splatted key list on `fetch`.
+/// helper this class or a subclass overrides, one with a `return`, a memoized one, a `merge` of a Hash variable,
+/// and a splatted key list on `fetch`.
 #[test]
 fn the_spinel_emit_names_the_symbol_keys() {
     let (tree, errors) = emit_and_run::real_blog()
@@ -254,9 +283,11 @@ fn the_spinel_emit_names_the_symbol_keys() {
         "early_attrs.fetch(\"title\")",
         "memo_attrs.fetch(\"title\")",
         ".fetch(*%w[title fallback]",
+        "allowed_attrs.fetch(\"title\")",
+        ".merge(extra).except(\"title\")",
     ] {
         assert!(src.contains(line), "missing `{line}`:\n{src}");
     }
     let child = std::fs::read_to_string(tree.join("app/controllers/override_imports_controller.rb")).expect("child");
-    assert!(child.contains("article_params.fetch(\"title\")"), "{child}");
+    assert!(child.contains("allowed_attrs.fetch(\"title\")"), "{child}");
 }
