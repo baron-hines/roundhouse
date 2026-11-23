@@ -189,7 +189,7 @@ pub(super) fn ingest_model_with_enum_constants(
                 continue;
             }
             let at = stmt.location().start_offset();
-            match settle_load_only_conditional(stmt, &lexical, enum_constants, file) {
+            match settle_load_only_conditional(stmt, &lexical, enum_constants, &root, file) {
                 Some(settled) => {
                     settled_loads.insert(at, settled?);
                 }
@@ -707,14 +707,17 @@ struct WalkStmt<'a> {
 /// could define `Const` the branch never runs (`Ok(None)`); when one of
 /// `owners`' spellings of it is defined and the branch is `include Const`
 /// alone, the branch is that include. Every other one is refused by what
-/// it is: a constant Ruby, the framework or an ancestor may define, a
-/// branch doing more than include the guarded module, or another guard.
+/// it is: a constant Ruby, the framework or an ancestor may define, one the
+/// model's own file declares (`file_root`: whether that runs before the
+/// guard is not what the recorded constants say), a branch doing more than
+/// include the guarded module, or another guard.
 // Not the modifier form (`include M if defined?(M)`): no `end`, so not a
 // conditional definition, and left as it was.
 fn settle_load_only_conditional<'pr>(
     node: Node<'pr>,
     owners: &[String],
     enum_constants: &EnumConstants,
+    file_root: &Node<'_>,
     file: &str,
 ) -> Option<IngestResult<Option<Node<'pr>>>> {
     let (negated, arms) = visibility::load_only_conditional(&node)?;
@@ -739,7 +742,8 @@ fn settle_load_only_conditional<'pr>(
         || crate::gems::is_stdlib_namespace(root)
         || crate::gems::is_core_constant(&segments)
         || crate::gems::preloaded_constant(root);
-    match (!runtime).then(|| enum_constants.guarded_constant(&written, owners)).flatten() {
+    let declared_here = declares_constant_named(file_root, segments[segments.len() - 1]);
+    match (!runtime && !declared_here).then(|| enum_constants.guarded_constant(&written, owners)).flatten() {
         Some(false) => Some(Ok(None)),
         Some(true) => {
             let includes_guarded = |stmt: &Node<'_>| {
@@ -755,6 +759,46 @@ fn settle_load_only_conditional<'pr>(
         }
         None => refuse(format!("whether `{written}` is defined where the model loads is not known here")),
     }
+}
+
+/// Whether the file declares a class, module or constant whose own name is
+/// `name`, at any depth (`module Auditable`, `Tracking::Auditable = …`).
+fn declares_constant_named(root: &Node<'_>, name: &str) -> bool {
+    struct Declares<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl Declares<'_> {
+        fn path(&mut self, path: &Node<'_>) {
+            let own = if let Some(read) = path.as_constant_read_node() {
+                Some(read.name())
+            } else {
+                path.as_constant_path_node().and_then(|p| p.name())
+            };
+            self.found |= own.is_some_and(|n| constant_id_str(&n) == self.name);
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Declares<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.path(&node.constant_path());
+            ruby_prism::visit_class_node(self, node);
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.path(&node.constant_path());
+            ruby_prism::visit_module_node(self, node);
+        }
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.found |= constant_id_str(&node.name()) == self.name;
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+        fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+            self.found |= node.target().name().is_some_and(|n| constant_id_str(&n) == self.name);
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+    }
+    let mut declares = Declares { name, found: false };
+    ruby_prism::Visit::visit(&mut declares, root);
+    declares.found
 }
 
 /// Where the previous statement ended, for the blank line before the next one.

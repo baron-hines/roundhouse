@@ -457,20 +457,26 @@ impl EnumConstants {
 
     /// What the recorded sources (the app's, its path gems' and its source
     /// gems') say `defined?(written)` answers in a class body whose lexical
-    /// owners are `owners`, innermost first: `Some(true)` when one of its
-    /// spellings is recorded, `Some(false)` when no recorded name could be it
-    /// (none ends in `written`), and `None` when one could only be reached
-    /// some other way (an ancestor's constant). The caller rules out what
-    /// Ruby or the framework define without a source.
+    /// owners are `owners`, innermost first: `Some(true)` when the constant
+    /// Ruby's lookup reaches is recorded, `Some(false)` when no recorded name
+    /// could be it (none ends in `written`), and `None` when one could only be
+    /// reached some other way (an ancestor's constant), or a nearer owner's
+    /// first segment shadows the top level's and does not hold the rest. The
+    /// caller rules out what Ruby or the framework define without a source.
     pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String]) -> Option<bool> {
-        let spellings: Vec<String> = match written.strip_prefix("::") {
-            Some(rooted) => vec![rooted.to_string()],
-            None => owners.iter().map(|owner| format!("{owner}::{written}")).chain(std::iter::once(written.to_string())).collect(),
-        };
-        if spellings.iter().any(|s| self.values.contains_key(s)) {
+        let bare = written.trim_start_matches("::");
+        if !written.starts_with("::") {
+            // Ruby reads the first segment lexically, innermost owner first: a
+            // nearer `Tracking` (`Post::Tracking`) is the one the rest is read
+            // under, whatever the top level holds.
+            let first = bare.split("::").next().unwrap_or(bare);
+            if let Some(owner) = owners.iter().find(|owner| self.values.contains_key(&format!("{owner}::{first}"))) {
+                return self.values.contains_key(&format!("{owner}::{bare}")).then_some(true);
+            }
+        }
+        if self.values.contains_key(bare) {
             return Some(true);
         }
-        let bare = written.trim_start_matches("::");
         let last = bare.rsplit("::").next().unwrap_or(bare);
         let suffix = format!("::{bare}");
         let names = self.names();

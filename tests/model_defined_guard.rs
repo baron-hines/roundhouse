@@ -177,3 +177,29 @@ fn a_conditional_definition_in_a_model_stays_refused() {
     let error = refusal(head, false);
     assert!(error.contains("conditional or dynamic visibility declarations are not modeled"), "{error}");
 }
+
+/// The model's own file declares the guarded module after the guard: Ruby
+/// reads `defined?` before that declaration runs, which the recorded
+/// constants cannot tell, so the model is refused rather than settled.
+#[test]
+fn a_guarded_module_the_model_file_declares_is_refused() {
+    let head = format!("{GUARDED}  module Tracking\n    module Auditable\n    end\n  end\n");
+    for auditable in [false, true] {
+        let error = refusal(&head, auditable);
+        assert!(error.contains("load-time conditional `include` or `require`"), "{error}");
+    }
+}
+
+/// `Post::Tracking` shadows the top-level `Tracking` inside `Post`, and
+/// holds no `Auditable`: Ruby's `defined?(Tracking::Auditable)` is false
+/// there although `Tracking::Auditable` exists, so the guard is not settled.
+#[test]
+fn a_nearer_namespace_shadowing_the_guard_is_refused() {
+    let mut tree = tree(GUARDED, true);
+    tree.insert(PathBuf::from("app/models/post/tracking.rb"), b"module Post::Tracking\nend\n".to_vec());
+    let error = match ingest_app_from_tree(tree) {
+        Ok(_) => panic!("the model is not refused"),
+        Err(err) => err.to_string(),
+    };
+    assert!(error.contains("load-time conditional `include` or `require`"), "{error}");
+}
