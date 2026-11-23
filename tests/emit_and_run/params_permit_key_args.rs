@@ -8,8 +8,9 @@
 //! answers such a `permit` (`def x_params = params.permit(%w[a b])`). A
 //! plain Hash the app builds, inline or in a helper, keeps Ruby's answer,
 //! as do a helper the class or a subclass overrides with one, a helper
-//! with a `return`, a memoized helper, a `merge` of a Hash that is not a
-//! literal, and a splatted key list on a one-key method.
+//! with a `return`, a memoized helper, a `merge` of anything but a Hash
+//! literal with Symbol keys (a String-keyed Hash literal keeps its String
+//! keys), and a splatted key list on a one-key method.
 
 use super::emit_and_run;
 
@@ -28,6 +29,9 @@ const ROUTES: &str = r#"  post "/imports/splat" => "imports#splat"
   post "/imports/memo_helper" => "imports#memo_helper"
   post "/imports/fetch_splat" => "imports#fetch_splat"
   post "/imports/merge_variable" => "imports#merge_variable"
+  post "/imports/merge_computed_key" => "imports#merge_computed_key"
+  post "/imports/merge_then_variable" => "imports#merge_then_variable"
+  post "/imports/merge_symbol" => "imports#merge_symbol"
   post "/override_imports/override" => "override_imports#override"
   post "/override_imports/inherited_fetch" => "override_imports#inherited_fetch"
 "#;
@@ -74,6 +78,7 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
     render plain: attrs.keys.map(&:to_s).sort.join(",")
   end
 
+  # A String-keyed Hash literal merged in keeps its String key, as on main (Rails answers `body,title`).
   def merge_string
     attrs = params.permit(%w[title body]).merge("title" => "z")
     render plain: attrs.keys.map(&:to_s).sort.join(",")
@@ -110,6 +115,24 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
   def merge_variable
     extra = { "title" => "changed" }
     attrs = params.permit(:body).merge(extra).except("title")
+    render plain: attrs.keys.map(&:to_s).sort.join(",")
+  end
+
+  # A computed key stops the walk; the merged String "title" is the one except("title") removes.
+  def merge_computed_key
+    other_key = :body
+    attrs = params.permit(:body).merge("title" => "changed", other_key => "replacement").except("title")
+    render plain: attrs.map { |k, v| [k, v].join("=") }.sort.join(",")
+  end
+
+  def merge_then_variable
+    extra = {}
+    attrs = params.permit(:body).merge("title" => "changed").merge(extra).except("title")
+    render plain: attrs.keys.map(&:to_s).sort.join(",")
+  end
+
+  def merge_symbol
+    attrs = params.permit(%w[title body version]).merge(body: "x").except("version")
     render plain: attrs.keys.map(&:to_s).sort.join(",")
   end
 
@@ -199,8 +222,23 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "body,title", response.body
   end
 
-  test "merge with a String key replaces the permitted key" do
+  test "merge with a String key keeps it beside the permitted key, as on main" do
     post "/imports/merge_string", params: PARAMS
+    assert_equal "body,title,title", response.body
+  end
+
+  test "except with a String drops a String key merged beside a computed key" do
+    post "/imports/merge_computed_key", params: PARAMS
+    assert_equal "body=replacement", response.body
+  end
+
+  test "except with a String drops a String key merged before a Hash variable" do
+    post "/imports/merge_then_variable", params: PARAMS
+    assert_equal "body", response.body
+  end
+
+  test "except with a String after a Symbol-keyed merge drops the key" do
+    post "/imports/merge_symbol", params: PARAMS
     assert_equal "body,title", response.body
   end
 
@@ -259,8 +297,8 @@ fn string_keys_on_a_permitted_hash_name_its_keys() {
 }
 
 /// The Spinel emit writes the same Symbol keys, through a helper too; a plain Hash keeps its String, as do a
-/// helper this class or a subclass overrides, one with a `return`, a memoized one, a `merge` of a Hash variable,
-/// and a splatted key list on `fetch`.
+/// helper this class or a subclass overrides, one with a `return`, a memoized one, a `merge` of a Hash variable, a
+/// String-keyed or computed-key Hash literal, and a splatted key list on `fetch`.
 #[test]
 fn the_spinel_emit_names_the_symbol_keys() {
     let (tree, errors) = emit_and_run::real_blog()
@@ -276,7 +314,10 @@ fn the_spinel_emit_names_the_symbol_keys() {
         ".slice(:title)",
         ".except(key.to_sym)",
         ".except(*keys.map { |x| x.to_sym })",
-        ".merge(title: \"z\")",
+        ".merge(\"title\" => \"z\")",
+        ".merge(body: \"x\").except(:version)",
+        "other_key => \"replacement\").except(\"title\")",
+        ".merge(\"title\" => \"changed\").merge(extra).except(\"title\")",
         "}.except(\"version\")",
         "article_params.except(:title)",
         "plain_attrs.except(\"version\")",
