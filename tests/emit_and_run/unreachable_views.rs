@@ -70,3 +70,15 @@ fn a_splatted_partial_render_and_pagy_backend_reach_no_template() {
         assert!(!warnings.iter().any(|w| w.contains("`notes/orphan` is rendered by no action")), "{open}: {warnings:#?}");
     }
 }
+
+/// maybe's `EntryableResource` concern: `include ActionView::RecordIdentifier` in a controller's included block
+/// is Rails' own module of dom id helpers, which defines no action, so `valuations/index` (no action, no route)
+/// is still unreachable.
+#[test]
+fn rails_record_identifier_defines_no_action() {
+    let warnings = app()
+        .write("app/controllers/concerns/note_resource.rb", "module NoteResource\n  extend ActiveSupport::Concern\n\n  included do\n    include ActionView::RecordIdentifier\n  end\nend\n")
+        .edit("app/controllers/notes_controller.rb", "class NotesController < ApplicationController\n", "class NotesController < ApplicationController\n  include NoteResource\n")
+        .ingest_warnings();
+    assert!(warnings.iter().any(|w| w.contains("`notes/orphan` is rendered by no action, route or render call")), "{warnings:#?}");
+}

@@ -3510,6 +3510,7 @@ end
             }
         }
         super::oj::lower_oj(&mut app, &sources, &initializers)?;
+        super::multi_json::lower_multi_json(&mut app, &sources, &initializers)?;
     }
     super::dry_initializer::drop_type_constants(&mut app, &sources);
     // graphql-ruby object types: analyzer-only field methods, so
@@ -3520,7 +3521,10 @@ end
     super::representable::lower_representable_decorators(&mut app, &sources)?;
     // ActiveModel::Serializer classes, the same way; their controllers'
     // `render json: x, serializer: S` sites call the expansion.
+    // Before the serializers, so a copy's `each_serializer:` is a constant the array rewrite reads.
+    super::class_arg_specialize::specialize(&mut app);
     super::active_model_serializer::lower_active_model_serializers(&mut app, &sources)?;
+    super::active_model_serializer_08::lower(&mut app, &sources)?;
     // After it, not before: `Current`'s own `delegate` reads an
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.

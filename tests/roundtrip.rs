@@ -161,6 +161,7 @@ fn tiny_blog_round_trips() {
         i18n_runtime_sites: Default::default(),
         i18n_table_sites: Default::default(),
         inferred_method_params: Default::default(),
+        relation_params: Default::default(),
         models: vec![post_model],
         library_classes: vec![],
         native_library_keywords: false,

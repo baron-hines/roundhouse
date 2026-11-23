@@ -57,6 +57,11 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         let (chain, root) = chain_of(id);
         root == "ActiveSupport::OrderedOptions" && !chain.iter().any(|c| own_update.contains(c))
     };
+    // An ActiveRecord model also answers `ActiveRecord::Base`'s own instance API, which the registry leaves out where a
+    // later pass lowers it (`association(:x).loaded?` to `x_loaded?`).
+    let active_record = |id: &ClassId, method: &str| {
+        registry.get(id).is_some_and(|info| info.active_record_model) && super::core_instance_methods::ACTIVE_RECORD_BASE.contains(&method)
+    };
     let core_of = |id: &ClassId| -> &'static [&'static str] {
         // Not Object's alone for Rails' OrderedOptions, a Hash on the ruby family's tree (Spinel's holds one, and
         // answers only what its own class defines).
@@ -116,6 +121,9 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         .map(|c| (c.name.0.as_str().to_string(), c.includes.iter().map(|m| m.0.as_str().trim_start_matches("::").to_string()).collect()))
         .collect();
     let module_answers = |id: &ClassId, method: &str| {
+        if active_record(id, method) {
+            return true;
+        }
         let mut current = Some(id.0.as_str().to_string());
         for _ in 0..32 {
             let Some(name) = current else { break };

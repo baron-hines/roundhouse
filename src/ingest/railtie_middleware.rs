@@ -43,6 +43,8 @@ struct Use {
     block: Option<String>,
     /// Run as its class body loads, not from an initializer: Bundler requires the gem before the app's class body runs.
     at_load: bool,
+    /// `insert_after ActionDispatch::RequestId, K`: right inside Rails' RequestId, where the emitted stack begins.
+    front: bool,
 }
 
 pub(super) struct MiddlewareLoop {
@@ -148,7 +150,7 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         let defined = defined_constants(vfs, &files);
         for u in uses {
             match resolve(&u, &defined).or_else(|| resolve(&u, &every_gem_defines)) {
-                Some(class) => out.push((class, u.ordered, u.span, u.block, u.at_load)),
+                Some(class) => out.push((class, u.ordered, u.span, u.block, u.at_load, u.front)),
                 None => diags.push(Diagnostic::unsupported(
                     u.span,
                     None,
@@ -175,16 +177,18 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
-            app_uses.push((class, false, u.span, u.block, true));
+            app_uses.push((class, false, u.span, u.block, true, false));
         }
     }
     let out: Vec<_> = {
-        let (load, init): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.4);
-        load.into_iter().chain(app_uses).chain(init).collect()
+        let (front, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.5);
+        let (load, init): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.4);
+        // Each `insert_after RequestId` lands right after it, ahead of the ones inserted before: Rails' order is the reverse.
+        front.into_iter().rev().chain(load).chain(app_uses).chain(init).collect()
     };
     // Not stacked in reading order when initializers order themselves: Rails sorts them by `before:` and `after:`.
     if out.len() > 1 {
-        for (_, _, span, _, _) in out.iter().filter(|(_, ordered, _, _, _)| *ordered) {
+        for (_, _, span, _, _, _) in out.iter().filter(|(_, ordered, _, _, _, _)| *ordered) {
             diags.push(Diagnostic::unsupported(
                 *span,
                 None,
@@ -193,8 +197,15 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
             ));
         }
     }
-    let blocks = out.iter().filter_map(|(class, _, _, block, _)| block.clone().map(|b| (class.clone(), b))).collect();
-    let classes: Vec<String> = out.into_iter().map(|(class, _, _, _, _)| class).collect();
+    // Blocks are kept per class, not per entry: a class stacked twice with different blocks is refused rather than given one twice.
+    for (i, (class, _, span, block, _, _)) in out.iter().enumerate() {
+        if out[..i].iter().any(|(c, _, _, b, _, _)| c == class && b != block) {
+            diags.push(Diagnostic::unsupported(*span, None, "railtie middleware",
+                format!("`{class}` is stacked twice with different construction blocks: the emitted stack keeps one per class")));
+        }
+    }
+    let blocks = out.iter().filter_map(|(class, _, _, block, _, _)| block.clone().map(|b| (class.clone(), b))).collect();
+    let classes: Vec<String> = out.into_iter().map(|(class, _, _, _, _, _)| class).collect();
     let env_writes_by_class = env_writes_by_class(vfs, &every_lib_file, &every_gem_defines);
     let mut env_writes = crate::det::HashMap::default();
     stacked_env_writes(&env_writes_by_class, &classes, &mut env_writes);
@@ -229,7 +240,7 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
         let receiver = value.receiver()?;
         let path = constant_path_of(&receiver)?;
         let rooted = receiver.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false }, defined)
+        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: false }, defined)
     };
     let read_owner = |body: Node<'_>, lexical: &[String]| -> Owner {
         let mut owner = Owner::default();
@@ -238,7 +249,7 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
                 for arg in include.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
                     let Some(path) = constant_path_of(&arg) else { continue };
                     let rooted = arg.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false };
+                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: false };
                     owner.includes.extend(resolve(&u, defined));
                 }
                 continue;
@@ -426,7 +437,7 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
         let body = b.body().map(|body| String::from_utf8_lossy(body.location().as_slice()).into_owned()).unwrap_or_default();
         format!("{{ {params}\n{body}\n}}")
     });
-    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true });
+    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, front: false });
 }
 
 #[derive(PartialEq)]
@@ -561,7 +572,9 @@ fn uncertain_loads(node: &Node<'_>, out: &mut Vec<Load>) {
 }
 
 fn rails_defined(predicate: &Node<'_>) -> bool {
-    predicate.as_defined_node().and_then(|d| constant_path_of(&d.value())).is_some_and(|path| path == ["Rails"])
+    predicate.as_defined_node().and_then(|d| constant_path_of(&d.value())).is_some_and(|path| {
+        matches!(path.iter().map(String::as_str).collect::<Vec<_>>().as_slice(), ["Rails"] | ["Rails", "Railtie"] | ["Rails", "Engine"])
+    })
 }
 
 /// Whether Bundler's `require` of the gem reaches `file`: from the entry file (`lib/<name>.rb`, or the
@@ -768,12 +781,22 @@ fn read_initializer(
         let class = match (verb, args.as_slice()) {
             ("use", [only]) if use_call.block().is_none() => constant_path_of(only).map(|path| {
                 let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                (path, rooted)
+                (path, rooted, false)
             }),
+            // The emitted stack starts right inside Rails' RequestId, so a middleware inserted after it is the stack's first.
+            ("insert_after", [anchor, only])
+                if use_call.block().is_none()
+                    && constant_path_of(anchor).is_some_and(|a| a == ["ActionDispatch", "RequestId"]) =>
+            {
+                constant_path_of(only).map(|path| {
+                    let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                    (path, rooted, true)
+                })
+            }
             _ => None,
         };
         match class {
-            Some((path, rooted)) => uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered, block: None, at_load: false }),
+            Some((path, rooted, front)) => uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered, block: None, at_load: false, front }),
             None => diags.push(Diagnostic::unsupported(
                 span,
                 None,
@@ -865,6 +888,31 @@ mod tests {
         assert_eq!(classes, ["Gem::Early", "Warden::Manager", "Gem::Late"], "{diags:?}");
         assert_eq!(blocks.get("Warden::Manager").map(String::as_str), Some("{ |manager|\nmanager.default_scope = :user\n}"));
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// request_store's shape: the entry requires the Railtie under `if defined?(Rails::Railtie)`, which holds in a Rails
+    /// app, and the initializer inserts after `ActionDispatch::RequestId` under `if ActionDispatch.const_defined?
+    /// :RequestId`, which actionpack 8.1 answers true: the middleware is the stack's first, ahead of a later `use`.
+    #[test]
+    fn a_railtie_required_when_rails_is_and_inserted_after_request_id_heads_the_stack() {
+        let entry = "require \"gem/middleware\"\nrequire \"gem/railtie\" if defined?(Rails::Railtie)\n\nmodule Store\nend\n";
+        let middleware = "module Store\n  class Middleware\n    def initialize(app)\n      @app = app\n    end\n  end\n\n  class Later\n    def initialize(app)\n      @app = app\n    end\n  end\nend\n";
+        let railtie = "module Store\n  class Railtie < ::Rails::Railtie\n    initializer \"store.later\" do |app|\n      app.middleware.use(Later)\n    end\n\n    initializer \"store.insert_middleware\" do |app|\n      if ActionDispatch.const_defined? :RequestId\n        app.config.middleware.insert_after ActionDispatch::RequestId, Store::Middleware\n      else\n        app.config.middleware.insert_after Rack::MethodOverride, Store::Middleware\n      end\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[
+            ("/gem/lib/gem.rb", entry),
+            ("/gem/lib/gem/middleware.rb", middleware),
+            ("/gem/lib/gem/railtie.rb", railtie),
+        ]);
+        assert_eq!(classes, ["Store::Middleware", "Store::Later"], "{diags:?}");
+        assert!(diags.is_empty(), "{diags:?}");
+        let twice = "module Gem\n  class A\n  end\n  class B\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n      app.middleware.insert_after ActionDispatch::RequestId, B\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", twice)]);
+        assert_eq!(classes, ["Gem::B", "Gem::A"], "{diags:?}");
+        // The same class stacked again with another block keeps one block per class: refused.
+        let blocks = "module Gem\n  class A\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n    end\n  end\nend\n";
+        let application = "module Blog\n  class Application < Rails::Application\n    config.middleware.use Gem::A do |a|\n      a.x = 1\n    end\n  end\nend\n";
+        let (_, diags) = read(&[("/gem/lib/gem.rb", blocks), ("/app/config/application.rb", application)]);
+        assert!(diags.iter().any(|d| d.contains("stacked twice with different construction blocks")), "{diags:?}");
     }
 
     /// The app's own `config.middleware.use` of a class in its lib/ sits where a source gem's class would.

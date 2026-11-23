@@ -21,6 +21,12 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// An empty `{}` / `[]` seed whose type a later write in its body refined and stamped back: the next analysis of
+/// the body starts it from that stamp less its unknown arms, which an earlier round's untyped ivars left there.
+pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
+/// A receiverless call the source wrote with empty parentheses (`h()`): the Ruby emit keeps them, as bare the name
+/// reads a local of the same name. A synthesized call's `parenthesized` is a default and says nothing.
+pub const WRITTEN_EMPTY_PARENS: u64 = 1 << 46;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
 /// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the
@@ -228,6 +234,13 @@ pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
 /// The body ingest read an `ActiveRecord::Base.connected_to(role: :writing)` block as, the call dropped. An app that
 /// switches roles gets the call back (`ingest::database_ownership`): inside a reading block it is what lifts the guard.
 pub const ERASED_WRITING_SCOPE: u64 = 1 << 61;
+/// On an argument analyze typed as the relation a has_many read is (`analyze::relation_params`): the read the lowering seeds.
+pub const RELATION_ARGUMENT: u64 = 1 << 42;
+/// On an operator's receiver whose non-nil arm defines the operator (`Money? * 2`): Ruby raises only for nil.
+pub const NILABLE_OPERATOR_RECEIVER: u64 = 1 << 43;
+/// On a number operator's operand whose class defines `coerce` and the operator (`2.5 * money`): Ruby asks the
+/// operand to coerce, and its own operator answers.
+pub const COERCED_OPERAND: u64 = 1 << 44;
 /// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 

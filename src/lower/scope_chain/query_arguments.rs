@@ -147,24 +147,30 @@ impl<'a> QueryArguments<'a> {
     pub(crate) fn rewrite(&self, classes: &mut [LibraryClass], regs: &Registries<'_>) {
         for class in classes {
             for method in &mut class.methods {
-                let ctx = Ctx {
-                    scopes: regs.scopes,
-                    models: regs.models,
-                    assocs: regs.assocs,
-                    assoc_class_methods: regs.assoc_class_methods,
-                    user_returns: regs.user_returns,
-                    unique_keys: regs.unique_keys,
-                    owner_objects: regs.owner_objects,
-                    scope_body: None,
-                    self_const_is_implicit: false,
-                    class_self: (method.receiver == MethodReceiver::Class)
-                        .then(|| class.name.clone()),
-                    instance_self: (method.receiver == MethodReceiver::Instance)
-                        .then(|| class.name.clone()),
-                };
-                self.rewrite_body(&mut method.body, &class.name, method.receiver, &ctx);
+                self.rewrite_method(method, &class.name, &class.name, regs);
             }
         }
+    }
+
+    /// One method of `owner`, run as `self_class`'s: a concern's method
+    /// copied into a model that includes it calls the concern's methods
+    /// and reads the model's associations.
+    pub(crate) fn rewrite_method(&self, method: &mut MethodDef, owner: &ClassId, self_class: &ClassId, regs: &Registries<'_>) {
+        let ctx = Ctx {
+            scopes: regs.scopes,
+            models: regs.models,
+            assocs: regs.assocs,
+            assoc_class_methods: regs.assoc_class_methods,
+            user_returns: regs.user_returns,
+            unique_keys: regs.unique_keys,
+            owner_objects: regs.owner_objects,
+            relation_params: regs.relation_params,
+            scope_body: None,
+            self_const_is_implicit: false,
+            class_self: (method.receiver == MethodReceiver::Class).then(|| self_class.clone()),
+            instance_self: (method.receiver == MethodReceiver::Instance).then(|| self_class.clone()),
+        };
+        self.rewrite_body(&mut method.body, owner, method.receiver, &ctx);
     }
 
     fn rewrite_body(&self, expr: &mut Expr, owner: &ClassId, side: MethodReceiver, ctx: &Ctx) {

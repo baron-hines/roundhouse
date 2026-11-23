@@ -1341,6 +1341,9 @@ fn catalog_answers_relation(method: &Symbol) -> Option<bool> {
 #[derive(Default)]
 pub struct AssocRegistry {
     finder_classes: HashMap<ClassId, crate::analyze::ClassInfo>,
+    /// (model, scope) a gem's code defines as the class loads (aasm's per-state scope, `analyze::aasm_surface`): a
+    /// chain hop on the model's relation, which the runtime's `scope` gives the relation too.
+    runtime_scopes: HashSet<(ClassId, Symbol)>,
     /// (model, association name) -> `"<target_table> ON <cond>"`; the
     /// rewrite prefixes `INNER JOIN` / `LEFT OUTER JOIN` by call. Direct
     /// `belongs_to`/`has_many`/`has_one`, plus resolvable `has_many
@@ -1816,6 +1819,7 @@ impl AssocRegistry {
     fn forget(&mut self, model: &ClassId, name: &Symbol) {
         let Self {
             finder_classes: _,
+            runtime_scopes: _,
             join_tails,
             unrenderable_join_scopes,
             belongs_to_fk,
@@ -2063,7 +2067,13 @@ pub fn belongs_to_inverse(models: &[Model], owner: &Model, assoc: &Association) 
 
 pub(crate) fn build_assoc_registry_for_app(app: &crate::App) -> AssocRegistry {
     let resolver = app.const_resolver.for_sources(&app.sources);
-    build_assoc_registry(&app.models).with_finder_classes(&crate::analyze::source_finder_classes(app, &resolver))
+    let mut reg = build_assoc_registry(&app.models).with_finder_classes(&crate::analyze::source_finder_classes(app, &resolver));
+    for model in &app.models {
+        for name in crate::analyze::aasm_surface::scope_names(model, app) {
+            reg.runtime_scopes.insert((model.name.clone(), name));
+        }
+    }
+    reg
 }
 
 pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
@@ -2794,6 +2804,19 @@ pub fn mentions_assoc_alias(expr: &Expr, assocs: &AssocRegistry) -> bool {
     found
 }
 
+/// True if `expr` calls a method with an argument at a position its definitions read as a relation
+/// ([`crate::analyze::relation_params`]).
+pub fn mentions_relation_argument(expr: &Expr, params: &crate::analyze::relation_params::RelationParams) -> bool {
+    if let ExprNode::Send { method, args, .. } = &*expr.node
+        && (0..args.len()).any(|i| params.chains(method, i))
+    {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found = found || mentions_relation_argument(c, params));
+    found
+}
+
 pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
     let mut found = false;
     fn walk(e: &Expr, assocs: &AssocRegistry, found: &mut bool) {
@@ -2826,7 +2849,11 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             // `post.comments.load` is a NoMethodError on the
                             // reader's Array too.
                             | "load" | "load_async" | "from" | "extract_associated"
-                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")));
+                    ) && (args.is_empty() || !matches!(method.as_str(), "load" | "load_async")))
+                // `owner.items.all`: Array answers no `all` either.
+                || (method.as_str() == "all" && args.is_empty() && block.is_none())
+                // Nor a scope a gem defines as the class loads (aasm's per-state scope).
+                || assocs.runtime_scopes.iter().any(|(_, name)| name == method);
             // `owner.items.update(attrs)` alone in a method body is the
             // proxy's bulk update over the records the association holds
             // (`rewrite_send` lowers it to the generated
@@ -3189,6 +3216,8 @@ pub struct Ctx<'a> {
     pub instance_self: Option<ClassId>,
     /// [`Registries::owner_objects`].
     pub owner_objects: bool,
+    /// [`Registries::relation_params`].
+    pub relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
 }
 
 impl Ctx<'_> {
@@ -3259,6 +3288,7 @@ impl Ctx<'_> {
             class_self: self.class_self.clone(),
             instance_self: self.instance_self.clone(),
             owner_objects: self.owner_objects,
+            relation_params: self.relation_params,
             user_returns: self.user_returns,
         }
     }
@@ -4597,6 +4627,30 @@ pub(crate) struct Locals {
 /// Alias-map key for a name. Ivars and locals share one map, so the
 /// ivar spelling is prefixed — `@room` and a local `room` are different
 /// bindings and must not overwrite each other.
+fn lvalue_key(target: &crate::expr::LValue) -> Option<Symbol> {
+    match target {
+        crate::expr::LValue::Var { name, .. } => Some(alias_key(name, false)),
+        crate::expr::LValue::Ivar { name } => Some(alias_key(name, true)),
+        _ => None,
+    }
+}
+
+/// An association read parked on a name reads its owner when it is seeded, so the owner's rebinding drops it.
+fn forget_owner(locals: &mut Locals, key: &Symbol) {
+    locals.assoc.retain(|_, (_, read)| !mentions_name(read, key));
+}
+
+fn mentions_name(expr: &Expr, key: &Symbol) -> bool {
+    let hit = match &*expr.node {
+        ExprNode::Var { name, .. } => alias_key(name, false) == *key,
+        ExprNode::Ivar { name } => alias_key(name, true) == *key,
+        _ => false,
+    };
+    let mut found = hit;
+    expr.node.for_each_child(&mut |c| found = found || mentions_name(c, key));
+    found
+}
+
 fn alias_key(name: &Symbol, ivar: bool) -> Symbol {
     if ivar { Symbol::from(format!("@{}", name.as_str())) } else { name.clone() }
 }
@@ -4747,6 +4801,7 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
                 crate::expr::LValue::Ivar { name } => Some(alias_key(name, true)),
                 _ => None,
             } {
+                forget_owner(locals, &key);
                 match seedable_assoc_read(ctx, &value, expr.span) {
                     Some(model) => {
                         locals.assoc.insert(key, (model, value.clone()));
@@ -4758,6 +4813,24 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             }
             *expr.node = ExprNode::Assign { target, value };
             m
+        }
+        // A rebinding this pass does not follow leaves no relation or association behind the names it writes.
+        ExprNode::MultiAssign { .. } | ExprNode::OpAssign { .. } => {
+            let mut names = Vec::new();
+            match &*expr.node {
+                ExprNode::MultiAssign { targets, .. } => names.extend(targets.iter().filter_map(lvalue_key)),
+                ExprNode::OpAssign { target, .. } => names.extend(lvalue_key(target)),
+                _ => {}
+            }
+            expr.node.for_each_child_mut(&mut |c| {
+                rewrite(c, ctx, locals);
+            });
+            for key in names {
+                locals.rel.remove(&key);
+                locals.assoc.remove(&key);
+                forget_owner(locals, &key);
+            }
+            None
         }
         ExprNode::Send { .. } => {
             let model = rewrite_send(expr, ctx, locals);
@@ -4776,6 +4849,43 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             None
         }
     }
+}
+
+/// A has_many read analyze typed as the relation a parameter takes (`analyze::relation_params`): `<read>.all`, which
+/// the seed arm lowers to the association's relation. A local analyze typed so that the pass did not see bound to such a read is refused.
+fn relation_argument(arg: &mut Expr, ctx: &Ctx, locals: &Locals) {
+    let read = self_qualified_assoc_read(arg.clone(), ctx);
+    let aliased = matches!(&*read.node, ExprNode::Var { name, .. } if locals.assoc.contains_key(&alias_key(name, false)));
+    let seeded = |e: &Expr| match &*e.node {
+        ExprNode::Var { name, .. } => locals.assoc.get(&alias_key(name, false)).map(|(_, r)| r.clone()),
+        _ => Some(e.clone()),
+    };
+    // Not through `.all` when the association defines its own: that call is the extension's, not the relation.
+    // The owner's association, when its model is known; any of the name's otherwise.
+    let all = Symbol::from("all");
+    let own_all = seeded(&read).is_some_and(|r| {
+        let ExprNode::Send { recv, method: aname, .. } = &*r.node else { return false };
+        let owners = match recv.as_ref().map(|o| &*o.node) {
+            Some(ExprNode::SelfRef) | None => ctx.instance_self.as_ref().map(|m| vec![m]),
+            Some(_) => recv.as_ref().and_then(|o| ctx.assocs.owner_models(o, aname)),
+        };
+        match owners {
+            Some(owners) => owners.iter().any(|m| ctx.assocs.is_assoc_extension(Some(&[*m]), aname, &all)),
+            None => ctx.assocs.is_assoc_extension(None, aname, &all),
+        }
+    });
+    if own_all || (!aliased && seedable_assoc_read(ctx, &read, read.span).is_none()) {
+        if arg.decisions & crate::expr::RELATION_ARGUMENT == 0 {
+            return;
+        }
+        crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(arg.span, None,
+            "records passed as a relation".to_owned(),
+            "the method calls a query method on this parameter, and the argument is not an association read the lowering can seed".to_owned()));
+        return;
+    }
+    let (span, ty) = (arg.span, arg.ty.clone());
+    *arg = syn(span, ExprNode::Send { recv: Some(read), method: Symbol::from("all"), args: vec![], block: None, parenthesized: false });
+    arg.ty = ty;
 }
 
 fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<ClassId> {
@@ -4833,7 +4943,10 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
     // constants (drop the scope-body relation), but may still read outer
     // locals.
     let arg_ctx = ctx.at_callsite();
-    for a in &mut args {
+    for (i, a) in args.iter_mut().enumerate() {
+        if ctx.relation_params.is_some_and(|p| p.chains(&method, i)) {
+            relation_argument(a, ctx, locals);
+        }
         rewrite(a, &arg_ctx, locals);
     }
     if let Some(b) = &mut block {
@@ -5247,6 +5360,8 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             } {
                 if ctx.scope_of(target, &method)
                     || is_relation_chain_method(method.as_str())
+                    || ctx.assocs.runtime_scopes.contains(&(target.clone(), method.clone()))
+                    || method.as_str() == "all"
                     || is_relation_terminal(method.as_str(), &args, block.as_ref())
                     || ctx.assoc_class_method_params(target, &method).is_some()
                     // CollectionProxy constructors too: `@subscriptions
@@ -5580,7 +5695,11 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             }
                         }
                         let is_scope = ctx.scope_of(&target, &method);
-                        let is_chain = is_relation_chain_method(method.as_str());
+                        // `all` on the association is its relation, as
+                        // a chain hop with nothing to add.
+                        let is_chain = is_relation_chain_method(method.as_str())
+                            || (method.as_str() == "all" && args.is_empty() && block.is_none())
+                            || ctx.assocs.runtime_scopes.contains(&(target.clone(), method.clone()));
                         let is_term =
                             is_relation_terminal(method.as_str(), &args, block.as_ref());
                         // A registered class method takes the same
@@ -6052,6 +6171,7 @@ fn rewrite_relation_taking_body(
         instance_self: None,
         user_returns: &empty_returns,
         owner_objects: false,
+        relation_params: None,
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
@@ -6141,6 +6261,7 @@ pub fn rewrite_call_site_seeded(
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
         owner_objects: regs.owner_objects,
+        relation_params: regs.relation_params,
     };
     let mut locals = Locals::default();
     for (name, value) in seeds {
@@ -6173,6 +6294,7 @@ pub fn rewrite_call_site(
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
         owner_objects: regs.owner_objects,
+        relation_params: regs.relation_params,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -6193,6 +6315,8 @@ pub struct Registries<'a> {
     /// [`AssocRegistry::has_many_inverse`]. False keeps `room_id:
     /// room.id`, the only form a strict target's attrs bag can carry.
     pub owner_objects: bool,
+    /// Parameters an app method reads as a relation: a has_many read handed to one is its relation.
+    pub relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
 }
 
 #[cfg(test)]
@@ -6423,6 +6547,7 @@ mod tests {
             user_returns: empty_returns(),
             unique_keys: empty_unique_keys(),
             owner_objects: false,
+            relation_params: None,
         }
     }
 
@@ -6443,6 +6568,7 @@ mod tests {
             instance_self: None,
             user_returns: empty_returns(),
             owner_objects: false,
+            relation_params: None,
         }
     }
 
@@ -6793,6 +6919,7 @@ mod tests {
             user_returns: empty_returns(),
             instance_self: None,
             owner_objects: false,
+            relation_params: None,
         }
     }
 

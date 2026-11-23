@@ -3097,11 +3097,21 @@ fn report_partial_binops(app: &App, target: BuildTarget) {
     }
     fn visit(expr: &crate::expr::Expr, target: BuildTarget) {
         if let Some(crate::diagnostic::DiagnosticKind::IncompatibleBinop { op, lhs_ty, rhs_ty }) = &expr.diagnostic()
-            && crate::analyze::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+            && (crate::analyze::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+                || matches!(&*expr.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if r.decisions & crate::expr::NILABLE_OPERATOR_RECEIVER != 0))
         {
             crate::emit::diagnostics::report_unsupported(
                 expr.span, target.as_str(), "operator on some of its operands' types",
                 format!("`{}` takes only some of the types its operands may hold; the ruby family raises for the rest as Ruby does, this target for all", op.as_str()),
+            );
+        }
+        if let crate::expr::ExprNode::Send { method, args, .. } = &*expr.node
+            && let [operand] = args.as_slice()
+            && operand.decisions & crate::expr::COERCED_OPERAND != 0
+        {
+            crate::emit::diagnostics::report_unsupported(
+                expr.span, target.as_str(), "numeric coercion",
+                format!("a number's `{}` with an operand that answers `coerce`: the ruby family runs Ruby's coercion, this target has no such dispatch", method.as_str()),
             );
         }
         expr.node.for_each_child(&mut |child| visit(child, target));
@@ -5458,6 +5468,15 @@ fn ruby_family_runtime_files(
                         # manager), which `rack` autoloads, on an entry point no Puma loaded rack for.\n\
                         require \"rack\"\n\
                         require \"rack/utils\"\n"
+                .to_string();
+        }
+        // `Rack::BodyProxy`: the rack gem's own, as for `Rack::Utils`.
+        if path == "runtime/rack_body_proxy.rb" {
+            *content = "# The rack gem's own Rack::BodyProxy — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/rack_body_proxy.rb exists for the targets\n\
+                        # that have no rack to load.\n\
+                        require \"rack\"\n\
+                        require \"rack/body_proxy\"\n"
                 .to_string();
         }
         if path == "runtime/zlib.rb" {
@@ -9666,7 +9685,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "JSON::GeneratorError"
         // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
         // the ruby family; no strict target loads either.
-        | "Rack::Utils"
+        | "Rack::Utils" | "Rack::BodyProxy"
         // `runtime/ruby/active_support_ext.rb` ships to the ruby family
         // and spinel only.
         | "ActiveSupport::JSON" | "ActiveSupport::Deprecation" | "ActiveSupport::Deprecation::DeprecatedConstantAccessor"
@@ -11564,6 +11583,8 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         // spinel (no rack gem to load); the ruby family swaps it for
         // `require "rack/utils"` below, as ipaddr and zlib are swapped.
         "rack_utils",
+        // rack's `BodyProxy`, ported the same way (request_store's middleware wraps the body in one).
+        "rack_body_proxy",
         // Ruby's `Logger` plus the two ActiveSupport wrappers in front
         // of it. Same arrangement as ipaddr, with one difference the
         // file's header gives: NOT swapped for Ruby's own on the
