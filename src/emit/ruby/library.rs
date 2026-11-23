@@ -9478,7 +9478,8 @@ fn emit_library_class_decl_inner(
         .iter()
         .filter(|call| {
             (call.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::CONSTANT_STATEMENT) != 0
-                || (call.decisions & crate::expr::BODY_STATEMENT != 0 && super::expr::carries_body_statements()))
+                || (call.decisions & crate::expr::BODY_STATEMENT != 0 && super::expr::carries_body_statements())
+                || inherited_class_method_call(app, classes, lc, call))
                 && !call.span.is_synthetic()
         })
         .collect();
@@ -10375,11 +10376,7 @@ fn emit_library_class_decl_inner(
         picked.extend(gem_include_macro_calls(lc));
         // A call of a class method an ancestor of the program's defines (a Concern's `class_methods` its parent took):
         // Ruby runs it as the body loads, and the method is in this tree. Not the class's own, written after the call here.
-        picked.extend(lc.unknown_calls.iter().filter(|call| {
-            !lc.is_module
-                && matches!(&*call.node, ExprNode::Send { recv, method, .. }
-                    if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) && singleton_method_visible(app, classes, lc, method))
-        }));
+        picked.extend(lc.unknown_calls.iter().filter(|call| inherited_class_method_call(app, classes, lc, call)));
         // Source order, each call once: `span_method` prepends its wrapper,
         // and an app macro written after it may read the ancestors.
         let own: Vec<&Expr> =
@@ -11322,6 +11319,14 @@ fn block_assigns_bare_constant(call: &Expr) -> bool {
 /// An ancestor's class method. This fragment's own `def self` is emitted
 /// with the methods, after this call, so it is not loaded yet. Another
 /// reopen of this class is a different file.
+/// A class-body call of a class method an ancestor of the program's defines: Ruby runs it as the body loads, where
+/// the body has it (a source-ordered body places it so, before a later constant that reads what it wrote).
+fn inherited_class_method_call(app: &App, classes: &[LibraryClass], lc: &LibraryClass, call: &Expr) -> bool {
+    !lc.is_module
+        && matches!(&*call.node, ExprNode::Send { recv, method, .. }
+            if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) && singleton_method_visible(app, classes, lc, method))
+}
+
 fn singleton_method_visible(app: &App, classes: &[LibraryClass], lc: &LibraryClass, method: &Symbol) -> bool {
     let defines = |m: &MethodDef| m.receiver == MethodReceiver::Class && m.name == *method;
     let mut current = lc.parent.clone();

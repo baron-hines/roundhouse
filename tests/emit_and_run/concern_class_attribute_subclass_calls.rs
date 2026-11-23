@@ -26,7 +26,7 @@ fn app() -> emit_and_run::Overlay {
 end
 "##)
         .write("app/models/field_resource.rb", "class FieldResource\n  include DeclaredFields\nend\n")
-        .write("app/models/topic_resource.rb", "class TopicResource < FieldResource\n  field :title\n  field :body\nend\n")
+        .write("app/models/topic_resource.rb", "class TopicResource < FieldResource\n  field :title\n  field :body\n  SNAPSHOT = field_names\nend\n")
 }
 
 #[test]
@@ -34,6 +34,6 @@ fn a_subclass_body_calling_its_parent_s_class_methods_runs_them() {
     let errors = app().check_errors();
     assert!(errors.is_empty(), "{errors:#?}");
     app()
-        .run_ruby("got = [TopicResource.field_names, FieldResource.field_names]\nraise got.inspect unless got == [[:title, :body], []]\nputs \"subclass calls passed\"\n")
+        .run_ruby("got = [TopicResource.field_names, FieldResource.field_names, TopicResource::SNAPSHOT]\nraise got.inspect unless got == [[:title, :body], [], [:title, :body]]\nputs \"subclass calls passed\"\n")
         .assert_passes();
 }

@@ -60,7 +60,11 @@ fn a_class_attribute_with_an_instance_accessor_beside_a_marker_is_refused() {
             .check_errors()
     })
     .expect_err("ingest refuses the file");
-    let message = refused.downcast_ref::<String>().cloned().unwrap_or_default();
-    assert!(message.contains("conditional or dynamic visibility declarations are not modeled"), "{message}");
+    let message = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| refused.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(message.contains("declared_fields.rb") && message.contains("conditional or dynamic visibility declarations are not modeled"), "{message}");
 }
 
