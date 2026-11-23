@@ -10,7 +10,8 @@
 //! as do a helper the class or a subclass overrides with one, a helper
 //! with a `return`, a memoized helper, a `merge` of anything but a Hash
 //! literal with Symbol keys (a String-keyed Hash literal keeps its String
-//! keys), and a splatted key list on a one-key method.
+//! keys), a call with a block, and a splatted key list on a one-key
+//! method.
 
 use super::emit_and_run;
 
@@ -134,6 +135,11 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
   def merge_symbol
     attrs = params.permit(%w[title body version]).merge(body: "x").except("version")
     render plain: attrs.keys.map(&:to_s).sort.join(",")
+  end
+
+  # A block can `break` with a Hash of its own, so the walk stops at it and fetch keeps its String (Spinel emit only).
+  def merge_break
+    render plain: params.permit(%w[title body]).merge(body: "x") { |_key, _old, _new| break({ "title" => "kept" }) }.fetch("title")
   end
 
   # Run on OverrideImportsController, whose allowed_attrs is a plain String-keyed Hash.
@@ -298,7 +304,7 @@ fn string_keys_on_a_permitted_hash_name_its_keys() {
 
 /// The Spinel emit writes the same Symbol keys, through a helper too; a plain Hash keeps its String, as do a
 /// helper this class or a subclass overrides, one with a `return`, a memoized one, a `merge` of a Hash variable, a
-/// String-keyed or computed-key Hash literal, and a splatted key list on `fetch`.
+/// String-keyed or computed-key Hash literal, a call with a block, and a splatted key list on `fetch`.
 #[test]
 fn the_spinel_emit_names_the_symbol_keys() {
     let (tree, errors) = emit_and_run::real_blog()
@@ -326,6 +332,7 @@ fn the_spinel_emit_names_the_symbol_keys() {
         ".fetch(*%w[title fallback]",
         "allowed_attrs.fetch(\"title\")",
         ".merge(extra).except(\"title\")",
+        "}.fetch(\"title\")",
     ] {
         assert!(src.contains(line), "missing `{line}`:\n{src}");
     }

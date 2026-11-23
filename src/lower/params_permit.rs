@@ -461,7 +461,9 @@ fn from_permitted(e: &Expr, helpers: &crate::det::HashSet<Symbol>) -> bool {
     if permitted_chain(e).is_some() || is_helper_call(e, helpers) {
         return true;
     }
-    let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return false };
+    // A block can end the call early with `break`, whose value need not hold the receiver's keys, so the walk stops
+    // at any call with a block (`merge(a: 1) { break other }`).
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return false };
     match method.as_str() {
         "permitted" => matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Params"),
         // Any other merged Hash may bring String keys, which a String key argument names in Ruby, so the walk
