@@ -22752,6 +22752,8 @@ mod json_update_columns;
 // Concern shapes: an `included do` block's class/instance attributes.
 #[path = "emit_and_run/concern_included_cattr.rs"]
 mod concern_included_cattr;
+#[path = "emit_and_run/concern_class_attribute_subclass_calls.rs"]
+mod concern_class_attribute_subclass_calls;
 
 // Concern shapes: model callbacks declared in a concern's included block.
 #[path = "emit_and_run/concern_model_callbacks.rs"]

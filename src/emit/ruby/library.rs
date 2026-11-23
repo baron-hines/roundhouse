@@ -10373,6 +10373,13 @@ fn emit_library_class_decl_inner(
     } else {
         let mut picked = app_extension_calls(lc, app, classes);
         picked.extend(gem_include_macro_calls(lc));
+        // A call of a class method an ancestor of the program's defines (a Concern's `class_methods` its parent took):
+        // Ruby runs it as the body loads, and the method is in this tree. Not the class's own, written after the call here.
+        picked.extend(lc.unknown_calls.iter().filter(|call| {
+            !lc.is_module
+                && matches!(&*call.node, ExprNode::Send { recv, method, .. }
+                    if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) && singleton_method_visible(app, classes, lc, method))
+        }));
         // Source order, each call once: `span_method` prepends its wrapper,
         // and an app macro written after it may read the ancestors.
         let own: Vec<&Expr> =
