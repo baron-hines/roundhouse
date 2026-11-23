@@ -455,6 +455,47 @@ impl EnumConstants {
             && !owner.split("::").any(|segment| self.snapshot_reflected.contains(segment))
     }
 
+    /// What the recorded sources (the app's, its path gems' and its source
+    /// gems') say `defined?(written)` answers in a class body whose lexical
+    /// owners are `owners`, innermost first: `Some(true)` when the constant
+    /// Ruby's lookup reaches is recorded, `Some(false)` when no recorded name
+    /// could be it (none ends in `written`), and `None` when one could only be
+    /// reached some other way (an ancestor's constant), is one segment
+    /// (Ruby predefines such names), or a nearer owner's
+    /// or one of `class`'s ancestors' first segment shadows the top level's.
+    /// The caller rules out what Ruby or the framework define without a source.
+    pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String], class: &str) -> Option<bool> {
+        let bare = written.trim_start_matches("::");
+        if !written.starts_with("::") {
+            // Ruby reads the first segment lexically, innermost owner first: a
+            // nearer `Tracking` (`Post::Tracking`) is the one the rest is read
+            // under, whatever the top level holds.
+            let first = bare.split("::").next().unwrap_or(bare);
+            if let Some(owner) = owners.iter().find(|owner| self.values.contains_key(&format!("{owner}::{first}"))) {
+                return self.values.contains_key(&format!("{owner}::{bare}")).then_some(true);
+            }
+            // Then through the class's ancestors (its superclasses and what they
+            // and it include), before the top level: an ancestor's own `Tracking`
+            // (`ApplicationRecord::Tracking`) is not settled here.
+            if self.ancestor_names(class).contains(first) {
+                return None;
+            }
+        }
+        if self.values.contains_key(bare) {
+            return Some(true);
+        }
+        // One segment is never settled absent: Ruby predefines names no source
+        // records (`RUBY_VERSION`, `ENV`, `ARGV`, `DATA`, …).
+        if !bare.contains("::") {
+            return None;
+        }
+        let last = bare.rsplit("::").next().unwrap_or(bare);
+        let suffix = format!("::{bare}");
+        let names = self.names();
+        let reachable = names.by_last.get(last).into_iter().flatten().any(|k| k == bare || k.ends_with(&suffix));
+        (!reachable).then_some(false)
+    }
+
     /// Whether any recorded source defines a constant, class or module
     /// named `name` at any depth (`Regexp`, `Admin::Regexp`).
     pub(in crate::ingest) fn defines_name(&self, name: &str) -> bool {
