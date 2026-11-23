@@ -22752,6 +22752,8 @@ mod json_update_columns;
 // Concern shapes: an `included do` block's class/instance attributes.
 #[path = "emit_and_run/concern_included_cattr.rs"]
 mod concern_included_cattr;
+#[path = "emit_and_run/struct_block_definers.rs"]
+mod struct_block_definers;
 #[path = "emit_and_run/concern_class_methods_body_calls.rs"]
 mod concern_class_methods_body_calls;
 #[path = "emit_and_run/base_with_connection.rs"]
