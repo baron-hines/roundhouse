@@ -3178,7 +3178,17 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             });
         }
     };
-    Ok(Expr::new(span, expr_node))
+    let mut out = Expr::new(span, expr_node);
+    if let Some(c) = node.as_call_node()
+        && c.receiver().is_none()
+        && c.arguments().is_none()
+        && c.block().is_none()
+        && c.opening_loc().is_some()
+        && matches!(&*out.node, ExprNode::Send { recv: None, args, .. } if args.is_empty())
+    {
+        out.decisions |= crate::expr::WRITTEN_EMPTY_PARENS;
+    }
+    Ok(out)
 }
 
 /// Ingest a `case/in` arm's pattern, unwrapping a guard first when the

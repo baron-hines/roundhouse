@@ -24,6 +24,9 @@ pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
 /// An empty `{}` / `[]` seed whose type a later write in its body refined and stamped back: the next analysis of
 /// the body starts it from that stamp less its unknown arms, which an earlier round's untyped ivars left there.
 pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
+/// A receiverless call the source wrote with empty parentheses (`h()`): the Ruby emit keeps them, as bare the name
+/// reads a local of the same name. A synthesized call's `parenthesized` is a default and says nothing.
+pub const WRITTEN_EMPTY_PARENS: u64 = 1 << 46;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
 /// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the

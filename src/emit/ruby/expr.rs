@@ -258,10 +258,9 @@ pub fn emit_expr(e: &Expr) -> String {
             }
         }
     }
-    // `h()` as written, not a synthesized call's default: bare, it would read a local of the same name.
-    if let ExprNode::Send { recv: None, method, args, block: None, parenthesized: true } = &*e.node
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
         && args.is_empty()
-        && !e.span.is_synthetic()
+        && e.decisions & crate::expr::WRITTEN_EMPTY_PARENS != 0
         && method.as_str().chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
     {
         return format!("{method}()");
