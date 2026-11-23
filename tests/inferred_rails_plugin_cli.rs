@@ -3,7 +3,8 @@
 //! to its constants are analysis errors, which `--allow-unsupported`
 //! downgrades: the tree is written and a reference raises where it runs.
 //! Only a `rails_dependent` row a project extension writes refuses the
-//! whole target (#2280).
+//! whole target (#2280), and on Roda, which runs no analysis, an inferred
+//! row too.
 
 #[path = "support/scratch.rs"]
 mod scratch;
@@ -76,8 +77,9 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// Whether the run wrote any of a tree.
 fn written(out: &Path) -> bool {
-    out.join("app/models/widget.rb").is_file()
+    std::fs::read_dir(out).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 const INFERRED: &str = "gem gadget-engine it depends on railties";
@@ -85,7 +87,7 @@ const INFERRED: &str = "gem gadget-engine it depends on railties";
 #[test]
 fn an_inferred_rails_plugin_reference_is_an_error_by_default() {
     let app = App::new("strict");
-    for target in ["ruby", "spinel"] {
+    for target in ["ruby", "spinel", "roda"] {
         let (ok, stderr, out) = app.emit(target, false);
         assert!(!ok, "{target}: {stderr}");
         assert!(stderr.contains("gem_requires_rails") && stderr.contains(INFERRED), "{target}: {stderr}");
@@ -101,8 +103,20 @@ fn allow_unsupported_writes_the_tree_past_an_inferred_rails_plugin() {
         assert!(ok, "{target}: {stderr}");
         assert!(stderr.contains("warning") && stderr.contains("gem_requires_rails") && stderr.contains(INFERRED), "{target}: {stderr}");
         assert!(!stderr.contains("roundhouse: gem_requires_rails"), "{target}: {stderr}");
-        assert!(written(&out), "{target}: no tree written\n{stderr}");
+        assert!(out.join("app/models/widget.rb").is_file(), "{target}: no tree written\n{stderr}");
     }
+}
+
+/// Roda converts the ingest-shape app and runs no type analysis, so no
+/// analysis error reports the reference: the target stays refused there,
+/// `--allow-unsupported` or not.
+#[test]
+fn roda_still_refuses_an_inferred_rails_plugin() {
+    let app = App::new("roda");
+    let (ok, stderr, out) = app.emit("roda", true);
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("roundhouse: gem_requires_rails") && stderr.contains(INFERRED), "{stderr}");
+    assert!(!written(&out), "a refused target writes no tree");
 }
 
 /// A row the project writes is its own decision: the target stays refused,
@@ -112,7 +126,7 @@ fn an_extension_written_rails_dependent_row_still_refuses_the_target() {
     let app = App::new("extension");
     app.write("roundhouse.yml", "extensions: [config/rh]\n");
     app.write("config/rh/gems.yml", "rails_dependent:\n  - {gem: gadget-engine, why: requires the Rails framework}\n");
-    for target in ["ruby", "spinel"] {
+    for target in ["ruby", "spinel", "roda"] {
         let (ok, stderr, out) = app.emit(target, true);
         assert!(!ok, "{target}: {stderr}");
         assert!(stderr.contains("a project extension marks gem gadget-engine rails_dependent"), "{target}: {stderr}");
