@@ -258,6 +258,13 @@ pub fn emit_expr(e: &Expr) -> String {
             }
         }
     }
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && args.is_empty()
+        && e.decisions & crate::expr::WRITTEN_EMPTY_PARENS != 0
+        && method.as_str().chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+    {
+        return format!("{method}()");
+    }
     emit_node(&e.node)
 }
 

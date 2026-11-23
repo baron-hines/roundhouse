@@ -17,6 +17,12 @@ mod emit_and_run;
 #[path = "support/native_http.rs"]
 #[allow(dead_code)]
 mod native_http;
+#[path = "emit_and_run/multi_json.rs"]
+mod multi_json;
+#[path = "emit_and_run/active_model_serializer_08.rs"]
+mod active_model_serializer_08;
+#[path = "emit_and_run/respond_to_core_class.rs"]
+mod respond_to_core_class;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
 #[path = "emit_and_run/fixture_explicit_id.rs"]
@@ -20913,6 +20919,16 @@ mod reset_counters;
 mod console_only_definitions;
 #[path = "emit_and_run/open_classes.rs"]
 mod open_classes;
+#[path = "emit_and_run/class_arg_specialize.rs"]
+mod class_arg_specialize;
+#[path = "emit_and_run/scope_hash_tail.rs"]
+mod scope_hash_tail;
+#[path = "emit_and_run/core_subclass_dispatch.rs"]
+mod core_subclass_dispatch;
+#[path = "emit_and_run/paren_call_beside_local.rs"]
+mod paren_call_beside_local;
+#[path = "emit_and_run/string_prepend.rs"]
+mod string_prepend;
 #[path = "emit_and_run/parameterized_mailer.rs"]
 mod parameterized_mailer;
 #[path = "emit_and_run/change_table_migrations.rs"]

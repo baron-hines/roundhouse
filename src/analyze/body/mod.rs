@@ -1441,6 +1441,25 @@ impl<'a> BodyTyper<'a> {
         Some(answer)
     }
 
+    /// Whether the program reopens a core class `ty` may be with its own `respond_to?` or `respond_to_missing?`, or
+    /// its own `asked`, whose visibility it may change.
+    fn builtin_reopens_respond_to(&self, ty: &Ty, asked: &Symbol) -> bool {
+        let class = |t: &Ty| match t {
+            Ty::Array { .. } => Some("Array"),
+            Ty::Hash { .. } => Some("Hash"),
+            Ty::Str => Some("String"),
+            _ => None,
+        };
+        let variants: Vec<&Ty> = match ty {
+            Ty::Union { variants } => variants.iter().collect(),
+            t => vec![t],
+        };
+        variants.iter().filter_map(|t| class(t)).any(|name| {
+            let id = ClassId(Symbol::from(name));
+            self.chain_defines(&id, &Symbol::from("respond_to?")) || self.chain_defines(&id, &Symbol::from("respond_to_missing?")) || self.chain_defines(&id, asked)
+        })
+    }
+
     fn constant_predicate_leaf(&self, cond: &mut Expr, ctx: &Ctx) -> Option<bool> {
         let predicates = self.constant_predicates?;
         // `respond_to?(:disable_warnings)` in a class method (OmniAuth's `KeyStore.override_logging`): true where the
@@ -1477,6 +1496,9 @@ impl<'a> BodyTyper<'a> {
                     Some(false)
                 }
                 Some(t) if builtin_never_answers(t, &asked) => Some(false),
+                // `obj.respond_to?(:to_ary)` on an Array: the branch for anything else never runs, and typed, its
+                // `S.new(obj, …)` hands the serializer an Array it never sees.
+                Some(t) if builtin_always_answers(t, &asked) && !self.builtin_reopens_respond_to(t, &asked) => Some(true),
                 _ => None,
             };
         }
@@ -1622,6 +1644,33 @@ impl<'a> BodyTyper<'a> {
             }
         }
         false
+    }
+
+    /// The core collection (`Hash`, `Array`, `String`) a source class directly subclasses, when neither it nor a
+    /// module it includes registers `method` on either side or answers through `method_missing`.
+    // Not through an intermediate class: a gem's (`Hashie::Mash` under OmniAuth's AuthHash) answers its readers by
+    // `method_missing`, which its RBS does not show.
+    fn core_ancestor(&self, class: &ClassId, method: &Symbol) -> Option<&'static str> {
+        let classes = self.classes();
+        let info = classes.get(class)?;
+        if info.source_instance_methods.is_empty() && info.source_class_methods.is_empty() {
+            return None;
+        }
+        let missing = Symbol::from("method_missing");
+        let mut chain = std::iter::once(info).chain(info.includes.iter().filter_map(|m| classes.get(m)));
+        if chain.any(|c| {
+            c.instance_methods.contains_key(method) || c.class_methods.contains_key(method) || c.instance_methods.contains_key(&missing) || !c.missing_readers.is_empty()
+        }) {
+            return None;
+        }
+        let core = match info.parent.as_ref()?.0.as_str().trim_start_matches("::") {
+            "Hash" => "Hash",
+            "Array" => "Array",
+            "String" => "String",
+            _ => return None,
+        };
+        // A reopening of the core class that defines it (`class Hash; def label`) answers it, not the core table.
+        (!self.chain_defines(&ClassId(Symbol::from(core)), method)).then_some(core)
     }
 
     /// Whether a source definition of `method` is in `class`'s chain: itself, its parents, the modules they include.
@@ -2969,6 +3018,11 @@ impl<'a> BodyTyper<'a> {
                         return ty;
                     }
                 }
+                // Recomputed on each pass: a lambda analyzed again with a value the stand-in writes drops the earlier refusal.
+                let refusal = multi_json_dump_refusal(recv.as_ref(), method, args);
+                if refusal.is_some() || crate::expr::ExprCold::diagnostic(&expr.cold).as_ref().is_some_and(|d| matches!(d, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "MultiJson.dump")) {
+                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, refusal);
+                }
                 if let Some(refusal) = self.pagy_object_refusal(recv_ty.as_ref(), method, args) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(refusal));
                 }
@@ -4302,7 +4356,23 @@ impl<'a> BodyTyper<'a> {
                         exprs[i].ty = Some(unknown());
                         last = unknown();
                     }
+                    // Not stripped where a loop reads and writes it: a read there sees an earlier iteration's `Untyped` write.
+                    let looped_read = match &*exprs[i].node {
+                        ExprNode::Assign { target: LValue::Ivar { name } | LValue::Var { name, .. }, .. } => {
+                            exprs[i + 1..].iter().any(|later| read_in_repeated(later, name))
+                        }
+                        _ => false,
+                    };
                     let e = &mut exprs[i];
+                    // Not restarted from the bare seed: the writes in a block refine it only after the reads this pass makes.
+                    if let ExprNode::Assign { value, .. } = &*e.node
+                        && value.decisions & crate::expr::REFINED_EMPTY_SEED != 0
+                        && matches!(&*value.node, ExprNode::Hash { entries, .. } if entries.is_empty())
+                            | matches!(&*value.node, ExprNode::Array { elements, .. } if elements.is_empty())
+                        && let Some(t) = &e.ty
+                    {
+                        e.ty = Some(without_unknown_arms(t, !looped_read));
+                    }
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
                             LValue::Ivar { name } => Some((true, name.clone())),
@@ -4331,10 +4401,12 @@ impl<'a> BodyTyper<'a> {
                                     local_ctx.local_bindings.remove(&mark);
                                 }
                             }
+                            // A refined seed too, restarted from its stamp: this pass's writes stamp it again.
+                            let refined_seed = value.decisions & crate::expr::REFINED_EMPTY_SEED != 0;
                             let empty_seed = matches!(&*value.node,
                                     ExprNode::Array { elements, .. } if elements.is_empty())
                                 && matches!(e.ty.as_ref(),
-                                    Some(Ty::Array { elem }) if matches!(&**elem, Ty::Var { .. }));
+                                    Some(Ty::Array { elem }) if refined_seed || matches!(&**elem, Ty::Var { .. }));
                             if empty_seed {
                                 array_seed_idx.insert((is_ivar, name.clone()), i);
                             } else {
@@ -4345,7 +4417,7 @@ impl<'a> BodyTyper<'a> {
                                     ExprNode::Hash { entries, .. } if entries.is_empty())
                                 && matches!(e.ty.as_ref(),
                                     Some(Ty::Hash { value, .. })
-                                        if matches!(&**value, Ty::Var { .. }));
+                                        if refined_seed || matches!(&**value, Ty::Var { .. }));
                             if empty_hash_seed {
                                 hash_seed_idx.insert((is_ivar, name.clone()), i);
                             } else {
@@ -4578,6 +4650,7 @@ impl<'a> BodyTyper<'a> {
                                     let seed = &mut exprs[si];
                                     if let ExprNode::Assign { value, .. } = &mut *seed.node {
                                         value.ty = Some(refined.clone());
+                                        value.decisions |= crate::expr::REFINED_EMPTY_SEED;
                                     }
                                     seed.ty = Some(refined);
                                 }
@@ -4609,6 +4682,7 @@ impl<'a> BodyTyper<'a> {
                                 let seed = &mut exprs[si];
                                 if let ExprNode::Assign { value, .. } = &mut *seed.node {
                                     value.ty = Some(refined.clone());
+                                    value.decisions |= crate::expr::REFINED_EMPTY_SEED;
                                 }
                                 seed.ty = Some(refined);
                             }
@@ -5121,6 +5195,71 @@ fn kernel_array_elem(arg: &Ty) -> Option<Ty> {
         Ty::Var { .. } | Ty::Untyped | Ty::Hash { .. } | Ty::Record { .. } | Ty::Class { .. } => None,
         scalar => Some(scalar.clone()),
     }
+}
+
+/// A refined seed's stamp with the unresolved (`Var`) arms of its unions dropped: what an earlier round's
+/// not-yet-typed ivar contributed, which this pass's writes join back if they still hold it.
+/// With `untyped` too, the `Untyped` arms: an ivar a parameter writes reads untyped before its call sites are read,
+/// and the write that took it joins again this pass.
+fn without_unknown_arms(t: &Ty, untyped: bool) -> Ty {
+    let drop = |v: &Ty| matches!(v, Ty::Var { .. }) || (untyped && matches!(v, Ty::Untyped));
+    match t {
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(without_unknown_arms(key, untyped)), value: std::sync::Arc::new(without_unknown_arms(value, untyped)) },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(without_unknown_arms(elem, untyped)) },
+        t if untyped && matches!(t, Ty::Untyped) => unknown(),
+        Ty::Union { variants } => {
+            let mut kept: Vec<Ty> = variants.iter().filter(|v| !drop(v)).map(|v| without_unknown_arms(v, untyped)).collect();
+            match kept.len() {
+                0 => unknown(),
+                1 => kept.pop().expect("one"),
+                _ => Ty::Union { variants: kept.into() },
+            }
+        }
+        _ => t.clone(),
+    }
+}
+
+/// Whether a block or loop in `e` both writes into `name` and reads it: a read there may see a write an earlier
+/// iteration made after it.
+fn read_in_repeated(e: &Expr, name: &Symbol) -> bool {
+    fn is_name(e: &Expr, name: &Symbol) -> bool {
+        matches!(&*e.node, ExprNode::Var { name: n, .. } | ExprNode::Ivar { name: n } if n == name)
+    }
+    fn writes(e: &Expr, name: &Symbol) -> bool {
+        let here = match &*e.node {
+            ExprNode::Assign { target: LValue::Index { recv, .. }, .. } | ExprNode::OpAssign { target: LValue::Index { recv, .. }, .. } => is_name(recv, name),
+            ExprNode::Send { recv: Some(r), method, .. } => {
+                is_name(r, name) && matches!(method.as_str(), "<<" | "push" | "append" | "unshift" | "prepend" | "concat" | "[]=" | "store" | "merge!" | "update" | "insert")
+            }
+            _ => false,
+        };
+        let mut found = here;
+        e.node.for_each_child(&mut |c| found |= writes(c, name));
+        found
+    }
+    // Not a mutating call's receiver (`items << x`): pushing does not observe what an earlier iteration pushed.
+    fn reads(e: &Expr, name: &Symbol) -> bool {
+        if let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*e.node
+            && is_name(r, name)
+            && matches!(method.as_str(), "<<" | "push" | "append" | "unshift" | "prepend" | "concat" | "[]=" | "store" | "merge!" | "update" | "insert")
+        {
+            return args.iter().any(|a| reads(a, name)) || block.as_ref().is_some_and(|b| reads(b, name));
+        }
+        if let ExprNode::Assign { target: LValue::Index { recv, index }, value } = &*e.node
+            && is_name(recv, name)
+        {
+            return reads(index, name) || reads(value, name);
+        }
+        let mut found = is_name(e, name);
+        e.node.for_each_child(&mut |c| found |= reads(c, name));
+        found
+    }
+    if matches!(&*e.node, ExprNode::Lambda { .. } | ExprNode::While { .. }) && writes(e, name) && reads(e, name) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found |= read_in_repeated(c, name));
+    found
 }
 
 pub(super) fn unknown() -> Ty {
@@ -8817,6 +8956,23 @@ fn set_discarded(e: &mut Expr, discarded: bool) {
 
 /// Whether no value of `ty`, of Ruby's built-in kinds only, answers `method`: a conversion protocol whose answering
 /// classes are known (`to_proc` only Symbol, Hash, Method and Proc answer). Any other method is not known here.
+/// Whether every value `ty` may be is of a core class whose own method `method` is.
+fn builtin_always_answers(ty: &Ty, method: &Symbol) -> bool {
+    let answers = |t: &Ty| -> bool {
+        let names: &[&str] = match t {
+            Ty::Array { .. } => &["to_ary", "to_a", "each", "map", "size", "length", "empty?", "first", "last"],
+            Ty::Hash { .. } => &["to_hash", "to_h", "each", "keys", "values", "size", "length", "empty?"],
+            Ty::Str => &["to_str", "to_s", "size", "length", "empty?"],
+            _ => return false,
+        };
+        names.contains(&method.as_str())
+    };
+    match ty {
+        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(answers),
+        t => answers(t),
+    }
+}
+
 fn builtin_never_answers(ty: &Ty, method: &Symbol) -> bool {
     let answers: &[&str] = match method.as_str() {
         "to_proc" => &["Symbol", "Hash", "Proc", "Method"],
@@ -8894,4 +9050,60 @@ fn locals_read(expr: &Expr) -> Vec<Symbol> {
     }
     walk(expr, &mut out);
     out
+}
+
+/// `MultiJson.dump(value)` whose value the stand-in (`ingest::multi_json`) does not write: oj calls a record's or any
+/// other object's `to_json`, which runs Rails' encoder (`<>&` escaped), and an untyped value may be one.
+fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) -> Option<crate::diagnostic::DiagnosticKind> {
+    let ExprNode::Const { path } = &*recv?.node else { return None };
+    if !matches!(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().as_slice(), ["MultiJson"])
+        || !matches!(method.as_str(), "dump" | "generate" | "encode")
+    {
+        return None;
+    }
+    fn written(ty: &Ty) -> bool {
+        match ty {
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Nil | Ty::Time => true,
+            Ty::Array { elem } => written(elem),
+            // A key of any class: oj's compat dump writes its `to_s`, as the stand-in does.
+            Ty::Hash { value, .. } => written(value),
+            Ty::Tuple { elems } => elems.iter().all(written),
+            Ty::Record { row } => row.rest.is_none() && row.fields.values().all(written),
+            Ty::Union { variants } => variants.iter().all(written),
+            _ => false,
+        }
+    }
+    // What a splat of `ty` puts in an Array: a Hash's entries as `[k, v]` pairs, an Array's elements, nothing for nil.
+    fn splatted(ty: &Ty) -> bool {
+        match ty {
+            Ty::Hash { key, value } => written(key) && written(value),
+            Ty::Array { elem } => written(elem),
+            Ty::Union { variants } => variants.iter().all(splatted),
+            // Nil adds nothing, a scalar itself.
+            other => matches!(other, Ty::Nil) || written(other),
+        }
+    }
+    // A literal by its elements: an empty `{}` or `[]` in it leaves an unresolved element in the literal's own type.
+    fn written_expr(expr: &Expr) -> bool {
+        match &*expr.node {
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(_, v)| written_expr(v)),
+            ExprNode::Array { elements, .. } => elements.iter().all(written_expr),
+            // `[*{k => v}]` writes each entry as a `[k, v]` Array: its key is a value there, not a Hash key.
+            ExprNode::Splat { value } => value.ty.as_ref().is_some_and(splatted),
+            _ => expr.ty.as_ref().is_some_and(written),
+        }
+    }
+    let value = args.first()?;
+    if written_expr(value) {
+        return None;
+    }
+    let ty = value.ty.as_ref();
+    Some(crate::diagnostic::DiagnosticKind::Unsupported {
+        target: None,
+        construct: Symbol::from("MultiJson.dump"),
+        detail: format!(
+            "of a {} value: oj writes an object through its `to_json`, and only Hashes, Arrays, Strings, Symbols, numbers, booleans, nil and Times are modeled",
+            ty.map_or("untyped".to_string(), crate::rbs::print_ty)
+        ),
+    })
 }

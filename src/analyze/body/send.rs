@@ -1616,6 +1616,22 @@ impl<'a> BodyTyper<'a> {
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
         }
+        // An app class under a core collection (discourse's `class Enum < Hash`): what its own chain does not define is
+        // the core class's, over values the analysis does not follow.
+        // Not the class object's own calls (`Ordinal.name`), nor a method answering the receiver itself, which keeps its
+        // class (`freeze`, `tap`).
+        if let Some(Ty::Class { id, .. }) = recv_ty
+            && instance_receiver
+            && !matches!(method.as_str(), "freeze" | "itself" | "tap" | "dup" | "clone")
+            && let Some(core) = self.core_ancestor(id, method)
+        {
+            let as_core = match core {
+                "Hash" => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+                "Array" => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
+                _ => Ty::Str,
+            };
+            return self.dispatch(Some(&as_core), method, block_ret, args);
+        }
         // What `errors` does not answer itself it delegates to its Array of `ActiveModel::Error`, as Rails' Enumerable does.
         if let Some(Ty::Class { id, .. }) = recv_ty {
             if id.0.as_str() == "ActiveModel::Errors"
@@ -4033,7 +4049,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
                 value: std::sync::Arc::new(unknown()),
             },
         },
-        "to_a" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
+        "to_a" | "to_ary" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
         "join" => Ty::Str,
         // `[0, 0, 0].pack("CCC")` — binary packing (lobsters'
         // confidence_order byte strings).
@@ -4469,7 +4485,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // Operators. `+` concats; `<<` mutates in place but still returns self.
         // `*` is repetition ("a" * 3); `%` is sprintf (returns Str). Comparisons
         // uniformly return Bool.
-        "+" | "<<" | "*" | "%" | "concat" => Ty::Str,
+        "+" | "<<" | "*" | "%" | "concat" | "prepend" => Ty::Str,
         "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "eql?" | "equal?" => Ty::Bool,
         // ActiveSupport String extensions. Pluralization/inflection
         // methods all return Str; comparison-style return Bool. Match
