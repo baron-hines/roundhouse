@@ -480,24 +480,35 @@ fn is_helper_call(e: &Expr, helpers: &crate::det::HashSet<Symbol>) -> bool {
 }
 
 /// The private helpers with no parameters whose value is the Symbol-keyed Hash a top-level `permit` with literal
-/// names lowers to (`def x_params = params.permit(%w[a b])`, `def x_params = @x ||= params.permit(...)`), before or
-/// after that lowering, so a key-taking call on their result names its Symbol keys (#2279).
+/// names lowers to (`def x_params = params.permit(%w[a b])`), before or after that lowering, so a key-taking call on
+/// their result names its Symbol keys (#2279). Only a straight-line body whose last statement is the permit: a body
+/// with a `return` may answer something else, and a memoized `@x ||= params.permit(...)` answers whatever the ivar
+/// already holds, so neither counts.
 pub(crate) fn permitted_helpers(privs: &[crate::dialect::Action]) -> crate::det::HashSet<Symbol> {
     let none = crate::det::HashSet::default();
     privs
         .iter()
-        .filter(|a| a.params.fields.is_empty() && from_permitted(value_tail(&a.body), &none))
+        .filter(|a| a.params.fields.is_empty() && !has_return(&a.body) && from_permitted(value_tail(&a.body), &none))
         .map(|a| a.name.clone())
         .collect()
 }
 
-/// What a body answers: its last statement, through an assignment's value (`@x ||= value`).
+/// What a body answers: its last statement.
 fn value_tail(e: &Expr) -> &Expr {
     match &*e.node {
         ExprNode::Seq { exprs } if !exprs.is_empty() => value_tail(exprs.last().unwrap()),
-        ExprNode::OpAssign { value, .. } | ExprNode::Assign { value, .. } => value_tail(value),
         _ => e,
     }
+}
+
+/// Whether `e` holds a `return` anywhere.
+fn has_return(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Return { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || has_return(c));
+    found
 }
 
 /// `x_params.except("a")` → `x_params.except(:a)` for each of `helpers` (`permitted_helpers`), as
@@ -521,8 +532,13 @@ fn symbolize_permitted_key_args(expr: &mut Expr, helpers: &crate::det::HashSet<S
     }
     match method.as_str() {
         "except" | "slice" | "values_at" => args.iter_mut().for_each(symbolize_key),
+        // One key: a splatted list may carry more than the key (`fetch(*%w[a default])`), so it stays as written.
         "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "delete" | "dig" => {
-            args.iter_mut().take(1).for_each(symbolize_key)
+            if let Some(first) = args.first_mut()
+                && !matches!(&*first.node, ExprNode::Splat { .. })
+            {
+                symbolize_key(first);
+            }
         }
         "merge" | "reverse_merge" | "with_defaults" => {
             for arg in args.iter_mut() {

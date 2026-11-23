@@ -3776,8 +3776,12 @@ fn lower_action_body(
     let mut filtered = crate::lower::params_permit::filtered_permit_helpers(privs);
     filtered.extend(crate::lower::params_permit::filtered_permit_helpers(params_privs));
     crate::lower::params_permit::stringify_filtered_helper_reads(&mut lowered, &filtered);
+    // A helper the class defines itself is judged by its own body: an override answering a plain Hash shadows an
+    // ancestor's permit, so only the inherited helpers this class does not define come from `params_privs`.
     let mut permitted = crate::lower::params_permit::permitted_helpers(privs);
-    permitted.extend(crate::lower::params_permit::permitted_helpers(params_privs));
+    let inherited: Vec<Action> =
+        params_privs.iter().filter(|a| !privs.iter().any(|p| p.name == a.name)).cloned().collect();
+    permitted.extend(crate::lower::params_permit::permitted_helpers(&inherited));
     crate::lower::params_permit::symbolize_permitted_helper_reads(&mut lowered, &permitted);
     if !defer_implicit_render {
         return (lowered, None);
