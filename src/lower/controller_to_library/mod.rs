@@ -1465,6 +1465,7 @@ fn build_methods(
                 /*is_public=*/ false, params_specs, assocs, &[], view_ivars, partials,
                 format_breadth, &shadows, route_id_segments, false, false, None, None, &[],
                 /*preserve_named_layout=*/ true, overlaid(controller, all_controllers),
+                &descendant_method_names(controller, all_controllers),
             ).0
         });
         // Template lowering can introduce a read of self.action_name.
@@ -2699,6 +2700,15 @@ fn inheritor_view_modules(controller: &Controller, all: &[Controller]) -> Vec<St
         .collect()
 }
 
+/// Every method name a controller below this one defines (its own or a concern's): an inherited action
+/// calling one of these by name runs that subclass's definition on the subclass's routes.
+fn descendant_method_names(controller: &Controller, all: &[Controller]) -> crate::det::HashSet<Symbol> {
+    all.iter()
+        .filter(|c| ancestor_chain(c, all).iter().any(|p| p.name == controller.name))
+        .flat_map(|c| c.actions().map(|a| a.name.clone()))
+        .collect()
+}
+
 /// Whether the controller has `route_param_recall::OVERLAY`, its own or inherited.
 fn overlaid(controller: &Controller, all: &[Controller]) -> bool {
     let name = crate::lower::route_param_recall::OVERLAY;
@@ -3368,6 +3378,7 @@ fn action_to_method(
         &inheritor_modules,
         /*preserve_named_layout=*/ false,
         overlaid(controller, all_controllers_for_params),
+        &descendant_method_names(controller, all_controllers_for_params),
     );
     if let Some(tail) = deferred_tail {
         deferred_out.insert(a.name.clone(), tail);
@@ -3613,6 +3624,8 @@ fn lower_action_body(
     inheritor_modules: &[String],
     preserve_named_layout: bool,
     overlaid: bool,
+    // Method names a subclass redefines (`descendant_method_names`).
+    overridden_below: &crate::det::HashSet<Symbol>,
 ) -> (Expr, Option<Expr>) {
     // BEFORE everything else: this turns a helper the permit recognizer
     // could not read into one that yields the params class, so every
@@ -3776,6 +3789,16 @@ fn lower_action_body(
     let mut filtered = crate::lower::params_permit::filtered_permit_helpers(privs);
     filtered.extend(crate::lower::params_permit::filtered_permit_helpers(params_privs));
     crate::lower::params_permit::stringify_filtered_helper_reads(&mut lowered, &filtered);
+    // A helper the class defines itself is judged by its own body: an override answering a plain Hash shadows an
+    // ancestor's permit, so only the inherited helpers this class does not define come from `params_privs`.
+    let mut permitted = crate::lower::params_permit::permitted_helpers(privs);
+    let inherited: Vec<Action> =
+        params_privs.iter().filter(|a| !privs.iter().any(|p| p.name == a.name)).cloned().collect();
+    permitted.extend(crate::lower::params_permit::permitted_helpers(&inherited));
+    // And a subclass that redefines one runs this body with its own: `allowed_attrs.fetch("title")` in an inherited
+    // action reads the subclass's Hash, so only a helper no subclass redefines counts.
+    permitted.retain(|name| !overridden_below.contains(name));
+    crate::lower::params_permit::symbolize_permitted_helper_reads(&mut lowered, &permitted);
     if !defer_implicit_render {
         return (lowered, None);
     }

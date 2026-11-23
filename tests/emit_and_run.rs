@@ -22817,3 +22817,5 @@ mod record_as_json_in_literal;
 mod empty_base_list_override;
 #[path = "emit_and_run/relation_argument.rs"]
 mod relation_argument;
+#[path = "emit_and_run/params_permit_key_args.rs"]
+mod params_permit_key_args;
