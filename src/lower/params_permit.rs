@@ -461,14 +461,21 @@ fn from_permitted(e: &Expr, helpers: &crate::det::HashSet<Symbol>) -> bool {
     if permitted_chain(e).is_some() || is_helper_call(e, helpers) {
         return true;
     }
-    let ExprNode::Send { recv: Some(r), method, .. } = &*e.node else { return false };
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return false };
     match method.as_str() {
         "permitted" => matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Params"),
-        "merge" | "reverse_merge" | "with_defaults" | "compact" | "compact_blank" | "except" | "slice" => {
-            from_permitted(r, helpers)
-        }
+        // A Hash merged by name may bring String keys, which a String key argument names in Ruby, so the walk
+        // stops at a `merge` that takes anything but Hash literals with literal keys.
+        "merge" | "reverse_merge" | "with_defaults" => args.iter().all(is_literal_keyed_hash) && from_permitted(r, helpers),
+        "compact" | "compact_blank" | "except" | "slice" => from_permitted(r, helpers),
         _ => false,
     }
+}
+
+/// A Hash literal whose keys are all String or Symbol literals (`{ "a" => 1, b: 2 }`, no `**rest`).
+fn is_literal_keyed_hash(e: &Expr) -> bool {
+    let ExprNode::Hash { entries, .. } = &*e.node else { return false };
+    entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } }))
 }
 
 /// `x_params` or `self.x_params`, with no arguments and no block, naming one of `helpers`.
