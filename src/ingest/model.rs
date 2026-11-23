@@ -705,7 +705,7 @@ struct WalkStmt<'a> {
 /// other conditional (#2282). `if defined?(Const)`, with at most an empty
 /// `else`, settles when the recorded sources answer the guard: when nothing
 /// could define `Const` the branch never runs (`Ok(None)`); when one of
-/// `owners`' spellings of it is defined and the branch is `include Const`
+/// `owners`' (the model class first) spellings of it is defined and the branch is `include Const`
 /// alone, the branch is that include. Every other one is refused by what
 /// it is: a constant Ruby, the framework or an ancestor may define, one the
 /// model's own file declares (`file_root`: whether that runs before the
@@ -743,7 +743,7 @@ fn settle_load_only_conditional<'pr>(
         || crate::gems::is_core_constant(&segments)
         || crate::gems::preloaded_constant(root);
     let declared_here = declares_constant_named(file_root, segments[segments.len() - 1]);
-    match (!runtime && !declared_here).then(|| enum_constants.guarded_constant(&written, owners)).flatten() {
+    match (!runtime && !declared_here).then(|| enum_constants.guarded_constant(&written, owners, &owners[0])).flatten() {
         Some(false) => Some(Ok(None)),
         Some(true) => {
             let includes_guarded = |stmt: &Node<'_>| {

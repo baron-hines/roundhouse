@@ -203,3 +203,21 @@ fn a_nearer_namespace_shadowing_the_guard_is_refused() {
     };
     assert!(error.contains("load-time conditional `include` or `require`"), "{error}");
 }
+
+/// `ApplicationRecord::Tracking` is found through `Post`'s superclass
+/// before the top-level `Tracking`, and holds no `Auditable`: Ruby's
+/// `defined?(Tracking::Auditable)` is false in `Post`, so the guard is not
+/// settled.
+#[test]
+fn an_ancestors_namespace_shadowing_the_guard_is_refused() {
+    let mut tree = tree(GUARDED, true);
+    tree.insert(
+        PathBuf::from("app/models/application_record.rb"),
+        b"class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n\n  module Tracking\n  end\nend\n".to_vec(),
+    );
+    let error = match ingest_app_from_tree(tree) {
+        Ok(_) => panic!("the model is not refused"),
+        Err(err) => err.to_string(),
+    };
+    assert!(error.contains("load-time conditional `include` or `require`"), "{error}");
+}

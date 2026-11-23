@@ -461,9 +461,9 @@ impl EnumConstants {
     /// Ruby's lookup reaches is recorded, `Some(false)` when no recorded name
     /// could be it (none ends in `written`), and `None` when one could only be
     /// reached some other way (an ancestor's constant), or a nearer owner's
-    /// first segment shadows the top level's and does not hold the rest. The
-    /// caller rules out what Ruby or the framework define without a source.
-    pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String]) -> Option<bool> {
+    /// or one of `class`'s ancestors' first segment shadows the top level's.
+    /// The caller rules out what Ruby or the framework define without a source.
+    pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String], class: &str) -> Option<bool> {
         let bare = written.trim_start_matches("::");
         if !written.starts_with("::") {
             // Ruby reads the first segment lexically, innermost owner first: a
@@ -472,6 +472,12 @@ impl EnumConstants {
             let first = bare.split("::").next().unwrap_or(bare);
             if let Some(owner) = owners.iter().find(|owner| self.values.contains_key(&format!("{owner}::{first}"))) {
                 return self.values.contains_key(&format!("{owner}::{bare}")).then_some(true);
+            }
+            // Then through the class's ancestors (its superclasses and what they
+            // and it include), before the top level: an ancestor's own `Tracking`
+            // (`ApplicationRecord::Tracking`) is not settled here.
+            if self.ancestor_names(class).contains(first) {
+                return None;
             }
         }
         if self.values.contains_key(bare) {
