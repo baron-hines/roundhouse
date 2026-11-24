@@ -2049,10 +2049,14 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &Hash
             let incoming_replaces_macro_method = !method.name_span.is_synthetic()
                 && macro_methods.contains(&(existing.name.clone(), existing.receiver));
             // A second `def` of a name the body already defined: Ruby's later definition replaces the earlier one.
+            // A `(...)` def on either side stays with the forwarding survey, which refuses the collision.
+            let forwards = |m: &MethodDef| m.params.iter().any(|p| p.forwarding);
             let incoming_is_later_def = !method.name_span.is_synthetic()
                 && selected_source_methods.contains(&existing.name_span)
                 && existing.name_span.file == method.name_span.file
-                && method.name_span.start > existing.name_span.start;
+                && method.name_span.start > existing.name_span.start
+                && !forwards(existing)
+                && !forwards(method);
             if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate || incoming_replaces_macro_method || incoming_is_later_def) {
                 selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
