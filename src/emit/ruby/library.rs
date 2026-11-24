@@ -9697,7 +9697,14 @@ fn emit_library_class_decl_inner(
         .filter(|m| m.name == lc.name)
         .flat_map(|m| crate::analyze::claimed_prepend_statements(m, &app.concern_prepended_items))
         .collect();
-    for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
+    // A lifted `X = Data.define(…) { include M }` this file writes runs its include where the constant stands, as the class's own does.
+    let factory_includes: Vec<crate::ident::ClassId> = lc
+        .constants
+        .iter()
+        .filter_map(|(cname, _)| lifted_data_factory(lc, cname.as_str(), classes, factories))
+        .flat_map(|factory| factory.includes.iter().cloned())
+        .collect();
+    for inc in lc.includes.iter().chain(prepends.iter().flatten()).chain(factory_includes.iter()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -10240,6 +10247,9 @@ fn emit_library_class_decl_inner(
                         call.span, None, "Data.define", "delegate in a Data.define block could not be lowered"));
                 }
                 writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
+                for include in &factory.includes {
+                    writeln!(s, "{body_pad}  include {}", include.0.as_str()).unwrap();
+                }
                 for method in &factory.methods {
                     render_library_method(s, method, &format!("{body_pad}  "));
                 }

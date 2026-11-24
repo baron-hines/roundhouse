@@ -22907,3 +22907,39 @@ fn class_eval_loop_overlay() -> emit_and_run::Overlay {
         .write("app/models/user_action_manager.rb", "class UserActionManager\n  %i[post topic].each { |type| class_eval(<<~RUBY) }\n      def self.#{type}_created(*args)\n        #{type}_rows(*args).map { |row| UserAction.log_action!(row) }\n      end\n    RUBY\n\n  def self.post_rows(x)\n    [\"post #{x}\"]\n  end\n\n  def self.topic_rows(x)\n    [\"topic #{x}\"]\n  end\nend\n")
         .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"user_actions\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
 }
+
+/// discourse's `JsonApiKit::Name`: `Data.define(:value) { include Name }`.
+/// Ruby runs the block on the new class, so the module is the Data class's
+/// include, its methods (`with` among the reads, `super` through a nested
+/// mixin) the record's. Before, an include beside a `def` refused the
+/// whole file, and a block holding only the include stayed an opaque
+/// constant another class could not name.
+#[test]
+fn a_data_define_block_s_include_is_the_data_class_s() {
+    let errors = data_include_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = data_include_overlay().run_ruby(DATA_INCLUDE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("data include passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_data_define_block_s_include_is_the_data_class_s_on_spinel() {
+    let run = data_include_overlay().run_spinel(DATA_INCLUDE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("data include passed"));
+}
+
+const DATA_INCLUDE_SCRIPT: &str = "m = Kit::Name::Member.new(value: \"a\")\nraise m.to_s unless m.to_s == \"a\"\nc = m.convert { |v| v.upcase }\nraise c.inspect unless c.value == \"A\" && c.is_a?(Kit::Name::Member)\nf = Kit::Name::Field.new(value: \"x\", type: \"t\")\ng = f.convert { |v| v + \"!\" }\nraise g.inspect unless g.value == \"x!\" && g.type == \"t!\"\nnames = Kit::Names.all\nraise names.inspect unless names == [\"tt\", \"Y\"]\nputs \"data include passed\"\n";
+
+fn data_include_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/kit/name.rb", "module Kit\n  module Name\n    def convert = with(value: yield(value))\n\n    def convert_type = self\n\n    def to_s = value\n  end\nend\n")
+        .write("app/models/kit/name/resource_scope.rb", "module Kit\n  module Name\n    module ResourceScope\n      include Name\n\n      def convert(&) = super.convert_type(&)\n\n      def convert_type = with(type: yield(type))\n    end\n  end\nend\n")
+        .write("app/models/kit/name/member.rb", "module Kit\n  module Name\n    Member = Data.define(:value) { include Name }\n  end\nend\n")
+        .write("app/models/kit/name/field.rb", "module Kit\n  module Name\n    Field = Data.define(:value, :type) { include Name::ResourceScope }\n  end\nend\n")
+        .write("app/models/kit/name/type.rb", "module Kit\n  module Name\n    Type =\n      Data.define(:value) do\n        include Name\n\n        def convert_type(&) = convert(&)\n      end\n  end\nend\n")
+        .write("app/models/kit/names.rb", "module Kit\n  class Names\n    def self.all\n      [Kit::Name::Field.new(value: \"f\", type: \"t\").convert { |v| v * 2 }.type, Kit::Name::Type.new(value: \"y\").convert_type { |v| v.upcase }.value]\n    end\n  end\nend\n")
+}
+
