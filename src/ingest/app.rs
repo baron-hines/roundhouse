@@ -888,6 +888,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let mut auto_sourced: Vec<String> = Vec::new();
     for gem in auto_source_gems {
         if let Ok(mut resolved) = super::source_gems::resolve(vfs, dir, lock.as_ref(), std::slice::from_ref(gem)) {
+            resolved.iter_mut().for_each(|g| g.spinel_only = true);
             source_gems.append(&mut resolved);
             auto_sourced.push(gem.clone());
         }
