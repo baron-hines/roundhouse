@@ -87,15 +87,22 @@ raise got.inspect unless got == ["hello", "uninitialized constant Greetings::Cod
 puts "misnamed gem constant OK"
 "#;
 
-/// message_bus's `MessageBus::BACKENDS = {}`: a constant a gem file assigns
-/// at its top level. Ingest does not carry that write yet, so a read of it
-/// stays an unsupported constant, never the NameError of one nothing defines.
+/// message_bus's `MessageBus::BACKENDS = {}` and redis-client's
+/// `CommandError::ERRORS = { … }` in `class RedisClient`: a constant a gem
+/// assigns into another class, at a file's top level and in a class body.
+/// Ruby defines it on that class.
 pub fn top_level_constant_overlay() -> emit_and_run::Overlay {
     misnamed_overlay()
-        .write(&format!("{GEMS}/greetings-1.0/lib/greetings/registry.rb"), "module Greetings; end\nGreetings::REGISTRY = { plain: \"Plain\" }\n\nmodule Greetings\n  class Registry\n    def self.lookup(name)\n      Greetings::REGISTRY[name]\n    end\n  end\nend\n")
+        .write(&format!("{GEMS}/greetings-1.0/lib/greetings/registry.rb"), "module Greetings; end\nGreetings::REGISTRY = { plain: \"Plain\" }\n\nmodule Greetings\n  class Registry\n    def self.lookup(name)\n      Greetings::REGISTRY[name]\n    end\n\n    def self.kind(code)\n      Codes::KINDS.fetch(code, Unknown).name\n    end\n  end\n\n  class Codes\n  end\n\n  Unknown = Class.new(StandardError)\n  Missing = Class.new(StandardError)\n\n  Codes::KINDS = {\n    \"MISSING\" => Missing,\n  }.freeze\nend\n")
         .edit(&format!("{GEMS}/greetings-1.0/lib/greetings.rb"), "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/registry\"\n")
-        .edit("app/models/article.rb", "  def shouted_title\n", "  def registered\n    Greetings::Registry.lookup(:plain)\n  end\n\n  def shouted_title\n")
+        .edit("app/models/article.rb", "  def shouted_title\n", "  def registered\n    [Greetings::Registry.lookup(:plain), Greetings::Registry.kind(\"MISSING\"), Greetings::Registry.kind(\"OTHER\")]\n  end\n\n  def shouted_title\n")
 }
+
+pub const TOP_LEVEL_CONSTANT_ASSERTIONS: &str = r#"a = Article.new(title: "hello", body: "a body that is long enough")
+got = a.registered
+raise got.inspect unless got == ["Plain", "Greetings::Missing", "Greetings::Unknown"]
+puts "top-level constant OK"
+"#;
 
 /// redis's `RedisClient::Config.prepend(Redis::LibIdentity)`: a gem file's
 /// top-level mixin of its own module into its own class, which Ruby runs as

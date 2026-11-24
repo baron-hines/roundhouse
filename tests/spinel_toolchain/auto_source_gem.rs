@@ -28,3 +28,12 @@ fn a_gem_file_s_top_level_prepend_runs_natively() {
     run.assert_passes();
     assert!(run.stdout.contains("top-level prepend OK"), "{}", run.stdout);
 }
+
+/// The native half of `emit_and_run::auto_source_gem::a_gem_s_constant_write_into_another_class_is_that_class_s`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_gem_s_constant_write_into_another_class_runs_natively() {
+    let run = auto_source_gem::top_level_constant_overlay().run_spinel(auto_source_gem::TOP_LEVEL_CONSTANT_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("top-level constant OK"), "{}", run.stdout);
+}
