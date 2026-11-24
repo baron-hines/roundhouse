@@ -22874,5 +22874,3 @@ fn a_class_a_macro_names_at_run_time_is_reported() {
         .check_errors();
     assert!(errors.iter().any(|e| e.contains("`params` defines methods this call does not expand")), "{errors:#?}");
 }
-#[path = "emit_and_run/model_destroy_returns_self.rs"]
-mod model_destroy_returns_self;

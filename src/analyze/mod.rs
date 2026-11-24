@@ -892,15 +892,13 @@ impl Analyzer {
                             .any(|include| source_methods.instance_method(include, name))
                 };
                 // Rails' `lock!` calls `reload`, so an override of either hides the seed.
-                // `destroy!` answers what `destroy` does, so an override of that one hides it too.
-                if inherited(entry.name) || (entry.name == "lock!" && inherited("reload")) || (entry.name == "destroy!" && inherited("destroy")) {
+                if inherited(entry.name) || (entry.name == "lock!" && inherited("reload")) {
                     continue;
                 }
                 // The shared runtime types `reload` and `lock!` as `() -> Base`,
                 // but in Rails they answer `self`: keep the receiver's own
                 // class so its model methods still resolve on the result.
-                // `destroy` too: Rails' `false` from an aborting `before_destroy` is no more in `Base` than in the model.
-                let ret = if matches!(entry.name, "reload" | "lock!" | "destroy" | "destroy!") {
+                let ret = if matches!(entry.name, "reload" | "lock!") {
                     self_ty.clone()
                 } else {
                     instantiate(kind)
