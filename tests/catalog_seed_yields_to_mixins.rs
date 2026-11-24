@@ -85,5 +85,5 @@ fn model_without_an_override_keeps_the_catalog_type() {
         example(PLAIN_AR, "class Widget < ApplicationRecord\n  include Retirable\nend\n"),
         "def self.other:",
     );
-    assert!(line.contains("done: ActiveRecord::Base"), "{line}");
+    assert!(line.contains("done: Gadget"), "{line}");
 }

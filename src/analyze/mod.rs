@@ -898,7 +898,8 @@ impl Analyzer {
                 // The shared runtime types `reload` and `lock!` as `() -> Base`,
                 // but in Rails they answer `self`: keep the receiver's own
                 // class so its model methods still resolve on the result.
-                let ret = if matches!(entry.name, "reload" | "lock!") {
+                // `destroy` too: Rails' `false` from an aborting `before_destroy` is no more in `Base` than in the model.
+                let ret = if matches!(entry.name, "reload" | "lock!" | "destroy" | "destroy!") {
                     self_ty.clone()
                 } else {
                     instantiate(kind)
