@@ -716,7 +716,12 @@ fn untyped_subexpressions_baseline() {
     // active_record/relation.rb), so the record is the list's nil arm.
     // MEASURED 1471 on merging main 2d9d16d0c (1465) with the uuid casts'
     // +6 (1470 less 1464), which add up.
-    const CEILING: usize = 1471;
+    // MEASURED 1474 on the connection handler (1471):
+    // `ConnectionHandler#clear_active_connections!` asks
+    // `Db.connection_slot(true) == -2` and `Db.query_cache_enabled?`
+    // (+3 in active_record/connection.rb), which read as untyped on this
+    // RBS-less probe, as the other `Db` results do.
+    const CEILING: usize = 1474;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
