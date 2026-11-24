@@ -26,7 +26,7 @@ use crate::det::HashMap;
 use crate::ty::Ty;
 
 use super::typing_mode::UnifyScope;
-use super::{ParamKey, ParamShape};
+use super::{ParamKey, ParamShapes};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Mode {
@@ -60,7 +60,7 @@ impl Mode {
 }
 
 /// The parameter shapes and the defined-method set of one analysis.
-pub(super) type ParamTables = Arc<(HashMap<ParamKey, ParamShape>, BTreeSet<ParamKey>)>;
+pub(super) type ParamTables = Arc<(ParamShapes, BTreeSet<ParamKey>)>;
 
 /// One key's observations as last folded, and the row they folded to.
 type Folded = HashMap<ParamKey, (Vec<Vec<Ty>>, Vec<Ty>)>;
@@ -89,7 +89,7 @@ impl UnifyMemo {
     /// The parameter shapes and defined methods, built by `build` once
     /// per analysis (every call under [`Mode::Off`]; checked against a
     /// rebuild under [`Mode::Check`]).
-    pub(super) fn tables(&mut self, build: impl Fn() -> (HashMap<ParamKey, ParamShape>, BTreeSet<ParamKey>)) -> ParamTables {
+    pub(super) fn tables(&mut self, build: impl Fn() -> (ParamShapes, BTreeSet<ParamKey>)) -> ParamTables {
         if self.mode == Mode::Off {
             return Arc::new(build());
         }

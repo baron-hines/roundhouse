@@ -65,21 +65,35 @@ end
 "#;
 
 fn spinel() -> Vec<(String, String)> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
-    for (path, content) in [
-        ("app/models/application_record.rb", APPLICATION_RECORD),
-        ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),
+    emit(&[
         ("app/models/concerns/labelled.rb", LABELLED),
         ("app/models/widget.rb", "class Widget < ApplicationRecord\n  include Labelled\nend\n"),
         ("app/models/gadget.rb", "class Gadget < ApplicationRecord\n  include Labelled\nend\n"),
         ("app/models/tag.rb", "class Tag < ApplicationRecord\n  belongs_to :taggable, polymorphic: true\nend\n"),
         ("app/controllers/widgets_controller.rb", WIDGETS_CONTROLLER),
+    ])
+}
+
+/// The app of the base classes, the schema, the routes and `app_files`.
+fn ingest(app_files: &[(&str, &str)]) -> roundhouse::App {
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    for (path, content) in [
+        ("app/models/application_record.rb", APPLICATION_RECORD),
+        ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),
         ("db/schema.rb", SCHEMA),
         ("config/routes.rb", ROUTES),
-    ] {
+    ]
+    .iter()
+    .chain(app_files)
+    {
         tree.insert(PathBuf::from(path), content.as_bytes().to_vec());
     }
-    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    ingest_app_from_tree(tree).expect("ingest")
+}
+
+/// The spinel tree for [`ingest`]'s app.
+fn emit(app_files: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut app = ingest(app_files);
     roundhouse::session::analyze_and_lower(&mut app);
     target_files(&app, Path::new("."), BuildTarget::Spinel).expect("spinel files")
 }
@@ -124,4 +138,52 @@ fn each_includer_copy_declares_the_keyword_by_name() {
         assert!(names_a_string(tag), "{path}:\n{tag}");
         assert!(!tag.contains("Hash[Symbol"), "{path}:\n{tag}");
     }
+}
+
+/// Ruby runs the includer's own `def` when it has one, even one whose
+/// reopenings disagree on their parameters (which leaves it with no
+/// shape to place keywords by). The module's keywords say nothing about
+/// it: `label(name: "gear")` binds the whole Hash to `first`.
+#[test]
+fn an_includer_with_conflicting_defs_of_its_own_keeps_the_hash() {
+    const KEYWORDED: &str = "module Keyworded\n  extend ActiveSupport::Concern\n\n  def label(name: nil)\n    name.to_s\n  end\nend\n";
+    const WIDGET: &str = "class Widget < ApplicationRecord\n  include Keyworded\n\n  def label(first)\n    first.to_s\n  end\n\n  def label(first, second = nil)\n    first.to_s\n  end\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    render plain: Widget.find(params[:id]).label(name: \"gear\")\n  end\nend\n";
+    let mut app = ingest(&[
+        ("app/models/concerns/keyworded.rb", KEYWORDED),
+        ("app/models/widget.rb", WIDGET),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    // The sidecar types `first` `untyped` either way (the two `def`s
+    // disagree), so read the row the call site left.
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let row = app
+        .inferred_method_params
+        .get(&(roundhouse::ident::ClassId("Widget".into()), "label".into()))
+        .expect("the label call site was collected");
+    let first = format!("{:?}", row.first());
+    assert!(first.contains("Hash"), "{row:?}");
+}
+
+/// Two modules define the method, and the one whose reopenings disagree
+/// has no shape. That is a disagreement too, not a module to skip:
+/// `Later`, included last, is the one Ruby reaches, and its `first`
+/// takes the whole Hash.
+#[test]
+fn a_poisoned_module_shape_is_not_skipped_for_a_sibling() {
+    const EARLIER: &str = "module Earlier\n  extend ActiveSupport::Concern\n\n  def label(name: nil)\n    name.to_s\n  end\nend\n";
+    const LATER: &str = "module Later\n  extend ActiveSupport::Concern\n\n  def label(first)\n    first.to_s\n  end\n\n  def label(first, second = nil)\n    first.to_s\n  end\nend\n";
+    const WIDGET: &str = "class Widget < ApplicationRecord\n  include Earlier\n  include Later\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    render plain: Widget.find(params[:id]).label(name: \"gear\")\n  end\nend\n";
+    let files = emit(&[
+        ("app/models/concerns/earlier.rb", EARLIER),
+        ("app/models/concerns/later.rb", LATER),
+        ("app/models/widget.rb", WIDGET),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    let rbs = file(&files, "app/models/later.rbs");
+    let label = sig(rbs, "label");
+    assert!(label.contains("Hash[Symbol, String]"), "{rbs}");
+    assert!(!label.contains("(String first"), "{rbs}");
 }
