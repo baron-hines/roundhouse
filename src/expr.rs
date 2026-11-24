@@ -27,6 +27,9 @@ pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
 /// A receiverless call the source wrote with empty parentheses (`h()`): the Ruby emit keeps them, as bare the name
 /// reads a local of the same name. A synthesized call's `parenthesized` is a default and says nothing.
 pub const WRITTEN_EMPTY_PARENS: u64 = 1 << 46;
+/// An `include M` written in a Concern's `class_methods do … end`: Ruby's ClassMethods includes M, so M's methods are
+/// the includer's class methods (`ingest::app::class_methods_includes` copies them onto the Concern's class side).
+pub const CLASS_METHODS_INCLUDE: u64 = 1 << 47;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
 /// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the

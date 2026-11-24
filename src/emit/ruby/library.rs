@@ -9587,7 +9587,8 @@ fn emit_library_class_decl_inner(
         .iter()
         .filter(|call| {
             (call.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::CONSTANT_STATEMENT) != 0
-                || (call.decisions & crate::expr::BODY_STATEMENT != 0 && super::expr::carries_body_statements()))
+                || (call.decisions & crate::expr::BODY_STATEMENT != 0 && super::expr::carries_body_statements())
+                || inherited_class_method_call(app, classes, lc, call))
                 && !call.span.is_synthetic()
         })
         .collect();
@@ -9795,13 +9796,9 @@ fn emit_library_class_decl_inner(
         (lc.constants[i].1.span.start, BodyItem::Constant(i, &lc.constants[i].1))
     }).collect();
     body.extend(lc.class_ivar_initializers.iter().filter(|init| {
-        // Source-ordered bodies interleave only real `@ivar` writes; keep
+        // Source-ordered bodies interleave only real `@ivar` and `@@cvar` writes; keep
         // synthetic mattr/cattr `@@` seeds on the partitioned path below.
-        !ordered_body || (!init.span.is_synthetic() && matches!(
-            &*init.node,
-            ExprNode::Assign { target: LValue::Ivar { .. }, .. }
-                | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
-        ))
+        !ordered_body || source_ordered_initializer(init)
     }).map(|init| {
         (key(&init.span), BodyItem::Initializer(init))
     }));
@@ -10486,6 +10483,9 @@ fn emit_library_class_decl_inner(
     } else {
         let mut picked = app_extension_calls(lc, app, classes);
         picked.extend(gem_include_macro_calls(lc));
+        // A call of a class method an ancestor of the program's defines (a Concern's `class_methods` its parent took):
+        // Ruby runs it as the body loads, and the method is in this tree. Not the class's own, written after the call here.
+        picked.extend(lc.unknown_calls.iter().filter(|call| inherited_class_method_call(app, classes, lc, call)));
         // Source order, each call once: `span_method` prepends its wrapper,
         // and an app macro written after it may read the ancestors.
         let own: Vec<&Expr> =
@@ -10565,15 +10565,7 @@ fn emit_library_class_decl_inner(
     // subclasses absent; `mattr_*` / `cattr_*` seeds are `@@` and share
     // across the hierarchy by Ruby class-variable rules. Source-ordered
     // `@ivar` writes already interleaved above; remaining seeds still run.
-    let remaining_inits = |init: &Expr| {
-        !ordered_body
-            || init.span.is_synthetic()
-            || !matches!(
-                &*init.node,
-                ExprNode::Assign { target: LValue::Ivar { .. }, .. }
-                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
-            )
-    };
+    let remaining_inits = |init: &Expr| !ordered_body || !source_ordered_initializer(init);
     if lc.class_ivar_initializers.iter().any(remaining_inits) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -11436,6 +11428,14 @@ fn block_assigns_bare_constant(call: &Expr) -> bool {
 /// An ancestor's class method. This fragment's own `def self` is emitted
 /// with the methods, after this call, so it is not loaded yet. Another
 /// reopen of this class is a different file.
+/// A class-body call of a class method an ancestor of the program's defines: Ruby runs it as the body loads, where
+/// the body has it (a source-ordered body places it so, before a later constant that reads what it wrote).
+fn inherited_class_method_call(app: &App, classes: &[LibraryClass], lc: &LibraryClass, call: &Expr) -> bool {
+    !lc.is_module
+        && matches!(&*call.node, ExprNode::Send { recv, method, .. }
+            if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) && singleton_method_visible(app, classes, lc, method))
+}
+
 fn singleton_method_visible(app: &App, classes: &[LibraryClass], lc: &LibraryClass, method: &Symbol) -> bool {
     let defines = |m: &MethodDef| m.receiver == MethodReceiver::Class && m.name == *method;
     let mut current = lc.parent.clone();
@@ -14388,4 +14388,15 @@ fn contains_super(expr: &Expr) -> bool {
     let mut found = false;
     expr.node.for_each_child(&mut |child| found = found || contains_super(child));
     found
+}
+
+/// A class-body write a source-ordered body places where the source has it:
+/// a written `@ivar` or `@@cvar` assignment, not a synthesized seed.
+fn source_ordered_initializer(init: &Expr) -> bool {
+    !init.span.is_synthetic()
+        && match &*init.node {
+            ExprNode::Assign { target: LValue::Ivar { .. }, .. } | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. } => true,
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => name.as_str().starts_with("@@"),
+            _ => false,
+        }
 }

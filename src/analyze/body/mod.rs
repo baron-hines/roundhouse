@@ -3019,7 +3019,20 @@ impl<'a> BodyTyper<'a> {
                     }
                 }
                 // Recomputed on each pass: a lambda analyzed again with a value the stand-in writes drops the earlier refusal.
-                let refusal = multi_json_dump_refusal(recv.as_ref(), method, args);
+                let classes = &self.classes;
+                // Not one under a core collection or scalar: the stand-in writes a Hash's or an Array's entries first.
+                let own_to_json = |id: &ClassId| {
+                    let mut at = Some(id.clone());
+                    for _ in 0..32 {
+                        let Some(current) = at.take() else { break };
+                        if matches!(current.0.as_str().trim_start_matches("::"), "Hash" | "Array" | "String" | "Symbol" | "Integer" | "Float" | "Time") {
+                            return false;
+                        }
+                        at = classes.get(&current).and_then(|c| c.parent.clone());
+                    }
+                    classes.get(id).is_some_and(|c| c.public_instance_methods.contains(&Symbol::from("to_json")))
+                };
+                let refusal = multi_json_dump_refusal(recv.as_ref(), method, args, &own_to_json);
                 if refusal.is_some() || crate::expr::ExprCold::diagnostic(&expr.cold).as_ref().is_some_and(|d| matches!(d, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "MultiJson.dump")) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, refusal);
                 }
@@ -3234,10 +3247,19 @@ impl<'a> BodyTyper<'a> {
                         "Hash#deep_merge conflict block",
                         "only the no-block Rails deep_merge form is supported",
                     )),
-                    "deep_merge!" => Some((
+                    "deep_merge!" if block.is_some() || args.len() != 1 => Some((
                         "Hash#deep_merge!",
-                        "the mutating deep_merge! form is unsupported",
+                        "only the one-argument, no-block deep_merge! form is supported",
                     )),
+                    "deep_merge!"
+                        if !matches!((&recv_ty, args.first().and_then(|arg| arg.ty.as_ref())), (Some(Ty::Hash { key, value }), Some(Ty::Hash { key: ok, value: ov }))
+                            if union_of((**key).clone(), (**ok).clone()) == **key && union_of((**value).clone(), (**ov).clone()) == **value) =>
+                    {
+                        Some((
+                            "Hash#deep_merge!",
+                            "the mutating form writes into its receiver, whose type must already hold the argument's keys and values",
+                        ))
+                    }
                     "deep_merge" if args.len() != 1 => Some((
                         "Hash#deep_merge arity",
                         "exactly one Hash argument is supported",
@@ -9053,48 +9075,55 @@ fn locals_read(expr: &Expr) -> Vec<Symbol> {
 }
 
 /// `MultiJson.dump(value)` whose value the stand-in (`ingest::multi_json`) does not write: oj calls a record's or any
-/// other object's `to_json`, which runs Rails' encoder (`<>&` escaped), and an untyped value may be one.
-fn multi_json_dump_refusal(recv: Option<&Expr>, method: &Symbol, args: &[Expr]) -> Option<crate::diagnostic::DiagnosticKind> {
+/// other object's `to_json`, which runs Rails' encoder (`<>&` escaped), and an untyped value may be one. An object of
+/// a class the program gives its own `to_json` is written as that answers, which the stand-in calls.
+fn multi_json_dump_refusal(
+    recv: Option<&Expr>,
+    method: &Symbol,
+    args: &[Expr],
+    own_to_json: &dyn Fn(&ClassId) -> bool,
+) -> Option<crate::diagnostic::DiagnosticKind> {
     let ExprNode::Const { path } = &*recv?.node else { return None };
     if !matches!(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().as_slice(), ["MultiJson"])
         || !matches!(method.as_str(), "dump" | "generate" | "encode")
     {
         return None;
     }
-    fn written(ty: &Ty) -> bool {
+    fn written(ty: &Ty, own: &dyn Fn(&ClassId) -> bool) -> bool {
         match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Nil | Ty::Time => true,
-            Ty::Array { elem } => written(elem),
+            Ty::Class { id, .. } => own(id),
+            Ty::Array { elem } => written(elem, own),
             // A key of any class: oj's compat dump writes its `to_s`, as the stand-in does.
-            Ty::Hash { value, .. } => written(value),
-            Ty::Tuple { elems } => elems.iter().all(written),
-            Ty::Record { row } => row.rest.is_none() && row.fields.values().all(written),
-            Ty::Union { variants } => variants.iter().all(written),
+            Ty::Hash { value, .. } => written(value, own),
+            Ty::Tuple { elems } => elems.iter().all(|t| written(t, own)),
+            Ty::Record { row } => row.rest.is_none() && row.fields.values().all(|t| written(t, own)),
+            Ty::Union { variants } => variants.iter().all(|t| written(t, own)),
             _ => false,
         }
     }
     // What a splat of `ty` puts in an Array: a Hash's entries as `[k, v]` pairs, an Array's elements, nothing for nil.
-    fn splatted(ty: &Ty) -> bool {
+    fn splatted(ty: &Ty, own: &dyn Fn(&ClassId) -> bool) -> bool {
         match ty {
-            Ty::Hash { key, value } => written(key) && written(value),
-            Ty::Array { elem } => written(elem),
-            Ty::Union { variants } => variants.iter().all(splatted),
+            Ty::Hash { key, value } => written(key, own) && written(value, own),
+            Ty::Array { elem } => written(elem, own),
+            Ty::Union { variants } => variants.iter().all(|t| splatted(t, own)),
             // Nil adds nothing, a scalar itself.
-            other => matches!(other, Ty::Nil) || written(other),
+            other => matches!(other, Ty::Nil) || written(other, own),
         }
     }
     // A literal by its elements: an empty `{}` or `[]` in it leaves an unresolved element in the literal's own type.
-    fn written_expr(expr: &Expr) -> bool {
+    fn written_expr(expr: &Expr, own: &dyn Fn(&ClassId) -> bool) -> bool {
         match &*expr.node {
-            ExprNode::Hash { entries, .. } => entries.iter().all(|(_, v)| written_expr(v)),
-            ExprNode::Array { elements, .. } => elements.iter().all(written_expr),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(_, v)| written_expr(v, own)),
+            ExprNode::Array { elements, .. } => elements.iter().all(|e| written_expr(e, own)),
             // `[*{k => v}]` writes each entry as a `[k, v]` Array: its key is a value there, not a Hash key.
-            ExprNode::Splat { value } => value.ty.as_ref().is_some_and(splatted),
-            _ => expr.ty.as_ref().is_some_and(written),
+            ExprNode::Splat { value } => value.ty.as_ref().is_some_and(|t| splatted(t, own)),
+            _ => expr.ty.as_ref().is_some_and(|t| written(t, own)),
         }
     }
     let value = args.first()?;
-    if written_expr(value) {
+    if written_expr(value, own_to_json) {
         return None;
     }
     let ty = value.ty.as_ref();

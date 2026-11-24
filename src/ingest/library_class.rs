@@ -490,7 +490,7 @@ fn ingest_library_classes_impl(
             out.push(base);
         }
         let owner = lc.as_ref().map_or_else(|| ClassId(Symbol::from(nested_in.unwrap_or_default())), |lc| lc.name.clone());
-        let structs = struct_constant_classes(&owner, class.body(), file)?;
+        let structs = struct_constant_classes(&owner, &class.body(), file)?;
         let made = super::class_new_factory::constant_classes(Some(&owner), class.body(), file);
         if let Some(lc) = lc.as_mut() {
             lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
@@ -521,7 +521,7 @@ fn ingest_library_classes_impl(
         let mut lc = library_class_from_module_node_with_scope(&module, &scope, file)
             .map_err(|err| super::error_site::at(err, &module.as_node()))?;
         let owner = lc.name.clone();
-        let structs = struct_constant_classes(&owner, module.body(), file)?;
+        let structs = struct_constant_classes(&owner, &module.body(), file)?;
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         let made = super::class_new_factory::constant_classes(Some(&owner), module.body(), file);
         lc.constants.retain(|(name, _)| !made.iter().any(|(s, _)| s == name));
@@ -544,9 +544,9 @@ fn ingest_library_classes_impl(
     if out.is_empty() && file_level {
         // Not an initializer's: the boot program replays that statement, and a class beside it would define the constant twice.
         if !file.contains("config/initializers/")
-            && let Some(lc) = file_struct_class(&root, file)?
+            && let Some(classes) = file_struct_class(&root, file)?
         {
-            return Ok(vec![lc]);
+            return Ok(classes);
         }
     }
     // Constants written at FILE level, outside any class — lobsters'
@@ -1049,8 +1049,22 @@ fn model_value_classes(owner: &ClassId, class: &ruby_prism::ClassNode<'_>, file:
 
 /// A file whose only statement is `X = Struct.new(…)` or `A::X = Struct.new(…)`,
 /// the class it defines read as one a class body's `X = Struct.new(…)` defines.
-fn file_struct_class(root: &ruby_prism::Node<'_>, file: &str) -> IngestResult<Option<LibraryClass>> {
+fn file_struct_class(root: &ruby_prism::Node<'_>, file: &str) -> IngestResult<Option<Vec<LibraryClass>>> {
     let Some((name, spec)) = file_struct_write(root) else { return Ok(None) };
+    let mut out = Vec::new();
+    // A block's `Y = Struct.new(…)` is the top level's constant, as the file's own statement is.
+    for nested in struct_constants(&spec.body) {
+        if let Some(classes) = file_struct_class_named(nested.name.as_str().to_string(), nested, file)? {
+            out.extend(classes);
+        }
+    }
+    if let Some(classes) = file_struct_class_named(name, spec, file)? {
+        out.splice(0..0, classes);
+    }
+    Ok(Some(out))
+}
+
+fn file_struct_class_named(name: String, spec: StructConstant<'_>, file: &str) -> IngestResult<Option<Vec<LibraryClass>>> {
     let id = ClassId(Symbol::from(name));
     let mut class = struct_class(
         id.clone(),
@@ -1065,7 +1079,7 @@ fn file_struct_class(root: &ruby_prism::Node<'_>, file: &str) -> IngestResult<Op
     if spec.body.is_some() {
         class.methods.extend(walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?.methods);
     }
-    Ok(Some(class))
+    Ok(Some(vec![class]))
 }
 
 fn file_struct_write<'pr>(root: &ruby_prism::Node<'pr>) -> Option<(String, StructConstant<'pr>)> {
@@ -2519,7 +2533,7 @@ struct StructConstant<'pr> {
     body: Option<ruby_prism::Node<'pr>>,
 }
 
-fn struct_constants<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<StructConstant<'pr>> {
+fn struct_constants<'pr>(body: &Option<ruby_prism::Node<'pr>>) -> Vec<StructConstant<'pr>> {
     let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) else {
         return Vec::new();
     };
@@ -2628,6 +2642,9 @@ fn struct_block_declaration(stmt: &ruby_prism::Node<'_>) -> bool {
             && sc.body().is_none_or(|b| flatten_statements(b).iter().all(|s| s.as_def_node().is_some() || struct_block_marker(s)));
     }
     struct_block_marker(stmt)
+        || struct_block_literal_definer_loop(stmt)
+        // Another `Y = Struct.new(…)`: the block keeps its lexical scope, so Y is the enclosing scope's constant.
+        || struct_constant(stmt).is_some()
         || stmt.as_call_node().is_some_and(|call| {
             call.receiver().is_none()
                 && call.block().is_none()
@@ -2635,6 +2652,27 @@ fn struct_block_declaration(stmt: &ruby_prism::Node<'_>) -> bool {
                     constant_id_str(&call.name()).as_ref(),
                     "delegate" | "attr_reader" | "attr_writer" | "attr_accessor" | "include"
                 )
+        })
+}
+
+/// `%w[pinned closed].each do |status| define_method("#{status}?") { … } end` (discourse's TopicStatusUpdater::Status):
+/// a loop over a literal list whose body only defines methods, which runs nothing of the app's as the class is made.
+fn struct_block_literal_definer_loop(stmt: &ruby_prism::Node<'_>) -> bool {
+    let Some(call) = stmt.as_call_node() else { return false };
+    if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
+        return false;
+    }
+    let literal = call.receiver().and_then(|r| r.as_array_node()).is_some_and(|a| {
+        a.elements().iter().all(|e| e.as_string_node().is_some() || e.as_symbol_node().is_some())
+    });
+    let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
+    literal
+        && block.body().is_some_and(|body| {
+            flatten_statements(body).iter().all(|s| {
+                s.as_call_node().is_some_and(|c| {
+                    c.receiver().is_none() && c.block().is_some() && matches!(constant_id_str(&c.name()).as_ref(), "define_method")
+                })
+            })
         })
 }
 
@@ -2655,13 +2693,16 @@ pub(super) fn struct_constant_block(value: &ruby_prism::Node<'_>) -> bool {
 /// the constant names they replace.
 fn struct_constant_classes(
     owner: &ClassId,
-    body: Option<ruby_prism::Node<'_>>,
+    body: &Option<ruby_prism::Node<'_>>,
     file: &str,
 ) -> IngestResult<Vec<(Symbol, LibraryClass)>> {
     let mut out = Vec::new();
     for spec in struct_constants(body) {
         let name = spec.name.clone();
+        // A block's `Y = Struct.new(…)` is `owner`'s constant too: the block keeps the class body's lexical scope.
+        let nested = struct_constant_classes(owner, &spec.body, file)?;
         out.push((name, struct_constant_class(owner, spec, file)?));
+        out.extend(nested);
     }
     Ok(out)
 }
@@ -4350,6 +4391,16 @@ fn walk_decl_body_with_visibility<'pr>(
                     "include" => {
                         if let Some(args) = call.arguments() {
                             let args: Vec<_> = args.arguments().iter().collect();
+                            // Not the module's own include: in `class_methods do`, it is the ClassMethods module's.
+                            if matches!(mode, DeclBodyMode::ClassMethods)
+                                && !args.is_empty()
+                                && args.iter().all(|arg| constant_path_of(arg).is_some())
+                            {
+                                let mut expr = ingest_expr(&stmt, file)?;
+                                expr.decisions |= crate::expr::CLASS_METHODS_INCLUDE;
+                                out.unknown_calls.push(expr);
+                                continue;
+                            }
                             if matches!(mode, DeclBodyMode::SingletonClass { .. })
                                 && args.iter().all(|arg| constant_path_of(arg).is_some())
                             {

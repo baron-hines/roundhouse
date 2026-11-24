@@ -4198,9 +4198,18 @@ pub(super) fn hash_method(
             },
             _ => Ty::Hash { key: std::sync::Arc::new(key.clone()), value: std::sync::Arc::new(value.clone()) },
         },
-        // The supported Rails subset is the non-mutating, one-argument,
-        // no-block form. Keep block conflicts and `deep_merge!` unresolved
-        // rather than claiming semantics the shared runtime does not provide.
+        // The supported Rails subset is the one-argument, no-block form. The
+        // mutating one answers the receiver, whose type it cannot widen: an
+        // argument whose keys or values the receiver's type does not already
+        // hold stays unresolved (refused in `analyze::body`).
+        "deep_merge!" if args.len() == 1 && block_ret.is_none() => match args[0].ty.as_ref() {
+            Some(Ty::Hash { key: other_key, value: other_value })
+                if union_of(key.clone(), (**other_key).clone()) == *key && union_of(value.clone(), (**other_value).clone()) == *value =>
+            {
+                Ty::Hash { key: std::sync::Arc::new(key.clone()), value: std::sync::Arc::new(value.clone()) }
+            }
+            _ => unknown(),
+        },
         "deep_merge" if args.len() == 1 && block_ret.is_none() => {
             match args[0].ty.as_ref() {
                 Some(Ty::Hash {

@@ -431,6 +431,9 @@ impl Analyzer {
             }
             cls.class_methods.insert(Symbol::from("current_transaction"), registry::ar::transaction_ty());
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
+            cls.class_methods.insert(Symbol::from("lease_connection"), registry::ar::connection_ty());
+            // The block's value, as `transaction`'s (connection.rb's `Base.with_connection`).
+            cls.class_methods.insert(Symbol::from("with_connection"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("establish_connection"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("table_name"), Ty::Str);

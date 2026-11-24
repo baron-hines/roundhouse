@@ -8,6 +8,9 @@ module ActionDispatch
     @discard: Array[String]
 
     def initialize: (?Hash[String, untyped]? other) -> void
+    def begin_carry: () -> nil
+    def carry_other: (String key, untyped value) -> nil
+    def carried: (String key) -> nil
     def notice: () -> untyped
     def notice=: (untyped value) -> untyped
     def alert: () -> untyped

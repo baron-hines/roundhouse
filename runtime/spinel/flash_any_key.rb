@@ -7,26 +7,21 @@
 # set does.
 module ActionDispatch
   class Flash
-    def initialize(other = nil)
-      @notice = nil
-      @alert  = nil
-      @notice_was = nil
-      @alert_was  = nil
+    # The shared constructor calls these: every loaded key is carried and discarded at the sweep.
+    def begin_carry
       @others = {}
       @discard = []
-      return if other.nil?
-      other.each do |k, v|
-        if k == "notice"
-          @notice = v
-          @notice_was = v
-        elsif k == "alert"
-          @alert = v
-          @alert_was = v
-        else
-          @others[k] = v
-        end
-        @discard.push(k)
-      end
+      nil
+    end
+
+    def carry_other(key, value)
+      @others[key] = value
+      nil
+    end
+
+    def carried(key)
+      @discard.push(key)
+      nil
     end
 
     def now

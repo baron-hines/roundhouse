@@ -302,6 +302,20 @@ const CONTROLLER: &str = r#"class ArticleAmsController < ApplicationController
     render json: ActiveModel::ArraySerializer.new(Article.order(:id), each_serializer: BasicArticleSerializer).as_json
   end
 
+  def lazy_dump
+    serializer = ActiveModel::ArraySerializer.new(Article.order(:id), each_serializer: BasicArticleSerializer, root: "articles")
+    render json: MultiJson.dump(serializer)
+  end
+
+  def lazy_nested
+    render json: MultiJson.dump({ list: ActiveModel::ArraySerializer.new(Article.order(:id), each_serializer: BasicArticleSerializer) })
+  end
+
+  def lazy_escape
+    marked = Article.where(title: "<b>&")
+    render json: MultiJson.dump([ActiveModel::ArraySerializer.new(marked, each_serializer: BasicArticleSerializer), ActiveModel::ArraySerializer.new(marked, each_serializer: BasicArticleSerializer).as_json])
+  end
+
   def rootless
     ArticleSerializer.new(Article.find(params[:id]), root: false).as_json
     render plain: "no error"
@@ -351,6 +365,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ("bare", r#"[{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"}},{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"}}]"#),
     ("helper_show", r#"{"comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"older":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"}],"implicit_comments":[{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"post":{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"},"summary":"A lon","draft":false,"summary_note":"note","secret":"s","heading":"H","title_shown":true,"comment_ids":[201,202],"first_comment":{"flair":"f","shout":"ANN!","id":201,"commenter":"ann","h":"ANN","note":null,"tag":null,"body_length":5,"text":"first"},"latest":[{"flair":"f","id":202,"h":"BOB","note":null,"tag":null,"body_length":6,"text":"second"}],"last_comment_id":202,"older_ids":[201],"implicit_comment_ids":[201,202]}}"#),
     ("helper_index", r#"{"articles":[{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"}},{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"}}]}"#),
+    ("lazy_dump", r#"{"articles":[{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"}},{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"}}]}"#),
+    ("lazy_nested", r#"{"list":[{"id":101,"title":"Hello","long":true,"raw_title":"Hello","body_size":11,"top_commenter":"ann","pk_id":101,"title_changes":{"now":"Hello"}},{"id":102,"title":"Draft one","long":false,"raw_title":"Draft one","body_size":10,"pk_id":102,"title_changes":{"now":"Draft one"}}]}"#),
     ("rootless", r#"Cannot serialize comments when ArticleSerializer does not have a root!"#),
 ];
 
@@ -364,7 +380,7 @@ fn overlay() -> emit_and_run::Overlay {
             "config/routes.rb",
             "  resources :articles do",
             &format!(
-                "  get \"article_ams\" => \"article_ams#index\"\n  get \"article_ams/bare\" => \"article_ams#bare\"\n  get \"article_ams/helper_index\" => \"article_ams#helper_index\"\n{}  resources :articles do",
+                "  get \"article_ams\" => \"article_ams#index\"\n  get \"article_ams/bare\" => \"article_ams#bare\"\n  get \"article_ams/lazy_dump\" => \"article_ams#lazy_dump\"\n  get \"article_ams/lazy_nested\" => \"article_ams#lazy_nested\"\n  get \"article_ams/lazy_escape\" => \"article_ams#lazy_escape\"\n  get \"article_ams/helper_index\" => \"article_ams#helper_index\"\n{}  resources :articles do",
                 ["show", "draft", "admin", "guest", "plain", "rootless", "helper_show"]
                     .map(|a| format!("  get \"article_ams/:id/{a}\" => \"article_ams#{a}\"\n"))
                     .concat()
@@ -443,7 +459,7 @@ run = ->(action, id) { c = ArticleAmsController.new; c.params = id ? {"id" => id
     for (name, expected) in EXPECTED {
         let id = match *name {
             "draft" => "d.id",
-            "index" | "bare" | "helper_index" => "nil",
+            "index" | "bare" | "helper_index" | "lazy_dump" | "lazy_nested" => "nil",
             _ => "a.id",
         };
         out.push_str(&format!(
@@ -451,6 +467,10 @@ run = ->(action, id) { c = ArticleAmsController.new; c.params = id ? {"id" => id
             serde_json::to_string(expected).unwrap().replace('#', "\\#")
         ));
     }
+    // oj writes the serializer through its `to_json`, Rails' encoder, and the `as_json` value as it is (the real gem, 0.8.4).
+    out.push_str(
+        "Article.create!(title: \"<b>&\", body: \"A long body\")\ngot = run.(:lazy_escape, nil)\nraise \"lazy_escape: \" + got unless got.include?(%q(\"title\":\"\\u003cb\\u003e\\u0026\")) && got.include?(%q(\"title\":\"<b>&\"))\n",
+    );
     out.push_str("puts \"ams 0.8 passed\"\n");
     out
 }
@@ -706,4 +726,18 @@ fn an_active_model_serializer_08_array_over_an_options_local_lowers_only_when_no
     assert!(!lowered("@raw\n    saved = opts\n    if xs\n      opts[:each_serializer] = ASerializer\n      render json: [ActiveModel::ArraySerializer.new(xs, opts).as_json, saved.key?(:hash)]\n    end\n"));
     assert!(!lowered("@raw\n    other = opts\n    opts[:each_serializer] = ASerializer\n    other.merge!(each_serializer: BSerializer)\n    render json: ActiveModel::ArraySerializer.new(xs, opts).as_json\n"));
     assert!(!lowered("    body = ActiveModel::ArraySerializer.new(xs, opts).as_json\n    render json: { body: body, shared: opts[:hash] }\n"));
+}
+
+/// A deferred ArraySerializer over an options local stays the gem's: it reads
+/// `:each_serializer` when `as_json` runs, which a later write to the Hash changes.
+#[test]
+fn an_active_model_serializer_08_deferred_array_over_an_options_local_stays_the_gem_s() {
+    let errors = overlay()
+        .edit(
+            "app/controllers/article_ams_controller.rb",
+            "  def lazy_dump\n",
+            "  def lazy_local\n    opts = { each_serializer: BasicArticleSerializer }\n    value = ActiveModel::ArraySerializer.new(Article.order(:id), opts)\n    render json: MultiJson.dump(value)\n  end\n\n  def lazy_dump\n",
+        )
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("ActiveModel::ArraySerializer")), "{errors:#?}");
 }
