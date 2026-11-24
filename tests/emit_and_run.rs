@@ -23017,6 +23017,16 @@ fn a_middleware_s_rack_and_connection_calls_answer_as_rails_does() {
     assert!(run.stdout.contains("middleware calls passed"));
 }
 
+/// The replay cache a fiber turned on goes off at `clear_active_connections!`, with no lease held, as Rails'
+/// `disable_query_cache!` turns each pool's off.
+#[test]
+fn clearing_active_connections_turns_the_query_cache_off() {
+    let script = "Db.query_cache_begin\nraise \"cache off\" unless Db.query_cache_enabled?\nActiveRecord::Base.connection_handler.clear_active_connections!(:all)\nraise \"cache still on\" if Db.query_cache_enabled?\nputs \"query cache cleared\"\n";
+    let run = middleware_calls_app().run_ruby(script);
+    run.assert_passes();
+    assert!(run.stdout.contains("query cache cleared"));
+}
+
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn a_middleware_s_rack_and_connection_calls_answer_as_rails_does_on_spinel() {
@@ -23032,4 +23042,34 @@ fn middleware_calls_app() -> emit_and_run::Overlay {
         "app/models/connection_probe.rb",
         "class ConnectionProbe\n  def self.report\n    [Rack::RACK_SESSION_OPTIONS, Rack::RACK_INPUT, ActiveRecord::Base.connection_handler.clear_active_connections!(:all), released]\n  end\n\n  def self.released\n    if defined? ActiveRecord::Base.connection_handler\n      ActiveRecord::Base.connection_handler.clear_active_connections!(:all)\n      :handler\n    elsif defined? ActiveRecord::Base.clear_active_connections!\n      ActiveRecord::Base.clear_active_connections!\n      :base\n    end\n  end\nend\n",
     )
+}
+
+/// `defined?(ActiveRecord::Base.clear_active_connections!)` folds to nil only for Rails' own `ActiveRecord`: in a
+/// namespace with an `ActiveRecord` of its own that defines the method, Ruby answers "method".
+#[test]
+fn a_removed_rails_method_s_defined_keeps_a_lexically_shadowed_head() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/wrapper.rb",
+            "module Wrapper\n  module ActiveRecord\n    class Base\n      def self.clear_active_connections!\n        :own\n      end\n    end\n  end\n\n  class Probe\n    def self.check\n      [defined?(ActiveRecord::Base.clear_active_connections!), defined?(::ActiveRecord::Base.clear_active_connections!)]\n    end\n  end\nend\n",
+        )
+        .run_ruby("got = Wrapper::Probe.check\nraise got.inspect unless got == [\"method\", nil]\nputs \"shadowed head passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("shadowed head passed"));
+}
+
+/// A `require` of a name built at run time loads nothing in the Spinel tree and is reported there; a call of the app's
+/// own `load(name)` is that method, and is not.
+#[test]
+fn only_kernel_s_require_of_a_built_name_is_reported_on_spinel() {
+    let errors = |body: &str| {
+        emit_and_run::real_blog()
+            .write("app/models/loader.rb", &format!("class Loader\n{body}end\n"))
+            .emit(roundhouse::project::BuildTarget::Spinel)
+            .1
+    };
+    let built = errors("  def self.backend(name)\n    require \"loader/#{name}\"\n  end\n");
+    assert!(built.iter().any(|e| e.contains("require of a name built at run time")), "{built:#?}");
+    let own = errors("  def self.load(name)\n    name.to_s\n  end\n\n  def self.fetch(name)\n    load(name)\n  end\n");
+    assert!(!own.iter().any(|e| e.contains("require of a name built at run time")), "{own:#?}");
 }
