@@ -6865,7 +6865,7 @@ impl Analyzer {
     fn apply_param_sites(
         &mut self,
         sites: Vec<SendSite>,
-        params_by_method: &HashMap<ParamKey, ParamShape>,
+        params_by_method: &ParamShapes,
         defined: &BTreeSet<ParamKey>,
     ) {
         let unknown = unknown_receiver();
@@ -6883,7 +6883,7 @@ impl Analyzer {
     fn param_observations(
         &self,
         sites: &[&SendSite],
-        params_by_method: &HashMap<ParamKey, ParamShape>,
+        params_by_method: &ParamShapes,
         defined: &BTreeSet<ParamKey>,
         open: &mut BTreeSet<(ParamKey, usize)>,
     ) -> Vec<(ParamKey, Vec<Ty>)> {
@@ -6896,7 +6896,7 @@ impl Analyzer {
     fn call_observations(
         &self,
         sites: &[(&ClassId, &SendSite)],
-        params_by_method: &HashMap<ParamKey, ParamShape>,
+        params_by_method: &ParamShapes,
         defined: &BTreeSet<ParamKey>,
         open: &mut BTreeSet<(ParamKey, usize)>,
     ) -> Vec<(ParamKey, Vec<Ty>)> {
@@ -6923,7 +6923,7 @@ impl Analyzer {
     fn param_observations_of(
         &self,
         sites: &[(&ClassId, &SendSite)],
-        params_by_method: &HashMap<ParamKey, ParamShape>,
+        params_by_method: &ParamShapes,
         defined: &BTreeSet<ParamKey>,
         open: &mut BTreeSet<(ParamKey, usize)>,
     ) -> Vec<(ParamKey, Vec<Ty>)> {
@@ -6937,7 +6937,30 @@ impl Analyzer {
             let Some(key) = key else { continue };
             // Not the placed row: keyword placement pads the slots a call leaves to their defaults with the same `Var`.
             let positional = arg_tys.len().saturating_sub(usize::from(kw_tys.group));
-            let shape = params_by_method.get(&key);
+            let shape = params_by_method.get(&key).or_else(|| {
+                // Not an includer whose own `def`s disagree: Ruby runs those, never the module's.
+                if params_by_method.poisoned.contains(&key) {
+                    return None;
+                }
+                let (shape, keyword_named) = self.included_param_shape(&key, params_by_method)?;
+                // Not past a `*rest`: a row puts every positional after it in the rest slot,
+                // so a keyword placed on its own index would read as one more rest element.
+                if shape.slots.iter().any(|(_, kind)| matches!(kind, ParamKind::Rest)) {
+                    return None;
+                }
+                // The module's shape places a key by name, keyword or not, so
+                // only where every key names a source keyword: `f(name: x)`
+                // against `def f(name)` binds the whole Hash, as Ruby does.
+                // A call with no keyword group places nothing.
+                let by_keyword = kw_tys.splat.is_none()
+                    && !kw_tys.anonymous_forward
+                    && if kw_tys.keys.is_empty() {
+                        !kw_tys.group
+                    } else {
+                        kw_tys.keys.iter().all(|(k, _)| keyword_named.contains(k))
+                    };
+                by_keyword.then_some(shape)
+            });
             for (i, t) in arg_tys.iter().take(positional).enumerate() {
                 // Not skipped without a shape: a concern's method keys to the includer, which has none, and its row folds into the module's.
                 let plain = shape.is_none_or(|s| s.slots.get(i).is_some_and(|(_, kind)| matches!(kind, ParamKind::Required | ParamKind::Optional)));
@@ -6951,9 +6974,13 @@ impl Analyzer {
                 match shape {
                     Some(shape) => {
                         // Not a positional argument nobody typed: the join leaves it out (`open_param_slots`), the default unused.
-                        for (i, (_, kind)) in shape.slots.iter().enumerate() {
+                        // A module's shape (`included_param_shape`): its flattened keyword a key filled is not left to its default.
+                        let from_module = params_by_method.get(&key).is_none();
+                        for (i, (name, kind)) in shape.slots.iter().enumerate() {
                             let left = match kind {
-                                ParamKind::Optional => i >= positional,
+                                ParamKind::Optional => {
+                                    i >= positional && !(from_module && kw_tys.keys.iter().any(|(k, _)| k == name))
+                                }
                                 ParamKind::Keyword { required: false } => arg_tys.get(i).is_none_or(|t| t.is_unknown()),
                                 _ => false,
                             };
@@ -6970,6 +6997,72 @@ impl Analyzer {
             observations.push((key, arg_tys));
         }
         observations
+    }
+
+    /// The shape of the module `def` a call keyed to an includer reaches.
+    ///
+    /// A concern's method keys to the class that includes it, which
+    /// declares no `def` of its own and so has no row in `param_shapes`;
+    /// `fold_concern_param_sites` moves the row onto the module later.
+    /// Without the module's shape here, `place_keyword_args` left the
+    /// call's kwargs Hash where it sits, and `def label(name: nil,
+    /// pinned: false)` called `label(name: "x", pinned: true)` typed
+    /// `name` as `Hash[Symbol, (String | bool)]`.
+    ///
+    /// Searched the way the fold searches: the class's own includes and
+    /// its ancestors', module→module includes followed. `None` when no
+    /// module defines it, or when two that do disagree on the shape. A
+    /// module whose own `def`s of it disagree (a poisoned entry) counts
+    /// as a disagreement, not as a module to skip: it may be the one
+    /// Ruby reaches. Leaving the Hash where it is was the behaviour
+    /// before. Beside the shape, the names of the parameters that were
+    /// keywords in the source, flattened or not.
+    fn included_param_shape<'a>(
+        &self,
+        key: &ParamKey,
+        params_by_method: &'a ParamShapes,
+    ) -> Option<(&'a ParamShape, &'a BTreeSet<Symbol>)> {
+        let (class_id, method, side) = key;
+        let mut queue: Vec<ClassId> = Vec::new();
+        let mut cur = Some(class_id.clone());
+        let mut depth = 0;
+        while let Some(cid) = cur {
+            let Some(c) = self.classes.get(&cid) else { break };
+            queue.extend(c.includes.iter().cloned());
+            depth += 1;
+            if depth > 32 {
+                break;
+            }
+            cur = c.parent.clone();
+        }
+        let mut seen: BTreeSet<ClassId> = BTreeSet::new();
+        let mut found: Option<(&'a ParamShape, &'a BTreeSet<Symbol>)> = None;
+        let mut qi = 0;
+        while qi < queue.len() {
+            let m = queue[qi].clone();
+            qi += 1;
+            if !seen.insert(m.clone()) {
+                continue;
+            }
+            let module_key = (m.clone(), method.clone(), *side);
+            if params_by_method.poisoned.contains(&module_key) {
+                return None;
+            }
+            if let Some(shape) = params_by_method.get(&module_key) {
+                // Its `def`s disagree on which parameters were keywords.
+                let Some(Some(keyword_named)) = params_by_method.keyword_named.get(&module_key) else {
+                    return None;
+                };
+                match found {
+                    Some(prev) if prev != (shape, keyword_named) => return None,
+                    _ => found = Some((shape, keyword_named)),
+                }
+            }
+            if let Some(ci) = self.classes.get(&m) {
+                queue.extend(ci.includes.iter().cloned());
+            }
+        }
+        found
     }
 
     /// The parameter row a call of `method` on `class_id` records under.
@@ -7162,6 +7255,8 @@ impl Analyzer {
         targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<(ParamKey, Vec<Ty>)> = Vec::new();
         let mut open_adds: Vec<(ParamKey, usize)> = Vec::new();
+        let mut defaulted_adds: Vec<(ParamKey, usize)> = Vec::new();
+        let defaulted = self.defaulted_param_slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (id, includes) in targets {
             let mut queue = includes;
             let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
@@ -7200,6 +7295,11 @@ impl Analyzer {
                                     open_adds.push(((m.clone(), name.clone(), side), i));
                                 }
                             }
+                            // The slots a call left to their defaults, placed by the module's shape;
+                            // past the row too (`tint(1)` leaves `tone:`). Not the `usize::MAX` catch-all.
+                            for (_, i) in defaulted.range((from.clone(), 0)..(from.clone(), usize::MAX)) {
+                                defaulted_adds.push(((m.clone(), name.clone(), side), *i));
+                            }
                         }
                     }
                 }
@@ -7207,6 +7307,7 @@ impl Analyzer {
         }
         fold_param_observations(&mut self.inferred_params, adds);
         self.open_param_slots.extend(open_adds);
+        self.defaulted_param_slots.lock().unwrap_or_else(|e| e.into_inner()).extend(defaulted_adds);
     }
 
     /// Every (class, method) pair's parameter names and canonical kinds
@@ -7218,9 +7319,21 @@ impl Analyzer {
     /// rather than pick one: placing keywords from the wrong `def` is
     /// worse than leaving the hash where it sits, which is the
     /// behaviour that stood before this table existed.
-    fn param_shapes(app: &App) -> HashMap<ParamKey, ParamShape> {
+    fn param_shapes(app: &App) -> ParamShapes {
         let mut out: HashMap<ParamKey, Option<ParamShape>> = HashMap::default();
+        let mut keyword_named: HashMap<ParamKey, Option<BTreeSet<Symbol>>> = HashMap::default();
         let mut record = |class: &ClassId, m: &crate::dialect::MethodDef| {
+            let names: BTreeSet<Symbol> =
+                // Named keywords only: a `**rest` kept as one (`keyword` and `rest`) binds the Hash, never a key's value.
+                m.params.iter().filter(|p| (p.keyword || p.from_keyword) && !p.rest).map(|p| p.name.clone()).collect();
+            keyword_named
+                .entry((class.clone(), m.name.clone(), m.receiver))
+                .and_modify(|slot| {
+                    if slot.as_ref() != Some(&names) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(names));
             let shape = ParamShape {
                 slots: m.params.iter().map(|p| (p.name.clone(), p.ty_kind())).collect(),
                 keywords_by_kind: false,
@@ -7285,7 +7398,18 @@ impl Analyzer {
                     .or_insert(Some(shape));
             }
         }
-        out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
+        let mut shapes = ParamShapes { keyword_named, ..ParamShapes::default() };
+        for (k, v) in out {
+            match v {
+                Some(v) => {
+                    shapes.by_key.insert(k, v);
+                }
+                None => {
+                    shapes.poisoned.insert(k);
+                }
+            }
+        }
+        shapes
     }
 
     /// Place a call's trailing keyword arguments on the parameter slots
@@ -10608,6 +10732,26 @@ struct SiteKeywords {
     /// The opaque final `**` can override the explicit pairs, so they are
     /// not type evidence for the receiving named parameters.
     anonymous_forward: bool,
+}
+
+/// [`Analyzer::param_shapes`]: each key's shape, and the keys whose
+/// `def`s disagree, kept apart so a missing shape is not read as a
+/// missing `def`.
+#[derive(Debug, Default, PartialEq)]
+struct ParamShapes {
+    by_key: HashMap<ParamKey, ParamShape>,
+    /// Two `def`s of the key whose shapes differ: no shape, but a `def`.
+    poisoned: BTreeSet<ParamKey>,
+    /// The parameters that were keywords in the source (`Param::keyword`
+    /// or `Param::from_keyword`), for the models', library classes' and
+    /// test modules' `def`s; `None` when two `def`s of a key disagree.
+    keyword_named: HashMap<ParamKey, Option<BTreeSet<Symbol>>>,
+}
+
+impl ParamShapes {
+    fn get(&self, key: &ParamKey) -> Option<&ParamShape> {
+        self.by_key.get(key)
+    }
 }
 
 /// A method's declared parameter slots, in declaration order, as
