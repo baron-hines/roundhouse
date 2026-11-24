@@ -1136,20 +1136,22 @@ fn classify_form_with_components(
     // `rooms/directs/new` keeps its directory's `rooms_directs_path`.
     let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
     let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
-    // A typed record takes its local's route only when its class IS that
-    // local's model (`Rooms::Open < Room` handed as `room`): a `Post`
-    // handed as `user` posting to `users_path` would be silently wrong
-    // where the unrouted `posts_path` fails loudly. An untyped record
-    // has only its name to go by: the partial's own emission, which
+    // A typed record takes its local's route only when the directory
+    // names none and its class IS that local's model (`Rooms::Open <
+    // Room` handed as `room`; `rooms/directs/new`'s `Rooms::Direct`
+    // keeps its routed directory): a `Post` handed as `user` posting to
+    // `users_path` would be silently wrong where the unrouted `posts_path`
+    // fails loudly. An untyped record has only its name to go by, and it
+    // wins over the directory as it always has (`posts/_form` handed a
+    // `user` posts to `users_path`); the partial's own emission, which
     // serves every render, types campfire's `room` as nothing.
-    let is_local_s_model = |local: &str| {
-        typed_full.as_deref().is_none_or(|full| {
+    let by_local = record_local_name(&model).filter(|local| match typed_full.as_deref() {
+        None => true,
+        Some(full) => {
             let local = singularize(&snake_case(local));
-            ctx.model_ancestors.get(full).is_some_and(|ancestors| ancestors.contains(&local))
-        })
-    };
-    let by_local = record_local_name(&model)
-        .filter(|local| !directory_known && is_local_s_model(local));
+            !directory_known && ctx.model_ancestors.get(full).is_some_and(|ancestors| ancestors.contains(&local))
+        }
+    });
     for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);

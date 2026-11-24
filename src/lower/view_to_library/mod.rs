@@ -5450,9 +5450,11 @@ pub(super) struct ViewCtx {
     /// runtime `url_for`, whose `is_a?`-dispatch shape is
     /// CRuby-overlay-only.
     pub(super) model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
-    /// Each model's model superclasses, as snake-singular names of their
-    /// last segment (`Rooms::Open` → `["room"]`). A form's record local
-    /// names a route for a record only when the record IS that model.
+    /// Each class's model superclasses, as their param keys
+    /// (`Rooms::Open` → `["room"]`, a `Billing::Article` ancestor →
+    /// `billing_article`, so an `article` local does not match it). A
+    /// form's record local names a route for a record only when the
+    /// record IS that model.
     pub(super) model_ancestors: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     /// Snake-singular names of models that OVERRIDE `to_param`
     /// (lobsters' Story→short_id, Domain→domain). The form-action
@@ -6935,7 +6937,7 @@ fn model_ancestors(app: &crate::App) -> crate::det::HashMap<String, Vec<String>>
         .map(|name| {
             let chain = crate::app::class_ancestors(&parents, name)
                 .filter(|class| models.contains(class))
-                .map(|class| singularize(&snake_case(last_segment(class))))
+                .map(|class| app.model_param_key(class))
                 .collect();
             (name.to_string(), chain)
         })

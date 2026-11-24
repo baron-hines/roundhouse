@@ -200,10 +200,43 @@ fn a_form_whose_record_is_not_its_local_s_model_keeps_its_own_route() {
     assert!(form.contains("features_path"), "expected features_path in:\n{form}");
 }
 
+/// A namespaced ancestor is no match for a bare local: a `Feature <
+/// Billing::Article` handed as `article` keeps `features_path` rather
+/// than posting to the top-level `Article`'s `articles_path`.
+#[test]
+fn a_namespaced_ancestor_is_not_its_bare_local_s_model() {
+    let form = features_form_with(
+        "Billing::Article",
+        emit_and_run::real_blog()
+            .write("app/models/billing/article.rb", "class Billing::Article < ApplicationRecord\n  self.table_name = \"articles\"\nend\n"),
+    );
+    assert!(!form.contains("articles_path"), "a Billing::Article posted to articles_path:\n{form}");
+    assert!(form.contains("features_path"), "expected features_path in:\n{form}");
+}
+
+/// An untyped record has only its name to go by, and the name wins
+/// over a routed directory: a `comments/_quick` form no render types
+/// still posts its `article` to `articles_path`, not `comments_path`.
+#[test]
+fn an_untyped_record_posts_to_its_local_s_route_over_its_directory_s() {
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  resources :comments, only: [:create]\n  resources :articles do\n")
+        .write("app/views/comments/_quick.html.erb", "<%= form_with model: article do |form| %>\n  <%= form.text_field :title %>\n<% end %>\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "emit errors: {errors:?}");
+    let form = std::fs::read_to_string(emitted.join("app/views/comments/_quick.rb")).expect("an emitted comments form");
+    assert!(form.contains("articles_path"), "expected articles_path in:\n{form}");
+    assert!(!form.contains("comments_path"), "an article posted to comments_path:\n{form}");
+}
+
 /// The emitted `features/_form`, handed a `Feature < parent` as `article`.
 fn features_form(parent: &str) -> String {
+    features_form_with(parent, emit_and_run::real_blog())
+}
+
+fn features_form_with(parent: &str, overlay: emit_and_run::Overlay) -> String {
     let heading = "  <h1 class=\"font-bold text-4xl\"><%= @article.title %></h1>\n";
-    let (emitted, errors) = emit_and_run::real_blog()
+    let (emitted, errors) = overlay
         .write("app/models/feature.rb", &format!("class Feature < {parent}\nend\n"))
         .write("app/views/features/_form.html.erb", "<%= form_with model: article do |form| %>\n  <%= form.text_field :title %>\n<% end %>\n")
         .edit("app/views/articles/show.html.erb", heading, &format!("{heading}  <%= render \"features/form\", article: Feature.new %>\n"))
