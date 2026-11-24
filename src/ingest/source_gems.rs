@@ -29,9 +29,13 @@ pub(super) struct SourceGem {
 }
 
 impl SourceGem {
-    /// The text of each file the gem compiles, as installed.
+    /// The text of each file the gem compiles, its load-time branches settled as the mount reads them.
     pub(super) fn texts<V: Vfs + ?Sized>(&self, vfs: &V) -> Vec<String> {
-        self.files.iter().filter_map(|rel| vfs.read_to_string(&self.installed.join(rel)).ok()).collect()
+        self.files
+            .iter()
+            .filter_map(|rel| vfs.read_to_string(&self.installed.join(rel)).ok())
+            .map(|text| super::ruby_conditions::settled_for(&text, self.spinel_only).unwrap_or(text))
+            .collect()
     }
 
     /// Does the gem define what `path`, one of its files under the mount,

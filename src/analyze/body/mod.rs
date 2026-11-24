@@ -5690,8 +5690,14 @@ impl BodyTyper<'_> {
     fn super_return(&self, owner: &ClassId, name: &Symbol, class_side: bool) -> Option<Ty> {
         let classes = self.classes();
         let info = classes.get(owner)?;
-        // A module's `super` is the next method of the class that mixes it in: one it `prepend`s (not among its
-        // includes) answers with its own method first (redis's `Redis::LibIdentity#connection_prelude`).
+        let modules = if class_side { &info.class_method_extensions } else { &info.includes };
+        for module in modules.iter().rev() {
+            if let Some(ty) = classes.get(module).and_then(|m| m.instance_methods.get(name)) {
+                return Some(ty.clone()).filter(|t| !t.is_open());
+            }
+        }
+        // Past its own includes, a module's `super` is the next method of the class that mixes it in: one that
+        // `prepend`s it (not among its includes) answers with its own (redis's `Redis::LibIdentity#connection_prelude`).
         if info.is_module
             && !class_side
             && info.parent.is_none()
@@ -5702,12 +5708,6 @@ impl BodyTyper<'_> {
             && let Some(ty) = host_info.instance_methods.get(name)
         {
             return Some(ty.clone()).filter(|t| !t.is_open());
-        }
-        let modules = if class_side { &info.class_method_extensions } else { &info.includes };
-        for module in modules.iter().rev() {
-            if let Some(ty) = classes.get(module).and_then(|m| m.instance_methods.get(name)) {
-                return Some(ty.clone()).filter(|t| !t.is_open());
-            }
         }
         let mut parent = info.parent.clone();
         let mut seen = 0;

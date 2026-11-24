@@ -742,7 +742,8 @@ fn ingest_library_classes_impl(
             program.statements().body().iter().all(|stmt| stmt.as_constant_write_node().is_some())
         });
         if !only_writes {
-            return Ok(Vec::new());
+            // The file's mixins and writes into other classes still are their targets' openings.
+            return Ok(super::top_level_mixins::openings(&root, file, &[]));
         }
         let mut holder = file_constants_holder(file, &file_constants);
         holder.constants = file_constants;

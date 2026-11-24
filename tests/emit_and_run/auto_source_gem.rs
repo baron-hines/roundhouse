@@ -67,6 +67,25 @@ fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_is_ruby_s_name_error() {
     assert!(errors.is_empty(), "{errors:#?}");
 }
 
+/// A gem's `const_set` of a name built with a literal prefix (aasm's `klass.const_set("STATE_#{name.upcase}", …)`,
+/// through a local) makes only names with that prefix, so the constants nothing defines stay Ruby's NameError; a name
+/// of no known shape may be any, and the read stays unsupported.
+#[test]
+fn a_gem_s_const_set_hides_only_the_names_it_may_make() {
+    let state_const_set = "module Greetings\n  module States\n    def self.define(klass, name)\n      const_name = name.nil? ? \"STATE_#{name}\" : \"STATE_#{name.upcase}\"\n      klass.const_set(const_name, name)\n    end\n  end\nend\n";
+    let with = |text: &str| {
+        auto_source_gem::misnamed_overlay()
+            .write("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings/states.rb", text)
+            .edit("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings.rb", "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/states\"\n")
+            .emit(BuildTarget::Spinel)
+            .1
+    };
+    let errors = with(state_const_set);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let errors = with(&state_const_set.replace("klass.const_set(const_name, name)", "klass.const_set(name, name)"));
+    assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): MustImplement")), "{errors:#?}");
+}
+
 /// A constant a gem assigns into another class (`MessageBus::BACKENDS = {}` at a file's top level, redis-client's
 /// `CommandError::ERRORS = { … }` in `class RedisClient`) is that class's, as Ruby defines it.
 #[test]

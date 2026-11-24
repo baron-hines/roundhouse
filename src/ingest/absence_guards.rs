@@ -54,13 +54,57 @@ pub(super) fn source_gem_code(app: &App) -> SourceGemCode {
     code
 }
 
+/// The names a gem's `const_set` may make: literals, and the literal prefix of a built one (aasm's
+/// `"STATE_#{name.upcase}"`); a name of neither shape may be any, which the empty prefix stands for.
+#[derive(Default)]
+struct ConstSetNames {
+    exact: crate::det::HashSet<String>,
+    prefixes: crate::det::HashSet<String>,
+}
+
+impl ConstSetNames {
+    fn may_make(&self, segment: &str) -> bool {
+        self.exact.contains(segment) || self.prefixes.iter().any(|p| segment.starts_with(p.as_str()))
+    }
+}
+
+/// What a name argument may be: `Some(true, s)` the literal `s`, `Some(false, p)` a name starting with `p`.
+fn name_shapes(node: &ruby_prism::Node<'_>, locals: &crate::det::HashMap<String, Vec<(bool, String)>>) -> Vec<(bool, String)> {
+    if let Some(name) = super::util::symbol_or_string_value(node) {
+        return vec![(true, name)];
+    }
+    if let Some(interp) = node.as_interpolated_string_node().map(|n| n.parts()).or_else(|| node.as_interpolated_symbol_node().map(|n| n.parts())) {
+        let head = interp.iter().next().and_then(|p| p.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()));
+        return vec![(false, head.unwrap_or_default())];
+    }
+    if let Some(branch) = node.as_if_node() {
+        let then = branch.statements().and_then(|s| s.body().iter().last());
+        let other = branch.subsequent().and_then(|e| e.as_else_node()).and_then(|e| e.statements()).and_then(|s| s.body().iter().last());
+        if let (Some(then), Some(other)) = (then, other) {
+            let mut out = name_shapes(&then, locals);
+            out.extend(name_shapes(&other, locals));
+            return out;
+        }
+    }
+    if let Some(read) = node.as_local_variable_read_node()
+        && let Some(shapes) = locals.get(super::util::constant_id_str(&read.name()).as_ref() as &str)
+    {
+        return shapes.clone();
+    }
+    vec![(false, String::new())]
+}
+
 /// Every constant a source gem's file assigns, by full name (`A::B = …` at any nesting, `B = …` in a class or module
-/// body), and every name it hands `const_set` as a literal.
-fn gem_source_constants(texts: &[String]) -> (crate::det::HashSet<String>, crate::det::HashSet<String>) {
+/// body), and the names it hands `const_set`.
+fn gem_source_constants(texts: &[String]) -> (crate::det::HashSet<String>, ConstSetNames) {
     struct Collect {
         nesting: Vec<String>,
         written: crate::det::HashSet<String>,
-        const_set: crate::det::HashSet<String>,
+        const_set: ConstSetNames,
+        /// The shapes each local of the method being read is assigned anywhere in it.
+        locals: crate::det::HashMap<String, Vec<(bool, String)>>,
+        /// Reading a method for its locals' writes, before its `const_set`s.
+        gathering: bool,
     }
     impl Collect {
         fn under(&self, name: &str) -> String {
@@ -88,6 +132,34 @@ fn gem_source_constants(texts: &[String]) -> (crate::det::HashSet<String>, crate
             let (rooted, parts) = Self::path(node)?;
             Some(if rooted { parts.join("::") } else { self.under(&parts.join("::")) })
         }
+        fn binding(&mut self, node: &ruby_prism::Node<'_>) {
+            let bare = node.as_constant_or_write_node().map(|n| n.name())
+                .or_else(|| node.as_constant_and_write_node().map(|n| n.name()))
+                .or_else(|| node.as_constant_operator_write_node().map(|n| n.name()))
+                .or_else(|| node.as_constant_target_node().map(|n| n.name()));
+            if let Some(name) = bare {
+                let full = self.under(&super::util::constant_id_str(&name));
+                self.written.insert(full);
+                return;
+            }
+            let target = node.as_constant_path_or_write_node().map(|n| n.target())
+                .or_else(|| node.as_constant_path_and_write_node().map(|n| n.target()))
+                .or_else(|| node.as_constant_path_operator_write_node().map(|n| n.target()));
+            if let Some(full) = target.and_then(|t| self.full(&t.as_node())) {
+                self.written.insert(full);
+                return;
+            }
+            if let Some(target) = node.as_constant_path_target_node()
+                && let Some(name) = target.name()
+            {
+                let name = super::util::constant_id_str(&name).to_string();
+                let full = match target.parent() {
+                    None => Some(name),
+                    Some(parent) => self.full(&parent).map(|owner| format!("{owner}::{name}")),
+                };
+                self.written.extend(full);
+            }
+        }
     }
     impl<'pr> ruby_prism::Visit<'pr> for Collect {
         fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
@@ -113,17 +185,40 @@ fn gem_source_constants(texts: &[String]) -> (crate::det::HashSet<String>, crate
             }
             ruby_prism::visit_constant_path_write_node(self, node);
         }
+        // `X ||= …`, `A::X &&= …`, `A::X += …` and a multiple assignment's `A::X, Y = …` define the constant as well.
+        fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            self.binding(&node);
+        }
+        fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            self.binding(&node);
+        }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            // Twice: a write after the `const_set` in a loop reaches it too.
+            let (outer, was) = (std::mem::take(&mut self.locals), self.gathering);
+            self.gathering = true;
+            ruby_prism::visit_def_node(self, node);
+            self.gathering = was;
+            ruby_prism::visit_def_node(self, node);
+            self.locals = outer;
+        }
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            let shapes = name_shapes(&node.value(), &self.locals);
+            self.locals.entry(super::util::constant_id_str(&node.name()).to_string()).or_default().extend(shapes);
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-            if super::util::constant_id_str(&node.name()) == "const_set"
+            if !self.gathering
+                && super::util::constant_id_str(&node.name()) == "const_set"
                 && let Some(first) = node.arguments().and_then(|a| a.arguments().iter().next())
             {
-                // A name only the run time knows may be any: the empty name stands for all of them.
-                self.const_set.insert(super::util::symbol_or_string_value(&first).unwrap_or_default());
+                for (exact, name) in name_shapes(&first, &self.locals) {
+                    if exact { self.const_set.exact.insert(name) } else { self.const_set.prefixes.insert(name) };
+                }
             }
             ruby_prism::visit_call_node(self, node);
         }
     }
-    let mut collect = Collect { nesting: Vec::new(), written: Default::default(), const_set: Default::default() };
+    let mut collect = Collect { nesting: Vec::new(), written: Default::default(), const_set: Default::default(), locals: Default::default(), gathering: false };
     for text in texts {
         let parsed = super::prism::parse_silent(text.as_bytes());
         collect.nesting.clear();
@@ -199,6 +294,7 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
     declared.extend(boot_assigned.iter().cloned());
     // Not a constant some gem of the app, Ruby's standard library or the app itself may define: only one nothing could.
     let absent = |written: &[&Symbol]| {
+        let written = rooted_tail(written).1;
         let Some(root) = written.first().map(|r| r.as_str()) else { return false };
         let segments: Vec<&str> = written.iter().map(|p| p.as_str()).collect();
         let full = segments.join("::");
@@ -231,23 +327,24 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
             _ => None,
         })))
         .collect();
-    let ancestry: crate::det::HashMap<String, Vec<String>> = app
-        .library_classes
-        .iter()
-        .map(|c| {
-            let up = c.parent.iter().chain(c.includes.iter()).map(|p| p.0.as_str().trim_start_matches("::").to_string()).collect();
-            (c.name.0.as_str().to_string(), up)
-        })
-        .collect();
+    // Of every entry by the name: an opening (`X.prepend(M)` read as one) has no parent of its own.
+    let mut ancestry: crate::det::HashMap<String, Vec<String>> = crate::det::HashMap::default();
+    for c in &app.library_classes {
+        let up = c.parent.iter().chain(c.includes.iter()).map(|p| p.0.as_str().trim_start_matches("::").to_string());
+        ancestry.entry(c.name.0.as_str().to_string()).or_default().extend(up);
+    }
     // In a gem's own code, a bare name the class's lexical scopes, Object, and its ancestors and mixins all lack: the
     // last segment of a class nested elsewhere (message_bus's `Backends::Base::ConcreteClassMustImplementError`, read
     // bare from `Codec::Base`) is no definition Ruby finds there.
     // Not a gem compiled from source: every constant it defines is in the program, so its namespace answers nothing more.
     let unknown_owners = |path: &str| index.owners(path).into_iter().filter(|g| !source_gem.gems.contains(*g)).count();
     let absent_from = |owner: &str, written: &[&Symbol]| {
+        // `::X` is looked up at the top level alone, whatever namespace the read sits in.
+        let (rooted, written) = rooted_tail(written);
+        let owner = if rooted { "" } else { owner };
         let root = written.first().map(|r| r.as_str()).unwrap_or_default();
         let segments: Vec<&str> = written.iter().map(|p| p.as_str()).collect();
-        if const_set_names.contains("") || segments.iter().any(|s| const_set_names.contains(*s)) {
+        if segments.iter().any(|s| const_set_names.may_make(s)) {
             return false;
         }
         if unknown_owners(&segments.join("::")) > 0 || crate::gems::is_stdlib_namespace(root) || crate::gems::is_core_constant(&segments) {
@@ -412,6 +509,14 @@ fn capitalized(s: &str) -> String {
 }
 
 type Probe<'p> = &'p dyn Fn(&[&Symbol]) -> bool;
+
+/// Whether a probed path is written rooted (`::X`), and its segments past the root.
+fn rooted_tail<'a, 'b>(written: &'a [&'b Symbol]) -> (bool, &'a [&'b Symbol]) {
+    match written.split_first() {
+        Some((first, rest)) if first.as_str().is_empty() => (true, rest),
+        _ => (false, written),
+    }
+}
 type Gone<'p> = &'p dyn Fn(&[&Symbol]) -> Option<String>;
 type Unloadable<'p> = &'p dyn Fn(&str) -> bool;
 
@@ -436,6 +541,8 @@ fn walk(e: &mut Expr, guarded: &[Vec<Symbol>], absent: Probe<'_>, gone: Gone<'_>
     }
     if let ExprNode::Const { path } = &*e.node {
         let written: Vec<&Symbol> = path.iter().filter(|p| !p.as_str().is_empty()).collect();
+        // The probe tells `::X` from `X` by the empty root it keeps.
+        let probed: Vec<&Symbol> = if path.first().is_some_and(|p| p.as_str().is_empty()) { path.iter().collect() } else { written.clone() };
         // Not only where guarded: a constant of a gem the lockfile lacks is missing wherever it is read.
         if let Some(missing) = gone(&written) {
             let span = e.span;
@@ -453,7 +560,7 @@ fn walk(e: &mut Expr, guarded: &[Vec<Symbol>], absent: Probe<'_>, gone: Gone<'_>
         if guarded.iter().any(|g| g.as_slice() == [Symbol::from(DEAD)])
             || (guarded.iter().any(|g| g.is_empty() || (written.len() >= g.len() && g.iter().zip(&written).all(|(a, b)| a == *b)))
                 && !written.first().is_some_and(|root| super::app::FRAMEWORK_ROOTS.contains(&root.as_str()))
-                && absent(&written))
+                && absent(&probed))
         {
             e.decisions |= crate::expr::ABSENCE_GUARDED;
         }

@@ -54,7 +54,7 @@ pub(super) fn file_program(
         Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 }
     };
     let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
-    let items = program_items(&statements, file, carried, list_dir, &span_of);
+    let items = program_items(&statements, file, carried, list_dir, &span_of, true);
     Some(FileProgram { source: file.to_string(), items })
 }
 
@@ -135,6 +135,7 @@ fn program_items(
     carried: &HashSet<String>,
     list_dir: &dyn Fn(&std::path::Path) -> Vec<(String, bool)>,
     span_of: &dyn Fn(&ruby_prism::Node<'_>) -> Span,
+    top: bool,
 ) -> Vec<ProgramItem> {
     let mut items = Vec::new();
     let mut loaders: Vec<String> = Vec::new();
@@ -260,8 +261,9 @@ fn program_items(
             items.push(branch);
             continue;
         }
-        // Not as the statement: the opening of its receiver runs it (`top_level_mixins`), on every tree.
-        if super::top_level_mixins::is_mixin(&stmt) {
+        // Not as the statement: the opening of its receiver runs it (`top_level_mixins`), on every tree; one in a file
+        // branch has no opening and stays the branch's statement.
+        if top && super::top_level_mixins::is_mixin(&stmt) {
             continue;
         }
         if is_file_return(&stmt) {
@@ -306,7 +308,7 @@ fn file_branch(
     if !(declares_inside(stmt) || requires_only) || super::visibility::console_only_node(stmt) {
         return None;
     }
-    let items = |stmts: &[ruby_prism::Node<'_>]| program_items(stmts, file, carried, list_dir, span_of);
+    let items = |stmts: &[ruby_prism::Node<'_>]| program_items(stmts, file, carried, list_dir, span_of, false);
     if let Some(branch) = stmt.as_if_node() {
         if !requires_only {
             branch.if_keyword_loc()?;
@@ -372,11 +374,11 @@ fn file_branch_elsif(
 ) -> Option<ProgramItem> {
     let branch = node.as_if_node()?;
     let condition = ingest_expr(&branch.predicate(), file).ok()?;
-    let then_items = program_items(&statements(branch.statements()), file, carried, list_dir, span_of);
+    let then_items = program_items(&statements(branch.statements()), file, carried, list_dir, span_of, false);
     let else_items = match branch.subsequent() {
         None => Vec::new(),
         Some(sub) if sub.as_else_node().is_some() => {
-            program_items(&statements(sub.as_else_node()?.statements()), file, carried, list_dir, span_of)
+            program_items(&statements(sub.as_else_node()?.statements()), file, carried, list_dir, span_of, false)
         }
         Some(sub) => vec![file_branch_elsif(&sub, file, carried, list_dir, span_of)?],
     };
