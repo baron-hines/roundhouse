@@ -184,20 +184,37 @@ fn a_partly_unknown_view_seed_gives_way_to_a_nested_known_type() {
 /// stopped the search and kept the unrouted `features_path`.
 #[test]
 fn a_form_whose_class_names_an_unrouted_directory_posts_to_its_local_s_route() {
+    let form = features_form("Article");
+    assert!(!form.contains("features_path") && !form.contains("feature_path"), "unrouted helper in:\n{form}");
+    assert!(form.contains("articles_path"), "expected articles_path in:\n{form}");
+}
+
+/// The local's name is no route for a record that is not that local's
+/// model: a `Feature < Comment` handed as `article` keeps the unrouted
+/// `features_path`, which fails loudly, rather than posting a comment
+/// to `articles_path`.
+#[test]
+fn a_form_whose_record_is_not_its_local_s_model_keeps_its_own_route() {
+    let form = features_form("Comment");
+    assert!(!form.contains("articles_path"), "a Comment posted to articles_path:\n{form}");
+    assert!(form.contains("features_path"), "expected features_path in:\n{form}");
+}
+
+/// The emitted `features/_form`, handed a `Feature < parent` as `article`.
+fn features_form(parent: &str) -> String {
     let heading = "  <h1 class=\"font-bold text-4xl\"><%= @article.title %></h1>\n";
     let (emitted, _app, errors) = emit_and_run::real_blog()
-        .write("app/models/feature.rb", "class Feature < Article\nend\n")
+        .write("app/models/feature.rb", &format!("class Feature < {parent}\nend\n"))
         .write("app/views/features/_form.html.erb", "<%= form_with model: article do |form| %>\n  <%= form.text_field :title %>\n<% end %>\n")
         .edit("app/views/articles/show.html.erb", heading, &format!("{heading}  <%= render \"features/form\", article: Feature.new %>\n"))
         .emit_with_app(BuildTarget::Ruby);
     assert!(errors.is_empty(), "emit errors: {errors:?}");
     let views = walk(&emitted);
-    let form = views
+    views
         .iter()
-        .find(|(path, _)| path.contains("features") && path.contains("form"))
-        .unwrap_or_else(|| panic!("no emitted features form among {:?}", views.iter().map(|(p, _)| p).collect::<Vec<_>>()));
-    assert!(!form.1.contains("features_path") && !form.1.contains("feature_path"), "unrouted helper in {}:\n{}", form.0, form.1);
-    assert!(form.1.contains("articles_path"), "expected articles_path in {}:\n{}", form.0, form.1);
+        .find(|(path, _)| path.ends_with("views/features/_form.rb"))
+        .map(|(_, body)| body.clone())
+        .unwrap_or_else(|| panic!("no emitted features form among {:?}", views.iter().map(|(p, _)| p).collect::<Vec<_>>()))
 }
 
 fn walk(dir: &std::path::Path) -> Vec<(String, String)> {

@@ -253,6 +253,7 @@ pub struct ViewLowerCtx<'a> {
     nilable_scalar_reads: std::rc::Rc<crate::det::HashSet<String>>,
     html_safe_methods: std::rc::Rc<HtmlSafeMarks>,
     model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
+    model_ancestors: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     slug_models: std::rc::Rc<crate::det::HashSet<String>>,
     bool_readers: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     time_columns: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
@@ -346,6 +347,7 @@ impl<'a> ViewLowerCtx<'a> {
                     .map(|m| app.model_param_key(m.name.0.as_str()))
                     .collect(),
             ),
+            model_ancestors: std::rc::Rc::new(model_ancestors(app)),
             slug_models: std::rc::Rc::new(
                 app.models
                     .iter()
@@ -898,6 +900,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         nilable_scalar_reads: lx.nilable_scalar_reads.clone(),
         html_safe_methods: lx.html_safe_methods.clone(),
         model_singulars: lx.model_singulars.clone(),
+        model_ancestors: lx.model_ancestors.clone(),
         slug_models: lx.slug_models.clone(),
         bool_readers: lx.bool_readers.clone(),
         time_columns: lx.time_columns.clone(),
@@ -5447,6 +5450,10 @@ pub(super) struct ViewCtx {
     /// runtime `url_for`, whose `is_a?`-dispatch shape is
     /// CRuby-overlay-only.
     pub(super) model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
+    /// Each model's model superclasses, as snake-singular names of their
+    /// last segment (`Rooms::Open` → `["room"]`). A form's record local
+    /// names a route for a record only when the record IS that model.
+    pub(super) model_ancestors: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     /// Snake-singular names of models that OVERRIDE `to_param`
     /// (lobsters' Story→short_id, Domain→domain). The form-action
     /// member arm passes `record.to_param` for these — Rails fills
@@ -6914,4 +6921,41 @@ pub(crate) fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<Stri
         }
     }
     out
+}
+
+/// See [`ViewCtx::model_ancestors`]. Walks each class's `parent`
+/// through the app's models and the other classes under `app/models/`
+/// (`Rooms::Open < Room` is filed there, its parent being no
+/// `ApplicationRecord`), keeping the ancestors that are models. The
+/// walk stops at a parent that is no app class or one already seen.
+fn model_ancestors(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
+    let parents: crate::det::HashMap<&str, Option<&str>> = app
+        .models
+        .iter()
+        .map(|m| (m.name.0.as_str(), m.parent.as_ref().map(|p| p.0.as_str())))
+        .chain(app.library_classes.iter().map(|c| (c.name.0.as_str(), c.parent.as_ref().map(|p| p.0.as_str()))))
+        .collect();
+    let models: crate::det::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
+    let resolve = |id: &str| {
+        let id = id.trim_start_matches("::");
+        parents.get_key_value(id).map(|(k, _)| *k)
+    };
+    parents
+        .iter()
+        .map(|(name, parent)| {
+            let mut chain = Vec::new();
+            let mut seen = crate::det::HashSet::default();
+            let mut next = parent.and_then(resolve);
+            while let Some(class) = next {
+                if !seen.insert(class) {
+                    break;
+                }
+                if models.contains(class) {
+                    chain.push(singularize(&snake_case(last_segment(class))));
+                }
+                next = parents.get(class).copied().flatten().and_then(resolve);
+            }
+            (name.to_string(), chain)
+        })
+        .collect()
 }

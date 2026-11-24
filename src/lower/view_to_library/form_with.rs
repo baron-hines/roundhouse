@@ -1123,11 +1123,12 @@ fn classify_form_with_components(
     // `form_with model: @mod_note` posts to `mod_notes_path` in Rails,
     // and the directory's `user_path` exists too.
     // Then the analyzer's model for the view ivar (`@users` recorded as User where the binding's own type is a collection).
-    let typed_class = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
-        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().rsplit("::").next().unwrap_or_default().to_string()),
+    let typed_full = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().to_string()),
         _ => None,
     }
     .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
+    let typed_class = typed_full.as_deref().map(|full| full.rsplit("::").next().unwrap_or_default().to_string());
     // The local's name when neither the class nor the directory names a
     // route: campfire's `rooms/layouts/_form` is handed a `Rooms::Open`
     // (or `Rooms::Closed`) `room`, and neither `opens_path` nor
@@ -1135,7 +1136,20 @@ fn classify_form_with_components(
     // `rooms/directs/new` keeps its directory's `rooms_directs_path`.
     let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
     let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
-    let by_local = record_local_name(&model).filter(|_| typed_class.is_none() || !directory_known);
+    // A typed record takes its local's route only when its class IS that
+    // local's model (`Rooms::Open < Room` handed as `room`): a `Post`
+    // handed as `user` posting to `users_path` would be silently wrong
+    // where the unrouted `posts_path` fails loudly. An untyped record
+    // has only its name to go by: the partial's own emission, which
+    // serves every render, types campfire's `room` as nothing.
+    let is_local_s_model = |local: &str| {
+        typed_full.as_deref().is_none_or(|full| {
+            let local = singularize(&snake_case(local));
+            ctx.model_ancestors.get(full).is_some_and(|ancestors| ancestors.contains(&local))
+        })
+    };
+    let by_local = record_local_name(&model)
+        .filter(|local| !directory_known && is_local_s_model(local));
     for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);
@@ -1817,6 +1831,7 @@ mod tests {
             model_singulars: Rc::new(
                 model_singulars.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             ),
+            model_ancestors: Default::default(),
             slug_models: Default::default(),
             bool_readers: Default::default(),
             time_columns: Default::default(),
