@@ -179,7 +179,16 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
                 .map(|scope| if scope.is_empty() { root.to_string() } else { format!("{scope}::{root}") })
                 .filter(|full| full_names.contains(full))
                 .collect();
-            let [only] = found.as_slice() else { return false };
+            let only = match found.as_slice() {
+                [only] => only,
+                // Not a root the chain defines: as anywhere else, unless the class sits in a Rails framework's namespace,
+                // where the framework may define it (responders' `Renderers::RENDERERS` in `ActionController::Responder`).
+                [] => {
+                    let framework = owner.split("::").next().is_some_and(|r| super::app::FRAMEWORK_ROOTS.contains(&r));
+                    return !framework && absent(written);
+                }
+                _ => return false,
+            };
             let mut at = only.clone();
             for segment in rest {
                 let next = format!("{at}::{segment}");
@@ -205,7 +214,8 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
             }
             pending.extend(ancestry.get(&scope).into_iter().flatten().cloned());
         }
-        true
+        // Not in a Rails framework's namespace: the framework, which the program does not hold, may define it there.
+        !owner.split("::").next().is_some_and(|r| super::app::FRAMEWORK_ROOTS.contains(&r))
     };
     // A relative read is looked up from each namespace the class sits in, innermost first.
     fn owner_chain(owner: &str) -> Vec<String> {
