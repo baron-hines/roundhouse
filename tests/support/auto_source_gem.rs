@@ -51,3 +51,36 @@ width = Article.new(title: "hello", body: "a body that is long enough").card_wid
 raise "width #{width.inspect}" unless width == 14
 puts "auto source gem OK"
 "#;
+
+/// message_bus's `Codec::Base`: a gem method raises a bare constant the gem
+/// defines only in another class (`Backends::Base::MustImplement`). From
+/// `Codec::Base`, Ruby looks in `Codec::Base`, `Codec`, `Greetings`, Object
+/// and the class's ancestors, finds none, and raises NameError, which the
+/// emitted program does too.
+pub fn misnamed_overlay() -> emit_and_run::Overlay {
+    overlay()
+        .edit(
+            &format!("{GEMS}/greetings-1.0/lib/greetings.rb"),
+            "require \"greetings/card\"\n",
+            "require \"greetings/card\"\nrequire \"greetings/backends\"\nrequire \"greetings/codec\"\n",
+        )
+        .write(
+            &format!("{GEMS}/greetings-1.0/lib/greetings/backends.rb"),
+            "module Greetings\n  module Backends\n    class Base\n      MustImplement = Class.new(StandardError)\n\n      def deliver\n        raise MustImplement\n      end\n    end\n  end\nend\n",
+        )
+        .write(
+            &format!("{GEMS}/greetings-1.0/lib/greetings/codec.rb"),
+            "module Greetings\n  module Codec\n    class Base\n      def encode(text)\n        raise MustImplement\n      end\n    end\n\n    class Plain < Base\n      def encode(text)\n        text.to_s\n      end\n    end\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  def shouted_title\n",
+            "  def encoded_title\n    Greetings::Codec::Plain.new.encode(title)\n  end\n\n  def abstract_encode\n    Greetings::Codec::Base.new.encode(title)\n  rescue NameError => e\n    e.message\n  end\n\n  def abstract_deliver\n    Greetings::Backends::Base.new.deliver\n  rescue StandardError => e\n    e.class.name\n  end\n\n  def shouted_title\n",
+        )
+}
+
+pub const MISNAMED_ASSERTIONS: &str = r#"a = Article.new(title: "hello", body: "a body that is long enough")
+got = [a.encoded_title, a.abstract_encode, a.abstract_deliver]
+raise got.inspect unless got == ["hello", "uninitialized constant Greetings::Codec::Base::MustImplement", "Greetings::Backends::Base::MustImplement"]
+puts "misnamed gem constant OK"
+"#;

@@ -58,3 +58,11 @@ fn a_gem_that_extends_a_compiled_gem_comes_with_it() {
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(mentions(&emitted, "def self.loud(text)"), "the extending gem is not in the Spinel tree");
 }
+
+/// A gem's bare read of a constant it defines only in another class is the
+/// NameError Ruby raises there, not an unsupported constant.
+#[test]
+fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_is_ruby_s_name_error() {
+    let (_emitted, errors) = auto_source_gem::misnamed_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}

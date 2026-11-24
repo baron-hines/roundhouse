@@ -100,9 +100,11 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
         }
         e.node.for_each_child(&mut |c| assigned_constants(c, out));
     }
+    let mut boot_assigned: crate::det::HashSet<String> = crate::det::HashSet::default();
     for stmt in &app.boot_program {
-        assigned_constants(stmt, &mut declared);
+        assigned_constants(stmt, &mut boot_assigned);
     }
+    declared.extend(boot_assigned.iter().cloned());
     // Not a constant some gem of the app, Ruby's standard library or the app itself may define: only one nothing could.
     let absent = |written: &[&Symbol]| {
         let Some(root) = written.first().map(|r| r.as_str()) else { return false };
@@ -113,6 +115,55 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
             && !crate::gems::is_core_constant(&segments)
             && !own_roots.contains(root)
             && !declared.contains(root)
+    };
+    // Every class and constant by its full name: a gem's relative read names one only from where it is looked up.
+    let full_names: crate::det::HashSet<String> = own
+        .iter()
+        .cloned()
+        .chain(app.library_classes.iter().flat_map(|c| c.constants.iter().map(move |(n, _)| format!("{}::{}", c.name.0.as_str(), n.as_str()))))
+        .chain(boot_assigned.iter().cloned())
+        .chain(app.models.iter().flat_map(|m| m.body.iter().filter_map(move |item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Assign { target: crate::expr::LValue::Const { path }, .. } => path.last().map(|n| format!("{}::{}", m.name.0.as_str(), n.as_str())),
+                _ => None,
+            },
+            _ => None,
+        })))
+        .collect();
+    let ancestry: crate::det::HashMap<String, Vec<String>> = app
+        .library_classes
+        .iter()
+        .map(|c| {
+            let up = c.parent.iter().chain(c.includes.iter()).map(|p| p.0.as_str().trim_start_matches("::").to_string()).collect();
+            (c.name.0.as_str().to_string(), up)
+        })
+        .collect();
+    // In a gem's own code, a bare name the class's lexical scopes, Object, and its ancestors and mixins all lack: the
+    // last segment of a class nested elsewhere (message_bus's `Backends::Base::ConcreteClassMustImplementError`, read
+    // bare from `Codec::Base`) is no definition Ruby finds there.
+    let absent_from = |owner: &str, written: &[&Symbol]| {
+        let [root] = written else { return absent(written) };
+        let root = root.as_str();
+        let segments = [root];
+        if !index.owners(root).is_empty() || crate::gems::is_stdlib_namespace(root) || crate::gems::is_core_constant(&segments) {
+            return false;
+        }
+        let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+        let mut pending = vec![owner.to_string()];
+        while let Some(scope) = pending.pop() {
+            if !seen.insert(scope.clone()) || seen.len() > 64 {
+                continue;
+            }
+            let parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+            for k in (0..=parts.len()).rev() {
+                let full = parts[..k].iter().copied().chain(std::iter::once(root)).collect::<Vec<_>>().join("::");
+                if full_names.contains(&full) {
+                    return false;
+                }
+            }
+            pending.extend(ancestry.get(&scope).into_iter().flatten().cloned());
+        }
+        true
     };
     // A relative read is looked up from each namespace the class sits in, innermost first.
     let gone_in = |owner: &str, written: &[&Symbol]| -> Option<String> {
@@ -160,7 +211,9 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
             // class it reopens or not, is the app's to bundle.
             let from_gem = source_gem.wrote(&owner, m);
             let unloadable = |path: &str| unloadable(path) || (from_gem && provided_by_nothing(path));
-            walk(&mut m.body, &everywhere, &absent, &gone, &unloadable);
+            let in_gem = |written: &[&Symbol]| absent_from(&owner, written);
+            let probe: Probe<'_> = if from_gem { &in_gem } else { &absent };
+            walk(&mut m.body, &everywhere, probe, &gone, &unloadable);
         }
     }
     let gone = |written: &[&Symbol]| gone_in("", written);
