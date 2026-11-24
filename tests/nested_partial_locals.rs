@@ -203,29 +203,11 @@ fn a_form_whose_record_is_not_its_local_s_model_keeps_its_own_route() {
 /// The emitted `features/_form`, handed a `Feature < parent` as `article`.
 fn features_form(parent: &str) -> String {
     let heading = "  <h1 class=\"font-bold text-4xl\"><%= @article.title %></h1>\n";
-    let (emitted, _app, errors) = emit_and_run::real_blog()
+    let (emitted, errors) = emit_and_run::real_blog()
         .write("app/models/feature.rb", &format!("class Feature < {parent}\nend\n"))
         .write("app/views/features/_form.html.erb", "<%= form_with model: article do |form| %>\n  <%= form.text_field :title %>\n<% end %>\n")
         .edit("app/views/articles/show.html.erb", heading, &format!("{heading}  <%= render \"features/form\", article: Feature.new %>\n"))
-        .emit_with_app(BuildTarget::Ruby);
+        .emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "emit errors: {errors:?}");
-    let views = walk(&emitted);
-    views
-        .iter()
-        .find(|(path, _)| path.ends_with("views/features/_form.rb"))
-        .map(|(_, body)| body.clone())
-        .unwrap_or_else(|| panic!("no emitted features form among {:?}", views.iter().map(|(p, _)| p).collect::<Vec<_>>()))
-}
-
-fn walk(dir: &std::path::Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(walk(&path));
-        } else if path.extension().is_some_and(|e| e == "rb") {
-            out.push((path.display().to_string(), std::fs::read_to_string(&path).unwrap_or_default()));
-        }
-    }
-    out
+    std::fs::read_to_string(emitted.join("app/views/features/_form.rb")).expect("an emitted features form")
 }
