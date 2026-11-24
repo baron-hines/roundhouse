@@ -22849,6 +22849,22 @@ fn a_class_a_macro_makes_from_its_block_runs() {
     assert!(run.stdout.contains("service params contract passed"));
 }
 
+/// A class the macro makes and never names, or a local it rebinds before
+/// `const_set`, leaves the call reported: the block is not dropped
+/// unread, and the constant is not taken for a class the local no longer
+/// holds.
+#[test]
+fn a_class_a_macro_does_not_name_is_reported() {
+    let base = "class Maker\n  def self.make(&block)\n    k = Class.new(Maker, &block)\n  end\n\n  def self.rebind(&block)\n    k = Class.new(Maker, &block)\n    k = Maker\n    const_set(\"Made\", k)\n  end\nend\n";
+    for call in ["  make { raise \"expected\" }\n", "  rebind do\n    def x = 1\n  end\n"] {
+        let errors = emit_and_run::empty_app()
+            .write("app/models/maker.rb", base)
+            .write("app/models/user_of_maker.rb", &format!("class UserOfMaker < Maker\n{call}end\n"))
+            .check_errors();
+        assert!(errors.iter().any(|e| e.contains("this call does not expand")), "{call}: {errors:#?}");
+    }
+}
+
 /// A name the macro computes from a value known only when it runs leaves
 /// the call reported, not expanded under a guessed name.
 #[test]

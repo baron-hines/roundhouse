@@ -186,7 +186,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
                 if !run.foreign.is_empty() {
                     return Err("it defines methods on another class".to_string());
                 }
-                if !run.made_classes.is_empty() {
+                if !run.made_classes.is_empty() || !run.pending_classes.is_empty() {
                     return Err("it makes a class".to_string());
                 }
                 for m in &run.methods {
@@ -411,6 +411,9 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
                     .collect();
                 if slots.len() + replays.len() != run.out.len() || !run.aliases.is_empty() || !run.extended.is_empty() || !run.class_attrs.is_empty() {
                     return Err("it does more than define methods".to_string());
+                }
+                if !run.pending_classes.is_empty() {
+                    return Err("it makes a class it does not name".to_string());
                 }
                 for (name, base, body) in std::mem::take(&mut run.made_classes) {
                     // Not another block the macro wrote: only the call's own is read back from the call's source.
@@ -1575,7 +1578,7 @@ impl Run<'_> {
                     Some(Val::Slot { name: slot, .. }) => {
                         let at = self.out.iter().position(|st| matches!(&*st.node, ExprNode::Assign { target: LValue::Const { path }, value } if path.as_slice() == std::slice::from_ref(&slot) && matches!(&*value.node, ExprNode::Const { .. })));
                         let Some(at) = at else { return Err("it makes a class whose superclass is known only when it runs".into()) };
-                        let ExprNode::Assign { value, .. } = &*self.out.remove(at).node else { unreachable!() };
+                        let ExprNode::Assign { value, .. } = &*self.out[at].node.clone() else { unreachable!() };
                         if let ExprNode::Var { name: held, .. } = &*base.node {
                             env.insert(held.clone(), Val::Lit(value.clone()));
                         }
@@ -1600,6 +1603,7 @@ impl Run<'_> {
             }
             ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
                 let v = self.eval(value, env)?;
+                self.pending_classes.remove(name);
                 env.insert(name.clone(), v);
                 Ok(false)
             }

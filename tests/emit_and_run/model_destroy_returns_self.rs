@@ -33,3 +33,16 @@ fn destroy_answers_the_record_itself() {
     run.assert_passes();
     assert!(run.stdout.contains("destroy probe passed"));
 }
+
+/// An included `destroy` that answers a Boolean is what `destroy!`
+/// answers too (`Base#destroy!` returns `destroy`): its result is not the
+/// record, so a model method on it is not accepted.
+#[test]
+fn an_overridden_destroy_keeps_destroy_bang_off_the_record() {
+    let errors = app()
+        .write("app/models/concerns/soft.rb", "module Soft\n  extend ActiveSupport::Concern\n\n  def destroy\n    true\n  end\nend\n")
+        .edit("app/models/member.rb", "class Member < ApplicationRecord\n", "class Member < ApplicationRecord\n  include Soft\n")
+        .write("app/models/probe.rb", "module Probe\n  def self.run\n    Member.create!(name: \"x\", ip_address: \"y\").destroy!.label\n  end\nend\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("label")), "{errors:#?}");
+}

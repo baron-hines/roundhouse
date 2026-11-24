@@ -892,7 +892,8 @@ impl Analyzer {
                             .any(|include| source_methods.instance_method(include, name))
                 };
                 // Rails' `lock!` calls `reload`, so an override of either hides the seed.
-                if inherited(entry.name) || (entry.name == "lock!" && inherited("reload")) {
+                // `destroy!` answers what `destroy` does, so an override of that one hides it too.
+                if inherited(entry.name) || (entry.name == "lock!" && inherited("reload")) || (entry.name == "destroy!" && inherited("destroy")) {
                     continue;
                 }
                 // The shared runtime types `reload` and `lock!` as `() -> Base`,
