@@ -6923,38 +6923,20 @@ pub(crate) fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<Stri
     out
 }
 
-/// See [`ViewCtx::model_ancestors`]. Walks each class's `parent`
-/// through the app's models and the other classes under `app/models/`
-/// (`Rooms::Open < Room` is filed there, its parent being no
-/// `ApplicationRecord`), keeping the ancestors that are models. The
-/// walk stops at a parent that is no app class or one already seen.
+/// See [`ViewCtx::model_ancestors`]. Walks each class's superclasses
+/// through [`App::class_parents`], which files `Rooms::Open < Room`
+/// among the library classes (its parent being no `ApplicationRecord`),
+/// keeping the ancestors that are models.
 fn model_ancestors(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
-    let parents: crate::det::HashMap<&str, Option<&str>> = app
-        .models
-        .iter()
-        .map(|m| (m.name.0.as_str(), m.parent.as_ref().map(|p| p.0.as_str())))
-        .chain(app.library_classes.iter().map(|c| (c.name.0.as_str(), c.parent.as_ref().map(|p| p.0.as_str()))))
-        .collect();
+    let parents = app.class_parents();
     let models: crate::det::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
-    let resolve = |id: &str| {
-        let id = id.trim_start_matches("::");
-        parents.get_key_value(id).map(|(k, _)| *k)
-    };
     parents
-        .iter()
-        .map(|(name, parent)| {
-            let mut chain = Vec::new();
-            let mut seen = crate::det::HashSet::default();
-            let mut next = parent.and_then(resolve);
-            while let Some(class) = next {
-                if !seen.insert(class) {
-                    break;
-                }
-                if models.contains(class) {
-                    chain.push(singularize(&snake_case(last_segment(class))));
-                }
-                next = parents.get(class).copied().flatten().and_then(resolve);
-            }
+        .keys()
+        .map(|name| {
+            let chain = crate::app::class_ancestors(&parents, name)
+                .filter(|class| models.contains(class))
+                .map(|class| singularize(&snake_case(last_segment(class))))
+                .collect();
             (name.to_string(), chain)
         })
         .collect()

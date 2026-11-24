@@ -15,7 +15,7 @@
 
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
 use crate::ident::{Symbol, VarId};
-use crate::naming::{singularize, snake_case};
+use crate::naming::{last_segment, singularize, snake_case};
 use crate::span::Span;
 
 use super::attr_parts::append_attr_parts;
@@ -1128,7 +1128,7 @@ fn classify_form_with_components(
         _ => None,
     }
     .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
-    let typed_class = typed_full.as_deref().map(|full| full.rsplit("::").next().unwrap_or_default().to_string());
+    let typed_class = typed_full.as_deref().map(|full| last_segment(full).to_string());
     // The local's name when neither the class nor the directory names a
     // route: campfire's `rooms/layouts/_form` is handed a `Rooms::Open`
     // (or `Rooms::Closed`) `room`, and neither `opens_path` nor
