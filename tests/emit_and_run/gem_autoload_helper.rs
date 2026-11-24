@@ -27,7 +27,7 @@ fn emitted_files(tree: &std::path::Path) -> Vec<String> {
 fn postbox_module(files: &[String]) -> &str {
     files
         .iter()
-        .find(|text| text.contains("module Postbox") && text.contains("def self.register_autoload"))
+        .find(|text| text.contains("module Postbox") && text.contains("def register_autoload") || text.contains("module Postbox") && text.contains("def self.register_autoload"))
         .expect("Postbox's module is not in the Spinel tree")
 }
 
@@ -57,4 +57,54 @@ fn a_helper_also_called_with_a_built_path_keeps_its_autoload() {
     let files = emitted_files(&emitted);
     let module = postbox_module(&files);
     assert!(module.lines().any(|l| l.trim() == "autoload(name, path)"), "the helper's autoload was dropped:\n{module}");
+}
+
+const POSTBOX: &str = "vendor/bundle/ruby/3.4.0/gems/postbox-1.0/lib/postbox.rb";
+
+/// The helper keeps its `autoload` after `edits` to the gem's module.
+fn keeps_its_autoload(edits: &[(&str, &str)]) {
+    let mut overlay = gem::overlay().edit(
+        POSTBOX,
+        "  register_autoload :Envelope, \"postbox/envelope\"\n",
+        "  require \"postbox/envelope\"\n  register_autoload :Envelope, \"postbox/envelope\"\n",
+    );
+    for (from, to) in edits {
+        overlay = overlay.edit(POSTBOX, from, to);
+    }
+    let (emitted, errors) = overlay.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let files = emitted_files(&emitted);
+    let module = postbox_module(&files);
+    // A rebound parameter is renamed on emit (`autoload(name, __rh_path)`).
+    assert!(module.lines().any(|l| l.trim().starts_with("autoload(name, ")), "the helper's autoload was dropped:\n{module}");
+}
+
+/// A built path in an assignment's call is a call of the helper too.
+#[test]
+fn a_helper_also_called_inside_an_assignment_keeps_its_autoload() {
+    keeps_its_autoload(&[("  register_autoload :Envelope, \"postbox/envelope\"\n", "  register_autoload :Envelope, \"postbox/envelope\"\n  @stamp = register_autoload(:Stamp, \"postbox/\" + \"stamp\")\n")]);
+}
+
+/// A built path in a `self.` call is a call of the helper too.
+#[test]
+fn a_helper_also_called_through_self_keeps_its_autoload() {
+    keeps_its_autoload(&[("  register_autoload :Envelope, \"postbox/envelope\"\n", "  register_autoload :Envelope, \"postbox/envelope\"\n  self.register_autoload(:Stamp, \"postbox/\" + \"stamp\")\n")]);
+}
+
+/// A helper defined in `class << self` is not one source-gem ingest follows.
+#[test]
+fn a_helper_in_a_singleton_class_body_keeps_its_autoload() {
+    keeps_its_autoload(&[(
+        "  def self.register_autoload(name, path)\n    @autoloads[name] = path\n    autoload(name, path)\n  end\n",
+        "  class << self\n    def register_autoload(name, path)\n      @autoloads[name] = path\n      autoload(name, path)\n    end\n  end\n",
+    )]);
+}
+
+/// A helper that rebinds its path registers a path its callers do not pass.
+#[test]
+fn a_helper_that_rebinds_its_path_keeps_its_autoload() {
+    keeps_its_autoload(&[(
+        "    @autoloads[name] = path\n",
+        "    path = \"postbox/\" + path.to_s\n    @autoloads[name] = path\n",
+    )]);
 }

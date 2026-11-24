@@ -2763,7 +2763,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     } = walk_decl_body_with_visibility(module.body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     let mut methods = methods;
-    drop_followed_autoload_registrations(&mut methods, &unknown_calls);
+    drop_followed_autoload_registrations(module, &mut methods);
     Ok(LibraryClass {
         name: owner,
         is_module: true,
@@ -2791,43 +2791,66 @@ pub(super) fn library_class_from_module_node_with_scope(
 /// register_autoload :Envelope, "mail/envelope"
 /// ```
 ///
-/// When every body call of the helper passes a Symbol and a String, source-gem ingest follows each as it follows a
-/// literal `autoload` (`source_gems::autoload_helpers`), and the file is loaded as the gem's other files are. The
-/// helper then drops its `autoload(name, path)` statement, as a literal `autoload` in a module body is not written
-/// either, and keeps the rest of its body.
-fn drop_followed_autoload_registrations(methods: &mut [MethodDef], unknown_calls: &[Expr]) {
-    let literal = |args: &[Expr]| {
-        matches!(args, [name, path] if matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { .. } })
-            && matches!(&*path.node, ExprNode::Lit { value: Literal::Str { .. } }))
-    };
-    for method in methods.iter_mut() {
-        if method.receiver != MethodReceiver::Class || method.block_param.is_some() {
-            continue;
+/// When the helper is one source-gem ingest follows (`source_gems::autoload_helpers`: a `def self.x(name, path)` that
+/// registers its two parameters and changes neither), and every call of it in the module body is a statement of that
+/// body passing a Symbol and a String, ingest follows each call as it follows a literal `autoload`, and the file is
+/// loaded as the gem's other files are. The helper then drops its `autoload(name, path)` statement, as a literal
+/// `autoload` in a module body is not written either, and keeps the rest of its body. Any other call of it (with a
+/// built path, with a receiver, inside an assignment or a method) keeps the `autoload`.
+fn drop_followed_autoload_registrations(module: &ruby_prism::ModuleNode<'_>, methods: &mut [MethodDef]) {
+    let statements: Vec<Node<'_>> =
+        module.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+    let helpers: Vec<Vec<u8>> = statements
+        .iter()
+        .filter(|s| s.as_def_node().is_some())
+        .flat_map(|s| super::source_gems::autoload_helpers(s))
+        .collect();
+    for helper in helpers {
+        struct Calls<'a>(&'a [u8], usize);
+        impl<'pr> ruby_prism::Visit<'pr> for Calls<'_> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                if node.name().as_slice() == self.0 {
+                    self.1 += 1;
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
         }
-        let [a, b] = method.params.as_slice() else { continue };
-        if [a, b].iter().any(|p| p.default.is_some() || p.keyword || p.rest || p.forwarding || p.name.as_str().is_empty()) {
-            continue;
+        let mut calls = Calls(&helper, 0);
+        if let Some(body) = module.body() {
+            ruby_prism::Visit::visit(&mut calls, &body);
         }
-        let is_registration = |s: &Expr| {
-            matches!(&*s.node, ExprNode::Send { recv, method: m, args, block: None, .. }
-                if m.as_str() == "autoload"
-                    && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
-                    && matches!(args.as_slice(), [x, y]
-                        if matches!(&*x.node, ExprNode::Var { name, .. } if *name == a.name)
-                            && matches!(&*y.node, ExprNode::Var { name, .. } if *name == b.name)))
-        };
-        let ExprNode::Seq { exprs: statements } = &mut *method.body.node else { continue };
-        if statements.iter().filter(|s| is_registration(s)).count() != 1 {
-            continue;
-        }
-        let mut calls = unknown_calls
+        let literal = statements
             .iter()
-            .filter(|c| matches!(&*c.node, ExprNode::Send { recv: None, method: m, .. } if *m == method.name))
-            .peekable();
-        if calls.peek().is_none() || !calls.all(|c| matches!(&*c.node, ExprNode::Send { args, block: None, .. } if literal(args))) {
+            .filter_map(|s| s.as_call_node())
+            .filter(|c| {
+                let args: Vec<_> = c.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                c.name().as_slice() == helper.as_slice()
+                    && c.receiver().is_none()
+                    && c.block().is_none()
+                    && matches!(args.as_slice(), [name, path] if name.as_symbol_node().is_some() && path.as_string_node().is_some())
+            })
+            .count();
+        if literal == 0 || literal != calls.1 {
             continue;
         }
-        statements.retain(|s| !is_registration(s));
+        for method in methods.iter_mut() {
+            if method.receiver != MethodReceiver::Class || method.name.as_str().as_bytes() != helper.as_slice() {
+                continue;
+            }
+            let [a, b] = method.params.as_slice() else { continue };
+            let is_registration = |s: &Expr| {
+                matches!(&*s.node, ExprNode::Send { recv, method: m, args, block: None, .. }
+                    if m.as_str() == "autoload"
+                        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                        && matches!(args.as_slice(), [x, y]
+                            if matches!(&*x.node, ExprNode::Var { name, .. } if *name == a.name)
+                                && matches!(&*y.node, ExprNode::Var { name, .. } if *name == b.name)))
+            };
+            let ExprNode::Seq { exprs: statements } = &mut *method.body.node else { continue };
+            if statements.iter().filter(|s| is_registration(s)).count() == 1 {
+                statements.retain(|s| !is_registration(s));
+            }
+        }
     }
 }
 

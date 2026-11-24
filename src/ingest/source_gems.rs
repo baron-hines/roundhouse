@@ -625,6 +625,7 @@ pub(super) fn autoload_helpers(root: &ruby_prism::Node<'_>) -> Vec<Vec<u8>> {
             if on_self
                 && names.len() == 2
                 && node.body().and_then(|b| b.as_statements_node()).is_some_and(|b| b.body().iter().filter(|s| registers(s)).count() == 1)
+                && !node.body().is_some_and(|b| changes_a_param(&b, &names))
             {
                 self.0.push(node.name().as_slice().to_vec());
             }
@@ -634,6 +635,48 @@ pub(super) fn autoload_helpers(root: &ruby_prism::Node<'_>) -> Vec<Vec<u8>> {
     let mut defs = Defs(Vec::new());
     ruby_prism::Visit::visit(&mut defs, root);
     defs.0
+}
+
+/// Whether a helper's body may make a parameter differ from the caller's argument by the time it registers:
+/// a write of the parameter (`path = "x/" + path`), or a call on it (`path << "x"`, `path.sub!(…)`). A table write
+/// such as `@autoloads[name] = path` reads both and changes neither.
+fn changes_a_param(body: &ruby_prism::Node<'_>, names: &[Vec<u8>]) -> bool {
+    struct Changes<'a>(&'a [Vec<u8>], bool);
+    impl Changes<'_> {
+        fn param(&mut self, name: &[u8]) {
+            self.1 |= self.0.iter().any(|n| n.as_slice() == name);
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Changes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.param(node.name().as_slice());
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if let Some(v) = node.receiver().and_then(|r| r.as_local_variable_read_node()) {
+                self.param(v.name().as_slice());
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut changes = Changes(names, false);
+    ruby_prism::Visit::visit(&mut changes, body);
+    changes.1
 }
 
 /// The directories a method that calls `autoload` (or `send(:autoload, …)`) builds a path under:
