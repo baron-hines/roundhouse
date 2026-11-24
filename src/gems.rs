@@ -826,7 +826,6 @@ const FATES: &[(&str, GemFate)] = &[
     ("bundler-audit", GemFate::Infrastructure),
     ("capybara", GemFate::Infrastructure),
     ("climate_control", GemFate::Infrastructure),
-    ("connection_pool", GemFate::Infrastructure),
     ("database_consistency", GemFate::Infrastructure),
     ("debug", GemFate::Infrastructure),
     ("dockerfile-rails", GemFate::Infrastructure),
