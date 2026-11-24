@@ -785,6 +785,12 @@ fn an_active_model_serializer_08_reading_options_through_a_literal_list_lowers()
     let _ = roundhouse::ingest::ingest_app_from_tree(tree(&postish("add_raw\n    hash")));
     let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
     assert!(ledger.iter().any(|e| e.contains("options.include?")), "{ledger:#?}");
+    // A listed name the block assigns over is no longer a key from the list.
+    let rebound = postish("add_raw\n    add_title").replace("public_send(\"#{name}=\", opts[name]) if opts.include? name", "name = :hash\n      public_send(:add_raw=, opts[name]) if opts.include? name");
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree(&rebound));
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("options.include?") || e.contains("[](:hash)") || e.contains("include?(:hash)")), "{ledger:#?}");
 }
 
 #[test]
@@ -803,7 +809,7 @@ fn listed_overlay() -> emit_and_run::Overlay {
     overlay().write("app/serializers/postish_serializer.rb", &postish("add_raw\n    add_title"))
 }
 
-const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nb = Article.create!(title: \"<b>&\", body: \"A long body\")\ndumped = MultiJson.dump(PostishSerializer.new(b, add_raw: true))\nraise dumped unless dumped == %Q({\"postish\":{\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"}})\nputs \"listed options passed\"\n";
+const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nb = Article.create!(title: \"<b>&\", body: \"A long body\")\ndumped = MultiJson.dump(PostishSerializer.new(b, add_raw: true))\nraise dumped unless dumped == %Q({\"postish\":{\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"}})\nbare = PostishSerializer.new(b, add_raw: true).to_json(root: false)\nraise bare unless bare == %Q({\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"})\nputs \"listed options passed\"\n";
 
 /// A plain class a serializer renders includes `ActiveModel::Serialization`
 /// (Rails) or `ActiveModel::SerializerSupport` (the gem), as discourse's

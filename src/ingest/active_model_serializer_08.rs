@@ -1892,12 +1892,20 @@ struct GemCalls {
     owner: String,
     /// The parameter of each `LIST.each` block the walk is inside: a key from one of those lists.
     listed: Vec<String>,
+    /// The listed parameters the block assigns: no longer a key from the list.
+    rebound: HashSet<String>,
 }
 
 impl GemCalls {
     fn new(option_locals: Vec<String>, lists: &HashMap<String, Vec<String>>, owner: &str) -> Self {
         let safe_lists = lists.iter().filter(|(_, names)| !names.iter().any(|n| matches!(n.as_str(), "hash" | "unique_values"))).map(|(k, _)| k.clone()).collect();
-        GemCalls { found: None, supers: false, option_locals, safe_lists, owner: owner.rsplit("::").next().unwrap_or(owner).to_string(), listed: Vec::new() }
+        GemCalls { found: None, supers: false, option_locals, safe_lists, owner: owner.rsplit("::").next().unwrap_or(owner).to_string(), listed: Vec::new(), rebound: HashSet::default() }
+    }
+
+    fn rebind(&mut self, name: String) {
+        if self.listed.contains(&name) {
+            self.rebound.insert(name);
+        }
     }
 
     /// `LIST` or `Owner::LIST`, one of the class's safe lists.
@@ -1931,7 +1939,12 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         let shared = keys.iter().filter_map(symbol_value).find(|k| matches!(k.as_str(), "hash" | "unique_values"));
         let on_options = node.receiver().is_some_and(|r| options_read(&r, &self.option_locals));
         // `PostSerializer::INSTANCE_VARS.each { |name| opts[name] }`: a key from a literal list the gem's keys are not in.
-        let listed = |k: &ruby_prism::Node<'_>| k.as_local_variable_read_node().is_some_and(|l| self.listed.iter().any(|n| n == constant_id_str(&l.name())));
+        let listed = |k: &ruby_prism::Node<'_>| {
+            k.as_local_variable_read_node().is_some_and(|l| {
+                let name = constant_id_str(&l.name());
+                self.listed.iter().any(|n| n == name) && !self.rebound.contains(name)
+            })
+        };
         if self.found.is_none() && on_options {
             if let Some(key) = shared {
                 self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
@@ -1958,10 +1971,27 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         }
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
         if options_read(&node.value(), &self.option_locals) {
             self.option_locals.push(constant_id_str(&node.name()).to_string());
         }
         ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_target_node(self, node);
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         self.supers = true;
@@ -2206,7 +2236,7 @@ const PER_CLASS_API: &[(&str, &str)] = &[
     ("attributes", "  def attributes\n    ams_attributes\n  end\n"),
     ("serializable_hash", "  def serializable_hash\n    return nil if @object.nil?\n    ams_serializable_hash\n  end\n"),
     // The gem's `to_json` is ActiveSupport's `Object#to_json`, `ActiveSupport::JSON.encode(self)`, which encodes what `as_json` answers.
-    ("to_json", "  def to_json(*args)\n    ActiveSupport::JSON.encode(as_json)\n  end\n"),
+    ("to_json", "  def to_json(options = nil)\n    ActiveSupport::JSON.encode(as_json(options || {}))\n  end\n"),
     ("as_json", "  def as_json(options = {})\n    options ||= {}\n    root = options.fetch(:root, @options.fetch(:root, root_name))\n    if root\n      hash = {}\n      @ams_side = hash\n      @ams_unique = {}\n      body = serializable_hash\n      hash[root] = body\n      include_meta(hash)\n      hash\n    else\n      serializable_hash\n    end\n  end\n"),
 ];
 

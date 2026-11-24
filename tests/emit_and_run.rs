@@ -22931,7 +22931,7 @@ fn a_data_define_block_s_include_is_the_data_class_s_on_spinel() {
     assert!(run.stdout.contains("data include passed"));
 }
 
-const DATA_INCLUDE_SCRIPT: &str = "m = Kit::Name::Member.new(value: \"a\")\nraise m.to_s unless m.to_s == \"a\"\nc = m.convert { |v| v.upcase }\nraise c.inspect unless c.value == \"A\" && c.is_a?(Kit::Name::Member)\nf = Kit::Name::Field.new(value: \"x\", type: \"t\")\ng = f.convert { |v| v + \"!\" }\nraise g.inspect unless g.value == \"x!\" && g.type == \"t!\"\nnames = Kit::Names.all\nraise names.inspect unless names == [\"tt\", \"Y\"]\nputs \"data include passed\"\n";
+const DATA_INCLUDE_SCRIPT: &str = "m = Kit::Name::Member.new(value: \"a\")\nraise m.to_s unless m.to_s == \"a\"\nc = m.convert { |v| v.upcase }\nraise c.inspect unless c.value == \"A\" && c.is_a?(Kit::Name::Member)\nf = Kit::Name::Field.new(value: \"x\", type: \"t\")\ng = f.convert { |v| v + \"!\" }\nraise g.inspect unless g.value == \"x!\" && g.type == \"t!\"\nnames = Kit::Names.all\nraise names.inspect unless names == [\"tt\", \"Y\"]\npair = Kit::Pair.new(value: 1)\nraise pair.tag unless pair.tag == \"a\" && pair.label == \"l\"\nputs \"data include passed\"\n";
 
 fn data_include_overlay() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -22940,6 +22940,7 @@ fn data_include_overlay() -> emit_and_run::Overlay {
         .write("app/models/kit/name/member.rb", "module Kit\n  module Name\n    Member = Data.define(:value) { include Name }\n  end\nend\n")
         .write("app/models/kit/name/field.rb", "module Kit\n  module Name\n    Field = Data.define(:value, :type) { include Name::ResourceScope }\n  end\nend\n")
         .write("app/models/kit/name/type.rb", "module Kit\n  module Name\n    Type =\n      Data.define(:value) do\n        include Name\n\n        def convert_type(&) = convert(&)\n      end\n  end\nend\n")
+        .write("app/models/kit/tags.rb", "module Kit\n  module TagA\n    def tag = \"a\"\n  end\n\n  module TagB\n    def tag = \"b\"\n  end\n\n  Pair = Data.define(:value) do\n    def label = \"l\"\n\n    include TagA, TagB\n  end\nend\n")
         .write("app/models/kit/names.rb", "module Kit\n  class Names\n    def self.all\n      [Kit::Name::Field.new(value: \"f\", type: \"t\").convert { |v| v * 2 }.type, Kit::Name::Type.new(value: \"y\").convert_type { |v| v.upcase }.value]\n    end\n  end\nend\n")
 }
 

@@ -10246,12 +10246,30 @@ fn emit_library_class_decl_inner(
                     crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                         call.span, None, "Data.define", "delegate in a Data.define block could not be lowered"));
                 }
-                writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
+                // A nested module an include names is written ahead of the factory, as the owner's own includes ask.
                 for include in &factory.includes {
-                    writeln!(s, "{body_pad}  include {}", include.0.as_str()).unwrap();
+                    nested.borrow_mut().write_include(s, depth, lc, include);
                 }
+                writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
+                // Each `include A, B` as one call, among the methods where the block wrote it: Ruby includes a call's
+                // arguments last first, and an `included` hook may read a method defined above it.
+                let mut groups: Vec<(u32, Vec<&str>)> = Vec::new();
+                for (i, include) in factory.includes.iter().enumerate() {
+                    let start = factory.include_spans.get(i).map_or(0, |span| span.start);
+                    match groups.last_mut() {
+                        Some((at, names)) if *at == start && factory.include_spans.len() == factory.includes.len() => names.push(include.0.as_str()),
+                        _ => groups.push((start, vec![include.0.as_str()])),
+                    }
+                }
+                let mut pending = groups.into_iter().peekable();
                 for method in &factory.methods {
+                    while let Some((_, names)) = pending.next_if(|(at, _)| *at <= method.name_span.start) {
+                        writeln!(s, "{body_pad}  include {}", names.join(", ")).unwrap();
+                    }
                     render_library_method(s, method, &format!("{body_pad}  "));
+                }
+                for (_, names) in pending {
+                    writeln!(s, "{body_pad}  include {}", names.join(", ")).unwrap();
                 }
                 writeln!(s, "{body_pad}end").unwrap();
                 continue;
