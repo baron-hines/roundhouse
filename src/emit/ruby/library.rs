@@ -9684,6 +9684,23 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
+    // When the nested file reopens this class with the header this file
+    // writes (the same superclass, from `outer_class_parent`), loading it
+    // first declares the same class, so its require stands with the
+    // file's other top-level requires. Spinel places a file a top-level
+    // `require_relative` loads; one a class body loads waits until every
+    // other require of it is placed, which a cycle of requires never is.
+    // Not under a namespace the runtime owns: the nested file then opens
+    // with one compound header (`module ActionText::Markdown::Uploads`),
+    // which looks this class up instead of declaring it.
+    let under_runtime_namespace = name.contains("::")
+        && require_path_for_body_const(&[name.split("::").next().unwrap_or(name).to_string()], app, classes, "")
+            .is_some_and(|p| p.starts_with("runtime/"));
+    let reopens_with_own_header = !lc.is_module
+        && lc.data_define().is_none()
+        && !under_runtime_namespace
+        && is_app_class(name, app, classes)
+        && outer_class_parent(name, app, classes) == lc.parent;
     // A model's `prepend Concern` names a module this file must load
     // before the class body runs, exactly as an `include` does — and one
     // the concern splice claimed, so there IS a module to load: an
@@ -9714,7 +9731,7 @@ fn emit_library_class_decl_inner(
         if let Some(anchor) = require_path_for_body_const(&path, app, classes, name) {
             if anchor != self_anchor {
                 let nested_prefix = format!("{self_anchor}/");
-                if anchor.starts_with(&nested_prefix) {
+                if anchor.starts_with(&nested_prefix) && !reopens_with_own_header {
                     // Nested constants such as `Account::Joinable` reopen
                     // their containing class. Load them after that class is
                     // declared, otherwise the nested file runs too early.
