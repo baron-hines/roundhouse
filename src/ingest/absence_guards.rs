@@ -19,6 +19,8 @@ pub(super) struct SourceGemCode {
     pub(super) classes: crate::det::HashSet<String>,
     gem_methods: crate::det::HashSet<MethodKey>,
     app_methods: crate::det::HashSet<MethodKey>,
+    /// The gems compiled from source, by name: every constant they define is in the program.
+    gems: crate::det::HashSet<String>,
 }
 
 impl SourceGemCode {
@@ -34,11 +36,14 @@ impl SourceGemCode {
 }
 
 pub(super) fn source_gem_code(app: &App) -> SourceGemCode {
-    let mut code = SourceGemCode { classes: Default::default(), gem_methods: Default::default(), app_methods: Default::default() };
+    let mut code = SourceGemCode { classes: Default::default(), gem_methods: Default::default(), app_methods: Default::default(), gems: Default::default() };
     for lc in &app.library_classes {
         let class = lc.name.0.as_str();
         for m in &lc.methods {
-            if super::sources::path_of(m.name_span.file).is_some_and(|p| is_source_gem_path(&p)) {
+            if let Some(path) = super::sources::path_of(m.name_span.file).filter(|p| is_source_gem_path(p)) {
+                if let Some(gem) = source_gem_name(&path) {
+                    code.gems.insert(gem);
+                }
                 code.classes.insert(class.to_string());
                 code.gem_methods.insert(method_key(class, m));
             } else {
@@ -47,6 +52,14 @@ pub(super) fn source_gem_code(app: &App) -> SourceGemCode {
         }
     }
     code
+}
+
+/// `…/.roundhouse/source_gems/redis-client-0.30.1/lib/…`: `redis-client`.
+fn source_gem_name(path: &str) -> Option<String> {
+    let rest = path.split(".roundhouse/source_gems/").nth(1)?;
+    let dir = rest.split('/').next()?;
+    let (name, version) = dir.rsplit_once('-')?;
+    version.starts_with(|c: char| c.is_ascii_digit()).then(|| name.to_string())
 }
 
 pub(crate) fn is_source_gem_path(p: &str) -> bool {
@@ -117,9 +130,14 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
             && !declared.contains(root)
     };
     // Every class and constant by its full name: a gem's relative read names one only from where it is looked up.
+    // Each namespace a class name passes through is a module Ruby has (`Greetings` of `Greetings::Codec::Base`), with no
+    // methods of its own to record it.
     let full_names: crate::det::HashSet<String> = own
         .iter()
-        .cloned()
+        .flat_map(|name| {
+            let parts: Vec<&str> = name.split("::").filter(|s| !s.is_empty()).collect();
+            (1..=parts.len()).map(move |k| parts[..k].join("::"))
+        })
         .chain(app.library_classes.iter().flat_map(|c| c.constants.iter().map(move |(n, _)| format!("{}::{}", c.name.0.as_str(), n.as_str()))))
         .chain(boot_assigned.iter().cloned())
         .chain(app.models.iter().flat_map(|m| m.body.iter().filter_map(move |item| match item {
@@ -141,11 +159,35 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
     // In a gem's own code, a bare name the class's lexical scopes, Object, and its ancestors and mixins all lack: the
     // last segment of a class nested elsewhere (message_bus's `Backends::Base::ConcreteClassMustImplementError`, read
     // bare from `Codec::Base`) is no definition Ruby finds there.
+    // Not a gem compiled from source: every constant it defines is in the program, so its namespace answers nothing more.
+    let unknown_owners = |path: &str| index.owners(path).into_iter().filter(|g| !source_gem.gems.contains(*g)).count();
     let absent_from = |owner: &str, written: &[&Symbol]| {
-        let [root] = written else { return absent(written) };
-        let root = root.as_str();
-        let segments = [root];
-        if !index.owners(root).is_empty() || crate::gems::is_stdlib_namespace(root) || crate::gems::is_core_constant(&segments) {
+        let root = written.first().map(|r| r.as_str()).unwrap_or_default();
+        let segments: Vec<&str> = written.iter().map(|p| p.as_str()).collect();
+        if unknown_owners(&segments.join("::")) > 0 || crate::gems::is_stdlib_namespace(root) || crate::gems::is_core_constant(&segments) {
+            return false;
+        }
+        // `A::B::C`: where `A` resolves, each later segment is looked up in what the earlier ones named; one missing
+        // there is Ruby's NameError (redis's `::RedisClient::Cluster::InitialSetupError` without redis-clustering).
+        if let [_, rest @ ..] = segments.as_slice()
+            && !rest.is_empty()
+        {
+            // Not where the root names more than one class of the chain: a `::Root` written rooted, which this probe
+            // no longer sees, would be the top-level one.
+            let found: Vec<String> = owner_chain(owner)
+                .into_iter()
+                .map(|scope| if scope.is_empty() { root.to_string() } else { format!("{scope}::{root}") })
+                .filter(|full| full_names.contains(full))
+                .collect();
+            let [only] = found.as_slice() else { return false };
+            let mut at = only.clone();
+            for segment in rest {
+                let next = format!("{at}::{segment}");
+                if !full_names.contains(&next) {
+                    return unknown_owners(&next) == 0;
+                }
+                at = next;
+            }
             return false;
         }
         let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
@@ -166,6 +208,10 @@ pub(super) fn mark(app: &mut App, source_gem: &SourceGemCode, shipped: &dyn Fn(&
         true
     };
     // A relative read is looked up from each namespace the class sits in, innermost first.
+    fn owner_chain(owner: &str) -> Vec<String> {
+        let parts: Vec<&str> = owner.split("::").filter(|s| !s.is_empty()).collect();
+        (0..=parts.len()).rev().map(|k| parts[..k].join("::")).collect()
+    }
     let gone_in = |owner: &str, written: &[&Symbol]| -> Option<String> {
         let tail: Vec<&str> = written.iter().map(|p| p.as_str()).collect();
         let scopes: Vec<&str> = owner.split("::").filter(|s| !s.is_empty()).collect();

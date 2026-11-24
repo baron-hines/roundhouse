@@ -56,7 +56,9 @@ puts "auto source gem OK"
 /// defines only in another class (`Backends::Base::MustImplement`). From
 /// `Codec::Base`, Ruby looks in `Codec::Base`, `Codec`, `Greetings`, Object
 /// and the class's ancestors, finds none, and raises NameError, which the
-/// emitted program does too.
+/// emitted program does too. A nested constant no gem defines, read under
+/// `defined?` (redis's `::RedisClient::Cluster::InitialSetupError` without
+/// redis-clustering), is absent the same way.
 pub fn misnamed_overlay() -> emit_and_run::Overlay {
     overlay()
         .edit(
@@ -70,17 +72,17 @@ pub fn misnamed_overlay() -> emit_and_run::Overlay {
         )
         .write(
             &format!("{GEMS}/greetings-1.0/lib/greetings/codec.rb"),
-            "module Greetings\n  module Codec\n    class Base\n      def encode(text)\n        raise MustImplement\n      end\n    end\n\n    class Plain < Base\n      def encode(text)\n        text.to_s\n      end\n    end\n  end\nend\n",
+            "module Greetings\n  module Codec\n    class Base\n      def encode(text)\n        raise MustImplement\n      end\n    end\n\n    class Plain < Base\n      def encode(text)\n        text.to_s\n      end\n\n      def self.cluster_error?(error)\n        defined?(::Greetings::Cluster::SetupError) && error.is_a?(::Greetings::Cluster::SetupError)\n      end\n    end\n  end\nend\n",
         )
         .edit(
             "app/models/article.rb",
             "  def shouted_title\n",
-            "  def encoded_title\n    Greetings::Codec::Plain.new.encode(title)\n  end\n\n  def abstract_encode\n    Greetings::Codec::Base.new.encode(title)\n  rescue NameError => e\n    e.message\n  end\n\n  def abstract_deliver\n    Greetings::Backends::Base.new.deliver\n  rescue StandardError => e\n    e.class.name\n  end\n\n  def shouted_title\n",
+            "  def encoded_title\n    Greetings::Codec::Plain.new.encode(title)\n  end\n\n  def abstract_encode\n    Greetings::Codec::Base.new.encode(title)\n  rescue NameError => e\n    e.message\n  end\n\n  def cluster_error\n    Greetings::Codec::Plain.cluster_error?(StandardError.new)\n  end\n\n  def abstract_deliver\n    Greetings::Backends::Base.new.deliver\n  rescue StandardError => e\n    e.class.name\n  end\n\n  def shouted_title\n",
         )
 }
 
 pub const MISNAMED_ASSERTIONS: &str = r#"a = Article.new(title: "hello", body: "a body that is long enough")
-got = [a.encoded_title, a.abstract_encode, a.abstract_deliver]
-raise got.inspect unless got == ["hello", "uninitialized constant Greetings::Codec::Base::MustImplement", "Greetings::Backends::Base::MustImplement"]
+got = [a.encoded_title, a.abstract_encode, a.abstract_deliver, a.cluster_error]
+raise got.inspect unless got == ["hello", "uninitialized constant Greetings::Codec::Base::MustImplement", "Greetings::Backends::Base::MustImplement", nil]
 puts "misnamed gem constant OK"
 "#;
