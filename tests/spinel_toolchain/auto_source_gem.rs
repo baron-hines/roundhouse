@@ -46,3 +46,12 @@ fn a_gem_s_platform_constant_read_under_its_test_runs_natively() {
     run.assert_passes();
     assert!(run.stdout.contains("platform constant OK"), "{}", run.stdout);
 }
+
+/// The native half of `emit_and_run::auto_source_gem::a_gem_s_rooted_read_in_a_framework_namespace_is_ruby_s_name_error`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_gem_s_rooted_read_in_a_framework_namespace_raises_name_error_natively() {
+    let run = auto_source_gem::rooted_in_framework_overlay().run_spinel(auto_source_gem::ROOTED_IN_FRAMEWORK_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("rooted framework read OK"), "{}", run.stdout);
+}

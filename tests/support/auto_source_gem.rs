@@ -132,3 +132,17 @@ pub const PLATFORM_CONSTANT_ASSERTIONS: &str = r#"got = Article.new(title: "hell
 raise got.inspect unless got.size == 2 && got.all? { |v| v.is_a?(Integer) }
 puts "platform constant OK"
 "#;
+
+/// responders' shape: a gem class in a Rails framework's namespace reads `::Absent` rooted, which nothing defines, and
+/// its caller rescues the NameError Ruby raises. A relative read there may be the framework's, a rooted one is the top level's.
+pub fn rooted_in_framework_overlay() -> emit_and_run::Overlay {
+    misnamed_overlay()
+        .write(&format!("{GEMS}/greetings-1.0/lib/greetings/responder.rb"), "module ActionController\n  class GreetingsResponder\n    def self.backend\n      ::OptionalGreetingsBackend\n    end\n  end\nend\n")
+        .edit(&format!("{GEMS}/greetings-1.0/lib/greetings.rb"), "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/responder\"\n")
+        .edit("app/models/article.rb", "  def shouted_title\n", "  def responder_backend\n    ActionController::GreetingsResponder.backend\n  rescue NameError => e\n    e.message\n  end\n\n  def shouted_title\n")
+}
+
+pub const ROOTED_IN_FRAMEWORK_ASSERTIONS: &str = r#"got = Article.new(title: "hello", body: "a body that is long enough").responder_backend
+raise got.inspect unless got == "uninitialized constant OptionalGreetingsBackend"
+puts "rooted framework read OK"
+"#;

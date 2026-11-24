@@ -112,3 +112,11 @@ fn a_gem_s_platform_constant_read_under_its_test_is_typed() {
         .check_errors();
     assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): Socket::SOL_TCP")), "{errors:#?}");
 }
+
+/// A rooted `::Absent` read in a gem class under a Rails framework's namespace is Ruby's NameError, which the gem
+/// rescues; the framework may define only a relative read there.
+#[test]
+fn a_gem_s_rooted_read_in_a_framework_namespace_is_ruby_s_name_error() {
+    let (_emitted, errors) = auto_source_gem::rooted_in_framework_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
