@@ -253,7 +253,7 @@ pub struct ViewLowerCtx<'a> {
     nilable_scalar_reads: std::rc::Rc<crate::det::HashSet<String>>,
     html_safe_methods: std::rc::Rc<HtmlSafeMarks>,
     model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
-    model_ancestors: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
+    model_lineage: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     slug_models: std::rc::Rc<crate::det::HashSet<String>>,
     bool_readers: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     time_columns: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
@@ -347,7 +347,7 @@ impl<'a> ViewLowerCtx<'a> {
                     .map(|m| app.model_param_key(m.name.0.as_str()))
                     .collect(),
             ),
-            model_ancestors: std::rc::Rc::new(model_ancestors(app)),
+            model_lineage: std::rc::Rc::new(model_lineage(app)),
             slug_models: std::rc::Rc::new(
                 app.models
                     .iter()
@@ -900,7 +900,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         nilable_scalar_reads: lx.nilable_scalar_reads.clone(),
         html_safe_methods: lx.html_safe_methods.clone(),
         model_singulars: lx.model_singulars.clone(),
-        model_ancestors: lx.model_ancestors.clone(),
+        model_lineage: lx.model_lineage.clone(),
         slug_models: lx.slug_models.clone(),
         bool_readers: lx.bool_readers.clone(),
         time_columns: lx.time_columns.clone(),
@@ -5450,12 +5450,12 @@ pub(super) struct ViewCtx {
     /// runtime `url_for`, whose `is_a?`-dispatch shape is
     /// CRuby-overlay-only.
     pub(super) model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
-    /// Each class's model superclasses, as their param keys
-    /// (`Rooms::Open` → `["room"]`, a `Billing::Article` ancestor →
-    /// `billing_article`, so an `article` local does not match it). A
-    /// form's record local names a route for a record only when the
-    /// record IS that model.
-    pub(super) model_ancestors: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
+    /// Each class's own model and model superclasses, as their param
+    /// keys (`Rooms::Open` → `["room"]`; `Billing::Article` →
+    /// `["billing_article"]`, so a `billing_article` local matches it and
+    /// a bare `article` does not). A form's record local names a route
+    /// for a record only when the record IS that model.
+    pub(super) model_lineage: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     /// Snake-singular names of models that OVERRIDE `to_param`
     /// (lobsters' Story→short_id, Domain→domain). The form-action
     /// member arm passes `record.to_param` for these — Rails fills
@@ -6925,17 +6925,18 @@ pub(crate) fn view_context_helpers(app: &crate::App) -> crate::det::HashSet<Stri
     out
 }
 
-/// See [`ViewCtx::model_ancestors`]. Walks each class's superclasses
-/// through [`App::class_parents`], which files `Rooms::Open < Room`
-/// among the library classes (its parent being no `ApplicationRecord`),
-/// keeping the ancestors that are models.
-fn model_ancestors(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
+/// See [`ViewCtx::model_lineage`]. Walks each class and its
+/// superclasses through [`App::class_parents`], which files
+/// `Rooms::Open < Room` among the library classes (its parent being no
+/// `ApplicationRecord`), keeping the ones that are models.
+fn model_lineage(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
     let parents = app.class_parents();
     let models: crate::det::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
     parents
         .keys()
         .map(|name| {
-            let chain = crate::app::class_ancestors(&parents, name)
+            let chain = std::iter::once(*name)
+                .chain(crate::app::class_ancestors(&parents, name))
                 .filter(|class| models.contains(class))
                 .map(|class| app.model_param_key(class))
                 .collect();

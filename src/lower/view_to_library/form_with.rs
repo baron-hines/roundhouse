@@ -1147,7 +1147,7 @@ fn classify_form_with_components(
         None => true,
         Some(full) => !directory_known && {
             let local = singularize(&snake_case(local));
-            ctx.model_ancestors.get(full).is_some_and(|ancestors| ancestors.contains(&local))
+            ctx.model_lineage.get(full).is_some_and(|lineage| lineage.contains(&local))
         },
     });
     for name in typed_class.clone().into_iter().chain(by_local) {
@@ -1831,7 +1831,7 @@ mod tests {
             model_singulars: Rc::new(
                 model_singulars.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             ),
-            model_ancestors: Default::default(),
+            model_lineage: Default::default(),
             slug_models: Default::default(),
             bool_readers: Default::default(),
             time_columns: Default::default(),

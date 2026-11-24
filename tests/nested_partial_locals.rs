@@ -214,6 +214,26 @@ fn a_namespaced_ancestor_is_not_its_bare_local_s_model() {
     assert!(form.contains("features_path"), "expected features_path in:\n{form}");
 }
 
+/// A namespaced record is its own local's model: a `Billing::Invoice`
+/// handed to `features/_form` as `billing_invoice` posts to
+/// `billing_invoices_path`. Its class's last segment names no route
+/// (`invoices_path`), and only its superclasses were looked at, so the
+/// form kept the unrouted `features_path`.
+#[test]
+fn a_namespaced_record_posts_to_its_own_local_s_route() {
+    let heading = "  <h1 class=\"font-bold text-4xl\"><%= @article.title %></h1>\n";
+    let (emitted, errors) = emit_and_run::real_blog()
+        .write("app/models/billing/invoice.rb", "class Billing::Invoice < ApplicationRecord\n  self.table_name = \"articles\"\nend\n")
+        .edit("config/routes.rb", "  resources :articles do\n", "  namespace :billing do\n    resources :invoices, only: [:create, :update]\n  end\n  resources :articles do\n")
+        .write("app/views/features/_form.html.erb", "<%= form_with model: billing_invoice do |form| %>\n  <%= form.text_field :title %>\n<% end %>\n")
+        .edit("app/views/articles/show.html.erb", heading, &format!("{heading}  <%= render \"features/form\", billing_invoice: Billing::Invoice.new %>\n"))
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "emit errors: {errors:?}");
+    let form = std::fs::read_to_string(emitted.join("app/views/features/_form.rb")).expect("an emitted features form");
+    assert!(form.contains("billing_invoices_path"), "expected billing_invoices_path in:\n{form}");
+    assert!(!form.contains("features_path"), "unrouted helper in:\n{form}");
+}
+
 /// An untyped record has only its name to go by, and the name wins
 /// over a routed directory: a `comments/_quick` form no render types
 /// still posts its `article` to `articles_path`, not `comments_path`.
