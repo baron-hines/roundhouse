@@ -2517,7 +2517,7 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }
-    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool) {
+    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool, app_loaders: &[&str]) {
         use crate::expr::{ExprNode, LValue};
         let construct = match &*expr.node {
             ExprNode::ForwardKeywords if target == BuildTarget::Spinel => None,
@@ -2572,6 +2572,15 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
                 if name.as_str().starts_with('$') => Some("global variable write"),
             ExprNode::Var { name, .. } if name.as_str().starts_with("@@") && target != BuildTarget::Spinel => Some("class variable read"),
+            // message_bus's `require "message_bus/backends/#{backend}"`: the tree has no load path, and Spinel resolves a
+            // require as it builds, so a name only the run time knows loads nothing (a LoadError where Ruby loads it).
+            ExprNode::Send { recv: None, method, args, block: None, .. }
+                if matches!(method.as_str(), "require" | "load")
+                    && !app_loaders.contains(&method.as_str())
+                    && matches!(args.as_slice(), [a] if !matches!(&*a.node, ExprNode::Lit { .. })) =>
+            {
+                Some("require of a name built at run time")
+            }
             _ => None,
         };
         if let Some(construct) = construct {
@@ -2580,11 +2589,19 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
                 "native Ruby semantics have no verified implementation on this target",
             );
         }
-        expr.node.for_each_child(&mut |child| visit(child, target, load_time));
+        expr.node.for_each_child(&mut |child| visit(child, target, load_time, app_loaders));
     }
+    // An app method of the name anywhere (a model's `load(name)`) keeps its calls out of the refusal, as
+    // `report_ruby_only_sends` keeps them: the call's body carries no mark of the method it dispatched to.
+    let defines = |name: &str| {
+        app.models.iter().any(|model| model.methods().any(|method| method.name.as_str() == name))
+            || app.library_classes.iter().any(|class| class.methods.iter().any(|method| method.name.as_str() == name))
+            || app.controllers.iter().any(|controller| controller.actions().any(|action| action.name.as_str() == name))
+    };
+    let app_loaders: Vec<&str> = ["require", "load"].into_iter().filter(|name| defines(name)).collect();
     let load_time = crate::lower::defined_const_fold::load_time_roots(app);
     crate::lower::for_each_emit_body_ref(app, &mut |expr| {
-        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)))
+        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)), &app_loaders)
     });
 }
 

@@ -840,6 +840,11 @@ module ActiveRecord
       connection
     end
 
+    # Rails' `connection_handler`, for the call a request's end makes of it (message_bus's `close_db_connection!`).
+    def self.connection_handler
+      ActiveRecord::ConnectionAdapters::ConnectionHandler.shared
+    end
+
     # Rails' `with_connection` holds one connection for its block: the
     # handle's slot, leased once, so each statement through it is on that
     # connection (a raw BEGIN carries to the next one). The block's value
@@ -3046,6 +3051,28 @@ module ActiveRecord
     def cache_key_with_version
       version = cache_version
       version.nil? ? cache_key : "#{cache_key}-#{version}"
+    end
+  end
+end
+
+module ActiveRecord
+  module ConnectionAdapters
+    # Rails' connection handler, with the one call a request's end makes of it. This runtime leases a connection only
+    # for a request or a `with_connection` block and gives it back itself, so there is none to return here; the query
+    # cache goes off for the rest of the request, as each pool's `disable_query_cache!` turns it off in Rails.
+    class ConnectionHandler
+      def self.shared
+        @shared ||= ConnectionHandler.new
+      end
+
+      # nil, not the pools Rails' `each` hands back: this runtime has no pool objects to answer with.
+      def clear_active_connections!(role = nil)
+        # Not before the databases open (`connection_slot` -2): the Spinel Db keeps its replay cache on a connection,
+        # which it has none of yet; the CRuby one keeps it on the fiber, which this turns off with or without a lease.
+        return nil if Db.connection_slot(true) == -2
+        Db.query_cache_end if Db.query_cache_enabled?
+        nil
+      end
     end
   end
 end

@@ -1160,18 +1160,19 @@ pub fn namespace_of(gem: &str) -> String {
 /// once the emitted program names that gem's namespace.
 ///
 /// A normal gem's entry file is `lib/<gem>.rb`, and the constant lowercases
-/// to that name (`duckdb` → `DuckDB`). The same file exists for three
-/// irregular constants: `caxlsx` (`lib/caxlsx.rb`), `polars-df`
-/// (`lib/polars-df.rb`), and `ruby_llm` (`lib/ruby_llm.rb`). Requiring the
-/// lowercased constant (`axlsx`, `polars`, `rubyllm`) is not that entry.
+/// to that name, its underscores aside (`duckdb` → `DuckDB`, `message_bus`
+/// → `MessageBus`, `ruby_llm` → `RubyLLM`): Bundler requires the gem by
+/// that name. The same file exists for two irregular constants: `caxlsx`
+/// (`lib/caxlsx.rb`) and `polars-df` (`lib/polars-df.rb`). Requiring the
+/// lowercased constant (`axlsx`, `polars`) is not that entry.
 ///
 /// `rubyzip` is not in this set. `require "rubyzip"` is not a file; the gem
 /// loads as `zip`.
 pub fn loads_by_gem_name(gem: &str) -> bool {
-    if namespace_of(gem).eq_ignore_ascii_case(gem) {
+    if namespace_of(gem).eq_ignore_ascii_case(&gem.replace('_', "")) {
         return true;
     }
-    matches!(gem, "caxlsx" | "polars-df" | "ruby_llm")
+    matches!(gem, "caxlsx" | "polars-df")
 }
 
 /// The top-level constants a gem might define, best guess first: the
@@ -2276,6 +2277,7 @@ end
             "rubyzip has no rubyzip.rb entry; boot must not require that name:\n{boot}"
         );
         assert!(loads_by_gem_name("duckdb") && loads_by_gem_name("mcp"));
+        assert!(loads_by_gem_name("message_bus") && loads_by_gem_name("ruby_llm"));
         assert!(!loads_by_gem_name("rubyzip"));
     }
 

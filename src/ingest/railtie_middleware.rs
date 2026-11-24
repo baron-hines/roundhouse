@@ -10,9 +10,12 @@
 //!
 //! `use` appends: the middleware sits after Rails' own (the static file
 //! server, `ActionDispatch::RequestId`, the session), just before the
-//! routes. Only `use` with the class alone is read; a middleware given
-//! arguments or placed with `insert_before` / `insert_after` is
-//! reported as unsupported instead of left out.
+//! routes. Only `use` with the class alone is read, and the two places
+//! the emitted stack has an edge for: `insert_after
+//! ActionDispatch::RequestId` (its first) and `insert_before
+//! ActionDispatch::Flash` (past the session, ahead of every `use`); a
+//! middleware given arguments or placed anywhere else is reported as
+//! unsupported instead of left out.
 
 use crate::det::HashSet;
 use std::path::{Path, PathBuf};
@@ -43,8 +46,20 @@ struct Use {
     block: Option<String>,
     /// Run as its class body loads, not from an initializer: Bundler requires the gem before the app's class body runs.
     at_load: bool,
-    /// `insert_after ActionDispatch::RequestId, K`: right inside Rails' RequestId, where the emitted stack begins.
-    front: bool,
+    /// Where on the stack it goes.
+    front: Place,
+}
+
+/// A middleware's place on the emitted stack, which runs from right inside Rails' RequestId to the routes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// `insert_after ActionDispatch::RequestId, K`: the stack's first.
+    Front,
+    /// `insert_before ActionDispatch::Flash, K` (message_bus's): past the session, ahead of every `use`d one, which
+    /// Rails appends after Flash.
+    BeforeFlash,
+    /// `use K`: appended.
+    End,
 }
 
 pub(super) struct MiddlewareLoop {
@@ -179,14 +194,16 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
-            app_uses.push((class, false, u.span, u.block, true, false));
+            app_uses.push((class, false, u.span, u.block, true, Place::End));
         }
     }
     let out: Vec<_> = {
-        let (front, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.5);
+        let (front, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.5 == Place::Front);
+        let (flash, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.5 == Place::BeforeFlash);
         let (load, init): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.4);
         // Each `insert_after RequestId` lands right after it, ahead of the ones inserted before: Rails' order is the reverse.
-        front.into_iter().rev().chain(load).chain(app_uses).chain(init).collect()
+        // Each `insert_before Flash` lands right before it, after the ones inserted before.
+        front.into_iter().rev().chain(flash).chain(load).chain(app_uses).chain(init).collect()
     };
     // Not stacked in reading order when initializers order themselves: Rails sorts them by `before:` and `after:`.
     if out.len() > 1 {
@@ -242,7 +259,7 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
         let receiver = value.receiver()?;
         let path = constant_path_of(&receiver)?;
         let rooted = receiver.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: false }, defined)
+        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: Place::End }, defined)
     };
     let read_owner = |body: Node<'_>, lexical: &[String]| -> Owner {
         let mut owner = Owner::default();
@@ -251,7 +268,7 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
                 for arg in include.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
                     let Some(path) = constant_path_of(&arg) else { continue };
                     let rooted = arg.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: false };
+                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: Place::End };
                     owner.includes.extend(resolve(&u, defined));
                 }
                 continue;
@@ -439,7 +456,7 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
         let body = b.body().map(|body| String::from_utf8_lossy(body.location().as_slice()).into_owned()).unwrap_or_default();
         format!("{{ {params}\n{body}\n}}")
     });
-    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, front: false });
+    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, front: Place::End });
 }
 
 #[derive(PartialEq)]
@@ -920,7 +937,7 @@ fn read_initializer(
         let class = match (verb, args.as_slice()) {
             ("use", [only]) if use_call.block().is_none() => constant_path_of(only).map(|path| {
                 let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                (path, rooted, false)
+                (path, rooted, Place::End)
             }),
             // The emitted stack starts right inside Rails' RequestId, so a middleware inserted after it is the stack's first.
             ("insert_after", [anchor, only])
@@ -929,7 +946,17 @@ fn read_initializer(
             {
                 constant_path_of(only).map(|path| {
                     let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                    (path, rooted, true)
+                    (path, rooted, Place::Front)
+                })
+            }
+            // The emitted stack keeps none of Rails' own past the session, so right before Flash is ahead of the `use`d ones.
+            ("insert_before", [anchor, only])
+                if use_call.block().is_none()
+                    && constant_path_of(anchor).is_some_and(|a| a == ["ActionDispatch", "Flash"]) =>
+            {
+                constant_path_of(only).map(|path| {
+                    let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                    (path, rooted, Place::BeforeFlash)
                 })
             }
             _ => None,
@@ -940,7 +967,7 @@ fn read_initializer(
                 span,
                 None,
                 "railtie middleware",
-                format!("`{verb}` with these arguments: only `app.middleware.use(Klass)` is put on the emitted stack"),
+                format!("`{verb}` with these arguments: only `app.middleware.use(Klass)`, `insert_after ActionDispatch::RequestId, Klass` and `insert_before ActionDispatch::Flash, Klass` are put on the emitted stack"),
             )),
         }
     }
@@ -1027,6 +1054,20 @@ mod tests {
         assert_eq!(classes, ["Gem::Early", "Warden::Manager", "Gem::Late"], "{diags:?}");
         assert_eq!(blocks.get("Warden::Manager").map(String::as_str), Some("{ |manager|\nmanager.default_scope = :user\n}"));
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// message_bus's shape: `insert_before ActionDispatch::Flash` lands past the session, behind a middleware inserted
+    /// after RequestId and ahead of every `use`d one, two of them in the order inserted; another anchor stays refused.
+    #[test]
+    fn a_middleware_inserted_before_flash_sits_between_the_front_and_the_used_ones() {
+        let railtie = "module Gem\n  class A\n  end\n  class B\n  end\n  class C\n  end\n  class D\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.all\" do |app|\n      app.middleware.use(D)\n      app.middleware.insert_before(ActionDispatch::Flash, B)\n      app.middleware.insert_before(ActionDispatch::Flash, C)\n      app.middleware.insert_after(ActionDispatch::RequestId, A)\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", railtie)]);
+        assert_eq!(classes, ["Gem::A", "Gem::B", "Gem::C", "Gem::D"], "{diags:?}");
+        assert!(diags.is_empty(), "{diags:?}");
+        let elsewhere = railtie.replace("insert_before(ActionDispatch::Flash, C)", "insert_before(ActionDispatch::Cookies, C)");
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", &elsewhere)]);
+        assert_eq!(classes, ["Gem::A", "Gem::B", "Gem::D"], "{diags:?}");
+        assert!(diags.iter().any(|d| d.contains("`insert_before` with these arguments")), "{diags:?}");
     }
 
     /// request_store's shape: the entry requires the Railtie under `if defined?(Rails::Railtie)`, which holds in a Rails
@@ -1116,9 +1157,8 @@ mod tests {
         assert_eq!(run(&app("    config.skip_gem_middleware = true\n"), ""), (vec![], vec![]));
         // API-only: the `use` branch.
         assert_eq!(run(&app("    config.api_only = true\n"), "").0, vec!["Gem::Middleware".to_string()]);
-        // Neither set: the `insert_before` branch, reported as before.
-        let (classes, diags) = run(&app(""), "");
-        assert!(classes.is_empty() && diags.iter().any(|d| d.contains("`insert_before` with these arguments")), "{diags:?}");
+        // Neither set: the `insert_before ActionDispatch::Flash` branch.
+        assert_eq!(run(&app(""), ""), (vec!["Gem::Middleware".to_string()], vec![]));
         // The environments disagree: the guard is not decided.
         let (_, diags) = run(&app("    config.skip_gem_middleware = true\n"), "Rails.application.configure do\n  config.skip_gem_middleware = false\nend\n");
         assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
