@@ -2048,7 +2048,12 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &Hash
             // body writes after it, as a later definition replaces it in Ruby.
             let incoming_replaces_macro_method = !method.name_span.is_synthetic()
                 && macro_methods.contains(&(existing.name.clone(), existing.receiver));
-            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate || incoming_replaces_macro_method) {
+            // A second `def` of a name the body already defined: Ruby's later definition replaces the earlier one.
+            let incoming_is_later_def = !method.name_span.is_synthetic()
+                && selected_source_methods.contains(&existing.name_span)
+                && existing.name_span.file == method.name_span.file
+                && method.name_span.start > existing.name_span.start;
+            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate || incoming_replaces_macro_method || incoming_is_later_def) {
                 selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
                 selected_source_methods.insert(method.name_span);
