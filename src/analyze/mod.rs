@@ -5133,7 +5133,6 @@ impl Analyzer {
         // Each partial types against the registry and the seeds above alone, so the partials are typed side by side.
         let mut partials: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| is_partial_view_name(&view.name)).collect();
         parallel::map(&mut partials, |view| type_partial(view, &partial_locals_by_name));
-        drop(partials);
 
         // A partial rendered from another partial (`articles/_form`
         // rendering `_field_error`, resource: form.object) takes
