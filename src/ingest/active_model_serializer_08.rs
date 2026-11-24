@@ -825,7 +825,7 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             } else {
                 Vec::new()
             };
-            let mut calls = GemCalls { found: None, supers: false, option_locals };
+            let mut calls = GemCalls::new(option_locals, &ctx.lists, ctx.name);
             ruby_prism::Visit::visit(&mut calls, &stmt);
             if let Some((call, at)) = calls.found {
                 return Err(refuse(source, at, &format!("`{call}` is the gem's, outside the subset")));
@@ -1560,7 +1560,7 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                     if method_name.starts_with("ams_") || method_name == "initialize" || GEM_ONLY.contains(&method_name.as_str()) {
                         return Err(fail(&format!("`define_method` of `{method_name}`, which the expansion writes")));
                     }
-                    let mut calls = GemCalls { found: None, supers: false, option_locals: Vec::new() };
+                    let mut calls = GemCalls::new(Vec::new(), &HashMap::default(), "");
                     ruby_prism::Visit::visit(&mut calls, &mblock.as_node());
                     if let Some((call, _)) = calls.found {
                         return Err(fail(&format!("`{call}` in a `define_method` block is the gem's, outside the subset")));
@@ -1582,7 +1582,7 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                         let Some(def) = d.as_def_node().filter(|d| d.receiver().is_none()) else {
                             return Err(fail("a `class_eval` string holding other than methods"));
                         };
-                        let mut calls = GemCalls { found: None, supers: false, option_locals: Vec::new() };
+                        let mut calls = GemCalls::new(Vec::new(), &HashMap::default(), "");
                         ruby_prism::Visit::visit(&mut calls, d);
                         if let Some((call, _)) = calls.found {
                             return Err(fail(&format!("`{call}` in a `class_eval` string is the gem's, outside the subset")));
@@ -1867,6 +1867,29 @@ struct GemCalls {
     found: Option<(String, usize)>,
     supers: bool,
     option_locals: Vec<String>,
+    /// The class's literal Symbol-list constants that hold none of the keys the gem adds, and the class's own name.
+    safe_lists: HashSet<String>,
+    owner: String,
+    /// The parameter of each `LIST.each` block the walk is inside: a key from one of those lists.
+    listed: Vec<String>,
+}
+
+impl GemCalls {
+    fn new(option_locals: Vec<String>, lists: &HashMap<String, Vec<String>>, owner: &str) -> Self {
+        let safe_lists = lists.iter().filter(|(_, names)| !names.iter().any(|n| matches!(n.as_str(), "hash" | "unique_values"))).map(|(k, _)| k.clone()).collect();
+        GemCalls { found: None, supers: false, option_locals, safe_lists, owner: owner.rsplit("::").next().unwrap_or(owner).to_string(), listed: Vec::new() }
+    }
+
+    /// `LIST` or `Owner::LIST`, one of the class's safe lists.
+    fn safe_list(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(read) = node.as_constant_read_node() {
+            return self.safe_lists.contains(constant_id_str(&read.name()));
+        }
+        let Some(path) = node.as_constant_path_node() else { return false };
+        let named = path.name().is_some_and(|n| self.safe_lists.contains(constant_id_str(&n)));
+        let own = path.parent().is_some_and(|p| p.as_constant_read_node().is_some_and(|r| constant_id_str(&r.name()) == self.owner));
+        named && own
+    }
 }
 
 impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
@@ -1887,15 +1910,32 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         };
         let shared = keys.iter().filter_map(symbol_value).find(|k| matches!(k.as_str(), "hash" | "unique_values"));
         let on_options = node.receiver().is_some_and(|r| options_read(&r, &self.option_locals));
+        // `PostSerializer::INSTANCE_VARS.each { |name| opts[name] }`: a key from a literal list the gem's keys are not in.
+        let listed = |k: &ruby_prism::Node<'_>| k.as_local_variable_read_node().is_some_and(|l| self.listed.iter().any(|n| n == constant_id_str(&l.name())));
         if self.found.is_none() && on_options {
             if let Some(key) = shared {
                 self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
-            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some()) {
+            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some() || listed(k)) {
                 // The whole Hash (`opts.size`, `opts.keys`) or a computed key: it may see the keys the gem adds.
                 self.found = Some((format!("options.{name}"), node.location().start_offset()));
             }
         }
+        let param = (name == "each" && node.arguments().is_none() && node.receiver().is_some_and(|r| self.safe_list(&r)))
+            .then(|| node.block().and_then(|b| b.as_block_node()))
+            .flatten()
+            .and_then(|b| b.parameters())
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|p| p.parameters())
+            .and_then(|p| match p.requireds().iter().collect::<Vec<_>>().as_slice() {
+                [only] => only.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()),
+                _ => None,
+            });
+        let pushed = param.is_some();
+        self.listed.extend(param);
         ruby_prism::visit_call_node(self, node);
+        if pushed {
+            self.listed.pop();
+        }
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
         if options_read(&node.value(), &self.option_locals) {

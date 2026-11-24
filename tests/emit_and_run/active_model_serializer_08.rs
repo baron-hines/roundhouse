@@ -748,12 +748,59 @@ fn an_active_model_serializer_08_deferred_array_over_an_options_local_stays_the_
 /// serializer's own `include_status?` and the Hash the caller passed.
 #[test]
 fn an_active_model_serializer_08_writing_an_option_in_initialize_lowers() {
-    let status = "class StatusSerializer < ActiveModel::Serializer\n  attributes :id, :status\n\n  def initialize(object, options = {})\n    super\n    options[:include_status] = true\n  end\n\n  def status\n    \"on\"\n  end\n\n  def include_status?\n    options[:include_status]\n  end\nend\n";
-    let overlay = || overlay().write("app/serializers/status_serializer.rb", status);
-    let errors = overlay().check_errors();
+    let run = status_overlay().run_ruby(STATUS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("option write passed"));
+    let errors = status_overlay().check_errors();
     assert!(errors.is_empty(), "{errors:#?}");
-    let script = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nopts = {}\ngot = StatusSerializer.new(a, opts).as_json(root: false)\nraise got.inspect unless got == { id: a.id, status: \"on\" }\nraise opts.inspect unless opts[:include_status] == true\nputs \"option write passed\"\n";
-    let run = overlay().run_ruby(script);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_serializer_08_writing_an_option_in_initialize_lowers_on_spinel() {
+    let run = status_overlay().run_spinel_with_db(STATUS_SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("option write passed"));
 }
+
+fn status_overlay() -> emit_and_run::Overlay {
+    let status = "class StatusSerializer < ActiveModel::Serializer\n  attributes :id, :status\n\n  def initialize(object, options = {})\n    super\n    options[:include_status] = true\n  end\n\n  def status\n    \"on\"\n  end\n\n  def include_status?\n    options[:include_status]\n  end\nend\n";
+    overlay().write("app/serializers/status_serializer.rb", status)
+}
+
+const STATUS_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nopts = {}\ngot = StatusSerializer.new(a, opts).as_json(root: false)\nraise got.inspect unless got == { id: a.id, status: \"on\" }\nraise opts.inspect unless opts[:include_status] == true\nputs \"option write passed\"\n";
+
+/// discourse's `PostSerializer`: `initialize` copies the options its
+/// literal `INSTANCE_VARS` list names into accessors the class body's
+/// loop defined. A key from that list is a named key, as a Symbol is; a
+/// list holding `:hash`, which the gem adds, stays refused.
+#[test]
+fn an_active_model_serializer_08_reading_options_through_a_literal_list_lowers() {
+    let errors = listed_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = listed_overlay().run_ruby(LISTED_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("listed options passed"));
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree(&postish("add_raw\n    hash")));
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("options.include?")), "{ledger:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_serializer_08_reading_options_through_a_literal_list_lowers_on_spinel() {
+    let run = listed_overlay().run_spinel_with_db(LISTED_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("listed options passed"));
+}
+
+fn postish(list: &str) -> String {
+    format!("class PostishSerializer < ActiveModel::Serializer\n  INSTANCE_VARS = %i[\n    {list}\n  ]\n\n  INSTANCE_VARS.each {{ |v| public_send(:attr_accessor, v) }}\n\n  attributes :id, :raw\n\n  def initialize(object, opts)\n    super(object, opts)\n    PostishSerializer::INSTANCE_VARS.each do |name|\n      public_send(\"#{{name}}=\", opts[name]) if opts.include? name\n    end\n  end\n\n  def raw\n    object.title\n  end\n\n  def include_raw?\n    @add_raw\n  end\nend\n")
+}
+
+fn listed_overlay() -> emit_and_run::Overlay {
+    overlay().write("app/serializers/postish_serializer.rb", &postish("add_raw\n    add_title"))
+}
+
+const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nputs \"listed options passed\"\n";
