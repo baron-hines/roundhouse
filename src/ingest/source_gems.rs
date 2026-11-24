@@ -434,8 +434,9 @@ pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf
 /// `autoload` to a feature name (one ending in `.rb` is a path Zeitwerk
 /// defers to, as to a defined constant).
 fn requires(text: &str) -> Vec<(bool, String, bool)> {
-    /// `.4`: the blocks entered, each with its own locals and the outer ones it writes.
-    struct Finder(Vec<(bool, String, bool)>, usize, Vec<Vec<u8>>, usize, Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>);
+    /// `.4`: the blocks entered, each with its own locals and the outer ones it writes. `.5`: the file's helpers that
+    /// register an autoload of their two arguments (`autoload_helpers`), whose literal calls count as `autoload`s.
+    struct Finder(Vec<(bool, String, bool)>, usize, Vec<Vec<u8>>, usize, Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>, Vec<Vec<u8>>);
     /// `File.dirname(__FILE__)` or `__dir__`: the directory of the file being loaded.
     fn file_dir(node: &ruby_prism::Node<'_>) -> bool {
         if let Some(call) = node.as_call_node() {
@@ -559,7 +560,11 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
             let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
             let feature = match (relative, args.as_slice()) {
                 (Some(_), [arg]) => arg.as_string_node(),
-                (None, [name, arg]) if method.as_slice() == b"autoload" && self.1 == 0 && name.as_symbol_node().is_some() => {
+                (None, [name, arg])
+                    if (method.as_slice() == b"autoload" || self.5.iter().any(|h| h.as_slice() == method.as_slice()))
+                        && self.1 == 0
+                        && name.as_symbol_node().is_some() =>
+                {
                     arg.as_string_node()
                 }
                 _ => None,
@@ -589,9 +594,46 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder(Vec::new(), 0, Vec::new(), 0, Vec::new());
+    let mut finder = Finder(Vec::new(), 0, Vec::new(), 0, Vec::new(), autoload_helpers(&parsed.node()));
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.0
+}
+
+/// The names of a file's `def self.x(name, path)` whose body registers an autoload of its two parameters as one of
+/// its statements, as the mail gem's `register_autoload` does: a literal call of one is the gem's `autoload`.
+pub(super) fn autoload_helpers(root: &ruby_prism::Node<'_>) -> Vec<Vec<u8>> {
+    struct Defs(Vec<Vec<u8>>);
+    impl<'pr> ruby_prism::Visit<'pr> for Defs {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            let on_self = node.receiver().is_some_and(|r| r.as_self_node().is_some());
+            let params = node.parameters();
+            let names: Vec<Vec<u8>> = params
+                .as_ref()
+                .filter(|p| p.optionals().is_empty() && p.rest().is_none() && p.posts().is_empty() && p.keywords().is_empty() && p.keyword_rest().is_none() && p.block().is_none())
+                .map(|p| p.requireds().iter().filter_map(|r| r.as_required_parameter_node().map(|n| n.name().as_slice().to_vec())).collect())
+                .unwrap_or_default();
+            let registers = |s: &ruby_prism::Node<'_>| {
+                let Some(call) = s.as_call_node() else { return false };
+                let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                call.name().as_slice() == b"autoload"
+                    && call.block().is_none()
+                    && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                    && matches!(args.as_slice(), [a, b]
+                        if a.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == names[0].as_slice())
+                            && b.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == names[1].as_slice()))
+            };
+            if on_self
+                && names.len() == 2
+                && node.body().and_then(|b| b.as_statements_node()).is_some_and(|b| b.body().iter().filter(|s| registers(s)).count() == 1)
+            {
+                self.0.push(node.name().as_slice().to_vec());
+            }
+            ruby_prism::visit_def_node(self, node);
+        }
+    }
+    let mut defs = Defs(Vec::new());
+    ruby_prism::Visit::visit(&mut defs, root);
+    defs.0
 }
 
 /// The directories a method that calls `autoload` (or `send(:autoload, …)`) builds a path under:

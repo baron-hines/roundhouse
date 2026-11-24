@@ -2762,6 +2762,8 @@ pub(super) fn library_class_from_module_node_with_scope(
         class_attributes: _, conditional_definitions,
     } = walk_decl_body_with_visibility(module.body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
+    let mut methods = methods;
+    drop_followed_autoload_registrations(&mut methods, &unknown_calls);
     Ok(LibraryClass {
         name: owner,
         is_module: true,
@@ -2777,6 +2779,56 @@ pub(super) fn library_class_from_module_node_with_scope(
         unknown_calls,
         class_ivar_initializers: class_initializers,
     })
+}
+
+/// A module body that registers its files through its own class method, as the mail gem does:
+///
+/// ```ruby
+/// def self.register_autoload(name, path)
+///   @autoloads[name] = path
+///   autoload(name, path)
+/// end
+/// register_autoload :Envelope, "mail/envelope"
+/// ```
+///
+/// When every body call of the helper passes a Symbol and a String, source-gem ingest follows each as it follows a
+/// literal `autoload` (`source_gems::autoload_helpers`), and the file is loaded as the gem's other files are. The
+/// helper then drops its `autoload(name, path)` statement, as a literal `autoload` in a module body is not written
+/// either, and keeps the rest of its body.
+fn drop_followed_autoload_registrations(methods: &mut [MethodDef], unknown_calls: &[Expr]) {
+    let literal = |args: &[Expr]| {
+        matches!(args, [name, path] if matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { .. } })
+            && matches!(&*path.node, ExprNode::Lit { value: Literal::Str { .. } }))
+    };
+    for method in methods.iter_mut() {
+        if method.receiver != MethodReceiver::Class || method.block_param.is_some() {
+            continue;
+        }
+        let [a, b] = method.params.as_slice() else { continue };
+        if [a, b].iter().any(|p| p.default.is_some() || p.keyword || p.rest || p.forwarding || p.name.as_str().is_empty()) {
+            continue;
+        }
+        let is_registration = |s: &Expr| {
+            matches!(&*s.node, ExprNode::Send { recv, method: m, args, block: None, .. }
+                if m.as_str() == "autoload"
+                    && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                    && matches!(args.as_slice(), [x, y]
+                        if matches!(&*x.node, ExprNode::Var { name, .. } if *name == a.name)
+                            && matches!(&*y.node, ExprNode::Var { name, .. } if *name == b.name)))
+        };
+        let ExprNode::Seq { exprs: statements } = &mut *method.body.node else { continue };
+        if statements.iter().filter(|s| is_registration(s)).count() != 1 {
+            continue;
+        }
+        let mut calls = unknown_calls
+            .iter()
+            .filter(|c| matches!(&*c.node, ExprNode::Send { recv: None, method: m, .. } if *m == method.name))
+            .peekable();
+        if calls.peek().is_none() || !calls.all(|c| matches!(&*c.node, ExprNode::Send { args, block: None, .. } if literal(args))) {
+            continue;
+        }
+        statements.retain(|s| !is_registration(s));
+    }
 }
 
 fn take_class_ivar_initializers(calls: &mut Vec<Expr>) -> Vec<Expr> {
