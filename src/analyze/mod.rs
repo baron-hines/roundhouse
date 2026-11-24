@@ -5139,9 +5139,9 @@ impl Analyzer {
         // its locals from that render, which reads only once its renderer
         // is typed. Each round harvests the typed partials' render sites,
         // fills the locals no view or layout typed, and retypes the
-        // partials that gained one, until a round fills nothing; a local
-        // is filled once, so the rounds end, and the depth cap guards a
-        // render cycle as the ivar propagation's does.
+        // partials that gained one, until a round fills nothing. A local
+        // is filled once, so the rounds end even through a render cycle;
+        // the cap bounds them as the ivar propagation's does.
         for _ in 0..16 {
             let mut nested: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
             for view in app.views.iter().filter(|view| is_partial_view_name(&view.name)) {
@@ -5166,19 +5166,19 @@ impl Analyzer {
             if seeded.is_empty() {
                 break;
             }
-            let mut retype: Vec<&mut crate::dialect::View> = app
+            let mut retype: Vec<(&mut crate::dialect::View, &Expr)> = app
                 .views
                 .iter_mut()
                 .zip(&untyped_partials)
                 .filter_map(|(view, untyped)| match untyped {
-                    Some(body) if seeded.contains(&view.name) => {
-                        view.body = body.clone();
-                        Some(view)
-                    }
+                    Some(body) if seeded.contains(&view.name) => Some((view, body)),
                     _ => None,
                 })
                 .collect();
-            parallel::map(&mut retype, |view| type_partial(view, &partial_locals_by_name));
+            parallel::map(&mut retype, |(view, untyped)| {
+                view.body = untyped.clone();
+                type_partial(view, &partial_locals_by_name)
+            });
         }
 
         // Record the render-site local types on the App. They already
