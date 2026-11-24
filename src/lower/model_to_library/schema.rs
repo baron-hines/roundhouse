@@ -427,13 +427,17 @@ pub(super) fn push_schema_methods(
             model,
             runtime_relation == super::RuntimeRelation::Present,
         ));
-        // An enum label can share its column's name. Rails' enum predicate
-        // overrides the generic attribute query in that case; otherwise
-        // push_user_methods would discard the value comparison as a duplicate.
+        // The model's own `<col>?` (a `def`, or an enum label sharing the
+        // column's name) overrides the generic attribute query, as in
+        // Rails, where attribute methods live in a module the class
+        // includes; otherwise push_user_methods would keep the generated
+        // predicate and discard the model's as a duplicate. A `def` that
+        // calls `super` wants the generated one, which has no other name
+        // to reach it by yet, so the generated predicate stays there.
         let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        if !model.enums.contains_key(&col.name)
-            || !super::associations::model_defines_instance_method(model, &predicate)
-        {
+        let overridden = super::associations::model_defines_instance_method(model, &predicate)
+            && (model.enums.contains_key(&col.name) || !instance_method_calls_super(model, &predicate));
+        if !overridden {
             methods.push(synth_column_predicate(owner, col));
         }
         // `<col>_previously_changed?` and `saved_change_to_<col>?`
@@ -1171,6 +1175,20 @@ fn synth_fill_timestamps(owner: &ClassId, table: &Table) -> Option<MethodDef> {
 /// affix `Pred`/`_pred`. Before that was uniform this synthesizer fired for
 /// boolean columns only (and no fixture has one, so it was never exercised
 /// cross-target).
+/// Some instance `def` of `name` in the model body calls `super`.
+fn instance_method_calls_super(model: &Model, name: &Symbol) -> bool {
+    use crate::dialect::ModelBodyItem;
+    fn calls_super(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Super { .. });
+        e.node.for_each_child(&mut |c| found = found || calls_super(c));
+        found
+    }
+    model.body.iter().any(|item| {
+        matches!(item, ModelBodyItem::Method { method, .. }
+            if method.name == *name && method.receiver == MethodReceiver::Instance && calls_super(&method.body))
+    })
+}
+
 fn synth_column_predicate(owner: &ClassId, col: &Column) -> MethodDef {
     let col_ty = ty_of_column(&col.col_type);
     // The ivar's real type — nullable columns hold nil, and the
