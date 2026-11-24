@@ -253,6 +253,8 @@ mod temporal_index_assign;
 mod file_mtime_time;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
+#[path = "support/service_params_class.rs"]
+mod service_params_class;
 #[path = "emit_and_run/gem_routes.rs"]
 mod gem_routes;
 #[path = "emit_and_run/route_request_guards.rs"]
@@ -22833,3 +22835,26 @@ mod empty_base_list_override;
 mod relation_argument;
 #[path = "emit_and_run/params_permit_key_args.rs"]
 mod params_permit_key_args;
+
+/// A class macro's `Class.new(base).tap { it.class_eval(&block) }` named by
+/// `const_set` is the class a `class Name < Base` with the call's block as
+/// its body makes: on main a `def` in the block was a nested def, refused
+/// and replaced by a raise.
+#[test]
+fn a_class_a_macro_makes_from_its_block_runs() {
+    let errors = service_params_class::overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = service_params_class::overlay().run_ruby(service_params_class::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("service params contract passed"));
+}
+
+/// A name the macro computes from a value known only when it runs leaves
+/// the call reported, not expanded under a guessed name.
+#[test]
+fn a_class_a_macro_names_at_run_time_is_reported() {
+    let errors = service_params_class::overlay()
+        .edit("app/models/list_service.rb", "  params :filter\n", "  params ENV.fetch(\"X\", \"y\").to_sym\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`params` defines methods this call does not expand")), "{errors:#?}");
+}
