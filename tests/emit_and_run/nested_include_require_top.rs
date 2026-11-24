@@ -68,3 +68,45 @@ puts "nested concern above its class passed"
         )
         .assert_passes();
 }
+
+/// The concern reads a constant of another model whose own file reads this
+/// class (`COPY = Audit::OWNER`, `OWNER = Ledger`): its file requires that
+/// model's file, which would run before `class Ledger` if the concern's
+/// require stood above it. It stays in the class body, where `ledger.rb`
+/// loaded first (as its own entry) has the class open by then.
+fn audit_app() -> emit_and_run::Overlay {
+    app()
+        .write(
+            "app/models/ledger/stamping.rb",
+            "module Ledger::Stamping\n  extend ActiveSupport::Concern\n  COPY = Audit::OWNER\n\n  def stamp\n    \"stamped\"\n  end\n\n  def copy = COPY\nend\n",
+        )
+        .write("app/models/audit.rb", "class Audit\n  OWNER = Ledger\nend\n")
+}
+
+#[test]
+fn a_nested_concern_whose_file_requires_another_model_stays_in_the_class_body() {
+    let (tree, errors) = audit_app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let text = ledger_file(&tree);
+    assert!(
+        text.lines().any(|l| l == "  require_relative \"ledger/stamping\""),
+        "the concern's require left the class body:\n{text}"
+    );
+}
+
+#[test]
+fn ledger_loaded_first_reads_the_concern_s_constant_on_ruby() {
+    let (tree, errors) = audit_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let out = std::process::Command::new("ruby")
+        .current_dir(&*tree)
+        .args(["-e", "require_relative 'app/models/ledger'; p Ledger::Stamping::COPY"])
+        .output()
+        .expect("run ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.trim() == "Ledger",
+        "ledger.rb as the entry did not load:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
