@@ -888,6 +888,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let mut auto_sourced: Vec<String> = Vec::new();
     for gem in auto_source_gems {
         if let Ok(mut resolved) = super::source_gems::resolve(vfs, dir, lock.as_ref(), std::slice::from_ref(gem)) {
+            resolved.iter_mut().for_each(|g| g.spinel_only = true);
             source_gems.append(&mut resolved);
             auto_sourced.push(gem.clone());
         }
@@ -3440,6 +3441,9 @@ end
     // A model's `begin include(X) rescue NameError end` becomes its
     // `include`s (or nothing), now that every module of the app is
     // known; before the qualification below, which reads them.
+    // Before the include splices: an opening a top-level mixin made takes its kind from the declaration it reopens.
+    super::top_level_mixins::settle(&mut app);
+    super::platform_guards::mark(&mut app);
     super::guarded_include::splice_guarded_includes(&mut app);
     // Every superclass and mixin, as Rubydex resolved it, before the
     // concern splices and every later consumer look them up by ClassId.
@@ -3826,7 +3830,8 @@ end
             .collect()
     };
     let shipped = |feature: &str| locked_gem_libs.iter().any(|lib| vfs.exists(&lib.join(format!("{feature}.rb"))));
-    super::absence_guards::mark(&mut app, &source_gem_code, &shipped);
+    let gem_texts: Vec<String> = source_gems.iter().flat_map(|gem| gem.texts(vfs)).collect();
+    super::absence_guards::mark(&mut app, &source_gem_code, &shipped, &gem_texts);
     // After every pass that changes a controller's methods, the concern
     // splice and the class-body macros above all: the lowering clones
     // from the controller they leave.

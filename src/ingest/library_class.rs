@@ -742,7 +742,8 @@ fn ingest_library_classes_impl(
             program.statements().body().iter().all(|stmt| stmt.as_constant_write_node().is_some())
         });
         if !only_writes {
-            return Ok(Vec::new());
+            // The file's mixins and writes into other classes still are their targets' openings.
+            return Ok(super::top_level_mixins::openings(&root, file, &[]));
         }
         let mut holder = file_constants_holder(file, &file_constants);
         holder.constants = file_constants;
@@ -764,6 +765,11 @@ fn ingest_library_classes_impl(
             consts.extend(std::mem::take(&mut host.constants));
             host.constants = consts;
         }
+    }
+    if file_level {
+        let made_here: Vec<&str> = factories.iter().map(|c| c.name.0.as_str()).collect();
+        let openings = super::top_level_mixins::openings(&root, file, &made_here);
+        out.extend(openings);
     }
     Ok(super::class_new_factory::order_with_file_classes(factories, out))
 }

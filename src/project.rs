@@ -10286,7 +10286,8 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
-            && crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+            && (crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+                || crate::analyze::platform_constant_type(&format!("Socket::{flag}")).is_some())
         {
             emit::diagnostics::report_unsupported(
                 expr.span,
@@ -14008,7 +14009,7 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 32] = [
+const BUNDLED: [(&str, &str); 33] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -14097,12 +14098,13 @@ const BUNDLED: [(&str, &str); 32] = [
     // `packages/openssl`; an app that signs a payload without HTTP never
     // loads it through net/http.
     ("OpenSSL", "openssl"),
-    // `Monitor.new`, `UNIXServer.new` / `UNIXSocket.new`, `Open3.capture3`
+    // `Monitor.new`, `Socket.const_defined?(:SOL_TCP)`, `UNIXServer.new` / `UNIXSocket.new`, `Open3.capture3`
     // and `Find.find`: the standard library on CRuby/JRuby; spinel
     // defines Monitor and the socket classes only after the require, and
     // takes `packages/open3` and `packages/find`.
     ("Monitor", "monitor"),
     ("MonitorMixin", "monitor"),
+    ("Socket", "socket"),
     ("UNIXServer", "socket"),
     ("UNIXSocket", "socket"),
     ("Open3", "open3"),

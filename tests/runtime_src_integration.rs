@@ -1393,7 +1393,12 @@ fn every_runtime_method_body_concretely_typed() {
     // MEASURED 1012 on merging main 81b6491fc (main's ceiling 1008, its
     // headroom used) with the uuid casts' +4, which add up; the unsaved
     // record's `IS NULL` arm adds none here.
-    const CEILING: usize = 1012;
+    // MEASURED 1013 on responders' renderer constants (1012):
+    // `ActionController::MissingRenderer#initialize`'s `super` reaches
+    // LoadError's, which no runtime signature declares (+1 in
+    // action_controller/parameter_missing.rb); `Renderers::RENDERERS` adds
+    // none. The ceiling is the measure.
+    const CEILING: usize = 1013;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

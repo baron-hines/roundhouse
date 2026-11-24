@@ -23,9 +23,21 @@ pub(super) struct SourceGem {
     /// autoload reaches: Ruby reads them the first time their constant is
     /// read, not while the gem boots.
     autoload_only: BTreeSet<PathBuf>,
+    /// Compiled into the Spinel tree alone (`auto_source_gems`): the ruby family loads the real gem, so its
+    /// load-time probes answer as Spinel does.
+    pub spinel_only: bool,
 }
 
 impl SourceGem {
+    /// The text of each file the gem compiles, its load-time branches settled as the mount reads them.
+    pub(super) fn texts<V: Vfs + ?Sized>(&self, vfs: &V) -> Vec<String> {
+        self.files
+            .iter()
+            .filter_map(|rel| vfs.read_to_string(&self.installed.join(rel)).ok())
+            .map(|text| super::ruby_conditions::settled_for(&text, self.spinel_only).unwrap_or(text))
+            .collect()
+    }
+
     /// Does the gem define what `path`, one of its files under the mount,
     /// declares before the app's autoloaders are set up? Not for a file only
     /// a feature-name autoload reaches: Zeitwerk sets its own autoload over
@@ -89,7 +101,7 @@ pub(super) fn resolve<V: Vfs + ?Sized>(
             files.extend(more);
             autoload_only = files.difference(&at_boot).cloned().collect();
         }
-        gems.push(SourceGem { mount: dir.join(MOUNT).join(format!("{name}-{version}")), installed, files, autoload_only });
+        gems.push(SourceGem { mount: dir.join(MOUNT).join(format!("{name}-{version}")), installed, files, autoload_only, spinel_only: false });
     }
     Ok(gems)
 }
@@ -124,6 +136,7 @@ pub(super) fn framework_models<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: Optio
         installed,
         files,
         autoload_only: BTreeSet::new(),
+        spinel_only: false,
     })
 }
 
@@ -775,8 +788,8 @@ impl<V: Vfs + ?Sized> MountVfs<'_, V> {
         self.gems.iter().find_map(|gem| path.strip_prefix(&gem.mount).ok().map(|rel| (gem, rel.to_path_buf())))
     }
 
-    fn as_loaded(&self, text: String) -> String {
-        let text = super::ruby_conditions::settled(&text).unwrap_or(text);
+    fn as_loaded(&self, text: String, spinel_only: bool) -> String {
+        let text = super::ruby_conditions::settled_for(&text, spinel_only).unwrap_or(text);
         if !text.contains("LoadError") {
             return text;
         }
@@ -809,17 +822,15 @@ impl<V: Vfs + ?Sized> Vfs for MountVfs<'_, V> {
             return Ok(bytes);
         }
         match String::from_utf8(bytes) {
-            Ok(text) => Ok(self.as_loaded(text).into_bytes()),
+            Ok(text) => Ok(self.as_loaded(text, self.mounted(path).is_some_and(|(gem, _)| gem.spinel_only)).into_bytes()),
             Err(err) => Ok(err.into_bytes()),
         }
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         let text = self.inner.read_to_string(&self.file(path)?)?;
-        if self.mounted(path).is_none() {
-            return Ok(text);
-        }
-        Ok(self.as_loaded(text))
+        let Some((gem, _)) = self.mounted(path) else { return Ok(text) };
+        Ok(self.as_loaded(text, gem.spinel_only))
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
