@@ -729,7 +729,7 @@ mod tests {
         }
         app.gem_lock = Some(crate::gems::Lockfile::default());
         let code = source_gem_code(&app);
-        mark(&mut app, &code, &|_| false);
+        mark(&mut app, &code, &|_| false, &[]);
         let class = app.library_classes.iter().find(|c| c.name.0.as_str() == "Shelf::Box").expect("Shelf::Box");
         let body = |name: &str| format!("{:?}", class.methods.iter().find(|m| m.name.as_str() == name).expect(name).body);
         assert!(body("pretty!").contains("cannot load such file -- fancy_printer"), "{}", body("pretty!"));

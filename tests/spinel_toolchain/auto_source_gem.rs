@@ -19,3 +19,12 @@ fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_raises_name_error_natively()
     assert!(run.stdout.contains("misnamed gem constant OK"), "{}", run.stdout);
 }
 
+/// The native half of `emit_and_run::auto_source_gem::a_gem_file_s_top_level_prepend_is_module_s`: the gem shake keeps
+/// the class's own method the prepended module's `super` reaches.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_gem_file_s_top_level_prepend_runs_natively() {
+    let run = auto_source_gem::top_level_prepend_overlay().run_spinel(auto_source_gem::TOP_LEVEL_PREPEND_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("top-level prepend OK"), "{}", run.stdout);
+}

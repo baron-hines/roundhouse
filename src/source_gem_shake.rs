@@ -391,7 +391,17 @@ struct Gems<'a> {
     model_copies: HashMap<(String, bool, String), Vec<&'a crate::dialect::MethodDef>>,
 }
 
+/// A module's `super`: the definition after the module in a class's lookup order (the class's own, for one it prepends).
+fn next_definition(lineage: &[String], module: &str, defines: impl Fn(&str) -> bool) -> Option<String> {
+    let at = lineage.iter().position(|a| a == module)?;
+    lineage[at + 1..].iter().find(|a| defines(a)).cloned()
+}
+
 impl<'a> Gems<'a> {
+    fn is_module(&self, name: &str) -> bool {
+        self.entries.get(name).is_some_and(|e| e.iter().any(|c| c.is_module))
+    }
+
     fn of(app: &'a App) -> Option<Self> {
         if app.auto_source_gems.is_empty() {
             return None;
@@ -1219,6 +1229,16 @@ impl Walk<'_, '_> {
                 let owner = self.ancestors(&c).iter().skip(1).find(|a| gems.defined.contains(&(a.as_str(), side, method.as_str()))).cloned();
                 if let Some(owner) = owner {
                     self.method((owner, side, method));
+                } else if !side && gems.is_module(&c) {
+                    let hosts: Vec<String> = gems.entries.keys().filter(|h| **h != c).cloned().collect();
+                    let mut owners = Vec::new();
+                    for host in hosts {
+                        let lineage = self.ancestors(&host);
+                        owners.extend(next_definition(&lineage, &c, |a| gems.defined.contains(&(a, false, method.as_str()))));
+                    }
+                    for owner in owners {
+                        self.method((owner, false, method.clone()));
+                    }
                 }
             }
             Target::Virtual(c, side) => {
@@ -1771,6 +1791,10 @@ mod tests {
                     Target::Super(c, side) => {
                         if let Some(owner) = ancestors(c).into_iter().skip(1).find(|a| defines(a, *side, method)) {
                             reached.push((owner, *side, method.clone()));
+                        } else if !*side && gems.is_module(c) {
+                            for host in gems.entries.keys().filter(|h| *h != c) {
+                                reached.extend(next_definition(&ancestors(host), c, |a| defines(a, false, method)).map(|o| (o, false, method.clone())));
+                            }
                         }
                         continue;
                     }
