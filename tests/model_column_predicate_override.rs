@@ -111,3 +111,63 @@ fn a_column_predicate_calling_super_keeps_the_generated_one() {
         assert!(defs[0].contains("@done"), "{target:?}: {}", defs[0]);
     }
 }
+
+/// The model's own `<col>?` is not a generated method, so it must not be
+/// a tree-shake candidate: Rails keeps it whether or not a caller is
+/// traced. The Ruby family shakes one name set for every model, so
+/// another model's generated `done?` must not expose it either.
+#[test]
+fn an_uncalled_own_column_predicate_is_not_a_shake_candidate() {
+    use roundhouse::Symbol;
+    use roundhouse::project::target_files;
+    let schema = "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.boolean \"done\", default: false, null: false\n  end\n  create_table \"gadgets\", force: :cascade do |t|\n    t.boolean \"done\", default: false, null: false\n  end\nend\n";
+    let widget = "class Widget < ApplicationRecord\n  def done?\n    'own column predicate survives' == 'x'\n  end\nend\n";
+    let files: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+        ("db/schema.rb", schema),
+        ("app/models/widget.rb", widget),
+        ("app/models/gadget.rb", "class Gadget < ApplicationRecord; end"),
+    ]
+    .iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(files).unwrap();
+    for model in &app.models {
+        let table = &app.schema.tables[&model.table.0];
+        let candidates = roundhouse::lower::model_to_library::shakeable_synthesized_names(table, model);
+        assert_eq!(candidates.contains(&Symbol::from("done?")), model.name.0.as_str() == "Gadget", "{}", model.name.0);
+    }
+    roundhouse::session::analyze_and_lower(&mut app);
+    for target in [BuildTarget::Typescript, BuildTarget::Ruby, BuildTarget::Spinel] {
+        let files = target_files(&app, roundhouse::fixtures::real_blog(), target).unwrap();
+        assert!(
+            files.iter().any(|(_, source)| source.contains("own column predicate survives")),
+            "{target:?} dropped a model's own column predicate"
+        );
+    }
+}
+
+/// A caller the tracer cannot follow (`send`) still reaches the model's own predicate.
+#[test]
+fn an_own_column_predicate_reached_by_send_runs() {
+    emit_and_run::empty_app()
+        .write("db/schema.rb", SCHEMA)
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n")
+        .write("app/models/widget.rb", OWN)
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+        .write(
+            "app/controllers/widgets_controller.rb",
+            "class WidgetsController < ApplicationController\n  def show\n    render json: { done: Widget.find(params[:id]).send(:done?) }\n  end\nend\n",
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  resources :widgets, only: %i[show]\nend\n")
+        .run_ruby(
+            r##"
+named = Widget.create!(name: "w", done: false)
+status, _headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/widgets/#{named.id}", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+text = +""
+body.each { |part| text << part }
+raise "#{status} #{text}" unless status == 200 && text == %({"done":true})
+puts "ALL OK"
+"##,
+        )
+        .assert_passes();
+}

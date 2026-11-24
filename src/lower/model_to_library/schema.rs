@@ -434,10 +434,7 @@ pub(super) fn push_schema_methods(
         // predicate and discard the model's as a duplicate. A `def` that
         // calls `super` wants the generated one, which has no other name
         // to reach it by yet, so the generated predicate stays there.
-        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        let overridden = super::associations::model_defines_instance_method(model, &predicate)
-            && (model.enums.contains_key(&col.name) || !instance_method_calls_super(model, &predicate));
-        if !overridden {
+        if !own_column_predicate(model, col) {
             methods.push(synth_column_predicate(owner, col));
         }
         // `<col>_previously_changed?` and `saved_change_to_<col>?`
@@ -969,13 +966,10 @@ pub(super) fn push_schema_methods(
 pub fn shakeable_synthesized_names(table: &Table, model: &Model) -> Vec<Symbol> {
     let mut names: Vec<Symbol> = Vec::new();
     for col in &table.columns {
-        // Mirror push_schema_methods: an enum's user-defined predicate
-        // was not synthesized and must never be a shake candidate.
-        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        if !model.enums.contains_key(&col.name)
-            || !super::associations::model_defines_instance_method(model, &predicate)
-        {
-            names.push(predicate);
+        // Mirror push_schema_methods: a model's own predicate was not
+        // synthesized and must never be a shake candidate.
+        if !own_column_predicate(model, col) {
+            names.push(Symbol::from(format!("{}?", col.name.as_str())));
         }
         // Mirrors the two `synth_column_dirty_pred` spellings (both
         // skipped for `id`, which Base answers from its own flag).
@@ -1175,6 +1169,15 @@ fn synth_fill_timestamps(owner: &ClassId, table: &Table) -> Option<MethodDef> {
 /// affix `Pred`/`_pred`. Before that was uniform this synthesizer fired for
 /// boolean columns only (and no fixture has one, so it was never exercised
 /// cross-target).
+/// The model's own `<col>?` (a `def`, or an enum label sharing the
+/// column's name) replaces the generated attribute predicate, which is
+/// then neither synthesized nor a tree-shake candidate.
+pub fn own_column_predicate(model: &Model, col: &Column) -> bool {
+    let predicate = Symbol::from(format!("{}?", col.name.as_str()));
+    super::associations::model_defines_instance_method(model, &predicate)
+        && (model.enums.contains_key(&col.name) || !instance_method_calls_super(model, &predicate))
+}
+
 /// Some instance `def` of `name` in the model body calls `super`.
 fn instance_method_calls_super(model: &Model, name: &Symbol) -> bool {
     use crate::dialect::ModelBodyItem;

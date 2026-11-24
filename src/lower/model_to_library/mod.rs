@@ -26,7 +26,7 @@ pub(crate) mod primary_key_guard;
 pub(crate) mod accessor_surface;
 pub(crate) mod schema;
 pub use schema::col_storage_name;
-pub use schema::shakeable_synthesized_names;
+pub use schema::{own_column_predicate, shakeable_synthesized_names};
 pub(crate) mod validations;
 mod associations;
 pub(crate) use associations::polymorphic_type_switch;
