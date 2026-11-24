@@ -766,7 +766,9 @@ fn ingest_library_classes_impl(
         }
     }
     if file_level {
-        out.extend(super::top_level_mixins::openings(&root, file));
+        let made_here: Vec<&str> = factories.iter().map(|c| c.name.0.as_str()).collect();
+        let openings = super::top_level_mixins::openings(&root, file, &made_here);
+        out.extend(openings);
     }
     Ok(super::class_new_factory::order_with_file_classes(factories, out))
 }

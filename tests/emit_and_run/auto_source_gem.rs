@@ -73,10 +73,6 @@ fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_is_ruby_s_name_error() {
 fn a_gem_s_constant_write_into_another_class_is_that_class_s() {
     let (_emitted, errors) = auto_source_gem::top_level_constant_overlay().emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
-    let errors = auto_source_gem::top_level_constant_overlay()
-        .edit("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings/registry.rb", "  Codes::KINDS = {", "  Kodes::KINDS = {")
-        .check_errors();
-    assert!(errors.iter().any(|e| e.contains("`Kodes` (written `Kodes::KINDS`) is no class or module the program declares")), "{errors:#?}");
 }
 
 /// A gem file's top-level `Klass.prepend(Mod)` is Module#prepend, run as the file loads.

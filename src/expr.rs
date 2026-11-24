@@ -248,10 +248,10 @@ pub const COERCED_OPERAND: u64 = 1 << 44;
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 /// A class-body `include M` / `prepend M` standing for a file's top-level `X.include(M)` / `X.prepend(M)`: the
 /// opening of `X` it sits in waits for `X`'s declaration to give it its kind (`ingest::top_level_mixins`).
-pub const TOP_LEVEL_MIXIN: u64 = 1 << 33;
+pub const TOP_LEVEL_MIXIN: u64 = 1 << 62;
 /// A read of a platform's own constant (`Socket::SOL_TCP`) in a load-time branch its `Socket.const_defined?` guards:
 /// it runs only where the platform defines it (`ingest::platform_guards`).
-pub const PLATFORM_GUARDED_CONST: u64 = 1 << 32;
+pub const PLATFORM_GUARDED_CONST: u64 = 1 << 63;
 
 /// On a route-helper call `lower::route_format_suffix` renamed for its
 /// literal `format:` (`widget_url(w, format: :json)` to

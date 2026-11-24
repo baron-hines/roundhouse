@@ -13,8 +13,9 @@
 //! `CommandError::ERRORS = { … }` in `class RedisClient`) is the same: an
 //! opening of that class holding the constant. Ruby finds the class as it
 //! finds any constant, innermost namespace first, so the opening is made for
-//! each namespace the write sits in and [`settle`] keeps the first one the
-//! program declares.
+//! each namespace the write sits in and [`settle`] keeps the innermost one
+//! the program declares. With none, the write is left as it was, and a read
+//! of the constant stays the unsupported one.
 
 use ruby_prism::Node;
 
@@ -45,10 +46,12 @@ pub(super) fn is_mixin(stmt: &Node<'_>) -> bool {
 }
 
 /// The openings `root`'s top-level mixins make, one per statement.
-pub(super) fn openings(root: &Node<'_>, file: &str) -> Vec<LibraryClass> {
+/// `made_here` are the classes the file's factories make (`Point = Data.define(:x)`), which carry the file's own writes
+/// into them (`Point::ORIGIN = …`) themselves.
+pub(super) fn openings(root: &Node<'_>, file: &str, made_here: &[&str]) -> Vec<LibraryClass> {
     let Some(program) = root.as_program_node() else { return Vec::new() };
     let mut out = Vec::new();
-    constant_writes(program.statements().body().iter().collect(), &[], file, &mut out);
+    constant_writes(program.statements().body().iter().collect(), &[], file, made_here, &mut out);
     for stmt in program.statements().body().iter() {
         let Some((verb, target, modules)) = mixin(&stmt) else { continue };
         let span = node_span(&stmt, file);
@@ -73,21 +76,22 @@ pub(super) fn openings(root: &Node<'_>, file: &str) -> Vec<LibraryClass> {
 }
 
 /// `A::B = value` in `statements` and the class and module bodies in them, under the namespaces `scope` names.
-fn constant_writes(statements: Vec<Node<'_>>, scope: &[String], file: &str, out: &mut Vec<LibraryClass>) {
+fn constant_writes(statements: Vec<Node<'_>>, scope: &[String], file: &str, made_here: &[&str], out: &mut Vec<LibraryClass>) {
     for stmt in statements {
         let declared = stmt.as_module_node().map(|m| (m.constant_path(), m.body()))
             .or_else(|| stmt.as_class_node().map(|c| (c.constant_path(), c.body())));
         if let Some((path, body)) = declared {
             let (Some(path), Some(body)) = (constant_path_of(&path), body) else { continue };
             let inner: Vec<String> = scope.iter().cloned().chain(path).collect();
-            constant_writes(flatten_statements(body), &inner, file, out);
+            constant_writes(flatten_statements(body), &inner, file, made_here, out);
             continue;
         }
         let Some(write) = stmt.as_constant_path_write_node() else { continue };
         let target = write.target().as_node();
         let Some(mut path) = constant_path_of(&target) else { continue };
         let Some(name) = path.pop() else { continue };
-        if path.is_empty() {
+        let written = path.iter().chain(std::iter::once(&name)).map(String::as_str).collect::<Vec<_>>().join("::");
+        if path.is_empty() || made_here.contains(&path.join("::").as_str()) || made_here.contains(&written.as_str()) {
             continue;
         }
         let Ok(mut value) = super::expr::ingest_expr(&write.value(), file) else { continue };
@@ -151,9 +155,19 @@ pub(super) fn settle(app: &mut App) {
     let declared = |name: &str| kinds.get(name).copied();
     let mut keep = Vec::with_capacity(app.library_classes.len());
     let mut refused: Vec<(Span, String)> = Vec::new();
-    // A constant write's openings, one per namespace it may name, share its value's span: the first declared is it.
+    // A constant write's openings, one per namespace it may name, share its value's span: the innermost declared is
+    // it, as Ruby looks the name up, whatever order the classes are in by now.
+    let mut innermost: crate::det::HashMap<Span, usize> = crate::det::HashMap::default();
+    for c in app.library_classes.iter().filter(|c| is_opening(c)) {
+        if let Some((_, value)) = c.constants.first()
+            && declared(c.name.0.as_str()).is_some()
+        {
+            let depth = c.name.0.as_str().split("::").count();
+            let best = innermost.entry(value.span).or_insert(depth);
+            *best = (*best).max(depth);
+        }
+    }
     let mut settled_writes: crate::det::HashSet<Span> = crate::det::HashSet::default();
-    let mut unsettled_writes: Vec<(Span, String)> = Vec::new();
     let classes = std::mem::take(&mut app.library_classes);
     for mut lc in classes {
         if !is_opening(&lc) {
@@ -161,7 +175,7 @@ pub(super) fn settle(app: &mut App) {
             continue;
         }
         let name = lc.name.0.as_str().to_string();
-        if let Some((constant, value)) = lc.constants.first() {
+        if let Some((_, value)) = lc.constants.first() {
             let span = value.span;
             if settled_writes.contains(&span) {
                 continue;
@@ -171,13 +185,15 @@ pub(super) fn settle(app: &mut App) {
                 refused.push((span, format!("`{name}` is a model: a constant written into one from outside is not carried")));
                 continue;
             }
-            match declared(&name) {
+            match declared(&name).filter(|_| innermost.get(&span) == Some(&name.split("::").count())) {
                 Some(is_module) => {
                     settled_writes.insert(span);
                     lc.is_module = is_module;
                     keep.push(lc);
                 }
-                None => unsettled_writes.push((span, format!("`{name}` (written `{name}::{constant}`) is no class or module the program declares"))),
+                // Not reported here: a read of the constant is the unsupported one, as before (`module ActiveSupport; end`
+                // reopened in an app file declares no class the program has, and nothing may read what it writes).
+                None => {}
             }
             continue;
         }
@@ -208,16 +224,7 @@ pub(super) fn settle(app: &mut App) {
         keep.push(lc);
     }
     app.library_classes = keep;
-    // The outermost namespace's is the last a write makes, and it names the write as written.
-    let mut last: Vec<(Span, String)> = Vec::new();
-    for (span, why) in unsettled_writes.into_iter().filter(|(span, _)| !settled_writes.contains(span)) {
-        last.retain(|(seen, _)| *seen != span);
-        last.push((span, why));
-    }
     for (span, why) in refused {
         super::prism::push(crate::diagnostic::Diagnostic::unsupported(span, None, "top-level mixin", why));
-    }
-    for (span, why) in last {
-        super::prism::push(crate::diagnostic::Diagnostic::unsupported(span, None, "constant written into another class", why));
     }
 }
