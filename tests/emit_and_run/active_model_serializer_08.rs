@@ -803,4 +803,4 @@ fn listed_overlay() -> emit_and_run::Overlay {
     overlay().write("app/serializers/postish_serializer.rb", &postish("add_raw\n    add_title"))
 }
 
-const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nputs \"listed options passed\"\n";
+const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nb = Article.create!(title: \"<b>&\", body: \"A long body\")\ndumped = MultiJson.dump(PostishSerializer.new(b, add_raw: true))\nraise dumped unless dumped == %Q({\"postish\":{\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"}})\nputs \"listed options passed\"\n";

@@ -2185,6 +2185,8 @@ const PER_CLASS_API: &[(&str, &str)] = &[
     ("root_name", "  def root_name\n    ams_root_name\n  end\n"),
     ("attributes", "  def attributes\n    ams_attributes\n  end\n"),
     ("serializable_hash", "  def serializable_hash\n    return nil if @object.nil?\n    ams_serializable_hash\n  end\n"),
+    // The gem's `to_json` is ActiveSupport's `Object#to_json`, `ActiveSupport::JSON.encode(self)`, which encodes what `as_json` answers.
+    ("to_json", "  def to_json(*args)\n    ActiveSupport::JSON.encode(as_json)\n  end\n"),
     ("as_json", "  def as_json(options = {})\n    options ||= {}\n    root = options.fetch(:root, @options.fetch(:root, root_name))\n    if root\n      hash = {}\n      @ams_side = hash\n      @ams_unique = {}\n      body = serializable_hash\n      hash[root] = body\n      include_meta(hash)\n      hash\n    else\n      serializable_hash\n    end\n  end\n"),
 ];
 
