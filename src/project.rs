@@ -2572,6 +2572,14 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
                 if name.as_str().starts_with('$') => Some("global variable write"),
             ExprNode::Var { name, .. } if name.as_str().starts_with("@@") && target != BuildTarget::Spinel => Some("class variable read"),
+            // message_bus's `require "message_bus/backends/#{backend}"`: the tree has no load path, and Spinel resolves a
+            // require as it builds, so a name only the run time knows loads nothing (a LoadError where Ruby loads it).
+            ExprNode::Send { recv: None, method, args, block: None, .. }
+                if matches!(method.as_str(), "require" | "load")
+                    && matches!(args.as_slice(), [a] if !matches!(&*a.node, ExprNode::Lit { .. })) =>
+            {
+                Some("require of a name built at run time")
+            }
             _ => None,
         };
         if let Some(construct) = construct {
