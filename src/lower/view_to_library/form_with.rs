@@ -1128,12 +1128,23 @@ fn classify_form_with_components(
         _ => None,
     }
     .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
-    if let Some(name) = typed_class.clone().or_else(|| record_local_name(&model)) {
+    // The local's name when neither the class nor the directory names a
+    // route: campfire's `rooms/layouts/_form` is handed a `Rooms::Open`
+    // (or `Rooms::Closed`) `room`, and neither `opens_path` nor
+    // `rooms_layouts_path` is a route where `rooms_path` is.
+    // `rooms/directs/new` keeps its directory's `rooms_directs_path`.
+    let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
+    let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
+    let by_local = record_local_name(&model).filter(|_| typed_class.is_none() || !directory_known);
+    for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);
-        let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
-        if rec_plural != plural_owned && (known(&rec_plural) || known(&rec_singular)) {
+        if rec_plural == plural_owned {
+            break;
+        }
+        if known(&rec_plural) || known(&rec_singular) {
             plural_owned = rec_plural;
+            break;
         }
     }
     let plural = plural_owned.as_str();

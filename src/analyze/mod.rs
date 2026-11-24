@@ -5071,11 +5071,12 @@ impl Analyzer {
         let attachable_partial_bindings = crate::lower::attachable::attachable_partial_bindings(app);
         // The bodies as ingested, so a partial whose locals a nested render
         // seeds below retypes from scratch rather than over its first typing.
-        let untyped_partials: HashMap<Symbol, Expr> = app
+        // Kept by position, not name: a partial's formats share one (`_boost`
+        // is both `.html.erb` and `.json.jbuilder`).
+        let untyped_partials: Vec<Option<Expr>> = app
             .views
             .iter()
-            .filter(|view| is_partial_view_name(&view.name))
-            .map(|view| (view.name.clone(), view.body.clone()))
+            .map(|view| is_partial_view_name(&view.name).then(|| view.body.clone()))
             .collect();
         let type_partial = |view: &mut crate::dialect::View, locals_by_name: &HashMap<Symbol, HashMap<Symbol, Ty>>| {
             let mut view_ctx = Ctx::default();
@@ -5149,12 +5150,14 @@ impl Analyzer {
             }
             let mut seeded: HashSet<Symbol> = HashSet::default();
             for (partial, locals) in nested {
-                if !untyped_partials.contains_key(&partial) {
+                if !is_partial_view_name(&partial) {
                     continue;
                 }
                 let entry = partial_locals_by_name.entry(partial.clone()).or_default();
                 for (local, ty) in locals {
-                    if ty.is_unknown() || entry.get(&local).is_some_and(|prev| !prev.is_unknown()) {
+                    // Not `Array[unknown]` either: filled once, it would keep
+                    // out the `Array[Article]` a later round reads.
+                    if ty.mentions_unknown() || entry.get(&local).is_some_and(|prev| !prev.is_unknown()) {
                         continue;
                     }
                     entry.insert(local, ty);
@@ -5164,10 +5167,18 @@ impl Analyzer {
             if seeded.is_empty() {
                 break;
             }
-            let mut retype: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| seeded.contains(&view.name)).collect();
-            for view in retype.iter_mut() {
-                view.body = untyped_partials[&view.name].clone();
-            }
+            let mut retype: Vec<&mut crate::dialect::View> = app
+                .views
+                .iter_mut()
+                .zip(&untyped_partials)
+                .filter_map(|(view, untyped)| match untyped {
+                    Some(body) if seeded.contains(&view.name) => {
+                        view.body = body.clone();
+                        Some(view)
+                    }
+                    _ => None,
+                })
+                .collect();
             parallel::map(&mut retype, |view| type_partial(view, &partial_locals_by_name));
         }
 

@@ -58,6 +58,10 @@ pub(super) fn extract_partial_render_sites(
                     targets.push(partial_name.clone());
                     let entry = out.entry(partial_name).or_default();
                     for (k, v) in locals {
+                        // A site that cannot type the local does not erase one that did.
+                        if v.is_unknown() && entry.get(&k).is_some_and(|prev| !prev.is_unknown()) {
+                            continue;
+                        }
                         entry.insert(k, v);
                     }
                 }
