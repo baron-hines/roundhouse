@@ -696,9 +696,12 @@ fn rebase_relative(child_name: &str, parent_name: &str, target: &str, app: &App)
         }
     }
     // Longest common prefix, then `..` for what the parent has left.
+    // The target's LAST segment is a file, never a shared directory (as
+    // in `relpath`): `Feeds::Strategy::Base`'s `../../feeds`, rebased into
+    // `feeds/strategy.rb`, matched every segment and came out as "".
     let common = parent_dir
         .iter()
-        .zip(resolved.iter())
+        .zip(&resolved[..resolved.len().saturating_sub(1)])
         .take_while(|(a, b)| a == b)
         .count();
     let ups = parent_dir.len() - common;
