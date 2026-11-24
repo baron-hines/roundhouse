@@ -225,3 +225,70 @@ fn a_keyword_an_includer_call_leaves_out_keeps_its_default_on_the_module() {
     assert!(tint.contains("String"), "{rbs}");
     assert!(!tint.contains("Hash[Symbol"), "{rbs}");
 }
+
+/// A keyword rest is not a named keyword: `label(opts: "x")` against a
+/// module's `def label(**opts)` binds `opts` to `{opts: "x"}`, so its
+/// name never places a key's value on it.
+#[test]
+fn a_key_named_like_a_keyword_rest_does_not_bind_to_it() {
+    const RESTED: &str = "module Rested\n  extend ActiveSupport::Concern\n\n  def label(**opts)\n    render_label(**opts)\n  end\n\n  def render_label(**opts)\n    opts.size.to_s\n  end\nend\n";
+    const WIDGET: &str = "class Widget < ApplicationRecord\n  include Rested\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    render plain: Widget.find(params[:id]).label(opts: \"x\")\n  end\nend\n";
+    let mut app = ingest(&[
+        ("app/models/concerns/rested.rb", RESTED),
+        ("app/models/widget.rb", WIDGET),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    // The sidecar spells a keyword rest by its values (`**String opts`)
+    // whether the slot holds the Hash or the String, so read the row.
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let row = app
+        .inferred_method_params
+        .get(&(roundhouse::ident::ClassId("Rested".into()), "label".into()))
+        .expect("the label call site was folded onto the module");
+    let opts = format!("{:?}", row.first());
+    assert!(opts.contains("Hash"), "{row:?}");
+}
+
+/// A call that passes fewer arguments than the `def` has slots leaves
+/// the rest to their defaults on the module too: `Widget` only calls
+/// `tint(1)`, so `tone` reaches its Integer `0` beside the String
+/// `Gadget` passes. `Widget`'s row stops before `tone`'s slot.
+#[test]
+fn a_default_past_the_includer_row_reaches_the_module() {
+    const TONED: &str = "module Toned\n  extend ActiveSupport::Concern\n\n  def tint(prefix = nil, tone: 0, **opts)\n    \"#{prefix}#{tone}#{opts.size}\"\n  end\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    render plain: Widget.find(params[:id]).tint(1) + Gadget.find(params[:id]).tint(tone: \"x\")\n  end\nend\n";
+    let files = emit(&[
+        ("app/models/concerns/toned.rb", TONED),
+        ("app/models/widget.rb", "class Widget < ApplicationRecord\n  include Toned\nend\n"),
+        ("app/models/gadget.rb", "class Gadget < ApplicationRecord\n  include Toned\nend\n"),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    let rbs = file(&files, "app/models/toned.rbs");
+    let tint = sig(rbs, "tint");
+    // `?tone: T` kept as a keyword, `?T tone` once flattened.
+    let both = ["(Integer | String)", "(String | Integer)"]
+        .iter()
+        .any(|t| tint.contains(&format!("tone: {t}")) || tint.contains(&format!("{t} tone")));
+    assert!(both, "{rbs}");
+}
+
+/// A `*rest` before the keywords: a call's row puts every positional
+/// past it in the rest slot, so a keyword placed on its own slot index
+/// reads as one more rest element. No fallback there: `Gadget`'s
+/// `tint(tone: "x")` must not make `more` a String.
+#[test]
+fn a_module_shape_with_a_rest_slot_places_no_keyword() {
+    const TONED: &str = "module Toned\n  extend ActiveSupport::Concern\n\n  def tint(prefix = nil, *more, tone: 0)\n    \"#{prefix}#{more.size}#{tone}\"\n  end\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    render plain: Widget.find(params[:id]).tint(1) + Gadget.find(params[:id]).tint(tone: \"x\")\n  end\nend\n";
+    let files = emit(&[
+        ("app/models/concerns/toned.rb", TONED),
+        ("app/models/widget.rb", "class Widget < ApplicationRecord\n  include Toned\nend\n"),
+        ("app/models/gadget.rb", "class Gadget < ApplicationRecord\n  include Toned\nend\n"),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    let rbs = file(&files, "app/models/toned.rbs");
+    let tint = sig(rbs, "tint");
+    assert!(!tint.contains("*String more"), "{rbs}");
+}

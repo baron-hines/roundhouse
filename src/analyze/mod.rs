@@ -6940,6 +6940,11 @@ impl Analyzer {
                     return None;
                 }
                 let (shape, keyword_named) = self.included_param_shape(&key, params_by_method)?;
+                // Not past a `*rest`: a row puts every positional after it in the rest slot,
+                // so a keyword placed on its own index would read as one more rest element.
+                if shape.slots.iter().any(|(_, kind)| matches!(kind, ParamKind::Rest)) {
+                    return None;
+                }
                 // The module's shape places a key by name, keyword or not, so
                 // only where every key names a source keyword: `f(name: x)`
                 // against `def f(name)` binds the whole Hash, as Ruby does.
@@ -7286,10 +7291,11 @@ impl Analyzer {
                                 if self.open_param_slots.contains(&(from.clone(), i)) {
                                     open_adds.push(((m.clone(), name.clone(), side), i));
                                 }
-                                // A slot a call left to its default, placed by the module's shape.
-                                if defaulted.contains(&(from.clone(), i)) {
-                                    defaulted_adds.push(((m.clone(), name.clone(), side), i));
-                                }
+                            }
+                            // The slots a call left to their defaults, placed by the module's shape;
+                            // past the row too (`tint(1)` leaves `tone:`). Not the `usize::MAX` catch-all.
+                            for (_, i) in defaulted.range((from.clone(), 0)..(from.clone(), usize::MAX)) {
+                                defaulted_adds.push(((m.clone(), name.clone(), side), *i));
                             }
                         }
                     }
@@ -7315,7 +7321,8 @@ impl Analyzer {
         let mut keyword_named: HashMap<ParamKey, Option<BTreeSet<Symbol>>> = HashMap::default();
         let mut record = |class: &ClassId, m: &crate::dialect::MethodDef| {
             let names: BTreeSet<Symbol> =
-                m.params.iter().filter(|p| p.keyword || p.from_keyword).map(|p| p.name.clone()).collect();
+                // Named keywords only: a `**rest` kept as one (`keyword` and `rest`) binds the Hash, never a key's value.
+                m.params.iter().filter(|p| (p.keyword || p.from_keyword) && !p.rest).map(|p| p.name.clone()).collect();
             keyword_named
                 .entry((class.clone(), m.name.clone(), m.receiver))
                 .and_modify(|slot| {
