@@ -6935,12 +6935,12 @@ fn model_lineage(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
     parents
         .keys()
         .map(|name| {
-            let chain = std::iter::once(*name)
+            let lineage = std::iter::once(*name)
                 .chain(crate::app::class_ancestors(&parents, name))
                 .filter(|class| models.contains(class))
                 .map(|class| app.model_param_key(class))
                 .collect();
-            (name.to_string(), chain)
+            (name.to_string(), lineage)
         })
         .collect()
 }
