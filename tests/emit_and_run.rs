@@ -22978,3 +22978,29 @@ fn top_level_prepend_app() -> emit_and_run::Overlay {
         .write("app/models/loud.rb", "module Loud\n  def hi = super + [\"loud\"]\nend\n\nGreeter.prepend(Loud)\n")
         .write("app/models/waving.rb", "module Waving\n  def wave = true\nend\n\nGreeter.include(Waving)\n")
 }
+
+/// responders' `ActionController::Responder` reads Rails' own renderer constants: the formats Rails renders itself
+/// and the LoadError it raises for another.
+#[test]
+fn rails_renderer_constants_answer_as_rails_does() {
+    let run = renderer_constants_app().run_ruby(RENDERER_CONSTANTS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("renderer constants passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn rails_renderer_constants_answer_as_rails_does_on_spinel() {
+    let run = renderer_constants_app().run_spinel(RENDERER_CONSTANTS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("renderer constants passed"));
+}
+
+const RENDERER_CONSTANTS_SCRIPT: &str = "got = RendererProbe.report\nraise got.inspect unless got == [true, true, true, false, \"No renderer defined for format: csv\"]\nputs \"renderer constants passed\"\n";
+
+fn renderer_constants_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app().write(
+        "app/models/renderer_probe.rb",
+        "class RendererProbe\n  def self.report\n    raise ActionController::MissingRenderer.new(:csv)\n  rescue LoadError => e\n    renderers = ActionController::Renderers::RENDERERS\n    [renderers.include?(:json), renderers.include?(:js), renderers.include?(:xml), renderers.include?(:csv), e.message]\n  end\nend\n",
+    )
+}
