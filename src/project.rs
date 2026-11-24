@@ -4118,13 +4118,14 @@ fn target_files_inner(
             .map(|s| s.as_str().to_string())
             .collect();
         // Ruby's text-level shake uses a global name set. An optional
-        // predicate on another model must not expose a user's enum override
-        // to shaking; conservatively keep that name on every model.
+        // predicate on another model must not expose a model's own column
+        // predicate (a `def` or an enum label) to shaking; conservatively
+        // keep that name on every model.
         for model in &app.models {
-            for column in model.enums.keys() {
-                let predicate = crate::ident::Symbol::from(format!("{}?", column.as_str()));
-                if crate::lower::model_to_library::model_defines_instance_method(model, &predicate) {
-                    synth_shakeable.remove(predicate.as_str());
+            let Some(table) = app.schema.tables.get(&model.table.0) else { continue };
+            for col in &table.columns {
+                if crate::lower::model_to_library::own_column_predicate(model, col) {
+                    synth_shakeable.remove(&format!("{}?", col.name.as_str()));
                 }
             }
         }
