@@ -4818,8 +4818,8 @@ impl Analyzer {
         // so their expression types are known at each `render` call site. We
         // then harvest the locals each render passes to the target partial,
         // keying by the partial's view name, and analyze partials with that
-        // seed. Nested partial-of-partial isn't handled here (would need a
-        // fixpoint); real-blog's dependency graph is shallow enough to skip.
+        // seed. A partial's own renders seed the partials it renders after
+        // Phase 3b, to a fixpoint (see below).
         let mut partial_locals_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
 
         // Renderer → partials-it-renders edges, harvested as views are
@@ -5069,9 +5069,15 @@ impl Analyzer {
         // and ivar_bindings from the propagated controller context, then
         // analyze.
         let attachable_partial_bindings = crate::lower::attachable::attachable_partial_bindings(app);
-        // Each partial types against the registry and the seeds above alone, so the partials are typed side by side.
-        let mut partials: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| is_partial_view_name(&view.name)).collect();
-        parallel::map(&mut partials, |view| {
+        // The bodies as ingested, so a partial whose locals a nested render
+        // seeds below retypes from scratch rather than over its first typing.
+        let untyped_partials: HashMap<Symbol, Expr> = app
+            .views
+            .iter()
+            .filter(|view| is_partial_view_name(&view.name))
+            .map(|view| (view.name.clone(), view.body.clone()))
+            .collect();
+        let type_partial = |view: &mut crate::dialect::View, locals_by_name: &HashMap<Symbol, HashMap<Symbol, Ty>>| {
             let mut view_ctx = Ctx::default();
             view_ctx.in_view = true; // `yield` here renders to a String
             view_ctx.view_name = Some(view.name.clone());
@@ -5082,7 +5088,7 @@ impl Analyzer {
                 args: vec![].into(),
             });
             view_ctx.constants = global_constants.clone();
-            if let Some(locals) = partial_locals_by_name.get(&view.name) {
+            if let Some(locals) = locals_by_name.get(&view.name) {
                 view_ctx.local_bindings = locals.clone();
             }
             // Partials the FRAMEWORK renders, so no site in the app seeds
@@ -5122,7 +5128,48 @@ impl Analyzer {
                 view_ctx.ivar_bindings = ivars.clone();
             }
             self.body_typer().analyze_expr(&mut view.body, &view_ctx);
-        });
+        };
+        // Each partial types against the registry and the seeds above alone, so the partials are typed side by side.
+        let mut partials: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| is_partial_view_name(&view.name)).collect();
+        parallel::map(&mut partials, |view| type_partial(view, &partial_locals_by_name));
+        drop(partials);
+
+        // A partial rendered from another partial (`articles/_form`
+        // rendering `_field_error`, resource: form.object) takes
+        // its locals from that render, which reads only once its renderer
+        // is typed. Each round harvests the typed partials' render sites,
+        // fills the locals no view or layout typed, and retypes the
+        // partials that gained one, until a round fills nothing; a local
+        // is filled once, so the rounds end, and the depth cap guards a
+        // render cycle as the ivar propagation's does.
+        for _ in 0..16 {
+            let mut nested: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
+            for view in app.views.iter().filter(|view| is_partial_view_name(&view.name)) {
+                extract_partial_render_sites(&view.body, &view.name, &mut nested, &mut Vec::new());
+            }
+            let mut seeded: HashSet<Symbol> = HashSet::default();
+            for (partial, locals) in nested {
+                if !untyped_partials.contains_key(&partial) {
+                    continue;
+                }
+                let entry = partial_locals_by_name.entry(partial.clone()).or_default();
+                for (local, ty) in locals {
+                    if ty.is_unknown() || entry.get(&local).is_some_and(|prev| !prev.is_unknown()) {
+                        continue;
+                    }
+                    entry.insert(local, ty);
+                    seeded.insert(partial.clone());
+                }
+            }
+            if seeded.is_empty() {
+                break;
+            }
+            let mut retype: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| seeded.contains(&view.name)).collect();
+            for view in retype.iter_mut() {
+                view.body = untyped_partials[&view.name].clone();
+            }
+            parallel::map(&mut retype, |view| type_partial(view, &partial_locals_by_name));
+        }
 
         // Record the render-site local types on the App. They already
         // seeded each partial's body typing above; persisting them is
