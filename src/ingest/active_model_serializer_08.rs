@@ -561,6 +561,26 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     if reopened && tree.iter().all(|n| done.contains(n)) {
         app.library_classes.retain(|c| c.name.0.as_str() != SERIALIZER);
     }
+    // `include ActiveModel::SerializerSupport` gives `active_model_serializer`, which the implicit pairs above
+    // answered, and `read_attribute_for_serialization`, `send` by another name, which the expansion reads as a
+    // reader. The gem's module is not emitted, so the include would be an `uninitialized constant` at class load;
+    // an app's own call of either is a method the class does not have, reported as one.
+    for lc in app.library_classes.iter_mut() {
+        let spanned = lc.include_spans.len() == lc.includes.len();
+        let mut at = 0;
+        let spans = std::mem::take(&mut lc.include_spans);
+        lc.includes.retain(|i| {
+            let keep = i.0.as_str().trim_start_matches("::") != "ActiveModel::SerializerSupport";
+            if spanned && keep {
+                lc.include_spans.push(spans[at]);
+            }
+            at += 1;
+            keep
+        });
+        if !spanned {
+            lc.include_spans = spans;
+        }
+    }
     Ok(())
 }
 

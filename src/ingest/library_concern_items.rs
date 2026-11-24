@@ -53,6 +53,7 @@ pub(super) fn splice(app: &mut App) {
                     let ExprNode::Const { path } = &*arg.node else { continue };
                     let segs: Vec<&str> = path.iter().map(|p| p.as_str()).collect();
                     if crate::ingest::util::is_view_helper_marker_include(&segs)
+                        || crate::ingest::util::is_serialization_marker_include(&segs)
                         || crate::ingest::util::is_concern_marker_include(&segs)
                     {
                         continue;

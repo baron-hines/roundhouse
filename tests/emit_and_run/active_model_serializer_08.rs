@@ -804,3 +804,41 @@ fn listed_overlay() -> emit_and_run::Overlay {
 }
 
 const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nb = Article.create!(title: \"<b>&\", body: \"A long body\")\ndumped = MultiJson.dump(PostishSerializer.new(b, add_raw: true))\nraise dumped unless dumped == %Q({\"postish\":{\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"}})\nputs \"listed options passed\"\n";
+
+/// A plain class a serializer renders includes `ActiveModel::Serialization`
+/// (Rails) or `ActiveModel::SerializerSupport` (the gem), as discourse's
+/// `TopicList` and `UserSummary` do: neither is a module the emitted
+/// program has, and the expansion reads attributes by their readers, as
+/// the modules' `send` alias answers. A call of `serializable_hash` on the
+/// class itself stays a method it does not have.
+#[test]
+fn an_active_model_serializer_08_renders_a_class_including_the_serialization_mixins() {
+    let errors = mixin_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = mixin_overlay().run_ruby(MIXIN_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("serialization mixins passed"));
+    let errors = mixin_overlay()
+        .write("app/controllers/stat_dumps_controller.rb", "class StatDumpsController < ApplicationController\n  def show\n    render plain: Stat.new(1).serializable_hash.to_s\n  end\nend\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("serializable_hash")), "{errors:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_serializer_08_renders_a_class_including_the_serialization_mixins_on_spinel() {
+    let run = mixin_overlay().run_spinel_with_db(MIXIN_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("serialization mixins passed"));
+}
+
+fn mixin_overlay() -> emit_and_run::Overlay {
+    overlay()
+        .write("app/models/stat.rb", "class Stat\n  include ActiveModel::Serialization\n\n  attr_reader :n\n\n  def initialize(n)\n    @n = n\n  end\nend\n")
+        .write("app/models/tally.rb", "class Tally\n  include ActiveModel::SerializerSupport\n\n  attr_reader :total\n\n  def initialize(total)\n    @total = total\n  end\nend\n")
+        .write("app/serializers/stat_serializer.rb", "class StatSerializer < ActiveModel::Serializer\n  attributes :n\nend\n")
+        .write("app/serializers/tally_serializer.rb", "class TallySerializer < ActiveModel::Serializer\n  attributes :total\nend\n")
+}
+
+const MIXIN_SCRIPT: &str = "s = StatSerializer.new(Stat.new(3)).as_json(root: false)\nraise s.inspect unless s == { n: 3 }\nt = TallySerializer.new(Tally.new(7)).as_json\nraise t.inspect unless t == { tally: { total: 7 } }\nputs \"serialization mixins passed\"\n";
+
