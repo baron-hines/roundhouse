@@ -61,8 +61,8 @@ fn a_helper_also_called_with_a_built_path_keeps_its_autoload() {
 
 const POSTBOX: &str = "vendor/bundle/ruby/3.4.0/gems/postbox-1.0/lib/postbox.rb";
 
-/// The helper keeps its `autoload` after `edits` to the gem's module.
-fn keeps_its_autoload(edits: &[(&str, &str)]) {
+/// The helper keeps its `autoload` after `edits` to the gem's module; the module's emitted text.
+fn keeps_its_autoload(edits: &[(&str, &str)]) -> String {
     let mut overlay = gem::overlay().edit(
         POSTBOX,
         "  register_autoload :Envelope, \"postbox/envelope\"\n",
@@ -77,6 +77,22 @@ fn keeps_its_autoload(edits: &[(&str, &str)]) {
     let module = postbox_module(&files);
     // A rebound parameter is renamed on emit (`autoload(name, __rh_path)`).
     assert!(module.lines().any(|l| l.trim().starts_with("autoload(name, ")), "the helper's autoload was dropped:\n{module}");
+    module.to_string()
+}
+
+/// The bodies of each emitted `def self.<name>`, in order.
+fn definitions<'a>(module: &'a str, name: &str) -> Vec<Vec<&'a str>> {
+    let header = format!("def self.{name}(");
+    let mut defs = Vec::new();
+    let mut lines = module.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with(&header) {
+            let indent = line.len() - line.trim_start().len();
+            let end = format!("{}end", " ".repeat(indent));
+            defs.push(lines.by_ref().take_while(|l| *l != end).collect());
+        }
+    }
+    defs
 }
 
 /// A built path in an assignment's call is a call of the helper too.
@@ -113,7 +129,7 @@ fn a_helper_that_rebinds_its_path_keeps_its_autoload() {
 /// here: Spinel refuses a redefinition beside a class-instance-variable initializer.
 #[test]
 fn a_helper_defined_twice_keeps_its_autoload() {
-    keeps_its_autoload(&[
+    let module = keeps_its_autoload(&[
         ("  @autoloads = {}\n", "  AUTOLOADS = {}\n"),
         ("    @autoloads[name] = path\n", "    AUTOLOADS[name] = path\n"),
         ("    @autoloads.keys\n", "    AUTOLOADS.keys\n"),
@@ -122,4 +138,9 @@ fn a_helper_defined_twice_keeps_its_autoload() {
             "  def self.register_autoload(name, path)\n    path = \"postbox/\" + path.to_s\n    AUTOLOADS[name] = path\n    autoload(name, path)\n  end\n\n  def self.registered\n",
         ),
     ]);
+    // The later definition is the one Ruby runs: its own body keeps the registration.
+    let defs = definitions(&module, "register_autoload");
+    let later = defs.last().unwrap_or_else(|| panic!("no register_autoload in:\n{module}"));
+    assert!(later.iter().any(|l| l.contains("\"postbox/\"")), "the last definition is not the later one:\n{module}");
+    assert!(later.iter().any(|l| l.trim().starts_with("autoload(name, ")), "the later definition lost its autoload:\n{module}");
 }
