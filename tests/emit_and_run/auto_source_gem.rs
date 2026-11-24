@@ -85,3 +85,15 @@ fn a_gem_file_s_top_level_prepend_is_module_s() {
     let (_emitted, errors) = auto_source_gem::top_level_prepend_overlay().emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
 }
+
+/// A platform constant read in the load-time branch that tests `Socket` for it runs only where it exists; read
+/// anywhere else it stays reported.
+#[test]
+fn a_gem_s_platform_constant_read_under_its_test_is_typed() {
+    let (_emitted, errors) = auto_source_gem::platform_constant_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let errors = auto_source_gem::platform_constant_overlay()
+        .edit("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings/keep_alive.rb", "[Socket::IPPROTO_TCP, Socket::TCP_KEEPINTVL]", "[Socket::SOL_TCP, Socket::TCP_KEEPINTVL]")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): Socket::SOL_TCP")), "{errors:#?}");
+}

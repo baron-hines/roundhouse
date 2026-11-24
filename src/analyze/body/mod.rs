@@ -62,7 +62,7 @@ mod diagnostic;
 pub(crate) use diagnostic::some_operands_take_it;
 mod const_resolution;
 mod lambda_local;
-pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
+pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant, platform_constant_type};
 pub use const_resolution::DefinitionIndex;
 pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
@@ -1989,6 +1989,7 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
+                let platform_guarded = expr.decisions & crate::expr::PLATFORM_GUARDED_CONST != 0;
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -2236,6 +2237,10 @@ impl<'a> BodyTyper<'a> {
                     expr.decisions |= crate::expr::GUARDED_NAME_ERROR;
                     return self.compute(expr, ctx);
                 }
+                let ty = match ty {
+                    Ty::Var { .. } if platform_guarded => const_resolution::platform_constant_type(written_class_id(path).0.as_str()).unwrap_or(ty),
+                    ty => ty,
+                };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,

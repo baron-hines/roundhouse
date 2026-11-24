@@ -117,3 +117,18 @@ pub const TOP_LEVEL_PREPEND_ASSERTIONS: &str = r#"a = Article.new(title: "hello"
 raise a.encoded_title.inspect unless a.encoded_title == "hello!"
 puts "top-level prepend OK"
 "#;
+
+/// redis-client's keep-alive options: a load-time branch per platform, the
+/// Linux one reading `Socket::SOL_TCP` and `Socket::TCP_KEEPIDLE`, which
+/// macOS lacks, after testing `Socket` for them.
+pub fn platform_constant_overlay() -> emit_and_run::Overlay {
+    misnamed_overlay()
+        .write(&format!("{GEMS}/greetings-1.0/lib/greetings/keep_alive.rb"), "require \"socket\"\n\nmodule Greetings\n  class KeepAlive\n    if %i[SOL_TCP TCP_KEEPIDLE].all? { |c| Socket.const_defined? c } # Linux\n      def self.options\n        [Socket::SOL_TCP, Socket::TCP_KEEPIDLE]\n      end\n    elsif Socket.const_defined?(:IPPROTO_TCP) && Socket.const_defined?(:TCP_KEEPINTVL)\n      def self.options\n        [Socket::IPPROTO_TCP, Socket::TCP_KEEPINTVL]\n      end\n    else\n      def self.options\n        []\n      end\n    end\n  end\nend\n")
+        .edit(&format!("{GEMS}/greetings-1.0/lib/greetings.rb"), "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/keep_alive\"\n")
+        .edit("app/models/article.rb", "  def shouted_title\n", "  def keep_alive_options\n    Greetings::KeepAlive.options\n  end\n\n  def shouted_title\n")
+}
+
+pub const PLATFORM_CONSTANT_ASSERTIONS: &str = r#"got = Article.new(title: "hello", body: "a body that is long enough").keep_alive_options
+raise got.inspect unless got.size == 2 && got.all? { |v| v.is_a?(Integer) }
+puts "platform constant OK"
+"#;

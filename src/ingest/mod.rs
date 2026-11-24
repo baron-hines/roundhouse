@@ -109,6 +109,7 @@ pub mod generated_helpers;
 pub mod jbuilder;
 pub mod library_class;
 mod top_level_mixins;
+mod platform_guards;
 mod file_program;
 pub(crate) use file_program::{normalize_source, resolve_gem_require};
 pub(crate) fn source_gems_mount() -> &'static str {

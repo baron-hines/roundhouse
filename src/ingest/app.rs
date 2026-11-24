@@ -3443,6 +3443,7 @@ end
     // known; before the qualification below, which reads them.
     // Before the include splices: an opening a top-level mixin made takes its kind from the declaration it reopens.
     super::top_level_mixins::settle(&mut app);
+    super::platform_guards::mark(&mut app);
     super::guarded_include::splice_guarded_includes(&mut app);
     // Every superclass and mixin, as Rubydex resolved it, before the
     // concern splices and every later consumer look them up by ClassId.

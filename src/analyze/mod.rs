@@ -38,7 +38,7 @@ mod class_new;
 pub(crate) use body::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
-pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
+pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant, platform_constant_type};
 pub use body::DefinitionIndex;
 pub use body::PreparedConstResolver;
 pub mod async_color;
