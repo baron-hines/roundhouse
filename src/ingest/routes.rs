@@ -1536,6 +1536,11 @@ fn route_default_literal(node: &Node<'_>) -> Option<crate::expr::Literal> {
     node.as_nil_node().map(|_| Literal::Nil)
 }
 
+/// Rails' route options a verb reads as itself rather than as a default (`Mapper::Mapping`'s keys).
+fn route_reserved_option(key: &str) -> bool {
+    matches!(key, "anchor" | "module" | "shallow" | "shallow_path" | "shallow_prefix" | "param" | "only" | "except" | "internal" | "format")
+}
+
 /// Literal `defaults:` the table keeps (scope ones are checked per route), and no option the ingesters skip.
 fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
     let default_kept = |default: Node<'_>| empty_route_splat(&default) || default.as_assoc_node().is_some_and(|pair| symbol_value(&pair.key()).is_some_and(|key|
@@ -1557,6 +1562,7 @@ fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
                     && pair.value().as_hash_node().is_some_and(|hash| hash.elements().iter().all(&default_kept)),
                 Some(key) => matches!(key.as_str(), "path" | "as" | "controller" | "action" | "constraints" | "to" | "via")
                     || (http_method_from(method).is_some() && key == "on")
+                    || (http_method_from(method).is_some() && !route_reserved_option(&key) && route_default_literal(&pair.value()).is_some())
                     || (matches!(method, "scope" | "namespace" | "resources" | "resource") && matches!(key.as_str(), "module" | "only" | "except" | "shallow" | "path_names"))
                     || (matches!(method, "resources" | "resource") && matches!(key.as_str(), "param" | "concerns")),
                 None => http_method_from(method).is_some() && !std::mem::replace(&mut path_seen, true)
@@ -4065,6 +4071,10 @@ fn ingest_explicit_route(
                             }
                             constraints.insert(Symbol::from(crate::dialect::FORMAT_REQUIREMENT), crate::dialect::FORMAT_NONE.to_string());
                         }
+                    }
+                    // `get "login" => "static#show", :id => "login"`: Rails' `normalize_defaults` takes every option that is not a Regexp as a default.
+                    other if !route_reserved_option(other) && let Some(literal) = route_default_literal(value) => {
+                        request_defaults.insert(Symbol::from(other), (literal, super::util::node_span(&el, file)));
                     }
                     other => {
                         if let Some(v) = string_value(value) {
