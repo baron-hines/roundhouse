@@ -612,6 +612,8 @@ jobs:
           gem install --no-document --ignore-dependencies responders -v 3.1.1
           # doorkeeper, compiled from source (tests/emit_and_run/doorkeeper.rs).
           gem install --no-document --ignore-dependencies doorkeeper -v 5.8.2
+          # message_bus, compiled from source (tests/emit_and_run/message_bus.rs).
+          gem install --no-document --ignore-dependencies message_bus -v 5.0.0
           # view_component, compiled from source (tests/emit_and_run/view_component.rs).
           gem install --no-document --ignore-dependencies view_component -v 3.23.2
           gem install --no-document --ignore-dependencies method_source -v 1.1.0
