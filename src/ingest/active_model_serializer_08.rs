@@ -1881,7 +1881,8 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         // Every key of a multi-key reader; only the first of `fetch` and the like, whose second is a default.
         let keys: &[ruby_prism::Node<'_>] = match name {
             "values_at" | "slice" | "except" => &args,
-            "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" => &args[..args.len().min(1)],
+            // `options[:include_status] = true` after `super`: the Hash is the caller's, as the gem's `@options = options` keeps it.
+            "[]" | "[]=" | "store" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" => &args[..args.len().min(1)],
             _ => &[],
         };
         let shared = keys.iter().filter_map(symbol_value).find(|k| matches!(k.as_str(), "hash" | "unique_values"));

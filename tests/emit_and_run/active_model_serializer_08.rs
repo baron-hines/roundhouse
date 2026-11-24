@@ -741,3 +741,19 @@ fn an_active_model_serializer_08_deferred_array_over_an_options_local_stays_the_
         .check_errors();
     assert!(errors.iter().any(|e| e.contains("ActiveModel::ArraySerializer")), "{errors:#?}");
 }
+
+/// `options[:include_status] = true` after `super` in `initialize`
+/// (discourse's `UserCardSerializer`): the gem's `@object, @options =
+/// object, options` keeps the caller's Hash, so the write reaches the
+/// serializer's own `include_status?` and the Hash the caller passed.
+#[test]
+fn an_active_model_serializer_08_writing_an_option_in_initialize_lowers() {
+    let status = "class StatusSerializer < ActiveModel::Serializer\n  attributes :id, :status\n\n  def initialize(object, options = {})\n    super\n    options[:include_status] = true\n  end\n\n  def status\n    \"on\"\n  end\n\n  def include_status?\n    options[:include_status]\n  end\nend\n";
+    let overlay = || overlay().write("app/serializers/status_serializer.rb", status);
+    let errors = overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let script = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nopts = {}\ngot = StatusSerializer.new(a, opts).as_json(root: false)\nraise got.inspect unless got == { id: a.id, status: \"on\" }\nraise opts.inspect unless opts[:include_status] == true\nputs \"option write passed\"\n";
+    let run = overlay().run_ruby(script);
+    run.assert_passes();
+    assert!(run.stdout.contains("option write passed"));
+}
