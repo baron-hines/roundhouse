@@ -637,6 +637,15 @@ fn widen_key_contract(app: &App, files: &mut [(String, String)]) -> Result<(), S
         ));
     }
     *relation = relation.replace(ids_narrow, ids_wide);
+    // Relation#uuid_record_key answers a record's key, nil when unsaved.
+    let key_narrow = "    def uuid_record_key: (Base record) -> Integer?\n";
+    let key_wide = "    def uuid_record_key: (Base record) -> (Integer | String)?\n";
+    if !relation.contains(key_narrow) {
+        return Err(format!(
+            "widen_key_contract: relation.rbs no longer declares {key_narrow:?}"
+        ));
+    }
+    *relation = relation.replace(key_narrow, key_wide);
     Ok(())
 }
 
@@ -3558,7 +3567,15 @@ fn target_files_lent(
         return futamura_target_files(app, fixture, None);
     }
     rack_mounts::check_target(app, target)?;
-    let refusals = crate::gems::extension_gem_refusals(app, Some(target.as_str()));
+    // A Rails plugin inferred from the lockfile is analysis's error, which
+    // `--allow-unsupported` downgrades; only these refuse the whole target.
+    // Roda converts the ingest-shape app and runs no type analysis, so no
+    // analysis error reports the reference there: the boundary refuses it.
+    let refusals = if target == BuildTarget::Roda {
+        crate::gems::extension_gem_refusals(app, Some(target.as_str()))
+    } else {
+        crate::gems::extension_gem_boundary_refusals(app, target.as_str())
+    };
     if !refusals.is_empty() {
         let message = refusals.iter().map(|diagnostic| diagnostic.message.as_str()).collect::<Vec<_>>().join("\n");
         for diagnostic in refusals {

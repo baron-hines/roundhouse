@@ -632,6 +632,8 @@ mod hash_fetch_one_arg;
 mod numericality_unknown_option;
 #[path = "emit_and_run/belongs_to_nil_writer.rs"]
 mod belongs_to_nil_writer;
+#[path = "emit_and_run/model_defined_guard.rs"]
+mod model_defined_guard;
 #[path = "emit_and_run/inclusion_duration_literals.rs"]
 mod inclusion_duration_literals;
 #[path = "emit_and_run/validates_constant_splat.rs"]
@@ -22315,6 +22317,8 @@ mod association_scopes;
 mod association_relation_calls;
 #[path = "emit_and_run/concern_association_includers.rs"]
 mod concern_association_includers;
+#[path = "emit_and_run/concern_super_includers.rs"]
+mod concern_super_includers;
 #[path = "emit_and_run/concern_includer_definitions.rs"]
 mod concern_includer_definitions;
 #[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
@@ -22827,3 +22831,5 @@ mod record_as_json_in_literal;
 mod empty_base_list_override;
 #[path = "emit_and_run/relation_argument.rs"]
 mod relation_argument;
+#[path = "emit_and_run/params_permit_key_args.rs"]
+mod params_permit_key_args;

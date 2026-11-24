@@ -699,7 +699,24 @@ fn untyped_subexpressions_baseline() {
     // and `Untyped`) as its callers' rows settle, a move the fixpoint no
     // longer counts toward a pin, so it stays unresolved on this RBS-less
     // probe (+1); migration_runner.rbs types it for the RBS-paired gate.
-    const CEILING: usize = 1465;
+    // MEASURED 1452 on PostgreSQL uuid casts (1451): a record's id under a
+    // uuid column is read on its own arm, `uuid_value_predicate(qcol,
+    // val._primary_key_value)`, as the bound arm already reads it. That is
+    // one more `_primary_key_value` send this RBS-less probe leaves
+    // unresolved (+1 in active_record/relation.rb). base.rbs types it
+    // `Integer` for the RBS-paired gate.
+    // MEASURED 1465 on merging main 81b6491fc (1464) with the uuid casts'
+    // +1 (1452 less 1451), which add up.
+    // MEASURED 1467 on an unsaved record under a uuid column (1465): the
+    // record arm reads `new_record?` and the key's `to_s` before casting
+    // (+2 in active_record/relation.rb), so an unsaved record is
+    // `IS NULL` as in Rails.
+    // MEASURED 1470 on an unsaved record in a uuid IN list (1467): the
+    // list's untyped elements reach `uuid_record_key` (+3 in
+    // active_record/relation.rb), so the record is the list's nil arm.
+    // MEASURED 1471 on merging main 2d9d16d0c (1465) with the uuid casts'
+    // +6 (1470 less 1464), which add up.
+    const CEILING: usize = 1471;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
