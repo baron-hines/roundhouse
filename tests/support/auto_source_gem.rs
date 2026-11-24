@@ -86,3 +86,13 @@ got = [a.encoded_title, a.abstract_encode, a.abstract_deliver, a.cluster_error]
 raise got.inspect unless got == ["hello", "uninitialized constant Greetings::Codec::Base::MustImplement", "Greetings::Backends::Base::MustImplement", nil]
 puts "misnamed gem constant OK"
 "#;
+
+/// message_bus's `MessageBus::BACKENDS = {}`: a constant a gem file assigns
+/// at its top level. Ingest does not carry that write yet, so a read of it
+/// stays an unsupported constant, never the NameError of one nothing defines.
+pub fn top_level_constant_overlay() -> emit_and_run::Overlay {
+    misnamed_overlay()
+        .write(&format!("{GEMS}/greetings-1.0/lib/greetings/registry.rb"), "module Greetings; end\nGreetings::REGISTRY = { plain: \"Plain\" }\n\nmodule Greetings\n  class Registry\n    def self.lookup(name)\n      Greetings::REGISTRY[name]\n    end\n  end\nend\n")
+        .edit(&format!("{GEMS}/greetings-1.0/lib/greetings.rb"), "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/registry\"\n")
+        .edit("app/models/article.rb", "  def shouted_title\n", "  def registered\n    Greetings::Registry.lookup(:plain)\n  end\n\n  def shouted_title\n")
+}

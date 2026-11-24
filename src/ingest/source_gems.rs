@@ -29,6 +29,11 @@ pub(super) struct SourceGem {
 }
 
 impl SourceGem {
+    /// The text of each file the gem compiles, as installed.
+    pub(super) fn texts<V: Vfs + ?Sized>(&self, vfs: &V) -> Vec<String> {
+        self.files.iter().filter_map(|rel| vfs.read_to_string(&self.installed.join(rel)).ok()).collect()
+    }
+
     /// Does the gem define what `path`, one of its files under the mount,
     /// declares before the app's autoloaders are set up? Not for a file only
     /// a feature-name autoload reaches: Zeitwerk sets its own autoload over

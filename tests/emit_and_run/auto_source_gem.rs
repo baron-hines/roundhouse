@@ -66,3 +66,12 @@ fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_is_ruby_s_name_error() {
     let (_emitted, errors) = auto_source_gem::misnamed_overlay().emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
 }
+
+/// A gem's top-level `A::B = …` is a definition: a read of it is not the
+/// NameError of a constant nothing defines (it stays reported until ingest
+/// carries the write).
+#[test]
+fn a_gem_s_top_level_constant_write_is_not_taken_for_absent() {
+    let (_emitted, errors) = auto_source_gem::top_level_constant_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): Greetings::REGISTRY")), "{errors:#?}");
+}
