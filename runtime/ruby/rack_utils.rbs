@@ -1,4 +1,62 @@
 module Rack
+  HTTP_HOST: String
+  HTTP_PORT: String
+  HTTPS: String
+  PATH_INFO: String
+  REQUEST_METHOD: String
+  REQUEST_PATH: String
+  SCRIPT_NAME: String
+  QUERY_STRING: String
+  SERVER_PROTOCOL: String
+  SERVER_NAME: String
+  SERVER_PORT: String
+  HTTP_COOKIE: String
+  CACHE_CONTROL: String
+  CONTENT_LENGTH: String
+  CONTENT_TYPE: String
+  ETAG: String
+  EXPIRES: String
+  SET_COOKIE: String
+  TRANSFER_ENCODING: String
+  GET: String
+  POST: String
+  PUT: String
+  PATCH: String
+  DELETE: String
+  HEAD: String
+  OPTIONS: String
+  CONNECT: String
+  LINK: String
+  UNLINK: String
+  TRACE: String
+  RACK_VERSION: String
+  RACK_TEMPFILES: String
+  RACK_EARLY_HINTS: String
+  RACK_ERRORS: String
+  RACK_LOGGER: String
+  RACK_INPUT: String
+  RACK_SESSION: String
+  RACK_SESSION_OPTIONS: String
+  RACK_SHOWSTATUS_DETAIL: String
+  RACK_URL_SCHEME: String
+  RACK_HIJACK: String
+  RACK_IS_HIJACK: String
+  RACK_RECURSIVE_INCLUDE: String
+  RACK_MULTIPART_BUFFER_SIZE: String
+  RACK_MULTIPART_TEMPFILE_FACTORY: String
+  RACK_RESPONSE_FINISHED: String
+  RACK_PROTOCOL: String
+  RACK_REQUEST_FORM_INPUT: String
+  RACK_REQUEST_FORM_HASH: String
+  RACK_REQUEST_FORM_PAIRS: String
+  RACK_REQUEST_FORM_VARS: String
+  RACK_REQUEST_FORM_ERROR: String
+  RACK_REQUEST_COOKIE_HASH: String
+  RACK_REQUEST_COOKIE_STRING: String
+  RACK_REQUEST_QUERY_HASH: String
+  RACK_REQUEST_QUERY_STRING: String
+  RACK_METHODOVERRIDE_ORIGINAL_METHOD: String
+
   module Utils
     def self.status_code: (Integer | Symbol status) -> Integer
     def self.q_values: (String? q_value_header) -> Array[[String?, Float]]

@@ -30,6 +30,8 @@ module Db
   def self.hold_slot: (Integer, bool) -> nil
   def self.leave_slot: () -> nil
   def self.transaction_open?: () -> bool
+  # Whether this thread leases a connection (a request, a `with_connection` block).
+  def self.in_lease?: () -> bool
   def self.close: () -> void
   def self.exec: (String) -> void
   def self.prepare: (String) -> Integer

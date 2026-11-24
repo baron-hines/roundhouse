@@ -560,6 +560,23 @@ fn framework_method(operand: &Expr) -> Option<(Vec<String>, &'static str)> {
     methods.iter().find(|m| **m == method.as_str()).map(|m| (segments, *m))
 }
 
+/// Class methods Rails 8.1 no longer defines, which a gem asks `defined?` for to tell Rails versions apart: Rails 7.2
+/// moved the connection clearing of `ActiveRecord::Base` to its connection handler (message_bus's
+/// `elsif defined? ActiveRecord::Base.clear_active_connections!`).
+const FRAMEWORK_REMOVED_METHODS: &[(&str, &[&str])] = &[(
+    "ActiveRecord::Base",
+    &["clear_active_connections!", "clear_reloadable_connections!", "clear_all_connections!", "flush_idle_connections!"],
+)];
+
+fn removed_framework_method(operand: &Expr) -> Option<Vec<String>> {
+    let ExprNode::Send { recv: Some(r), method, block: None, .. } = &*operand.node else { return None };
+    let ExprNode::Const { path } = &*r.node else { return None };
+    let segments: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
+    let name = segments.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join("::");
+    let (_, methods) = FRAMEWORK_REMOVED_METHODS.iter().find(|(c, _)| *c == name)?;
+    methods.contains(&method.as_str()).then_some(segments)
+}
+
 fn framework_answer(e: &Expr) -> Option<bool> {
     let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return None };
     if method.as_str() != "respond_to?" {
@@ -616,6 +633,13 @@ fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool, cond: bo
             && facts.decide(owner, &path, lt) == Some(true)
         {
             *e = if cond { lit(e, Literal::Bool { value: true }, Ty::Bool) } else { lit(e, Literal::Str { value: "method".into() }, Ty::Str) };
+            return true;
+        }
+        // nil where the framework is loaded, as Rails answers; an absent one is left to Ruby as above.
+        if let Some(path) = removed_framework_method(operand)
+            && facts.decide(owner, &path, lt) == Some(true)
+        {
+            *e = lit(e, Literal::Nil, Ty::Nil);
             return true;
         }
         if let ExprNode::Const { path } = &*operand.node {

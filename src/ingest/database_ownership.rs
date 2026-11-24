@@ -187,6 +187,12 @@ fn calls_named(expr: &Expr, names: &[&str], out: &mut Vec<(Span, String)>) {
 /// it. A call on another object, or without those keywords, is the
 /// app's own method of the same name.
 fn switches_in(expr: &Expr, routes: Option<&DatabaseRoutes>, out: &mut Vec<(Span, String, String)>) {
+    if let Some(args) = handler_release_args(expr) {
+        for arg in args {
+            switches_in(arg, routes, out);
+        }
+        return;
+    }
     if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node {
         let name = method.as_str();
         let on_class = recv.as_ref().is_none_or(|r| matches!(*r.node, ExprNode::SelfRef | ExprNode::Const { .. }));
@@ -246,10 +252,27 @@ fn switches_in(expr: &Expr, routes: Option<&DatabaseRoutes>, out: &mut Vec<(Span
     expr.node.for_each_child(&mut |child| switches_in(child, routes, out));
 }
 
+/// `ActiveRecord::Base.connection_handler.clear_active_connections!(…)`, its arguments: the one call on the handler the
+/// runtime carries (`ActiveRecord::ConnectionAdapters::ConnectionHandler`), which switches nothing.
+fn handler_release_args(expr: &Expr) -> Option<&[Expr]> {
+    let ExprNode::Send { recv: Some(handler), method, args, block: None, .. } = &*expr.node else { return None };
+    let ExprNode::Send { recv: Some(base), method: get, args: none, block: None, .. } = &*handler.node else { return None };
+    let ExprNode::Const { path } = &*base.node else { return None };
+    let on_base = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).eq(["ActiveRecord", "Base"]);
+    (on_base && method.as_str() == "clear_active_connections!" && get.as_str() == "connection_handler" && none.is_empty())
+        .then_some(args.as_slice())
+}
+
 /// Every switch in a body a routed app is not carried in (a view, a seed,
 /// a test helper): a [`SWITCHES`] call on a class, whatever it passes,
 /// and a writing block ingest read as its body.
 fn switches_aside(expr: &Expr, out: &mut Vec<(Span, String, String)>) {
+    if let Some(args) = handler_release_args(expr) {
+        for arg in args {
+            switches_aside(arg, out);
+        }
+        return;
+    }
     let name = match &*expr.node {
         ExprNode::Send { recv, method, .. }
             if SWITCHES.contains(&method.as_str()) && recv.as_ref().is_none_or(|r| matches!(*r.node, ExprNode::SelfRef | ExprNode::Const { .. })) =>

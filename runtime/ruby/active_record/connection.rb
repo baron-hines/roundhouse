@@ -840,6 +840,11 @@ module ActiveRecord
       connection
     end
 
+    # Rails' `connection_handler`, for the call a request's end makes of it (message_bus's `close_db_connection!`).
+    def self.connection_handler
+      ActiveRecord::ConnectionAdapters::ConnectionHandler.shared
+    end
+
     # Rails' `with_connection` holds one connection for its block: the
     # handle's slot, leased once, so each statement through it is on that
     # connection (a raw BEGIN carries to the next one). The block's value
@@ -3046,6 +3051,27 @@ module ActiveRecord
     def cache_key_with_version
       version = cache_version
       version.nil? ? cache_key : "#{cache_key}-#{version}"
+    end
+  end
+end
+
+module ActiveRecord
+  module ConnectionAdapters
+    # Rails' connection handler, with the one call a request's end makes of it. This runtime leases a connection only
+    # for a `with_connection` block, so the thread holds none to give back; the query cache goes off for the rest of
+    # the request, as each pool's `disable_query_cache!` turns it off in Rails.
+    class ConnectionHandler
+      def self.shared
+        @shared ||= ConnectionHandler.new
+      end
+
+      # nil, not the pools Rails' `each` hands back: this runtime has no pool objects to answer with.
+      def clear_active_connections!(role = nil)
+        # Only on a thread that leases one: the replay cache lives on the leased connection, so another has none on.
+        return nil unless Db.in_lease?
+        Db.query_cache_end if Db.query_cache_enabled?
+        nil
+      end
     end
   end
 end

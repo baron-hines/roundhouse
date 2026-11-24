@@ -1235,6 +1235,8 @@ pub fn insert_db_stub(
         ("query_cache_begin", Ty::Nil),
         ("query_cache_end", Ty::Nil),
         ("query_cache_enabled?", Ty::Bool),
+        // Whether this thread leases a connection (`ConnectionHandler#clear_active_connections!` asks).
+        ("in_lease?", Ty::Bool),
     ] {
         db_info.class_methods.insert(Symbol::from(name), fn_sig(vec![], ret));
     }

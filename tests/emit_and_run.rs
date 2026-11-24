@@ -22261,6 +22261,8 @@ mod concern_class_settings;
 mod load_time_constants;
 #[path = "emit_and_run/doorkeeper.rs"]
 mod doorkeeper;
+#[path = "emit_and_run/message_bus.rs"]
+mod message_bus;
 #[path = "emit_and_run/render_object.rs"]
 mod render_object;
 #[path = "support/ordered_options_app.rs"]
@@ -23002,5 +23004,32 @@ fn renderer_constants_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app().write(
         "app/models/renderer_probe.rb",
         "class RendererProbe\n  def self.report\n    raise ActionController::MissingRenderer.new(:csv)\n  rescue LoadError => e\n    renderers = ActionController::Renderers::RENDERERS\n    [renderers.include?(:json), renderers.include?(:js), renderers.include?(:xml), renderers.include?(:csv), e.message]\n  end\nend\n",
+    )
+}
+
+/// What a gem's Rack middleware asks of Rack and Rails at a request's end (message_bus's): rack's env key constants,
+/// the connection handler's `clear_active_connections!`, and `defined?` of the `ActiveRecord::Base` method Rails 7.2
+/// moved to the handler, which Rails 8.1 answers nil.
+#[test]
+fn a_middleware_s_rack_and_connection_calls_answer_as_rails_does() {
+    let run = middleware_calls_app().run_ruby(MIDDLEWARE_CALLS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("middleware calls passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_middleware_s_rack_and_connection_calls_answer_as_rails_does_on_spinel() {
+    let run = middleware_calls_app().run_spinel(MIDDLEWARE_CALLS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("middleware calls passed"));
+}
+
+const MIDDLEWARE_CALLS_SCRIPT: &str = "got = ConnectionProbe.report\nraise got.inspect unless got == [\"rack.session.options\", \"rack.input\", nil, :handler]\nputs \"middleware calls passed\"\n";
+
+fn middleware_calls_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write(
+        "app/models/connection_probe.rb",
+        "class ConnectionProbe\n  def self.report\n    [Rack::RACK_SESSION_OPTIONS, Rack::RACK_INPUT, ActiveRecord::Base.connection_handler.clear_active_connections!(:all), released]\n  end\n\n  def self.released\n    if defined? ActiveRecord::Base.connection_handler\n      ActiveRecord::Base.connection_handler.clear_active_connections!(:all)\n      :handler\n    elsif defined? ActiveRecord::Base.clear_active_connections!\n      ActiveRecord::Base.clear_active_connections!\n      :base\n    end\n  end\nend\n",
     )
 }
