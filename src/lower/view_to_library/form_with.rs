@@ -1129,22 +1129,20 @@ fn classify_form_with_components(
     }
     .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
     let typed_class = typed_full.as_deref().map(|full| last_segment(full).to_string());
-    // The local's name when neither the class nor the directory names a
-    // route: campfire's `rooms/layouts/_form` is handed a `Rooms::Open`
-    // (or `Rooms::Closed`) `room`, and neither `opens_path` nor
-    // `rooms_layouts_path` is a route where `rooms_path` is.
-    // `rooms/directs/new` keeps its directory's `rooms_directs_path`.
-    let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
-    let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
-    // A typed record takes its local's route only when the directory
-    // names none and its class IS that local's model (`Rooms::Open <
-    // Room` handed as `room`; `rooms/directs/new`'s `Rooms::Direct`
-    // keeps its routed directory): a `Post` handed as `user` posting to
+    // The record's local's name is the fallback route. A typed record
+    // takes it only when the directory names no route and its class IS
+    // that local's model: campfire's `rooms/layouts/_form` is handed a
+    // `Rooms::Open < Room` as `room`, and neither `opens_path` nor
+    // `rooms_layouts_path` is a route where `rooms_path` is, while
+    // `rooms/directs/new`'s `Rooms::Direct` keeps its directory's
+    // `rooms_directs_path`. A `Post` handed as `user` posting to
     // `users_path` would be silently wrong where the unrouted `posts_path`
     // fails loudly. An untyped record has only its name to go by, and it
     // wins over the directory as it always has (`posts/_form` handed a
     // `user` posts to `users_path`); the partial's own emission, which
     // serves every render, types campfire's `room` as nothing.
+    let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
+    let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
     let by_local = record_local_name(&model).filter(|local| match typed_full.as_deref() {
         None => true,
         Some(full) => !directory_known && {
