@@ -791,6 +791,12 @@ fn an_active_model_serializer_08_reading_options_through_a_literal_list_lowers()
     let _ = roundhouse::ingest::ingest_app_from_tree(tree(&rebound));
     let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
     assert!(ledger.iter().any(|e| e.contains("options.include?") || e.contains("[](:hash)") || e.contains("include?(:hash)")), "{ledger:#?}");
+    // The list assigned again after the method reads from it: the method runs with the later list.
+    let reassigned = postish("add_raw\n    add_title").replace("  def raw\n", "  INSTANCE_VARS = %i[hash]\n\n  def raw\n");
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree(&reassigned));
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("is assigned again after a method reads options keys from it")), "{ledger:#?}");
 }
 
 #[test]

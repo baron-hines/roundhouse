@@ -4423,7 +4423,11 @@ fn walk_decl_body_with_visibility<'pr>(
                                     && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
                                     && !crate::ingest::util::is_rails_mounted_helpers_chain(&arg)
                             }) {
-                                if let Ok(e) = ingest_expr(&stmt, file) {
+                                if let Ok(mut e) = ingest_expr(&stmt, file) {
+                                    // Not a marker the include list drops: replayed, its namespace is one no target ships.
+                                    if let ExprNode::Send { args, .. } = &mut *e.node {
+                                        args.retain(|a| !matches!(&*a.node, ExprNode::Const { path } if crate::ingest::util::is_serialization_marker_include(&path.iter().map(|p| p.as_str()).collect::<Vec<_>>())));
+                                    }
                                     out.unknown_calls.push(e);
                                 }
                             }

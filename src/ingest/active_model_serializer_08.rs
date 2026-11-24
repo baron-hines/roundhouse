@@ -726,6 +726,9 @@ struct Walk<'a> {
     extra: Vec<String>,
     /// Constants the body assigns a literal list of Symbols, by name.
     lists: HashMap<String, Vec<String>>,
+    /// The list constants a method reads an options key from (`LIST.each { |k| options[k] }`): a later write would
+    /// change the keys the method reads when it runs, which is after the whole body.
+    keyed_lists: HashSet<String>,
     /// Each class macro a tree class defines (`def self.staff_attributes(*attrs)`): its classes and their sources.
     macros: &'a HashMap<String, Vec<(String, usize)>>,
     /// The constants the tree's class bodies assign, by full name.
@@ -764,7 +767,7 @@ fn collect(
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new(), concern: false, implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), keyed_lists: HashSet::default(), macros, consts, lineage, expanded: Vec::new(), concern: false, implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
@@ -850,12 +853,16 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             if let Some((call, at)) = calls.found {
                 return Err(refuse(source, at, &format!("`{call}` is the gem's, outside the subset")));
             }
+            ctx.keyed_lists.extend(calls.keyed);
             ctx.defs.push(Def { name: method, at, visible: ctx.visible, supers: calls.supers, from_module: matches!(mode, Mode::Module) });
             continue;
         }
         // Every write replaces the list: `FIELDS = [].freeze` after `FIELDS = [:title]` declares nothing.
         if let Some(w) = stmt.as_constant_write_node() {
             let name = constant_id_str(&w.name()).to_string();
+            if ctx.keyed_lists.contains(&name) {
+                return Err(fail(&format!("`{name}` is assigned again after a method reads options keys from it")));
+            }
             match symbol_list(&w.value()) {
                 Some(names) => ctx.lists.insert(name, names),
                 None => ctx.lists.remove(&name),
@@ -1890,8 +1897,10 @@ struct GemCalls {
     /// The class's literal Symbol-list constants that hold none of the keys the gem adds, and the class's own name.
     safe_lists: HashSet<String>,
     owner: String,
-    /// The parameter of each `LIST.each` block the walk is inside: a key from one of those lists.
-    listed: Vec<String>,
+    /// The parameter of each `LIST.each` block the walk is inside, with its list: a key from one of those lists.
+    listed: Vec<(String, String)>,
+    /// The lists a key read here came from.
+    keyed: HashSet<String>,
     /// The listed parameters the block assigns: no longer a key from the list.
     rebound: HashSet<String>,
 }
@@ -1899,24 +1908,25 @@ struct GemCalls {
 impl GemCalls {
     fn new(option_locals: Vec<String>, lists: &HashMap<String, Vec<String>>, owner: &str) -> Self {
         let safe_lists = lists.iter().filter(|(_, names)| !names.iter().any(|n| matches!(n.as_str(), "hash" | "unique_values"))).map(|(k, _)| k.clone()).collect();
-        GemCalls { found: None, supers: false, option_locals, safe_lists, owner: owner.rsplit("::").next().unwrap_or(owner).to_string(), listed: Vec::new(), rebound: HashSet::default() }
+        GemCalls { found: None, supers: false, option_locals, safe_lists, owner: owner.rsplit("::").next().unwrap_or(owner).to_string(), listed: Vec::new(), keyed: HashSet::default(), rebound: HashSet::default() }
     }
 
     fn rebind(&mut self, name: String) {
-        if self.listed.contains(&name) {
+        if self.listed.iter().any(|(n, _)| *n == name) {
             self.rebound.insert(name);
         }
     }
 
-    /// `LIST` or `Owner::LIST`, one of the class's safe lists.
-    fn safe_list(&self, node: &ruby_prism::Node<'_>) -> bool {
+    /// `LIST` or `Owner::LIST`, one of the class's safe lists: its name.
+    fn list_name(&self, node: &ruby_prism::Node<'_>) -> Option<String> {
         if let Some(read) = node.as_constant_read_node() {
-            return self.safe_lists.contains(constant_id_str(&read.name()));
+            let name = constant_id_str(&read.name()).to_string();
+            return self.safe_lists.contains(&name).then_some(name);
         }
-        let Some(path) = node.as_constant_path_node() else { return false };
-        let named = path.name().is_some_and(|n| self.safe_lists.contains(constant_id_str(&n)));
+        let path = node.as_constant_path_node()?;
+        let name = constant_id_str(&path.name()?).to_string();
         let own = path.parent().is_some_and(|p| p.as_constant_read_node().is_some_and(|r| constant_id_str(&r.name()) == self.owner));
-        named && own
+        (own && self.safe_lists.contains(&name)).then_some(name)
     }
 }
 
@@ -1940,20 +1950,23 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         let on_options = node.receiver().is_some_and(|r| options_read(&r, &self.option_locals));
         // `PostSerializer::INSTANCE_VARS.each { |name| opts[name] }`: a key from a literal list the gem's keys are not in.
         let listed = |k: &ruby_prism::Node<'_>| {
-            k.as_local_variable_read_node().is_some_and(|l| {
+            k.as_local_variable_read_node().and_then(|l| {
                 let name = constant_id_str(&l.name());
-                self.listed.iter().any(|n| n == name) && !self.rebound.contains(name)
+                (!self.rebound.contains(name)).then(|| self.listed.iter().rev().find(|(n, _)| n == name).map(|(_, list)| list.clone())).flatten()
             })
         };
+        let mut keyed = Vec::new();
         if self.found.is_none() && on_options {
             if let Some(key) = shared {
                 self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
-            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some() || listed(k)) {
+            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some() || listed(k).map(|list| keyed.push(list)).is_some()) {
                 // The whole Hash (`opts.size`, `opts.keys`) or a computed key: it may see the keys the gem adds.
                 self.found = Some((format!("options.{name}"), node.location().start_offset()));
             }
         }
-        let param = (name == "each" && node.arguments().is_none() && node.receiver().is_some_and(|r| self.safe_list(&r)))
+        self.keyed.extend(keyed);
+        let list = node.receiver().and_then(|r| self.list_name(&r));
+        let param = (name == "each" && node.arguments().is_none() && list.is_some())
             .then(|| node.block().and_then(|b| b.as_block_node()))
             .flatten()
             .and_then(|b| b.parameters())
@@ -1964,7 +1977,7 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
                 _ => None,
             });
         let pushed = param.is_some();
-        self.listed.extend(param);
+        self.listed.extend(param.map(|p| (p, list.clone().unwrap_or_default())));
         ruby_prism::visit_call_node(self, node);
         if pushed {
             self.listed.pop();

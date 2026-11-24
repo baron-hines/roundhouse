@@ -1422,3 +1422,16 @@ fn a_top_level_data_factory_is_rejected_before_unverified_target_emission() {
         );
     }
 }
+
+/// A computed include replayed as a call keeps no `ActiveModel::Serialization`
+/// argument: the marker the include list drops would name a namespace no
+/// target ships when the call runs.
+#[test]
+fn a_replayed_include_drops_the_serialization_marker() {
+    let source = b"class Stat < Base\n  include ActiveModel::Serialization, Helpers.mixin\nend\n";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let stat = classes.iter().find(|c| c.name.0.as_str() == "Stat").expect("class");
+    let replayed: Vec<String> = stat.unknown_calls.iter().map(|e| format!("{:?}", e.node)).collect();
+    assert!(!replayed.is_empty(), "the computed include is replayed");
+    assert!(replayed.iter().all(|r| !r.contains("Serialization")), "{replayed:#?}");
+}
