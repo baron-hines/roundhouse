@@ -5155,8 +5155,10 @@ impl Analyzer {
                 let entry = partial_locals_by_name.entry(partial.clone()).or_default();
                 for (local, ty) in locals {
                     // Not `Array[unknown]` either: filled once, it would keep
-                    // out the `Array[Article]` a later round reads.
-                    if ty.mentions_unknown() || entry.get(&local).is_some_and(|prev| !prev.is_unknown()) {
+                    // out the `Array[Article]` a later round reads. A seed
+                    // that is itself `Array[unknown]` (`items: []`) gives way
+                    // to a known one; once known, a local is never refilled.
+                    if ty.mentions_unknown() || entry.get(&local).is_some_and(|prev| !prev.mentions_unknown()) {
                         continue;
                     }
                     entry.insert(local, ty);

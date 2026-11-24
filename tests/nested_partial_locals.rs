@@ -131,3 +131,84 @@ fn a_retyped_partial_keeps_its_own_format_s_body() {
         .run_test(CONTROLLER_TEST)
         .assert_passes();
 }
+
+fn is_array_of_article(ty: &Option<Ty>) -> bool {
+    matches!(ty, Some(Ty::Array { elem }) if matches!(&**elem, Ty::Class { id, .. } if id.0.as_str() == "Article"))
+}
+
+/// Two sites in one partial hand the leaf the same local: the later
+/// site's `Array[unknown]` (`items: []`) does not erase the earlier
+/// site's `Array[Article]`, round after round.
+#[test]
+fn a_later_partly_unknown_container_keeps_the_earlier_element_type() {
+    let ty = local_type(
+        "<%= render \"middle\", resource: form.object %>",
+        &[
+            (
+                "app/views/articles/_middle.html.erb",
+                "<%= render \"leaf\", items: [resource] %>\n<%= render \"leaf\", items: [] %>\n",
+            ),
+            ("app/views/articles/_leaf.html.erb", "<% items.each do |item| %><p><%= item.title %></p><% end %>\n"),
+        ],
+        "articles/_leaf",
+        "items",
+    );
+    assert!(is_array_of_article(&ty), "expected items : Array[Article], got {ty:?}");
+}
+
+/// A view's `items: []` seeds the leaf's local as `Array[unknown]`;
+/// that partly known seed gives way to the `Array[Article]` a nested
+/// render reads, where a fully known seed would hold.
+#[test]
+fn a_partly_unknown_view_seed_gives_way_to_a_nested_known_type() {
+    let render_form = "  <%= render \"form\", article: @article %>\n";
+    let (_emitted, app, errors) = emit_and_run::real_blog()
+        .edit("app/views/articles/new.html.erb", render_form, &format!("{render_form}  <%= render \"leaf\", items: [] %>\n"))
+        .edit(FORM, TITLE_FIELD, &format!("{TITLE_FIELD}    <%= render \"middle\", resource: form.object %>\n"))
+        .write("app/views/articles/_middle.html.erb", "<%= render \"leaf\", items: [resource] %>\n")
+        .write("app/views/articles/_leaf.html.erb", "<% items.each do |item| %><p><%= item.title %></p><% end %>\n")
+        .emit_with_app(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "emit errors: {errors:?}");
+    let ty = app
+        .partial_local_types
+        .get(&Symbol::from("articles/_leaf"))
+        .and_then(|locals| locals.get(&Symbol::from("items")))
+        .cloned();
+    assert!(is_array_of_article(&ty), "expected items : Array[Article], got {ty:?}");
+}
+
+/// A form whose record's class names its directory (`features/_form`
+/// handed a `Feature` `article`) where neither is a route still tries
+/// the local's name: campfire's `opens/_form` shape, a `Rooms::Open`
+/// `room` posting to `rooms_path`. The class matching the directory
+/// stopped the search and kept the unrouted `features_path`.
+#[test]
+fn a_form_whose_class_names_an_unrouted_directory_posts_to_its_local_s_route() {
+    let heading = "  <h1 class=\"font-bold text-4xl\"><%= @article.title %></h1>\n";
+    let (emitted, _app, errors) = emit_and_run::real_blog()
+        .write("app/models/feature.rb", "class Feature < Article\nend\n")
+        .write("app/views/features/_form.html.erb", "<%= form_with model: article do |form| %>\n  <%= form.text_field :title %>\n<% end %>\n")
+        .edit("app/views/articles/show.html.erb", heading, &format!("{heading}  <%= render \"features/form\", article: Feature.new %>\n"))
+        .emit_with_app(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "emit errors: {errors:?}");
+    let views = walk(&emitted);
+    let form = views
+        .iter()
+        .find(|(path, _)| path.contains("features") && path.contains("form"))
+        .unwrap_or_else(|| panic!("no emitted features form among {:?}", views.iter().map(|(p, _)| p).collect::<Vec<_>>()));
+    assert!(!form.1.contains("features_path") && !form.1.contains("feature_path"), "unrouted helper in {}:\n{}", form.0, form.1);
+    assert!(form.1.contains("articles_path"), "expected articles_path in {}:\n{}", form.0, form.1);
+}
+
+fn walk(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else if path.extension().is_some_and(|e| e == "rb") {
+            out.push((path.display().to_string(), std::fs::read_to_string(&path).unwrap_or_default()));
+        }
+    }
+    out
+}

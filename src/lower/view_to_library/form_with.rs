@@ -1139,8 +1139,11 @@ fn classify_form_with_components(
     for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);
+        // The class naming the directory proves nothing when the directory
+        // is no route (`opens/_form` handed a `Rooms::Open` `room`): the
+        // local still gets its look.
         if rec_plural == plural_owned {
-            break;
+            continue;
         }
         if known(&rec_plural) || known(&rec_singular) {
             plural_owned = rec_plural;
