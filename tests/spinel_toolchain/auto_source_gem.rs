@@ -37,3 +37,12 @@ fn a_gem_s_constant_write_into_another_class_runs_natively() {
     run.assert_passes();
     assert!(run.stdout.contains("top-level constant OK"), "{}", run.stdout);
 }
+
+/// The native half of `emit_and_run::auto_source_gem::a_gem_s_platform_constant_read_under_its_test_is_typed`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_gem_s_platform_constant_read_under_its_test_runs_natively() {
+    let run = auto_source_gem::platform_constant_overlay().run_spinel(auto_source_gem::PLATFORM_CONSTANT_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("platform constant OK"), "{}", run.stdout);
+}
