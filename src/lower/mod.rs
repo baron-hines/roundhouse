@@ -137,6 +137,7 @@ pub mod route_param_recall;
 pub mod expect_string_key;
 pub mod defined_ivar_memo;
 pub mod defined_const_fold;
+mod diverging_args;
 pub mod controller_class_render;
 pub mod dirty_predicate_kwargs;
 pub mod job_test_only;
@@ -351,6 +352,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // pruned. First, so every later pass (and the spinel refusal of a
     // runtime `defined?`) sees only the code that can run.
     ("defined_const_fold", &[]),
+    // A call whose argument is Ruby's NameError raises there: after the fold, which may leave such a read live.
+    ("diverging_args", &["defined_const_fold"]),
     // Deletes every class extending a Rails base the runtime does not
     // port (`ApplicationMailbox < ActionMailbox::Base`) before any pass
     // ledgers residue for a body that is not going to emit.
@@ -879,6 +882,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     crate::timings::lap_start();
     defined_const_fold::apply_defined_const_fold(app);
     ran!("defined_const_fold");
+    diverging_args::apply(app);
+    ran!("diverging_args");
     let mut diags = unported_rails_subclasses::apply_unported_rails_subclass_drop(app);
     ran!("unported_rails_subclasses");
     spliced_concern_bodies::apply_spliced_concern_body_prune(app);
