@@ -1147,10 +1147,10 @@ fn classify_form_with_components(
     // serves every render, types campfire's `room` as nothing.
     let by_local = record_local_name(&model).filter(|local| match typed_full.as_deref() {
         None => true,
-        Some(full) => {
+        Some(full) => !directory_known && {
             let local = singularize(&snake_case(local));
-            !directory_known && ctx.model_ancestors.get(full).is_some_and(|ancestors| ancestors.contains(&local))
-        }
+            ctx.model_ancestors.get(full).is_some_and(|ancestors| ancestors.contains(&local))
+        },
     });
     for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
