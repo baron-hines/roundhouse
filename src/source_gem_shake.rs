@@ -595,11 +595,21 @@ impl<'a> Gems<'a> {
 
     /// The modules a class body `extend`s: their instance methods are the class's own class methods.
     fn extends_of(&self, name: &str) -> Vec<String> {
+        self.body_mixins_of(name, "extend")
+    }
+
+    /// The modules a class body `prepend`s (redis's `RedisClient::Config.prepend(Redis::LibIdentity)`, read as an
+    /// opening): Ruby looks a method up in them ahead of the class.
+    fn prepends_of(&self, name: &str) -> Vec<String> {
+        self.body_mixins_of(name, "prepend")
+    }
+
+    fn body_mixins_of(&self, name: &str, verb: &str) -> Vec<String> {
         let mut out = Vec::new();
         for c in self.entries.get(name).into_iter().flatten() {
             for call in &c.unknown_calls {
                 let ExprNode::Send { recv, method, args, .. } = &*call.node else { continue };
-                if method.as_str() != "extend" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+                if method.as_str() != verb || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
                     continue;
                 }
                 for a in args {
@@ -672,6 +682,11 @@ impl<'a> Gems<'a> {
             if guard > 64 || out.contains(&c) {
                 break;
             }
+            for m in self.prepends_of(&c).into_iter().rev() {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
             out.push(c.clone());
             let mut stack = self.includes_of(&c);
             stack.reverse();
@@ -693,6 +708,7 @@ impl<'a> Gems<'a> {
         let mut more: Vec<String> = Vec::new();
         more.extend(self.parent_of(c));
         more.extend(self.includes_of(c));
+        more.extend(self.prepends_of(c));
         more.extend(self.extends_of(c));
         let mut outer = c;
         while let Some((o, _)) = outer.rsplit_once("::") {

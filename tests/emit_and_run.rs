@@ -22944,3 +22944,37 @@ fn data_include_overlay() -> emit_and_run::Overlay {
         .write("app/models/kit/names.rb", "module Kit\n  class Names\n    def self.all\n      [Kit::Name::Field.new(value: \"f\", type: \"t\").convert { |v| v * 2 }.type, Kit::Name::Type.new(value: \"y\").convert_type { |v| v.upcase }.value]\n    end\n  end\nend\n")
 }
 
+
+/// An app file's top-level `Foo.prepend(Bar)` beside `module Bar`: Ruby runs
+/// Module#prepend as the file loads. It was dropped from the emitted tree
+/// with no diagnostic; it is now the class's own `prepend Bar`. A target the
+/// program does not declare is reported.
+#[test]
+fn an_app_file_s_top_level_prepend_runs() {
+    let errors = top_level_prepend_app().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = top_level_prepend_app().run_ruby(TOP_LEVEL_PREPEND_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("app prepend passed"));
+    let errors = emit_and_run::empty_app()
+        .write("app/models/bar.rb", "module Bar\n  def hi = \"bar\"\nend\n\nNowhere.prepend(Bar)\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`Nowhere` is no class or module the program declares")), "{errors:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_app_file_s_top_level_prepend_runs_on_spinel() {
+    let run = top_level_prepend_app().run_spinel(TOP_LEVEL_PREPEND_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("app prepend passed"));
+}
+
+const TOP_LEVEL_PREPEND_SCRIPT: &str = "got = [Greeter.new.hi, Greeter.new.respond_to?(:wave)]\nraise got.inspect unless got == [[\"greeter\", \"loud\"], true]\nputs \"app prepend passed\"\n";
+
+fn top_level_prepend_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/greeter.rb", "class Greeter\n  def hi = [\"greeter\"]\nend\n")
+        .write("app/models/loud.rb", "module Loud\n  def hi = super + [\"loud\"]\nend\n\nGreeter.prepend(Loud)\n")
+        .write("app/models/waving.rb", "module Waving\n  def wave = true\nend\n\nGreeter.include(Waving)\n")
+}

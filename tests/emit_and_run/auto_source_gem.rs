@@ -75,3 +75,10 @@ fn a_gem_s_top_level_constant_write_is_not_taken_for_absent() {
     let (_emitted, errors) = auto_source_gem::top_level_constant_overlay().emit(BuildTarget::Spinel);
     assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): Greetings::REGISTRY")), "{errors:#?}");
 }
+
+/// A gem file's top-level `Klass.prepend(Mod)` is Module#prepend, run as the file loads.
+#[test]
+fn a_gem_file_s_top_level_prepend_is_module_s() {
+    let (_emitted, errors) = auto_source_gem::top_level_prepend_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}

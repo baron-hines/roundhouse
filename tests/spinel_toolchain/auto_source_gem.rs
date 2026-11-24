@@ -18,3 +18,4 @@ fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_raises_name_error_natively()
     run.assert_passes();
     assert!(run.stdout.contains("misnamed gem constant OK"), "{}", run.stdout);
 }
+

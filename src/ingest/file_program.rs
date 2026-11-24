@@ -260,6 +260,10 @@ fn program_items(
             items.push(branch);
             continue;
         }
+        // Not as the statement: the opening of its receiver runs it (`top_level_mixins`), on every tree.
+        if super::top_level_mixins::is_mixin(&stmt) {
+            continue;
+        }
         if is_file_return(&stmt) {
             items.push(ProgramItem::NotCarried {
                 span: span_of(&stmt),

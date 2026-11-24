@@ -96,3 +96,17 @@ pub fn top_level_constant_overlay() -> emit_and_run::Overlay {
         .edit(&format!("{GEMS}/greetings-1.0/lib/greetings.rb"), "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/registry\"\n")
         .edit("app/models/article.rb", "  def shouted_title\n", "  def registered\n    Greetings::Registry.lookup(:plain)\n  end\n\n  def shouted_title\n")
 }
+
+/// redis's `RedisClient::Config.prepend(Redis::LibIdentity)`: a gem file's
+/// top-level mixin of its own module into its own class, which Ruby runs as
+/// the file loads.
+pub fn top_level_prepend_overlay() -> emit_and_run::Overlay {
+    misnamed_overlay()
+        .write(&format!("{GEMS}/greetings-1.0/lib/greetings/identity.rb"), "module Greetings\n  module Identity\n    def encode(text)\n      super + \"!\"\n    end\n  end\nend\n\nGreetings::Codec::Plain.prepend(Greetings::Identity)\n")
+        .edit(&format!("{GEMS}/greetings-1.0/lib/greetings.rb"), "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/identity\"\n")
+}
+
+pub const TOP_LEVEL_PREPEND_ASSERTIONS: &str = r#"a = Article.new(title: "hello", body: "a body that is long enough")
+raise a.encoded_title.inspect unless a.encoded_title == "hello!"
+puts "top-level prepend OK"
+"#;

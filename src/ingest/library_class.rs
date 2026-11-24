@@ -765,6 +765,9 @@ fn ingest_library_classes_impl(
             host.constants = consts;
         }
     }
+    if file_level {
+        out.extend(super::top_level_mixins::openings(&root, file));
+    }
     Ok(super::class_new_factory::order_with_file_classes(factories, out))
 }
 
