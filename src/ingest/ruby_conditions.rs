@@ -18,12 +18,25 @@ const MINIMUM: [u64; 3] = [4, 0, 0];
 /// Engines neither tree is.
 const OTHER_ENGINES: &[&str] = &["jruby", "truffleruby", "rbx", "mruby", "opal", "maglev", "ironruby", "macruby"];
 
+/// A core class's `method_defined?` that CRuby 4.0 and Spinel answer alike (`stdlib_constant_execution`'s
+/// `core_feature_probes_answer_as_settled` runs each on both): redis-client's `if String.method_defined?(:byteindex)`.
+/// Not `Process.respond_to?(:fork)`, which Spinel answers false.
+pub(crate) const CORE_PROBES: &[(&str, &str, bool)] = &[
+    ("String", "byteindex", true),
+    ("IO", "wait_readable", true),
+    ("IO", "wait_writable", true),
+];
+
 /// Constants only another engine defines.
 const OTHER_ENGINE_CONSTANTS: &[&str] = &["JRUBY_VERSION", "TruffleRuby", "Truffle", "Rubinius", "MRUBY_VERSION", "Java"];
 
 /// `text` with each settled load-time branch replaced by the arm that runs, or None when nothing settles.
 pub(super) fn settled(text: &str) -> Option<String> {
-    if !(text.contains("RUBY_VERSION") || text.contains("RUBY_ENGINE") || OTHER_ENGINE_CONSTANTS.iter().any(|c| text.contains(c))) {
+    if !(text.contains("RUBY_VERSION")
+        || text.contains("RUBY_ENGINE")
+        || OTHER_ENGINE_CONSTANTS.iter().any(|c| text.contains(c))
+        || text.contains(".method_defined?("))
+    {
         return None;
     }
     // Not a file that defines one of these itself: its reads in a nesting that holds the definition are its own.
@@ -165,6 +178,13 @@ fn truth(cond: &Node<'_>) -> Option<bool> {
     }
     let [arg] = args.as_slice() else { return None };
     let receiver = receiver?;
+    if method == "method_defined?"
+        && let Some(class) = constant_name(&receiver)
+        && let Some(symbol) = arg.as_symbol_node()
+    {
+        let name = String::from_utf8_lossy(symbol.unescaped()).into_owned();
+        return CORE_PROBES.iter().find(|(c, m, _)| *c == class.trim_start_matches("::") && *m == name).map(|(_, _, answer)| *answer);
+    }
     if engine_operand(&receiver).is_some() {
         let other = string(arg)?;
         if !OTHER_ENGINES.contains(&other.as_str()) {
@@ -194,7 +214,10 @@ fn truth(cond: &Node<'_>) -> Option<bool> {
 
 /// Does the file assign one of the names the settling reads, or open a class or module of one?
 fn shadows(text: &str) -> bool {
-    let names = ["RUBY_VERSION", "RUBY_ENGINE", "RUBY_ENGINE_VERSION"].into_iter().chain(OTHER_ENGINE_CONSTANTS.iter().copied());
+    let names = ["RUBY_VERSION", "RUBY_ENGINE", "RUBY_ENGINE_VERSION"]
+        .into_iter()
+        .chain(OTHER_ENGINE_CONSTANTS.iter().copied())
+        .chain(CORE_PROBES.iter().map(|(class, _, _)| *class));
     names.into_iter().any(|name| {
         text.match_indices(name).any(|(at, _)| {
             let before = text[..at].chars().next_back();
@@ -320,6 +343,47 @@ mod tests {
         assert_eq!(out.lines().count(), src.lines().count());
         assert!(!out.contains("def y") && !out.contains("RUBY_ENGINE") && !out.contains("Z = 1"), "{out}");
         assert!(out.contains("private :x") && out.contains("Z = 2"), "{out}");
+    }
+
+    /// redis-client's `if String.method_defined?(:byteindex)`: a core method CRuby 4.0 and Spinel both have. A probe
+    /// they answer differently (`Process.respond_to?(:fork)`) or one the table does not list is left.
+    #[test]
+    fn a_core_method_probe_both_rubies_answer_alike_settles() {
+        let src = "class B
+  if String.method_defined?(:byteindex)
+    ENCODING = 1
+  else
+    ENCODING = 2
+  end
+end
+require \"io/wait\" unless IO.method_defined?(:wait_readable) && ::IO.method_defined?(:wait_writable)
+";
+        let out = settled(src).expect("settles");
+        assert!(out.contains("ENCODING = 1") && !out.contains("ENCODING = 2") && !out.contains("io/wait"), "{out}");
+        for left in [
+            "class C
+  if Process.respond_to?(:fork)
+    X = 1
+  end
+end
+",
+            "class C
+  if String.method_defined?(:unknown_one)
+    X = 1
+  end
+end
+",
+            "module M
+  class String
+  end
+  if String.method_defined?(:byteindex)
+    X = 1
+  end
+end
+",
+        ] {
+            assert_eq!(settled(left), None, "{left}");
+        }
     }
 
     #[test]
