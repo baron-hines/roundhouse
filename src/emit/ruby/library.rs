@@ -9697,7 +9697,14 @@ fn emit_library_class_decl_inner(
         .filter(|m| m.name == lc.name)
         .flat_map(|m| crate::analyze::claimed_prepend_statements(m, &app.concern_prepended_items))
         .collect();
-    for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
+    // A lifted `X = Data.define(…) { include M }` this file writes runs its include where the constant stands, as the class's own does.
+    let factory_includes: Vec<crate::ident::ClassId> = lc
+        .constants
+        .iter()
+        .filter_map(|(cname, _)| lifted_data_factory(lc, cname.as_str(), classes, factories))
+        .flat_map(|factory| factory.includes.iter().cloned())
+        .collect();
+    for inc in lc.includes.iter().chain(prepends.iter().flatten()).chain(factory_includes.iter()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -10239,9 +10246,30 @@ fn emit_library_class_decl_inner(
                     crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                         call.span, None, "Data.define", "delegate in a Data.define block could not be lowered"));
                 }
+                // A nested module an include names is written ahead of the factory, as the owner's own includes ask.
+                for include in &factory.includes {
+                    nested.borrow_mut().write_include(s, depth, lc, include);
+                }
                 writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
+                // Each `include A, B` as one call, among the methods where the block wrote it: Ruby includes a call's
+                // arguments last first, and an `included` hook may read a method defined above it.
+                let mut groups: Vec<(u32, Vec<&str>)> = Vec::new();
+                for (i, include) in factory.includes.iter().enumerate() {
+                    let start = factory.include_spans.get(i).map_or(0, |span| span.start);
+                    match groups.last_mut() {
+                        Some((at, names)) if *at == start && factory.include_spans.len() == factory.includes.len() => names.push(include.0.as_str()),
+                        _ => groups.push((start, vec![include.0.as_str()])),
+                    }
+                }
+                let mut pending = groups.into_iter().peekable();
                 for method in &factory.methods {
+                    while let Some((_, names)) = pending.next_if(|(at, _)| *at <= method.name_span.start) {
+                        writeln!(s, "{body_pad}  include {}", names.join(", ")).unwrap();
+                    }
                     render_library_method(s, method, &format!("{body_pad}  "));
+                }
+                for (_, names) in pending {
+                    writeln!(s, "{body_pad}  include {}", names.join(", ")).unwrap();
                 }
                 writeln!(s, "{body_pad}end").unwrap();
                 continue;

@@ -992,7 +992,6 @@ fn custom_factory_blocks_are_not_silently_discarded() {
     assert!(roundhouse::ingest::ingest_library_class(source, "probe.rb").is_err());
     for block in [
         "def label; name; end; LIMIT = 4",
-        "def label; name; end; include Comparable",
         "def label; name; end; puts 'side effect'",
         "def other.label; 1; end",
         "|value| value; def label; name; end",
@@ -1003,6 +1002,17 @@ fn custom_factory_blocks_are_not_silently_discarded() {
             "{source}"
         );
     }
+}
+
+/// An `include` of a constant in the block is the Data class's own, kept
+/// rather than dropped with the rest of the body.
+#[test]
+fn a_custom_factory_block_s_include_is_kept() {
+    let source = b"class Owner; State = Data.define(:name) do; include Comparable; def label; name; end; end; end";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let state = classes.iter().find(|c| c.name.0.as_str() == "Owner::State").expect("lifted");
+    assert_eq!(state.includes.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), ["Comparable"]);
+    assert!(state.methods.iter().any(|m| m.name.as_str() == "label"));
 }
 
 /// Keep error diagnostics for dynamic/invalid members, shadowed Data, and
@@ -1411,4 +1421,17 @@ fn a_top_level_data_factory_is_rejected_before_unverified_target_emission() {
             "{diagnostic:?}"
         );
     }
+}
+
+/// A computed include replayed as a call keeps no `ActiveModel::Serialization`
+/// argument: the marker the include list drops would name a namespace no
+/// target ships when the call runs.
+#[test]
+fn a_replayed_include_drops_the_serialization_marker() {
+    let source = b"class Stat < Base\n  include ActiveModel::Serialization, Helpers.mixin\nend\n";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let stat = classes.iter().find(|c| c.name.0.as_str() == "Stat").expect("class");
+    let replayed: Vec<String> = stat.unknown_calls.iter().map(|e| format!("{:?}", e.node)).collect();
+    assert!(!replayed.is_empty(), "the computed include is replayed");
+    assert!(replayed.iter().all(|r| !r.contains("Serialization")), "{replayed:#?}");
 }

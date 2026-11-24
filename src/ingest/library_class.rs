@@ -4423,7 +4423,11 @@ fn walk_decl_body_with_visibility<'pr>(
                                     && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
                                     && !crate::ingest::util::is_rails_mounted_helpers_chain(&arg)
                             }) {
-                                if let Ok(e) = ingest_expr(&stmt, file) {
+                                if let Ok(mut e) = ingest_expr(&stmt, file) {
+                                    // Not a marker the include list drops: replayed, its namespace is one no target ships.
+                                    if let ExprNode::Send { args, .. } = &mut *e.node {
+                                        args.retain(|a| !matches!(&*a.node, ExprNode::Const { path } if crate::ingest::util::is_serialization_marker_include(&path.iter().map(|p| p.as_str()).collect::<Vec<_>>())));
+                                    }
                                     out.unknown_calls.push(e);
                                 }
                             }
@@ -4440,6 +4444,7 @@ fn walk_decl_body_with_visibility<'pr>(
                                     let segs: Vec<&str> =
                                         path.iter().map(|p| p.as_str()).collect();
                                     if crate::ingest::util::is_view_helper_marker_include(&segs)
+                                        || crate::ingest::util::is_serialization_marker_include(&segs)
                                         || crate::ingest::util::is_concern_marker_include(&segs)
                                     {
                                         continue;
@@ -4822,12 +4827,26 @@ fn walk_decl_body_with_visibility<'pr>(
                 out.include_spans.push(at_loop);
             }
         }
+        // Not looked up at their own spans: those offsets are the wrapped string's, not the file's, so a constant is read as written.
+        fn mark_constants(e: &mut crate::expr::Expr) {
+            if matches!(&*e.node, crate::expr::ExprNode::Const { .. }) {
+                e.decisions |= crate::expr::GENERATED_CONST_REF;
+            }
+            e.node.for_each_child_mut(&mut mark_constants);
+        }
         out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
             let mut call = call.clone();
             call.span = at_loop;
+            mark_constants(&mut call);
             call
         }));
         for mut method in class.methods {
+            mark_constants(&mut method.body);
+            for param in &mut method.params {
+                if let Some(default) = param.default.as_mut() {
+                    mark_constants(default);
+                }
+            }
             // A `module ClassMethods` body's methods are the includer's class side, as its own `def`s are.
             if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
                 method.receiver = MethodReceiver::Class;

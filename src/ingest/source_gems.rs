@@ -448,6 +448,22 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
         }
         false
     }
+    /// `File.expand_path("json", __dir__)` or `File.join(__dir__, "json")` (message_bus's codecs): a path relative to
+    /// the file, as `require_relative` takes it.
+    fn dir_relative(node: &ruby_prism::Node<'_>) -> Option<String> {
+        let call = node.as_call_node()?;
+        if !call.receiver().and_then(|r| r.as_constant_read_node()).is_some_and(|c| c.name().as_slice() == b"File") {
+            return None;
+        }
+        let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+        let literal = |n: &ruby_prism::Node<'_>| n.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+        let rest = match (call.name().as_slice(), args.as_slice()) {
+            (b"expand_path", [rest, dir]) if file_dir(dir) => literal(rest)?,
+            (b"join", [dir, rest]) if file_dir(dir) => literal(rest)?,
+            _ => return None,
+        };
+        (!rest.starts_with('/') && !rest.is_empty()).then_some(rest)
+    }
     impl Finder {
         /// `"#{direc}/method_source/version"` over `direc = File.dirname(__FILE__)` (method_source): a path relative to
         /// the file, as `require_relative` takes it.
@@ -555,8 +571,18 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
             } else if relative == Some(false)
                 && node.receiver().is_none()
                 && let [arg] = args.as_slice()
-                && let Some(path) = self.built_relative(arg)
+                && let Some(path) = self.built_relative(arg).or_else(|| dir_relative(arg))
             {
+                self.0.push((true, path, false));
+            } else if relative.is_none()
+                && method.as_slice() == b"autoload"
+                && self.1 == 0
+                && node.receiver().is_none()
+                && let [name, arg] = args.as_slice()
+                && name.as_symbol_node().is_some()
+                && let Some(path) = dir_relative(arg)
+            {
+                // A path, as one ending in `.rb` is: Zeitwerk defers to it as to a defined constant.
                 self.0.push((true, path, false));
             }
             ruby_prism::visit_call_node(self, node);
@@ -949,6 +975,36 @@ require \"#{dir}/gone\"
         let gems = resolve(&crate::vfs::FsVfs::new(), &root.join("app"), Some(&lock), &["widgets".to_string()]).unwrap();
         let files: Vec<_> = gems[0].files.iter().map(|p| p.display().to_string()).collect();
         assert_eq!(files, vec!["lib/widgets/base.rb", "lib/widgets.rb"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// message_bus's `autoload :Json, File.expand_path("json", __dir__)` and a `require File.join(__dir__, …)`: a
+    /// path the file's own directory spells is that file's sibling, as `require_relative` names it.
+    #[test]
+    fn a_path_built_from_the_file_s_directory_is_followed() {
+        let root = std::env::temp_dir().join(format!("rh-source-gems-expand-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |path: &str, text: &str| {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, text).unwrap();
+        };
+        write("app/.bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n");
+        let gem = "app/vendor/bundle/ruby/3.4.0/gems/widgets-1.0";
+        write(&format!("{gem}/lib/widgets.rb"), "require_relative \"widgets/codec/base\"\nrequire File.join(__dir__, \"widgets/helper\")\n");
+        write(
+            &format!("{gem}/lib/widgets/codec/base.rb"),
+            "module Widgets\n  module Codec\n    autoload :Json, File.expand_path(\"json\", __dir__)\n    autoload :Oj, File.expand_path(\"oj\", File.dirname(__FILE__))\n  end\nend\n",
+        );
+        write(&format!("{gem}/lib/widgets/codec/json.rb"), "module Widgets; module Codec; class Json; end; end; end\n");
+        write(&format!("{gem}/lib/widgets/codec/oj.rb"), "module Widgets; module Codec; class Oj; end; end; end\n");
+        write(&format!("{gem}/lib/widgets/helper.rb"), "module Widgets; class Helper; end; end\n");
+        let lock = Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    widgets (1.0)\n\nDEPENDENCIES\n  widgets\n");
+        let gems = resolve(&crate::vfs::FsVfs::new(), &root.join("app"), Some(&lock), &["widgets".to_string()]).unwrap();
+        let mut files: Vec<_> = gems[0].files.iter().map(|p| p.display().to_string()).collect();
+        files.sort();
+        assert_eq!(files, vec!["lib/widgets.rb", "lib/widgets/codec/base.rb", "lib/widgets/codec/json.rb", "lib/widgets/codec/oj.rb", "lib/widgets/helper.rb"]);
+        assert!(gems[0].autoload_only.is_empty(), "{:?}", gems[0].autoload_only);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1684,6 +1684,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // stays untyped. `Find.find` answers nil with a block and an Enumerator
     // without one, so it stays untyped as `File.open` does.
     register_stdlib_class(classes, "Monitor", &[], &[]);
+    // `include MonitorMixin` (message_bus's `Synchronizer`): its `synchronize` is Monitor's, answering the block.
+    register_stdlib_class(classes, "MonitorMixin", &[], &[]);
     for name in ["ConditionVariable", "Thread::ConditionVariable"] {
         let condition_variable = Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
         register_stdlib_class(classes, name, &[], &[
@@ -1798,6 +1800,7 @@ pub(crate) const BUILTIN_BLOCK_VALUE_METHODS: &[(&str, &str)] = &[
     ("Mutex", "synchronize"),
     ("Thread::Mutex", "synchronize"),
     ("Monitor", "synchronize"),
+    ("MonitorMixin", "synchronize"),
     ("ActiveSupport::Cache::MemoryStore", "fetch"),
     ("ActiveSupport::Cache::NullStore", "fetch"),
     ("ActiveSupport::Notifications", "subscribed"),

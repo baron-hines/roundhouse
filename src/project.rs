@@ -14007,7 +14007,7 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 31] = [
+const BUNDLED: [(&str, &str); 32] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -14101,6 +14101,7 @@ const BUNDLED: [(&str, &str); 31] = [
     // defines Monitor and the socket classes only after the require, and
     // takes `packages/open3` and `packages/find`.
     ("Monitor", "monitor"),
+    ("MonitorMixin", "monitor"),
     ("UNIXServer", "socket"),
     ("UNIXSocket", "socket"),
     ("Open3", "open3"),

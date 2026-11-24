@@ -1193,6 +1193,18 @@ pub(crate) fn is_view_helper_marker_include(path: &[&str]) -> bool {
     )
 }
 
+/// `ActiveModel::Serialization` in a plain class (a value an
+/// ActiveModel::Serializer renders): what it adds is `serializable_hash`,
+/// which reads the class's `attributes` and sends each name, and
+/// `read_attribute_for_serialization`, `send` by another name. No target
+/// ships the namespace, so the `include` is an `uninitialized constant`
+/// at class load. The serializer expansion reads an attribute by its own
+/// reader, as that alias answers; an app's own call of either method is
+/// a method the class does not have, and is reported as one.
+pub(crate) fn is_serialization_marker_include(path: &[&str]) -> bool {
+    matches!(path, ["ActiveModel", "Serialization"] | ["", "ActiveModel", "Serialization"])
+}
+
 /// `ActiveModel::*` (Validations / Conversion / AttributeMethods /
 /// Model) in a MODEL's include list. Same "no target ships the
 /// namespace" argument as above, and here the replacement is already in

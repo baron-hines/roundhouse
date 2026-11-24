@@ -8932,7 +8932,7 @@ pub(super) const RUBY_TOP_LEVEL: &[&str] = &[
     "Base64", "Benchmark", "BigDecimal", "CGI", "CSV", "Comparable", "Complex", "Coverage",
     "Date", "DateTime", "Digest", "Dir", "ERB", "Encoding", "Enumerable", "Errno", "Etc",
     "Fiber", "File", "FileUtils", "Find", "Forwardable", "GC", "IO", "IPAddr", "JSON",
-    "Kernel", "Logger", "Marshal", "Math", "Monitor", "Mutex", "Net", "ObjectSpace", "Open3",
+    "Kernel", "Logger", "Marshal", "Math", "Monitor", "MonitorMixin", "Mutex", "Net", "ObjectSpace", "Open3",
     "OpenSSL", "OpenStruct", "PP", "Pathname", "Prism", "Process", "Psych", "Random",
     "Rational", "Ripper", "SecureRandom", "Set", "Shellwords", "Signal", "Singleton",
     "Socket", "StringIO", "Struct", "Tempfile", "Thread", "Time", "Timeout", "URI", "YAML",

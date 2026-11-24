@@ -253,6 +253,8 @@ mod temporal_index_assign;
 mod file_mtime_time;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
+#[path = "support/service_params_class.rs"]
+mod service_params_class;
 #[path = "emit_and_run/gem_routes.rs"]
 mod gem_routes;
 #[path = "emit_and_run/route_request_guards.rs"]
@@ -22833,3 +22835,112 @@ mod empty_base_list_override;
 mod relation_argument;
 #[path = "emit_and_run/params_permit_key_args.rs"]
 mod params_permit_key_args;
+
+/// A class macro's `Class.new(base).tap { it.class_eval(&block) }` named by
+/// `const_set` is the class a `class Name < Base` with the call's block as
+/// its body makes: on main a `def` in the block was a nested def, refused
+/// and replaced by a raise.
+#[test]
+fn a_class_a_macro_makes_from_its_block_runs() {
+    let errors = service_params_class::overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = service_params_class::overlay().run_ruby(service_params_class::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("service params contract passed"));
+}
+
+/// A class the macro makes and never names, or a local it rebinds before
+/// `const_set`, leaves the call reported: the block is not dropped
+/// unread, and the constant is not taken for a class the local no longer
+/// holds.
+#[test]
+fn a_class_a_macro_does_not_name_is_reported() {
+    let base = "class Maker\n  def self.make(&block)\n    k = Class.new(Maker, &block)\n  end\n\n  def self.rebind(&block)\n    k = Class.new(Maker, &block)\n    k = Maker\n    const_set(\"Made\", k)\n  end\nend\n";
+    for call in ["  make { raise \"expected\" }\n", "  rebind do\n    def x = 1\n  end\n"] {
+        let errors = emit_and_run::empty_app()
+            .write("app/models/maker.rb", base)
+            .write("app/models/user_of_maker.rb", &format!("class UserOfMaker < Maker\n{call}end\n"))
+            .check_errors();
+        assert!(errors.iter().any(|e| e.contains("this call does not expand")), "{call}: {errors:#?}");
+    }
+}
+
+/// A name the macro computes from a value known only when it runs leaves
+/// the call reported, not expanded under a guessed name.
+#[test]
+fn a_class_a_macro_names_at_run_time_is_reported() {
+    let errors = service_params_class::overlay()
+        .edit("app/models/list_service.rb", "  params :filter\n", "  params ENV.fetch(\"X\", \"y\").to_sym\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`params` defines methods this call does not expand")), "{errors:#?}");
+}
+
+/// discourse's `UserActionManager`: `%i[post topic].each { |type|
+/// class_eval(<<~RUBY) }` defines class methods whose bodies name a model.
+/// The string's `def`s are parsed apart from the file, so their offsets
+/// are no source position; a constant in them is read as written rather
+/// than looked up at a position it does not stand at, which reported
+/// `UserAction` as unsupported.
+#[test]
+fn a_class_eval_string_loop_s_methods_read_their_constants() {
+    let errors = class_eval_loop_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = class_eval_loop_overlay().run_ruby(CLASS_EVAL_LOOP_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("class_eval loop passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_class_eval_string_loop_s_methods_read_their_constants_on_spinel() {
+    let run = class_eval_loop_overlay().run_spinel_with_db(CLASS_EVAL_LOOP_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("class_eval loop passed"));
+}
+
+const CLASS_EVAL_LOOP_SCRIPT: &str = "got = [UserActionManager.post_created(1), UserActionManager.topic_created(2)]\nraise got.inspect unless got == [[\"logged post 1\"], [\"logged topic 2\"]]\nputs \"class_eval loop passed\"\n";
+
+fn class_eval_loop_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/user_action.rb", "class UserAction < ApplicationRecord\n  def self.log_action!(row)\n    \"logged #{row}\"\n  end\nend\n")
+        .write("app/models/user_action_manager.rb", "class UserActionManager\n  %i[post topic].each { |type| class_eval(<<~RUBY) }\n      def self.#{type}_created(*args)\n        #{type}_rows(*args).map { |row| UserAction.log_action!(row) }\n      end\n    RUBY\n\n  def self.post_rows(x)\n    [\"post #{x}\"]\n  end\n\n  def self.topic_rows(x)\n    [\"topic #{x}\"]\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"user_actions\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+/// discourse's `JsonApiKit::Name`: `Data.define(:value) { include Name }`.
+/// Ruby runs the block on the new class, so the module is the Data class's
+/// include, its methods (`with` among the reads, `super` through a nested
+/// mixin) the record's. Before, an include beside a `def` refused the
+/// whole file, and a block holding only the include stayed an opaque
+/// constant another class could not name.
+#[test]
+fn a_data_define_block_s_include_is_the_data_class_s() {
+    let errors = data_include_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = data_include_overlay().run_ruby(DATA_INCLUDE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("data include passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_data_define_block_s_include_is_the_data_class_s_on_spinel() {
+    let run = data_include_overlay().run_spinel(DATA_INCLUDE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("data include passed"));
+}
+
+const DATA_INCLUDE_SCRIPT: &str = "m = Kit::Name::Member.new(value: \"a\")\nraise m.to_s unless m.to_s == \"a\"\nc = m.convert { |v| v.upcase }\nraise c.inspect unless c.value == \"A\" && c.is_a?(Kit::Name::Member)\nf = Kit::Name::Field.new(value: \"x\", type: \"t\")\ng = f.convert { |v| v + \"!\" }\nraise g.inspect unless g.value == \"x!\" && g.type == \"t!\"\nnames = Kit::Names.all\nraise names.inspect unless names == [\"tt\", \"Y\"]\npair = Kit::Pair.new(value: 1)\nraise pair.tag unless pair.tag == \"a\" && pair.label == \"l\"\nputs \"data include passed\"\n";
+
+fn data_include_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/kit/name.rb", "module Kit\n  module Name\n    def convert = with(value: yield(value))\n\n    def convert_type = self\n\n    def to_s = value\n  end\nend\n")
+        .write("app/models/kit/name/resource_scope.rb", "module Kit\n  module Name\n    module ResourceScope\n      include Name\n\n      def convert(&) = super.convert_type(&)\n\n      def convert_type = with(type: yield(type))\n    end\n  end\nend\n")
+        .write("app/models/kit/name/member.rb", "module Kit\n  module Name\n    Member = Data.define(:value) { include Name }\n  end\nend\n")
+        .write("app/models/kit/name/field.rb", "module Kit\n  module Name\n    Field = Data.define(:value, :type) { include Name::ResourceScope }\n  end\nend\n")
+        .write("app/models/kit/name/type.rb", "module Kit\n  module Name\n    Type =\n      Data.define(:value) do\n        include Name\n\n        def convert_type(&) = convert(&)\n      end\n  end\nend\n")
+        .write("app/models/kit/tags.rb", "module Kit\n  module TagA\n    def tag = \"a\"\n  end\n\n  module TagB\n    def tag = \"b\"\n  end\n\n  Pair = Data.define(:value) do\n    def label = \"l\"\n\n    include TagA, TagB\n  end\nend\n")
+        .write("app/models/kit/names.rb", "module Kit\n  class Names\n    def self.all\n      [Kit::Name::Field.new(value: \"f\", type: \"t\").convert { |v| v * 2 }.type, Kit::Name::Type.new(value: \"y\").convert_type { |v| v.upcase }.value]\n    end\n  end\nend\n")
+}
+
