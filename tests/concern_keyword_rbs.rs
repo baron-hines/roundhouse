@@ -187,3 +187,41 @@ fn a_poisoned_module_shape_is_not_skipped_for_a_sibling() {
     assert!(label.contains("Hash[Symbol, String]"), "{rbs}");
     assert!(!label.contains("(String first"), "{rbs}");
 }
+
+/// A key binds by name only to a parameter that was a keyword in the
+/// source. `label(name: "gear")` against a module's `def label(name)`
+/// binds the whole Hash to the positional `name`, as Ruby does.
+#[test]
+fn a_key_does_not_bind_to_a_same_named_positional_of_the_module() {
+    const POSITIONAL: &str = "module Positional\n  extend ActiveSupport::Concern\n\n  def label(name)\n    name.to_s\n  end\nend\n";
+    const WIDGET: &str = "class Widget < ApplicationRecord\n  include Positional\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    render plain: Widget.find(params[:id]).label(name: \"gear\")\n  end\nend\n";
+    let files = emit(&[
+        ("app/models/concerns/positional.rb", POSITIONAL),
+        ("app/models/widget.rb", WIDGET),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    let rbs = file(&files, "app/models/positional.rbs");
+    let label = sig(rbs, "label");
+    assert!(label.contains("Hash[Symbol, String]"), "{rbs}");
+}
+
+/// A call that leaves a keyword to its default reaches the default on
+/// the module too: `tint()` gives `tone` its Integer `0` beside the
+/// String `tint(tone: "x")` passes.
+#[test]
+fn a_keyword_an_includer_call_leaves_out_keeps_its_default_on_the_module() {
+    const TONED: &str = "module Toned\n  extend ActiveSupport::Concern\n\n  def tint(prefix = nil, tone: 0)\n    \"#{prefix}#{tone}\"\n  end\nend\n";
+    const WIDGET: &str = "class Widget < ApplicationRecord\n  include Toned\nend\n";
+    const CONTROLLER: &str = "class WidgetsController < ApplicationController\n  def index\n    widget = Widget.find(params[:id])\n    render plain: widget.tint(tone: \"x\") + widget.tint\n  end\nend\n";
+    let files = emit(&[
+        ("app/models/concerns/toned.rb", TONED),
+        ("app/models/widget.rb", WIDGET),
+        ("app/controllers/widgets_controller.rb", CONTROLLER),
+    ]);
+    let rbs = file(&files, "app/models/toned.rbs");
+    let tint = sig(rbs, "tint");
+    assert!(tint.contains("Integer"), "{rbs}");
+    assert!(tint.contains("String"), "{rbs}");
+    assert!(!tint.contains("Hash[Symbol"), "{rbs}");
+}

@@ -6936,9 +6936,22 @@ impl Analyzer {
             let positional = arg_tys.len().saturating_sub(usize::from(kw_tys.group));
             let shape = params_by_method.get(&key).or_else(|| {
                 // Not an includer whose own `def`s disagree: Ruby runs those, never the module's.
-                (!params_by_method.poisoned.contains(&key))
-                    .then(|| self.included_param_shape(&key, params_by_method))
-                    .flatten()
+                if params_by_method.poisoned.contains(&key) {
+                    return None;
+                }
+                let (shape, keyword_named) = self.included_param_shape(&key, params_by_method)?;
+                // The module's shape places a key by name, keyword or not, so
+                // only where every key names a source keyword: `f(name: x)`
+                // against `def f(name)` binds the whole Hash, as Ruby does.
+                // A call with no keyword group places nothing.
+                let by_keyword = kw_tys.splat.is_none()
+                    && !kw_tys.anonymous_forward
+                    && if kw_tys.keys.is_empty() {
+                        !kw_tys.group
+                    } else {
+                        kw_tys.keys.iter().all(|(k, _)| keyword_named.contains(k))
+                    };
+                by_keyword.then_some(shape)
             });
             for (i, t) in arg_tys.iter().take(positional).enumerate() {
                 // Not skipped without a shape: a concern's method keys to the includer, which has none, and its row folds into the module's.
@@ -6953,9 +6966,13 @@ impl Analyzer {
                 match shape {
                     Some(shape) => {
                         // Not a positional argument nobody typed: the join leaves it out (`open_param_slots`), the default unused.
-                        for (i, (_, kind)) in shape.slots.iter().enumerate() {
+                        // A module's shape (`included_param_shape`): its flattened keyword a key filled is not left to its default.
+                        let from_module = params_by_method.get(&key).is_none();
+                        for (i, (name, kind)) in shape.slots.iter().enumerate() {
                             let left = match kind {
-                                ParamKind::Optional => i >= positional,
+                                ParamKind::Optional => {
+                                    i >= positional && !(from_module && kw_tys.keys.iter().any(|(k, _)| k == name))
+                                }
                                 ParamKind::Keyword { required: false } => arg_tys.get(i).is_none_or(|t| t.is_unknown()),
                                 _ => false,
                             };
@@ -6990,12 +7007,13 @@ impl Analyzer {
     /// module whose own `def`s of it disagree (a poisoned entry) counts
     /// as a disagreement, not as a module to skip: it may be the one
     /// Ruby reaches. Leaving the Hash where it is was the behaviour
-    /// before.
+    /// before. Beside the shape, the names of the parameters that were
+    /// keywords in the source, flattened or not.
     fn included_param_shape<'a>(
         &self,
         key: &ParamKey,
         params_by_method: &'a ParamShapes,
-    ) -> Option<&'a ParamShape> {
+    ) -> Option<(&'a ParamShape, &'a BTreeSet<Symbol>)> {
         let (class_id, method, side) = key;
         let mut queue: Vec<ClassId> = Vec::new();
         let mut cur = Some(class_id.clone());
@@ -7010,7 +7028,7 @@ impl Analyzer {
             cur = c.parent.clone();
         }
         let mut seen: BTreeSet<ClassId> = BTreeSet::new();
-        let mut found: Option<&'a ParamShape> = None;
+        let mut found: Option<(&'a ParamShape, &'a BTreeSet<Symbol>)> = None;
         let mut qi = 0;
         while qi < queue.len() {
             let m = queue[qi].clone();
@@ -7023,9 +7041,13 @@ impl Analyzer {
                 return None;
             }
             if let Some(shape) = params_by_method.get(&module_key) {
+                // Its `def`s disagree on which parameters were keywords.
+                let Some(Some(keyword_named)) = params_by_method.keyword_named.get(&module_key) else {
+                    return None;
+                };
                 match found {
-                    Some(prev) if prev != shape => return None,
-                    _ => found = Some(shape),
+                    Some(prev) if prev != (shape, keyword_named) => return None,
+                    _ => found = Some((shape, keyword_named)),
                 }
             }
             if let Some(ci) = self.classes.get(&m) {
@@ -7225,6 +7247,8 @@ impl Analyzer {
         targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<(ParamKey, Vec<Ty>)> = Vec::new();
         let mut open_adds: Vec<(ParamKey, usize)> = Vec::new();
+        let mut defaulted_adds: Vec<(ParamKey, usize)> = Vec::new();
+        let defaulted = self.defaulted_param_slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (id, includes) in targets {
             let mut queue = includes;
             let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
@@ -7262,6 +7286,10 @@ impl Analyzer {
                                 if self.open_param_slots.contains(&(from.clone(), i)) {
                                     open_adds.push(((m.clone(), name.clone(), side), i));
                                 }
+                                // A slot a call left to its default, placed by the module's shape.
+                                if defaulted.contains(&(from.clone(), i)) {
+                                    defaulted_adds.push(((m.clone(), name.clone(), side), i));
+                                }
                             }
                         }
                     }
@@ -7270,6 +7298,7 @@ impl Analyzer {
         }
         fold_param_observations(&mut self.inferred_params, adds);
         self.open_param_slots.extend(open_adds);
+        self.defaulted_param_slots.lock().unwrap_or_else(|e| e.into_inner()).extend(defaulted_adds);
     }
 
     /// Every (class, method) pair's parameter names and canonical kinds
@@ -7283,7 +7312,18 @@ impl Analyzer {
     /// behaviour that stood before this table existed.
     fn param_shapes(app: &App) -> ParamShapes {
         let mut out: HashMap<ParamKey, Option<ParamShape>> = HashMap::default();
+        let mut keyword_named: HashMap<ParamKey, Option<BTreeSet<Symbol>>> = HashMap::default();
         let mut record = |class: &ClassId, m: &crate::dialect::MethodDef| {
+            let names: BTreeSet<Symbol> =
+                m.params.iter().filter(|p| p.keyword || p.from_keyword).map(|p| p.name.clone()).collect();
+            keyword_named
+                .entry((class.clone(), m.name.clone(), m.receiver))
+                .and_modify(|slot| {
+                    if slot.as_ref() != Some(&names) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(names));
             let shape = ParamShape {
                 slots: m.params.iter().map(|p| (p.name.clone(), p.ty_kind())).collect(),
                 keywords_by_kind: false,
@@ -7348,7 +7388,7 @@ impl Analyzer {
                     .or_insert(Some(shape));
             }
         }
-        let mut shapes = ParamShapes::default();
+        let mut shapes = ParamShapes { keyword_named, ..ParamShapes::default() };
         for (k, v) in out {
             match v {
                 Some(v) => {
@@ -10692,6 +10732,10 @@ struct ParamShapes {
     by_key: HashMap<ParamKey, ParamShape>,
     /// Two `def`s of the key whose shapes differ: no shape, but a `def`.
     poisoned: BTreeSet<ParamKey>,
+    /// The parameters that were keywords in the source (`Param::keyword`
+    /// or `Param::from_keyword`), for the models', library classes' and
+    /// test modules' `def`s; `None` when two `def`s of a key disagree.
+    keyword_named: HashMap<ParamKey, Option<BTreeSet<Symbol>>>,
 }
 
 impl ParamShapes {
