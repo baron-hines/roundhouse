@@ -552,6 +552,8 @@ mod campfire_caches_contract;
 mod campfire_caches;
 #[path = "emit_and_run/action_text_markdown.rs"]
 mod action_text_markdown;
+#[path = "emit_and_run/nested_include_require_top.rs"]
+mod nested_include_require_top;
 #[path = "emit_and_run/ordinalize.rs"]
 mod ordinalize;
 #[path = "emit_and_run/float_round_digits.rs"]

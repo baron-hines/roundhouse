@@ -1,0 +1,70 @@
+//! A model that includes a concern nested under its own name
+//! (`Ledger::Stamping` for `include Stamping`) loads the concern's file
+//! from the top of its own file, before `class Ledger < ApplicationRecord`.
+//! The concern's file reopens the class with the same superclass, so it
+//! can run first. Spinel places a file whose `require_relative` is a
+//! top-level statement; one required from a class body only once every
+//! other require of it is placed, which a cycle of requires never is.
+
+use roundhouse::build_target::BuildTarget;
+
+use super::emit_and_run;
+
+const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table :ledgers do |t|\n    t.string :name\n  end\nend\n";
+
+fn app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write("db/schema.rb", SCHEMA)
+        .write(
+            "app/models/ledger.rb",
+            "class Ledger < ApplicationRecord\n  include Stamping\n\n  def label\n    \"#{stamp}:#{name}\"\n  end\nend\n",
+        )
+        .write(
+            "app/models/ledger/stamping.rb",
+            "module Ledger::Stamping\n  extend ActiveSupport::Concern\n\n  def stamp\n    \"stamped\"\n  end\nend\n",
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+}
+
+fn ledger_file(tree: &std::path::Path) -> String {
+    std::fs::read_to_string(tree.join("app/models/ledger.rb")).expect("app/models/ledger.rb is in the tree")
+}
+
+#[test]
+fn the_spinel_tree_requires_a_nested_concern_above_its_class() {
+    let (tree, errors) = app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let text = ledger_file(&tree);
+    let require = text.lines().position(|l| l == "require_relative \"ledger/stamping\"");
+    let class = text.lines().position(|l| l.starts_with("class Ledger"));
+    assert!(
+        matches!((require, class), (Some(r), Some(c)) if r < c),
+        "the concern's require is not a top-level statement above the class:\n{text}"
+    );
+    assert!(
+        !text.lines().any(|l| l.starts_with(' ') && l.trim_start().starts_with("require_relative")),
+        "a require is still in the class body:\n{text}"
+    );
+}
+
+#[test]
+fn a_nested_concern_required_above_its_class_runs_on_ruby() {
+    app()
+        .run_ruby(
+            r#"
+ledger = Ledger.new(name: "q1")
+raise "label: #{ledger.label.inspect}" unless ledger.label == "stamped:q1"
+raise "superclass: #{Ledger.superclass}" unless Ledger.superclass == ApplicationRecord
+puts "nested concern above its class passed"
+"#,
+        )
+        .assert_passes();
+}
