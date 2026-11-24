@@ -108,3 +108,18 @@ fn a_helper_that_rebinds_its_path_keeps_its_autoload() {
         "    path = \"postbox/\" + path.to_s\n    @autoloads[name] = path\n",
     )]);
 }
+
+/// A second definition of the helper is the one Ruby runs, whatever the first one does. The table is a constant
+/// here: Spinel refuses a redefinition beside a class-instance-variable initializer.
+#[test]
+fn a_helper_defined_twice_keeps_its_autoload() {
+    keeps_its_autoload(&[
+        ("  @autoloads = {}\n", "  AUTOLOADS = {}\n"),
+        ("    @autoloads[name] = path\n", "    AUTOLOADS[name] = path\n"),
+        ("    @autoloads.keys\n", "    AUTOLOADS.keys\n"),
+        (
+            "  def self.registered\n",
+            "  def self.register_autoload(name, path)\n    path = \"postbox/\" + path.to_s\n    AUTOLOADS[name] = path\n    autoload(name, path)\n  end\n\n  def self.registered\n",
+        ),
+    ]);
+}

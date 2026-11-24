@@ -2819,6 +2819,24 @@ fn drop_followed_autoload_registrations(module: &ruby_prism::ModuleNode<'_>, met
         if let Some(body) = module.body() {
             ruby_prism::Visit::visit(&mut calls, &body);
         }
+        // Defined once in the body (a `def` in `class << self` included): with a second definition, Ruby runs
+        // the later one, which need not be the one the rule accepted.
+        struct Defs<'a>(&'a [u8], usize);
+        impl<'pr> ruby_prism::Visit<'pr> for Defs<'_> {
+            fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                if node.name().as_slice() == self.0 {
+                    self.1 += 1;
+                }
+                ruby_prism::visit_def_node(self, node);
+            }
+        }
+        let mut defs = Defs(&helper, 0);
+        if let Some(body) = module.body() {
+            ruby_prism::Visit::visit(&mut defs, &body);
+        }
+        if defs.1 != 1 {
+            continue;
+        }
         let literal = statements
             .iter()
             .filter_map(|s| s.as_call_node())
