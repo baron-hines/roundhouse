@@ -521,7 +521,7 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_includes_into_constant(m.body())
         || body_registers_autoloads(m.body())
         || body_extends_module(m.body())
-        || concern_includes_module(m.body())
+        || module_includes_module(m.body())
         || body_hands_itself_out(m.body())
 }
 
@@ -544,10 +544,12 @@ fn body_hands_itself_out(body: Option<Node<'_>>) -> bool {
     })
 }
 
-/// A Concern whose body only includes other modules. It has nothing of
-/// its own to emit, but Rails runs its dependencies' `included` blocks on
-/// whatever includes it, so the `include` edge has to survive.
-fn concern_includes_module(body: Option<Node<'_>>) -> bool {
+/// A module whose body only includes other modules. It has nothing of its
+/// own to emit, but it is still an ancestor: its includer reaches the
+/// included modules' methods through it, and for a Concern Rails runs its
+/// dependencies' `included` blocks on whatever includes it, so the
+/// `include` edge has to survive. A plain module counts too (#2278).
+fn module_includes_module(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     let statements = flatten_statements(body);
     fn call_named<'pr>(stmt: &Node<'pr>, name: &str) -> Option<ruby_prism::CallNode<'pr>> {
@@ -555,27 +557,11 @@ fn concern_includes_module(body: Option<Node<'_>>) -> bool {
             call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
         })
     }
-    // `self.extend` is the same call.
-    let extends_concern = statements.iter().any(|stmt| {
-        let call = stmt.as_call_node().filter(|call| {
-            call.receiver().is_none_or(|r| r.as_self_node().is_some())
-                && call.block().is_none()
-                && constant_id_str(&call.name()) == "extend"
-        });
-        call.is_some_and(|call| {
-            call.arguments().is_some_and(|a| {
-                a.arguments().iter().any(|arg| {
-                    constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
-                })
-            })
+    statements.iter().any(|stmt| {
+        call_named(stmt, "include").is_some_and(|call| {
+            call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| constant_path_of(&arg).is_some()))
         })
-    });
-    extends_concern
-        && statements.iter().any(|stmt| {
-            call_named(stmt, "include").is_some_and(|call| {
-                call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| constant_path_of(&arg).is_some()))
-            })
-        })
+    })
 }
 
 // `extend ActiveSupport::Concern` is left out: it is the included-block machinery, not methods the module answers.
