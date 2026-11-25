@@ -179,3 +179,40 @@ fn an_ordered_bodys_hooked_include_keeps_its_class_top_require() {
         "the concern is not required anywhere:\n{text}"
     );
 }
+
+/// The includes come from two files: the model's file writes the late
+/// concern and `include Hooky`, and `Hooky`'s hook writes `include Gamma`
+/// in hooky.rb. `Gamma`'s span has no place in the model's file, so it
+/// follows the include before it: the moved includes keep Ruby's order,
+/// and the method two of them define resolves as in Ruby.
+#[test]
+fn includes_spanning_two_files_keep_their_order_on_ruby() {
+    // `Hooky`'s `included` hook adds `include Gamma` to the class; that
+    // include's span sits in hooky.rb, at an offset below the late
+    // `include Stamping` in ledger.rb. Offsets from two files say nothing
+    // about their order: Gamma follows Hooky, after the constant.
+    let ledger = "# Ledger entries.\n# Kinds come from TYPES.\n# Tags come from the concerns.\nclass Ledger < ApplicationRecord\n  TYPES = %w[a b].freeze\n  include Stamping\n  include Hooky\nend\n";
+    let stamping = "module Ledger::Stamping\n  extend ActiveSupport::Concern\n  KINDS = Ledger::TYPES.map(&:upcase)\n\n  def kinds = KINDS\n  def tag = :stamping\nend\n";
+    let build = || {
+        app(ledger, stamping)
+            .write("app/models/hooky.rb", "module Hooky\n  extend ActiveSupport::Concern\n  included { include Gamma }\nend\n")
+            .write("app/models/gamma.rb", "module Gamma\n  def tag = :gamma\nend\n")
+    };
+    let (tree, errors) = build().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let text = ledger_file(&tree);
+    let at = |needle: &str| line_of(&text, |l| l.trim() == needle).unwrap_or_else(|| panic!("{needle} missing:\n{text}"));
+    assert!(at("TYPES = %w[a b].freeze") < at("include Ledger::Stamping"), "{text}");
+    assert!(at("include Ledger::Stamping") < at("include Hooky") && at("include Hooky") < at("include Gamma"), "{text}");
+    build()
+        .run_ruby(
+            r#"
+order = Ledger.ancestors.select { |a| [Gamma, Hooky, Ledger::Stamping].include?(a) }
+raise "ancestors: #{order.inspect}" unless order == [Gamma, Hooky, Ledger::Stamping]
+raise "tag: #{Ledger.new.tag.inspect}" unless Ledger.new.tag == :gamma
+raise "kinds: #{Ledger.new.kinds.inspect}" unless Ledger.new.kinds == ["A", "B"]
+puts "includes across files passed"
+"#,
+        )
+        .assert_passes();
+}

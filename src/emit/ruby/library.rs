@@ -10097,6 +10097,7 @@ fn emit_library_class_decl_inner(
     };
     let mut late_requires: BTreeSet<String> = BTreeSet::new();
     let mut late_from: Option<u32> = None;
+    let mut late_file = None;
     let mut late_includes: Vec<(&ClassId, String)> = Vec::new();
     for (i, inc) in lc.includes.iter().enumerate() {
         let Some(span) = include_span(i, inc) else { continue };
@@ -10117,16 +10118,38 @@ fn emit_library_class_decl_inner(
             }
             _ => false,
         });
-        if reads_earlier {
+        // Offsets compare only within one file: a late include in another
+        // file than the first one keeps main's class-top shape.
+        if reads_earlier && late_file.is_none_or(|file| file == span.file) {
             late_requires.insert(require.clone());
             late_from = Some(late_from.map_or(span.start, |from| from.min(span.start)));
+            late_file = Some(span.file);
         }
     }
     let mut moved_to_body: Vec<&ClassId> = Vec::new();
-    if let Some(from) = late_from {
+    if let (Some(from), Some(file)) = (late_from, late_file) {
+        // Offsets order includes only within the late include's file. One
+        // with no span there (an `include` a hook writes in its concern's
+        // file, or one in another opening) has no place of its own in this
+        // body: once an include has moved, it follows the include before
+        // it, so the moved includes keep the order `lc.includes` gives
+        // them. Before that, it stays at the class top.
+        let mut last_at: Option<u32> = None;
         for (i, inc) in lc.includes.iter().enumerate() {
-            let Some(span) = include_span(i, inc) else { continue };
-            if span.start < from || ordered_includes.iter().any(|(_, o)| *o == inc) {
+            let at = match include_span(i, inc) {
+                Some(span) if span.file == file => {
+                    if span.start < from {
+                        continue;
+                    }
+                    span.start
+                }
+                _ => match last_at {
+                    Some(at) => at,
+                    None => continue,
+                },
+            };
+            last_at = Some(at);
+            if ordered_includes.iter().any(|(_, o)| *o == inc) {
                 continue;
             }
             let require = nested_require_of.iter().find(|(of, _)| of == inc).map(|(_, r)| r.clone());
@@ -10136,12 +10159,12 @@ fn emit_library_class_decl_inner(
             if positioned.iter().any(|(_, p)| *p == inc) {
                 // Its hook needs the methods above it: only its file loads here.
                 if late_includes.iter().any(|(late, _)| *late == inc) {
-                    body.push((span.start, BodyItem::Load(inc)));
+                    body.push((at, BodyItem::Load(inc)));
                 }
                 continue;
             }
             moved_to_body.push(inc);
-            body.push((span.start, BodyItem::Include(inc)));
+            body.push((at, BodyItem::Include(inc)));
         }
         body.sort_by_key(|(start, _)| *start);
     }
