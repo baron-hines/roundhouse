@@ -911,6 +911,18 @@ pub(super) fn ingest_model_body_items(
         start: stmt.location().start_offset() as u32,
         end: stmt.location().end_offset() as u32,
     };
+    // `alias new old` in an `included do` block, as the model body walk records it.
+    if let Some(alias) = stmt.as_alias_method_node()
+        && let Some((to, from)) = super::library_class::alias_keyword_name(&alias.new_name()).zip(super::library_class::alias_keyword_name(&alias.old_name()))
+    {
+        return Ok(vec![ModelBodyItem::Alias {
+            new: crate::ident::Symbol::from(to.as_str()),
+            old: crate::ident::Symbol::from(from.as_str()),
+            leading_comments,
+            leading_blank_line: false,
+            span,
+        }]);
+    }
     // Only `serialize` and `scope` beside the `define_method`s: the other macros are read from the statement, not from a rewritten Expr.
     enum Unrolled {
         Serialize(Expr),
