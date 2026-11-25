@@ -80,6 +80,7 @@ mod boot_program;
 mod engine_config;
 mod engine_helpers;
 mod interpolated_renders;
+mod controller_csp;
 mod container_specialize;
 mod controller_class_methods;
 mod controller_delegates;

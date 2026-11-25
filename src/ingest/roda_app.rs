@@ -407,6 +407,7 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
         }],
         layout: LayoutDecl::Inherit,
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
 
     let Some(route_call) = route_call else {
@@ -973,6 +974,7 @@ impl<'f> RouteWalker<'f> {
                 body,
                 layout: LayoutDecl::Inherit,
                 sibling_classes: Vec::new(),
+                csp_header: false,
             });
         }
     }

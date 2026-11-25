@@ -13162,6 +13162,7 @@ mod concern_method_snapshot_tests {
             body: includes.iter().map(|n| mixin_item("include", n)).collect(),
             layout: crate::dialect::LayoutDecl::Inherit,
             sibling_classes: vec![],
+            csp_header: false,
         }
     }
 

@@ -519,6 +519,19 @@ module ActionDispatch
       @content_security_policy
     end
 
+    # Rails' `content_security_policy_nonce`: nil without a generator, else generated once per request.
+    def content_security_policy_nonce
+      return nil unless Rails.application.content_security_policy_nonce_generator?
+      @csp_nonce = Rails.application.content_security_policy_nonce_generated(self) if @csp_nonce.nil?
+      @csp_nonce
+    end
+
+    # A controller's `content_security_policy` block on a request whose app has no policy: Rails starts a new one.
+    def content_security_policy=(policy)
+      @csp_ready = true
+      @content_security_policy = policy
+    end
+
     # Absolute URL of this request. Feed templates interpolate it as
     # the channel link (lobsters' home/rss.rbuilder), which is why the
     # spinel tree needs it and not just the CRuby overlay's twin.

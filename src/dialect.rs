@@ -1617,6 +1617,10 @@ pub struct Controller {
     /// emit path re-declares these ahead of the controller class.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sibling_classes: Vec<SiblingClass>,
+    /// Rails' Content-Security-Policy middleware answers this controller's responses: the app has a policy, or the
+    /// controller sets one (`ingest::controller_csp`). `process_action` then writes the header after the chain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub csp_header: bool,
 }
 
 /// An empty-bodied class beside a controller (`class X < Parent; end`).

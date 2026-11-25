@@ -1486,6 +1486,7 @@ fn build_methods(
             &wraps,
             reads,
             &missing,
+            controller.csp_header,
         );
         // Assembly adds expressions after action lowering. Route-helper
         // rewriting is idempotent and must still cover the final dispatcher;

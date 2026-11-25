@@ -816,6 +816,28 @@ module Rails
       nil
     end
 
+    # `config.content_security_policy_nonce_generator`: none unless an initializer sets one, when ingest overrides
+    # these on the app's reopen with the lambda's body.
+    def content_security_policy_nonce_generator?
+      false
+    end
+
+    def content_security_policy_nonce_generated(request)
+      ""
+    end
+
+    # The request's nonce for the view helpers, which have no request of their own: nil outside one, or without a
+    # generator, as Rails' `request&.content_security_policy_nonce` is.
+    def content_security_policy_nonce_current
+      req = ActionController::Current.request
+      req.nil? ? nil : req.content_security_policy_nonce
+    end
+
+    # Rails' DEFAULT_NONCE_DIRECTIVES, where the app names none.
+    def content_security_policy_nonce_directives
+      ["script-src", "style-src"]
+    end
+
     # `Rails.application.importmap`. Paths are already `/assets/…`
     # from ingest; `to_json` ignores the resolver. The string is the
     # pretty script body the layout embeds, because a CSP hash of a

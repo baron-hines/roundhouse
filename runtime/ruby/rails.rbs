@@ -115,6 +115,10 @@ module Rails
     def default_per_page: () -> Integer
     def config: () -> FrameworkConfig
     def content_security_policy: () -> ActionDispatch::ContentSecurityPolicy?
+    def content_security_policy_nonce_generator?: () -> bool
+    def content_security_policy_nonce_generated: (ActionDispatch::Request request) -> String
+    def content_security_policy_nonce_directives: () -> Array[String]
+    def content_security_policy_nonce_current: () -> String?
     def importmap: () -> ImportmapMap
     def importmap_json: () -> String
   end

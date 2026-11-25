@@ -1390,12 +1390,15 @@ module ActionView
       end
       import_lines = pins.map { |p| "    \"#{p[:name]}\": \"#{p[:path]}\"" }.join(",\n")
       json = "{\n  \"imports\": {\n" + import_lines + "\n  }\n}"
+      # importmap-rails passes `nonce: request&.content_security_policy_nonce` to each tag; the tag helper drops a nil one.
+      nonce = Rails.application.content_security_policy_nonce_current
+      attr = nonce.nil? ? "" : %( nonce="#{nonce}")
       parts = []
-      parts << %(<script type="importmap" data-turbo-track="reload">) + json + %(</script>)
+      parts << %(<script type="importmap" data-turbo-track="reload") + attr + ">" + json + %(</script>)
       pins.each do |p|
-        parts << %(<link rel="modulepreload" href="#{p[:path]}">)
+        parts << %(<link rel="modulepreload" href="#{p[:path]}") + attr + ">"
       end
-      parts << %(<script type="module">import "#{entry}"</script>)
+      parts << %(<script type="module") + attr + %(>import "#{entry}"</script>)
       parts.join("\n")
     end
   
