@@ -1001,6 +1001,14 @@ fn rewrite(
         &*target.node,
         ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }
     ) {
+        // Not `send` on a receiver of unknown class: a native build resolves that name to any class defining its own
+        // `send` (the Spinel tree's `Faye::WebSocket#send`); `__send__` is Kernel's alone, as Ruby's `send` is here.
+        let untyped = recv.as_ref().is_some_and(|r| matches!(r.ty, None | Some(Ty::Var { .. }) | Some(Ty::Untyped)));
+        if method.as_str() == "send" && untyped
+            && let ExprNode::Send { method, .. } = &mut *e.node
+        {
+            *method = Symbol::from("__send__");
+        }
         return;
     }
     // The receiver lands in every arm, and the case evaluates the
