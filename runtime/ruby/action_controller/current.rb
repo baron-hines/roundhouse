@@ -36,6 +36,12 @@ module ActionController
       @request
     end
 
+    # The dynamic sources a controller's `content_security_policy` blocks give, by index; each such controller answers
+    # its own (`ingest::controller_csp`).
+    def content_security_policy_source(index)
+      ""
+    end
+
     def csrf_header_token
       req = @request
       return "" if req.nil?

@@ -444,6 +444,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         body: body_items,
         layout,
         sibling_classes,
+        csp_header: false,
     }))
 }
 

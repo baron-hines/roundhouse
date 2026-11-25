@@ -3696,6 +3696,30 @@ impl<'a> BodyTyper<'a> {
                     let elem = args[0].ty.as_ref().and_then(kernel_array_elem);
                     return Ty::Array { elem: std::sync::Arc::new(elem.unwrap_or_else(unknown)) };
                 }
+                // Not typed from the argument's class alone: `rand(0)` is a Float, `rand(1.5)` an Integer and
+                // `rand(1...1)` nil, so only a literal whose value settles it is typed (`rand(0..9999)`, `rand(10)`).
+                if recv.is_none() && method.as_str() == "rand" && args.len() <= 1
+                    && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                {
+                    let int = |e: &Option<Expr>| match e.as_ref().map(|e| &*e.node) {
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) => Some(*value),
+                        _ => None,
+                    };
+                    let answer = match args.first().map(|a| &*a.node) {
+                        None => Some(Ty::Float),
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) if *value != 0 => Some(Ty::Int),
+                        Some(ExprNode::Range { begin, end, exclusive }) => match (int(begin), int(end)) {
+                            (Some(b), Some(e)) if if *exclusive { b < e } else { b <= e } => Some(Ty::Int),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(answer) = answer {
+                        return answer;
+                    }
+                }
                 let translate = matches!(method.as_str(), "t" | "translate");
                 let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
                 let scope = match (!translate || ctx.in_view, recv.is_none() && !ctx.class_side) {

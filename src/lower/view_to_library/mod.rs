@@ -1509,18 +1509,20 @@ pub fn insert_db_stub(
             Ty::Bool,
         ),
     );
-    digest_info.class_methods.insert(
-        Symbol::from("pbkdf2_sha256"),
-        fn_sig(
-            vec![
-                (Symbol::from("secret"), Ty::Str),
-                (Symbol::from("salt"), Ty::Str),
-                (Symbol::from("iters"), Ty::Int),
-                (Symbol::from("dklen"), Ty::Int),
-            ],
-            Ty::Str,
-        ),
-    );
+    for name in ["pbkdf2_sha256", "pbkdf2_sha1"] {
+        digest_info.class_methods.insert(
+            Symbol::from(name),
+            fn_sig(
+                vec![
+                    (Symbol::from("secret"), Ty::Str),
+                    (Symbol::from("salt"), Ty::Str),
+                    (Symbol::from("iters"), Ty::Int),
+                    (Symbol::from("dklen"), Ty::Int),
+                ],
+                Ty::Str,
+            ),
+        );
+    }
     // AES-256-GCM, the encrypted cookie jar's cipher: encrypt answers the
     // ciphertext followed by the tag, decrypt the plaintext or "".
     let bytes = |n: &str| (Symbol::from(n), Ty::Str);

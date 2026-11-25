@@ -407,6 +407,7 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
         }],
         layout: LayoutDecl::Inherit,
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
 
     let Some(route_call) = route_call else {
@@ -871,7 +872,7 @@ impl<'f> RouteWalker<'f> {
                 action_symbol: false,
             });
         }
-        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new() };
+        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new(), url_protocols: Vec::new() };
 
         // Controllers — group leaves by controller stem, first-seen
         // order.
@@ -973,6 +974,7 @@ impl<'f> RouteWalker<'f> {
                 body,
                 layout: LayoutDecl::Inherit,
                 sibling_classes: Vec::new(),
+                csp_header: false,
             });
         }
     }

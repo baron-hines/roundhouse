@@ -181,6 +181,7 @@ pub(super) fn merge_route_files(files: Vec<FileRoutes>) -> RouteTable {
         table.direct_helpers.extend(file.table.direct_helpers);
         table.redirects.extend(file.table.redirects);
         table.diagnostics.extend(file.table.diagnostics);
+        table.url_protocols.extend(file.table.url_protocols);
         appended.extend(file.appended);
     }
     prepended.extend(table.entries);
@@ -244,6 +245,7 @@ fn ingest_route_file_in_frame(
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
+        url_protocols: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(0),
         scope_controller: RefCell::new(None),
         mounted_engines: RefCell::new(HashSet::default()),
@@ -314,7 +316,7 @@ fn ingest_route_file_in_frame(
     diagnostics.extend(refused_route_diagnostics(&prepended, source, file));
     diagnostics.extend(refused_route_diagnostics(&appended, source, file));
     Ok(FileRoutes {
-        table: RouteTable { entries, direct_helpers, redirects: redirect_sink::drain(), diagnostics },
+        table: RouteTable { entries, direct_helpers, redirects: redirect_sink::drain(), diagnostics, url_protocols: cx.url_protocols.take() },
         prepended,
         appended,
     })
@@ -414,6 +416,8 @@ struct Ctx<'a> {
     hoisted: RefCell<Vec<RouteSpec>>,
     /// Located errors recovered while retaining sibling routes.
     diagnostics: RefCell<Vec<Diagnostic>>,
+    /// `root … protocol:` options, by the helper stem they set the protocol of.
+    url_protocols: RefCell<Vec<(String, crate::span::Span)>>,
     /// Fixed runtime mounts cannot inherit path/constraint DSL wrappers.
     mount_scope_depth: Cell<usize>,
     /// The `controller:` of the enclosing `scope controller: :x do` /
@@ -836,6 +840,7 @@ fn walk_engine_body(body: Node<'_>, file: &str) -> IngestResult<EngineWalk> {
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
+        url_protocols: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(1),
         scope_controller: RefCell::new(None),
         mounted_engines: RefCell::new(HashSet::default()),
@@ -1492,6 +1497,15 @@ fn ingest_route_stmts<'pr>(
 
         if !route_options_kept(&call, &method) {
             route_refusal(&call.as_node(), file, cx, "route defaults", "this route option or defaults form is not modeled");
+        } else if method == "root"
+            && let Some((stem, span)) = root_url_protocol(&call, file)
+        {
+            // A scope renames the helper (`admin_root`), which the call sites are matched by.
+            if cx.mount_scope_depth.get() == 0 {
+                cx.url_protocols.borrow_mut().push((stem, span));
+            } else {
+                route_refusal(&call.as_node(), file, cx, "route defaults", "a scoped root's `protocol:` is not modeled");
+            }
         }
         // Per-entry recovery: one `mount`/`use_doorkeeper` must not
         // zero the whole table. Survey mode records the gap and keeps
@@ -1560,6 +1574,7 @@ fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
                 Some(key) if key != "defaults" && pair.value().as_regular_expression_node().is_some() => true,
                 Some(key) if key == "defaults" => !std::mem::replace(&mut defaults_seen, true)
                     && pair.value().as_hash_node().is_some_and(|hash| hash.elements().iter().all(&default_kept)),
+                Some(key) if key == "protocol" && method == "root" => true,
                 Some(key) => matches!(key.as_str(), "path" | "as" | "controller" | "action" | "constraints" | "to" | "via")
                     || (http_method_from(method).is_some() && key == "on")
                     || (http_method_from(method).is_some() && !route_reserved_option(&key) && route_default_literal(&pair.value()).is_some())
@@ -1572,6 +1587,26 @@ fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
     };
     let routed = http_method_from(method).is_some() || matches!(method, "root" | "scope" | "namespace" | "resources" | "resource");
     !routed || call.arguments().is_none_or(|args| args.arguments().iter().all(&mut read))
+}
+
+/// The `protocol:` of a `root` route, under the helper stem its `as:` names (`root` without one).
+fn root_url_protocol(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<(String, crate::span::Span)> {
+    let args = call.arguments()?;
+    let pairs: Vec<_> = args
+        .arguments()
+        .iter()
+        .filter_map(|arg| arg.as_keyword_hash_node())
+        .flat_map(|options| options.elements().iter().filter_map(|option| option.as_assoc_node()).collect::<Vec<_>>())
+        .collect();
+    let protocol = pairs.iter().find(|pair| symbol_value(&pair.key()).as_deref() == Some("protocol"))?;
+    // The last `as:`, as `ingest_root_route` names the helper by it.
+    let stem = pairs
+        .iter()
+        .rev()
+        .find(|pair| symbol_value(&pair.key()).as_deref() == Some("as"))
+        .and_then(|pair| symbol_or_string_value(&pair.value()))
+        .unwrap_or_else(|| "root".to_string());
+    Some((stem, super::util::node_span(&protocol.as_node(), file)))
 }
 
 fn route_refusal(node: &Node<'_>, file: &str, cx: &Ctx<'_>, construct: &str, detail: &str) {

@@ -15,9 +15,10 @@ module ActionController
     def self.derive_key: (String secret) -> String
     def self.encrypt: (String secret, String message_json, String purpose, String exp) -> String
     def self.decrypted_json: (String secret, String value, String purpose) -> String
+    def self.decrypted_json_by_key: (String key, String value, String purpose) -> String
     def self.purposed_json: (String plain, String purpose) -> String
     def self.unpurposed_json: (String plain) -> String
-    def self.decrypt: (String secret, String value) -> String
+    def self.decrypt: (String key, String value) -> String
     def self.strict_decode: (String text) -> String
   end
 end

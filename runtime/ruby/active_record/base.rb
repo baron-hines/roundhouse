@@ -1220,6 +1220,20 @@ module ActiveRecord
       !changes.empty?
     end
 
+    # ActiveModel::Dirty's names over the same diffs: `changes` is the pending one (`changes_to_save`), keyed by column
+    # String as Rails' indifferent Hash reads it; `previous_changes` the last save's; `changed` the pending columns.
+    def changes
+      changes_to_save
+    end
+
+    def previous_changes
+      saved_changes
+    end
+
+    def changed
+      changes_to_save.keys
+    end
+
     def has_changes_to_save?
       changed?
     end

@@ -57,7 +57,8 @@ module ActionDispatch
           @alert = v
           @alert_was = v
         else
-          carry_other(k, v)
+          # Not `v` alone: TypeScript reads a value of the untyped Hash as `unknown`, which no String parameter takes.
+          carry_other(k, v.to_s)
         end
         carried(k)
       end

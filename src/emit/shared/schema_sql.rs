@@ -435,7 +435,10 @@ pub fn validate_schema_for_dialect(schema: &Schema, dialect: Dialect) -> Result<
                 }
             }
             for expression in table.columns.iter().filter_map(|c| c.computed_default()) {
-                if !schema_expression_supported(expression, None, expression_dialect) {
+                // A SQLite app's `now()`, the one ingest carries (`ingest::schema`, as Rails' table on SQLite keeps it):
+                // the DDL takes it, and an insert relying on it fails there as in Rails.
+                let sqlite_now = dialect == Dialect::Sqlite && expression.replace(' ', "").eq_ignore_ascii_case("now()");
+                if !sqlite_now && !schema_expression_supported(expression, None, expression_dialect) {
                     return Err(format!("unsupported default expression on {}: {expression}", table.name));
                 }
             }

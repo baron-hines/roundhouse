@@ -163,6 +163,7 @@ pub(super) fn synthesize_process_action(
     wraps: &WrapFilters,
     reads_action_name: bool,
     missing: &[Symbol],
+    csp_header: bool,
 ) -> MethodDef {
     let mut stmts: Vec<Expr> = Vec::new();
 
@@ -342,7 +343,7 @@ pub(super) fn synthesize_process_action(
     // yield. Only a chain that narrowed (or consulted)
     // `content_security_policy` pays for the call; `write_header`
     // no-ops when the request has no policy.
-    if (!publics.is_empty() || !inherited.is_empty()) && chain_mentions_csp(preamble, wraps) {
+    if (!publics.is_empty() || !inherited.is_empty()) && (csp_header || chain_mentions_csp(preamble, wraps)) {
         stmts.push(csp_header_stmt());
     }
 

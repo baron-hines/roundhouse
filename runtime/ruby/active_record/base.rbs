@@ -204,6 +204,9 @@ module ActiveRecord
     def saved_change_to_attribute?: (Symbol name) -> bool
     def saved_change_to_attribute: (Symbol name) -> untyped
     def changes_to_save: () -> Hash[String, untyped]
+    def changes: () -> Hash[String, untyped]
+    def previous_changes: () -> Hash[String, untyped]
+    def changed: () -> Array[String]
     def attribute_changed?: (String name) -> bool
     def will_save_change_to_attribute?: (Symbol | String name) -> bool
     def changed?: () -> bool
