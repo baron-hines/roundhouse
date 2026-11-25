@@ -37,6 +37,9 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
     // Not a gem the Spinel tree already carries (a spin package or a facade): the same boundary `project::report_spinel_unknown_gem_constants` reports.
     let carried = crate::gems::native_extension_gem_namespaces(app);
     let ownership = crate::gems::LockGemIndex::new(lock);
+    // Not only the listed source gems: one whose files the tree carries for another reason (solid_queue's models) is compiled too.
+    let mounted = mounted_gems(app, lock);
+    let sourced: Vec<&str> = lock.source.iter().map(String::as_str).chain(mounted.iter().map(String::as_str)).collect();
     let mut out: BTreeSet<String> = BTreeSet::new();
     // Whether a gem's `lib/` declares a constant, per gem and path: asked only for a name the app declares too.
     let mut declared: crate::det::HashMap<(String, String), bool> = Default::default();
@@ -62,7 +65,7 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
         // Not an unlisted transitive gem: the fate table classifies an app's direct dependencies, so a transitive one reads as unknown whatever it is (rack).
         let direct = lock.dependencies.iter().any(|d| d == gem);
         // A dependency a sourced gem declares (typeid's uuid7) comes with it, whatever the table says of it.
-        let needed_by_source = from_gem && lock.source.iter().any(|s| lock.spec_deps.get(s).is_some_and(|deps| deps.iter().any(|d| d == gem)));
+        let needed_by_source = from_gem && sourced.iter().any(|s| lock.spec_deps.get(*s).is_some_and(|deps| deps.iter().any(|d| d == gem)));
         match crate::gems::fate_of(gem) {
             GemFate::Unknown if direct || needed_by_source => {}
             // Not left to its façade: rotp's `ROTP` raises there, so two-factor sign-in failed on Spinel while the installed gem is plain Ruby.
@@ -91,7 +94,7 @@ pub(super) fn candidates<V: Vfs + ?Sized>(app: &App, vfs: &V, dir: &Path) -> Vec
     let source_files: Vec<bool> = app
         .sources
         .iter()
-        .map(|s| lock.source.iter().any(|g| lock.version_of(g).is_some_and(|v| super::source_gems::file_of(&s.path, g, v))))
+        .map(|s| sourced.iter().any(|g| lock.version_of(g).is_some_and(|v| super::source_gems::file_of(&s.path, g, v))))
         .collect();
     let in_source_file =
         |file: crate::span::FileId| (file.0 as usize).checked_sub(1).and_then(|i| source_files.get(i)).copied().unwrap_or(false);
@@ -250,6 +253,25 @@ fn required_features(items: &[crate::app::ProgramItem], out: &mut Vec<String>) {
     }
 }
 
+/// The lockfile gems some source of the tree is a file of, read from the mount directory each sits under.
+fn mounted_gems(app: &App, lock: &crate::gems::Lockfile) -> BTreeSet<String> {
+    let mut dirs: BTreeSet<&str> = BTreeSet::new();
+    for source in &app.sources {
+        if let Some((_, rest)) = source.path.split_once(&format!("{}/", super::source_gems::MOUNT))
+            && let Some((dir, _)) = rest.split_once('/')
+        {
+            dirs.insert(dir);
+        }
+    }
+    // Matched whole against each locked `name-version`, as `source_gems::resolve` names the mount: a platform version
+    // (`1.0.0-x86_64-linux`) has hyphens of its own.
+    lock.specs
+        .iter()
+        .filter(|(gem, version)| dirs.contains(format!("{gem}-{version}").as_str()))
+        .map(|(gem, _)| gem.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,4 +357,23 @@ mod tests {
         let vfs = Linked { read_dirs: Cell::new(0) };
         assert!(declares(&vfs, Path::new("/gem/lib"), "Shelf::Box"));
     }
+
+    /// solid_queue's models, compiled for the queue's records, count as a sourced gem: its own needs (fugit) come
+    /// with it. A file of a gem the lockfile locks at another version, or of no gem, does not.
+    #[test]
+    fn a_gem_whose_files_the_tree_carries_is_sourced() {
+        let lock = crate::gems::Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    fugit (1.11.1)\n    nokogiri (1.19.2-arm64-darwin)\n    solid_queue (1.2.1)\n      fugit (~> 1.11)\n\nDEPENDENCIES\n  solid_queue\n");
+        let file = |path: &str| crate::span::SourceFile { path: path.to_string(), text: String::new() };
+        let app = App {
+            sources: vec![
+                file("/app/.roundhouse/source_gems/solid_queue-1.2.1/app/models/solid_queue/job.rb"),
+                file("/app/.roundhouse/source_gems/fugit-1.9.0/lib/fugit.rb"),
+                file("/app/.roundhouse/source_gems/nokogiri-1.19.2-arm64-darwin/lib/nokogiri.rb"),
+                file("/app/app/models/post.rb"),
+            ],
+            ..App::default()
+        };
+        assert_eq!(mounted_gems(&app, &lock).into_iter().collect::<Vec<_>>(), ["nokogiri", "solid_queue"]);
+    }
 }
+
