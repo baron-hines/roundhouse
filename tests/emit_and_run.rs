@@ -21735,10 +21735,15 @@ fn simple_format_sanitizes_a_literal_form_and_refuses_a_computed_one() {
         let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
         assert!(!errors.iter().any(|e| e.contains("simple_format")), "{markup}: {errors:?}");
     }
-    let markup = "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n";
-    let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
-    let refused: Vec<_> = errors.iter().filter(|e| e.contains("simple_format")).collect();
-    assert!(refused.len() == 1 && refused[0].contains("simple_format not supported") && refused[0].contains("HTML sanitizer"), "{markup}: {errors:?}");
+    // A computed `sanitize:`, and html options Rails evaluates before it sanitizes, which could change the text first.
+    for markup in [
+        "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n",
+        "<%= simple_format(\"a\", { class: @article.title }) %>\n",
+    ] {
+        let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
+        let refused: Vec<_> = errors.iter().filter(|e| e.contains("simple_format")).collect();
+        assert!(refused.len() == 1 && refused[0].contains("simple_format not supported") && refused[0].contains("HTML sanitizer"), "{markup}: {errors:?}");
+    }
 }
 
 /// Options that aren't a literal hash of `sanitize: false` and a literal

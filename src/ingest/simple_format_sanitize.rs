@@ -10,7 +10,10 @@ use crate::Symbol;
 
 pub(super) fn expand(app: &mut App) {
     // Not over the app's own helpers of either name: the call is then theirs, not Rails'.
-    if ["simple_format", "sanitize"].iter().any(|n| app.helper_method_index.contains_key(&Symbol::from(*n))) {
+    if ["simple_format", "sanitize"].iter().any(|n| {
+        let name = Symbol::from(*n);
+        app.helper_method_index.contains_key(&name) || app.view_visible_controller_methods.contains(&name)
+    }) {
         return;
     }
     for view in &mut app.views {
@@ -39,9 +42,9 @@ fn rewrite(e: &mut Expr) {
             _ => return,
         }
     }
-    if args.get(1).is_some_and(|a| matches!(&*a.node, ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. }))
-        || matches!(&*args[0].node, ExprNode::Splat { .. })
-    {
+    // Not where the html options could run code: Rails evaluates them before it sanitizes the text, and the rewrite
+    // sanitizes first.
+    if args.get(1).is_some_and(|a| !inert(a)) || matches!(&*args[0].node, ExprNode::Splat { .. }) {
         return;
     }
     options.retain(|(k, _)| !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "sanitize"));
@@ -53,4 +56,14 @@ fn rewrite(e: &mut Expr) {
     );
     let html = args.get(1).cloned().unwrap_or_else(|| Expr::new(span, ExprNode::Hash { entries: Vec::new(), kwargs: false }));
     *args = vec![sanitized, html, Expr::new(span, ExprNode::Hash { entries: options, kwargs: true })];
+}
+
+/// A literal, a local or instance variable read, or a Hash or Array of those: nothing it evaluates can change the text.
+fn inert(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. } => true,
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| inert(k) && inert(v)),
+        ExprNode::Array { elements, .. } => elements.iter().all(inert),
+        _ => false,
+    }
 }
