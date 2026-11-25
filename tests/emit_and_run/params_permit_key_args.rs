@@ -10,8 +10,8 @@
 //! as do a helper the class or a subclass overrides with one, a helper
 //! with a `return`, a memoized helper, a `merge` of anything but a Hash
 //! literal with Symbol keys (a String-keyed Hash literal keeps its String
-//! keys), a call with a block, and a splatted key list on a one-key
-//! method.
+//! keys), and a call with a block. A splatted key list on a one-key
+//! method names its first element (#2293, `params_permit_splat_keys`).
 
 use super::emit_and_run;
 
@@ -147,7 +147,7 @@ const CONTROLLER: &str = r#"class ImportsController < ApplicationController
     render plain: allowed_attrs.fetch("title")
   end
 
-  # Emit-only (no runtime case): the emitters cast a splatted first key as one key, on main too.
+  # Emit-only here; params_permit_splat_keys runs the splatted lists (#2293).
   def fetch_splat
     render plain: params.permit(%w[body]).fetch(*%w[title fallback]).inspect
   end
@@ -304,7 +304,8 @@ fn string_keys_on_a_permitted_hash_name_its_keys() {
 
 /// The Spinel emit writes the same Symbol keys, through a helper too; a plain Hash keeps its String, as do a
 /// helper this class or a subclass overrides, one with a `return`, a memoized one, a `merge` of a Hash variable, a
-/// String-keyed or computed-key Hash literal, a call with a block, and a splatted key list on `fetch`.
+/// String-keyed or computed-key Hash literal, and a call with a block; a splatted key list on `fetch` names its first
+/// element.
 #[test]
 fn the_spinel_emit_names_the_symbol_keys() {
     let (tree, errors) = emit_and_run::real_blog()
@@ -329,7 +330,7 @@ fn the_spinel_emit_names_the_symbol_keys() {
         "plain_attrs.except(\"version\")",
         "early_attrs.fetch(\"title\")",
         "memo_attrs.fetch(\"title\")",
-        ".fetch(*%w[title fallback]",
+        ".fetch(:title, \"fallback\")",
         "allowed_attrs.fetch(\"title\")",
         ".merge(extra).except(\"title\")",
         "}.fetch(\"title\")",
