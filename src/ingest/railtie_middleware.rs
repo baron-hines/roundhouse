@@ -729,6 +729,9 @@ fn each_collection<'p>(stmt: &Node<'p>) -> Option<(Node<'p>, String)> {
 
 /// `initializer "…" do |app| app.middleware.use(K) end`.
 /// What a Railtie's initializer guard reads: the Railtie's own predicates over the app's settings.
+/// Rails::Application::Configuration's boolean settings an app leaves unset, with Rails 8.1's value for them.
+const RAILS_BOOLEAN_DEFAULTS: &[(&str, bool)] = &[("api_only", false)];
+
 struct Guards<'a> {
     /// `def skip_middleware?(config) = return false if !config.respond_to?(:k); config.k` (message_bus): the
     /// predicate's name and the setting `k` it answers.
@@ -746,8 +749,8 @@ impl Guards<'_> {
         if name == "!" && call.arguments().is_none() {
             return self.decide(&call.receiver()?, app).map(|b| !b);
         }
-        if call.receiver().is_some() {
-            return None;
+        if let Some(recv) = call.receiver() {
+            return self.app_setting(&recv, &name, call.arguments().is_none(), app);
         }
         let key = self.predicates.get(&*name.to_string())?;
         let args: Vec<_> = call.arguments()?.arguments().iter().collect();
@@ -770,6 +773,24 @@ impl Guards<'_> {
     }
 
     /// `statements` with each `if`/`unless` a guard decides replaced by the branch Rails runs.
+    /// `app.config.k` read directly: the app's literal setting, or Rails' default where the app sets none.
+    fn app_setting(&self, recv: &Node<'_>, key: &str, bare: bool, app: &str) -> Option<bool> {
+        let config = recv.as_call_node()?;
+        let on_app = config.receiver().and_then(|r| r.as_local_variable_read_node()).is_some_and(|l| constant_id_str(&l.name()) == app);
+        if !(bare && on_app && constant_id_str(&config.name()) == "config" && config.arguments().is_none()) {
+            return None;
+        }
+        match self.settings.get(key) {
+            None => RAILS_BOOLEAN_DEFAULTS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v),
+            Some(Some(value)) => match value.as_str() {
+                "true" => Some(true),
+                "false" | "nil" => Some(false),
+                _ => None,
+            },
+            Some(None) => None,
+        }
+    }
+
     fn expand<'pr>(&self, statements: Vec<Node<'pr>>, app: &str, depth: usize) -> Vec<Node<'pr>> {
         let branch = |node: Option<ruby_prism::StatementsNode<'pr>>| node.map(|s| s.body().iter().collect::<Vec<_>>()).unwrap_or_default();
         let mut out = Vec::new();
@@ -1161,6 +1182,23 @@ mod tests {
         assert_eq!(run(&app(""), ""), (vec!["Gem::Middleware".to_string()], vec![]));
         // The environments disagree: the guard is not decided.
         let (_, diags) = run(&app("    config.skip_gem_middleware = true\n"), "Rails.application.configure do\n  config.skip_gem_middleware = false\nend\n");
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+    }
+
+    /// mission_control-jobs' engine: `if app.config.api_only` read directly. Rails leaves `api_only` false where the app
+    /// sets none, so nothing is inserted; an app setting it true gets the `use`.
+    #[test]
+    fn a_railtie_guard_on_an_app_setting_reads_rails_default_where_the_app_sets_none() {
+        let rt = railtie("    initializer \"gem.middleware\" do |app|\n      if app.config.api_only\n        app.middleware.use(Middleware)\n      end\n    end");
+        let run = |application: &str| {
+            read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", rt.as_str()), ("/app/config/application.rb", application)])
+        };
+        let app = |lines: &str| format!("module App\n  class Application < Rails::Application\n{lines}  end\nend\n");
+        assert_eq!(run(&app("")), (vec![], vec![]));
+        assert_eq!(run(&app("    config.api_only = true\n")), (vec!["Gem::Middleware".to_string()], vec![]));
+        // A setting Rails has no default for here stays undecided.
+        let rt = rt.replace("app.config.api_only", "app.config.eager_load");
+        let (_, diags) = read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", rt.as_str()), ("/app/config/application.rb", &app(""))]);
         assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
     }
 
