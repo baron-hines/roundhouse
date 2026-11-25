@@ -1563,6 +1563,17 @@ module ActiveRecord
     # model's synthesized `preload_associations` (batched `IN` loads
     # into the `_preload_<assoc>` caches). Models without a synthesized
     # override inherit Base's no-op and stay lazy (correct, just N+1).
+    # The JOINs written, and each one an `includes` implies because a condition names its association (Rails'
+    # `references_eager_loaded_tables?`), which preloading alone leaves out of the query.
+    def rendered_joins
+      return @joins if @includes.length == 0
+      out = copy_string_list(@joins)
+      copy_string_list(@model._eager_load_joins(@includes, @wheres.join(" "), @joins.join(" "))).each do |join|
+        out << join unless out.include?(join)
+      end
+      out
+    end
+
     def includes(*names)
       spawn.include_names!(names)
     end
@@ -2717,7 +2728,8 @@ module ActiveRecord
       return 0.0 if @null
       term = expr.is_a?(Symbol) ? aggregate_column(expr.to_s) : expr.to_s
       sql = "#{cte_prefix}SELECT COALESCE(SUM(#{term}), 0) AS n FROM #{from_source}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       rows = ActiveRecord.adapter.select_rows(sql)
       rows.length == 0 ? 0.0 : rows[0]["n"].to_f
@@ -3051,7 +3063,8 @@ module ActiveRecord
       return false if @null
       return true if n < 0
       sql = "#{cte_prefix}SELECT 1 AS one FROM #{from_source}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} LIMIT 1 OFFSET #{n}"
       ActiveRecord.adapter.select_rows(sql).length > 0
@@ -3811,7 +3824,8 @@ module ActiveRecord
       distinct = @distinct ? "DISTINCT " : ""
       hints = @optimizer_hints.empty? ? "" : "/*+ #{@optimizer_hints} */ "
       sql = "#{cte_prefix}SELECT #{hints}#{distinct}#{cols} FROM #{from_source}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} GROUP BY #{@groups.join(", ")}" if @groups.length > 0
       sql = "#{sql} HAVING #{@havings.join(" AND ")}" if @havings.length > 0
@@ -3848,7 +3862,8 @@ module ActiveRecord
     # JOIN + WHERE only — shared by count_sql / exists_sql so DISTINCT
     # and GROUP arms do not re-paste the ladder.
     def append_join_where(sql)
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql
     end

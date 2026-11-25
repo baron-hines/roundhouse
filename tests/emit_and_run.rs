@@ -21,6 +21,10 @@ mod native_http;
 mod namespaced_form_partial;
 #[path = "emit_and_run/literal_send_untyped.rs"]
 mod literal_send_untyped;
+#[path = "emit_and_run/duration_defined_units.rs"]
+mod duration_defined_units;
+#[path = "emit_and_run/eager_load_conditions.rs"]
+mod eager_load_conditions;
 #[path = "emit_and_run/zeitwerk_eager_gem.rs"]
 mod zeitwerk_eager_gem;
 #[path = "emit_and_run/lobsters_boot_calls.rs"]
