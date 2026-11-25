@@ -229,6 +229,34 @@ fn call_site_types(app: &App, jobs: &BTreeSet<String>) -> BTreeMap<String, Vec<S
     crate::lower::for_each_hook_body_ref(app, &mut |body| {
         collect_sites(body, jobs, &mut out);
     });
+    for job in recurring_argless_classes(app) {
+        if jobs.contains(&job) {
+            out.entry(job).or_default().push(Site::default());
+        }
+    }
+    out
+}
+
+/// The `class:` tasks of `config/recurring.yml` that give no `args:`: solid_queue's `RecurringTask` enqueues each
+/// with `perform_later(*arguments)` over the task's `args` (none here), so each is a call site with no arguments. A
+/// task with `args:` adds none, and stays without a typed site.
+fn recurring_argless_classes(app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+    for source in app.sources.iter().filter(|s| s.path.ends_with("config/recurring.yml")) {
+        let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&source.text) else { continue };
+        let Some(envs) = doc.as_mapping() else { continue };
+        for tasks in envs.values().filter_map(|v| v.as_mapping()) {
+            for task in tasks.values().filter_map(|v| v.as_mapping()) {
+                let get = |k: &str| task.get(serde_yaml_ng::Value::String(k.to_string()));
+                if get("args").is_some() {
+                    continue;
+                }
+                if let Some(class) = get("class").and_then(|c| c.as_str()) {
+                    out.push(class.trim_start_matches("::").to_string());
+                }
+            }
+        }
+    }
     out
 }
 
@@ -409,8 +437,12 @@ fn plan_params(
                 codec = join_codec(p, codec, ty)?;
             }
         }
-        let Some(codec) = codec else {
-            return Err(gap(Some(&p.name), "no call site passes it".to_string()));
+        // A rest no call site passes anything to is always empty: no element is ever written or read back, so any
+        // element codec reads it alike (a recurring `class:` task with no `args:`).
+        let codec = match codec {
+            Some(codec) => codec,
+            None if p.rest => Codec::Str,
+            None => return Err(gap(Some(&p.name), "no call site passes it".to_string())),
         };
         if p.rest && matches!(codec, Codec::NullableRecord { .. }) {
             return Err(gap(Some(&p.name), "a rest parameter of nullable records".to_string()));
@@ -1797,4 +1829,20 @@ pub fn sidekiq_adapter_target_warning(
             target.as_str()
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every environment's `class:` task without `args:` (lobsters' `ResticJob`, `WalCheckpointJob`), and none with them.
+    #[test]
+    fn a_recurring_class_task_without_args_is_an_argless_call_site() {
+        let yaml = "production:\n  restic:\n    class: ResticJob\n    schedule: every day at 1 am\n  pinged:\n    class: PingJob\n    args: [1]\n    schedule: every minute\n  cleanup:\n    command: SolidQueue::Job.clear_finished_in_batches\n    schedule: every day\ndevelopment:\n  wal:\n    class: \"::WalCheckpointJob\"\n    schedule: every minute\n";
+        let app = App {
+            sources: vec![crate::span::SourceFile { path: "/app/config/recurring.yml".to_string(), text: yaml.to_string() }],
+            ..App::default()
+        };
+        assert_eq!(recurring_argless_classes(&app), ["ResticJob", "WalCheckpointJob"]);
+    }
 }

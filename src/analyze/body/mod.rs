@@ -3696,6 +3696,27 @@ impl<'a> BodyTyper<'a> {
                     let elem = args[0].ty.as_ref().and_then(kernel_array_elem);
                     return Ty::Array { elem: std::sync::Arc::new(elem.unwrap_or_else(unknown)) };
                 }
+                // `Kernel#rand`: an Integer for an Integer or an Integer Range, a Float with none or a Float one.
+                if recv.is_none() && method.as_str() == "rand" && args.len() <= 1
+                    && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                {
+                    let answer = match args.first().and_then(|a| a.ty.as_ref()) {
+                        None => Some(Ty::Float),
+                        Some(Ty::Int) => Some(Ty::Int),
+                        Some(Ty::Float) => Some(Ty::Float),
+                        Some(Ty::Class { id, args: range }) if id.0.as_str() == "Range" => match range.first() {
+                            Some(Ty::Int) => Some(Ty::Int),
+                            Some(Ty::Float) => Some(Ty::Float),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(answer) = answer {
+                        return answer;
+                    }
+                }
                 let translate = matches!(method.as_str(), "t" | "translate");
                 let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
                 let scope = match (!translate || ctx.in_view, recv.is_none() && !ctx.class_side) {

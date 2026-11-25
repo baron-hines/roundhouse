@@ -121,10 +121,9 @@ fn colliding_association_predicates_are_refused_instead_of_collapsed() {
 fn creation_blocks_cannot_run_after_initialization_callbacks() {
     for target in [roundhouse::project::BuildTarget::Ruby, roundhouse::project::BuildTarget::Spinel] {
         let (_, errors) = reviewed_app().emit(target);
-        assert_eq!(errors.iter().filter(|e| e.contains("variable-condition calls must be blockless")).count(), 2,
-            "variable blocks must remain unsupported: {errors:?}");
-        assert_eq!(errors.iter().filter(|e| e.contains("creation block must run inside initialize")).count(), 1,
-            "literal blocks cannot overtake callbacks either: {errors:?}");
+        // Variable and literal conditions alike: on a model with an initialization callback, the block would run after it.
+        assert_eq!(errors.iter().filter(|e| e.contains("creation block must run inside initialize")).count(), 3,
+            "blocks cannot overtake initialization callbacks: {errors:?}");
     }
 }
 
