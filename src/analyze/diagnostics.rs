@@ -1899,6 +1899,20 @@ fn diagnose_expr(expr: &Expr, out: &mut Vec<Diagnostic>) {
 /// same `I18n.with_locale` twice (the call, then the body `Seq` that
 /// takes its tail's type) and once more for nothing. Every other
 /// diagnostic is position-independent and reported regardless.
+fn core_value_lacks(ty: &Ty, method: &str) -> bool {
+    let class = match ty {
+        Ty::Str => "String",
+        Ty::Int => "Integer",
+        Ty::Float => "Float",
+        Ty::Sym => "Symbol",
+        Ty::Array { .. } => "Array",
+        Ty::Hash { .. } => "Hash",
+        _ => return false,
+    };
+    !crate::lower::core_method_names::defined_by_every_object(method)
+        && !crate::lower::core_method_names::core_value_definers(method).contains(&class)
+}
+
 fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
     // Diagnostic annotations set by the body-typer during analyze.
     // These are the IR-carried path: detection happens once at the
@@ -2061,9 +2075,14 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             let unresolved_assignment = method.as_str() == "content_type="
                 && matches!(expr.diagnostic(), Some(DiagnosticKind::UnresolvedType { expr_kind, .. })
                     if expr_kind.as_str() == "assignment result");
-            // `Some(Var)` only: the analyzer's unresolved dispatch. A send a lowering built after analysis carries no type
-            // at all (`None`), and reading that as a failed dispatch reported `String#to_s` at emit, never at check.
-            if !is_unknown_ty(r.ty.as_ref()) && matches!(expr.ty, Some(Ty::Var { .. })) && !unresolved_assignment {
+            // Not every untyped send: one a lowering built after analysis carries no type at all (`None`), and reading that
+            // as a failed dispatch reported `String#to_s` at emit, never at check; only a core value missing the method is.
+            let failed = match &expr.ty {
+                Some(Ty::Var { .. }) => true,
+                None => r.ty.as_ref().is_some_and(|t| core_value_lacks(t, method.as_str())),
+                _ => false,
+            };
+            if !is_unknown_ty(r.ty.as_ref()) && failed && !unresolved_assignment {
                 let recv_ty = r.ty.clone().unwrap_or_else(|| Ty::Var { var: crate::ident::TyVar(0) });
                 let kind = DiagnosticKind::SendDispatchFailed {
                     method: method.clone(),
