@@ -22271,6 +22271,8 @@ mod doorkeeper;
 mod message_bus;
 #[path = "emit_and_run/cookie_rotation.rs"]
 mod cookie_rotation;
+#[path = "emit_and_run/render_layout_choice.rs"]
+mod render_layout_choice;
 #[path = "emit_and_run/render_object.rs"]
 mod render_object;
 #[path = "support/ordered_options_app.rs"]

@@ -382,8 +382,9 @@ module ActionDispatch
       @body ||= StringIO.new(@env["RAW_POST_DATA"].to_s)
     end
 
+    # Rails' `/XMLHttpRequest/i.match?`: anywhere in the header, any case.
     def xhr?
-      @env["HTTP_X_REQUESTED_WITH"] == "XMLHttpRequest"
+      @env["HTTP_X_REQUESTED_WITH"].to_s.downcase.include?("xmlhttprequest")
     end
 
     def inertia?
