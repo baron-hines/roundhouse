@@ -1398,6 +1398,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(app.included_hoist_conflicts.iter().cloned());
     out.extend(app.superclass_refusals.iter().cloned());
     out.extend(app.gem_route_gaps.iter().cloned());
+    out.extend(route_protocol_urls(app));
     // after_initialize bodies are the app's own code run at boot
     // (`ingest::after_initialize`): checked like a model method, not under
     // the library policy, so a call with no runtime behind it is an error.
@@ -1648,6 +1649,37 @@ pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
         }
     }
     helper_out
+}
+
+/// A `<stem>_url` call that names no `protocol:` of its own, for a route whose `protocol:` would pick it
+/// (`root to: …, protocol: …`): the emitted helper builds the request's protocol instead. A call naming its own
+/// protocol, and every `_path`, take nothing from the option.
+fn route_protocol_urls(app: &App) -> Vec<Diagnostic> {
+    if app.routes.url_protocols.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    crate::lower::for_each_emit_body_ref(app, &mut |body| {
+        fn visit(e: &Expr, protocols: &[(String, crate::span::Span)], out: &mut Vec<Diagnostic>) {
+            if let ExprNode::Send { recv, method, args, .. } = &*e.node
+                && recv.as_ref().is_none_or(crate::lower::controller_to_library::rewrites::is_rails_url_helpers_chain)
+                && let Some((stem, _)) = protocols.iter().find(|(stem, _)| method.as_str().strip_suffix("_url") == Some(stem.as_str()))
+                && !args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { entries, .. }
+                    if entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "protocol"))))
+                && !e.span.is_synthetic()
+            {
+                out.push(Diagnostic::unsupported(
+                    e.span,
+                    None,
+                    "route protocol",
+                    format!("`{}` takes its protocol from the `{stem}` route's `protocol:`, which is not modeled; pass `protocol:` here", method.as_str()),
+                ));
+            }
+            e.node.for_each_child(&mut |c| visit(c, protocols, out));
+        }
+        visit(body, &app.routes.url_protocols, &mut out);
+    });
+    out
 }
 
 /// A call in an `after_initialize` body that nothing checks: its receiver
