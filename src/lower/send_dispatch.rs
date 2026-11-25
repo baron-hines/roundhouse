@@ -1003,8 +1003,9 @@ fn rewrite(
     ) {
         // Not `send` on a receiver of unknown class: a native build resolves that name to any class defining its own
         // `send` (the Spinel tree's `Faye::WebSocket#send`); `__send__` is Kernel's alone, as Ruby's `send` is here.
+        // Nor a String argument: `ws.send("hello")` on a socket is the socket's own `send`, which a Symbol never reaches.
         let untyped = recv.as_ref().is_some_and(|r| matches!(r.ty, None | Some(Ty::Var { .. }) | Some(Ty::Untyped)));
-        if method.as_str() == "send" && untyped
+        if method.as_str() == "send" && untyped && matches!(&*target.node, ExprNode::Lit { value: Literal::Sym { .. } })
             && let ExprNode::Send { method, .. } = &mut *e.node
         {
             *method = Symbol::from("__send__");
