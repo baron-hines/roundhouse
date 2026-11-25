@@ -258,3 +258,82 @@ want = {}
     run.assert_passes();
     assert!(run.stdout.contains("include order passed"), "{}", run.stdout);
 }
+
+/// One controller reading `method` through the modules in `files`, against
+/// Ruby's answer for the same modules.
+fn single_case(files: &[(&str, &str)], include_lines: &str, method: &str, want: &str) {
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (file, source) in files {
+        app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
+    }
+    app = app
+        .write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < ApplicationController\n{include_lines}\n  def show\n    render json: {{ label: {method} }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n");
+    let script = format!(
+        r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {{}}, [e.message[0, 100]]]
+end
+text = +""
+body.each {{ |part| text << part }}
+got = [status, text]
+want = [200, %({{"label":{want:?}}})]
+raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
+puts "single case passed"
+"##
+    );
+    let run = app.run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("single case passed"), "{}", run.stdout);
+}
+
+/// A plain module whose body only includes others is still an ancestor:
+/// `[Single, PlainOnlyAb, PlainOnlyB, PlainOnlyA]` (#2278).
+#[test]
+fn a_plain_module_of_includes_only_passes_its_ancestors_on() {
+    single_case(
+        &[
+            ("plain_only_a", "module PlainOnlyA\n  def plain_a_only\n    \"plain a\"\n  end\nend\n"),
+            ("plain_only_b", "module PlainOnlyB\n  def label\n    \"plain b\"\n  end\nend\n"),
+            ("plain_only_ab", "module PlainOnlyAb\n  include PlainOnlyA\n  include PlainOnlyB\nend\n"),
+        ],
+        "  include PlainOnlyAb\n",
+        "plain_a_only",
+        "plain a",
+    );
+}
+
+/// `self.include` in a concern of includes only is the same include:
+/// `[Single, SelfWrapper, HookDef]`, and HookDef's hook defines `label` (#2278).
+#[test]
+fn a_concern_of_self_includes_only_passes_its_hook_on() {
+    single_case(
+        &[
+            ("hook_def", "module HookDef\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+            ("self_wrapper", "module SelfWrapper\n  self.extend ActiveSupport::Concern\n  self.include HookDef\nend\n"),
+        ],
+        "  include SelfWrapper\n",
+        "label",
+        "hook",
+    );
+}
+
+/// `self.included do` is the same hook: its `label` is defined on the
+/// controller, ahead of the later PlainDef's (#2278).
+#[test]
+fn a_self_included_hook_defines_on_the_includer() {
+    single_case(
+        &[
+            ("hook_self", "module HookSelf\n  extend ActiveSupport::Concern\n\n  self.included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+            ("plain_def", "module PlainDef\n  extend ActiveSupport::Concern\n\n  def label\n    \"plain\"\n  end\nend\n"),
+        ],
+        "  include HookSelf\n  include PlainDef\n",
+        "label",
+        "hook",
+    );
+}

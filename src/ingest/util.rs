@@ -521,7 +521,7 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_includes_into_constant(m.body())
         || body_registers_autoloads(m.body())
         || body_extends_module(m.body())
-        || concern_includes_module(m.body())
+        || module_includes_module(m.body())
         || body_hands_itself_out(m.body())
 }
 
@@ -544,25 +544,28 @@ fn body_hands_itself_out(body: Option<Node<'_>>) -> bool {
     })
 }
 
-/// A Concern whose body only includes other modules. It has nothing of
-/// its own to emit, but Rails runs its dependencies' `included` blocks on
-/// whatever includes it, so the `include` edge has to survive.
-fn concern_includes_module(body: Option<Node<'_>>) -> bool {
+/// A module that is only a set of includes. It has nothing of its own to
+/// emit, but it is still an ancestor, so the `include` edge has to survive:
+/// - A Concern that includes a module: Rails runs its dependencies'
+///   `included` blocks on whatever includes it.
+/// - A plain module whose every statement is an `include` of constants:
+///   its includer reaches the included modules' methods through it
+///   (#2278). A body with anything else, such as a nested module, is not
+///   one.
+fn module_includes_module(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     let statements = flatten_statements(body);
     fn call_named<'pr>(stmt: &Node<'pr>, name: &str) -> Option<ruby_prism::CallNode<'pr>> {
+        // `self.include` is the same call (#2278).
         stmt.as_call_node().filter(|call| {
-            call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && call.block().is_none()
+                && constant_id_str(&call.name()) == name
         })
     }
     // `self.extend` is the same call.
     let extends_concern = statements.iter().any(|stmt| {
-        let call = stmt.as_call_node().filter(|call| {
-            call.receiver().is_none_or(|r| r.as_self_node().is_some())
-                && call.block().is_none()
-                && constant_id_str(&call.name()) == "extend"
-        });
-        call.is_some_and(|call| {
+        call_named(stmt, "extend").is_some_and(|call| {
             call.arguments().is_some_and(|a| {
                 a.arguments().iter().any(|arg| {
                     constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
@@ -570,12 +573,18 @@ fn concern_includes_module(body: Option<Node<'_>>) -> bool {
             })
         })
     });
-    extends_concern
-        && statements.iter().any(|stmt| {
-            call_named(stmt, "include").is_some_and(|call| {
-                call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| constant_path_of(&arg).is_some()))
-            })
+    let includes_constant = |stmt: &Node<'_>| {
+        call_named(stmt, "include").is_some_and(|call| {
+            call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| constant_path_of(&arg).is_some()))
         })
+    };
+    let only_constant_includes = |stmt: &Node<'_>| {
+        call_named(stmt, "include").is_some_and(|call| {
+            call.arguments().is_some_and(|a| !a.arguments().is_empty() && a.arguments().iter().all(|arg| constant_path_of(&arg).is_some()))
+        })
+    };
+    (extends_concern && statements.iter().any(includes_constant))
+        || (!statements.is_empty() && statements.iter().all(only_constant_includes))
 }
 
 // `extend ActiveSupport::Concern` is left out: it is the included-block machinery, not methods the module answers.
@@ -746,7 +755,8 @@ fn body_has_included_block(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     for stmt in flatten_statements(body) {
         if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none()
+            // `self.included do` is the same block (#2278).
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some())
                 && constant_id_str(&call.name()) == "included"
                 && call.block().is_some_and(|b| b.as_block_node().is_some())
             {
