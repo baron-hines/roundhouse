@@ -624,6 +624,12 @@ module ActiveRecord
     def self.preload_associations(_records, _specs)
     end
 
+    # Not left to `preload_associations` alone: an `includes` whose association a condition names is a JOIN in Rails
+    # (`includes(:article).where(article: {…})`); models with such associations answer theirs.
+    def self._eager_load_joins(_specs, _conditions)
+      []
+    end
+
     # Per-model adapter primitives — public AR API delegates here.
     # Default implementations route through the legacy
     # `ActiveRecord.adapter.X` + `instantiate` path so subclasses that
