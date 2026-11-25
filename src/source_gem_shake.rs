@@ -391,7 +391,18 @@ struct Gems<'a> {
     model_copies: HashMap<(String, bool, String), Vec<&'a crate::dialect::MethodDef>>,
 }
 
+/// `super` from `owner`'s method: the definition after `owner` in a lookup order (for a module a class prepends, the
+/// class's own).
+fn next_definition(lineage: &[String], module: &str, defines: impl Fn(&str) -> bool) -> Option<String> {
+    let at = lineage.iter().position(|a| a == module)?;
+    lineage[at + 1..].iter().find(|a| defines(a)).cloned()
+}
+
 impl<'a> Gems<'a> {
+    fn is_module(&self, name: &str) -> bool {
+        self.entries.get(name).is_some_and(|e| e.iter().any(|c| c.is_module))
+    }
+
     fn of(app: &'a App) -> Option<Self> {
         if app.auto_source_gems.is_empty() {
             return None;
@@ -595,19 +606,33 @@ impl<'a> Gems<'a> {
 
     /// The modules a class body `extend`s: their instance methods are the class's own class methods.
     fn extends_of(&self, name: &str) -> Vec<String> {
+        self.body_mixins_of(name, "extend").into_iter().flatten().collect()
+    }
+
+    /// The modules a class body `prepend`s (redis's `RedisClient::Config.prepend(Redis::LibIdentity)`, read as an
+    /// opening), in the order Ruby looks a method up in them ahead of the class: a later `prepend` first, and the
+    /// arguments of one in the order written.
+    fn prepends_of(&self, name: &str) -> Vec<String> {
+        self.body_mixins_of(name, "prepend").into_iter().rev().flatten().collect()
+    }
+
+    /// Each `verb` call's modules, one list per call in source order.
+    fn body_mixins_of(&self, name: &str, verb: &str) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         for c in self.entries.get(name).into_iter().flatten() {
             for call in &c.unknown_calls {
                 let ExprNode::Send { recv, method, args, .. } = &*call.node else { continue };
-                if method.as_str() != "extend" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+                if method.as_str() != verb || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
                     continue;
                 }
+                let mut modules = Vec::new();
                 for a in args {
                     if let ExprNode::Const { path } = &*a.node {
                         let written = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
-                        out.extend(self.resolve(Some(name), &written));
+                        modules.extend(self.resolve(Some(name), &written));
                     }
                 }
+                out.push(modules);
             }
         }
         out
@@ -628,7 +653,7 @@ impl<'a> Gems<'a> {
 
     /// The definition a call of `method` on `c`'s `side` runs: a class method may be an instance method of a module the class extends.
     fn lookup(&self, c: &str, side: bool, method: &str) -> Option<MethodKey> {
-        let ancestors = self.ancestors(c);
+        let ancestors = self.ancestors_on(c, side);
         if let Some(owner) = ancestors.iter().find(|a| self.defined.contains(&(a.as_str(), side, method))) {
             return Some((owner.clone(), side, method.to_string()));
         }
@@ -664,6 +689,12 @@ impl<'a> Gems<'a> {
 
     /// Method resolution order, as Ruby looks a method up: the class, its modules, then its parent's.
     fn ancestors(&self, name: &str) -> Vec<String> {
+        self.ancestors_on(name, false)
+    }
+
+    /// The lookup order of `name`'s instance methods, or of its class methods (`class_side`), which a module it
+    /// prepends does not answer: `C.prepend(M)` gives `C` none of `M`'s singleton methods.
+    fn ancestors_on(&self, name: &str, class_side: bool) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut current = Some(name.to_string());
         let mut guard = 0;
@@ -671,6 +702,11 @@ impl<'a> Gems<'a> {
             guard += 1;
             if guard > 64 || out.contains(&c) {
                 break;
+            }
+            if !class_side {
+                for m in self.prepends_of(&c) {
+                    self.module_lineage(&m, &mut out, 0);
+                }
             }
             out.push(c.clone());
             let mut stack = self.includes_of(&c);
@@ -688,11 +724,26 @@ impl<'a> Gems<'a> {
         out
     }
 
+    /// A mixed-in module's place in a lookup order: what it prepends, itself, then what it includes.
+    fn module_lineage(&self, m: &str, out: &mut Vec<String>, depth: usize) {
+        if depth > 16 || out.iter().any(|a| a == m) {
+            return;
+        }
+        for p in self.prepends_of(m) {
+            self.module_lineage(&p, out, depth + 1);
+        }
+        out.push(m.to_string());
+        for i in self.includes_of(m) {
+            self.module_lineage(&i, out, depth + 1);
+        }
+    }
+
     /// What loads with a reached class: its parent, its modules and the namespaces enclosing it.
     fn loads_with(&self, c: &str) -> Vec<String> {
         let mut more: Vec<String> = Vec::new();
         more.extend(self.parent_of(c));
         more.extend(self.includes_of(c));
+        more.extend(self.prepends_of(c));
         more.extend(self.extends_of(c));
         let mut outer = c;
         while let Some((o, _)) = outer.rsplit_once("::") {
@@ -1063,17 +1114,22 @@ impl Walk<'_, '_> {
     }
 
     fn ancestors(&mut self, name: &str) -> Rc<[String]> {
-        if let Some(found) = self.ancestors.get(name) {
+        self.ancestors_on(name, false)
+    }
+
+    fn ancestors_on(&mut self, name: &str, class_side: bool) -> Rc<[String]> {
+        let key = if class_side { format!("{name}\u{1}") } else { name.to_string() };
+        if let Some(found) = self.ancestors.get(&key) {
             return found.clone();
         }
-        let found: Rc<[String]> = self.gems.ancestors(name).into();
-        self.ancestors.insert(name.to_string(), found.clone());
+        let found: Rc<[String]> = self.gems.ancestors_on(name, class_side).into();
+        self.ancestors.insert(key, found.clone());
         found
     }
 
     /// The ancestor of `c` whose method of this name and side a call on `c` runs.
     fn owner(&mut self, c: &str, side: bool, method: &str) -> Option<String> {
-        self.ancestors(c).iter().find(|a| self.gems.defined.contains(&(a.as_str(), side, method))).cloned()
+        self.ancestors_on(c, side).iter().find(|a| self.gems.defined.contains(&(a.as_str(), side, method))).cloned()
     }
 
     fn answer(&mut self, c: &str, side: bool, method: &str) {
@@ -1200,9 +1256,19 @@ impl Walk<'_, '_> {
                 }
             }
             Target::Super(c, side) => {
-                let owner = self.ancestors(&c).iter().skip(1).find(|a| gems.defined.contains(&(a.as_str(), side, method.as_str()))).cloned();
+                let owner = next_definition(&self.ancestors_on(&c, side), &c, |a| gems.defined.contains(&(a, side, method.as_str())));
                 if let Some(owner) = owner {
                     self.method((owner, side, method));
+                } else if !side && gems.is_module(&c) {
+                    let hosts: Vec<String> = gems.entries.keys().filter(|h| **h != c).cloned().collect();
+                    let mut owners = Vec::new();
+                    for host in hosts {
+                        let lineage = self.ancestors(&host);
+                        owners.extend(next_definition(&lineage, &c, |a| gems.defined.contains(&(a, false, method.as_str()))));
+                    }
+                    for owner in owners {
+                        self.method((owner, false, method.clone()));
+                    }
                 }
             }
             Target::Virtual(c, side) => {
@@ -1753,8 +1819,12 @@ mod tests {
                         continue;
                     }
                     Target::Super(c, side) => {
-                        if let Some(owner) = ancestors(c).into_iter().skip(1).find(|a| defines(a, *side, method)) {
+                        if let Some(owner) = next_definition(&gems.ancestors_on(c, *side), c, |a| defines(a, *side, method)) {
                             reached.push((owner, *side, method.clone()));
+                        } else if !*side && gems.is_module(c) {
+                            for host in gems.entries.keys().filter(|h| *h != c) {
+                                reached.extend(next_definition(&ancestors(host), c, |a| defines(a, false, method)).map(|o| (o, false, method.clone())));
+                            }
                         }
                         continue;
                     }
@@ -1996,6 +2066,38 @@ mod tests {
         // Not reached from `[1, 2].count_down(1)`: an Array's methods are its own.
         assert!(!reached.methods.contains(&method("Tally::Counting", false, "count_down")), "{reached:#?}");
         assert!(!reached.classes.contains("Tally::Spare"), "{reached:#?}");
+    }
+
+    /// A class's prepended modules answer its instance methods ahead of it, the first argument of one `prepend`
+    /// first and each module's own includes after it; they answer none of its class methods; and `super` from the
+    /// class's own method goes on to its parent, past the class.
+    #[test]
+    fn prepended_modules_answer_in_ruby_s_lookup_order() {
+        let app = spinel_app(
+            &[("chime (1.0)", &[])],
+            &[
+                ("chime-1.0/lib/chime.rb", "require \"chime/bell\"\n"),
+                ("chime-1.0/lib/chime/bell.rb", "module Chime\n  class Root\n    def greet\n      \"root\"\n    end\n  end\n\n  module Hush\n    def hum\n      \"hm\"\n    end\n  end\n\n  module Loud\n    include Hush\n\n    def tone\n      \"loud\"\n    end\n\n    def self.setting\n      \"loud\"\n    end\n  end\n\n  module Soft\n    def tone\n      \"soft\"\n    end\n  end\n\n  class Bell < Root\n    def greet\n      super + \"bell\"\n    end\n\n    def self.setting\n      \"bell\"\n    end\n  end\nend\n\nChime::Bell.prepend(Chime::Loud, Chime::Soft)\n"),
+            ],
+            &[(
+                "app/models/article.rb",
+                "class Article < ApplicationRecord\n",
+                "class Article < ApplicationRecord\n  def chime\n    bell = Chime::Bell.new\n    [bell.tone, bell.hum, bell.greet, Chime::Bell.setting]\n  end\n\n",
+            )],
+        );
+        let reached = reached(&app);
+        for (owner, class_side, name) in [
+            ("Chime::Loud", false, "tone"),
+            ("Chime::Hush", false, "hum"),
+            ("Chime::Bell", false, "greet"),
+            ("Chime::Root", false, "greet"),
+            ("Chime::Bell", true, "setting"),
+        ] {
+            assert!(reached.methods.contains(&method(owner, class_side, name)), "{owner} {name}: {reached:#?}");
+        }
+        for (owner, class_side, name) in [("Chime::Soft", false, "tone"), ("Chime::Loud", true, "setting")] {
+            assert!(!reached.methods.contains(&method(owner, class_side, name)), "{owner} {name}: {reached:#?}");
+        }
     }
 
     /// A call by a name built at run time reaches only the methods that name can be: one its

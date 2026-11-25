@@ -863,6 +863,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             Ty::Hash { key: std::sync::Arc::new(Ty::Int), value: std::sync::Arc::new(Ty::Str) },
         );
     }
+    // rack's `lib/rack/constants.rb`, the env keys and header names a gem's middleware reads
+    // (message_bus's `env[Rack::RACK_SESSION_OPTIONS]`): rack's own on the ruby family, the port's
+    // (`runtime/ruby/rack_utils.rb`) elsewhere, both Strings. On `ClassInfo.constants` behind `gem_boundary`, as
+    // `Rack::Utils::HTTP_STATUS_CODES` is.
+    {
+        let info = classes.entry(ClassId(Symbol::from("Rack"))).or_default();
+        info.gem_boundary = true;
+        info.is_module = true;
+        for name in ["HTTP_HOST", "HTTP_PORT", "HTTPS", "PATH_INFO", "REQUEST_METHOD", "REQUEST_PATH", "SCRIPT_NAME", "QUERY_STRING", "SERVER_PROTOCOL", "SERVER_NAME", "SERVER_PORT", "HTTP_COOKIE", "CACHE_CONTROL", "CONTENT_LENGTH", "CONTENT_TYPE", "ETAG", "EXPIRES", "SET_COOKIE", "TRANSFER_ENCODING", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "LINK", "UNLINK", "TRACE", "RACK_VERSION", "RACK_TEMPFILES", "RACK_EARLY_HINTS", "RACK_ERRORS", "RACK_LOGGER", "RACK_INPUT", "RACK_SESSION", "RACK_SESSION_OPTIONS", "RACK_SHOWSTATUS_DETAIL", "RACK_URL_SCHEME", "RACK_HIJACK", "RACK_IS_HIJACK", "RACK_RECURSIVE_INCLUDE", "RACK_MULTIPART_BUFFER_SIZE", "RACK_MULTIPART_TEMPFILE_FACTORY", "RACK_RESPONSE_FINISHED", "RACK_PROTOCOL", "RACK_REQUEST_FORM_INPUT", "RACK_REQUEST_FORM_HASH", "RACK_REQUEST_FORM_PAIRS", "RACK_REQUEST_FORM_VARS", "RACK_REQUEST_FORM_ERROR", "RACK_REQUEST_COOKIE_HASH", "RACK_REQUEST_COOKIE_STRING", "RACK_REQUEST_QUERY_HASH", "RACK_REQUEST_QUERY_STRING", "RACK_METHODOVERRIDE_ORIGINAL_METHOD"] {
+            info.constants.insert(Symbol::from(name), Ty::Str);
+        }
+    }
     register_stdlib_class(classes, "IPAddr", &[], &[
         ("ipv4?", Ty::Bool), ("ipv6?", Ty::Bool), ("ipv4_mapped?", Ty::Bool),
         ("loopback?", Ty::Bool), ("private?", Ty::Bool), ("link_local?", Ty::Bool),

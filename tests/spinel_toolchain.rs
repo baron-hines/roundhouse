@@ -356,6 +356,10 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "spinel_toolchain/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_autoload_helper.rs"]
+mod gem_autoload_helper_contract;
+#[path = "spinel_toolchain/gem_autoload_helper.rs"]
+mod gem_autoload_helper;
 #[path = "support/gem_method_require.rs"]
 mod gem_method_require_contract;
 #[path = "spinel_toolchain/gem_method_require.rs"]

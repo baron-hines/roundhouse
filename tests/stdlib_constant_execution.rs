@@ -652,3 +652,28 @@ fn monitor_mixin_executes_in_native_spinel() {
     stdlib_app().write("app/services/mixin_counter.rb", MONITOR_MIXIN_SOURCE)
         .run_spinel(MONITOR_MIXIN_SCRIPT).assert_passes();
 }
+
+/// `ingest::ruby_conditions::CORE_PROBES`: each probe settled at ingest answers so on the tree's Ruby too.
+const CORE_PROBE_SOURCE: &str = r#"class CoreProbe
+  def self.answers
+    [String.method_defined?(:byteindex), IO.method_defined?(:wait_readable), IO.method_defined?(:wait_writable)]
+  end
+end
+"#;
+
+const CORE_PROBE_SCRIPT: &str = r#"
+got = CoreProbe.answers
+raise got.inspect unless got == [true, true, true]
+puts "core probes passed"
+"#;
+
+#[test]
+fn core_feature_probes_answer_as_settled() {
+    stdlib_app().write("app/services/core_probe.rb", CORE_PROBE_SOURCE).run_ruby(CORE_PROBE_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn core_feature_probes_answer_as_settled_in_native_spinel() {
+    stdlib_app().write("app/services/core_probe.rb", CORE_PROBE_SOURCE).run_spinel(CORE_PROBE_SCRIPT).assert_passes();
+}

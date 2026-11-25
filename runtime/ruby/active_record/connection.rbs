@@ -153,6 +153,7 @@ module ActiveRecord
     def self._cast_primary_key: (Integer | Float | String | nil id) -> (Integer | String | nil)
     def self.connection: () -> Connection
     def self.lease_connection: () -> Connection
+    def self.connection_handler: () -> ConnectionAdapters::ConnectionHandler
     def self.with_connection: (?prevent_permanent_checkout: bool) { (Connection) -> untyped } -> untyped
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
@@ -331,5 +332,15 @@ module ActiveRecord
     def clear_attribute_change: (String name) -> nil
     def restore_attribute!: (String name) -> nil
     def restore_attributes: () -> Array[String]
+  end
+end
+
+module ActiveRecord
+  module ConnectionAdapters
+    class ConnectionHandler
+      self.@shared: ConnectionHandler?
+      def self.shared: () -> ConnectionHandler
+      def clear_active_connections!: (?Symbol? role) -> nil
+    end
   end
 end

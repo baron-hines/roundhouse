@@ -317,6 +317,14 @@ pub(crate) fn core_value_constant_type(name: &str) -> Option<Ty> {
     core_value_type(name)
 }
 
+/// The constants a platform may lack, read where a load-time branch has tested for them
+/// (`ingest::platform_guards`); not core values, since a read anywhere else may raise NameError.
+const PLATFORM_CONSTANTS: &[&str] = &["Socket::SOL_TCP", "Socket::TCP_KEEPIDLE", "Socket::TCP_KEEPALIVE"];
+
+pub(crate) fn platform_constant_type(name: &str) -> Option<Ty> {
+    PLATFORM_CONSTANTS.contains(&name.trim_start_matches("::")).then_some(Ty::Int)
+}
+
 /// The value contract contributed by a constant declared in `core_rbs()`.
 fn core_value_type(name: &str) -> Option<Ty> {
     if name.trim_start_matches("Object::") == "ENV" {

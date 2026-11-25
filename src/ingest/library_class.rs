@@ -742,7 +742,8 @@ fn ingest_library_classes_impl(
             program.statements().body().iter().all(|stmt| stmt.as_constant_write_node().is_some())
         });
         if !only_writes {
-            return Ok(Vec::new());
+            // The file's mixins and writes into other classes still are their targets' openings.
+            return Ok(super::top_level_mixins::openings(&root, file, &[]));
         }
         let mut holder = file_constants_holder(file, &file_constants);
         holder.constants = file_constants;
@@ -764,6 +765,11 @@ fn ingest_library_classes_impl(
             consts.extend(std::mem::take(&mut host.constants));
             host.constants = consts;
         }
+    }
+    if file_level {
+        let made_here: Vec<&str> = factories.iter().map(|c| c.name.0.as_str()).collect();
+        let openings = super::top_level_mixins::openings(&root, file, &made_here);
+        out.extend(openings);
     }
     Ok(super::class_new_factory::order_with_file_classes(factories, out))
 }
@@ -2762,6 +2768,8 @@ pub(super) fn library_class_from_module_node_with_scope(
         class_attributes: _, conditional_definitions,
     } = walk_decl_body_with_visibility(module.body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
+    let mut methods = methods;
+    drop_followed_autoload_registrations(module, &mut methods);
     Ok(LibraryClass {
         name: owner,
         is_module: true,
@@ -2777,6 +2785,97 @@ pub(super) fn library_class_from_module_node_with_scope(
         unknown_calls,
         class_ivar_initializers: class_initializers,
     })
+}
+
+/// A module body that registers its files through its own class method, as the mail gem does:
+///
+/// ```ruby
+/// def self.register_autoload(name, path)
+///   @autoloads[name] = path
+///   autoload(name, path)
+/// end
+/// register_autoload :Envelope, "mail/envelope"
+/// ```
+///
+/// When the helper is one source-gem ingest follows (`source_gems::autoload_helpers`: a `def self.x(name, path)` that
+/// registers its two parameters and changes neither), and every call of it in the module body is a statement of that
+/// body passing a Symbol and a String, ingest follows each call as it follows a literal `autoload`, and the file is
+/// loaded as the gem's other files are. The helper then drops its `autoload(name, path)` statement, as a literal
+/// `autoload` in a module body is not written either, and keeps the rest of its body. Any other call of it (with a
+/// built path, with a receiver, inside an assignment or a method) keeps the `autoload`.
+fn drop_followed_autoload_registrations(module: &ruby_prism::ModuleNode<'_>, methods: &mut [MethodDef]) {
+    let statements: Vec<Node<'_>> =
+        module.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+    let helpers: Vec<Vec<u8>> = statements
+        .iter()
+        .filter(|s| s.as_def_node().is_some())
+        .flat_map(|s| super::source_gems::autoload_helpers(s))
+        .collect();
+    for helper in helpers {
+        struct Calls<'a>(&'a [u8], usize);
+        impl<'pr> ruby_prism::Visit<'pr> for Calls<'_> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                if node.name().as_slice() == self.0 {
+                    self.1 += 1;
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let mut calls = Calls(&helper, 0);
+        if let Some(body) = module.body() {
+            ruby_prism::Visit::visit(&mut calls, &body);
+        }
+        // Defined once in the body (a `def` in `class << self` included): with a second definition, Ruby runs
+        // the later one, which need not be the one the rule accepted.
+        struct Defs<'a>(&'a [u8], usize);
+        impl<'pr> ruby_prism::Visit<'pr> for Defs<'_> {
+            fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                if node.name().as_slice() == self.0 {
+                    self.1 += 1;
+                }
+                ruby_prism::visit_def_node(self, node);
+            }
+        }
+        let mut defs = Defs(&helper, 0);
+        if let Some(body) = module.body() {
+            ruby_prism::Visit::visit(&mut defs, &body);
+        }
+        if defs.1 != 1 {
+            continue;
+        }
+        let literal = statements
+            .iter()
+            .filter_map(|s| s.as_call_node())
+            .filter(|c| {
+                let args: Vec<_> = c.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                c.name().as_slice() == helper.as_slice()
+                    && c.receiver().is_none()
+                    && c.block().is_none()
+                    && matches!(args.as_slice(), [name, path] if name.as_symbol_node().is_some() && path.as_string_node().is_some())
+            })
+            .count();
+        if literal == 0 || literal != calls.1 {
+            continue;
+        }
+        for method in methods.iter_mut() {
+            if method.receiver != MethodReceiver::Class || method.name.as_str().as_bytes() != helper.as_slice() {
+                continue;
+            }
+            let [a, b] = method.params.as_slice() else { continue };
+            let is_registration = |s: &Expr| {
+                matches!(&*s.node, ExprNode::Send { recv, method: m, args, block: None, .. }
+                    if m.as_str() == "autoload"
+                        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                        && matches!(args.as_slice(), [x, y]
+                            if matches!(&*x.node, ExprNode::Var { name, .. } if *name == a.name)
+                                && matches!(&*y.node, ExprNode::Var { name, .. } if *name == b.name)))
+            };
+            let ExprNode::Seq { exprs: statements } = &mut *method.body.node else { continue };
+            if statements.iter().filter(|s| is_registration(s)).count() == 1 {
+                statements.retain(|s| !is_registration(s));
+            }
+        }
+    }
 }
 
 fn take_class_ivar_initializers(calls: &mut Vec<Expr>) -> Vec<Expr> {

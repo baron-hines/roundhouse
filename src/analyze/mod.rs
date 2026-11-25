@@ -38,7 +38,7 @@ mod class_new;
 pub(crate) use body::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
-pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
+pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant, platform_constant_type};
 pub use body::DefinitionIndex;
 pub use body::PreparedConstResolver;
 pub mod async_color;
@@ -5299,7 +5299,11 @@ impl Analyzer {
                     if method.as_str() != "prepend" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) { continue; }
                     for arg in args {
                         if let ExprNode::Const { path } = &*arg.node {
-                            if let Some(id) = resolver.namespace(arg.span, path) { includes.entry(owner).or_default().push(id.clone()); }
+                            // Not by its span alone: a top-level mixin's opening writes the module rooted, at a span no reference is indexed at.
+                            let rooted = (path.first().is_some_and(|p| p.as_str().is_empty()) && arg.decisions & crate::expr::GENERATED_CONST_REF != 0)
+                                .then(|| ClassId(Symbol::from(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"))))
+                                .filter(|id| classes.contains_key(id));
+                            if let Some(id) = resolver.namespace(arg.span, path).cloned().or(rooted) { includes.entry(owner).or_default().push(id); }
                         }
                     }
                 }
