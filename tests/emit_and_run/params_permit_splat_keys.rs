@@ -70,7 +70,7 @@ fn a_splatted_key_list_on_a_permitted_hash_stays_a_list() {
         .assert_passes();
 }
 
-/// The Spinel emit writes the same lists: no `.to_s` / `.to_sym` on a splat.
+/// The Spinel emit writes the same arguments: the list's first element is the Symbol key, the rest as written.
 #[test]
 fn the_spinel_emit_keeps_a_splatted_key_list() {
     let (tree, errors) = emit_and_run::real_blog()
@@ -79,6 +79,12 @@ fn the_spinel_emit_keeps_a_splatted_key_list() {
         .emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.is_empty(), "{}", errors.join("\n"));
     let src = std::fs::read_to_string(tree.join("app/controllers/splat_keys_controller.rb")).expect("controller");
-    assert!(!src.contains("].to_s"), "a splatted list is coerced as one key:\n{src}");
-    assert!(!src.contains("keys.to_s"), "a splatted list is coerced as one key:\n{src}");
+    for line in [
+        ".fetch(:title, \"fallback\")",
+        ".fetch(keys[0].to_sym, *keys.drop(1))",
+        ".fetch(:body, \"fallback\")",
+        ".key?(:body)",
+    ] {
+        assert!(src.contains(line), "missing `{line}`:\n{src}");
+    }
 }

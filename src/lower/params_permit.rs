@@ -541,9 +541,13 @@ fn symbolize_permitted_key_args(expr: &mut Expr, helpers: &crate::det::HashSet<S
     }
     match method.as_str() {
         "except" | "slice" | "values_at" => args.iter_mut().for_each(symbolize_key),
-        // One key: a splatted list may carry more than the key (`fetch(*%w[a default])`), so it stays as written.
+        // One key: a splatted list may carry more than the key (`fetch(*%w[a default])`), so only its first element is
+        // the key (#2293). `dig` walks nested values, whose keys this Hash does not hold, so its splat stays as written.
         "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "delete" | "dig" => {
-            if let Some(first) = args.first_mut()
+            let splat_list = method.as_str() != "dig" && args.first().is_some_and(|a| matches!(&*a.node, ExprNode::Splat { .. }));
+            if splat_list {
+                symbolize_first_of_splat(args);
+            } else if let Some(first) = args.first_mut()
                 && !matches!(&*first.node, ExprNode::Splat { .. })
             {
                 symbolize_key(first);
@@ -551,6 +555,42 @@ fn symbolize_permitted_key_args(expr: &mut Expr, helpers: &crate::det::HashSet<S
         }
         _ => {}
     }
+}
+
+/// A one-key lookup whose arguments start with a splatted list: the list's first element is the key, the rest the
+/// default. A literal list is written out, its first String the Symbol (`fetch(*%w[a b])` → `fetch(:a, "b")`); a
+/// String Array variable reads its first element as the key (`fetch(*keys)` → `fetch(keys[0].to_sym, *keys.drop(1))`).
+/// Any other splat stays as written.
+fn symbolize_first_of_splat(args: &mut Vec<Expr>) {
+    let ExprNode::Splat { value } = &*args[0].node else { return };
+    let value = value.clone();
+    let span = args[0].span;
+    if let ExprNode::Array { elements, .. } = &*value.node {
+        if elements.is_empty() {
+            return;
+        }
+        let mut spread: Vec<Expr> = elements.clone();
+        symbolize_key(&mut spread[0]);
+        args.splice(0..1, spread);
+        return;
+    }
+    let pure = matches!(&*value.node, ExprNode::Var { .. } | ExprNode::Ivar { .. });
+    if !pure || !matches!(&value.ty, Some(Ty::Array { elem }) if **elem == Ty::Str) {
+        return;
+    }
+    let mut zero = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: 0 } });
+    zero.ty = Some(Ty::Int);
+    let mut first = send(span, Some(value.clone()), "[]", vec![zero]);
+    first.ty = Some(Ty::Str);
+    let mut key = send(span, Some(first), "to_sym", vec![]);
+    key.ty = Some(Ty::Sym);
+    let mut one = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: 1 } });
+    one.ty = Some(Ty::Int);
+    let mut rest = send(span, Some(value.clone()), "drop", vec![one]);
+    rest.ty = value.ty.clone();
+    let mut splat = Expr::new(span, ExprNode::Splat { value: rest });
+    splat.ty = args[0].ty.clone();
+    args.splice(0..1, [key, splat]);
 }
 
 /// A String literal → its Symbol; false for anything else.
@@ -889,9 +929,14 @@ fn parameters_on_hash(expr: &mut Expr) -> bool {
             *key = text;
             false
         }
-        // Not a literal key: the emit's coercion writes those as Rails reads them.
+        // Not a literal key: the emit's coercion writes those as Rails reads them. Not a splatted list either, which
+        // is the key and the default (`fetch(*%w[a b])`), not one key, nor a Symbol key on a `permit` result, which
+        // the permit lowering already named as its Hash's Symbol key (`fetch(*keys)`'s `keys[0].to_sym`, #2293).
         ("[]" | "fetch" | "key?" | "has_key?", [key, ..])
-            if !matches!(key.ty, Some(Ty::Str)) && !matches!(&*key.node, ExprNode::Lit { .. }) =>
+            if !matches!(key.ty, Some(Ty::Str))
+                && !matches!(&*key.node, ExprNode::Lit { .. } | ExprNode::Splat { .. })
+                && !(matches!(key.ty, Some(Ty::Sym))
+                    && matches!(&*r.node, ExprNode::Send { method: m, .. } if m.as_str() == "permit")) =>
         {
             let sym = key.clone();
             let mut text = send(span, Some(sym), "to_s", vec![]);
