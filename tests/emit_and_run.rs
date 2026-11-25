@@ -233,6 +233,10 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "emit_and_run/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_autoload_helper.rs"]
+mod gem_autoload_helper_contract;
+#[path = "emit_and_run/gem_autoload_helper.rs"]
+mod gem_autoload_helper;
 #[path = "support/gem_method_require.rs"]
 mod gem_method_require_contract;
 #[path = "emit_and_run/gem_method_require.rs"]
