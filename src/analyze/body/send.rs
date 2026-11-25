@@ -2507,6 +2507,10 @@ impl<'a> BodyTyper<'a> {
                 // through hash_method / array_method instead of falling
                 // back to the (no-op) class-method table. Element types
                 // start as Var; usage narrows them via flow-typing.
+                // A module has no `new`: `Module#new` is Class's alone.
+                if method.as_str() == "new" && self.classes().get(id).is_some_and(|c| c.is_module) {
+                    return unknown();
+                }
                 if method.as_str() == "new" {
                     match id.0.as_str() {
                         "Hash" => {

@@ -1660,23 +1660,29 @@ fn unchecked_callback_calls(expr: &Expr, out: &mut Vec<Diagnostic>) {
     fn unchecked(expr: &Expr) -> bool {
         match &*expr.node {
             ExprNode::Send { recv: Some(r), .. } => {
-                matches!(r.ty, Some(Ty::Untyped)) || is_unknown_ty(r.ty.as_ref())
+                matches!(r.ty, Some(Ty::Untyped)) || is_unknown_ty(r.ty.as_ref()) || open_framework_miss(r, expr)
             }
             ExprNode::Send { recv: None, .. } => is_unknown_ty(expr.ty.as_ref()),
             _ => false,
         }
     }
+    // Typed on the receiver, yet unchecked: the open class answers a name it does not model untyped, and nothing runs it.
+    fn open_framework_miss(recv: &Expr, call: &Expr) -> bool {
+        matches!(&recv.ty, Some(Ty::Class { id, .. }) if crate::analyze::registry::stdlib::OPEN_FRAMEWORK_RECEIVERS.contains(&id.0.as_str()))
+            && matches!(call.ty, Some(Ty::Untyped))
+    }
     if let ExprNode::Send { recv, method, .. } = &*expr.node {
         let link_of_reported_chain = recv.as_ref().is_some_and(|r| unchecked(r));
         if unchecked(expr) && !link_of_reported_chain && expr.diagnostic().is_none() && !expr.span.is_synthetic() {
+            let why = match recv.as_ref().map(|r| (r, &r.ty)) {
+                Some((r, Some(Ty::Class { id, .. }))) if open_framework_miss(r, expr) => format!("`{}` does not model it", id.0.as_str()),
+                _ => "it has no typed receiver".to_string(),
+            };
             out.push(Diagnostic::unsupported(
                 expr.span,
                 None,
                 "after_initialize callback call",
-                format!(
-                    "`{}` has no typed receiver, so nothing checks that the emitted program answers it at boot",
-                    method.as_str()
-                ),
+                format!("`{}`: {why}, so nothing checks that the emitted program answers it at boot", method.as_str()),
             ));
         }
     }

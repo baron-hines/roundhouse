@@ -80,7 +80,12 @@ module ActionController
     # The message JSON `value` carries for `purpose`, or "" for every
     # rejection (see the header). The caller parses it.
     def self.decrypted_json(secret, value, purpose)
-      plain = decrypt(secret, value)
+      decrypted_json_by_key(derive_key(secret), value, purpose)
+    end
+
+    # `decrypted_json` under a cipher key given as it is: a rotated secret is the encryptor's key itself.
+    def self.decrypted_json_by_key(key, value, purpose)
+      plain = decrypt(key, value)
       return "" if plain == ""
       json = purposed_json(plain, purpose)
       return json if json != ""
@@ -109,7 +114,7 @@ module ActionController
     # encoded tag and IV lengths and decoded strictly, as Rails does: a
     # part that is not canonical base64 rejects the cookie before the
     # cipher runs.
-    def self.decrypt(secret, value)
+    def self.decrypt(key, value)
       n = value.length
       return "" if n < ENCODED_TAG_LENGTH + ENCODED_IV_LENGTH + 4
       tag_at = n - ENCODED_TAG_LENGTH
@@ -120,7 +125,7 @@ module ActionController
       iv = strict_decode(value[iv_at, ENCODED_IV_LENGTH].to_s)
       tag = strict_decode(value[tag_at, ENCODED_TAG_LENGTH].to_s)
       return "" if ct == "" || iv.bytesize != IV_SIZE || tag.bytesize != TAG_SIZE
-      MessageDigest.aes_256_gcm_decrypt(derive_key(secret), iv, ct, tag)
+      MessageDigest.aes_256_gcm_decrypt(key, iv, ct, tag)
     end
 
     # `Base64.strict_decode64`, which raises on anything but canonical

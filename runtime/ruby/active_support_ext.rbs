@@ -73,10 +73,26 @@ module ActiveSupport
     end
   end
   class KeyGenerator
+    @sha1: bool
     @secret: String
     @iterations: Integer
     def initialize: (String secret, ?Hash[Symbol, untyped] options) -> void
     def generate_key: (String salt, ?Integer key_size) -> String
+  end
+  module MessageEncryptor
+    def self.key_len: (?String cipher) -> Integer
+  end
+  module Messages
+    class RotationConfiguration
+      self.@shared: RotationConfiguration
+      @signed: Array[String]
+      @encrypted: Array[String]
+      def self.shared: () -> RotationConfiguration
+      def initialize: () -> void
+      def signed: () -> Array[String]
+      def encrypted: () -> Array[String]
+      def rotate: (Symbol kind, String secret) -> nil
+    end
   end
   class CachingKeyGenerator
     @key_generator: KeyGenerator

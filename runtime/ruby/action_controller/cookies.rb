@@ -327,13 +327,35 @@ module ActionController
     def [](key)
       raw = @jar.raw(key)
       return nil if raw == ""
+      purpose = "cookie." + key.to_s
       json = ActionController::MessageVerifier.verified_json(
         Rails.application.secret_key_base,
         ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
-        raw, "cookie." + key.to_s, true
+        raw, purpose, true
       )
+      return ActionController::EncryptedCookieJar.parse(json) if json != ""
+      json = rotated_json(raw, purpose)
       return nil if json == ""
+      # Rails' `force_reserialize`: a cookie read by an old secret goes back out under the current one.
+      @jar.raw_set(key, ActionController::MessageVerifier.envelope(
+        Rails.application.secret_key_base,
+        ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
+        json, purpose, "null", true
+      ))
       ActionController::EncryptedCookieJar.parse(json)
+    end
+
+    # The message under the first `cookies_rotations.signed` secret that verifies it, by the SHA1 digest those
+    # rotations inherit from the jar's; "" when none does.
+    def rotated_json(raw, purpose)
+      secrets = ActiveSupport::Messages::RotationConfiguration.shared.signed
+      i = 0
+      while i < secrets.length
+        json = ActionController::MessageVerifier.verified_json_by_key(secrets[i], raw, purpose, true)
+        return json if json != ""
+        i += 1
+      end
+      ""
     end
 
     # Rails takes either a bare value or an options Hash carrying
@@ -374,8 +396,7 @@ module ActionController
   end
 
   # The `cookies.encrypted` view: same storage, encrypted on the way out
-  # and decrypted on the way in. Rails' EncryptedKeyRotatingCookieJar,
-  # minus the rotation.
+  # and decrypted on the way in. Rails' EncryptedKeyRotatingCookieJar.
   #
   # Unlike the signed view, a read answers the VALUE, not its text: the
   # cookie carries JSON (`cookies_serializer :json`), so a Hash comes back
@@ -393,11 +414,26 @@ module ActionController
     def [](key)
       raw = @jar.raw(key)
       return nil if raw == ""
-      json = ActionController::MessageEncryptor.decrypted_json(
-        Rails.application.secret_key_base, raw, "cookie." + key.to_s
-      )
+      purpose = "cookie." + key.to_s
+      json = ActionController::MessageEncryptor.decrypted_json(Rails.application.secret_key_base, raw, purpose)
+      return ActionController::EncryptedCookieJar.parse(json) if json != ""
+      json = rotated_json(raw, purpose)
       return nil if json == ""
+      # Rails' `force_reserialize`, as the signed view's: re-encrypted under the current secret, with no expiry.
+      @jar.raw_set(key, ActionController::MessageEncryptor.encrypt(Rails.application.secret_key_base, json, purpose, "null"))
       ActionController::EncryptedCookieJar.parse(json)
+    end
+
+    # The message under the first `cookies_rotations.encrypted` secret that decrypts it; "" when none does.
+    def rotated_json(raw, purpose)
+      secrets = ActiveSupport::Messages::RotationConfiguration.shared.encrypted
+      i = 0
+      while i < secrets.length
+        json = ActionController::MessageEncryptor.decrypted_json_by_key(secrets[i], raw, purpose)
+        return json if json != ""
+        i += 1
+      end
+      ""
     end
 
     # A bare value or Rails' options Hash, as the signed view takes them.

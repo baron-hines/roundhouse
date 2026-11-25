@@ -173,11 +173,17 @@ module ActionController
     # past. Callers that signed a non-String message read this and
     # deserialize themselves.
     def self.verified_json(secret, salt, signed, purpose, sha1)
+      verified_json_by_key(derive_key(secret, salt), signed, purpose, sha1)
+    end
+
+    # `verified_json` under an HMAC key given as it is, not derived: a rotated secret
+    # (`cookies_rotations.rotate :signed, key`) is the verifier's key itself.
+    def self.verified_json_by_key(key, signed, purpose, sha1)
       sep = signed.index("--")
       return "" if sep.nil?
       payload = signed[0, sep]
       supplied = signed[sep + 2, signed.length - sep - 2]
-      return "" unless secure_compare(supplied, digest_for(secret, salt, payload, sha1))
+      return "" unless secure_compare(supplied, digest_by_key(key, payload, sha1))
       envelope_message(Base64.strict_decode64(payload), purpose)
     end
 
@@ -329,7 +335,10 @@ module ActionController
     end
 
     def self.digest_for(secret, salt, payload, sha1)
-      key = derive_key(secret, salt)
+      digest_by_key(derive_key(secret, salt), payload, sha1)
+    end
+
+    def self.digest_by_key(key, payload, sha1)
       return MessageDigest.hmac_sha1_hex(key, payload) if sha1
       MessageDigest.hmac_sha256_hex(key, payload)
     end

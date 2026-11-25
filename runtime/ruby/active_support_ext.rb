@@ -603,20 +603,64 @@ module ActiveSupport
   end
 
   # Rails' PBKDF2 key derivation (`ActiveSupport::KeyGenerator`): `secret` stretched with each salt it is asked for,
-  # 2**16 iterations by default, by the SHA256 digest a `load_defaults 7.0` app sets as its `hash_digest_class`.
-  # Not SHA1, an older app's: the digest primitives this runtime carries derive by SHA256 only.
+  # 2**16 iterations by default, by the SHA256 digest a `load_defaults 7.0` app sets as its `hash_digest_class`,
+  # or by SHA1, the digest an app rotating its pre-7.0 cookies derives their old keys with.
   class KeyGenerator
     def initialize(secret, options = {})
-      digest = options[:hash_digest_class]
+      digest = options[:hash_digest_class].to_s
+      @sha1 = digest.end_with?("SHA1")
       # Not a SHA256 key under another digest's name: it would never match the keys that digest derived.
-      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256" unless digest.nil? || digest.to_s.end_with?("SHA256")
+      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256 or SHA1" unless digest == "" || @sha1 || digest.end_with?("SHA256")
       @secret = secret
       iterations = options[:iterations]
       @iterations = iterations.nil? ? 65536 : iterations.to_i
     end
 
     def generate_key(salt, key_size = 64)
+      return MessageDigest.pbkdf2_sha1(@secret, salt, @iterations, key_size) if @sha1
       MessageDigest.pbkdf2_sha256(@secret, salt, @iterations, key_size)
+    end
+  end
+
+  # Only the key length of the cookie jar's ciphers: the encryption itself is `ActionController::MessageEncryptor`.
+  # A module, not Rails' class: an encryptor of the app's own (`MessageEncryptor.new(key)`) stays reported.
+  module MessageEncryptor
+    def self.key_len(cipher = "aes-256-gcm")
+      raise ArgumentError, "unsupported cipher #{cipher}" unless cipher == "aes-256-gcm" || cipher == "aes-256-cbc"
+      32
+    end
+  end
+
+  module Messages
+    # `config.action_dispatch.cookies_rotations`: the old secrets the signed and encrypted cookie jars also accept.
+    # One shared instance, as the app's config has one: this runtime's `Rails.application.config` is built per call.
+    class RotationConfiguration
+      def self.shared
+        @shared ||= RotationConfiguration.new
+      end
+
+      def initialize
+        @signed = []
+        @encrypted = []
+      end
+
+      def signed
+        @signed
+      end
+
+      def encrypted
+        @encrypted
+      end
+
+      # One secret per rotation: a signed verifier takes no second, and the AES-256-GCM jar ignores a sign secret.
+      def rotate(kind, secret)
+        if kind == :signed
+          @signed << secret
+        elsif kind == :encrypted
+          @encrypted << secret
+        end
+        nil
+      end
     end
   end
 
