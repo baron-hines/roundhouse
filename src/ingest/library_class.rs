@@ -4433,7 +4433,9 @@ fn walk_decl_body_with_visibility<'pr>(
                             };
                             for name in call.arguments().into_iter().flat_map(|a| a.arguments().iter()).filter_map(|a| a.as_symbol_node()) {
                                 let name = String::from_utf8_lossy(name.unescaped()).into_owned();
-                                out.methods.push(reader_alias_method(&name, &name, owner, file, span)?);
+                                let mut m = reader_alias_method(&name, &name, owner, file, span)?;
+                                visibility.apply(&inner, &mut m);
+                                out.methods.push(m);
                             }
                             hoisted.push((inner.location().start_offset() as u32, inner.location().end_offset() as u32));
                             hoisted_alias = true;
@@ -4442,14 +4444,16 @@ fn walk_decl_body_with_visibility<'pr>(
                         // `alias to_s name` of an `attr_reader :name` the block declares: Ruby's alias is that reader.
                         if let Some(alias) = inner.as_alias_method_node()
                             && let Some((to, from)) = alias_keyword_name(&alias.new_name()).zip(alias_keyword_name(&alias.old_name()))
-                            && readers.contains(&from)
+                            && alias_targets.contains(&from)
                         {
                             let span = Span {
                                 file: super::sources::file_id(file),
                                 start: alias.location().start_offset() as u32,
                                 end: alias.location().end_offset() as u32,
                             };
-                            out.methods.push(reader_alias_method(&to, &from, owner, file, span)?);
+                            let mut m = reader_alias_method(&to, &from, owner, file, span)?;
+                            visibility.apply(&inner, &mut m);
+                            out.methods.push(m);
                             hoisted.push((inner.location().start_offset() as u32, inner.location().end_offset() as u32));
                             hoisted_alias = true;
                             continue;
@@ -4533,7 +4537,10 @@ fn walk_decl_body_with_visibility<'pr>(
                         }
                         Ok(e)
                     };
-                    if let Ok(mut e) = ingested {
+                    // Not dropped when it does not ingest: the block's macros (an `attr_reader`, an `alias`) then never reach
+                    // the includer, and the check would pass over a program that answers differently.
+                    {
+                        let mut e = ingested?;
                         if let ExprNode::Send { block: Some(blk), .. } = &mut *e.node
                             && let ExprNode::Lambda { body, .. } = &mut *blk.node
                         {
@@ -5516,12 +5523,34 @@ fn block_attr_readers(stmts: &[ruby_prism::Node<'_>]) -> crate::det::HashSet<Str
 /// The readers an `alias` of the same block names: only those are hoisted with it, so every other `attr_reader` stays
 /// as the includer's own call.
 fn block_alias_targets(stmts: &[ruby_prism::Node<'_>], readers: &crate::det::HashSet<String>) -> crate::det::HashSet<String> {
-    stmts
-        .iter()
-        .filter_map(|stmt| stmt.as_alias_method_node())
-        .filter_map(|alias| alias_keyword_name(&alias.old_name()))
-        .filter(|from| readers.contains(from))
-        .collect()
+    // The method each name is bound to at each alias, in source order: an alias copies what is current there, so a
+    // `def` of the name between the reader and the alias (or any `def` of it in the block) is not the reader.
+    let mut bound: crate::det::HashMap<String, bool> = Default::default();
+    let mut redefined: crate::det::HashSet<String> = Default::default();
+    let mut out = crate::det::HashSet::default();
+    for stmt in stmts {
+        if let Some(def) = visibility::definition(stmt).map(|d| d.as_node()).as_ref().unwrap_or(stmt).as_def_node() {
+            let name = constant_id_str(&def.name()).to_string();
+            bound.insert(name.clone(), false);
+            redefined.insert(name);
+        } else if let Some(call) = stmt.as_call_node()
+            && call.receiver().is_none()
+            && matches!(constant_id_str(&call.name()), "attr_reader" | "attr_accessor")
+        {
+            for name in call.arguments().into_iter().flat_map(|a| a.arguments().iter()).filter_map(|a| a.as_symbol_node()) {
+                bound.insert(String::from_utf8_lossy(name.unescaped()).into_owned(), true);
+            }
+        } else if let Some(alias) = stmt.as_alias_method_node()
+            && let Some(from) = alias_keyword_name(&alias.old_name())
+            && readers.contains(&from)
+            && bound.get(&from).copied().unwrap_or(false)
+        {
+            out.insert(from);
+        }
+    }
+    // Not a reader the block also defines by `def`: hoisting the reader would move it past that definition.
+    out.retain(|name| !redefined.contains(name));
+    out
 }
 
 /// An `attr_reader` (not `attr_accessor`, whose writer stays the includer's) every name of which an alias targets.

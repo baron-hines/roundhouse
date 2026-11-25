@@ -70,3 +70,13 @@ puts "included alias passed"
         ))
         .assert_passes();
 }
+
+/// An alias copies the method current at it: with a `def name` between the reader and the alias, `to_s` is that
+/// `def`'s, which a reader hoist would not be. The reader is not hoisted, and the block, which the alias keeps from
+/// ingesting, is an error rather than dropped (it was dropped whole, `to_s` and the `def name` with it).
+#[test]
+fn an_included_alias_of_a_redefined_reader_is_an_error() {
+    let concern = CONCERN.replace("    alias to_s name\n", "    def name\n      \"override\"\n    end\n    alias to_s name\n");
+    let (_tree, errors) = app().write("lib/identified_by_name.rb", &concern).emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("AliasMethodNode")), "{errors:#?}");
+}

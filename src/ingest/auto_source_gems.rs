@@ -263,11 +263,12 @@ fn mounted_gems(app: &App, lock: &crate::gems::Lockfile) -> BTreeSet<String> {
             dirs.insert(dir);
         }
     }
-    dirs.into_iter()
-        .filter_map(|dir| {
-            let (gem, version) = dir.rsplit_once('-')?;
-            (lock.version_of(gem) == Some(version)).then(|| gem.to_string())
-        })
+    // Matched whole against each locked `name-version`, as `source_gems::resolve` names the mount: a platform version
+    // (`1.0.0-x86_64-linux`) has hyphens of its own.
+    lock.specs
+        .iter()
+        .filter(|(gem, version)| dirs.contains(format!("{gem}-{version}").as_str()))
+        .map(|(gem, _)| gem.clone())
         .collect()
 }
 
@@ -361,17 +362,18 @@ mod tests {
     /// with it. A file of a gem the lockfile locks at another version, or of no gem, does not.
     #[test]
     fn a_gem_whose_files_the_tree_carries_is_sourced() {
-        let lock = crate::gems::Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    fugit (1.11.1)\n    solid_queue (1.2.1)\n      fugit (~> 1.11)\n\nDEPENDENCIES\n  solid_queue\n");
+        let lock = crate::gems::Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    fugit (1.11.1)\n    nokogiri (1.19.2-arm64-darwin)\n    solid_queue (1.2.1)\n      fugit (~> 1.11)\n\nDEPENDENCIES\n  solid_queue\n");
         let file = |path: &str| crate::span::SourceFile { path: path.to_string(), text: String::new() };
         let app = App {
             sources: vec![
                 file("/app/.roundhouse/source_gems/solid_queue-1.2.1/app/models/solid_queue/job.rb"),
                 file("/app/.roundhouse/source_gems/fugit-1.9.0/lib/fugit.rb"),
+                file("/app/.roundhouse/source_gems/nokogiri-1.19.2-arm64-darwin/lib/nokogiri.rb"),
                 file("/app/app/models/post.rb"),
             ],
             ..App::default()
         };
-        assert_eq!(mounted_gems(&app, &lock).into_iter().collect::<Vec<_>>(), ["solid_queue"]);
+        assert_eq!(mounted_gems(&app, &lock).into_iter().collect::<Vec<_>>(), ["nokogiri", "solid_queue"]);
     }
 }
 
