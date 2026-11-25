@@ -574,6 +574,8 @@ mod action_text_markdown;
 mod nested_class_requires_its_namespace;
 #[path = "emit_and_run/nested_include_require_top.rs"]
 mod nested_include_require_top;
+#[path = "emit_and_run/nested_include_after_constants.rs"]
+mod nested_include_after_constants;
 #[path = "emit_and_run/ordinalize.rs"]
 mod ordinalize;
 #[path = "emit_and_run/float_round_digits.rs"]
