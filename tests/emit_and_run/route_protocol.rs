@@ -79,3 +79,25 @@ fn a_root_url_that_leaves_the_protocol_to_the_route_is_an_error() {
         "no route protocol error: {errors:#?}"
     );
 }
+
+/// A `root_url(host:)` names no protocol either, so it is reported too, before the lowering builds its string.
+#[test]
+fn a_root_url_with_a_host_and_no_protocol_is_an_error() {
+    let (_tree, errors) = app("    redirect_to root_url(host: \"example.org\")\n").emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("`root_url` takes its protocol from the `root` route's `protocol:`")),
+        "no route protocol error: {errors:#?}"
+    );
+}
+
+/// A scope renames the helper (`admin_root`), so a scoped root's `protocol:` stays refused.
+#[test]
+fn a_scoped_root_protocol_is_refused() {
+    let (_tree, errors) = app("    head :ok\n")
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  namespace :admin do\n    root to: \"home#index\", protocol: \"https://\"\n  end\n  root to: \"home#index\"\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("a scoped root's `protocol:` is not modeled")), "{errors:#?}");
+}

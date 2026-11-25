@@ -71,3 +71,16 @@ puts "layout choice passed"
         )
         .assert_passes();
 }
+
+/// Not rewritten where the `if` would read the condition before an argument that changes it: the call stays a
+/// computed layout, reported.
+#[test]
+fn a_layout_condition_an_argument_assigns_stays_an_error() {
+    let (_tree, errors) = app()
+        .write(
+            "app/controllers/notes_controller.rb",
+            "class NotesController < ApplicationController\n  def preview\n    xhr = false\n    render action: (xhr = true; \"new\"), layout: !xhr\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("`render layout:` given a computed value")), "{errors:#?}");
+}

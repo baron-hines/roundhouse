@@ -1398,7 +1398,6 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(app.included_hoist_conflicts.iter().cloned());
     out.extend(app.superclass_refusals.iter().cloned());
     out.extend(app.gem_route_gaps.iter().cloned());
-    out.extend(route_protocol_urls(app));
     // after_initialize bodies are the app's own code run at boot
     // (`ingest::after_initialize`): checked like a model method, not under
     // the library policy, so a call with no runtime behind it is an error.
@@ -1653,8 +1652,9 @@ pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
 
 /// A `<stem>_url` call that names no `protocol:` of its own, for a route whose `protocol:` would pick it
 /// (`root to: …, protocol: …`): the emitted helper builds the request's protocol instead. A call naming its own
-/// protocol, and every `_path`, take nothing from the option.
-fn route_protocol_urls(app: &App) -> Vec<Diagnostic> {
+/// protocol, and every `_path`, take nothing from the option. Run at ingest (`ingest::app`), before the lowering
+/// rewrites a `_url(host:)` call into a string.
+pub(crate) fn route_protocol_urls(app: &App) -> Vec<Diagnostic> {
     if app.routes.url_protocols.is_empty() {
         return Vec::new();
     }

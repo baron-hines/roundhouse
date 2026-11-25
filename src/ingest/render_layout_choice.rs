@@ -20,6 +20,10 @@ pub(super) fn expand(app: &mut App) {
 fn rewrite(e: &mut Expr) {
     e.node.for_each_child_mut(&mut |c| rewrite(c));
     let Some(negated) = negated_layout(e) else { return };
+    // Not when moving the condition ahead of the render's arguments could change what either reads.
+    if !reorderable(e, &negated) {
+        return;
+    }
     let branch = |layout: bool| {
         let mut render = e.clone();
         set_layout(&mut render, layout);
@@ -27,6 +31,26 @@ fn rewrite(e: &mut Expr) {
     };
     let (shown, hidden) = (branch(true), branch(false));
     *e = Expr::new(e.span, ExprNode::If { cond: negated, then_branch: hidden, else_branch: shown });
+}
+
+/// The condition reads only calls with no arguments (`request.xhr?`), and nothing in the render assigns.
+fn reorderable(render: &Expr, cond: &Expr) -> bool {
+    fn assigns(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Assign { .. } | ExprNode::OpAssign { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found |= assigns(c));
+        found
+    }
+    fn plain_chain(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { recv, args, block: None, .. } => args.is_empty() && recv.as_ref().is_none_or(plain_chain),
+            ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef | ExprNode::Const { .. } => true,
+            _ => false,
+        }
+    }
+    plain_chain(cond) && !assigns(render)
 }
 
 /// `e` of a `render …, layout: !e`.

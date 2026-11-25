@@ -156,9 +156,8 @@ module Rack
       request_method == "OPTIONS"
     end
 
-    # Rails' `/XMLHttpRequest/i.match?`: anywhere in the header, any case.
     def xhr?
-      @env["HTTP_X_REQUESTED_WITH"].to_s.downcase.include?("xmlhttprequest")
+      @env["HTTP_X_REQUESTED_WITH"] == "XMLHttpRequest"
     end
 
     def ip

@@ -335,7 +335,16 @@ module ActionController
       )
       return ActionController::EncryptedCookieJar.parse(json) if json != ""
       json = rotated_json(raw, purpose)
-      return nil if json == ""
+      if json == ""
+        # Rails' jar reads again with no purpose: a cookie signed without metadata, by the current secret or an old one.
+        json = ActionController::MessageVerifier.verified_unpurposed_json_by_key(
+          ActionController::MessageVerifier.derive_key(Rails.application.secret_key_base, ActionController::MessageVerifier::SIGNED_COOKIE_SALT),
+          raw, true
+        )
+        return ActionController::EncryptedCookieJar.parse(json) if json != ""
+        json = rotated_json(raw, "")
+        return nil if json == ""
+      end
       # Rails' `force_reserialize`: a cookie read by an old secret goes back out under the current one.
       @jar.raw_set(key, ActionController::MessageVerifier.envelope(
         Rails.application.secret_key_base,
@@ -346,12 +355,16 @@ module ActionController
     end
 
     # The message under the first `cookies_rotations.signed` secret that verifies it, by the SHA1 digest those
-    # rotations inherit from the jar's; "" when none does.
+    # rotations inherit from the jar's; "" when none does. A `purpose` of "" is the jar's read with none.
     def rotated_json(raw, purpose)
       secrets = ActiveSupport::Messages::RotationConfiguration.shared.signed
       i = 0
       while i < secrets.length
-        json = ActionController::MessageVerifier.verified_json_by_key(secrets[i], raw, purpose, true)
+        json = if purpose == ""
+          ActionController::MessageVerifier.verified_unpurposed_json_by_key(secrets[i], raw, true)
+        else
+          ActionController::MessageVerifier.verified_json_by_key(secrets[i], raw, purpose, true)
+        end
         return json if json != ""
         i += 1
       end

@@ -178,6 +178,16 @@ module ActionController
 
     # `verified_json` under an HMAC key given as it is, not derived: a rotated secret
     # (`cookies_rotations.rotate :signed, key`) is the verifier's key itself.
+    # The read with no purpose: an envelope naming none, or a message signed without one.
+    def self.verified_unpurposed_json_by_key(key, signed, sha1)
+      sep = signed.index("--")
+      return "" if sep.nil?
+      payload = signed[0, sep]
+      supplied = signed[sep + 2, signed.length - sep - 2]
+      return "" unless secure_compare(supplied, digest_by_key(key, payload, sha1))
+      ActionController::MessageEncryptor.unpurposed_json(Base64.strict_decode64(payload))
+    end
+
     def self.verified_json_by_key(key, signed, purpose, sha1)
       sep = signed.index("--")
       return "" if sep.nil?

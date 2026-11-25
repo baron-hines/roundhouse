@@ -1497,8 +1497,15 @@ fn ingest_route_stmts<'pr>(
 
         if !route_options_kept(&call, &method) {
             route_refusal(&call.as_node(), file, cx, "route defaults", "this route option or defaults form is not modeled");
-        } else if method == "root" {
-            record_url_protocol(&call, file, cx);
+        } else if method == "root"
+            && let Some((stem, span)) = root_url_protocol(&call, file)
+        {
+            // A scope renames the helper (`admin_root`), which the call sites are matched by.
+            if cx.mount_scope_depth.get() == 0 {
+                cx.url_protocols.borrow_mut().push((stem, span));
+            } else {
+                route_refusal(&call.as_node(), file, cx, "route defaults", "a scoped root's `protocol:` is not modeled");
+            }
         }
         // Per-entry recovery: one `mount`/`use_doorkeeper` must not
         // zero the whole table. Survey mode records the gap and keeps
@@ -1583,21 +1590,21 @@ fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
 }
 
 /// The `protocol:` of a `root` route, under the helper stem its `as:` names (`root` without one).
-fn record_url_protocol(call: &ruby_prism::CallNode<'_>, file: &str, cx: &Ctx<'_>) {
-    let Some(args) = call.arguments() else { return };
+fn root_url_protocol(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<(String, crate::span::Span)> {
+    let args = call.arguments()?;
     let pairs: Vec<_> = args
         .arguments()
         .iter()
         .filter_map(|arg| arg.as_keyword_hash_node())
         .flat_map(|options| options.elements().iter().filter_map(|option| option.as_assoc_node()).collect::<Vec<_>>())
         .collect();
-    let Some(protocol) = pairs.iter().find(|pair| symbol_value(&pair.key()).as_deref() == Some("protocol")) else { return };
+    let protocol = pairs.iter().find(|pair| symbol_value(&pair.key()).as_deref() == Some("protocol"))?;
     let stem = pairs
         .iter()
         .find(|pair| symbol_value(&pair.key()).as_deref() == Some("as"))
         .and_then(|pair| symbol_or_string_value(&pair.value()))
         .unwrap_or_else(|| "root".to_string());
-    cx.url_protocols.borrow_mut().push((stem, super::util::node_span(&protocol.as_node(), file)));
+    Some((stem, super::util::node_span(&protocol.as_node(), file)))
 }
 
 fn route_refusal(node: &Node<'_>, file: &str, cx: &Ctx<'_>, construct: &str, detail: &str) {

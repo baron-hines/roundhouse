@@ -26,13 +26,14 @@ end
 
 const CONTROLLER: &str = r##"class VisitsController < ApplicationController
   def index
-    render plain: "#{cookies.signed[:remember]}|#{cookies.encrypted[:token]}"
+    render plain: "#{cookies.signed[:remember]}|#{cookies.encrypted[:token]}|#{cookies.signed[:legacy]}"
   end
 end
 "##;
 
 /// Both cookies as a pre-7.0 Rails wrote them for `secret`: PBKDF2-SHA1 keys, the signed one under HMAC-SHA1, the
-/// encrypted one under AES-256-GCM, each value in the `_rails` envelope for its name.
+/// encrypted one under AES-256-GCM, each value in the `_rails` envelope for its name, and a signed one with no envelope
+/// at all, which Rails' jar reads on its second, purpose-free try.
 const MINT: &str = r##"require "openssl"
 require "json"
 require "base64"
@@ -42,12 +43,14 @@ def mint(secret)
   signed_key = OpenSSL::PKCS5.pbkdf2_hmac(secret, "signed cookie", 1000, 64, OpenSSL::Digest::SHA1.new)
   payload = Base64.strict_encode64(envelope.("old-signed", "remember"))
   signed = payload + "--" + OpenSSL::HMAC.hexdigest("SHA1", signed_key, payload)
+  bare = Base64.strict_encode64(JSON.generate("plain-old"))
+  legacy = bare + "--" + OpenSSL::HMAC.hexdigest("SHA1", signed_key, bare)
   cipher = OpenSSL::Cipher.new("aes-256-gcm").encrypt
   cipher.key = OpenSSL::PKCS5.pbkdf2_hmac(secret, "authenticated encrypted cookie", 1000, 32, OpenSSL::Digest::SHA1.new)
   iv = cipher.random_iv
   cipher.auth_data = ""
   sealed = cipher.update(envelope.("old-encrypted", "token")) + cipher.final
-  [signed, [sealed, iv, cipher.auth_tag].map { |part| Base64.strict_encode64(part) }.join("--")]
+  [signed, [sealed, iv, cipher.auth_tag].map { |part| Base64.strict_encode64(part) }.join("--"), legacy]
 end
 "##;
 
@@ -69,12 +72,12 @@ fn app() -> emit_and_run::Overlay {
 
 /// The two requests, answered as `body|names of the cookies set` for each: the old cookies read and both go out again,
 /// then the new ones read and nothing is set.
-const EXPECTED: &str = "old-signed|old-encrypted|remember,token\nold-signed|old-encrypted|\n";
+const EXPECTED: &str = "old-signed|old-encrypted|plain-old|legacy,remember,token\nold-signed|old-encrypted|plain-old|\n";
 
 const REQUESTS: &str = r##"
-signed, encrypted = mint(Rails.application.secret_key_base)
+signed, encrypted, legacy = mint(Rails.application.secret_key_base)
 answer = ""
-cookie = "remember=#{CGI.escape(signed)}; token=#{CGI.escape(encrypted)}"
+cookie = "remember=#{CGI.escape(signed)}; token=#{CGI.escape(encrypted)}; legacy=#{CGI.escape(legacy)}"
 2.times do
   status, headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/visits", "QUERY_STRING" => "", "rack.input" => StringIO.new(""), "HTTP_COOKIE" => cookie)
   raise "GET /visits answered #{status}" unless status == 200
@@ -106,27 +109,27 @@ fn rotated_cookies_read_and_go_out_under_the_current_secret_on_spinel() {
         .expect("spawn ruby");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let minted = String::from_utf8_lossy(&output.stdout).into_owned();
-    let (signed, encrypted) = minted.split_once('\n').expect("two cookies");
+    let [signed, encrypted, legacy]: [&str; 3] = minted.split('\n').collect::<Vec<_>>().try_into().expect("three cookies");
     app()
         .run_spinel(&format!(
             r##"Rails.secret_key_base = {SECRET:?}
 AppInitializers.run(false)
-old = {{ "remember" => {signed:?}, "token" => {encrypted:?} }}
+old = {{ "remember" => {signed:?}, "token" => {encrypted:?}, "legacy" => {legacy:?} }}
 controller = VisitsController.new
 controller.request_method = "GET"
 controller.params = {{}}
 controller.cookies = ActionController::CookieJar.new(old)
 controller.process_action(:index)
-raise "rotated read: #{{controller.body}}" unless controller.body == "old-signed|old-encrypted"
+raise "rotated read: #{{controller.body}}" unless controller.body == "old-signed|old-encrypted|plain-old"
 jar = controller.cookies
-fresh = {{ "remember" => jar.raw("remember"), "token" => jar.raw("token") }}
-raise "not written back under the current secret" if fresh["remember"] == old["remember"] || fresh["token"] == old["token"]
+fresh = {{ "remember" => jar.raw("remember"), "token" => jar.raw("token"), "legacy" => jar.raw("legacy") }}
+raise "not written back under the current secret" if fresh.any? {{ |k, v| v == old[k] }}
 again = VisitsController.new
 again.request_method = "GET"
 again.params = {{}}
 again.cookies = ActionController::CookieJar.new(fresh)
 again.process_action(:index)
-raise "current read: #{{again.body}}" unless again.body == "old-signed|old-encrypted"
+raise "current read: #{{again.body}}" unless again.body == "old-signed|old-encrypted|plain-old"
 raise "a current cookie is written again" unless again.cookies.raw("remember") == fresh["remember"]
 puts "cookie rotation passed"
 "##
