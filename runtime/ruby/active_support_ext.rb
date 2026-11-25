@@ -623,8 +623,8 @@ module ActiveSupport
   end
 
   # Only the key length of the cookie jar's ciphers: the encryption itself is `ActionController::MessageEncryptor`.
-  # A module, not Rails' class: an encryptor of the app's own (`MessageEncryptor.new(key)`) stays reported.
-  module MessageEncryptor
+  # Rails' class, as a tree loading the real ActiveSupport reopens it; the analysis answers no `new` on it (`registry::stdlib`).
+  class MessageEncryptor
     def self.key_len(cipher = "aes-256-gcm")
       raise ArgumentError, "unsupported cipher #{cipher}" unless cipher == "aes-256-gcm" || cipher == "aes-256-cbc"
       32

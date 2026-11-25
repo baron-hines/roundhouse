@@ -104,9 +104,7 @@ module ActionController
     # The second read, with no purpose: an envelope must then name none,
     # and plaintext without one is the message itself.
     def self.unpurposed_json(plain)
-      return ActionController::MessageVerifier.envelope_message(plain, "") if plain.start_with?(ENVELOPE_PREFIX)
-      return "" if plain.start_with?("{\"_rails\":")
-      plain
+      ActionController::MessageVerifier.unpurposed_json(plain)
     end
 
 

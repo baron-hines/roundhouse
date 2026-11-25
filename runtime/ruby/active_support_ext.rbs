@@ -79,7 +79,7 @@ module ActiveSupport
     def initialize: (String secret, ?Hash[Symbol, untyped] options) -> void
     def generate_key: (String salt, ?Integer key_size) -> String
   end
-  module MessageEncryptor
+  class MessageEncryptor
     def self.key_len: (?String cipher) -> Integer
   end
   module Messages

@@ -185,7 +185,15 @@ module ActionController
       payload = signed[0, sep]
       supplied = signed[sep + 2, signed.length - sep - 2]
       return "" unless secure_compare(supplied, digest_by_key(key, payload, sha1))
-      ActionController::MessageEncryptor.unpurposed_json(Base64.strict_decode64(payload))
+      unpurposed_json(Base64.strict_decode64(payload))
+    end
+
+    # The read with no purpose of a decoded message: an envelope must then name none, and a message without one is the
+    # message itself. Shared with `MessageEncryptor`, which depends on this module, not the other way round.
+    def self.unpurposed_json(plain)
+      return envelope_message(plain, "") if plain.start_with?("{\"_rails\":{\"message\":")
+      return "" if plain.start_with?("{\"_rails\":")
+      plain
     end
 
     def self.verified_json_by_key(key, signed, purpose, sha1)

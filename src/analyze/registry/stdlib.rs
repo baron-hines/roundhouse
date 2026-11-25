@@ -1857,6 +1857,7 @@ fn register_application_surface(rails_cls: &mut ClassInfo, classes: &mut HashMap
     ]);
     register_stdlib_class(classes, "ActiveSupport::KeyGenerator", &[("new", class("ActiveSupport::KeyGenerator"))], &[("generate_key", Ty::Str)]);
     register_stdlib_class(classes, "ActiveSupport::MessageEncryptor", &[("key_len", Ty::Int)], &[]);
+    // Read as a module, not the runtime's class: only `key_len` is served, so an encryptor of the app's own (`.new(key)`) is reported.
     classes.entry(ClassId(Symbol::from("ActiveSupport::MessageEncryptor"))).or_default().is_module = true;
 }
 

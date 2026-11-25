@@ -2507,8 +2507,11 @@ impl<'a> BodyTyper<'a> {
                 // through hash_method / array_method instead of falling
                 // back to the (no-op) class-method table. Element types
                 // start as Var; usage narrows them via flow-typing.
-                // A module has no `new`: `Module#new` is Class's alone.
-                if method.as_str() == "new" && self.classes().get(id).is_some_and(|c| c.is_module) {
+                // A module has no `new`: `Module#new` is Class's alone. Only one the source defines nothing on: an app's module
+                // can answer the call itself (a `self.public_send` its literal-name dispatch reaches).
+                if method.as_str() == "new"
+                    && self.classes().get(id).is_some_and(|c| c.is_module && c.source_class_methods.is_empty() && c.source_instance_methods.is_empty())
+                {
                     return unknown();
                 }
                 if method.as_str() == "new" {
