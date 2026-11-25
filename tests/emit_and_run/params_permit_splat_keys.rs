@@ -88,3 +88,30 @@ fn the_spinel_emit_keeps_a_splatted_key_list() {
         assert!(src.contains(line), "missing `{line}`:\n{src}");
     }
 }
+
+/// Two splats the rewrite leaves as written: a nested splat first, whose default must not become a Symbol
+/// (`fetch(*[*%w[title fallback]])`), and a list variable followed by more arguments, which may be empty
+/// (`fetch(*keys, :body)`), where `keys[0]` would be `nil`.
+#[test]
+fn the_spinel_emit_leaves_a_nested_splat_and_a_variable_before_more_arguments() {
+    const NESTED: &str = r#"class SplatKeysController < ApplicationController
+  def fetch_nested
+    render plain: params.permit(%w[body]).fetch(*[*%w[title fallback]]).inspect
+  end
+
+  def fetch_then_key
+    keys = %w[title]
+    render plain: params.permit(%w[body]).fetch(*keys, :body).inspect
+  end
+end
+"#;
+    let routes = "  post \"/splat_keys/fetch_nested\" => \"splat_keys#fetch_nested\"\n  post \"/splat_keys/fetch_then_key\" => \"splat_keys#fetch_then_key\"\n";
+    let (tree, errors) = emit_and_run::real_blog()
+        .edit("config/routes.rb", "  root \"articles#index\"\n", &format!("  root \"articles#index\"\n{routes}"))
+        .write("app/controllers/splat_keys_controller.rb", NESTED)
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let src = std::fs::read_to_string(tree.join("app/controllers/splat_keys_controller.rb")).expect("controller");
+    assert!(!src.contains("%i[title fallback]") && !src.contains(":fallback"), "the nested default became a Symbol:\n{src}");
+    assert!(!src.contains("keys[0]"), "a list variable before more arguments was read as the key:\n{src}");
+}

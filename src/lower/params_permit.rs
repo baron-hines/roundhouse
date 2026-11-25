@@ -566,7 +566,8 @@ fn symbolize_first_of_splat(args: &mut Vec<Expr>) {
     let value = value.clone();
     let span = args[0].span;
     if let ExprNode::Array { elements, .. } = &*value.node {
-        if elements.is_empty() {
+        // A nested splat first (`fetch(*[*%w[a b]])`) holds the default too, which must not become a Symbol: as written.
+        if elements.is_empty() || matches!(&*elements[0].node, ExprNode::Splat { .. }) {
             return;
         }
         let mut spread: Vec<Expr> = elements.clone();
@@ -574,8 +575,10 @@ fn symbolize_first_of_splat(args: &mut Vec<Expr>) {
         args.splice(0..1, spread);
         return;
     }
+    // Only a variable that is the whole argument list: with more arguments after it (`fetch(*keys, :body)`) an empty
+    // list leaves the key to them, which `keys[0]` would not, so it stays as written.
     let pure = matches!(&*value.node, ExprNode::Var { .. } | ExprNode::Ivar { .. });
-    if !pure || !matches!(&value.ty, Some(Ty::Array { elem }) if **elem == Ty::Str) {
+    if args.len() != 1 || !pure || !matches!(&value.ty, Some(Ty::Array { elem }) if **elem == Ty::Str) {
         return;
     }
     let mut zero = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: 0 } });
