@@ -735,7 +735,8 @@ fn body_has_included_block(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     for stmt in flatten_statements(body) {
         if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none()
+            // `self.included do` is the same block (#2278).
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some())
                 && constant_id_str(&call.name()) == "included"
                 && call.block().is_some_and(|b| b.as_block_node().is_some())
             {

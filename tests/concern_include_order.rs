@@ -322,3 +322,18 @@ fn a_concern_of_self_includes_only_passes_its_hook_on() {
         "hook",
     );
 }
+
+/// `self.included do` is the same hook: its `label` is defined on the
+/// controller, ahead of the later PlainDef's (#2278).
+#[test]
+fn a_self_included_hook_defines_on_the_includer() {
+    single_case(
+        &[
+            ("hook_self", "module HookSelf\n  extend ActiveSupport::Concern\n\n  self.included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+            ("plain_def", "module PlainDef\n  extend ActiveSupport::Concern\n\n  def label\n    \"plain\"\n  end\nend\n"),
+        ],
+        "  include HookSelf\n  include PlainDef\n",
+        "label",
+        "hook",
+    );
+}

@@ -6194,7 +6194,9 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .unknown_calls
             .iter()
             .filter(|call| {
-                matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "included")
+                // `self.included do` is the same hook (#2278).
+                matches!(&*call.node, crate::expr::ExprNode::Send { recv, method, block: Some(_), .. }
+                    if method.as_str() == "included" && recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)))
             })
             .map(|call| call.span)
             .collect();
