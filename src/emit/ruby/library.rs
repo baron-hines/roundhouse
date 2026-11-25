@@ -14094,6 +14094,59 @@ end
         src.push_str("  end\n  nil\nend\n");
     }
 
+    // Not a has_many, whose JOIN repeats owners (Rails dedups), nor a table the query already joins (Rails reuses it).
+    let own = model.table.0.as_str();
+    let mut joins = String::new();
+    for (name, kind) in &targets {
+        let (table, on) = match kind {
+            PreloadKind::BelongsTo { fk, table, .. } => (table.clone(), format!("{{t}}.id = {own}.{fk}")),
+            PreloadKind::HasOne { fk, owner_key, target } => {
+                let Some(t) = app.models.iter().find(|m| m.name.0.as_str() == target) else { continue };
+                (t.table.0.as_str().to_string(), format!("{{t}}.{fk} = {own}.{owner_key}"))
+            }
+            _ => continue,
+        };
+        let aliased = format!("LEFT OUTER JOIN {table} {name} ON {}", on.replace("{t}", name));
+        let plain = format!("LEFT OUTER JOIN {table} ON {}", on.replace("{t}", &table));
+        let names = |q: &str| format!("conditions.include?(\"\\\"{q}\\\".\") || conditions.include?(\" {q}.\") || conditions.include?(\"({q}.\") || conditions.start_with?(\"{q}.\")");
+        let _ = write!(
+            joins,
+            "  when \"{name}\"\n    return nil if joined.include?(\"JOIN {table} \")\n    return {aliased:?} if {}\n    return {plain:?} if {}\n",
+            names(name),
+            names(&table)
+        );
+    }
+    if !joins.is_empty() {
+        let _ = write!(
+            src,
+            r#"
+def self._eager_load_joins(specs, conditions, joined)
+  out = []
+  specs.each do |spec|
+    if spec.is_a?(Hash)
+      spec.each_key do |name|
+        join = _eager_load_join(name.to_s, conditions, joined)
+        out << join unless join.nil?
+      end
+    elsif spec.is_a?(Array)
+      _eager_load_joins(spec, conditions, joined).each {{ |join| out << join }}
+    elsif !spec.nil?
+      join = _eager_load_join(spec.to_s, conditions, joined)
+      out << join unless join.nil?
+    end
+  end
+  out
+end
+
+def self._eager_load_join(name, conditions, joined)
+  case name
+{joins}  end
+  nil
+end
+"#
+        );
+    }
+
     // Spec walker — the entry point `Relation#to_a` calls. Specs are
     // Symbols, Hashes (nested: `story: :user`), or Arrays of either.
     src.push_str(

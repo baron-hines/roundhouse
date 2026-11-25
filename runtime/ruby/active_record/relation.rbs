@@ -464,6 +464,7 @@ module ActiveRecord
     def sql_comment: (String comment) -> String
     def append_window: (String sql) -> String
     def append_join_where: (String sql) -> String
+    def rendered_joins: () -> Array[String]
     def append_group_having: (String sql) -> String
     def count_sql: () -> String
     def bound_count_sql: () -> String
