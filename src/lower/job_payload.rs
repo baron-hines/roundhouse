@@ -169,6 +169,7 @@ fn suffix(class_name: &str) -> String {
 /// synthesized `perform_later`), in name order.
 pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>) -> Vec<JobPlan> {
     let sites = call_site_types(app, jobs);
+    let recurring_with_args: BTreeSet<String> = recurring_task_classes(app, true).into_iter().collect();
     let unattributed = unattributed_jobs(app, jobs);
     let sti = crate::lower::sti_scope::sti_bases(app);
     let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
@@ -187,6 +188,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
         let discards = discards_deserialization_error(app, lc);
         let empty = Vec::new();
         let job_sites = sites.get(name).unwrap_or(&empty);
+        let recurring_args = recurring_with_args.contains(name);
         let planned = if unattributed.contains(name) || unattributed.contains("*") {
             Err(JobFallback {
                 param: None,
@@ -194,7 +196,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
                     .to_string(),
             })
         } else {
-            plan_params(app, &sti, &perform.params, job_sites)
+            plan_params(app, &sti, &perform.params, job_sites, recurring_args)
         };
         let (params, fallback) = match planned {
             Ok(params) => (params, None),
@@ -229,7 +231,7 @@ fn call_site_types(app: &App, jobs: &BTreeSet<String>) -> BTreeMap<String, Vec<S
     crate::lower::for_each_hook_body_ref(app, &mut |body| {
         collect_sites(body, jobs, &mut out);
     });
-    for job in recurring_argless_classes(app) {
+    for job in recurring_task_classes(app, false) {
         if jobs.contains(&job) {
             out.entry(job).or_default().push(Site::default());
         }
@@ -237,10 +239,10 @@ fn call_site_types(app: &App, jobs: &BTreeSet<String>) -> BTreeMap<String, Vec<S
     out
 }
 
-/// The `class:` tasks of `config/recurring.yml` that give no `args:`: solid_queue's `RecurringTask` enqueues each
-/// with `perform_later(*arguments)` over the task's `args` (none here), so each is a call site with no arguments. A
-/// task with `args:` adds none, and stays without a typed site.
-fn recurring_argless_classes(app: &App) -> Vec<String> {
+/// The `class:` tasks of `config/recurring.yml` that give `args:` or not: solid_queue's `RecurringTask` enqueues
+/// each with `perform_later(*arguments)`, so one without is a call site with no arguments; one with is a site whose
+/// argument types are not read.
+fn recurring_task_classes(app: &App, with_args: bool) -> Vec<String> {
     let mut out = Vec::new();
     for source in app.sources.iter().filter(|s| s.path.ends_with("config/recurring.yml")) {
         let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&source.text) else { continue };
@@ -248,7 +250,7 @@ fn recurring_argless_classes(app: &App) -> Vec<String> {
         for tasks in envs.values().filter_map(|v| v.as_mapping()) {
             for task in tasks.values().filter_map(|v| v.as_mapping()) {
                 let get = |k: &str| task.get(serde_yaml_ng::Value::String(k.to_string()));
-                if get("args").is_some() {
+                if get("args").is_some() != with_args {
                     continue;
                 }
                 if let Some(class) = get("class").and_then(|c| c.as_str()) {
@@ -383,6 +385,7 @@ fn plan_params(
     sti: &crate::det::HashMap<ClassId, ClassId>,
     params: &[crate::dialect::Param],
     sites: &[Site],
+    recurring_args: bool,
 ) -> Result<Vec<JobParam>, JobFallback> {
     let gap = |param: Option<&Symbol>, reason: String| JobFallback { param: param.cloned(), reason };
     if params.is_empty() {
@@ -438,10 +441,11 @@ fn plan_params(
             }
         }
         // A rest no call site passes anything to is always empty: no element is ever written or read back, so any
-        // element codec reads it alike (a recurring `class:` task with no `args:`).
+        // element codec reads it alike (a recurring `class:` task with no `args:`). Not when a task gives `args:`,
+        // whose values would go through that codec.
         let codec = match codec {
             Some(codec) => codec,
-            None if p.rest => Codec::Str,
+            None if p.rest && !recurring_args => Codec::Str,
             None => return Err(gap(Some(&p.name), "no call site passes it".to_string())),
         };
         if p.rest && matches!(codec, Codec::NullableRecord { .. }) {
@@ -1843,6 +1847,7 @@ mod tests {
             sources: vec![crate::span::SourceFile { path: "/app/config/recurring.yml".to_string(), text: yaml.to_string() }],
             ..App::default()
         };
-        assert_eq!(recurring_argless_classes(&app), ["ResticJob", "WalCheckpointJob"]);
+        assert_eq!(recurring_task_classes(&app, false), ["ResticJob", "WalCheckpointJob"]);
+        assert_eq!(recurring_task_classes(&app, true), ["PingJob"]);
     }
 }

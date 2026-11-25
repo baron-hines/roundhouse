@@ -3696,19 +3696,22 @@ impl<'a> BodyTyper<'a> {
                     let elem = args[0].ty.as_ref().and_then(kernel_array_elem);
                     return Ty::Array { elem: std::sync::Arc::new(elem.unwrap_or_else(unknown)) };
                 }
-                // `Kernel#rand`: an Integer for an Integer or an Integer Range, a Float with none or a Float one.
+                // Not typed from the argument's class alone: `rand(0)` is a Float, `rand(1.5)` an Integer and
+                // `rand(1...1)` nil, so only a literal whose value settles it is typed (`rand(0..9999)`, `rand(10)`).
                 if recv.is_none() && method.as_str() == "rand" && args.len() <= 1
                     && block.is_none()
                     && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
                     && !self.app_defines(ctx.self_ty.as_ref(), method)
                 {
-                    let answer = match args.first().and_then(|a| a.ty.as_ref()) {
+                    let int = |e: &Option<Expr>| match e.as_ref().map(|e| &*e.node) {
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) => Some(*value),
+                        _ => None,
+                    };
+                    let answer = match args.first().map(|a| &*a.node) {
                         None => Some(Ty::Float),
-                        Some(Ty::Int) => Some(Ty::Int),
-                        Some(Ty::Float) => Some(Ty::Float),
-                        Some(Ty::Class { id, args: range }) if id.0.as_str() == "Range" => match range.first() {
-                            Some(Ty::Int) => Some(Ty::Int),
-                            Some(Ty::Float) => Some(Ty::Float),
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) if *value != 0 => Some(Ty::Int),
+                        Some(ExprNode::Range { begin, end, exclusive }) => match (int(begin), int(end)) {
+                            (Some(b), Some(e)) if if *exclusive { b < e } else { b <= e } => Some(Ty::Int),
                             _ => None,
                         },
                         _ => None,
