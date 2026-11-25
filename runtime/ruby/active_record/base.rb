@@ -626,7 +626,7 @@ module ActiveRecord
 
     # Not left to `preload_associations` alone: an `includes` whose association a condition names is a JOIN in Rails
     # (`includes(:article).where(article: {…})`); models with such associations answer theirs.
-    def self._eager_load_joins(_specs, _conditions)
+    def self._eager_load_joins(_specs, _conditions, _joined)
       []
     end
 

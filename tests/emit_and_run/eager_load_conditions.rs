@@ -1,7 +1,7 @@
 //! A condition on an `includes`d association (mission_control-jobs' `executions.includes(:job)` then
 //! `executions.where(job: { queue_name: … })`, each in its own method): Rails reads the association's name in the
 //! condition and loads it with a LEFT OUTER JOIN aliased to that name, or to the table when the condition names the
-//! table. The query used to keep the preload alone, and SQLite rejected `"article"."title"`. `EXPECTED` is what Rails
+//! table; a JOIN the query already has is reused. The query used to keep the preload alone, and SQLite rejected `"article"."title"`. `EXPECTED` is what Rails
 //! 8.1.4 answers for the same data (`conditions_on_an_included_association_match_rails`).
 
 #[path = "../support/prerequisite.rs"]
@@ -16,6 +16,10 @@ const FEED: &str = r#"class Feed
 
   def by_table
     Comment.order(:id).includes(:article).where(articles: { title: "Second" }).map(&:commenter)
+  end
+
+  def joined
+    Comment.order(:id).joins(:article).includes(:article).where(articles: { title: "Second" }).map(&:commenter)
   end
 
   def split
@@ -43,7 +47,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/models/feed.rb", FEED)
         .write(
             "app/controllers/feeds_controller.rb",
-            "class FeedsController < ApplicationController\n  def index\n    feed = Feed.new\n    render plain: \"#{feed.by_association.join(\",\")} #{feed.by_table.join(\",\")} #{feed.split.join(\",\")}\"\n  end\nend\n",
+            "class FeedsController < ApplicationController\n  def index\n    feed = Feed.new\n    render plain: \"#{feed.by_association.join(\",\")} #{feed.by_table.join(\",\")} #{feed.split.join(\",\")} #{feed.joined.join(\",\")}\"\n  end\nend\n",
         )
 }
 
@@ -54,7 +58,7 @@ Comment.create!(article: second, commenter: "Bob", body: "A comment")
 Comment.create!(article: first, commenter: "Cy", body: "A comment")
 "#;
 
-const EXPECTED: &str = "Ann,Cy Bob Ann,Cy";
+const EXPECTED: &str = "Ann,Cy Bob Ann,Cy Bob";
 
 #[test]
 fn conditions_on_an_included_association_join_it() {
@@ -112,7 +116,7 @@ class Comment < ActiveRecord::Base
   belongs_to :article
 end
 {FEED}{SEED}feed = Feed.new
-print "#{{feed.by_association.join(",")}} #{{feed.by_table.join(",")}} #{{feed.split.join(",")}}"
+print "#{{feed.by_association.join(",")}} #{{feed.by_table.join(",")}} #{{feed.split.join(",")}} #{{feed.joined.join(",")}}"
 "##
     );
     let output = std::process::Command::new("ruby").args(["-e", &script]).output().expect("Rails oracle");

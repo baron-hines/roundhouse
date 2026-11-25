@@ -1568,7 +1568,7 @@ module ActiveRecord
     def rendered_joins
       return @joins if @includes.length == 0
       out = copy_string_list(@joins)
-      @model._eager_load_joins(@includes, @wheres.join(" ")).each do |join|
+      @model._eager_load_joins(@includes, @wheres.join(" "), @joins.join(" ")).each do |join|
         out << join unless out.include?(join)
       end
       out

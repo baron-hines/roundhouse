@@ -14094,7 +14094,7 @@ end
         src.push_str("  end\n  nil\nend\n");
     }
 
-    // Not every association: only one whose JOIN adds no row per owner, as a has_many's would (Rails dedups those).
+    // Not a has_many, whose JOIN repeats owners (Rails dedups), nor a table the query already joins (Rails reuses it).
     let own = model.table.0.as_str();
     let mut joins = String::new();
     for (name, kind) in &targets {
@@ -14111,7 +14111,7 @@ end
         let names = |q: &str| format!("conditions.include?(\"\\\"{q}\\\".\") || conditions.include?(\" {q}.\") || conditions.include?(\"({q}.\") || conditions.start_with?(\"{q}.\")");
         let _ = write!(
             joins,
-            "  when \"{name}\"\n    return {aliased:?} if {}\n    return {plain:?} if {}\n",
+            "  when \"{name}\"\n    return nil if joined.include?(\"JOIN {table} \")\n    return {aliased:?} if {}\n    return {plain:?} if {}\n",
             names(name),
             names(&table)
         );
@@ -14120,25 +14120,25 @@ end
         let _ = write!(
             src,
             r#"
-def self._eager_load_joins(specs, conditions)
+def self._eager_load_joins(specs, conditions, joined)
   out = []
   specs.each do |spec|
     if spec.is_a?(Hash)
       spec.each_key do |name|
-        join = _eager_load_join(name.to_s, conditions)
+        join = _eager_load_join(name.to_s, conditions, joined)
         out << join unless join.nil?
       end
     elsif spec.is_a?(Array)
-      _eager_load_joins(spec, conditions).each {{ |join| out << join }}
+      _eager_load_joins(spec, conditions, joined).each {{ |join| out << join }}
     elsif !spec.nil?
-      join = _eager_load_join(spec.to_s, conditions)
+      join = _eager_load_join(spec.to_s, conditions, joined)
       out << join unless join.nil?
     end
   end
   out
 end
 
-def self._eager_load_join(name, conditions)
+def self._eager_load_join(name, conditions, joined)
   case name
 {joins}  end
   nil
