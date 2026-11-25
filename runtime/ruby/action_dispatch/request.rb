@@ -333,8 +333,9 @@ module ActionDispatch
       @request_method == "HEAD"
     end
 
+    # Rails' `/XMLHttpRequest/i.match?`: anywhere in the header, any case.
     def xhr?
-      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s == "XMLHttpRequest"
+      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s.downcase.include?("xmlhttprequest")
     end
 
     def inertia?
