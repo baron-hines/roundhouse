@@ -15,13 +15,21 @@
 //! Current.set(request: r) { body }
 //! # →
 //! __current_set_request = Current.request
-//! Current.request = r
 //! begin
+//!   Current.request = r
 //!   body
 //! ensure
 //!   Current.request = __current_set_request
 //! end
 //! ```
+//!
+//! A second attribute nests its own save and `begin` inside the first's,
+//! after the first's assignment, as `Object#with` saves each attribute
+//! just before it assigns it. An argument that is not a literal or a
+//! variable is evaluated first, into a local. A block with parameters,
+//! or a `next` or `break` of its own, runs as
+//! `Current.instance.then { |context| … }`, which yields the instance as
+//! `set` does; any other block runs as its body in place.
 //!
 //! ENSURE, NOT A TRAILING ASSIGNMENT, and it is the half that matters:
 //! `Current.set` exists to be exception-safe. campfire's
@@ -122,35 +130,116 @@ fn keyword_pairs(args: &[Expr]) -> Option<Vec<(String, Expr)>> {
 
 fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Expr {
     let mut stmts: Vec<Expr> = Vec::new();
-    // Saves FIRST, all of them, then the assignments — the order Rails'
-    // own `set` uses. A save that read an attribute another pair had
-    // already overwritten would restore the wrong value on a call that
-    // names two.
-    let saved: Vec<(String, Symbol)> = pairs
-        .iter()
-        .map(|(name, _)| (name.clone(), Symbol::from(format!("__current_set_{name}"))))
-        .collect();
-    for ((name, _), (_, local)) in pairs.iter().zip(saved.iter()) {
-        stmts.push(assign_local(span, local.clone(), class_read(span, class, name)));
-    }
+    // (a `set` inside this block saves into locals of its own level: one name for both would have the inner save overwrite the outer's)
+    let level = match nesting(body) {
+        0 => String::new(),
+        n => n.to_string(),
+    };
+    // The arguments are evaluated before anything is saved, as a call's
+    // arguments are; one that raises leaves every attribute as it was.
+    let mut values: Vec<(String, Expr)> = Vec::new();
     for (name, value) in pairs {
-        stmts.push(class_write(span, class, name, value.clone()));
+        if is_plain(value) {
+            values.push((name.clone(), value.clone()));
+        } else {
+            let local = Symbol::from(format!("__current_set{level}_value_{name}"));
+            stmts.push(assign_local(span, local.clone(), value.clone()));
+            values.push((name.clone(), local_read(span, local)));
+        }
     }
-    let mut restore: Vec<Expr> = Vec::new();
-    for (name, local) in &saved {
-        restore.push(class_write(span, class, name, local_read(span, local.clone())));
+    // Then, per attribute in order, Rails' `Object#with`: save it, assign
+    // it, and restore it on the way out. Each save reads after the
+    // writes before it (a writer that sets another attribute is saved
+    // as it left it), and an assignment that raises restores what was
+    // saved up to it. The nesting restores in reverse order, where Rails
+    // restores in order; the two differ only when a restore raises.
+    let mut inner = run_block(span, class, body);
+    for (name, value) in values.iter().rev() {
+        let local = Symbol::from(format!("__current_set{level}_{name}"));
+        let save = assign_local(span, local.clone(), class_read(span, class, name));
+        let scoped = Expr::new(
+            span,
+            ExprNode::BeginRescue {
+                body: seq(span, vec![class_write(span, class, name, value.clone()), inner]),
+                rescues: Vec::new(),
+                else_branch: None,
+                ensure: Some(Box::new(class_write(span, class, name, local_read(span, local)))),
+                implicit: false,
+            },
+        );
+        inner = seq(span, vec![save, scoped]);
     }
-    stmts.push(Expr::new(
-        span,
-        ExprNode::BeginRescue {
-            body: body.clone(),
-            rescues: Vec::new(),
-            else_branch: None,
-            ensure: Some(Box::new(seq(span, restore))),
-            implicit: false,
-        },
-    ));
+    stmts.push(inner);
     seq(span, stmts)
+}
+
+/// How many `set` expansions deep `e` already is: one more than the
+/// deepest level whose save locals it assigns, 0 for none.
+fn nesting(e: &Expr) -> usize {
+    let mut deepest = 0;
+    let mut visit = |c: &Expr| deepest = deepest.max(nesting(c));
+    e.node.for_each_child(&mut visit);
+    if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node
+        && let Some(rest) = name.as_str().strip_prefix("__current_set")
+    {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        deepest = deepest.max(digits.parse::<usize>().unwrap_or(0) + 1);
+    }
+    deepest
+}
+
+/// A value whose evaluation reads nothing the saves or writes change and
+/// raises nothing, so it needs no local of its own.
+fn is_plain(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. })
+}
+
+/// The block's run inside the save/restore. A block with no parameters
+/// and no `next` or `break` of its own runs as its body in place; any
+/// other is handed to `Current.instance.then`, which yields the instance
+/// as Rails' `set` does and keeps the block's own `next`, `break` and
+/// parameters.
+fn run_block(span: Span, class: &str, block: &Expr) -> Expr {
+    let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else {
+        return block.clone();
+    };
+    if params.is_empty() && rest_param.is_none() && extra_params.is_empty() && block_param.is_none() && !jumps_out(body) {
+        return body.clone();
+    }
+    let instance = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(const_path(span, class)),
+            method: Symbol::from("instance"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(instance),
+            method: Symbol::from("then"),
+            args: vec![],
+            block: Some(block.clone()),
+            parenthesized: false,
+        },
+    )
+}
+
+/// Does `e` hold a `next` or `break` that leaves the block itself (one
+/// in a nested block or loop leaves that instead)?
+fn jumps_out(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Next { .. } | ExprNode::Break { .. } => true,
+        ExprNode::Lambda { .. } | ExprNode::While { .. } => false,
+        _ => {
+            let mut found = false;
+            e.node.for_each_child(&mut |c| found |= jumps_out(c));
+            found
+        }
+    }
 }
 
 fn seq(span: Span, exprs: Vec<Expr>) -> Expr {
@@ -237,27 +326,74 @@ mod tests {
 
     #[test]
     fn one_attribute_saves_assigns_and_restores_in_an_ensure() {
-        let mut app = app_with("Current.set(request: r) do\n      work\n    end");
+        let mut app = app_with("Current.set(request: \"r\") do\n      work\n    end");
         let diags = apply_current_set_lowering(&mut app);
         assert!(diags.is_empty(), "{diags:?}");
         let out = lowered(&app);
         assert!(out.contains("__current_set_request = Current.request"), "{out}");
-        assert!(out.contains("Current.request = r"), "{out}");
+        assert!(out.contains("Current.request = \"r\""), "{out}");
         assert!(out.contains("ensure"), "{out}");
         assert!(out.contains("Current.request = __current_set_request"), "{out}");
     }
 
-    /// Every save runs before any assignment: with two attributes, a
-    /// save that read after a write would restore the new value.
+    /// Each attribute is saved just before it is assigned, as
+    /// `Object#with` does: the second save reads after the first write.
     #[test]
-    fn two_attributes_save_before_either_is_written() {
-        let mut app = app_with("Current.set(request: r, user: u) do\n      work\n    end");
+    fn each_attribute_is_saved_just_before_it_is_assigned() {
+        let mut app = app_with("Current.set(request: \"r\", user: \"u\") do\n      work\n    end");
         let diags = apply_current_set_lowering(&mut app);
         assert!(diags.is_empty(), "{diags:?}");
         let out = lowered(&app);
-        let save_user = out.find("__current_set_user = Current.user").expect(&out);
-        let write_request = out.find("Current.request = r").expect(&out);
-        assert!(save_user < write_request, "a save ran after a write:\n{out}");
+        let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("no `{s}` in:\n{out}"));
+        let order = [
+            at("__current_set_request = Current.request"),
+            at("Current.request = \"r\""),
+            at("__current_set_user = Current.user"),
+            at("Current.user = \"u\""),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "out of Object#with's order:\n{out}");
+    }
+
+    /// The block runs: its body sits in the `begin`, not a lambda left
+    /// unrun there.
+    #[test]
+    fn a_plain_block_runs_as_its_body() {
+        let mut app = app_with("x = Current.set(request: r) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("work") && !out.contains("->") && !out.contains("then"), "{out}");
+    }
+
+    /// A block parameter, and a `next` or `break` of the block's own,
+    /// keep their meaning through `Current.instance.then`.
+    #[test]
+    fn a_block_with_a_parameter_or_a_jump_runs_through_then() {
+        for body in ["Current.set(request: r) { |c| c.request }", "Current.set(request: r) { next 1 }", "Current.set(request: r) { break 1 }"] {
+            let mut app = app_with(body);
+            assert!(apply_current_set_lowering(&mut app).is_empty());
+            let out = lowered(&app);
+            assert!(out.contains("Current.instance.then"), "{body}:\n{out}");
+        }
+    }
+
+    /// A `next` in a nested block or a `break` in a loop leaves that, not
+    /// the `set` block, which runs as its body.
+    #[test]
+    fn a_jump_of_a_nested_block_or_loop_stays_in_place() {
+        let mut app = app_with("Current.set(request: r) { [1].each { |n| next n }; while true; break; end }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        assert!(!lowered(&app).contains("Current.instance.then"), "{}", lowered(&app));
+    }
+
+    /// An argument that is a call is evaluated before the first save.
+    #[test]
+    fn a_call_argument_is_evaluated_before_anything_is_saved() {
+        let mut app = app_with("Current.set(request: build) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        let value = out.find("__current_set_value_request = build").expect(&out);
+        let save = out.find("__current_set_request = Current.request").expect(&out);
+        assert!(value < save, "{out}");
     }
 
     #[test]
