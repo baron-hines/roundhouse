@@ -193,6 +193,7 @@ module ActiveRecord
       @limit = nil
       @offset = nil
       @includes = []
+      @references = []
       @skip_preloading = false
       # Rails' NullRelation flag: `Model.none` and `where(id: [])` must not
       # hit the database. Chain methods call `unload_records`, which keeps
@@ -276,6 +277,7 @@ module ActiveRecord
         @havings,
         @ctes,
         @includes,
+        @references,
         @scope_attributes
       )
       target.take_query_scalars(
@@ -437,6 +439,7 @@ module ActiveRecord
           @havings,
           @ctes,
           @includes,
+          @references,
           @scope_attributes
         )
       end
@@ -445,7 +448,7 @@ module ActiveRecord
 
     # List accumulators go through copy_* so inference types the
     # parameters. Scalars come from `clone` (shallow ivar copy).
-    def take_query_lists(wheres, where_cols, where_null, joins, orders, groups, havings, ctes, includes, attrs)
+    def take_query_lists(wheres, where_cols, where_null, joins, orders, groups, havings, ctes, includes, references, attrs)
       @wheres = copy_string_list(wheres)
       @where_cols = copy_cols_list(where_cols)
       @where_null = copy_bool_list(where_null)
@@ -455,6 +458,7 @@ module ActiveRecord
       @havings = copy_string_list(havings)
       @ctes = copy_string_list(ctes)
       @includes = copy_symbol_list(includes)
+      @references = copy_string_list(references)
       @scope_attributes = copy_scope_attributes(attrs)
       self
     end
@@ -1568,7 +1572,10 @@ module ActiveRecord
     def rendered_joins
       return @joins if @includes.length == 0
       out = copy_string_list(@joins)
-      copy_string_list(@model._eager_load_joins(@includes, @wheres.join(" "), @joins.join(" "))).each do |join|
+      # Not every name the SQL qualifies by: only a hash condition (`"name".`) or `references(:name)` joins in Rails.
+      named = @wheres.join(" ")
+      @references.each { |name| named = named + " \"" + name + "\"." }
+      copy_string_list(@model._eager_load_joins(@includes, named, @joins.join(" "))).each do |join|
         out << join unless out.include?(join)
       end
       out
@@ -1612,14 +1619,16 @@ module ActiveRecord
       spawn.include_names!(names)
     end
 
-    # `references(:assoc)` — Rails' marker that a string condition
-    # mentions an eager-loaded table. The preload machinery here decides
-    # what to load from `eager_load`/`includes` alone, so the marker
-    # carries no state; accept and ignore it so marker-bearing chains
-    # stay chainable (lobsters' filters page).
+    # Not ignored: a string condition on an included table joins it only once `references` names it, as in Rails.
     def references(*names)
-      names
-      unloaded_spawn
+      spawn.reference_names!(names)
+    end
+
+    def reference_names!(names)
+      own_lists
+      unload_records
+      names.each { |n| @references << n.to_s }
+      self
     end
 
     # `merge(other)` — fold another relation's WHEREs and ORDER BY in.

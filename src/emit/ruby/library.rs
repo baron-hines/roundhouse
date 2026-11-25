@@ -14109,7 +14109,7 @@ end
         };
         let aliased = format!("LEFT OUTER JOIN {table} {name} ON {}", on.replace("{t}", name));
         let plain = format!("LEFT OUTER JOIN {table} ON {}", on.replace("{t}", &table));
-        let names = |q: &str| format!("conditions.include?(\"\\\"{q}\\\".\") || conditions.include?(\" {q}.\") || conditions.include?(\"({q}.\") || conditions.start_with?(\"{q}.\")");
+        let names = |q: &str| format!("conditions.include?(\"\\\"{q}\\\".\")");
         let _ = write!(
             joins,
             "  when \"{name}\"\n    return nil if joined.include?(\"JOIN {table} \")\n    return {aliased:?} if {}\n    return {plain:?} if {}\n",
