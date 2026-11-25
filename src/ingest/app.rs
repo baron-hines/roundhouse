@@ -15312,7 +15312,14 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
 /// refused, since that text may be the other database's own SQL.
 fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
     use crate::schema::generated::GeneratedExpressionDialect::{OtherDatabase, Portable, Sqlite};
-    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Portable };
+    // Not only `database.yml`: an app that ships its configuration as a sample (lobsters' `database.yml.sample`) names
+    // the database it is deployed on there.
+    let Some(text) = ["config/database.yml", "config/database.yml.sample", "config/database.yml.example"]
+        .iter()
+        .find_map(|name| vfs.read_to_string(&dir.join(name)).ok())
+    else {
+        return Portable;
+    };
     let read = super::database_yml::database_configurations(&text, crate::span::FileId(0));
     let sqlite = read.refusals.is_empty()
         && !read.computed_url

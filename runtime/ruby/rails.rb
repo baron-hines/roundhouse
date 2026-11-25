@@ -829,6 +829,8 @@ module Rails
     # The request's nonce for the view helpers, which have no request of their own: nil outside one, or without a
     # generator, as Rails' `request&.content_security_policy_nonce` is.
     def content_security_policy_nonce_current
+      # Not the request first: a tree that serves no request (a helper unit) loads no `ActionController::Current`.
+      return nil unless content_security_policy_nonce_generator?
       req = ActionController::Current.request
       req.nil? ? nil : req.content_security_policy_nonce
     end
