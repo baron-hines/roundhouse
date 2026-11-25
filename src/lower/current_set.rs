@@ -31,8 +31,9 @@
 //! `ensure` restores those, in order. A block with parameters, or a
 //! `next` or `break` of its own, runs as
 //! `Current.instance.then { |context| … }`, which yields the instance as
-//! `set` does; any other block runs as its body in place. A `set` nested
-//! in the block or an argument names its locals with its own level.
+//! `set` does, and so does one that assigns a local, which keeps the
+//! block's locals its own; any other block runs as its body in place.
+//! Each call site's locals carry its own number.
 //!
 //! ENSURE, NOT A TRAILING ASSIGNMENT, and it is the half that matters:
 //! `Current.set` exists to be exception-safe. campfire's
@@ -71,26 +72,27 @@ pub fn apply_current_set_lowering(app: &mut App) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut diags = Vec::new();
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &classes, &mut diags));
+    let mut sites = 0;
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &classes, &mut sites, &mut diags));
     for view in &mut app.views {
-        rewrite(&mut view.body, &classes, &mut diags);
+        rewrite(&mut view.body, &classes, &mut sites, &mut diags);
     }
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &classes, &mut diags);
+            rewrite(setup, &classes, &mut sites, &mut diags);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &classes, &mut diags);
+            rewrite(&mut t.body, &classes, &mut sites, &mut diags);
         }
         for m in &mut tm.helpers {
-            rewrite(&mut m.body, &classes, &mut diags);
+            rewrite(&mut m.body, &classes, &mut sites, &mut diags);
         }
     }
     diags
 }
 
-fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, diags: &mut Vec<Diagnostic>) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, classes, diags));
+fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, sites: &mut usize, diags: &mut Vec<Diagnostic>) {
+    e.node.for_each_child_mut(&mut |c| rewrite(c, classes, sites, diags));
     let span = e.span;
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { return };
     if method.as_str() != "set" {
@@ -113,7 +115,8 @@ fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, diags: &mut Vec<Diagnostic>
         report(span, &class, "its argument is not a literal keyword hash", diags);
         return;
     };
-    *e = expand(span, &class, &pairs, body);
+    *e = expand(span, &class, &pairs, body, *sites);
+    *sites += 1;
 }
 
 /// `[(attribute, value)]` from the single trailing keyword hash.
@@ -135,11 +138,10 @@ fn keyword_pairs(args: &[Expr]) -> Option<Vec<(String, Expr)>> {
     Some(out)
 }
 
-fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Expr {
+fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr, site: usize) -> Expr {
     let mut stmts: Vec<Expr> = Vec::new();
-    // (a `set` inside this block or its arguments saves into locals of its own level: one name for both would have the inner save overwrite the outer's)
-    let depth = pairs.iter().map(|(_, v)| nesting(v)).fold(nesting(body), usize::max);
-    let level = if depth == 0 { String::new() } else { depth.to_string() };
+    // (numbered per call site, not per nesting level: a lambda defined beside one `set` and called inside another shares the method's locals)
+    let level = if site == 0 { String::new() } else { site.to_string() };
     let local = |kind: &str, i: usize, name: &str| Symbol::from(format!("__current_set{level}_{kind}{i}_{name}"));
     // The arguments are evaluated in order before anything is saved, as a
     // call's arguments are: one that raises leaves every attribute as it
@@ -217,23 +219,9 @@ fn int(span: Span, value: i64) -> Expr {
     Expr::new(span, ExprNode::Lit { value: Literal::Int { value } })
 }
 
-/// How many `set` expansions deep `e` already is: one more than the
-/// deepest level whose locals it assigns, 0 for none.
-fn nesting(e: &Expr) -> usize {
-    let mut deepest = 0;
-    let mut visit = |c: &Expr| deepest = deepest.max(nesting(c));
-    e.node.for_each_child(&mut visit);
-    if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node
-        && let Some(rest) = name.as_str().strip_prefix("__current_set")
-    {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        deepest = deepest.max(digits.parse::<usize>().unwrap_or(0) + 1);
-    }
-    deepest
-}
-
-/// The block's run inside the save/restore. A block with no parameters
-/// and no `next` or `break` of its own runs as its body in place; any
+/// The block's run inside the save/restore. A block with no parameters,
+/// no `next`, `break` or `redo` of its own and no locals of its own runs
+/// as its body in place; any
 /// other is handed to `Current.instance.then`, which yields the instance
 /// as Rails' `set` does and keeps the block's own `next`, `break` and
 /// parameters.
@@ -241,7 +229,7 @@ fn run_block(span: Span, class: &str, block: &Expr) -> Expr {
     let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else {
         return block.clone();
     };
-    if params.is_empty() && rest_param.is_none() && extra_params.is_empty() && block_param.is_none() && !jumps_out(body) {
+    if params.is_empty() && rest_param.is_none() && extra_params.is_empty() && block_param.is_none() && !jumps_out(body) && !binds_local(body) {
         return body.clone();
     }
     let instance = Expr::new(
@@ -275,6 +263,24 @@ fn jumps_out(e: &Expr) -> bool {
         _ => {
             let mut found = false;
             e.node.for_each_child(&mut |c| found |= jumps_out(c));
+            found
+        }
+    }
+}
+
+/// Does `e` assign a local outside a nested block? Run in place, the
+/// block's own locals would join the method's, and two sibling blocks
+/// would share one.
+fn binds_local(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Var { .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { .. }, .. }
+        | ExprNode::Let { .. } => true,
+        ExprNode::MultiAssign { targets, .. } if targets.iter().any(|t| matches!(t, LValue::Var { .. })) => true,
+        ExprNode::Lambda { .. } => false,
+        _ => {
+            let mut found = false;
+            e.node.for_each_child(&mut |c| found |= binds_local(c));
             found
         }
     }
@@ -404,6 +410,25 @@ mod tests {
         let user = ensure.find("Current.user = __current_set_was1_user").expect(&out);
         assert!(request < user, "{out}");
         assert!(ensure.contains("__current_set_saved >= 2"), "{out}");
+    }
+
+    /// A block that assigns a local keeps it its own: two sibling blocks
+    /// do not share one.
+    #[test]
+    fn a_block_with_a_local_of_its_own_runs_through_then() {
+        let mut app = app_with("Current.set(request: \"r\") { memo = 1 }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        assert!(lowered(&app).contains("Current.instance.then"), "{}", lowered(&app));
+    }
+
+    /// Two call sites in one body name their locals apart, whatever their
+    /// nesting: a lambda beside one can run inside the other.
+    #[test]
+    fn each_call_site_has_its_own_locals() {
+        let mut app = app_with("Current.set(user: \"a\") { work }\n    Current.set(user: \"b\") { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("__current_set_was0_user") && out.contains("__current_set1_was0_user"), "{out}");
     }
 
     /// A `set` in another's argument names its locals apart from the
