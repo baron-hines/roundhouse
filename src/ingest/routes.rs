@@ -1599,8 +1599,10 @@ fn root_url_protocol(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<(Str
         .flat_map(|options| options.elements().iter().filter_map(|option| option.as_assoc_node()).collect::<Vec<_>>())
         .collect();
     let protocol = pairs.iter().find(|pair| symbol_value(&pair.key()).as_deref() == Some("protocol"))?;
+    // The last `as:`, as `ingest_root_route` names the helper by it.
     let stem = pairs
         .iter()
+        .rev()
         .find(|pair| symbol_value(&pair.key()).as_deref() == Some("as"))
         .and_then(|pair| symbol_or_string_value(&pair.value()))
         .unwrap_or_else(|| "root".to_string());
