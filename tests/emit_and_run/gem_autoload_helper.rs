@@ -144,3 +144,32 @@ fn a_helper_defined_twice_keeps_its_autoload() {
     assert!(later.iter().any(|l| l.contains("\"postbox/\"")), "the last definition is not the later one:\n{module}");
     assert!(later.iter().any(|l| l.trim().starts_with("autoload(name, ")), "the later definition lost its autoload:\n{module}");
 }
+
+const REGISTRATION_ONLY: (&str, &str) =
+    ("    @autoloads[name] = path\n    autoload(name, path)\n", "    autoload(name, path)\n");
+
+/// A helper whose whole body is the registration ingests as that one call. It loses the `autoload`
+/// and answers `nil`, as `autoload` does.
+#[test]
+fn a_helper_whose_body_is_only_the_registration_drops_its_autoload() {
+    let (emitted, errors) = gem::overlay().edit(POSTBOX, REGISTRATION_ONLY.0, REGISTRATION_ONLY.1).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let files = emitted_files(&emitted);
+    assert!(files.iter().any(|text| text.contains("  class Envelope")), "the registered file is not in the Spinel tree");
+    let module = postbox_module(&files);
+    assert!(!module.lines().any(|l| l.trim().starts_with("autoload(")), "the helper still calls autoload:\n{module}");
+    let defs = definitions(module, "register_autoload");
+    assert_eq!(defs.len(), 1, "{module}");
+    let body: Vec<&str> = defs[0].iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    assert_eq!(body, ["nil"], "the helper's body is not nil:\n{module}");
+}
+
+/// The same helper, also called with a built path, keeps its `autoload`.
+#[test]
+fn a_helper_whose_body_is_only_the_registration_keeps_it_for_a_built_path() {
+    let module = keeps_its_autoload(&[
+        REGISTRATION_ONLY,
+        ("  register_autoload :Envelope, \"postbox/envelope\"\n", "  register_autoload :Envelope, \"postbox/envelope\"\n  register_autoload :Stamp, \"postbox/\" + \"stamp\"\n"),
+    ]);
+    assert!(!module.contains("@autoloads[name] = path"), "{module}");
+}
