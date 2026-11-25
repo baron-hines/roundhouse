@@ -21722,22 +21722,23 @@ fn simple_format_renders_as_rails_on_spinel() {
         .assert_passes();
 }
 
-/// The default `sanitize: true` runs Rails' HTML sanitizer, which isn't
-/// modeled: refused with the reason, as is a `sanitize:` that isn't a
-/// literal `false` or `nil`.
+/// The default `sanitize: true` runs the app's `sanitize` first (`ingest::simple_format_sanitize`), so each literal
+/// form checks clean; a `sanitize:` that isn't a literal is refused with the reason.
 #[test]
-fn simple_format_that_sanitizes_is_refused() {
+fn simple_format_sanitizes_a_literal_form_and_refuses_a_computed_one() {
     for markup in [
         "<%= simple_format(\"a\") %>\n",
         "<%= simple_format(\"a\", class: \"k\") %>\n",
         "<%= simple_format(\"a\", {}, sanitize: true) %>\n",
         "<%= simple_format(\"a\", {}, wrapper_tag: :div) %>\n",
-        "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n",
     ] {
         let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
-        let refused: Vec<_> = errors.iter().filter(|e| e.contains("simple_format")).collect();
-        assert!(refused.len() == 1 && refused[0].contains("simple_format not supported") && refused[0].contains("HTML sanitizer"), "{markup}: {errors:?}");
+        assert!(!errors.iter().any(|e| e.contains("simple_format")), "{markup}: {errors:?}");
     }
+    let markup = "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n";
+    let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
+    let refused: Vec<_> = errors.iter().filter(|e| e.contains("simple_format")).collect();
+    assert!(refused.len() == 1 && refused[0].contains("simple_format not supported") && refused[0].contains("HTML sanitizer"), "{markup}: {errors:?}");
 }
 
 /// Options that aren't a literal hash of `sanitize: false` and a literal
@@ -21889,7 +21890,7 @@ fn a_base_controllers_pure_helper_method_with_an_override_is_refused() {
 /// does, so its `simple_format` doesn't fail another target's build.
 #[test]
 fn simple_format_in_an_unreachable_template_is_a_warning() {
-    let overlay = || emit_and_run::real_blog().write("app/views/articles/orphan.html.erb", "<%= simple_format(\"a\") %>\n");
+    let overlay = || emit_and_run::real_blog().write("app/views/articles/orphan.html.erb", "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n");
     let (_, errors) = overlay().emit(roundhouse::project::BuildTarget::Typescript);
     assert!(!errors.iter().any(|e| e.contains("simple_format")), "{errors:?}");
     let (_, errors) = overlay()
@@ -22269,6 +22270,8 @@ mod load_time_constants;
 mod doorkeeper;
 #[path = "emit_and_run/message_bus.rs"]
 mod message_bus;
+#[path = "emit_and_run/simple_format_sanitize.rs"]
+mod simple_format_sanitize;
 #[path = "emit_and_run/render_object.rs"]
 mod render_object;
 #[path = "support/ordered_options_app.rs"]
