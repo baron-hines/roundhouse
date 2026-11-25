@@ -17,6 +17,12 @@ mod emit_and_run;
 #[path = "support/native_http.rs"]
 #[allow(dead_code)]
 mod native_http;
+#[path = "emit_and_run/namespaced_form_partial.rs"]
+mod namespaced_form_partial;
+#[path = "emit_and_run/zeitwerk_eager_gem.rs"]
+mod zeitwerk_eager_gem;
+#[path = "emit_and_run/lobsters_boot_calls.rs"]
+mod lobsters_boot_calls;
 #[path = "emit_and_run/multi_json.rs"]
 mod multi_json;
 #[path = "emit_and_run/active_model_serializer_08.rs"]

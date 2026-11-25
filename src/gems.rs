@@ -130,7 +130,7 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 27] = [
+    const RUNTIME_GEMS: [(Marker, &str); 28] = [
         (Marker::Constant("Faye"), "faye-websocket"),
         (Marker::Constant("EventMachine"), "eventmachine"),
         (Marker::Constant("BCrypt"), "bcrypt"),
@@ -219,6 +219,8 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
         // installed, which the app's own Gemfile (image_processing →
         // ruby-vips) already asked of the machine.
         (Marker::AnyText(&[VARIATION_MARKER]), "ruby-vips"),
+        // Not only the variant marker: an app's own `Vips::Image` (lobsters' StoryImage) needs the gem too.
+        (Marker::Constant("Vips"), "ruby-vips"),
         // The HTTP client an app calls. The real gem runs on this lane;
         // the strict targets refuse it (`lower::ruby_family_gems`). `Constant`
         // matches `Faraday.new` / `Faraday::…` / `rescue Faraday`; the
@@ -1019,6 +1021,10 @@ pub(crate) fn is_core_constant(written: &[&str]) -> bool {
 /// no such file is on its load path.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
     let root = feature.split('/').next().unwrap_or(feature);
+    // Not required as written: the runtime ports a Framework-fate `-rails` gem's engine (MC's importmap-rails); i18n is the real gem.
+    if feature == root && root.ends_with("-rails") && !compiler_tree_loads_gem(root) && FATES.iter().any(|(name, fate)| *name == root && *fate == GemFate::Framework) {
+        return true;
+    }
     matches!(
         root,
         "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
@@ -1952,6 +1958,24 @@ mod tests {
         let stubs = stub_facade_namespaces();
         assert!(stubs.contains("ROTP"), "{stubs:?}");
         assert!(!stubs.contains("WebPush"), "{stubs:?}");
+    }
+
+    /// mission_control-jobs' engine requires importmap-rails, turbo-rails and stimulus-rails, which the runtime ports;
+    /// a gem the app ships stays a require.
+    #[test]
+    fn a_framework_fate_gem_is_a_framework_feature() {
+        for feature in ["importmap-rails", "turbo-rails", "stimulus-rails", "rails/engine"] {
+            assert!(is_framework_feature(feature), "{feature}");
+        }
+        assert!(!is_framework_feature("rotp"));
+        assert!(!is_framework_feature("i18n/backend/simple"));
+        assert!(!is_framework_feature("i18n"));
+    }
+
+    /// lobsters' own `Vips::Image` needs ruby-vips loaded, not only an Active Storage variant.
+    #[test]
+    fn an_app_s_vips_constant_needs_ruby_vips() {
+        assert!(compiler_runtime_gems().iter().any(|(marker, gem)| *gem == "ruby-vips" && matches!(marker, Marker::Constant("Vips"))));
     }
 
     #[test]

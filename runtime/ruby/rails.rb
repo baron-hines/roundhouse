@@ -69,6 +69,12 @@ module Rails
     AppPath.new("public")
   end
 
+  # Empty, not ported: a gem's command (mission_control-jobs' `Authentication`) only needs its superclass to load.
+  module Command
+    class Base
+    end
+  end
+
   # Plain value object, no Pathname subclassing (the runtime stays
   # statically resolvable).
   # Not ActiveSupport's gem-path rewriting: a silenced frame never shows it, and only a `:noise` reading would.
@@ -507,22 +513,23 @@ module Rails
   # corpus is `Rails.logger.error "..."` (campfire: 7 sites, all
   # rescue-path reports); the lazy block form has no caller and an
   # optional block is its own hazard on the strict targets.
+  # Not a required message: Ruby's Logger takes none (lobsters' seeds write a bare `Rails.logger.debug`).
   class Logger
-    def info(message)
+    def info(message = nil)
       Rails.log_line("[rails] INFO " + message.to_s)
     end
 
-    def error(message)
+    def error(message = nil)
       Rails.log_line("[rails] ERROR " + message.to_s)
     end
 
-    def warn(message)
+    def warn(message = nil)
       Rails.log_line("[rails] WARN " + message.to_s)
     end
 
-    def debug(message); end
+    def debug(message = nil); end
 
-    def fatal(message)
+    def fatal(message = nil)
       Rails.log_line("[rails] FATAL " + message.to_s)
     end
   end
