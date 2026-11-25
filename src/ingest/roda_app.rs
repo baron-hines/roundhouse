@@ -872,7 +872,7 @@ impl<'f> RouteWalker<'f> {
                 action_symbol: false,
             });
         }
-        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new() };
+        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new(), url_protocols: Vec::new() };
 
         // Controllers — group leaves by controller stem, first-seen
         // order.

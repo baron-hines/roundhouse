@@ -415,10 +415,9 @@ fn scoped_creation_refusal(e: &Expr, models: &ModelColumns) -> Option<String> {
             return Some(format!("multiple conditions resolve to `{column}`; lookup predicates and constructor assignment order cannot be preserved by this factory"));
         }
     }
+    // Variable conditions too: the inlined block runs after `new` and before `save`, where Rails' does, as long as no
+    // initialization callback would run between them (below), and a block body assigns no local (admission).
     if block.is_some() {
-        if scalar_pairs(&args[0]).is_none() {
-            return Some("variable-condition calls must be blockless; the factory cannot yield inside initialize before its callbacks".to_string());
-        }
         if model.initialization_hook {
             return Some("creation block must run inside initialize before initialization callbacks; this factory calls new before the block".to_string());
         }

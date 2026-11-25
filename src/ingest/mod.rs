@@ -81,6 +81,8 @@ mod engine_config;
 mod engine_helpers;
 mod interpolated_renders;
 mod controller_csp;
+mod simple_format_sanitize;
+mod render_layout_choice;
 mod container_specialize;
 mod controller_class_methods;
 mod controller_delegates;

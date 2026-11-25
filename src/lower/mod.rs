@@ -86,7 +86,7 @@ pub mod unported_rails_subclasses;
 pub mod pathname_ctor;
 pub mod assoc_pluck;
 pub mod try_guard;
-mod core_method_names;
+pub(crate) mod core_method_names;
 pub mod class_body_new;
 pub mod mocha;
 pub mod stub_const;

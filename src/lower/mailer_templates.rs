@@ -530,8 +530,12 @@ fn callback_names(app: &App, mailers: &BTreeSet<String>) -> crate::det::HashSet<
         for m in &lc.methods {
             let (mut starts, mut called) = (false, Vec::new());
             calls(&m.body, &mut starts, &mut called);
+            // By the action's name: a callback that is itself a public method (lobsters' `check_email_blocklist`) is
+            // called through its action body, `__mailer_action_<name>`, whose bare `mail` is the callback's too.
+            // Not a method's call of its own action body (a zero-argument action's `self.__mailer_action_<itself>`).
             if starts {
-                out.extend(called.into_iter().filter(|n| crate::ingest::mailer_callbacks::action_of(n) == n.as_str()));
+                let own = format!("{}{}", crate::ingest::mailer_callbacks::ACTION_PREFIX, m.name.as_str());
+                out.extend(called.into_iter().filter(|n| *n != own).map(|n| crate::ingest::mailer_callbacks::action_of(&n).to_string()));
             }
         }
     }

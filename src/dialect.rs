@@ -2118,6 +2118,10 @@ pub struct RouteTable {
     /// so callers can inspect supported siblings without claiming full support.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    /// `root to: …, protocol: …`: the helper stem whose route sets the protocol its `_url` builds, and the option's
+    /// span. Not modeled: a `_url` call that leaves the protocol to the route is reported (`analyze::diagnostics`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_protocols: Vec<(String, crate::span::Span)>,
 }
 
 /// One `to: redirect(...)` route, as the action synthesized for it.

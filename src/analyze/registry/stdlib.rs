@@ -17,7 +17,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // propagate through dispatch without bottoming out at Var.
     // `Rails.env` is the one we can type concretely as Str.
     let mut rails_cls = ClassInfo::default();
-    for m in ["application", "logger", "cache", "configuration"] {
+    for m in ["logger", "cache"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String
@@ -48,6 +48,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let app_path = class("Rails::AppPath");
     rails_cls.class_methods.insert(Symbol::from("root"), app_path.clone());
     rails_cls.class_methods.insert(Symbol::from("public_path"), app_path.clone());
+    register_application_surface(&mut rails_cls, classes);
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
     register_stdlib_class(classes, "Rails::AppPath", &[], &[
         ("join", app_path.clone()), ("+", app_path.clone()), ("expand_path", app_path.clone()), ("mkpath", app_path.clone()),
@@ -1827,6 +1828,38 @@ pub(crate) const BUILTIN_BLOCK_VALUE_METHODS: &[(&str, &str)] = &[
     ("RestClient", "head"),
     ("RestClient", "options"),
 ];
+
+/// The classes behind `Rails.application` and its `config`: open, so a name missing here answers untyped as before.
+pub(crate) const OPEN_FRAMEWORK_RECEIVERS: &[&str] = &["Rails::Application", "Rails::FrameworkConfig"];
+
+/// `Rails.application` and `Rails.application.config` (`Rails.configuration`), with what runtime/ruby/rails.rb answers
+/// on them typed. Open, not closed: an app's config takes keys of its own, which ingest lifts and `lower::config_reader`
+/// reads, and an application method the app adds (`class << Rails.application`) is its own.
+fn register_application_surface(rails_cls: &mut ClassInfo, classes: &mut HashMap<ClassId, ClassInfo>) {
+    let class = |name: &str| Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
+    let config = class("Rails::FrameworkConfig");
+    rails_cls.class_methods.insert(Symbol::from("application"), class("Rails::Application"));
+    rails_cls.class_methods.insert(Symbol::from("configuration"), config.clone());
+    register_stdlib_class(classes, "Rails::Application", &[], &[("config", config), ("secret_key_base", Ty::Str)]);
+    register_stdlib_class(classes, "Rails::FrameworkConfig", &[], &[("action_dispatch", class("Rails::ActionDispatchOptions"))]);
+    for name in OPEN_FRAMEWORK_RECEIVERS {
+        classes.entry(ClassId(Symbol::from(*name))).or_default().open = true;
+    }
+    let rotations = class("ActiveSupport::Messages::RotationConfiguration");
+    register_stdlib_class(classes, "Rails::ActionDispatchOptions", &[], &[
+        ("cookies_rotations", rotations.clone()),
+        ("signed_cookie_salt", Ty::Str),
+        ("authenticated_encrypted_cookie_salt", Ty::Str),
+    ]);
+    let secrets = Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
+    register_stdlib_class(classes, "ActiveSupport::Messages::RotationConfiguration", &[], &[
+        ("rotate", Ty::Nil), ("signed", secrets.clone()), ("encrypted", secrets),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::KeyGenerator", &[("new", class("ActiveSupport::KeyGenerator"))], &[("generate_key", Ty::Str)]);
+    register_stdlib_class(classes, "ActiveSupport::MessageEncryptor", &[("key_len", Ty::Int)], &[]);
+    // Read as a module, not the runtime's class: only `key_len` is served, so an encryptor of the app's own (`.new(key)`) is reported.
+    classes.entry(ClassId(Symbol::from("ActiveSupport::MessageEncryptor"))).or_default().is_module = true;
+}
 
 fn register_stdlib_class(
     classes: &mut HashMap<ClassId, ClassInfo>,

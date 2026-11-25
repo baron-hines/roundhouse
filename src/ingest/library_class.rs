@@ -4418,7 +4418,46 @@ fn walk_decl_body_with_visibility<'pr>(
                         collect_block_includes(inner, &mut block_includes);
                     }
                     let mut hoisted: Vec<(u32, u32)> = Vec::new();
+                    let readers = block_attr_readers(&inner_stmts);
+                    let alias_targets = block_alias_targets(&inner_stmts, &readers);
+                    let mut hoisted_alias = false;
                     for inner in inner_stmts {
+                        // `attr_reader :name` here defines the reader on the includer: the module's reader, so its ivar is typed.
+                        if hoisted_alias_target(&inner, &alias_targets)
+                            && let Some(call) = inner.as_call_node()
+                        {
+                            let span = Span {
+                                file: super::sources::file_id(file),
+                                start: call.location().start_offset() as u32,
+                                end: call.location().end_offset() as u32,
+                            };
+                            for name in call.arguments().into_iter().flat_map(|a| a.arguments().iter()).filter_map(|a| a.as_symbol_node()) {
+                                let name = String::from_utf8_lossy(name.unescaped()).into_owned();
+                                let mut m = reader_alias_method(&name, &name, owner, file, span)?;
+                                visibility.apply(&inner, &mut m);
+                                out.methods.push(m);
+                            }
+                            hoisted.push((inner.location().start_offset() as u32, inner.location().end_offset() as u32));
+                            hoisted_alias = true;
+                            continue;
+                        }
+                        // `alias to_s name` of an `attr_reader :name` the block declares: Ruby's alias is that reader.
+                        if let Some(alias) = inner.as_alias_method_node()
+                            && let Some((to, from)) = alias_keyword_name(&alias.new_name()).zip(alias_keyword_name(&alias.old_name()))
+                            && alias_targets.contains(&from)
+                        {
+                            let span = Span {
+                                file: super::sources::file_id(file),
+                                start: alias.location().start_offset() as u32,
+                                end: alias.location().end_offset() as u32,
+                            };
+                            let mut m = reader_alias_method(&to, &from, owner, file, span)?;
+                            visibility.apply(&inner, &mut m);
+                            out.methods.push(m);
+                            hoisted.push((inner.location().start_offset() as u32, inner.location().end_offset() as u32));
+                            hoisted_alias = true;
+                            continue;
+                        }
                         // `class << self` here opens the includer's singleton:
                         // class methods, as from `class_methods do`.
                         if let Some(sc) = inner.as_singleton_class_node()
@@ -4470,7 +4509,38 @@ fn walk_decl_body_with_visibility<'pr>(
                     }
                     // The rest of the block is kept as before; only the
                     // hoisted statements leave it.
-                    if let Ok(mut e) = ingest_expr(&stmt, file) {
+                    // Rebuilt from what stays after a hoisted `alias`: the keyword is no expression, so the whole block would not ingest.
+                    let ingested: IngestResult<Expr> = if !hoisted_alias {
+                        ingest_expr(&stmt, file)
+                    } else {
+                        let kept: Vec<_> = block.body().map(flatten_statements).unwrap_or_default()
+                            .into_iter()
+                            .filter(|x| !hoisted.iter().any(|&(s, e)| s <= x.location().start_offset() as u32 && x.location().end_offset() as u32 <= e))
+                            .map(|x| ingest_expr(&x, file))
+                            .collect::<Result<_, _>>()?;
+                        let shell = super::prism::parse_silent(b"included do\nend\n");
+                        let call = shell
+                            .node()
+                            .as_program_node()
+                            .and_then(|p| p.statements().body().iter().next())
+                            .ok_or_else(|| IngestError::Unsupported { file: file.into(), message: "included block".into() })?;
+                        let mut e = ingest_expr(&call, file)?;
+                        e.span = Span {
+                            file: super::sources::file_id(file),
+                            start: stmt.location().start_offset() as u32,
+                            end: stmt.location().end_offset() as u32,
+                        };
+                        if let ExprNode::Send { block: Some(blk), .. } = &mut *e.node
+                            && let ExprNode::Lambda { body, .. } = &mut *blk.node
+                        {
+                            *body = Expr::new(e.span, ExprNode::Seq { exprs: kept });
+                        }
+                        Ok(e)
+                    };
+                    // Not dropped when it does not ingest: the block's macros (an `attr_reader`, an `alias`) then never reach
+                    // the includer, and the check would pass over a program that answers differently.
+                    {
+                        let mut e = ingested?;
                         if let ExprNode::Send { block: Some(blk), .. } = &mut *e.node
                             && let ExprNode::Lambda { body, .. } = &mut *blk.node
                         {
@@ -5432,6 +5502,92 @@ pub(crate) const COMPARABLE_METHODS: &[(&str, &str, &str)] = &[
     ("between?", "min, max", "min, max"),
     ("clamp", "*args", "*args"),
 ];
+
+/// The names an `attr_reader` / `attr_accessor` of these statements declares, with literal Symbol arguments.
+fn block_attr_readers(stmts: &[ruby_prism::Node<'_>]) -> crate::det::HashSet<String> {
+    let mut out = crate::det::HashSet::default();
+    for stmt in stmts {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if call.receiver().is_some() || !matches!(constant_id_str(&call.name()), "attr_reader" | "attr_accessor") {
+            continue;
+        }
+        for arg in call.arguments().into_iter().flat_map(|a| a.arguments().iter()) {
+            if let Some(sym) = arg.as_symbol_node() {
+                out.insert(String::from_utf8_lossy(sym.unescaped()).into_owned());
+            }
+        }
+    }
+    out
+}
+
+/// The readers an `alias` of the same block names: only those are hoisted with it, so every other `attr_reader` stays
+/// as the includer's own call.
+fn block_alias_targets(stmts: &[ruby_prism::Node<'_>], readers: &crate::det::HashSet<String>) -> crate::det::HashSet<String> {
+    // The method each name is bound to at each alias, in source order: an alias copies what is current there, so a
+    // `def` of the name between the reader and the alias (or any `def` of it in the block) is not the reader.
+    let mut bound: crate::det::HashMap<String, bool> = Default::default();
+    let mut redefined: crate::det::HashSet<String> = Default::default();
+    let mut out = crate::det::HashSet::default();
+    for stmt in stmts {
+        if let Some(def) = visibility::definition(stmt).map(|d| d.as_node()).as_ref().unwrap_or(stmt).as_def_node() {
+            let name = constant_id_str(&def.name()).to_string();
+            bound.insert(name.clone(), false);
+            redefined.insert(name);
+        } else if let Some(call) = stmt.as_call_node()
+            && call.receiver().is_none()
+            && matches!(constant_id_str(&call.name()), "attr_reader" | "attr_accessor")
+        {
+            for name in call.arguments().into_iter().flat_map(|a| a.arguments().iter()).filter_map(|a| a.as_symbol_node()) {
+                bound.insert(String::from_utf8_lossy(name.unescaped()).into_owned(), true);
+            }
+        } else if let Some(alias) = stmt.as_alias_method_node()
+            && let Some(from) = alias_keyword_name(&alias.old_name())
+            && readers.contains(&from)
+            && bound.get(&from).copied().unwrap_or(false)
+        {
+            out.insert(from);
+        }
+    }
+    // Not a reader the block also defines by `def`: hoisting the reader would move it past that definition.
+    out.retain(|name| !redefined.contains(name));
+    out
+}
+
+/// An `attr_reader` (not `attr_accessor`, whose writer stays the includer's) every name of which an alias targets.
+fn hoisted_alias_target(stmt: &ruby_prism::Node<'_>, targets: &crate::det::HashSet<String>) -> bool {
+    let Some(call) = stmt.as_call_node() else { return false };
+    if call.receiver().is_some() || constant_id_str(&call.name()) != "attr_reader" {
+        return false;
+    }
+    let names: Vec<String> = call
+        .arguments()
+        .into_iter()
+        .flat_map(|a| a.arguments().iter())
+        .map(|a| a.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    !names.is_empty() && names.iter().all(|n| targets.contains(n))
+}
+
+/// `alias to from` of an attribute reader: a reader of the same ivar under the new name.
+fn reader_alias_method(to: &str, from: &str, owner: &ClassId, file: &str, span: Span) -> IngestResult<MethodDef> {
+    let source = format!("def {to}\n  @{from}\nend\n");
+    let parsed = super::prism::parse_silent(source.as_bytes());
+    let def = parsed
+        .node()
+        .as_program_node()
+        .and_then(|program| program.statements().body().iter().next())
+        .and_then(|stmt| stmt.as_def_node())
+        .ok_or_else(|| IngestError::Unsupported { file: file.into(), message: "alias names a reader this block has not declared".into() })?;
+    let mut method = ingest_library_method(&def, owner, file)?;
+    method.name_span = span;
+    fn respan(e: &mut Expr, span: Span) {
+        e.span = span;
+        e.node.for_each_child_mut(&mut |c| respan(c, span));
+    }
+    respan(&mut method.body, span);
+    Ok(method)
+}
 
 fn builtin_alias_method(to: &str, from: &str, owner: &ClassId, file: &str, span: Span) -> IngestResult<MethodDef> {
     mixin_alias_method(to, from, OBJECT_BUILTINS, owner, file, span)

@@ -931,8 +931,9 @@ impl Analyzer {
                 ("attribute_in_database", Ty::Untyped),
                 ("saved_changes", Ty::Untyped),
                 ("saved_changes?", Ty::Bool),
-                ("changes", Ty::Untyped),
-                ("previous_changes", Ty::Untyped),
+                // runtime/ruby/active_record/base.rb: String-keyed, as `lower::indifferent_access` reads Rails' indifferent Hash.
+                ("changes", crate::analyze::indifferent::of(Ty::Untyped)),
+                ("previous_changes", crate::analyze::indifferent::of(Ty::Untyped)),
                 ("changed_attributes", Ty::Untyped),
                 ("changed", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
                 // Turbo::Broadcastable, which turbo-rails mixes into

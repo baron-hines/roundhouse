@@ -3809,6 +3809,8 @@ end
     super::unreached_gem_modules::drop(&mut app, dir);
     super::gem_load_program::carry(&mut app);
     super::interpolated_renders::expand(&mut app);
+    super::simple_format_sanitize::expand(&mut app);
+    super::render_layout_choice::expand(&mut app);
     super::controller_delegates::expand(&mut app);
     super::active_model_super::rewrite(&mut app);
     super::queue_adapter_reader::synthesize(&mut app);
@@ -3819,6 +3821,8 @@ end
     for d in crate::controller_layout::diagnostics(&app.controllers, &app.views) {
         super::prism::push(d);
     }
+    let protocol_calls = crate::analyze::diagnostics::route_protocol_urls(&app);
+    app.routes.diagnostics.extend(protocol_calls);
     // Not beside the hoists: later passes give an included module methods and ancestors (forwardable, carried includes, props bases, the queue adapter reader) or take an inactive branch's away.
     app.included_hoist_conflicts = super::library_class::included_hoist_conflicts(&app.library_classes);
     // Here, once later passes stop giving modules methods: a concern's `to_param` before analysis types it on the model.

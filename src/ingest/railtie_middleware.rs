@@ -89,6 +89,7 @@ pub(super) struct Stack {
 
 pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -> Stack {
     let settings = app_settings(vfs, dir);
+    let defaulted = defaulted_settings(vfs, dir);
     let mut out = Vec::new();
     let mut diags = Vec::new();
     let mut loops = Vec::new();
@@ -128,7 +129,8 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
                 let Some(body) = class.body() else { continue };
                 let own = scope.iter().cloned().chain(class_name_path(&class).unwrap_or_default()).collect::<Vec<_>>();
                 let lexical: Vec<String> = std::iter::once(own.join("::")).chain(nesting).collect();
-                let guards = Guards { predicates: class.body().map(setting_predicates).unwrap_or_default(), settings: &settings };
+                let body_text = class.body().map(|b| String::from_utf8_lossy(b.location().as_slice()).into_owned()).unwrap_or_default();
+                let guards = Guards { body_text, defaulted: &defaulted, predicates: class.body().map(setting_predicates).unwrap_or_default(), settings: &settings };
                 // Not `file_id` alone: a file library ingest has not registered yet answers no file.
                 let file_id = super::sources::register(&name, &String::from_utf8_lossy(&bytes));
                 if matches!(loaded, Loading::Autoload | Loading::Unknown) {
@@ -729,7 +731,15 @@ fn each_collection<'p>(stmt: &Node<'p>) -> Option<(Node<'p>, String)> {
 
 /// `initializer "…" do |app| app.middleware.use(K) end`.
 /// What a Railtie's initializer guard reads: the Railtie's own predicates over the app's settings.
+/// Rails::Application::Configuration's boolean settings an app leaves unset, with Rails 8.1's value for them.
+const RAILS_BOOLEAN_DEFAULTS: &[(&str, bool)] = &[("api_only", false)];
+
 struct Guards<'a> {
+    /// The Railtie class body's source, for a write of a setting a guard reads.
+    body_text: String,
+    /// Each [`RAILS_BOOLEAN_DEFAULTS`] key every environment answers alike, over `config/application.rb` and Rails'
+    /// default; `None` where the environments differ or an initializer writes it. Absent: no file sets it.
+    defaulted: &'a crate::det::HashMap<String, Option<String>>,
     /// `def skip_middleware?(config) = return false if !config.respond_to?(:k); config.k` (message_bus): the
     /// predicate's name and the setting `k` it answers.
     predicates: crate::det::HashMap<String, String>,
@@ -746,8 +756,8 @@ impl Guards<'_> {
         if name == "!" && call.arguments().is_none() {
             return self.decide(&call.receiver()?, app).map(|b| !b);
         }
-        if call.receiver().is_some() {
-            return None;
+        if let Some(recv) = call.receiver() {
+            return self.app_setting(&recv, &name, call.arguments().is_none(), app);
         }
         let key = self.predicates.get(&*name.to_string())?;
         let args: Vec<_> = call.arguments()?.arguments().iter().collect();
@@ -770,6 +780,36 @@ impl Guards<'_> {
     }
 
     /// `statements` with each `if`/`unless` a guard decides replaced by the branch Rails runs.
+    /// `app.config.k` read directly: the app's literal setting, or Rails' default where the app sets none.
+    fn app_setting(&self, recv: &Node<'_>, key: &str, bare: bool, app: &str) -> Option<bool> {
+        let config = recv.as_call_node()?;
+        let on_app = config.receiver().and_then(|r| r.as_local_variable_read_node()).is_some_and(|l| constant_id_str(&l.name()) == app);
+        if !(bare && on_app && constant_id_str(&config.name()) == "config" && config.arguments().is_none()) {
+            return None;
+        }
+        // Not decided where this Railtie itself writes the setting: it may change it before the guard runs.
+        if self.body_text.contains(&format!("config.{key} =")) || self.body_text.contains(&format!("config.{key}=")) {
+            return None;
+        }
+        let boolean = |value: &str| match value {
+            "true" => Some(true),
+            "false" | "nil" => Some(false),
+            _ => None,
+        };
+        if let Some((_, default)) = RAILS_BOOLEAN_DEFAULTS.iter().find(|(k, _)| *k == key) {
+            return match self.defaulted.get(key) {
+                Some(Some(value)) => boolean(value),
+                Some(None) => None,
+                None => Some(*default),
+            };
+        }
+        match self.settings.get(key) {
+            None => None,
+            Some(Some(value)) => boolean(value),
+            Some(None) => None,
+        }
+    }
+
     fn expand<'pr>(&self, statements: Vec<Node<'pr>>, app: &str, depth: usize) -> Vec<Node<'pr>> {
         let branch = |node: Option<ruby_prism::StatementsNode<'pr>>| node.map(|s| s.body().iter().collect::<Vec<_>>()).unwrap_or_default();
         let mut out = Vec::new();
@@ -837,6 +877,47 @@ fn setting_predicates(body: Node<'_>) -> crate::det::HashMap<String, String> {
 
 /// The app's top-level `config.k = v` settings Rails has read when the Railtie initializers run: `config/application.rb`
 /// and each environment file, the value only where every one that sets it agrees.
+/// Each environment's own value of a defaulted setting: its file's, else `config/application.rb`'s, else Rails'
+/// default. A key the environments answer differently, or an initializer writes, is `None`.
+fn defaulted_settings<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::det::HashMap<String, Option<String>> {
+    let assigned = |file: &Path| -> crate::det::HashMap<String, String> {
+        let Ok(bytes) = vfs.read(file) else { return Default::default() };
+        super::app::extract_config_assignments(&bytes, &file.display().to_string())
+            .into_iter()
+            .filter_map(|(path, value)| match path.as_slice() {
+                [key] => Some((key.clone(), value.trim().to_string())),
+                _ => None,
+            })
+            .collect()
+    };
+    let base = assigned(&dir.join("config/application.rb"));
+    let mut envs = Vec::new();
+    if let Ok(entries) = vfs.read_dir(&dir.join("config/environments")) {
+        envs = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rb")).map(|p| assigned(&p)).collect();
+    }
+    let mut initializers = Vec::new();
+    if let Ok(entries) = vfs.read_dir(&dir.join("config/initializers")) {
+        initializers = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rb")).map(|p| assigned(&p)).collect();
+    }
+    let mut out = crate::det::HashMap::default();
+    for (key, default) in RAILS_BOOLEAN_DEFAULTS {
+        let key = key.to_string();
+        let set_anywhere = base.contains_key(&key) || envs.iter().any(|e| e.contains_key(&key));
+        if initializers.iter().any(|i| i.contains_key(&key)) {
+            out.insert(key, None);
+            continue;
+        }
+        if !set_anywhere {
+            continue;
+        }
+        let fallback = base.get(&key).cloned().unwrap_or_else(|| default.to_string());
+        let values: Vec<String> = if envs.is_empty() { vec![fallback.clone()] } else { envs.iter().map(|e| e.get(&key).cloned().unwrap_or_else(|| fallback.clone())).collect() };
+        let agreed = values.iter().all(|v| *v == values[0]);
+        out.insert(key, agreed.then(|| values[0].clone()));
+    }
+    out
+}
+
 fn app_settings<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::det::HashMap<String, Option<String>> {
     let mut files = vec![dir.join("config/application.rb")];
     if let Ok(entries) = vfs.read_dir(&dir.join("config/environments")) {
@@ -1161,6 +1242,36 @@ mod tests {
         assert_eq!(run(&app(""), ""), (vec!["Gem::Middleware".to_string()], vec![]));
         // The environments disagree: the guard is not decided.
         let (_, diags) = run(&app("    config.skip_gem_middleware = true\n"), "Rails.application.configure do\n  config.skip_gem_middleware = false\nend\n");
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+    }
+
+    /// mission_control-jobs' engine: `if app.config.api_only` read directly. Rails leaves `api_only` false where the app
+    /// sets none, so nothing is inserted; an app setting it true gets the `use`.
+    #[test]
+    fn a_railtie_guard_on_an_app_setting_reads_rails_default_where_the_app_sets_none() {
+        let rt = railtie("    initializer \"gem.middleware\" do |app|\n      if app.config.api_only\n        app.middleware.use(Middleware)\n      end\n    end");
+        let run = |application: &str| {
+            read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", rt.as_str()), ("/app/config/application.rb", application)])
+        };
+        let app = |lines: &str| format!("module App\n  class Application < Rails::Application\n{lines}  end\nend\n");
+        assert_eq!(run(&app("")), (vec![], vec![]));
+        assert_eq!(run(&app("    config.api_only = true\n")), (vec!["Gem::Middleware".to_string()], vec![]));
+        // Set in development alone: production keeps Rails' false, so the environments differ and nothing is decided.
+        let (_, diags) = read(&[
+            ("/gem/lib/gem.rb", ENTRY),
+            ("/gem/lib/gem/railtie.rb", rt.as_str()),
+            ("/app/config/application.rb", &app("")),
+            ("/app/config/environments/development.rb", "Rails.application.configure do\n  config.api_only = true\nend\n"),
+            ("/app/config/environments/production.rb", "Rails.application.configure do\nend\n"),
+        ]);
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+        // Written by the Railtie itself: not folded from the app's files.
+        let writes = rt.replace("      if app.config.api_only", "      app.config.api_only = true\n      if app.config.api_only");
+        let (_, diags) = read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", writes.as_str()), ("/app/config/application.rb", &app(""))]);
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+        // A setting Rails has no default for here stays undecided.
+        let rt = rt.replace("app.config.api_only", "app.config.eager_load");
+        let (_, diags) = read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", rt.as_str()), ("/app/config/application.rb", &app(""))]);
         assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
     }
 
