@@ -6159,12 +6159,29 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
     let mut module_statements: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
     let mut concerns: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
     let mut before_concern: crate::det::HashSet<(crate::ident::ClassId, usize)> = crate::det::HashSet::default();
-    // The instance methods an `included do` defines: the includer's own,
-    // not its ancestor's.
-    let mut hook_defined: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> = crate::det::HashSet::default();
+    // The instance methods an `included do` defines, per module: the
+    // includer's own, not its ancestor's. Kept apart from the module's own
+    // methods, since an ordinary def of the same name in a later opening is
+    // the module's and leaves the hook's standing on the includer (#2278).
+    let mut hook_methods: HashMap<crate::ident::ClassId, Vec<&crate::dialect::MethodDef>> = HashMap::default();
     let settler = super::settled_conditionals::Settler::of(app, resolver);
     for lc in openings_gem_first(&app.library_classes, &app.sources) {
         let conditional = |m: &crate::dialect::MethodDef| settler.defines(lc, m).is_none();
+        let hooks: Vec<crate::span::Span> = lc
+            .unknown_calls
+            .iter()
+            .filter(|call| {
+                // `self.included do` is the same hook (#2278).
+                matches!(&*call.node, crate::expr::ExprNode::Send { recv, method, block: Some(_), .. }
+                    if method.as_str() == "included" && recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)))
+            })
+            .map(|call| call.span)
+            .collect();
+        // `def self.x` in the hook is the includer's class-side method: not an instance one.
+        let in_hook = |m: &crate::dialect::MethodDef| {
+            let at = m.name_span;
+            hooks.iter().any(|h| !at.is_synthetic() && h.file == at.file && h.start <= at.start && at.end <= h.end)
+        };
         let instance: Vec<&crate::dialect::MethodDef> = lc
             .methods
             .iter()
@@ -6172,16 +6189,20 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             .collect();
         // Within one opening, too, the last definition of a name is the
         // one Ruby keeps; an earlier one is replaced, not an ancestor a
-        // `super` reaches.
-        let opened: Vec<&crate::dialect::MethodDef> = instance
-            .iter()
-            .enumerate()
-            .filter(|&(at, m)| !instance[at + 1..].iter().any(|later| later.name == m.name && !conditional(later)))
-            .map(|(_, m)| *m)
-            .collect();
-        let methods = module_methods.entry(lc.name.clone()).or_default();
-        methods.retain(|m| !opened.iter().any(|o| o.name == m.name && !conditional(o)));
-        methods.extend(opened);
+        // `super` reaches. The hook's defs and the module's own are two
+        // sets of definitions, each read this way.
+        for hooked in [false, true] {
+            let defs: Vec<&crate::dialect::MethodDef> = instance.iter().copied().filter(|m| in_hook(m) == hooked).collect();
+            let opened: Vec<&crate::dialect::MethodDef> = defs
+                .iter()
+                .enumerate()
+                .filter(|&(at, m)| !defs[at + 1..].iter().any(|later| later.name == m.name && !conditional(later)))
+                .map(|(_, m)| *m)
+                .collect();
+            let methods = if hooked { &mut hook_methods } else { &mut module_methods }.entry(lc.name.clone()).or_default();
+            methods.retain(|m| !opened.iter().any(|o| o.name == m.name && !conditional(o)));
+            methods.extend(opened);
+        }
         module_constants.entry(lc.name.clone()).or_default().extend(lc.constants.iter().map(|(n, _)| n.clone()));
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
         // An opening read while the module isn't a concern yet: its
@@ -6199,23 +6220,6 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         }
         if extended.is_some() {
             concerns.insert(lc.name.clone());
-        }
-        let hooks: Vec<crate::span::Span> = lc
-            .unknown_calls
-            .iter()
-            .filter(|call| {
-                // `self.included do` is the same hook (#2278).
-                matches!(&*call.node, crate::expr::ExprNode::Send { recv, method, block: Some(_), .. }
-                    if method.as_str() == "included" && recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)))
-            })
-            .map(|call| call.span)
-            .collect();
-        // `def self.x` in the hook is the includer's class-side method: not an instance one.
-        for m in lc.methods.iter().filter(|m| matches!(m.receiver, MethodReceiver::Instance)) {
-            let at = m.name_span;
-            if hooks.iter().any(|h| !at.is_synthetic() && h.file == at.file && h.start <= at.start && at.end <= h.end) {
-                hook_defined.insert((lc.name.clone(), m.name.clone()));
-            }
         }
     }
     let filter_edges = filter_dependency_edges(app, &module_includes);
@@ -6431,9 +6435,7 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         // where the chain has that module. Ruby finds a prepended module
         // ahead of the controller's own, hooks' defs included.
         let hooked: crate::det::HashSet<&crate::ident::ClassId> = hooks.iter().collect();
-        let hook_defines = |module: &crate::ident::ClassId| {
-            module_methods.get(module).into_iter().flatten().any(|m| hook_defined.contains(&(module.clone(), m.name.clone())))
-        };
+        let hook_defines = |module: &crate::ident::ClassId| hook_methods.get(module).is_some_and(|defs| !defs.is_empty());
         let mut carried: HashMap<&crate::ident::ClassId, Vec<&crate::ident::ClassId>> = HashMap::default();
         for module in queue.iter().filter(|m| !hooked.contains(*m) && hook_defines(m)) {
             let names = |recipient: &crate::ident::ClassId| {
@@ -6469,15 +6471,22 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         passes.extend(hook_order.iter().rev().map(|module| (*module, Pick::Hooked)));
         passes.extend(in_place(&queue[ahead..], &carried));
         for (module, pick) in passes {
-            let own = |method: &&&crate::dialect::MethodDef| {
-                let made_by_hook = hook_defined.contains(&(module.clone(), method.name.clone()));
-                match pick {
-                    Pick::Hooked => hooked.contains(module) && made_by_hook,
-                    Pick::Own => !(made_by_hook && (hooked.contains(module) || is_carried(module))),
-                    Pick::Carried => made_by_hook,
+            let own = module_methods.get(module).into_iter().flatten();
+            let by_hook = hook_methods.get(module).into_iter().flatten();
+            let picked: Vec<&&crate::dialect::MethodDef> = match pick {
+                Pick::Hooked if hooked.contains(module) => by_hook.collect(),
+                Pick::Hooked => Vec::new(),
+                Pick::Carried => by_hook.collect(),
+                // A hook that ran nowhere the chain shows: its defs are read
+                // as the module's, below its own of the same name.
+                Pick::Own if !hooked.contains(module) && !is_carried(module) => {
+                    let own: Vec<_> = own.collect();
+                    let unshadowed: Vec<_> = by_hook.filter(|m| !own.iter().any(|o| o.name == m.name)).collect();
+                    own.into_iter().chain(unshadowed).collect()
                 }
+                Pick::Own => own.collect(),
             };
-            for method in module_methods.get(module).into_iter().flatten().filter(own) {
+            for method in picked {
                 let renamed;
                 let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
                     method

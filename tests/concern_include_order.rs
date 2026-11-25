@@ -422,3 +422,17 @@ fn a_hook_include_goes_in_before_the_explicit_arguments_left_of_it() {
     assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"c\"");
     single_case(&files, lines, "label", "c");
 }
+
+/// The hook's `label` is defined on the controller when it is included. A
+/// later opening's `label` is the module's own, below the controller, so the
+/// hook's answers (#2278).
+#[test]
+fn a_hook_def_stands_over_a_later_ordinary_def_of_its_name() {
+    let files = [(
+        "hook_reopen",
+        "module HookReopen\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule HookReopen\n  def label\n    \"ordinary\"\n  end\nend\n",
+    )];
+    let lines = "  include HookReopen\n";
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"hook\"");
+    single_case(&files, lines, "label", "hook");
+}
