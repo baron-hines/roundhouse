@@ -367,7 +367,7 @@ pub(super) fn zeitwerk_ignored<V: Vfs + ?Sized>(vfs: &V, lib: &Path) -> Vec<Path
 }
 
 // `None` for a root or an ignore this cannot read as a path, or a root outside lib/: mounting what it leaves out would ingest code the gem never loads.
-fn zeitwerk_dirs(text: &str, dir: &Path, lib: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+pub(crate) fn zeitwerk_dirs(text: &str, dir: &Path, lib: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     let for_gem = text.contains("Zeitwerk::Loader.for_gem");
     if !(for_gem || text.contains("Zeitwerk::Loader.new")) || !text.contains(".setup") {
         return None;

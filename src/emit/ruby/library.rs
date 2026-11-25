@@ -11911,7 +11911,9 @@ fn require_path_for_parent(parent: &ClassId, app: &App, classes: &[LibraryClass]
             return Some("runtime/gem_facades".to_string());
         }
     }
-    None
+    // Not only the parents listed above: a superclass is read as the class body loads (mission_control-jobs' `I18n::Config`).
+    let segments: Vec<String> = raw.trim_start_matches("::").split("::").map(str::to_string).collect();
+    require_path_for_body_const(&segments, app, classes, "").filter(|anchor| anchor.starts_with("runtime/"))
 }
 
 /// Roots hosted by `runtime/ruby/gem_facades.rb` — the one file that
@@ -12084,6 +12086,10 @@ fn require_path_for_body_const(
     }
     if joined == "ActiveSupport::Duration" {
         return Some("runtime/active_support_duration".to_string());
+    }
+    // Not lazily: mission_control-jobs reads `ActiveSupport::Logger.new(nil)` as its module loads.
+    if joined == "ActiveSupport::Logger" {
+        return Some("runtime/logger".to_string());
     }
     match first.as_str() {
         // `Views::*` refs always go through the per-app aggregator at

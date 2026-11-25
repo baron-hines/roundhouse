@@ -1080,6 +1080,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("partial_qualify");
     diags.extend(first_or_create::apply_first_or_create_lowering(app));
     ran!("first_or_create");
+    diags.extend(view_to_library::conflicting_partial_form_bindings(app));
     case_class_narrow::apply_case_class_narrowing(app);
     ran!("case_class_narrow");
     reset_counters::apply_reset_counters_lowering(app);

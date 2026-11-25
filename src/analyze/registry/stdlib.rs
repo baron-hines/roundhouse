@@ -242,7 +242,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let str_arr = || Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
     register_stdlib_class(classes, "SecureRandom", &[
         ("hex", Ty::Str), ("base64", Ty::Str), ("urlsafe_base64", Ty::Str),
-        ("base58", Ty::Str), ("uuid", Ty::Str), ("alphanumeric", Ty::Str),
+        ("base58", Ty::Str), ("base36", Ty::Str), ("uuid", Ty::Str), ("alphanumeric", Ty::Str),
         ("random_bytes", Ty::Str), ("random_number", Ty::Untyped),
     ], &[]);
     // `Random` carries the same `Random::Formatter` surface as

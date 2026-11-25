@@ -6037,6 +6037,36 @@ fn rewrite_carried_requires(files: &mut [(String, String)], app: &App, program: 
     }
 }
 
+// Not loaded lazily: production Rails eager-loads a gem's Zeitwerk-managed files at boot (mission_control-jobs' `push_dir`).
+fn zeitwerk_eager_programs(app: &App, is_program: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in &app.boot_gem_entries {
+        let entry = normalize_source(entry);
+        let Some(text) = app.sources.iter().find(|f| normalize_source(&f.path) == entry).map(|f| f.text.as_str()) else { continue };
+        let Some(at) = entry.rfind("/lib/") else { continue };
+        let lib = std::path::Path::new(&entry[..at + 4]);
+        let dir = std::path::Path::new(&entry).parent().unwrap_or(lib);
+        let Some((roots, ignores)) = crate::ingest::source_gems::zeitwerk_dirs(text, dir, lib) else { continue };
+        let mut managed: Vec<String> = app
+            .sources
+            .iter()
+            .map(|f| normalize_source(&f.path))
+            .filter(|p| *p != entry && is_program(p))
+            .filter(|p| {
+                let path = std::path::Path::new(p);
+                roots.iter().any(|r| path.starts_with(r)) && !ignores.iter().any(|i| path.starts_with(i))
+            })
+            .collect();
+        managed.sort();
+        for p in managed {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
     use std::fmt::Write;
     if app.file_programs.is_empty() {
@@ -6265,9 +6295,11 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         }
         files.push((format!("app/{}.rb", anchor_of(&program.source)), out));
     }
-    // What boot reaches: the gem entries' programs and what they require.
+    // What boot reaches: the gem entries' programs, what they require, and what their Zeitwerk loaders eager-load.
+    let eager = zeitwerk_eager_programs(app, |p| programs.contains_key(p));
     let mut reached: crate::det::HashSet<String> = Default::default();
     let mut pending: Vec<String> = app.boot_gem_entries.iter().map(|e| normalize_source(e)).filter(|e| programs.contains_key(e)).collect();
+    pending.extend(eager.iter().cloned());
     while let Some(next) = pending.pop() {
         if reached.insert(next.clone()) {
             pending.extend(edges.get(&next).into_iter().flatten().cloned());
@@ -6365,6 +6397,9 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         if programs.contains_key(&entry) {
             writeln!(boot, "RoundhouseAutoload.require_gem_file({:?})", anchor_of(&entry)).unwrap();
         }
+    }
+    for program in &eager {
+        writeln!(boot, "RoundhouseAutoload.require_gem_file({:?})", anchor_of(program)).unwrap();
     }
     // A declaration file's load-time require of a constant under an
     // autoloaded namespace loads that namespace's program, as reading the

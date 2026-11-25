@@ -14,6 +14,11 @@ module Rails
   def self.application: () -> Application
   def self.configuration: () -> FrameworkConfig
 
+  module Command
+    class Base
+    end
+  end
+
   class BacktraceCleaner
     APP_DIRS_PATTERN: Regexp
     RENDER_TEMPLATE_PATTERN: Regexp
@@ -75,11 +80,11 @@ module Rails
   end
 
   class Logger
-    def info: (untyped message) -> void
-    def error: (untyped message) -> void
-    def warn: (untyped message) -> void
-    def debug: (untyped message) -> void
-    def fatal: (untyped message) -> void
+    def info: (?untyped message) -> void
+    def error: (?untyped message) -> void
+    def warn: (?untyped message) -> void
+    def debug: (?untyped message) -> void
+    def fatal: (?untyped message) -> void
   end
 
   class Application

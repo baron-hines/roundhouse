@@ -2426,6 +2426,36 @@ pub(crate) fn partial_form_bindings(
     views: &[View],
     library_classes: &[crate::dialect::LibraryClass],
 ) -> crate::det::HashMap<ViewKey, PartialFormBinding> {
+    partial_form_bindings_and_conflicts(views, library_classes).0
+}
+
+/// Not left silent: an unbound partial's builder calls and its callers' `f: f` name a local nothing defines.
+pub(crate) fn conflicting_partial_form_bindings(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let (_, poisoned) = partial_form_bindings_and_conflicts(&app.views, &app.library_classes);
+    let stems = PartialStems::of(&app.views);
+    let mut out = Vec::new();
+    for view in &app.views {
+        let Some(key) = view_key_of(view, &stems) else { continue };
+        if !poisoned.contains(&key) {
+            continue;
+        }
+        let mut diagnostic = crate::lower::residue_diagnostic(
+            "view_to_library",
+            "partial-form-binding",
+            view.body.span,
+            "every render handing the partial a form builder must name the same record and form",
+            format!("partial `{}` is handed form builders that bind it differently; its builder calls cannot be lowered", view.name.as_str()),
+        );
+        diagnostic.severity = crate::diagnostic::Severity::Error;
+        out.push(diagnostic);
+    }
+    out
+}
+
+fn partial_form_bindings_and_conflicts(
+    views: &[View],
+    library_classes: &[crate::dialect::LibraryClass],
+) -> (crate::det::HashMap<ViewKey, PartialFormBinding>, crate::det::HashSet<ViewKey>) {
     use crate::det::{HashMap, HashSet};
     let overrides = crate::lower::view::form_builder_overrides_in(library_classes);
 
@@ -2626,7 +2656,7 @@ pub(crate) fn partial_form_bindings(
                                             {
                                                 scope.model_name = Some(crate::naming::snake_case(&id.0.as_str().replace("::", "")));
                                             }
-                                            if let Some(r) = simple_ref(v) {
+                                            if let Some(r) = simple_ref(named) {
                                                 record_refs.insert(r);
                                             }
                                         }
@@ -2726,7 +2756,7 @@ pub(crate) fn partial_form_bindings(
         }
         pending = next;
     }
-    out
+    (out, poisoned)
 }
 
 pub(crate) fn render_locals_keys(
