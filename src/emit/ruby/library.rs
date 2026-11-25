@@ -9715,6 +9715,10 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
+    // The include each of those requires is for: one whose module body
+    // reads a constant written above its `include` loads where the
+    // `include` stands instead (see `late_includes`).
+    let mut nested_require_of: Vec<(ClassId, String)> = Vec::new();
     // When the nested file reopens this class with the header this file
     // writes (the same superclass, from `outer_class_parent`), loading it
     // first declares the same class, so its require stands with the
@@ -9807,6 +9811,7 @@ fn emit_library_class_decl_inner(
                     // their containing class. Load them after that class is
                     // declared, otherwise the nested file runs too early.
                     nested_include_requires.insert(relpath(&out_dir, &anchor));
+                    nested_require_of.push((inc.clone(), relpath(&out_dir, &anchor)));
                 } else {
                     requires.push(relpath(&out_dir, &anchor));
                 }
@@ -9872,6 +9877,9 @@ fn emit_library_class_decl_inner(
         Initializer(&'a Expr),
         Call(&'a Expr),
         Include(&'a ClassId),
+        // A positioned include's file, loaded where the source has the
+        // `include`; the include itself is written with the methods.
+        Load(&'a ClassId),
         Method(&'a MethodDef),
     }
     // A model's body is its own file's. What a Concern's `included` block
@@ -10057,6 +10065,84 @@ fn emit_library_class_decl_inner(
             body_requires.extend(resolve_all(default, false));
         }
     }
+    // A concern nested under this class (`Ledger::Stamping`) loads from
+    // the class body, ahead of its statements, and Rails loads it where
+    // the `include` names it. When the concern's module body reads, at
+    // load, a constant this body writes above that `include`
+    // (`KINDS = Ledger::TYPES.map(&:upcase)` below `TYPES = …`), it would
+    // run before the constant exists. Such an include, and every include
+    // the source writes after it, goes where the source has it, and its
+    // file loads there: the split below closes the class after the
+    // constant and requires the file, as for a constant initializer.
+    let readers = constant_readers(lc, app, classes, &resolve);
+    let include_span = |i: usize, inc: &ClassId| -> Option<Span> {
+        if let Some(span) = lc.include_spans.get(i).filter(|span| !span.is_synthetic()) {
+            return Some(*span);
+        }
+        let written = inc.0.as_str().trim_start_matches("::");
+        app.models.iter().filter(|m| m.name == lc.name && Some(m.span.file) == model_file).find_map(|m| {
+            m.body.iter().find_map(|item| {
+                let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return None };
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+                let names = args.iter().any(|arg| match &*arg.node {
+                    ExprNode::Const { path } => {
+                        let path = path.iter().map(|seg| seg.as_str()).collect::<Vec<_>>().join("::");
+                        written == path || written.ends_with(&format!("::{path}"))
+                    }
+                    _ => false,
+                });
+                (method.as_str() == "include" && names && Some(expr.span.file) == model_file).then_some(expr.span)
+            })
+        })
+    };
+    let mut late_requires: BTreeSet<String> = BTreeSet::new();
+    let mut late_from: Option<u32> = None;
+    let mut late_includes: Vec<(&ClassId, String)> = Vec::new();
+    for (i, inc) in lc.includes.iter().enumerate() {
+        let Some(span) = include_span(i, inc) else { continue };
+        let Some((_, require)) = nested_require_of.iter().find(|(of, _)| of == inc) else { continue };
+        if requires.contains(require) || body_requires.contains(require) {
+            continue;
+        }
+        let reads_earlier = body.iter().any(|(at, item)| match item {
+            BodyItem::Constant(c, value) => {
+                *at < span.start
+                    && value.span.file == span.file
+                    && readers.get(lc.constants[*c].0.as_str()).is_some_and(|r| r.contains(require))
+            }
+            _ => false,
+        });
+        if reads_earlier {
+            late_requires.insert(require.clone());
+            late_from = Some(late_from.map_or(span.start, |from| from.min(span.start)));
+        }
+    }
+    let mut moved_to_body: Vec<&ClassId> = Vec::new();
+    if let Some(from) = late_from {
+        for (i, inc) in lc.includes.iter().enumerate() {
+            let Some(span) = include_span(i, inc) else { continue };
+            if span.start < from || ordered_includes.iter().any(|(_, o)| *o == inc) {
+                continue;
+            }
+            let require = nested_require_of.iter().find(|(of, _)| of == inc).map(|(_, r)| r.clone());
+            if let Some(require) = require.filter(|r| late_requires.contains(r)) {
+                late_includes.push((inc, require));
+            }
+            if positioned.iter().any(|(_, p)| *p == inc) {
+                // Its hook needs the methods above it: only its file loads here.
+                if late_includes.iter().any(|(late, _)| *late == inc) {
+                    body.push((span.start, BodyItem::Load(inc)));
+                }
+                continue;
+            }
+            moved_to_body.push(inc);
+            body.push((span.start, BodyItem::Include(inc)));
+        }
+        body.sort_by_key(|(start, _)| *start);
+    }
+    let late_require = |inc: &ClassId| -> BTreeSet<String> {
+        late_includes.iter().filter(|(late, _)| *late == inc).map(|(_, r)| r.clone()).collect()
+    };
     // …and each eager initializer's own, in order, because WHERE those go
     // matters. A class body runs top to bottom, and a required file can
     // read this one's earlier constants — campfire's `ContentFilters`
@@ -10081,9 +10167,9 @@ fn emit_library_class_decl_inner(
             BodyItem::Constant(_, expr) | BodyItem::Initializer(expr) | BodyItem::Call(expr) => {
                 resolve_all(expr, true)
             }
-            BodyItem::Method(_) | BodyItem::Include(_) => BTreeSet::new(),
+            BodyItem::Include(inc) | BodyItem::Load(inc) => late_require(inc),
+            BodyItem::Method(_) => BTreeSet::new(),
         }).collect();
-    let readers = constant_readers(lc, app, classes, &resolve);
     let mut splits = std::collections::BTreeMap::new();
     for p in 1..per_body.len() {
         let mut before: BTreeSet<String> = body_requires.clone();
@@ -10266,6 +10352,7 @@ fn emit_library_class_decl_inner(
         names: nested.iter().map(|block| block.name.clone()).collect(),
     });
 
+    nested_include_requires.retain(|r| !late_requires.contains(r));
     for require in &nested_include_requires {
         writeln!(s, "{body_pad}require_relative {require:?}").unwrap();
     }
@@ -10281,7 +10368,10 @@ fn emit_library_class_decl_inner(
     // it the class's ancestors. An ordered body interleaves its methods
     // with ivar writes and keeps the other includes first.
     for inc in &lc.includes {
-        if positioned.iter().any(|(_, p)| *p == inc) || ordered_includes.iter().any(|(_, p)| *p == inc) {
+        if positioned.iter().any(|(_, p)| *p == inc)
+            || ordered_includes.iter().any(|(_, p)| *p == inc)
+            || moved_to_body.contains(&inc)
+        {
             continue;
         }
         nested.borrow_mut().write_include(&mut s, depth, lc, inc);
@@ -10301,7 +10391,7 @@ fn emit_library_class_decl_inner(
         let names: Vec<String> = statement.iter().map(|inc| include_name(inc)).collect();
         writeln!(s, "{body_pad}prepend {}", names.join(", ")).unwrap();
     }
-    if lc.includes.len() > positioned.len() + ordered_includes.len() && !lc.methods.is_empty() {
+    if lc.includes.len() > positioned.len() + ordered_includes.len() + moved_to_body.len() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
 
@@ -10533,6 +10623,7 @@ fn emit_library_class_decl_inner(
                     nested.borrow_mut().write_include(s, depth, lc, inc);
                     writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
                 }
+                BodyItem::Load(_) => {}
                 BodyItem::Method(method) => {
                     writeln!(s).unwrap();
                     render_method(s, method);
