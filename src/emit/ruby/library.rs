@@ -9741,28 +9741,33 @@ fn emit_library_class_decl_inner(
     // this class) would run before `class` here, and after it on the
     // class-body path.
     let parent_anchor = lc.parent.as_ref().and_then(|p| require_path_for_parent(p, app, classes));
+    // Every opening of the name counts: the emitter writes them all into
+    // the one file, so any of them may read a constant or require a file.
     let nested_file_loads_nothing_new = |inc: &ClassId, anchor: &str| -> bool {
-        let Some(module) = library_classes_named(inc.0.as_str(), app, classes).into_iter().find(|c| c.is_module) else {
-            return false;
-        };
-        if !module.unknown_calls.iter().all(is_load_inert_module_call)
-            || !module.class_ivar_initializers.is_empty()
-            || !module.conditional_definitions.is_empty()
-            || !module.constants.iter().all(|(_, value)| is_literal_value(value))
-        {
+        let openings = library_classes_named(inc.0.as_str(), app, classes);
+        if openings.is_empty() || !openings.iter().all(|c| c.is_module) {
             return false;
         }
         let Some(parent_anchor) = parent_anchor.as_deref() else { return false };
         let path = PathBuf::from(format!("{anchor}.rb"));
         let dir = anchor.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let guarded = read_statement_cleanup(module);
-        let rendered = super::expr::with_emitted_file(&path, || {
-            emit_library_class_decl_inner(guarded.as_ref(), app, classes, factories, path.clone(), &[], &[])
-        });
-        rendered.content.lines().map(str::trim_start).filter(|l| l.starts_with("require")).all(|line| {
-            line.strip_prefix("require_relative ")
-                .map(|target| normalize_path(&format!("{dir}/{}", target.trim().trim_matches('"'))) == parent_anchor)
-                .unwrap_or(false)
+        openings.into_iter().all(|module| {
+            if !module.unknown_calls.iter().all(is_load_inert_module_call)
+                || !module.class_ivar_initializers.is_empty()
+                || !module.conditional_definitions.is_empty()
+                || !module.constants.iter().all(|(_, value)| is_literal_value(value))
+            {
+                return false;
+            }
+            let guarded = read_statement_cleanup(module);
+            let rendered = super::expr::with_emitted_file(&path, || {
+                emit_library_class_decl_inner(guarded.as_ref(), app, classes, factories, path.clone(), &[], &[])
+            });
+            rendered.content.lines().map(str::trim_start).filter(|l| l.starts_with("require")).all(|line| {
+                line.strip_prefix("require_relative ")
+                    .map(|target| normalize_path(&format!("{dir}/{}", target.trim().trim_matches('"'))) == parent_anchor)
+                    .unwrap_or(false)
+            })
         })
     };
     // A model's `prepend Concern` names a module this file must load
