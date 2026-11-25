@@ -87,8 +87,8 @@ pub fn apply_duration_lowering(app: &mut App) {
 pub(crate) fn apply_duration_lowering_for(app: &mut App, target: BuildTarget) {
     let time_operands = matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel);
     let temporal_predicates = !app_defines_temporal_predicates(app);
-    let duration_constants = named_duration_constants(app);
     let defined = app_defined_units(app);
+    let duration_constants = named_duration_constants(app, &defined);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         type_duration_constants(body, owner, &duration_constants);
         apply_duration_rewrites(body, temporal_predicates, time_operands, &defined)
@@ -133,11 +133,11 @@ pub(crate) fn app_defined_units(app: &App) -> BTreeSet<String> {
     out
 }
 
-fn named_duration_constants(app: &App) -> BTreeSet<Vec<Symbol>> {
+fn named_duration_constants(app: &App, defined: &BTreeSet<String>) -> BTreeSet<Vec<Symbol>> {
     let mut candidates = BTreeMap::new();
     let mut record = |path: Vec<Symbol>, value: &Expr| {
         let mut value = value.clone();
-        rewrite_durations(&mut value, &BTreeSet::new());
+        rewrite_durations(&mut value, defined);
         candidates.entry(path)
             .and_modify(|duration| *duration = false)
             .or_insert_with(|| is_duration_const_call(&value));
@@ -651,12 +651,6 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
         && matches!(&*expr.node, ExprNode::Send { recv: Some(r), method, .. }
             if !is_numeric_expr(r) && defined.contains(method.as_str())
                 && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }));
-    let skipped = rewrite
-        && !guarded
-        && matches!(&*expr.node, ExprNode::Send { recv: Some(r), method, .. } if !is_numeric_expr(r) && defined.contains(method.as_str()));
-    if skipped {
-        return;
-    }
     let reader = guarded.then(|| expr.clone());
     if rewrite {
         let span = expr.span;
