@@ -12,6 +12,7 @@ const CURRENT: &str = r#"class Current < ActiveSupport::CurrentAttributes
     TRACE << "user"
     super(value)
     self.account = "side" if value == 83 && (mode == :side || mode == :read)
+    raise "restore" if value == 47 && mode == :restore
   end
   def account=(value)
     TRACE << "account"
@@ -122,6 +123,12 @@ const PROBE: &str = r#"class ScopeProbe
   def self.reader_failure
     Current.set(user: 83, account: "C") { raise "body" }
   end
+  def self.restore_failure
+    Current.set(user: 83, account: "C") { 31 }
+  end
+  def self.restore_order
+    Current.set(user: 47, account: "C") { 31 }
+  end
   def self.body_failure
     Current.set(user: 83) { raise "body" }
   end
@@ -155,16 +162,20 @@ fresh; check("nested each", [[[85, 88], 47], 47], [ScopeProbe.nested_each, Curre
 fresh; check("nil", [nil, 47], [ScopeProbe.nil_value, Current.user])
 fresh; check("instance identity", [true, 47], [ScopeProbe.identity, Current.user])
 fresh; check("downstream", true, ScopeProbe.downstream)
-fresh; check("arguments in order", [[83, "C"], ["first", "second", "user", "account"]], [ScopeProbe.ordered, Current::TRACE.first(4)])
+fresh; check("arguments in order", [[83, "C"], ["first", "second", "user", "account", "user", "account"]], [ScopeProbe.ordered, Current::TRACE.dup])
 fresh; check("body raise", ["body", 47], [error_from { ScopeProbe.body_failure }, Current.user])
 fresh; check("argument raise", ["rhs", 47, "Z", ["first", "rhs-error"]], [error_from { ScopeProbe.rhs_failure }, Current.user, Current.account, Current::TRACE.dup])
 fresh; Current.mode = :side
 check("writer side effect", [[83, "C"], 47, "side"], [ScopeProbe.writer_effect, Current.user, Current.account])
 fresh; Current.mode = :side
-check("writer raise", ["setup", 47, "side"], [error_from { ScopeProbe.setup_failure }, Current.user, Current.account])
+check("writer raise", ["setup", 47, "side", ["user", "account", "account", "user", "account"]], [error_from { ScopeProbe.setup_failure }, Current.user, Current.account, Current::TRACE.dup])
 fresh; Current.mode = :read
 check("reader raise", ["read", 47, "side", ["user", "account", "user"]], [error_from { ScopeProbe.reader_failure }, Current.user, Current.account, Current::TRACE.dup])
-puts "Current.set: 20 checks passed"
+fresh; Current.mode = :restore
+check("a restore that raises stops the rest", ["restore", 47, "C", ["user", "account", "user"]], [error_from { ScopeProbe.restore_failure }, Current.user, Current.account, Current::TRACE.dup])
+fresh; Current.mode = :side; Current.user = 83; Current.account = "Z"
+check("restores in order", [31, 83, "Z"], [ScopeProbe.restore_order, Current.user, Current.account])
+puts "Current.set: 22 checks passed"
 "##;
 
 #[test]
@@ -174,7 +185,7 @@ fn current_set_runs_its_block_and_restores_on_ruby() {
         .write("app/models/scope_probe.rb", PROBE)
         .run_ruby(ASSERTIONS);
     run.assert_passes();
-    assert_eq!(run.stdout.trim(), "Current.set: 20 checks passed");
+    assert_eq!(run.stdout.trim(), "Current.set: 22 checks passed");
 }
 
 #[test]
@@ -185,5 +196,5 @@ fn current_set_runs_its_block_and_restores_on_spinel() {
         .write("app/models/scope_probe.rb", PROBE)
         .run_spinel(ASSERTIONS);
     run.assert_passes();
-    assert!(run.stdout.contains("Current.set: 20 checks passed"), "{}", run.stdout);
+    assert!(run.stdout.contains("Current.set: 22 checks passed"), "{}", run.stdout);
 }

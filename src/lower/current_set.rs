@@ -14,22 +14,25 @@
 //! ```ruby
 //! Current.set(request: r) { body }
 //! # →
-//! __current_set_request = Current.request
+//! __current_set_arg_request = r
+//! __current_set_was_request = Current.request
 //! begin
-//!   Current.request = r
+//!   Current.request = __current_set_arg_request
 //!   body
 //! ensure
-//!   Current.request = __current_set_request
+//!   Current.request = __current_set_was_request
 //! end
 //! ```
 //!
-//! A second attribute nests its own save and `begin` inside the first's,
-//! after the first's assignment, as `Object#with` saves each attribute
-//! just before it assigns it. An argument that is not a literal or a
-//! variable is evaluated first, into a local. A block with parameters,
-//! or a `next` or `break` of its own, runs as
+//! That is `Object#with`'s order: the arguments first (a literal needs
+//! no local), then each attribute saved just before it is assigned. With
+//! a second attribute, its save and assignment follow the first's inside
+//! the `begin`, a count records how many saves were made, and the
+//! `ensure` restores those, in order. A block with parameters, or a
+//! `next` or `break` of its own, runs as
 //! `Current.instance.then { |context| … }`, which yields the instance as
-//! `set` does; any other block runs as its body in place.
+//! `set` does; any other block runs as its body in place. A `set` nested
+//! in the block or an argument names its locals with its own level.
 //!
 //! ENSURE, NOT A TRAILING ASSIGNMENT, and it is the half that matters:
 //! `Current.set` exists to be exception-safe. campfire's
@@ -130,51 +133,88 @@ fn keyword_pairs(args: &[Expr]) -> Option<Vec<(String, Expr)>> {
 
 fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Expr {
     let mut stmts: Vec<Expr> = Vec::new();
-    // (a `set` inside this block saves into locals of its own level: one name for both would have the inner save overwrite the outer's)
-    let level = match nesting(body) {
-        0 => String::new(),
-        n => n.to_string(),
-    };
-    // The arguments are evaluated before anything is saved, as a call's
-    // arguments are; one that raises leaves every attribute as it was.
+    // (a `set` inside this block or its arguments saves into locals of its own level: one name for both would have the inner save overwrite the outer's)
+    let depth = pairs.iter().map(|(_, v)| nesting(v)).fold(nesting(body), usize::max);
+    let level = if depth == 0 { String::new() } else { depth.to_string() };
+    let local = |kind: &str, name: &str| Symbol::from(format!("__current_set{level}_{kind}_{name}"));
+    // The arguments are evaluated in order before anything is saved, as a
+    // call's arguments are: one that raises leaves every attribute as it
+    // was, and a later one cannot change an earlier one's value.
     let mut values: Vec<(String, Expr)> = Vec::new();
     for (name, value) in pairs {
-        if is_plain(value) {
+        if matches!(&*value.node, ExprNode::Lit { .. }) {
             values.push((name.clone(), value.clone()));
         } else {
-            let local = Symbol::from(format!("__current_set{level}_value_{name}"));
-            stmts.push(assign_local(span, local.clone(), value.clone()));
-            values.push((name.clone(), local_read(span, local)));
+            let arg = local("arg", name);
+            stmts.push(assign_local(span, arg.clone(), value.clone()));
+            values.push((name.clone(), local_read(span, arg)));
         }
     }
-    // Then, per attribute in order, Rails' `Object#with`: save it, assign
-    // it, and restore it on the way out. Each save reads after the
-    // writes before it (a writer that sets another attribute is saved
-    // as it left it), and an assignment that raises restores what was
-    // saved up to it. The nesting restores in reverse order, where Rails
-    // restores in order; the two differ only when a restore raises.
-    let mut inner = run_block(span, class, body);
-    for (name, value) in values.iter().rev() {
-        let local = Symbol::from(format!("__current_set{level}_{name}"));
-        let save = assign_local(span, local.clone(), class_read(span, class, name));
-        let scoped = Expr::new(
-            span,
-            ExprNode::BeginRescue {
-                body: seq(span, vec![class_write(span, class, name, value.clone()), inner]),
-                rescues: Vec::new(),
-                else_branch: None,
-                ensure: Some(Box::new(class_write(span, class, name, local_read(span, local)))),
-                implicit: false,
-            },
-        );
-        inner = seq(span, vec![save, scoped]);
+    // Then Rails' `Object#with`: per attribute in order, save it and
+    // assign it, so each save reads after the writes before it; on the
+    // way out, restore the attributes saved so far, in order. The count
+    // of saves made is what lets one `ensure` skip those not reached.
+    let count = Symbol::from(format!("__current_set{level}_saved"));
+    let mut setup: Vec<Expr> = Vec::new();
+    let mut restore: Vec<Expr> = Vec::new();
+    for (i, (name, value)) in values.iter().enumerate() {
+        let saved = local("was", name);
+        let save = assign_local(span, saved.clone(), class_read(span, class, name));
+        let back = class_write(span, class, name, local_read(span, saved.clone()));
+        if i == 0 {
+            stmts.push(save);
+            restore.push(back);
+        } else {
+            stmts.push(assign_local(span, saved, nil(span)));
+            setup.push(save);
+            setup.push(assign_local(span, count.clone(), int(span, i as i64 + 1)));
+            restore.push(Expr::new(
+                span,
+                ExprNode::If {
+                    cond: Expr::new(
+                        span,
+                        ExprNode::Send {
+                            recv: Some(local_read(span, count.clone())),
+                            method: Symbol::from(">="),
+                            args: vec![int(span, i as i64 + 1)],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ),
+                    then_branch: back,
+                    else_branch: nil(span),
+                },
+            ));
+        }
+        setup.push(class_write(span, class, name, value.clone()));
     }
-    stmts.push(inner);
+    if values.len() > 1 {
+        stmts.push(assign_local(span, count, int(span, 1)));
+    }
+    setup.push(run_block(span, class, body));
+    stmts.push(Expr::new(
+        span,
+        ExprNode::BeginRescue {
+            body: seq(span, setup),
+            rescues: Vec::new(),
+            else_branch: None,
+            ensure: Some(Box::new(seq(span, restore))),
+            implicit: false,
+        },
+    ));
     seq(span, stmts)
 }
 
+fn nil(span: Span) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Nil })
+}
+
+fn int(span: Span, value: i64) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Int { value } })
+}
+
 /// How many `set` expansions deep `e` already is: one more than the
-/// deepest level whose save locals it assigns, 0 for none.
+/// deepest level whose locals it assigns, 0 for none.
 fn nesting(e: &Expr) -> usize {
     let mut deepest = 0;
     let mut visit = |c: &Expr| deepest = deepest.max(nesting(c));
@@ -186,12 +226,6 @@ fn nesting(e: &Expr) -> usize {
         deepest = deepest.max(digits.parse::<usize>().unwrap_or(0) + 1);
     }
     deepest
-}
-
-/// A value whose evaluation reads nothing the saves or writes change and
-/// raises nothing, so it needs no local of its own.
-fn is_plain(e: &Expr) -> bool {
-    matches!(&*e.node, ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. })
 }
 
 /// The block's run inside the save/restore. A block with no parameters
@@ -330,10 +364,10 @@ mod tests {
         let diags = apply_current_set_lowering(&mut app);
         assert!(diags.is_empty(), "{diags:?}");
         let out = lowered(&app);
-        assert!(out.contains("__current_set_request = Current.request"), "{out}");
+        assert!(out.contains("__current_set_was_request = Current.request"), "{out}");
         assert!(out.contains("Current.request = \"r\""), "{out}");
         assert!(out.contains("ensure"), "{out}");
-        assert!(out.contains("Current.request = __current_set_request"), "{out}");
+        assert!(out.contains("Current.request = __current_set_was_request"), "{out}");
     }
 
     /// Each attribute is saved just before it is assigned, as
@@ -346,12 +380,36 @@ mod tests {
         let out = lowered(&app);
         let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("no `{s}` in:\n{out}"));
         let order = [
-            at("__current_set_request = Current.request"),
+            at("__current_set_was_request = Current.request"),
             at("Current.request = \"r\""),
-            at("__current_set_user = Current.user"),
+            at("__current_set_was_user = Current.user"),
             at("Current.user = \"u\""),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "out of Object#with's order:\n{out}");
+    }
+
+    /// The attributes saved are restored in the order they were set,
+    /// each only once its save was made.
+    #[test]
+    fn restores_run_in_order_and_only_for_the_saves_made() {
+        let mut app = app_with("Current.set(request: \"r\", user: \"u\") { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        let ensure = &out[out.find("ensure").expect(&out)..];
+        let request = ensure.find("Current.request = __current_set_was_request").expect(&out);
+        let user = ensure.find("Current.user = __current_set_was_user").expect(&out);
+        assert!(request < user, "{out}");
+        assert!(ensure.contains("__current_set_saved >= 2"), "{out}");
+    }
+
+    /// A `set` in another's argument names its locals apart from the
+    /// outer one's.
+    #[test]
+    fn a_set_in_an_argument_keeps_its_own_locals() {
+        let mut app = app_with("Current.set(user: a, request: Current.set(user: b) { \"c\" }) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("__current_set1_arg_user = a") && out.contains("__current_set_arg_user = b"), "{out}");
     }
 
     /// The block runs: its body sits in the `begin`, not a lambda left
@@ -391,8 +449,8 @@ mod tests {
         let mut app = app_with("Current.set(request: build) { work }");
         assert!(apply_current_set_lowering(&mut app).is_empty());
         let out = lowered(&app);
-        let value = out.find("__current_set_value_request = build").expect(&out);
-        let save = out.find("__current_set_request = Current.request").expect(&out);
+        let value = out.find("__current_set_arg_request = build").expect(&out);
+        let save = out.find("__current_set_was_request = Current.request").expect(&out);
         assert!(value < save, "{out}");
     }
 
