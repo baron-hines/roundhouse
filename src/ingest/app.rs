@@ -6440,10 +6440,22 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         // One the superclass's chain has stays the superclass's.
         // One a superclass that isn't a controller (a class in lib/) has made
         // its forwarder there, where no splice emits it: the child that
-        // names the module has it, below everything else.
-        let mut wrapped: Vec<&crate::ident::ClassId> = queue.iter().rev().filter(|module| from_library.contains(*module)).collect();
+        // names the module has it, below everything else, unless a module
+        // this child emits ran its hook, where it goes instead.
+        // Only a carrier this child emits counts: one the superclass's chain
+        // has holds the modules it carries in that chain too, so they stay
+        // out here as on main. Neither rule changes what is emitted: a
+        // forwarder spliced twice comes out as one `def` (a lib/ superclass
+        // including DelegateTwo under a child including its wrapper W3 has
+        // one `label` without them), and a module a skipped carrier holds is
+        // skipped on its own. They keep each forwarder at one place.
+        let carried_here = |module: &crate::ident::ClassId| {
+            carried.iter().any(|(recipient, modules)| !inherited.contains(*recipient) && modules.contains(&module))
+        };
+        let mut wrapped: Vec<&crate::ident::ClassId> =
+            queue.iter().rev().filter(|module| from_library.contains(*module) && !carried_here(module)).collect();
         for module in queue.iter().rev().filter(|module| !inherited.contains(*module)) {
-            if !hooks.contains(module) && !is_carried(module) {
+            if !hooks.contains(module) && !carried_here(module) {
                 wrapped.push(module);
             }
             wrapped.extend(carried.get(module).into_iter().flatten().copied());
