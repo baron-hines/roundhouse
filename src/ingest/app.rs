@@ -3802,6 +3802,7 @@ end
     super::unreached_gem_modules::drop(&mut app, dir);
     super::gem_load_program::carry(&mut app);
     super::interpolated_renders::expand(&mut app);
+    super::simple_format_sanitize::expand(&mut app);
     super::render_layout_choice::expand(&mut app);
     super::controller_delegates::expand(&mut app);
     super::active_model_super::rewrite(&mut app);
