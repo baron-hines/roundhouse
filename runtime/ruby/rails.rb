@@ -940,6 +940,10 @@ module Rails
       @action_controller
     end
 
+    def action_dispatch
+      ActionDispatchOptions.new
+    end
+
     # `config.session_options`, what `config.session_store` was given: the cookie's name alone, as ingest lifts no
     # other option (`path:`, `domain:`, `secure:` are not read, and a cookie a gem scopes by them takes none).
     def session_options
@@ -950,6 +954,21 @@ module Rails
     # list is the one ingest lifts from the app's `config.filter_parameters`.
     def filter_parameters
       Rails.application.config_filter_parameters
+    end
+  end
+
+  # The salts are Rails' defaults: the cookie jars derive with these, whatever an app assigns to them.
+  class ActionDispatchOptions
+    def cookies_rotations
+      ActiveSupport::Messages::RotationConfiguration.shared
+    end
+
+    def signed_cookie_salt
+      ActionController::MessageVerifier::SIGNED_COOKIE_SALT
+    end
+
+    def authenticated_encrypted_cookie_salt
+      ActionController::MessageEncryptor::SALT
     end
   end
 

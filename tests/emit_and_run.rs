@@ -558,6 +558,8 @@ mod campfire_caches;
 mod action_text_markdown;
 #[path = "emit_and_run/nested_class_requires_its_namespace.rs"]
 mod nested_class_requires_its_namespace;
+#[path = "emit_and_run/nested_include_require_top.rs"]
+mod nested_include_require_top;
 #[path = "emit_and_run/ordinalize.rs"]
 mod ordinalize;
 #[path = "emit_and_run/float_round_digits.rs"]
@@ -22277,6 +22279,12 @@ mod doorkeeper;
 mod message_bus;
 #[path = "emit_and_run/simple_format_sanitize.rs"]
 mod simple_format_sanitize;
+#[path = "emit_and_run/cookie_rotation.rs"]
+mod cookie_rotation;
+#[path = "emit_and_run/render_layout_choice.rs"]
+mod render_layout_choice;
+#[path = "emit_and_run/route_protocol.rs"]
+mod route_protocol;
 #[path = "emit_and_run/render_object.rs"]
 mod render_object;
 #[path = "support/ordered_options_app.rs"]

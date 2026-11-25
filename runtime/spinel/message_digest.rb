@@ -88,6 +88,11 @@ module MessageDigest
     Base64.urlsafe_decode64(b64)
   end
 
+  # Not sp_crypto: it derives by SHA256 only, and `packages/openssl` already links libcrypto for the cipher below.
+  def self.pbkdf2_sha1(secret, salt, iters, dklen)
+    OpenSSL::PKCS5.pbkdf2_hmac(secret, salt, iters, dklen, OpenSSL::Digest::SHA1.new)
+  end
+
   # AES-256-GCM, as message_digest_cruby.rb has it and over the same
   # object: `OpenSSL::Cipher` is the package's spelling of CRuby's. The
   # encrypt side answers ciphertext followed by the 16-byte tag; the

@@ -2923,7 +2923,7 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
         if !is_rails_url_helpers_chain(r) {
             return None;
         }
-        Some(Expr::new(
+        let mut bare = Expr::new(
             e.span,
             ExprNode::Send {
                 recv: None,
@@ -2932,7 +2932,16 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
                 block: block.as_ref().map(strip_url_helpers_receiver),
                 parenthesized: *parenthesized,
             },
-        ))
+        );
+        // Not left to `route_url_options`: it ran while the receiver was on, and its chained form is the library emit's.
+        // Only with a `host:`: without one it would drop a `protocol:` that `url_from_path` cannot take.
+        let names_host = args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { entries, .. }
+            if entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "host"))));
+        if names_host {
+            let helper: crate::det::HashSet<String> = std::iter::once(method.as_str().to_string()).collect();
+            crate::lower::route_url_options::rewrite_node(&mut bare, &helper);
+        }
+        Some(bare)
     })
 }
 
