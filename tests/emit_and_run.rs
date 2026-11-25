@@ -22867,6 +22867,8 @@ mod empty_base_list_override;
 mod relation_argument;
 #[path = "emit_and_run/params_permit_key_args.rs"]
 mod params_permit_key_args;
+#[path = "emit_and_run/current_set.rs"]
+mod current_set;
 
 /// A class macro's `Class.new(base).tap { it.class_eval(&block) }` named by
 /// `const_set` is the class a `class Name < Base` with the call's block as
