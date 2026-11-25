@@ -1021,8 +1021,8 @@ pub(crate) fn is_core_constant(written: &[&str]) -> bool {
 /// no such file is on its load path.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
     let root = feature.split('/').next().unwrap_or(feature);
-    // Not required as written: the runtime ports a Framework-fate gem and the Gemfile omits it (MC requires importmap-rails).
-    if FATES.iter().any(|(name, fate)| *name == root && *fate == GemFate::Framework) {
+    // Not required as written: the runtime ports a Framework-fate gem itself (MC's importmap-rails), not each path under it.
+    if feature == root && !compiler_tree_loads_gem(root) && FATES.iter().any(|(name, fate)| *name == root && *fate == GemFate::Framework) {
         return true;
     }
     matches!(
@@ -1968,6 +1968,7 @@ mod tests {
             assert!(is_framework_feature(feature), "{feature}");
         }
         assert!(!is_framework_feature("rotp"));
+        assert!(!is_framework_feature("i18n/backend/simple"));
     }
 
     /// lobsters' own `Vips::Image` needs ruby-vips loaded, not only an Active Storage variant.

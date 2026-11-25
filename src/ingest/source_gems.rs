@@ -410,6 +410,29 @@ pub(crate) fn zeitwerk_dirs(text: &str, dir: &Path, lib: &Path) -> Option<(Vec<P
     Some((roots, ignores))
 }
 
+/// The paths a loader's `do_not_eager_load` names, or `None` for one this cannot read as a path.
+pub(crate) fn zeitwerk_eager_exclusions(text: &str, dir: &Path) -> Option<Vec<PathBuf>> {
+    struct Calls<'a> {
+        dir: &'a Path,
+        paths: Vec<Option<PathBuf>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Calls<'_> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.name().as_slice() == b"do_not_eager_load" && node.receiver().is_some() {
+                match node.arguments() {
+                    Some(args) => self.paths.extend(args.arguments().iter().map(|a| path_of(&a, self.dir).map(|p| normalize(&p)))),
+                    None => self.paths.push(None),
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let parsed = super::prism::parse_silent(text.as_bytes());
+    let mut calls = Calls { dir, paths: Vec::new() };
+    ruby_prism::Visit::visit(&mut calls, &parsed.node());
+    calls.paths.into_iter().collect()
+}
+
 pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf> {
     let text = |n: &ruby_prism::Node<'_>| n.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
     if let Some(call) = node.as_call_node() {

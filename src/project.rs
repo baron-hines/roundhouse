@@ -6046,7 +6046,9 @@ fn zeitwerk_eager_programs(app: &App, is_program: impl Fn(&str) -> bool) -> Vec<
         let Some(at) = entry.rfind("/lib/") else { continue };
         let lib = std::path::Path::new(&entry[..at + 4]);
         let dir = std::path::Path::new(&entry).parent().unwrap_or(lib);
-        let Some((roots, ignores)) = crate::ingest::source_gems::zeitwerk_dirs(text, dir, lib) else { continue };
+        let Some((roots, mut ignores)) = crate::ingest::source_gems::zeitwerk_dirs(text, dir, lib) else { continue };
+        let Some(lazy) = crate::ingest::source_gems::zeitwerk_eager_exclusions(text, dir) else { continue };
+        ignores.extend(lazy);
         let mut managed: Vec<String> = app
             .sources
             .iter()

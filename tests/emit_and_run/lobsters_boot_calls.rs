@@ -7,9 +7,10 @@ const CONTROLLER: &str = r##"class ProbesController < ApplicationController
   def index
     code = SecureRandom.base58(12)
     token = SecureRandom.base36
+    sized = SecureRandom.base58(nil).length + SecureRandom.base36(nil).length
     Rails.logger.debug
     alphabet = code.chars.all? { |c| "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".include?(c) }
-    render plain: "#{code.length} #{alphabet} #{token.length} #{token.match?(/\A[0-9a-z]+\z/)}"
+    render plain: "#{code.length} #{alphabet} #{token.length} #{token.match?(/\A[0-9a-z]+\z/)} #{sized}"
   end
 end
 "##;
@@ -20,7 +21,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/controllers/probes_controller.rb", CONTROLLER)
 }
 
-const EXPECTED: &str = "12 true 16 true";
+const EXPECTED: &str = "12 true 16 true 32";
 
 #[test]
 fn securerandom_and_a_bare_logger_call_answer_as_rails_does() {

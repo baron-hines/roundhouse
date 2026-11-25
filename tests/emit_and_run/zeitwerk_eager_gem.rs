@@ -1,6 +1,6 @@
 //! A source gem whose Zeitwerk loader manages its files (mission_control-jobs' `loader.push_dir`): production Rails
 //! eager-loads every managed file at boot, so a file nothing names still runs (`Relay.loaded << :registry`), and an
-//! ignored one does not. What it reads loads as MC's does: a class under `I18n::Config`, one under
+//! ignored one or one kept out of eager loading does not. What it reads loads as MC's does: a class under `I18n::Config`, one under
 //! `Rails::Command::Base`, and a `mattr_accessor` defaulting to `ActiveSupport::Logger.new(nil)`.
 
 use super::emit_and_run;
@@ -12,6 +12,7 @@ const ENTRY: &str = r##"require "zeitwerk"
 loader = Zeitwerk::Loader.new
 loader.push_dir(__dir__)
 loader.ignore("#{__dir__}/relay/tasks.rb")
+loader.do_not_eager_load("#{__dir__}/relay/optional.rb")
 loader.setup
 
 module Relay
@@ -30,6 +31,7 @@ fn app() -> emit_and_run::Overlay {
         .write(&format!("{GEM}/lib/relay.rb"), ENTRY)
         .write(&format!("{GEM}/lib/relay/registry.rb"), "module Relay\n  class Registry\n  end\nend\n\nRelay.loaded << :registry\nRelay.loaded << Relay::LocaleConfig.superclass.name\nRelay.loaded << Relay::Authentication.superclass.name\n")
         .write(&format!("{GEM}/lib/relay/tasks.rb"), "Relay.loaded << :tasks\n")
+        .write(&format!("{GEM}/lib/relay/optional.rb"), "Relay.loaded << :optional\n")
         .write(&format!("{GEM}/lib/relay/locale_config.rb"), "module Relay\n  class LocaleConfig < I18n::Config\n  end\nend\n")
         .write(&format!("{GEM}/lib/relay/authentication.rb"), "module Relay\n  class Authentication < Rails::Command::Base\n  end\nend\n")
 }

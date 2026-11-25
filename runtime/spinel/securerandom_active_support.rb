@@ -6,13 +6,13 @@ module SecureRandom
 
   def self.base58(n = 16)
     out = +""
-    n.times { out << BASE58_ALPHABET[SecureRandom.random_number(58)] }
+    (n.nil? ? 16 : n).times { out << BASE58_ALPHABET[SecureRandom.random_number(58)] }
     out
   end
 
   def self.base36(n = 16)
     out = +""
-    n.times { out << BASE36_ALPHABET[SecureRandom.random_number(36)] }
+    (n.nil? ? 16 : n).times { out << BASE36_ALPHABET[SecureRandom.random_number(36)] }
     out
   end
 end
