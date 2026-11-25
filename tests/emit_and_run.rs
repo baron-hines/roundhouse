@@ -21,6 +21,8 @@ mod native_http;
 mod namespaced_form_partial;
 #[path = "emit_and_run/url_helper_protocol.rs"]
 mod url_helper_protocol;
+#[path = "emit_and_run/literal_send_untyped.rs"]
+mod literal_send_untyped;
 #[path = "emit_and_run/duration_defined_units.rs"]
 mod duration_defined_units;
 #[path = "emit_and_run/eager_load_conditions.rs"]
@@ -22879,6 +22881,8 @@ mod empty_base_list_override;
 mod relation_argument;
 #[path = "emit_and_run/params_permit_key_args.rs"]
 mod params_permit_key_args;
+#[path = "emit_and_run/params_permit_splat_keys.rs"]
+mod params_permit_splat_keys;
 
 /// A class macro's `Class.new(base).tap { it.class_eval(&block) }` named by
 /// `const_set` is the class a `class Name < Base` with the call's block as
