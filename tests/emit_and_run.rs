@@ -22277,6 +22277,10 @@ mod load_time_constants;
 mod doorkeeper;
 #[path = "emit_and_run/message_bus.rs"]
 mod message_bus;
+#[path = "emit_and_run/find_or_create_variable_block.rs"]
+mod find_or_create_variable_block;
+#[path = "emit_and_run/lowered_sends.rs"]
+mod lowered_sends;
 #[path = "emit_and_run/included_alias.rs"]
 mod included_alias;
 #[path = "emit_and_run/simple_format_sanitize.rs"]
