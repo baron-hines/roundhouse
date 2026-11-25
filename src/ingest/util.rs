@@ -544,11 +544,14 @@ fn body_hands_itself_out(body: Option<Node<'_>>) -> bool {
     })
 }
 
-/// A module whose body only includes other modules. It has nothing of its
-/// own to emit, but it is still an ancestor: its includer reaches the
-/// included modules' methods through it, and for a Concern Rails runs its
-/// dependencies' `included` blocks on whatever includes it, so the
-/// `include` edge has to survive. A plain module counts too (#2278).
+/// A module that is only a set of includes. It has nothing of its own to
+/// emit, but it is still an ancestor, so the `include` edge has to survive:
+/// - A Concern that includes a module: Rails runs its dependencies'
+///   `included` blocks on whatever includes it.
+/// - A plain module whose every statement is an `include` of constants:
+///   its includer reaches the included modules' methods through it
+///   (#2278). A body with anything else, such as a nested module, is not
+///   one.
 fn module_includes_module(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     let statements = flatten_statements(body);
@@ -560,11 +563,28 @@ fn module_includes_module(body: Option<Node<'_>>) -> bool {
                 && constant_id_str(&call.name()) == name
         })
     }
-    statements.iter().any(|stmt| {
+    // `self.extend` is the same call.
+    let extends_concern = statements.iter().any(|stmt| {
+        call_named(stmt, "extend").is_some_and(|call| {
+            call.arguments().is_some_and(|a| {
+                a.arguments().iter().any(|arg| {
+                    constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
+                })
+            })
+        })
+    });
+    let includes_constant = |stmt: &Node<'_>| {
         call_named(stmt, "include").is_some_and(|call| {
             call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| constant_path_of(&arg).is_some()))
         })
-    })
+    };
+    let only_constant_includes = |stmt: &Node<'_>| {
+        call_named(stmt, "include").is_some_and(|call| {
+            call.arguments().is_some_and(|a| !a.arguments().is_empty() && a.arguments().iter().all(|arg| constant_path_of(&arg).is_some()))
+        })
+    };
+    (extends_concern && statements.iter().any(includes_constant))
+        || (!statements.is_empty() && statements.iter().all(only_constant_includes))
 }
 
 // `extend ActiveSupport::Concern` is left out: it is the included-block machinery, not methods the module answers.
