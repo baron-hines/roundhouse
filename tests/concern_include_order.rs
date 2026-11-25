@@ -439,6 +439,23 @@ fn a_hook_def_stands_over_a_later_ordinary_def_of_its_name() {
     single_case(&files, lines, "label", "hook");
 }
 
+/// Each plain wrapper runs its concern's hook on itself, so each holds its
+/// own forwarder. W3 is the nearest ancestor, and its forwarder reads
+/// `source_two` (#2278).
+#[test]
+fn a_hook_forwarder_stands_on_each_plain_wrapper_it_ran_on() {
+    let files = [
+        ("delegate_one", "module DelegateOne\n  extend ActiveSupport::Concern\n\n  included { delegate :label, to: :source_one }\nend\n"),
+        ("delegate_two", "module DelegateTwo\n  extend ActiveSupport::Concern\n\n  included { delegate :label, to: :source_two }\nend\n"),
+        ("w1", "module W1\n  include DelegateOne\nend\n"),
+        ("w2", "module W2\n  include DelegateTwo\nend\n"),
+        ("w3", "module W3\n  include DelegateTwo\nend\n"),
+    ];
+    let lines = "  include W2\n  include W1\n  include W3\n";
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "self.source_two.label");
+    single_case(&files, lines, "label", "source two");
+}
+
 /// A plain wrapper takes a concern's deferred dependencies itself: HookDef's
 /// hook runs on Wrapper, so its `label` is Wrapper's, ahead of PlainDef's
 /// below (#2278).

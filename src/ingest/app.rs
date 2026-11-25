@@ -6406,35 +6406,6 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 hook_order.push(module);
             }
         }
-        // A hook that ran on a plain module in the chain made its forwarder
-        // there: still found from the controller, below its own hooks'.
-        // Spliced first, farthest first, since the last forwarder stands.
-        // One the superclass's chain has stays the superclass's.
-        // One a superclass that isn't a controller (a class in lib/) has made
-        // its forwarder there, where no splice emits it: the child that
-        // names the module has it, below everything else.
-        let wrapped: Vec<&crate::ident::ClassId> = queue
-            .iter()
-            .rev()
-            .filter(|module| from_library.contains(*module))
-            .chain(queue.iter().rev().filter(|module| !hooks.contains(*module) && !inherited.contains(*module)))
-            .collect();
-        for module in wrapped {
-            for call in module_delegates.get(module).into_iter().flatten() {
-                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
-            }
-        }
-        // Then the hooks that ran here, in the order they ran.
-        for module in &hooks {
-            for call in module_delegates.get(module).into_iter().flatten() {
-                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
-            }
-        }
-        // A def a hook made on a module in the chain is that module's: the
-        // module whose statement ran the hook (`carried`) has it, where the
-        // chain has that module, the last hook's first. Ruby finds a
-        // prepended module ahead of the controller's own, hooks' defs
-        // included.
         // The hooks that ran on each module of the chain, in the order they
         // ran: the ones its own statements run there, as they run on an
         // includer (`hook_order`). All of a plain module's statements run
@@ -6461,6 +6432,38 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             }
         }
         let is_carried = |module: &crate::ident::ClassId| carried.values().flatten().any(|m| *m == module);
+        // A hook that ran on a module in the chain made its forwarder there:
+        // still found from the controller, below its own hooks'. Spliced
+        // first, farthest first, and on each module in the order its hooks
+        // ran, since the last forwarder stands. A concern no module of the
+        // chain runs keeps its forwarder at its own place.
+        // One the superclass's chain has stays the superclass's.
+        // One a superclass that isn't a controller (a class in lib/) has made
+        // its forwarder there, where no splice emits it: the child that
+        // names the module has it, below everything else.
+        let mut wrapped: Vec<&crate::ident::ClassId> = queue.iter().rev().filter(|module| from_library.contains(*module)).collect();
+        for module in queue.iter().rev().filter(|module| !inherited.contains(*module)) {
+            if !hooks.contains(module) && !is_carried(module) {
+                wrapped.push(module);
+            }
+            wrapped.extend(carried.get(module).into_iter().flatten().copied());
+        }
+        for module in wrapped {
+            for call in module_delegates.get(module).into_iter().flatten() {
+                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
+            }
+        }
+        // Then the hooks that ran here, in the order they ran.
+        for module in &hooks {
+            for call in module_delegates.get(module).into_iter().flatten() {
+                methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
+            }
+        }
+        // A def a hook made on a module in the chain is that module's: the
+        // module whose statement ran the hook (`carried`) has it, where the
+        // chain has that module, the last hook's first. Ruby finds a
+        // prepended module ahead of the controller's own, hooks' defs
+        // included.
         #[derive(Clone, Copy, PartialEq)]
         enum Pick {
             /// The defs its hook made on the controller.
