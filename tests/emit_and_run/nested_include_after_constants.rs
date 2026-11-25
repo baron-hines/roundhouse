@@ -151,3 +151,31 @@ puts "includes around a late concern passed"
         )
         .assert_passes();
 }
+
+/// A library module with source ivar initializers writes a hooked include
+/// where the source has it, after the `def self.mark` the hook calls. The
+/// concern's require must stay at the class top for it: the late-require
+/// split must not drop it for an include it never moves. (The concern's
+/// read of `TYPES` still runs before `TYPES` is written there, as on main:
+/// only the require is pinned, not a Ruby run.)
+#[test]
+fn an_ordered_bodys_hooked_include_keeps_its_class_top_require() {
+    let ledger = "module Ledger\n  @registry = []\n  TYPES = %w[a b].freeze\n\n  def self.mark\n    @registry << :marked\n  end\n\n  def self.registry = @registry\n\n  include Stamping\nend\n";
+    let stamping = "module Ledger::Stamping\n  extend ActiveSupport::Concern\n  KINDS = Ledger::TYPES.map(&:upcase)\n\n  def self.included(base)\n    base.mark\n  end\nend\n";
+    let build = || {
+        emit_and_run::empty_app()
+            .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+            .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+            .write("db/schema.rb", "ActiveRecord::Schema.define do\nend\n")
+            .write("app/models/ledger.rb", ledger)
+            .write("app/models/ledger/stamping.rb", stamping)
+            .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+    };
+    let (tree, errors) = build().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let text = std::fs::read_to_string(tree.join("app/models/ledger.rb")).expect("app/models/ledger.rb is in the tree");
+    assert!(
+        text.lines().any(|l| l.trim_start().starts_with("require_relative") && l.contains("ledger/stamping")),
+        "the concern is not required anywhere:\n{text}"
+    );
+}

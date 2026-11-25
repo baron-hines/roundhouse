@@ -10104,6 +10104,11 @@ fn emit_library_class_decl_inner(
         if requires.contains(require) || body_requires.contains(require) {
             continue;
         }
+        // An ordered body writes this include itself, where the source has
+        // it, and never moves it: its require stays at the class top.
+        if ordered_includes.iter().any(|(_, o)| *o == inc) {
+            continue;
+        }
         let reads_earlier = body.iter().any(|(at, item)| match item {
             BodyItem::Constant(c, value) => {
                 *at < span.start
