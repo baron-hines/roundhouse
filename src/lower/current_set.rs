@@ -14,13 +14,13 @@
 //! ```ruby
 //! Current.set(request: r) { body }
 //! # →
-//! __current_set_arg_request = r
-//! __current_set_was_request = Current.request
+//! __current_set_arg0_request = r
+//! __current_set_was0_request = Current.request
 //! begin
-//!   Current.request = __current_set_arg_request
+//!   Current.request = __current_set_arg0_request
 //!   body
 //! ensure
-//!   Current.request = __current_set_was_request
+//!   Current.request = __current_set_was0_request
 //! end
 //! ```
 //!
@@ -105,6 +105,10 @@ fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, diags: &mut Vec<Diagnostic>
         report(span, &class, "it takes no block, so there is no scope to restore after", diags);
         return;
     };
+    if !matches!(&*body.node, ExprNode::Lambda { .. }) {
+        report(span, &class, "its block is passed as a value (`&blk`, `&method(:m)`), not written at the call", diags);
+        return;
+    }
     let Some(pairs) = keyword_pairs(args) else {
         report(span, &class, "its argument is not a literal keyword hash", diags);
         return;
@@ -136,16 +140,16 @@ fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Exp
     // (a `set` inside this block or its arguments saves into locals of its own level: one name for both would have the inner save overwrite the outer's)
     let depth = pairs.iter().map(|(_, v)| nesting(v)).fold(nesting(body), usize::max);
     let level = if depth == 0 { String::new() } else { depth.to_string() };
-    let local = |kind: &str, name: &str| Symbol::from(format!("__current_set{level}_{kind}_{name}"));
+    let local = |kind: &str, i: usize, name: &str| Symbol::from(format!("__current_set{level}_{kind}{i}_{name}"));
     // The arguments are evaluated in order before anything is saved, as a
     // call's arguments are: one that raises leaves every attribute as it
     // was, and a later one cannot change an earlier one's value.
     let mut values: Vec<(String, Expr)> = Vec::new();
-    for (name, value) in pairs {
+    for (i, (name, value)) in pairs.iter().enumerate() {
         if matches!(&*value.node, ExprNode::Lit { .. }) {
             values.push((name.clone(), value.clone()));
         } else {
-            let arg = local("arg", name);
+            let arg = local("arg", i, name);
             stmts.push(assign_local(span, arg.clone(), value.clone()));
             values.push((name.clone(), local_read(span, arg)));
         }
@@ -158,7 +162,7 @@ fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Exp
     let mut setup: Vec<Expr> = Vec::new();
     let mut restore: Vec<Expr> = Vec::new();
     for (i, (name, value)) in values.iter().enumerate() {
-        let saved = local("was", name);
+        let saved = local("was", i, name);
         let save = assign_local(span, saved.clone(), class_read(span, class, name));
         let back = class_write(span, class, name, local_read(span, saved.clone()));
         if i == 0 {
@@ -262,11 +266,11 @@ fn run_block(span: Span, class: &str, block: &Expr) -> Expr {
     )
 }
 
-/// Does `e` hold a `next` or `break` that leaves the block itself (one
+/// Does `e` hold a `next`, `break` or `redo` that leaves the block itself (one
 /// in a nested block or loop leaves that instead)?
 fn jumps_out(e: &Expr) -> bool {
     match &*e.node {
-        ExprNode::Next { .. } | ExprNode::Break { .. } => true,
+        ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo => true,
         ExprNode::Lambda { .. } | ExprNode::While { .. } => false,
         _ => {
             let mut found = false;
@@ -364,10 +368,10 @@ mod tests {
         let diags = apply_current_set_lowering(&mut app);
         assert!(diags.is_empty(), "{diags:?}");
         let out = lowered(&app);
-        assert!(out.contains("__current_set_was_request = Current.request"), "{out}");
+        assert!(out.contains("__current_set_was0_request = Current.request"), "{out}");
         assert!(out.contains("Current.request = \"r\""), "{out}");
         assert!(out.contains("ensure"), "{out}");
-        assert!(out.contains("Current.request = __current_set_was_request"), "{out}");
+        assert!(out.contains("Current.request = __current_set_was0_request"), "{out}");
     }
 
     /// Each attribute is saved just before it is assigned, as
@@ -380,9 +384,9 @@ mod tests {
         let out = lowered(&app);
         let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("no `{s}` in:\n{out}"));
         let order = [
-            at("__current_set_was_request = Current.request"),
+            at("__current_set_was0_request = Current.request"),
             at("Current.request = \"r\""),
-            at("__current_set_was_user = Current.user"),
+            at("__current_set_was1_user = Current.user"),
             at("Current.user = \"u\""),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "out of Object#with's order:\n{out}");
@@ -396,8 +400,8 @@ mod tests {
         assert!(apply_current_set_lowering(&mut app).is_empty());
         let out = lowered(&app);
         let ensure = &out[out.find("ensure").expect(&out)..];
-        let request = ensure.find("Current.request = __current_set_was_request").expect(&out);
-        let user = ensure.find("Current.user = __current_set_was_user").expect(&out);
+        let request = ensure.find("Current.request = __current_set_was0_request").expect(&out);
+        let user = ensure.find("Current.user = __current_set_was1_user").expect(&out);
         assert!(request < user, "{out}");
         assert!(ensure.contains("__current_set_saved >= 2"), "{out}");
     }
@@ -409,7 +413,26 @@ mod tests {
         let mut app = app_with("Current.set(user: a, request: Current.set(user: b) { \"c\" }) { work }");
         assert!(apply_current_set_lowering(&mut app).is_empty());
         let out = lowered(&app);
-        assert!(out.contains("__current_set1_arg_user = a") && out.contains("__current_set_arg_user = b"), "{out}");
+        assert!(out.contains("__current_set1_arg0_user = a") && out.contains("__current_set_arg0_user = b"), "{out}");
+    }
+
+    /// A block passed as a value has no body to run in place: the call
+    /// is reported and left as written.
+    #[test]
+    fn a_block_passed_as_a_value_is_reported_and_left() {
+        let mut app = app_with("Current.set(request: \"r\", &handler)");
+        let diags = apply_current_set_lowering(&mut app);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(lowered(&app).contains("Current.set"), "{}", lowered(&app));
+    }
+
+    /// The same attribute named twice keeps two locals of its own.
+    #[test]
+    fn a_name_given_twice_keeps_a_local_per_entry() {
+        let mut app = app_with("Current.set(request: a, \"request\" => b) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("__current_set_arg0_request = a") && out.contains("__current_set_arg1_request = b"), "{out}");
     }
 
     /// The block runs: its body sits in the `begin`, not a lambda left
@@ -426,7 +449,7 @@ mod tests {
     /// keep their meaning through `Current.instance.then`.
     #[test]
     fn a_block_with_a_parameter_or_a_jump_runs_through_then() {
-        for body in ["Current.set(request: r) { |c| c.request }", "Current.set(request: r) { next 1 }", "Current.set(request: r) { break 1 }"] {
+        for body in ["Current.set(request: r) { |c| c.request }", "Current.set(request: r) { next 1 }", "Current.set(request: r) { break 1 }", "Current.set(request: r) { redo }"] {
             let mut app = app_with(body);
             assert!(apply_current_set_lowering(&mut app).is_empty());
             let out = lowered(&app);
@@ -449,8 +472,8 @@ mod tests {
         let mut app = app_with("Current.set(request: build) { work }");
         assert!(apply_current_set_lowering(&mut app).is_empty());
         let out = lowered(&app);
-        let value = out.find("__current_set_arg_request = build").expect(&out);
-        let save = out.find("__current_set_was_request = Current.request").expect(&out);
+        let value = out.find("__current_set_arg0_request = build").expect(&out);
+        let save = out.find("__current_set_was0_request = Current.request").expect(&out);
         assert!(value < save, "{out}");
     }
 
