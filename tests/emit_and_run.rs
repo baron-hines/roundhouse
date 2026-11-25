@@ -19,6 +19,8 @@ mod emit_and_run;
 mod native_http;
 #[path = "emit_and_run/namespaced_form_partial.rs"]
 mod namespaced_form_partial;
+#[path = "emit_and_run/duration_defined_units.rs"]
+mod duration_defined_units;
 #[path = "emit_and_run/eager_load_conditions.rs"]
 mod eager_load_conditions;
 #[path = "emit_and_run/zeitwerk_eager_gem.rs"]
