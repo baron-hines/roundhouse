@@ -46,7 +46,12 @@ fn scopes(e: &mut Expr, found: &mut Vec<(String, Symbol)>) {
     {
         let model = args.iter().find_map(|a| match &*a.node {
             ExprNode::Hash { entries, .. } => entries.iter().find_map(|(k, v)| {
-                matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "model").then(|| simple_ref(v)).flatten()
+                // Not the Array itself: `model: [:mod, @story]` names the record `@story` behind a route namespace.
+                let record = match &*v.node {
+                    ExprNode::Array { elements, .. } => elements.last()?,
+                    _ => v,
+                };
+                matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "model").then(|| simple_ref(record)).flatten()
             }),
             _ => None,
         });

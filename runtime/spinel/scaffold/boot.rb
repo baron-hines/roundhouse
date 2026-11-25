@@ -30,6 +30,7 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+require_relative "runtime/securerandom_active_support"
 # Module-only Shellwords — packages/shellwords reopens String/Array and
 # poisons String#split (PolyArray → C compile fail). See
 # runtime/spinel/shellwords_spinel.rb; defining the module drops

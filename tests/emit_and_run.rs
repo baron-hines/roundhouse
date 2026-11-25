@@ -17,6 +17,16 @@ mod emit_and_run;
 #[path = "support/native_http.rs"]
 #[allow(dead_code)]
 mod native_http;
+#[path = "emit_and_run/namespaced_form_partial.rs"]
+mod namespaced_form_partial;
+#[path = "emit_and_run/duration_defined_units.rs"]
+mod duration_defined_units;
+#[path = "emit_and_run/eager_load_conditions.rs"]
+mod eager_load_conditions;
+#[path = "emit_and_run/zeitwerk_eager_gem.rs"]
+mod zeitwerk_eager_gem;
+#[path = "emit_and_run/lobsters_boot_calls.rs"]
+mod lobsters_boot_calls;
 #[path = "emit_and_run/multi_json.rs"]
 mod multi_json;
 #[path = "emit_and_run/active_model_serializer_08.rs"]
@@ -22867,6 +22877,8 @@ mod empty_base_list_override;
 mod relation_argument;
 #[path = "emit_and_run/params_permit_key_args.rs"]
 mod params_permit_key_args;
+#[path = "emit_and_run/params_permit_splat_keys.rs"]
+mod params_permit_splat_keys;
 #[path = "emit_and_run/current_set.rs"]
 mod current_set;
 

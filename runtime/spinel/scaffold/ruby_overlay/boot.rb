@@ -49,6 +49,7 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+require_relative "runtime/securerandom_active_support"
 # stdlib Shellwords, including String#shellescape. The Spinel port is
 # runtime/shellwords_spinel.rb and must not be named shellwords.rb:
 # runtime/ is on $LOAD_PATH, so the library's own name would answer a
