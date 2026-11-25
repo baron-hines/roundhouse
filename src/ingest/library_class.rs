@@ -2801,7 +2801,8 @@ pub(super) fn library_class_from_module_node_with_scope(
 /// registers its two parameters and changes neither), and every call of it in the module body is a statement of that
 /// body passing a Symbol and a String, ingest follows each call as it follows a literal `autoload`, and the file is
 /// loaded as the gem's other files are. The helper then drops its `autoload(name, path)` statement, as a literal
-/// `autoload` in a module body is not written either, and keeps the rest of its body. Any other call of it (with a
+/// `autoload` in a module body is not written either, and keeps the rest of its body (a body that is only the
+/// registration becomes `nil`, what `autoload` answers). Any other call of it (with a
 /// built path, with a receiver, inside an assignment or a method) keeps the `autoload`.
 fn drop_followed_autoload_registrations(module: &ruby_prism::ModuleNode<'_>, methods: &mut [MethodDef]) {
     let statements: Vec<Node<'_>> =
@@ -2870,6 +2871,12 @@ fn drop_followed_autoload_registrations(module: &ruby_prism::ModuleNode<'_>, met
                             if matches!(&*x.node, ExprNode::Var { name, .. } if *name == a.name)
                                 && matches!(&*y.node, ExprNode::Var { name, .. } if *name == b.name)))
             };
+            // A body that is only the registration ingests as that one call: the helper then answers `nil`, as
+            // `autoload` does.
+            if is_registration(&method.body) {
+                method.body = Expr::new(method.body.span, ExprNode::Lit { value: Literal::Nil });
+                continue;
+            }
             let ExprNode::Seq { exprs: statements } = &mut *method.body.node else { continue };
             if statements.iter().filter(|s| is_registration(s)).count() == 1 {
                 statements.retain(|s| !is_registration(s));
