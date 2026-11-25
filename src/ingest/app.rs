@@ -6431,21 +6431,33 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
             }
         }
         // A def a hook made on a module in the chain is that module's: the
-        // plain module whose `include` ran the hook (`carried`) has it,
-        // where the chain has that module. Ruby finds a prepended module
-        // ahead of the controller's own, hooks' defs included.
+        // module whose statement ran the hook (`carried`) has it, where the
+        // chain has that module, the last hook's first. Ruby finds a
+        // prepended module ahead of the controller's own, hooks' defs
+        // included.
+        // The hooks that ran on each module of the chain, in the order they
+        // ran: the ones its own statements run there, as they run on an
+        // includer (`hook_order`). All of a plain module's statements run
+        // there, a concern's only those ahead of its `extend
+        // ActiveSupport::Concern`; the rest it defers to its includer. So a
+        // plain wrapper of a concern that defers another runs both hooks on
+        // itself (#2278). Not the ones that ran on the controller.
         let hooked: crate::det::HashSet<&crate::ident::ClassId> = hooks.iter().collect();
-        let hook_defines = |module: &crate::ident::ClassId| hook_methods.get(module).is_some_and(|defs| !defs.is_empty());
+        let none = crate::det::HashSet::default();
         let mut carried: HashMap<&crate::ident::ClassId, Vec<&crate::ident::ClassId>> = HashMap::default();
-        for module in queue.iter().filter(|m| !hooked.contains(*m) && hook_defines(m)) {
-            let names = |recipient: &crate::ident::ClassId| {
-                module_statements.get(recipient).into_iter().flatten().enumerate().any(|(at, statement)| {
-                    let deferred = concerns.contains(recipient) && !before_concern.contains(&(recipient.clone(), at)) && concerns.contains(module);
-                    !deferred && statement.contains(module)
-                })
-            };
-            if let Some(recipient) = queue.iter().find(|r| *r != module && names(r)) {
-                carried.entry(recipient).or_default().push(module);
+        for recipient in &queue {
+            let runs_here: Vec<Vec<crate::ident::ClassId>> = module_statements
+                .get(recipient)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(at, _)| !concerns.contains(recipient) || before_concern.contains(&(recipient.clone(), *at)))
+                .map(|(_, statement)| statement.clone())
+                .collect();
+            for ran in ancestry.hook_order(&runs_here, &none) {
+                if let Some(module) = queue.iter().find(|m| **m == ran && *m != recipient && !hooked.contains(*m)) {
+                    carried.entry(recipient).or_default().push(module);
+                }
             }
         }
         let is_carried = |module: &crate::ident::ClassId| carried.values().flatten().any(|m| *m == module);
@@ -6464,7 +6476,7 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         ) -> Vec<(&'a crate::ident::ClassId, Pick)> {
             modules
                 .iter()
-                .flat_map(|module| std::iter::once((module, Pick::Own)).chain(carried.get(module).into_iter().flatten().map(|m| (*m, Pick::Carried))))
+                .flat_map(|module| std::iter::once((module, Pick::Own)).chain(carried.get(module).into_iter().flatten().rev().map(|m| (*m, Pick::Carried))))
                 .collect()
         }
         let mut passes = in_place(&queue[..ahead], &carried);

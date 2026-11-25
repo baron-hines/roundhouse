@@ -404,6 +404,8 @@ fn a_self_included_hook_defines_on_the_includer() {
     );
 }
 
+const HOOK_DEF: (&str, &str) = ("hook_def", "module HookDef\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n");
+const PLAIN_DEF: (&str, &str) = ("plain_def", "module PlainDef\n  extend ActiveSupport::Concern\n\n  def label\n    \"plain\"\n  end\nend\n");
 
 /// `include B, C, HookWrapper` includes HookWrapper first, and its hook
 /// includes B right above it. The explicit B then finds B there and moves
@@ -433,6 +435,22 @@ fn a_hook_def_stands_over_a_later_ordinary_def_of_its_name() {
         "module HookReopen\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule HookReopen\n  def label\n    \"ordinary\"\n  end\nend\n",
     )];
     let lines = "  include HookReopen\n";
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"hook\"");
+    single_case(&files, lines, "label", "hook");
+}
+
+/// A plain wrapper takes a concern's deferred dependencies itself: HookDef's
+/// hook runs on Wrapper, so its `label` is Wrapper's, ahead of PlainDef's
+/// below (#2278).
+#[test]
+fn a_deferred_hook_runs_on_the_plain_wrapper() {
+    let files = [
+        HOOK_DEF,
+        PLAIN_DEF,
+        ("hook_bundle", "module HookBundle\n  extend ActiveSupport::Concern\n\n  include HookDef\nend\n"),
+        ("wrapper", "module Wrapper\n  include HookBundle\n  include PlainDef\nend\n"),
+    ];
+    let lines = "  include Wrapper\n";
     assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"hook\"");
     single_case(&files, lines, "label", "hook");
 }
