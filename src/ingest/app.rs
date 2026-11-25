@@ -1897,6 +1897,12 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                     methods.append(&mut synth);
                 }
             }
+            let path = dir.join("config/initializers/content_security_policy.rb").display().to_string();
+            if let Some(nonce) = content_security_policy_nonce_methods(&init, &path)
+                && let Ok(mut synth) = crate::runtime_src::parse_methods(&nonce)
+            {
+                methods.append(&mut synth);
+            }
         }
         // The forgery check's verification strategy (Rails main's
         // Fetch Metadata rule; see `read_forgery_verification_strategy`).
@@ -3631,6 +3637,7 @@ end
     // concern (before the splice carries both to the includer) or on
     // the controller that called it directly.
     super::allow_browser::lower_allow_browser(&mut app);
+    super::controller_csp::expand(&mut app);
     super::rate_limit::lower_rate_limit(&mut app, rate_limit_stores, &const_resolver.for_sources(&sources));
     // The concern that wraps the pagy gem's `pagy` in a bounds check.
     super::pagy::lower_pagy(&mut app)?;
@@ -7637,7 +7644,7 @@ fn expr_calls_respond_with(expr: &crate::expr::Expr) -> bool {
 /// methods a `content_security_policy do |p| … end` block calls on its
 /// block parameter to build the policy Rails would send as a response
 /// header.
-const CSP_DIRECTIVES: &[&str] = &[
+pub(super) const CSP_DIRECTIVES: &[&str] = &[
     "base_uri",
     "block_all_mixed_content",
     "child_src",
@@ -13281,6 +13288,7 @@ fn synthesize_redirect_controller(
         body,
         layout: crate::dialect::LayoutDecl::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     }
 }
 
@@ -14421,6 +14429,49 @@ pub(crate) fn csp_source_mapping(symbol: &str) -> Option<&'static str> {
     })
 }
 
+/// `config.content_security_policy_nonce_generator = ->(request) { … }` and `config.content_security_policy_nonce_directives
+/// = %w[…]`: the application methods the request's nonce reads (runtime/ruby/rails.rb has Rails' defaults: no generator,
+/// `script-src` and `style-src`). A generator that is not a one-parameter lambda literal, or directives that are not a
+/// literal list of strings, leaves the defaults, as the ledger reports the line.
+pub(super) fn content_security_policy_nonce_methods(source: &[u8], file: &str) -> Option<String> {
+    let mut out = String::new();
+    for (segments, value) in extract_framework_config_assignments(source, file) {
+        match segments.as_slice() {
+            [key] if key == "content_security_policy_nonce_generator" => {
+                let parsed = super::prism::parse_silent(value.as_bytes());
+                let node = parsed.node().as_program_node()?.statements().body().iter().next()?;
+                let (param, body) = if let Some(lambda) = node.as_lambda_node() {
+                    let params = lambda.parameters()?.as_block_parameters_node()?.parameters()?;
+                    let requireds: Vec<_> = params.requireds().iter().collect();
+                    let [param] = requireds.as_slice() else { continue };
+                    let name = super::util::constant_id_str(&param.as_required_parameter_node()?.name()).to_string();
+                    let loc = lambda.body()?.location();
+                    (name, value[loc.start_offset()..loc.end_offset()].to_string())
+                } else {
+                    continue;
+                };
+                out.push_str("def content_security_policy_nonce_generator?\n  true\nend\n");
+                out.push_str(&format!("def content_security_policy_nonce_generated({param})\n  ({body}).to_s\nend\n"));
+            }
+            [key] if key == "content_security_policy_nonce_directives" => {
+                let parsed = super::prism::parse_silent(value.as_bytes());
+                let node = parsed.node().as_program_node()?.statements().body().iter().next()?;
+                let array = node.as_array_node()?;
+                let names: Option<Vec<String>> = array
+                    .elements()
+                    .iter()
+                    .map(|e| e.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+                    .collect();
+                let Some(names) = names else { continue };
+                let list = names.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!("def content_security_policy_nonce_directives\n  [{list}]\nend\n"));
+            }
+            _ => {}
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// `config.content_security_policy do |policy| policy.script_src :self end`,
 /// including the `unless ENV["DISABLE_CONTENT_SECURITY_POLICY"]` guard
 /// when the file has one. `None` when the block names no literal source.
@@ -15265,7 +15316,14 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
 /// refused, since that text may be the other database's own SQL.
 fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
     use crate::schema::generated::GeneratedExpressionDialect::{OtherDatabase, Portable, Sqlite};
-    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Portable };
+    // Not only `database.yml`: an app that ships its configuration as a sample (lobsters' `database.yml.sample`) names
+    // the database it is deployed on there.
+    let Some(text) = ["config/database.yml", "config/database.yml.sample", "config/database.yml.example"]
+        .iter()
+        .find_map(|name| vfs.read_to_string(&dir.join(name)).ok())
+    else {
+        return Portable;
+    };
     let read = super::database_yml::database_configurations(&text, crate::span::FileId(0));
     let sqlite = read.refusals.is_empty()
         && !read.computed_url

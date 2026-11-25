@@ -22277,6 +22277,8 @@ mod load_time_constants;
 mod doorkeeper;
 #[path = "emit_and_run/message_bus.rs"]
 mod message_bus;
+#[path = "emit_and_run/content_security_policy.rs"]
+mod content_security_policy;
 #[path = "emit_and_run/find_or_create_variable_block.rs"]
 mod find_or_create_variable_block;
 #[path = "emit_and_run/lowered_sends.rs"]

@@ -1058,6 +1058,12 @@ module ActionView
     def self.csp_meta_tag
       ""
     end
+
+    # Not `Rails.application`'s nonce here: a strict target has no `Rails` in a view helper, so its tags carry none;
+    # the ruby family reopens this in `view_helpers_ext.rb`, as `csp_meta_tag`.
+    def self.content_security_policy_nonce
+      nil
+    end
   
     def self.stylesheet_link_tag(name, opts = EMPTY_HTML_OPTS)
       href = stylesheet_href(name.to_s)
@@ -1390,12 +1396,15 @@ module ActionView
       end
       import_lines = pins.map { |p| "    \"#{p[:name]}\": \"#{p[:path]}\"" }.join(",\n")
       json = "{\n  \"imports\": {\n" + import_lines + "\n  }\n}"
+      # importmap-rails passes `nonce: request&.content_security_policy_nonce` to each tag; the tag helper drops a nil one.
+      nonce = content_security_policy_nonce
+      attr = nonce.nil? ? "" : %( nonce="#{nonce}")
       parts = []
-      parts << %(<script type="importmap" data-turbo-track="reload">) + json + %(</script>)
+      parts << %(<script type="importmap" data-turbo-track="reload") + attr + ">" + json + %(</script>)
       pins.each do |p|
-        parts << %(<link rel="modulepreload" href="#{p[:path]}">)
+        parts << %(<link rel="modulepreload" href="#{p[:path]}") + attr + ">"
       end
-      parts << %(<script type="module">import "#{entry}"</script>)
+      parts << %(<script type="module") + attr + %(>import "#{entry}"</script>)
       parts.join("\n")
     end
   

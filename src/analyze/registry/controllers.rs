@@ -462,6 +462,18 @@ pub(in crate::analyze) fn register(
                 },
             );
         }
+        // The policy a controller's `content_security_policy` block narrows (`ingest::controller_csp`): the request's copy
+        // of the app's, which runtime/ruby/action_dispatch/content_security_policy.rb answers.
+        {
+            let policy = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::ContentSecurityPolicy")), args: vec![].into() };
+            let policy_or_nil = Ty::Union { variants: vec![policy.clone(), Ty::Nil].into() };
+            request.instance_methods.insert(Symbol::from("content_security_policy"), policy_or_nil.clone());
+            request.instance_methods.insert(Symbol::from("content_security_policy="), policy_or_nil);
+            let csp = classes.entry(ClassId(Symbol::from("ActionDispatch::ContentSecurityPolicy"))).or_default();
+            csp.class_methods.insert(Symbol::from("new"), policy);
+            csp.class_methods.insert(Symbol::from("dynamic_source"), Ty::Str);
+            csp.instance_methods.insert(Symbol::from("set_directive"), Ty::Nil);
+        }
         classes.insert(request_id.clone(), request);
         let request_ty = Ty::Class { id: request_id, args: vec![].into() };
         // A template reads `request` too — Rails' view context

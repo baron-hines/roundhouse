@@ -1894,6 +1894,7 @@ mod tests {
             }],
             layout: LayoutDecl::Inherit,
             sibling_classes: Vec::new(),
+            csp_header: false,
         }
     }
 
