@@ -307,3 +307,18 @@ fn a_plain_module_of_includes_only_passes_its_ancestors_on() {
         "plain a",
     );
 }
+
+/// `self.include` in a concern of includes only is the same include:
+/// `[Single, SelfWrapper, HookDef]`, and HookDef's hook defines `label` (#2278).
+#[test]
+fn a_concern_of_self_includes_only_passes_its_hook_on() {
+    single_case(
+        &[
+            ("hook_def", "module HookDef\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+            ("self_wrapper", "module SelfWrapper\n  self.extend ActiveSupport::Concern\n  self.include HookDef\nend\n"),
+        ],
+        "  include SelfWrapper\n",
+        "label",
+        "hook",
+    );
+}

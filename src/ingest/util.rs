@@ -553,8 +553,11 @@ fn module_includes_module(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     let statements = flatten_statements(body);
     fn call_named<'pr>(stmt: &Node<'pr>, name: &str) -> Option<ruby_prism::CallNode<'pr>> {
+        // `self.include` is the same call (#2278).
         stmt.as_call_node().filter(|call| {
-            call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && call.block().is_none()
+                && constant_id_str(&call.name()) == name
         })
     }
     statements.iter().any(|stmt| {
