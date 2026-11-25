@@ -484,6 +484,34 @@ fn file_load_ranks(app: &App) -> HashMap<String, Option<usize>> {
     ranks
 }
 
+/// A module-body call that reads nothing beyond a constant it names:
+/// `extend`/`include`/`prepend` of a constant, or an `included` /
+/// `class_methods` / `prepended` block (which runs at the include, not here).
+fn is_load_inert_module_call(call: &Expr) -> bool {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*call.node else { return false };
+    match method.as_str() {
+        "extend" | "include" | "prepend" => {
+            block.is_none() && !args.is_empty() && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
+        }
+        "included" | "class_methods" | "prepended" => args.is_empty() && block.is_some(),
+        _ => false,
+    }
+}
+
+/// A constant's value that runs nothing as the file loads: a literal, or an
+/// Array or Hash of them, optionally frozen.
+fn is_literal_value(value: &Expr) -> bool {
+    match &*value.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(is_literal_value),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| is_literal_value(k) && is_literal_value(v)),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+            method.as_str() == "freeze" && args.is_empty() && is_literal_value(recv)
+        }
+        _ => false,
+    }
+}
+
 fn normalize_path(path: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -9687,6 +9715,61 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
+    // When the nested file reopens this class with the header this file
+    // writes (the same superclass, from `outer_class_parent`), loading it
+    // first declares the same class, so its require stands with the
+    // file's other top-level requires. Spinel places a file a top-level
+    // `require_relative` loads; one a class body loads waits until every
+    // other require of it is placed, which a cycle of requires never is.
+    // Not under a namespace the runtime owns: the nested file then opens
+    // with one compound header (`module ActionText::Markdown::Uploads`),
+    // which looks this class up instead of declaring it.
+    let under_runtime_namespace = name.contains("::")
+        && require_path_for_body_const(&[name.split("::").next().unwrap_or(name).to_string()], app, classes, "")
+            .is_some_and(|p| p.starts_with("runtime/"));
+    let reopens_with_own_header = !lc.is_module
+        && lc.data_define().is_none()
+        && !under_runtime_namespace
+        && is_app_class(name, app, classes)
+        && outer_class_parent(name, app, classes) == lc.parent;
+    // …and when loading it first can't observe that the class isn't open
+    // yet: the nested module's body runs nothing that reads another
+    // constant (its constants are literals, and no class-body call the
+    // ingest didn't model), and its file requires no file but this
+    // class's superclass's, which this file has already required. A
+    // require of anything else (a constant its body reads, whose file reads
+    // this class) would run before `class` here, and after it on the
+    // class-body path.
+    let parent_anchor = lc.parent.as_ref().and_then(|p| require_path_for_parent(p, app, classes));
+    // Every opening of the name counts: the emitter writes them all into
+    // the one file, so any of them may read a constant or require a file.
+    let nested_file_loads_nothing_new = |inc: &ClassId, anchor: &str| -> bool {
+        let openings = library_classes_named(inc.0.as_str(), app, classes);
+        if openings.is_empty() || !openings.iter().all(|c| c.is_module) {
+            return false;
+        }
+        let Some(parent_anchor) = parent_anchor.as_deref() else { return false };
+        let path = PathBuf::from(format!("{anchor}.rb"));
+        let dir = anchor.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        openings.into_iter().all(|module| {
+            if !module.unknown_calls.iter().all(is_load_inert_module_call)
+                || !module.class_ivar_initializers.is_empty()
+                || !module.conditional_definitions.is_empty()
+                || !module.constants.iter().all(|(_, value)| is_literal_value(value))
+            {
+                return false;
+            }
+            let guarded = read_statement_cleanup(module);
+            let rendered = super::expr::with_emitted_file(&path, || {
+                emit_library_class_decl_inner(guarded.as_ref(), app, classes, factories, path.clone(), &[], &[])
+            });
+            rendered.content.lines().map(str::trim_start).filter(|l| l.starts_with("require")).all(|line| {
+                line.strip_prefix("require_relative ")
+                    .map(|target| normalize_path(&format!("{dir}/{}", target.trim().trim_matches('"'))) == parent_anchor)
+                    .unwrap_or(false)
+            })
+        })
+    };
     // A model's `prepend Concern` names a module this file must load
     // before the class body runs, exactly as an `include` does — and one
     // the concern splice claimed, so there IS a module to load: an
@@ -9717,7 +9800,9 @@ fn emit_library_class_decl_inner(
         if let Some(anchor) = require_path_for_body_const(&path, app, classes, name) {
             if anchor != self_anchor {
                 let nested_prefix = format!("{self_anchor}/");
-                if anchor.starts_with(&nested_prefix) {
+                if anchor.starts_with(&nested_prefix)
+                    && !(reopens_with_own_header && nested_file_loads_nothing_new(inc, &anchor))
+                {
                     // Nested constants such as `Account::Joinable` reopen
                     // their containing class. Load them after that class is
                     // declared, otherwise the nested file runs too early.
