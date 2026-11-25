@@ -43,22 +43,24 @@ end
     }
 }
 
-/// A call on a value with no type (the registry's gradual `Rails.application`
-/// and `Rails.cache`) is checked by nothing, so the callback is not carried
-/// as supported: an error per unchecked chain, instead of a clean check over
-/// a boot that may raise `NoMethodError`.
+/// A call on a value with no type (the registry's gradual `Rails.cache`), or
+/// one the open `Rails.application.config` does not model, is checked by
+/// nothing, so the callback is not carried as supported: an error per
+/// unchecked chain, instead of a clean check over a boot that may raise
+/// `NoMethodError`.
 #[test]
 fn a_callback_call_on_an_untyped_value_is_an_error() {
     let (_tree, errors) = base()
         .write("config/initializers/rotate.rb", r#"Rails.application.config.after_initialize do
   Rails.application.config.action_dispatch.cookies_rotations.rotate(:signed, "old")
+  Rails.application.config.i18n_cache.reload!
   store = Rails.cache
   store.clear
 end
 "#)
         .emit(roundhouse::project::BuildTarget::Ruby);
     let unchecked: Vec<&String> = errors.iter().filter(|e| e.contains("after_initialize callback call")).collect();
-    for call in ["`config` has no typed receiver", "`clear` has no typed receiver"] {
+    for call in ["`i18n_cache`: `Rails::FrameworkConfig` does not model it", "`clear`: it has no typed receiver"] {
         assert!(unchecked.iter().any(|e| e.contains(call)), "no error `{call}`: {errors:#?}");
     }
     assert_eq!(unchecked.len(), 2, "one error per unchecked chain: {unchecked:#?}");

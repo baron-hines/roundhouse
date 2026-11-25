@@ -84,6 +84,10 @@ module MessageDigest
     OpenSSL::PKCS5.pbkdf2_hmac(secret, salt, iters, dklen, OpenSSL::Digest::SHA256.new)
   end
 
+  def self.pbkdf2_sha1(secret, salt, iters, dklen)
+    OpenSSL::PKCS5.pbkdf2_hmac(secret, salt, iters, dklen, OpenSSL::Digest::SHA1.new)
+  end
+
   # AES-256-GCM, the cipher Rails' encrypted cookie jar (and so its
   # session store) uses since `use_authenticated_cookie_encryption`:
   # a 32-byte key, a 12-byte IV, no associated data, a 16-byte tag.

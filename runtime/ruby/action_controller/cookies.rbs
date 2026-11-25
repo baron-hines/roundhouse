@@ -66,6 +66,7 @@ module ActionController
     def []: (String | Symbol key) -> untyped
     def []=: (String | Symbol key, untyped value) -> untyped
     def permanent: () -> ActionController::SignedCookieJar
+    def rotated_json: (String raw, String purpose) -> String
     def delete: (String | Symbol key, ?Hash[Symbol, untyped] options) -> String
   end
 
@@ -80,6 +81,7 @@ module ActionController
     def []: (String | Symbol key) -> untyped
     def []=: (String | Symbol key, untyped value) -> untyped
     def permanent: () -> ActionController::EncryptedCookieJar
+    def rotated_json: (String raw, String purpose) -> String
     def delete: (String | Symbol key) -> String
     def self.value_of: (untyped value) -> untyped
     def self.parse: (String json) -> untyped

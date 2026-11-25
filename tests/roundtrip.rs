@@ -148,6 +148,7 @@ fn tiny_blog_round_trips() {
         direct_helpers: vec![],
         redirects: vec![],
         diagnostics: vec![],
+        url_protocols: vec![],
     };
 
     let app = App {
