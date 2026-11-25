@@ -279,6 +279,17 @@ fn binds_local(e: &Expr) -> bool {
         ExprNode::MultiAssign { targets, .. } if targets.iter().any(|t| matches!(t, LValue::Var { .. })) => true,
         ExprNode::Lambda { .. } => false,
         _ => {
+            // `rescue => e` and a pattern's names bind locals too.
+            let mut bound: Vec<Symbol> = Vec::new();
+            match &*e.node {
+                ExprNode::BeginRescue { rescues, .. } => bound.extend(rescues.iter().filter_map(|r| r.binding.clone())),
+                ExprNode::CaseMatch { arms, .. } => arms.iter().for_each(|arm| arm.pattern.bound_names(&mut bound)),
+                ExprNode::MatchPredicate { pattern, .. } | ExprNode::MatchRequired { pattern, .. } => pattern.bound_names(&mut bound),
+                _ => {}
+            }
+            if !bound.is_empty() {
+                return true;
+            }
             let mut found = false;
             e.node.for_each_child(&mut |c| found |= binds_local(c));
             found
@@ -419,6 +430,17 @@ mod tests {
         let mut app = app_with("Current.set(request: \"r\") { memo = 1 }");
         assert!(apply_current_set_lowering(&mut app).is_empty());
         assert!(lowered(&app).contains("Current.instance.then"), "{}", lowered(&app));
+    }
+
+    /// A pattern's names and a rescue's binding are locals of the block's
+    /// own too.
+    #[test]
+    fn a_block_binding_by_pattern_or_rescue_runs_through_then() {
+        for body in ["Current.set(request: \"r\") { 1 => memo }", "Current.set(request: \"r\") { begin; work; rescue => e; e; end }"] {
+            let mut app = app_with(body);
+            assert!(apply_current_set_lowering(&mut app).is_empty());
+            assert!(lowered(&app).contains("Current.instance.then"), "{body}:\n{}", lowered(&app));
+        }
     }
 
     /// Two call sites in one body name their locals apart, whatever their

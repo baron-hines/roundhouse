@@ -133,6 +133,10 @@ const PROBE: &str = r#"class ScopeProbe
     Current.set(user: 83) { memo = 1 }
     Current.set(user: 109) { memo ||= 2 }
   end
+  def self.sibling_patterns
+    Current.set(user: 83) { 1 => memo }
+    Current.set(user: 109) { memo ||= 2 }
+  end
   def self.callback_set
     Current.set(user: 10) { 0 }
     callback = -> { Current.set(user: 20) { 0 } }
@@ -187,7 +191,8 @@ fresh; Current.mode = :side; Current.user = 83; Current.account = "Z"
 check("restores in order", [31, 83, "Z"], [ScopeProbe.restore_order, Current.user, Current.account])
 fresh; check("sibling blocks' locals", 2, ScopeProbe.sibling_locals)
 fresh; check("a set run through a lambda", 47, ScopeProbe.callback_set)
-puts "Current.set: 24 checks passed"
+fresh; check("a pattern's local", 2, ScopeProbe.sibling_patterns)
+puts "Current.set: 25 checks passed"
 "##;
 
 #[test]
@@ -197,7 +202,7 @@ fn current_set_runs_its_block_and_restores_on_ruby() {
         .write("app/models/scope_probe.rb", PROBE)
         .run_ruby(ASSERTIONS);
     run.assert_passes();
-    assert_eq!(run.stdout.trim(), "Current.set: 24 checks passed");
+    assert_eq!(run.stdout.trim(), "Current.set: 25 checks passed");
 }
 
 #[test]
@@ -208,5 +213,5 @@ fn current_set_runs_its_block_and_restores_on_spinel() {
         .write("app/models/scope_probe.rb", PROBE)
         .run_spinel(ASSERTIONS);
     run.assert_passes();
-    assert!(run.stdout.contains("Current.set: 24 checks passed"), "{}", run.stdout);
+    assert!(run.stdout.contains("Current.set: 25 checks passed"), "{}", run.stdout);
 }
