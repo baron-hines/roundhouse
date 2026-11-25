@@ -80,6 +80,7 @@ module ActiveRecord
         Array[String] havings,
         Array[String] ctes,
         Array[Symbol | Hash[Symbol, Symbol | EagerFilter]] includes,
+        Array[String] references,
         Hash[Symbol, untyped] attrs
       ) -> Relation
     def copy_string_list: (Array[String] xs) -> Array[String]
@@ -244,6 +245,7 @@ module ActiveRecord
     def skip_preloading!: () -> Relation
     def preload_associations: (Array[Base] records) -> Array[Base]
     def references: (*Symbol names) -> Relation
+    def reference_names!: (Array[Symbol] names) -> Relation
     def merge: (Relation other) -> Relation
     def merge!: (Relation other) -> Relation
     def merge_orders!: (Relation other) -> nil
