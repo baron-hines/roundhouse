@@ -536,7 +536,8 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String
         Some(p) if matches!(&*p.node, ExprNode::Lit { value: Literal::Str { .. } }) => {
             let ExprNode::Lit { value: Literal::Str { value } } = &*p.node else { unreachable!() };
             let scheme = value.trim_end_matches("//").trim_end_matches(':');
-            parts.push(InterpPart::Text { value: format!("{scheme}://") });
+            // Not `://host`: Rails writes `"//"` as a protocol-relative URL.
+            parts.push(InterpPart::Text { value: if scheme.is_empty() { "//".to_string() } else { format!("{scheme}://") } });
         }
         Some(p) => {
             parts.push(InterpPart::Expr { expr: p });
@@ -697,8 +698,9 @@ fn strip_host_options(
     // what `emit::ruby::library::rewrite_url_helpers_absolute` builds
     // for the explicit `…routes.url_helpers.x_url(…, host:)` chain.
     // Two spellings, one rendering.
-    // Not only with a host: `x_url(…, protocol: "https")` is the request's host with that scheme.
-    if host.is_none() && protocol.is_none() {
+    // Not any protocol alone: only a literal one, normalized below; a run-time value (nil, `false`, "https://") stays as it was.
+    let literal_protocol = protocol.as_ref().is_some_and(|p| matches!(&*p.node, ExprNode::Lit { value: Literal::Str { .. } }));
+    if host.is_none() && !literal_protocol {
         return None;
     }
     Some((stem.to_string(), host, protocol))

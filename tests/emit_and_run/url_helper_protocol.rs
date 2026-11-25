@@ -6,7 +6,7 @@ use super::emit_and_run;
 
 const CONTROLLER: &str = r#"class PlainsController < ApplicationController
   def show
-    render plain: [article_url(1, protocol: "https"), plain_url(protocol: "ftp"), article_url(1, protocol: "https://"), article_url(1)].join(" ")
+    render plain: [article_url(1, protocol: "https"), plain_url(protocol: "ftp"), article_url(1, protocol: "https://"), article_url(1, protocol: "//"), article_url(1)].join(" ")
   end
 end
 "#;
@@ -17,7 +17,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/controllers/plains_controller.rb", CONTROLLER)
 }
 
-const EXPECTED: &str = "https://example.org/articles/1 ftp://example.org/plain https://example.org/articles/1 http://example.org/articles/1";
+const EXPECTED: &str = "https://example.org/articles/1 ftp://example.org/plain https://example.org/articles/1 //example.org/articles/1 http://example.org/articles/1";
 
 #[test]
 fn a_protocol_alone_keeps_the_request_s_host() {
