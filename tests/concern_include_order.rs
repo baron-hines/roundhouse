@@ -17,6 +17,8 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
+use roundhouse::project::BuildTarget;
+
 const CONCERNS: &[(&str, &str)] = &[
     ("first_label", "module FirstLabel\n  extend ActiveSupport::Concern\n\n  def label\n    \"first\"\n  end\nend\n"),
     ("second_label", "module SecondLabel\n  extend ActiveSupport::Concern\n\n  def label\n    \"second\"\n  end\nend\n"),
@@ -259,20 +261,84 @@ want = {}
     assert!(run.stdout.contains("include order passed"), "{}", run.stdout);
 }
 
-/// One controller reading `method` through the modules in `files`, against
-/// Ruby's answer for the same modules.
-fn single_case(files: &[(&str, &str)], include_lines: &str, method: &str, want: &str) {
+/// The app of one controller that includes `include_lines` and renders
+/// `method`, with the concerns in `files`. Its private `source_one` and
+/// `source_two` answer what a delegated `label` reads.
+fn single_app(files: &[(&str, &str)], include_lines: &str, method: &str) -> emit_and_run::Overlay {
     let mut app = emit_and_run::empty_app()
-        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+        .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
     for (file, source) in files {
         app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
     }
-    app = app
-        .write(
-            "app/controllers/single_controller.rb",
-            &format!("class SingleController < ApplicationController\n{include_lines}\n  def show\n    render json: {{ label: {method} }}\n  end\nend\n"),
-        )
-        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n");
+    app.write(
+        "app/controllers/single_controller.rb",
+        &format!(
+            "class SingleController < ApplicationController\n{include_lines}\n  def show\n    render json: {{ label: {method} }}\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n"
+        ),
+    )
+    .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+}
+
+/// The controller as `target` emits it, from the app `single_app` makes.
+fn emitted_controller(files: &[(&str, &str)], include_lines: &str, target: BuildTarget) -> String {
+    let (emitted, errors) = single_app(files, include_lines, "label").emit(target);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let path = emitted.join("app/controllers/single_controller.rb");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The modules each `include` of the ingested controller names, as the
+/// splice and the analyzer read them: after a hook's includes are carried
+/// onto the controller's own `include`.
+fn ingested_include_lines(files: &[(&str, &str)], include_lines: &str) -> Vec<Vec<String>> {
+    use roundhouse::dialect::ControllerBodyItem;
+    use roundhouse::expr::ExprNode;
+    let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = std::collections::HashMap::new();
+    tree.insert("app/controllers/application_controller.rb".into(), b"class ApplicationController < ActionController::API\nend\n".to_vec());
+    for (file, source) in files {
+        tree.insert(format!("app/controllers/concerns/{file}.rb").into(), source.as_bytes().to_vec());
+    }
+    tree.insert(
+        "app/controllers/single_controller.rb".into(),
+        format!("class SingleController < ApplicationController\n{include_lines}\n  def show\n    head :ok\n  end\nend\n").into_bytes(),
+    );
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let controller = app.controllers.iter().find(|c| c.name.0.as_str() == "SingleController").expect("SingleController");
+    controller
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ControllerBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "include" => Some(
+                    args.iter()
+                        .map(|arg| match &*arg.node {
+                            ExprNode::Const { path } => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+                            other => format!("{other:?}"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The body of `def label` in the controller `target` emits, its lines
+/// trimmed.
+fn spliced_label(files: &[(&str, &str)], include_lines: &str, target: BuildTarget) -> String {
+    let controller = emitted_controller(files, include_lines, target);
+    let at = controller.find("  def label\n").unwrap_or_else(|| panic!("no spliced label:\n{controller}"));
+    let body = &controller[at + "  def label\n".len()..];
+    let end = body.find("\n  end\n").unwrap_or_else(|| panic!("label unterminated:\n{controller}"));
+    body[..end].trim().to_string()
+}
+
+/// One controller reading `method` through the modules in `files`, against
+/// Ruby's answer for the same modules.
+fn single_case(files: &[(&str, &str)], include_lines: &str, method: &str, want: &str) {
+    let app = single_app(files, include_lines, method);
     let script = format!(
         r##"status, _headers, body = begin
   Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
@@ -336,4 +402,23 @@ fn a_self_included_hook_defines_on_the_includer() {
         "label",
         "hook",
     );
+}
+
+
+/// `include B, C, HookWrapper` includes HookWrapper first, and its hook
+/// includes B right above it. The explicit B then finds B there and moves
+/// nothing, and C goes above them: `[Single, C, B, HookWrapper]` (#2278).
+#[test]
+fn a_hook_include_goes_in_before_the_explicit_arguments_left_of_it() {
+    let files = [
+        ("b", "module B\n  def label\n    \"b\"\n  end\nend\n"),
+        ("c", "module C\n  def label\n    \"c\"\n  end\nend\n"),
+        ("hook_wrapper", "module HookWrapper\n  extend ActiveSupport::Concern\n\n  included do\n    include B\n  end\nend\n"),
+    ];
+    let lines = "  include B, C, HookWrapper\n";
+    // The explicit B stays beside the one the hook carries: dropping either
+    // would put B back ahead of C.
+    assert_eq!(ingested_include_lines(&files, lines), [["B", "C", "B", "HookWrapper"]]);
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"c\"");
+    single_case(&files, lines, "label", "c");
 }

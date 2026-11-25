@@ -5767,15 +5767,25 @@ fn carry_included_block_includes_into_controllers(app: &mut App) {
             if method.as_str() != "include" {
                 continue;
             }
-            let mut carried = Vec::with_capacity(args.len());
-            for arg in std::mem::take(args) {
+            // `include B, C, Hooked` includes `Hooked` first, then `C`, then
+            // `B`, so the arguments are walked last first: a module the
+            // hook includes goes in ahead of `Hooked` before an explicit
+            // argument left of it is seen. Each argument's piece is its
+            // carried modules, then itself, and the pieces keep the
+            // arguments' order. An explicit argument stays even when a hook
+            // already included it (`include B, C, B, Hooked`), as Ruby moves
+            // nothing for it (#2278).
+            let mut pieces: Vec<Vec<Expr>> = Vec::with_capacity(args.len());
+            for arg in std::mem::take(args).into_iter().rev() {
+                let mut piece = Vec::new();
                 if let Some(id) = id_of(&arg) {
                     seen.insert(id.clone());
-                    ahead_of(&id, &block_includes, &mut seen, &mut carried);
+                    ahead_of(&id, &block_includes, &mut seen, &mut piece);
                 }
-                carried.push(arg);
+                piece.push(arg);
+                pieces.push(piece);
             }
-            *args = carried;
+            *args = pieces.into_iter().rev().flatten().collect();
         }
     }
 }
