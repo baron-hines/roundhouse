@@ -20,4 +20,17 @@ module SidekiqEnvelope
   def self.with_error: (String raw, String queue, String error_class, String message, Integer now_ms) -> String
   def self.with_enqueued_at: (String raw, Integer now_ms) -> String
   def self.truncate: (String message) -> String
+  def self.retry_in_choice: (untyped rv) -> Integer
+  def self.native_args: (untyped args) -> Integer
+  def self.native_int: (untyped v, String where) -> Integer
+  def self.native_float: (untyped v, String where) -> Float
+  def self.native_str: (untyped v, String where) -> String
+  def self.native_bool: (untyped v, String where) -> bool
+  def self.native_null: (untyped v, String where) -> nil
+  def self.native_scalar: (untyped v, String where) -> untyped
+  def self.native_scalar_array: (untyped v, String where) -> untyped
+  def self.native_scalar_hash: (untyped v, String where) -> untyped
+  def self.native_array: (untyped v, String where) -> Integer
+  def self.native_hash: (untyped v, String where) -> Integer
+  def self.json_kind: (untyped v) -> String
 end
