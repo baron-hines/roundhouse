@@ -5909,6 +5909,12 @@ fn spanned_include_statements(lc: &LibraryClass) -> Vec<(crate::span::Span, Vec<
     out
 }
 
+/// Whether a controller's body item is a `prepend` statement.
+fn is_prepend(item: &crate::dialect::ControllerBodyItem) -> bool {
+    matches!(item, crate::dialect::ControllerBodyItem::Unknown { expr, .. }
+        if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "prepend"))
+}
+
 /// Where an opening runs `extend ActiveSupport::Concern`, which the
 /// ingest keeps as one of its unmodelled calls.
 fn extends_active_support_concern(lc: &LibraryClass) -> Option<crate::span::Span> {
@@ -6218,15 +6224,25 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         expanded: Default::default(),
         walking: Default::default(),
     };
-    // Each controller's statements across its openings, and its
-    // superclass, for the modules a child finds in its superclass's chain.
-    let mut controller_groups: HashMap<crate::ident::ClassId, Vec<Vec<crate::ident::ClassId>>> = HashMap::default();
+    // A concern's `prepend_features` does nothing when the class has it
+    // already, through its superclass too; a plain module is prepended again.
+    let not_prepended_again = |groups: Vec<Vec<crate::ident::ClassId>>, inherited: &crate::det::HashSet<crate::ident::ClassId>| {
+        groups
+            .into_iter()
+            .map(|group| group.into_iter().filter(|m| !(concerns.contains(m) && inherited.contains(m))).collect::<Vec<_>>())
+            .filter(|group| !group.is_empty())
+            .collect::<Vec<_>>()
+    };
+    // Each controller's statements across its openings, each with whether
+    // it is a `prepend`, and its superclass, for the modules a child finds
+    // in its superclass's chain.
+    let mut controller_groups: HashMap<crate::ident::ClassId, Vec<(bool, Vec<crate::ident::ClassId>)>> = HashMap::default();
     let mut controller_parent: HashMap<crate::ident::ClassId, crate::ident::ClassId> = HashMap::default();
     for controller in &app.controllers {
         controller_groups
             .entry(controller.name.clone())
             .or_default()
-            .extend(crate::analyze::controller_include_statements(controller).into_iter().map(|(_, group)| group));
+            .extend(crate::analyze::controller_include_statements(controller).into_iter().map(|(at, group)| (is_prepend(&controller.body[at]), group)));
         if let Some(parent) = &controller.parent {
             controller_parent.entry(controller.name.clone()).or_insert_with(|| parent.clone());
         }
@@ -6257,7 +6273,22 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         let mut library: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
         for p in parents.into_iter().rev() {
             let groups = controller_groups.get(p);
-            let chain = ancestry.of_statements(groups.or_else(|| module_statements.get(p)).map(Vec::as_slice).unwrap_or(&[]), &above);
+            // A controller's prepends go ahead of it and its includes below:
+            // `[M, P, N]` for `prepend M; include N`. A class in lib/ is
+            // read from its includes only.
+            let chain = match groups {
+                Some(groups) => {
+                    let of = |prepend: bool| groups.iter().filter(|(p, _)| *p == prepend).map(|(_, group)| group.clone()).collect::<Vec<_>>();
+                    let mut chain = ancestry.of_statements(&not_prepended_again(of(true), &above), &crate::det::HashSet::default());
+                    for module in ancestry.of_statements(&of(false), &above) {
+                        if !chain.contains(&module) {
+                            chain.push(module);
+                        }
+                    }
+                    chain
+                }
+                None => ancestry.of_statements(module_statements.get(p).map(Vec::as_slice).unwrap_or(&[]), &above),
+            };
             if groups.is_none() {
                 library.extend(chain.iter().cloned());
             }
@@ -6316,16 +6347,15 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         // what the superclass's chain has already.
         let (inherited_order, from_library) = inherited_of(&controller.name);
         let inherited: crate::det::HashSet<crate::ident::ClassId> = inherited_order.iter().cloned().collect();
-        let (prepended, included): (Vec<_>, Vec<_>) = statements.iter().partition(|(at, _)| {
-            matches!(&controller.body[*at], ControllerBodyItem::Unknown { expr, .. }
-                if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "prepend"))
-        });
+        let (prepended, included): (Vec<_>, Vec<_>) = statements.iter().partition(|(at, _)| is_prepend(&controller.body[*at]));
         let groups = |of: Vec<&(usize, Vec<crate::ident::ClassId>)>| of.into_iter().map(|(_, group)| group.clone()).collect::<Vec<_>>();
         let (prepended, included) = (groups(prepended), groups(included));
-        // `prepend` puts a module ahead of the class even when the
-        // superclass's chain has it already; `include` adds nothing then.
+        // `prepend` puts a plain module ahead of the class even when the
+        // superclass's chain has it already; `include` adds nothing then,
+        // and neither does a concern's `prepend` (#2278).
         let none = crate::det::HashSet::default();
-        let mut queue = ancestry.of_statements(&prepended, &none);
+        let prepended_here: crate::det::HashSet<crate::ident::ClassId> = prepended.iter().flatten().cloned().collect();
+        let mut queue = ancestry.of_statements(&not_prepended_again(prepended, &inherited), &none);
         let ahead = queue.len();
         for module in ancestry.of_statements(&included, &inherited) {
             if !queue.contains(&module) {
@@ -6387,7 +6417,8 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         // `included do` runs in the includer, in hook order: its delegates
         // go in that order, and the methods it defines are the includer's
         // own, the last hook's ahead. The rest come in ancestor order.
-        let hooks = ancestry.hook_order(&include_groups, &inherited);
+        // A `prepend` runs the concern's `prepended do`, not this (#2278).
+        let hooks = ancestry.hook_order(&included, &inherited);
         let mut hook_order: Vec<&crate::ident::ClassId> = Vec::new();
         for module in hooks.iter().chain(&queue) {
             if !hook_order.contains(&module) {
@@ -6442,8 +6473,9 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         };
         let mut wrapped: Vec<&crate::ident::ClassId> =
             queue.iter().rev().filter(|module| from_library.contains(*module) && !carried_here(module)).collect();
+        // One this controller prepends ran no `included` hook (#2278).
         for module in queue.iter().rev().filter(|module| !inherited.contains(*module)) {
-            if !hooks.contains(module) && !carried_here(module) {
+            if !hooks.contains(module) && !carried_here(module) && !prepended_here.contains(module) {
                 wrapped.push(module);
             }
             wrapped.extend(carried.get(module).into_iter().flatten().copied());
@@ -6495,6 +6527,9 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 // A hook that ran on a lib/ superclass made its defs there,
                 // ahead of the module's own (#2278).
                 Pick::Own if from_library.contains(module) && !hooked.contains(module) && !is_carried(module) => by_hook.chain(own).collect(),
+                // A module this controller prepends ran no `included` hook
+                // here: a prepend runs its `prepended do` (#2278).
+                Pick::Own if prepended_here.contains(module) && !hooked.contains(module) && !is_carried(module) => own.collect(),
                 // A hook that ran nowhere the chain shows: its defs are read
                 // as the module's, below its own of the same name.
                 Pick::Own if !hooked.contains(module) && !is_carried(module) => {
