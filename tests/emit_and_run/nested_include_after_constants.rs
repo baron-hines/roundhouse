@@ -216,3 +216,18 @@ puts "includes across files passed"
         )
         .assert_passes();
 }
+
+/// The concern reads the includer's constant rooted (`::Ledger::TYPES`):
+/// the same read as `Ledger::TYPES`, so the concern still loads after it.
+#[test]
+fn a_nested_concern_reading_a_rooted_includer_constant_runs_on_ruby() {
+    let stamping = READING_STAMPING.replace("= Ledger::TYPES", "= ::Ledger::TYPES");
+    app(LEDGER, &stamping)
+        .run_ruby(
+            r#"
+raise "kinds: #{Ledger.new.kinds.inspect}" unless Ledger.new.kinds == ["A", "B"]
+puts "rooted constant read passed"
+"#,
+        )
+        .assert_passes();
+}
