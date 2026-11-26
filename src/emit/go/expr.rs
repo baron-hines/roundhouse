@@ -4688,13 +4688,7 @@ fn box_nullable_column_arg(method: &str, arg: &Expr, arg_s: &str) -> Option<Stri
     if !UNTYPED_ARG_HELPERS.contains(&method) {
         return None;
     }
-    let go_ty = match &*arg.node {
-        ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
-        ExprNode::Send { recv: Some(inner), method: m, args: a, .. } if a.is_empty() => {
-            recv_column_go_ty(inner, m.as_str())
-        }
-        _ => None,
-    }?;
+    let go_ty = nullable_read_go_ty(arg)?;
     let f = match go_ty.as_str() {
         "*string" => "AnyString",
         "*int64" => "AnyInt64",
@@ -4711,13 +4705,7 @@ fn box_nullable_column_arg(method: &str, arg: &Expr, arg_s: &str) -> Option<Stri
 /// `interface{}` slot (nil stays nil). `None` when `v` is no such read
 /// or the slot already holds the pointer.
 fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
-    let ptr = match &*v.node {
-        ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
-        ExprNode::Send { recv: Some(inner), method: m, args, .. } if args.is_empty() => {
-            recv_column_go_ty(inner, m.as_str())
-        }
-        _ => None,
-    }?;
+    let ptr = nullable_read_go_ty(v)?;
     let (scalar, deref, any) = match ptr.as_str() {
         "*string" => ("string", "DerefString", "AnyString"),
         "*int64" => ("int64", "DerefInt64", "AnyInt64"),
