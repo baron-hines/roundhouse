@@ -523,6 +523,7 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_extends_module(m.body())
         || module_includes_module(m.body())
         || body_hands_itself_out(m.body())
+        || m.body().is_some_and(|b| super::library_class::concern_body_evaluates_class_eval_loop(&flatten_statements(b)))
 }
 
 /// A module whose body hands itself to a call as it loads (devise's `Devise::Models.config(self, :pepper)`

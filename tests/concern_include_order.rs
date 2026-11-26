@@ -708,3 +708,70 @@ fn a_prepend_runs_no_included_hook() {
     let lines = "  prepend DelegateOne\n  include PlainDef\n";
     single_case(&[delegate_one, PLAIN_DEF], lines, "label", "plain");
 }
+
+const LOOP_HOOK_HOST: (&str, &str) = (
+    "loop_hook_host",
+    "module LoopHookHost\n  extend ActiveSupport::Concern\n  %w[x].each { |m| class_eval \"included do\\n  def label\\n    \\\"hooked\\\"\\n  end\\nend\\n\" }\nend\n",
+);
+
+/// A `class_eval` loop's string runs in the concern's body, so its
+/// `included do` is the concern's hook: its def is the includer's (#2278).
+#[test]
+fn a_class_eval_loops_included_hook_defines_on_the_includer() {
+    single_case(&[LOOP_HOOK_HOST], "  include LoopHookHost\n", "label", "hooked");
+    assert!(emitted_controller(&[LOOP_HOOK_HOST], "  include LoopHookHost\n", BuildTarget::Spinel).contains("\"hooked\""));
+}
+
+/// A `def` the string writes beside its `included do` is the concern's own,
+/// not the hook's: PlainLabel, included later, stands ahead of it (#2278).
+#[test]
+fn a_def_beside_a_loops_included_hook_stays_the_concerns() {
+    let host = (
+        "loop_hook_plain_beside",
+        "module LoopHookPlainBeside\n  extend ActiveSupport::Concern\n  %w[x].each { |m| class_eval \"def label\\n  \\\"plain\\\"\\nend\\nincluded do\\n  def hooked\\n    \\\"hooked\\\"\\n  end\\nend\\n\" }\nend\n",
+    );
+    let plain = ("plain_label", "module PlainLabel\n  extend ActiveSupport::Concern\n\n  def label\n    \"other\"\n  end\nend\n");
+    let lines = "  include LoopHookPlainBeside\n  include PlainLabel\n";
+    single_case(&[host, plain], lines, "label", "other");
+    single_case(&[host, plain], lines, "hooked", "hooked");
+}
+
+/// A hook def of a name the concern's body also defines: Ruby gives the
+/// hook's (`"hooked"`, defined on the includer), which the splice doesn't
+/// model, so it is refused as the same `included do` written in the body
+/// is, not answered with the body's def (#2278).
+#[test]
+fn a_loops_hook_def_of_the_hosts_name_is_refused_as_the_bodys_is() {
+    let hook = "included do\\n  def label\\n    \\\"hooked\\\"\\n  end\\nend\\n";
+    let looped = ("loop_hook_own_def", format!("module LoopHookOwnDef\n  extend ActiveSupport::Concern\n  %w[x].each {{ |m| class_eval \"{hook}\" }}\n\n  def label\n    \"host\"\n  end\nend\n"));
+    let direct = ("direct_hook_own_def", "module DirectHookOwnDef\n  extend ActiveSupport::Concern\n  included do\n    def label\n      \"hooked\"\n    end\n  end\n\n  def label\n    \"host\"\n  end\nend\n");
+    let refusal = |files: &[(&str, &str)], lines: &str| {
+        let (_, errors) = single_app(files, lines, "label").emit(BuildTarget::Ruby);
+        errors.iter().map(|e| format!("{e:?}")).find(|e| e.contains("nested def not supported")).map(|e| e.contains("`def label`"))
+    };
+    assert_eq!(refusal(&[direct], "  include DirectHookOwnDef\n"), Some(true));
+    assert_eq!(refusal(&[(looped.0, looped.1.as_str())], "  include LoopHookOwnDef\n"), Some(true));
+}
+
+/// Without `extend ActiveSupport::Concern`, `included do` is Module#included
+/// called with no argument, which raises as the module loads: the string's
+/// hook is not read as a concern's, and nothing of it reaches the includer.
+#[test]
+fn a_plain_modules_loop_included_block_is_no_hook() {
+    let host = ("loop_not_concern", "module LoopNotConcern\n  %w[x].each { |m| class_eval \"included do\\n  def label\\n    \\\"hooked\\\"\\n  end\\nend\\n\" }\nend\n");
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+        assert!(!emitted_controller(&[host], "  include LoopNotConcern\n", target).contains("hooked"), "{target:?}");
+    }
+}
+
+/// A module whose body only extends ActiveSupport::Concern, with no loop,
+/// stays out of the library classes as before: only a `class_eval` loop
+/// that runs in the concern keeps a module with no `def` of its own (#2278).
+#[test]
+fn a_concern_with_only_its_extend_is_still_not_a_library_class() {
+    let only_extend = "module OnlyExtend\n  extend ActiveSupport::Concern\nend\n";
+    assert!(roundhouse::ingest::ingest_library_classes(only_extend.as_bytes(), "only_extend.rb").expect("ingest").is_empty());
+    let looped = "module LoopOnly\n  extend ActiveSupport::Concern\n  %w[x].each { |m| class_eval \"included do\\n  def label\\n    \\\"hooked\\\"\\n  end\\nend\\n\" }\nend\n";
+    let classes = roundhouse::ingest::ingest_library_classes(looped.as_bytes(), "loop_only.rb").expect("ingest");
+    assert_eq!(classes.iter().map(|c| c.name.0.as_str()).collect::<Vec<_>>(), ["LoopOnly"]);
+}

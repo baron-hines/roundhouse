@@ -4977,10 +4977,40 @@ fn walk_decl_body_with_visibility<'pr>(
     // later `def` of the body replaces one of them only by name, which no target here orders by.
     let mut from_eval: Vec<usize> = Vec::new();
     for ((start, end), source) in evaled {
-        let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
+        // In a body that extends ActiveSupport::Concern the string runs there too, so its `included do` is the
+        // concern's hook (#2278): the wrapper extends it as well, and its empty `def`s of the body's own names let
+        // the hoist keep a colliding hook def in the block, as it does for the body's own `included do`. Neither
+        // the `extend` nor those `def`s is the string's.
+        let prefix = match &concern_direct_defs {
+            Some(direct) => {
+                let mut names: Vec<&String> = direct.iter().collect();
+                names.sort();
+                let stubs: String = names.iter().map(|name| format!("def {name}(*)\nend\n")).collect();
+                format!("class RoundhouseClassEval\nextend ActiveSupport::Concern\n{stubs}")
+            }
+            None => "class RoundhouseClassEval\n".to_string(),
+        };
+        let prefix_end = prefix.len() as u32;
+        let wrapped = format!("{prefix}{source}\nend\n");
         let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
         let mut classes = parsed?;
-        let Some(class) = classes.pop() else { continue };
+        let Some(mut class) = classes.pop() else { continue };
+        class.unknown_calls.retain(|call| call.span.is_synthetic() || call.span.start >= prefix_end);
+        class.methods.retain(|m| m.name_span.is_synthetic() || m.name_span.start >= prefix_end);
+        // The string's `included` blocks, at their offsets in it, and a span inside the loop's own for them and the
+        // defs hoisted out of them: a `def` the string writes beside the block stays at the loop's span, which the
+        // block's no longer holds, so it is not read as the hook's (`in_included_hook`).
+        let hooks: Vec<Span> = class
+            .unknown_calls
+            .iter()
+            .filter(|call| {
+                concern_direct_defs.is_some()
+                    && matches!(&*call.node, ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "included")
+            })
+            .map(|call| call.span)
+            .collect();
+        let in_hook = |at: Span| hooks.iter().any(|h| h.start <= at.start && at.end <= h.end);
+        let at_hook = Span { file: super::sources::file_id(file), start: start + 1, end };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
         // Each has the loop's span, as it runs there: a name the string spells (`include Leaf`, the host's nested
         // `Leaf`) is looked up in the loop, and an `extend` it makes runs after the includes written ahead of the
@@ -5012,7 +5042,7 @@ fn walk_decl_body_with_visibility<'pr>(
         }
         out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
             let mut call = call.clone();
-            call.span = at_loop;
+            call.span = if in_hook(call.span) { at_hook } else { at_loop };
             mark_constants(&mut call);
             call
         }));
@@ -5028,7 +5058,7 @@ fn walk_decl_body_with_visibility<'pr>(
                 method.receiver = MethodReceiver::Class;
             }
             // At the loop: the carrier spans (`ingest_concern_class_method_spans`) name it, as they do the body's `def`s.
-            method.name_span = Span { file: super::sources::file_id(file), start, end };
+            method.name_span = if in_hook(method.name_span) { at_hook } else { at_loop };
             match out.methods.iter().position(|m| m.name == method.name && m.receiver == method.receiver) {
                 // A later string's `def` replaces an earlier string's, as Ruby runs them in order.
                 Some(at) if from_eval.contains(&at) => out.methods[at] = method,
@@ -5063,6 +5093,23 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
         }
     }
     (kept, evaled)
+}
+
+/// Whether a module body extends ActiveSupport::Concern and runs a `class_eval` loop `unroll_class_eval_loops`
+/// evaluates: the loop's string runs in the concern, and an `included do` it writes is the concern's hook (#2278),
+/// so the module is kept although it writes no `def` of its own.
+pub(super) fn concern_body_evaluates_class_eval_loop(statements: &[ruby_prism::Node<'_>]) -> bool {
+    let extends_concern = statements.iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && constant_id_str(&call.name()) == "extend"
+                && call.arguments().is_some_and(|args| {
+                    args.arguments().iter().any(|arg| constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveSupport::Concern"))
+                })
+        })
+    });
+    let lists = class_attribute_lists(statements);
+    extends_concern && statements.iter().any(|stmt| class_eval_loop_sources(stmt, &lists).is_some())
 }
 
 /// Rails 8's `FormBuilder.field_helpers`, also the list without a lockfile; Rails 7 spells two of them
