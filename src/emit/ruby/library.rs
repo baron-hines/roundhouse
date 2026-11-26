@@ -11052,7 +11052,7 @@ fn constant_readers(
         for call in other.unknown_calls.iter().chain(&other.class_ivar_initializers) {
             walk_const_paths(call, &mut paths);
         }
-        for path in &paths {
+        for path in paths.into_iter().map(unrooted_read) {
             let read = match path.split_last() {
                 Some((last, prefix)) if names.contains(last.as_str()) => {
                     prefix.iter().map(String::as_str).eq(own_segs.iter().copied())
@@ -11070,6 +11070,16 @@ fn constant_readers(
         }
     }
     out
+}
+
+/// A read's path as `constant_readers` keys it: the rooted `::Ledger::TYPES`
+/// (stored with a leading empty segment) reads the same constant as
+/// `Ledger::TYPES`. A rooted bare `::TYPES` stays rooted: it is no nested read.
+fn unrooted_read(mut path: Vec<String>) -> Vec<String> {
+    if path.len() > 2 && path[0].is_empty() {
+        path.remove(0);
+    }
+    path
 }
 
 /// Every constant path each library class's load-time code (constant
@@ -11126,7 +11136,7 @@ impl ConstantReaderIndex {
                 walk_const_paths(call, &mut paths);
             }
             for path in paths {
-                index.entry(path).or_default().push(j);
+                index.entry(unrooted_read(path)).or_default().push(j);
             }
         }
         let key = app as *const App as usize;
