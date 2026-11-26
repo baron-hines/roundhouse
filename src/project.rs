@@ -14029,12 +14029,44 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
         })
         .flat_map(|(_, c)| c.lines().filter_map(top_name).collect::<Vec<_>>())
         .collect();
+    // The paths the gem's own top-level headers open, whole (`SVG::Graph::Graph`, `SVG`), and how: a module, a class, or a
+    // class with a superclass.
+    let declared: std::collections::BTreeMap<String, &'static str> = files
+        .iter()
+        .filter(|(p, c)| {
+            !p.starts_with("runtime/")
+                && p.ends_with(".rb")
+                && c.lines().any(|l| l.starts_with("#<SPINEL_SOURCE>") && l.contains(crate::ingest::source_gems::MOUNT))
+        })
+        .flat_map(|(_, c)| {
+            c.lines()
+                .filter_map(|l| {
+                    let (kind, rest) = match (l.strip_prefix("module "), l.strip_prefix("class ")) {
+                        (Some(rest), _) => ("module", rest),
+                        (_, Some(rest)) => ("class", rest),
+                        _ => return None,
+                    };
+                    let path: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+                    let kind = if kind == "class" && rest[path.len()..].trim_start().starts_with('<') { "subclass" } else { kind };
+                    Some((path, kind))
+                })
+                .collect::<Vec<_>>()
+        })
+        .fold(std::collections::BTreeMap::new(), |mut map, (path, kind)| {
+            // A class with a superclass in one header is that class in every other.
+            let entry = map.entry(path).or_insert(kind);
+            if kind == "subclass" || (kind == "class" && *entry == "module") {
+                *entry = kind;
+            }
+            map
+        });
     for (path, content) in files.iter_mut() {
         if path != "runtime/gem_facades.rb" && path != "runtime/gem_facades.rbs" {
             continue;
         }
         let lines: Vec<&str> = content.lines().collect();
         let mut keep = vec![true; lines.len()];
+        let mut replaced: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
         let mut i = 0;
         while i < lines.len() {
             if top_name(lines[i]).is_some_and(|n| defined.contains(&n)) {
@@ -14045,13 +14077,59 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
                 }
                 let end = (i + 1..lines.len()).find(|&j| lines[j] == "end").unwrap_or(lines.len() - 1);
                 keep[start..=end].iter_mut().for_each(|k| *k = false);
+                // Not the namespaces too: a gem's compound headers (`class SVG::Graph::Graph`) were written for the
+                // runtime anchor this file was, and a namespace with nothing of its own (svg-graph's `SVG::Graph`)
+                // has no other definition in the program.
+                // Only a module holding a declaration is a namespace: ROTP's `module Base32` façade is the gem's `class
+                // ROTP::Base32`, and an empty `module Base32` would contradict it.
+                let indent_of = |line: &str| line.len() - line.trim_start().len();
+                let declares = |line: &str| line.trim_start().starts_with("module ") || line.trim_start().starts_with("class ");
+                let mut open: Vec<usize> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                for j in i..=end {
+                    let line = lines[j];
+                    let indent = indent_of(line);
+                    let trimmed = line.trim_start();
+                    let is_module = trimmed.strip_prefix("module ").is_some_and(|rest| rest.chars().all(|c| c.is_alphanumeric() || c == '_'));
+                    if is_module && open.len() * 2 == indent {
+                        let close = (j + 1..=end).find(|&k| lines[k].trim_start() == "end" && indent_of(lines[k]) == indent).unwrap_or(end);
+                        let name = trimmed["module ".len()..].trim().to_string();
+                        let path = names.iter().cloned().chain(std::iter::once(name.clone())).collect::<Vec<_>>().join("::");
+                        // The gem's own kind for a path it declares: a `module` shell would reopen its class as a module. Not a
+                        // class it gives a superclass: this file loads first, and a bare `class` here would be Object's.
+                        let header = match declared.get(&path).copied() {
+                            None | Some("module") => Some("module"),
+                            Some("class") => Some("class"),
+                            _ => None,
+                        };
+                        if let Some(header) = header
+                            && (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2)
+                        {
+                            open.push(indent);
+                            names.push(name.clone());
+                            keep[j] = true;
+                            if header == "class" {
+                                replaced.insert(j, format!("{}class {name}", " ".repeat(indent)));
+                            }
+                        }
+                    } else if trimmed == "end" && open.last() == Some(&indent) {
+                        open.pop();
+                        names.pop();
+                        keep[j] = true;
+                    }
+                }
                 i = end + 1;
             } else {
                 i += 1;
             }
         }
         if keep.iter().any(|k| !k) {
-            let mut out: String = lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| format!("{l}\n")).collect();
+            let mut out: String = lines
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| keep[*j])
+                .map(|(j, l)| format!("{}\n", replaced.get(&j).map(String::as_str).unwrap_or(l)))
+                .collect();
             if !content.ends_with('\n') {
                 out.pop();
             }
@@ -17201,6 +17279,35 @@ mod tests {
     /// `require "bcrypt"`, its sidecar drops, the manifest declares the
     /// dependency, and the Makefile's binary build delegates to
     /// `spin build` (the raw $(SPINEL) lane can't resolve the package).
+    /// A gem compiled from source replaces its façade, but keeps the façade's
+    /// namespaces: the gem's compound `class SVG::Graph::Graph` headers were
+    /// written against them, and svg-graph declares nothing in `SVG::Graph`. A
+    /// module the façade only fills (ROTP's `Base32`, the gem's class) is not one.
+    #[test]
+    fn a_sourced_gem_keeps_its_facades_namespaces() {
+        let facade = "module GemFacade\nend\n\n# SVG — the stats graph.\nmodule SVG\n  module Graph\n    class TimeSeries\n      def initialize(_opts)\n        @opts = _opts\n      end\n    end\n  end\nend\n\nmodule ROTP\n  module Base32\n    def self.random\n      \"\"\n    end\n  end\nend\n\nmodule Mail\nend\n";
+        let gem = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG/Graph/Graph.rb:1\nclass SVG::Graph::Graph\nend\n";
+        let rotp = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/rotp-6.3.0/lib/rotp/base32.rb:1\nclass ROTP::Base32\nend\n";
+        let mut files = vec![
+            ("runtime/gem_facades.rb".to_string(), facade.to_string()),
+            ("app/models/svg/graph/graph.rb".to_string(), gem.to_string()),
+            ("app/models/rotp/base32.rb".to_string(), rotp.to_string()),
+        ];
+        let mut declared = files.clone();
+        drop_facades_the_program_defines(&mut files);
+        assert_eq!(files[0].1, "module GemFacade\nend\n\nmodule SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // A gem that declares the namespace itself (`class SVG`) gets no `module` shell to reopen it as.
+        declared[1].1 = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG.rb:1\nclass SVG\nend\nclass SVG::Graph::Graph\nend\n".to_string();
+        let mut subclassed = declared.clone();
+        drop_facades_the_program_defines(&mut declared);
+        // A class without a superclass keeps a `class` shell, so `SVG::Graph` still exists for the compound header.
+        assert_eq!(declared[0].1, "module GemFacade\nend\n\nclass SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // Not one with a superclass: this file loads before the gem, and a bare `class SVG` would make it Object's.
+        subclassed[1].1 = subclassed[1].1.replace("class SVG\n", "class SVG < Base\n");
+        drop_facades_the_program_defines(&mut subclassed);
+        assert_eq!(subclassed[0].1, "module GemFacade\nend\n\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+    }
+
     #[test]
     fn spin_shape_swaps_bcrypt_facade_for_the_package() {
         let makefile = "SPINEL ?= spinel\n\

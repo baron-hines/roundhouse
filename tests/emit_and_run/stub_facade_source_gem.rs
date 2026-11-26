@@ -38,7 +38,7 @@ fn the_spinel_tree_compiles_the_gem_behind_a_raising_facade() {
     let (emitted, errors) = overlay().emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(mentions(&emitted, "app/models/rotp/totp.rb", "def interval"), "rotp's source is not in the Spinel tree");
-    assert!(!mentions(&emitted, "runtime/gem_facades.rb", "module ROTP"), "the raising ROTP façade still ships");
+    assert!(!mentions(&emitted, "runtime/gem_facades.rb", "GemFacade.fail!(\"ROTP"), "the raising ROTP façade still ships");
     let makefile = std::fs::read_to_string(emitted.join("Makefile")).expect("Makefile");
     assert!(!makefile.contains("--int-overflow"), "{makefile}");
 }

@@ -1398,7 +1398,11 @@ fn every_runtime_method_body_concretely_typed() {
     // LoadError's, which no runtime signature declares (+1 in
     // action_controller/parameter_missing.rb); `Renderers::RENDERERS` adds
     // none. The ceiling is the measure.
-    const CEILING: usize = 1013;
+    // MEASURED 1014 on ActiveStorage::Current.set (1013): `set` answers what
+    // its block gives (+1 in active_storage.rb), as `transaction` does; the
+    // thread-held url_options are read through `.to_s` and add none.
+    // The ceiling is the measure.
+    const CEILING: usize = 1014;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

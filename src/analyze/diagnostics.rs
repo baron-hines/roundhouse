@@ -1397,6 +1397,7 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     out.extend(app.gem_middleware_refusals.iter().cloned());
     out.extend(app.included_hoist_conflicts.iter().cloned());
     out.extend(app.superclass_refusals.iter().cloned());
+    out.extend(app.current_attribute_refusals.iter().cloned());
     out.extend(app.gem_route_gaps.iter().cloned());
     // after_initialize bodies are the app's own code run at boot
     // (`ingest::after_initialize`): checked like a model method, not under

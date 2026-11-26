@@ -480,6 +480,8 @@ mod backticks;
 mod json_params_contract;
 #[path = "emit_and_run/json_params.rs"]
 mod json_params;
+#[path = "emit_and_run/current_attribute_defaults.rs"]
+mod current_attribute_defaults;
 #[path = "emit_and_run/raw_post_body.rs"]
 mod raw_post_body;
 #[path = "emit_and_run/scoped_new_form.rs"]
@@ -594,6 +596,8 @@ mod float_round_digits;
 mod autoload_once_paths;
 #[path = "emit_and_run/config_require_relative.rs"]
 mod config_require_relative;
+#[path = "emit_and_run/active_storage_current.rs"]
+mod active_storage_current;
 #[path = "emit_and_run/defined_const_fold.rs"]
 mod defined_const_fold;
 #[path = "emit_and_run/job_payload.rs"]
@@ -21011,6 +21015,8 @@ mod bigdecimal_clamp;
 mod partial_binop;
 #[path = "emit_and_run/union_block_params.rs"]
 mod union_block_params;
+#[path = "emit_and_run/tuple_element_param.rs"]
+mod tuple_element_param;
 #[path = "emit_and_run/format_once.rs"]
 mod format_once;
 #[path = "emit_and_run/condition_lambda_record.rs"]
