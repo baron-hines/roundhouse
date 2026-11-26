@@ -521,8 +521,10 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                     );
                 }
                 if let Some(ptr) = nullable_or_go_ty(left, right) {
+                    // Not nil alone for a Boolean: a stored false is falsy in Ruby too, and takes the right.
+                    let set = if ptr == "*bool" { "p != nil && *p" } else { "p != nil" };
                     return format!(
-                        "func() {ptr} {{ if p := {}; p != nil {{ return p }}; return {} }}()",
+                        "func() {ptr} {{ if p := {}; {set} {{ return p }}; return {} }}()",
                         emit_expr_as_value(ctx, left),
                         emit_expr_as_value(ctx, right)
                     );
@@ -4623,6 +4625,7 @@ fn nullable_read_go_ty(e: &Expr) -> Option<String> {
         ExprNode::Send { recv: Some(inner), method, args, block: None, .. } if args.is_empty() => {
             recv_column_go_ty(inner, method.as_str())
         }
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => nullable_or_go_ty(left, right),
         _ => None,
     })
 }
