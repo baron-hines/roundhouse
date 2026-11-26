@@ -76,3 +76,12 @@ fn a_default_inlining_would_change_is_reported() {
         assert!(!errors.is_empty(), "`default: {default}` must be reported");
     }
 }
+
+/// A local the callable closed over in the class body is unbound inside the reset.
+#[test]
+fn a_default_capturing_a_class_body_local_is_reported() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .write("app/models/current.rb", "class Current < ActiveSupport::CurrentAttributes\n  list = []\n  attribute :theme, default: -> { list }\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(!errors.is_empty(), "a captured local must be reported");
+}

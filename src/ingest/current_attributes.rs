@@ -195,7 +195,7 @@ fn default_value(value: &Expr) -> Option<Expr> {
     }
 }
 
-/// Inlined into `__reset_attributes`, `self`/ivars/receiverless calls would read the instance rather than the closure's class, and a non-final `return` would leave reset.
+/// Inlined into `__reset_attributes`, `self`/ivars/receiverless calls would read the instance rather than the closure's class, a captured local would be unbound, and a non-final `return` would leave reset.
 fn callable_body(body: &Expr) -> Option<Expr> {
     fn context_free(e: &Expr) -> bool {
         let here = !matches!(
@@ -210,6 +210,23 @@ fn callable_body(body: &Expr) -> Option<Expr> {
         let mut children = true;
         e.node.for_each_child(&mut |c| children &= context_free(c));
         here && children
+    }
+    fn assigned(e: &Expr, out: &mut Vec<Symbol>) {
+        if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. } = &*e.node {
+            out.push(name.clone());
+        }
+        e.node.for_each_child(&mut |c| assigned(c, out));
+    }
+    fn captures(e: &Expr, own: &[Symbol]) -> bool {
+        let here = matches!(&*e.node, ExprNode::Var { name, .. } if !own.contains(name));
+        let mut children = false;
+        e.node.for_each_child(&mut |c| children |= captures(c, own));
+        here || children
+    }
+    let mut own = Vec::new();
+    assigned(body, &mut own);
+    if captures(body, &own) {
+        return None;
     }
     let mut body = body.clone();
     let last = match &mut *body.node {
