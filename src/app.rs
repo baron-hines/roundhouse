@@ -1170,6 +1170,21 @@ pub struct ImportmapPin {
 }
 
 impl App {
+    /// Each of the app's classes and its superclass, a leading `::`
+    /// dropped. A subclass of a model with no table of its own is a
+    /// library class (chatwoot's `SuperAdmin < User`, campfire's
+    /// `Rooms::Open < Room`), so both lists are walked.
+    pub fn class_parents(&self) -> HashMap<&str, Option<&str>> {
+        fn parent(p: &Option<ClassId>) -> Option<&str> {
+            p.as_ref().map(|p| p.0.as_str().trim_start_matches("::"))
+        }
+        self.models
+            .iter()
+            .map(|m| (m.name.0.as_str(), parent(&m.parent)))
+            .chain(self.library_classes.iter().map(|c| (c.name.0.as_str(), parent(&c.parent))))
+            .collect()
+    }
+
     /// Drop the spare capacity ingest leaves in the unit collections.
     ///
     /// Building a tree by pushing leaves every `Vec` and `String` in it
@@ -1867,5 +1882,19 @@ fn extends_active_support_concern(lc: &crate::dialect::LibraryClass) -> bool {
                 matches!(&*arg.node, crate::expr::ExprNode::Const { path }
                     if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
             })
+    })
+}
+
+/// A class's superclasses in [`App::class_parents`], nearest first. The
+/// first parent that is no app class (`ApplicationRecord`'s
+/// `ActiveRecord::Base`) is the last one yielded, and a cycle ends the
+/// walk instead of looping.
+pub fn class_ancestors<'a>(parents: &'a HashMap<&'a str, Option<&'a str>>, class: &str) -> impl Iterator<Item = &'a str> {
+    let mut seen: crate::det::HashSet<&str> = crate::det::HashSet::default();
+    let mut current = parents.get(class).copied().flatten();
+    std::iter::from_fn(move || {
+        let name = current.filter(|name| seen.insert(name))?;
+        current = parents.get(name).copied().flatten();
+        Some(name)
     })
 }

@@ -41,7 +41,7 @@ pub(super) struct Facts {
 
 impl Facts {
     pub(super) fn of(app: &App) -> Self {
-        let parents = parents(app);
+        let parents = app.class_parents();
         let calls = devise_calls(app);
         let mut own: HashMap<String, HashSet<String>> = HashMap::default();
         for (class, args) in &calls {
@@ -62,7 +62,7 @@ impl Facts {
         // A subclass's are its parent's too (`class_attribute`): chatwoot's `SuperAdmin < User` declares none of its own.
         let mut devise_configured = own.clone();
         for name in parents.keys() {
-            for ancestor in ancestors(&parents, name) {
+            for ancestor in crate::app::class_ancestors(&parents, name) {
                 if let Some(inherited) = own.get(ancestor) {
                     devise_configured.entry(name.to_string()).or_default().extend(inherited.iter().cloned());
                 }
@@ -114,29 +114,6 @@ impl Facts {
     }
 }
 
-/// Each of the app's classes and its superclass: a subclass of a model with no table of its own is a library class (chatwoot's `SuperAdmin < User`).
-fn parents(app: &App) -> HashMap<&str, Option<&str>> {
-    fn parent(p: &Option<crate::ident::ClassId>) -> Option<&str> {
-        p.as_ref().map(|p| p.0.as_str().trim_start_matches("::"))
-    }
-    app.models
-        .iter()
-        .map(|m| (m.name.0.as_str(), parent(&m.parent)))
-        .chain(app.library_classes.iter().map(|c| (c.name.0.as_str(), parent(&c.parent))))
-        .collect()
-}
-
-/// A class's superclasses among the app's, nearest first.
-fn ancestors<'a>(parents: &'a HashMap<&'a str, Option<&'a str>>, class: &str) -> impl Iterator<Item = &'a str> {
-    let mut seen: HashSet<&str> = HashSet::default();
-    let mut current = parents.get(class).copied().flatten();
-    std::iter::from_fn(move || {
-        let name = current.filter(|name| seen.insert(name))?;
-        current = parents.get(name).copied().flatten();
-        Some(name)
-    })
-}
-
 /// Each class's `devise :a, :b` call, a model's or a library class's (a subclass with no table of its own), with its arguments.
 fn devise_calls(app: &App) -> Vec<(&str, &[Expr])> {
     fn is_devise(e: &Expr) -> Option<&[Expr]> {
@@ -184,7 +161,7 @@ fn devise_modules(parents: &HashMap<&str, Option<&str>>, calls: &[(&str, &[Expr]
     }
     let mut out: HashMap<String, Vec<String>> = HashMap::default();
     for name in parents.keys() {
-        let mut chain: Vec<&str> = ancestors(parents, name).collect();
+        let mut chain: Vec<&str> = crate::app::class_ancestors(parents, name).collect();
         chain.reverse();
         chain.push(name);
         let mut modules: Option<Vec<String>> = None;
