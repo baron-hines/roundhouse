@@ -2192,8 +2192,9 @@ pub(super) fn emit_send(
             let nilable_col = match &*r.node {
                 ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()).is_some(),
                 ExprNode::Send { recv: Some(inner), method: m, args, .. } if args.is_empty() => {
-                    nullable_column_go_ty(m.as_str()).is_some()
-                        || recv_column_is_nullable(inner, m.as_str())
+                    !recv_model_defines(inner, m.as_str())
+                        && (nullable_column_go_ty(m.as_str()).is_some()
+                            || recv_column_is_nullable(inner, m.as_str()))
                 }
                 _ => false,
             };
@@ -4597,10 +4598,7 @@ fn nullable_field_go_ty(e: &Expr) -> Option<String> {
 /// (`article.title` in a view).
 fn nullable_read_go_ty(e: &Expr) -> Option<String> {
     nullable_field_go_ty(e).or_else(|| match &*e.node {
-        // Not a reader the model defines over the column: that method answers its own type, not the column's pointer.
-        ExprNode::Send { recv: Some(inner), method, args, block: None, .. }
-            if args.is_empty() && !recv_model_defines(inner, method.as_str()) =>
-        {
+        ExprNode::Send { recv: Some(inner), method, args, block: None, .. } if args.is_empty() => {
             recv_column_go_ty(inner, method.as_str())
         }
         _ => None,
@@ -4727,6 +4725,10 @@ fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
 /// to, when the schema declares it nullable.
 fn recv_column_go_ty(recv: &Expr, column: &str) -> Option<String> {
     let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return None };
+    // Not a reader the model defines over the column: that method answers its own type, not the column's pointer.
+    if recv_model_defines(recv, column) {
+        return None;
+    }
     // Not the last segment: the table is keyed by the model's full path (`Admin::Article`), as `recv_model_defines` reads it.
     let model = id.0.as_str();
     ALL_NULLABLE_COLUMNS.with(|c| {
