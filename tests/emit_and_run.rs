@@ -25,6 +25,8 @@ mod url_helper_protocol;
 mod literal_send_untyped;
 #[path = "emit_and_run/duration_defined_units.rs"]
 mod duration_defined_units;
+#[path = "emit_and_run/form_field_attribute_order.rs"]
+mod form_field_attribute_order;
 #[path = "emit_and_run/eager_load_conditions.rs"]
 mod eager_load_conditions;
 #[path = "emit_and_run/zeitwerk_eager_gem.rs"]
@@ -2381,8 +2383,8 @@ fn localized_form_labels_and_submit_text() {
 const FORM_ERROR_CLASSES: &str = r#"a = Article.new(title: "", body: "long enough body")
 a.valid?
 html = Views::Articles.form(a)
-raise html unless html.include?("id=\"article_title\" class=\"block shadow-sm rounded-md border px-3 py-2 mt-2 w-full border-red-400 focus:outline-red-600\"")
-raise html unless html.include?("rows=\"4\" class=\"block shadow-sm rounded-md border px-3 py-2 mt-2 w-full border-gray-400 focus:outline-blue-600\">")
+raise html unless html.include?("<input class=\"block shadow-sm rounded-md border px-3 py-2 mt-2 w-full border-red-400 focus:outline-red-600\" type=\"text\" name=\"article[title]\" id=\"article_title\" />")
+raise html unless html.include?("<textarea rows=\"4\" class=\"block shadow-sm rounded-md border px-3 py-2 mt-2 w-full border-gray-400 focus:outline-blue-600\" name=\"article[body]\" id=\"article_body\">")
 "#;
 
 #[test]
@@ -2411,10 +2413,11 @@ const FIELD_WITH_ERRORS: &str = r#"a = Article.new(title: "", body: "long enough
 a.valid?
 html = Views::Articles.form(a)
 raise html unless html.include?("<div class=\"field_with_errors\"><label for=\"article_title\">Title</label></div>")
-raise html unless html.include?("<input name=\"article[title]\" type=\"hidden\" value=\"0\"><div class=\"field_with_errors\"><input type=\"checkbox\" value=\"1\" name=\"article[title]\" id=\"article_title\"></div>")
-raise html unless html.include?("<div class=\"field_with_errors\"><input type=\"text\" name=\"article[title]\" id=\"article_title\"")
+raise html unless html.include?("<input name=\"article[title]\" type=\"hidden\" value=\"0\" /><div class=\"field_with_errors\"><input type=\"checkbox\" value=\"1\" name=\"article[title]\" id=\"article_title\" /></div>")
+raise html unless html.include?("<div class=\"field_with_errors\"><input class=\"")
+raise html unless html.include?(" type=\"text\" name=\"article[title]\" id=\"article_title\" /></div>")
 raise html unless html.include?("<label for=\"article_body\">Body</label>\n")
-raise html unless html.include?("<textarea name=\"article[body]\"")
+raise html unless html.include?(" name=\"article[body]\" id=\"article_body\">\n")
 raise html if html.include?("<div class=\"field_with_errors\"><textarea")
 clean = Views::Articles.form(Article.new(title: "t", body: "long enough body"))
 raise clean if clean.include?("field_with_errors")

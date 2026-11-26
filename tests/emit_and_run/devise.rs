@@ -446,7 +446,7 @@ raise "sign-in page #{status}" unless status == 200
 token = page[/name="authenticity_token" value="([^"]*)"/, 1]
 status, _, failed = req("POST", "/users/sign_in", form.(token, "wrong"))
 raise "wrong password #{status}" unless status == 200
-raise "email kept #{failed}" unless failed.include?(%(name="user[email]" id="user_email" value="a@example.com"))
+raise "email kept #{failed}" unless failed.include?(%(value="a@example.com" name="user[email]" id="user_email"))
 status, headers, = req("POST", "/users/sign_in", form.(token, "secret123"))
 raise "sign in #{status} #{headers.inspect}" unless status == 302 && headers["location"].end_with?("/secret")
 status, = req("GET", "/secret")
@@ -599,7 +599,7 @@ fn a_devise_user_signs_in_over_http_natively() {
     );
     assert_eq!(failed.status, 200, "{}\n{}", failed.body, server.log());
     assert!(failed.body.contains(r#"<form class="new_user" id="new_user" action="/users/sign_in""#), "{}", failed.body);
-    assert!(failed.body.contains(r#"name="user[email]" id="user_email" value="a@example.com""#), "{}", failed.body);
+    assert!(failed.body.contains(r#"value="a@example.com" name="user[email]" id="user_email""#), "{}", failed.body);
     kept(&mut jar, &cookies);
     let form = format!("authenticity_token={}&user%5Bemail%5D=a%40example.com&user%5Bpassword%5D=secret123&commit=Log+in", form_encode(token));
     let cookie = header(&jar);
