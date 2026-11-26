@@ -29,10 +29,13 @@ fn with_svg_gem() -> emit_and_run::Overlay {
 fn a_namespace_a_source_compiled_gem_defines_leaves_the_gem_facade() {
     let (emitted, _errors) = with_svg_gem().emit(BuildTarget::Spinel);
     let facades = std::fs::read_to_string(emitted.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
-    assert!(!facades.contains("module SVG"), "{facades}");
+    assert!(!facades.contains("class TimeSeries"), "{facades}");
+    // Not the namespaces: the gem's compound `class SVG::Graph::…` headers look them up, and svg-graph declares nothing in them.
+    assert!(facades.contains("module SVG\n  module Graph\n  end\nend\n"), "{facades}");
     assert!(facades.contains("module Markly"), "the other façades stay:\n{facades}");
     let sig = std::fs::read_to_string(emitted.join("runtime/gem_facades.rbs")).expect("gem_facades.rbs");
-    assert!(!sig.contains("module SVG"), "{sig}");
+    assert!(!sig.contains("class TimeSeries"), "{sig}");
+    assert!(sig.contains("module SVG\n  module Graph\n  end\nend\n"), "{sig}");
 }
 
 /// An app's own reopening of a façade's namespace (campfire's
