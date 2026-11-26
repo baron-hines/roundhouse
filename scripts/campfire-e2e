@@ -122,10 +122,13 @@ trap cleanup EXIT INT TERM
 if [[ -n "$REUSE" ]]; then
     OUT="$REUSE"
     [[ -d "$OUT" ]] || fail "no such emit: $OUT"
+    OUT="$(cd "$OUT" && pwd)"
     step "reusing emit at $OUT"
 else
     [[ -d "$APP" ]] || fail "campfire-e2e: no app at $APP"
     [[ -z "$OUT" ]] && OUT="$(mktemp -d -t roundhouse-campfire-e2e.XXXXXX)"
+    # Absolute, not as given: the Spinel lane cds into the emit before it reads $OUT again.
+    mkdir -p "$OUT" && OUT="$(cd "$OUT" && pwd)"
     step "transpiling $APP → $OUT (target: $TARGET)"
     # `roundhouse -o` does not wipe, and a stale file from an older emit
     # outlives the run that wrote it. Always start clean.

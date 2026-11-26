@@ -1271,7 +1271,7 @@ fn sti_action(ctx: &ViewCtx, record: &Expr, singular: &str, persisted: &Expr, me
     let has = |n: &str| ctx.route_helper_names.contains(n);
     let arm = |stem: &str| {
         let member_name = format!("{stem}_path");
-        let collection_name = format!("{}_path", crate::naming::pluralize_snake(stem));
+        let collection_name = format!("{}_path", crate::lower::routes::collection_name(stem, &crate::naming::pluralize_snake(stem)));
         let member = has(&member_name).then(|| super::member_path_call(ctx, &member_name, member_arg.clone()));
         let collection = has(&collection_name).then(|| super::route_helpers_call(&collection_name, Vec::new()));
         match (member, collection) {
@@ -1337,6 +1337,10 @@ fn is_known_model_record(model: &Expr, ctx: &ViewCtx) -> bool {
         }
         _ => return false,
     };
+    // The expression's own type first: a local can share a name with a model ivar and hold a form object.
+    if let Some(crate::ty::Ty::Class { id, .. }) = model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        return ctx.model_param_keys.get(id.0.as_str()).is_some_and(|key| ctx.model_singulars.contains(key));
+    }
     // Not every typed ivar: a form object (`SearchForm`) has no `persisted?`, and keeps POST as in Rails.
     ctx.ivar_models.get(name).is_some_and(|key| ctx.model_singulars.contains(key))
 }

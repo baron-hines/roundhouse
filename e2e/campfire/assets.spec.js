@@ -22,7 +22,22 @@ import { watchForFailures, triage, report } from './helpers.js'
 // is a string in `config/importmap.rb`, and nothing but a browser ever
 // checks that a file exists behind it.
 
-test('the sign-in page and the room page load with nothing missing and nothing thrown', async ({ page }) => {
+// Its own signed-out context: the config's shared session would skip the sign-in page, and its assets with it.
+test('the sign-in page loads with nothing missing and nothing thrown', async ({ browser }) => {
+  const context = await browser.newContext({ storageState: { cookies: [], origins: [] } })
+  const page = await context.newPage()
+  try {
+    const findings = watchForFailures(page)
+    await page.goto('/session/new')
+    await page.waitForLoadState('load')
+    const { open } = triage([...findings.responses, ...findings.failed, ...findings.console, ...findings.errors])
+    expect(open, `the browser reported ${open.length} unledgered failure(s):\n${report(findings)}`).toEqual([])
+  } finally {
+    await context.close()
+  }
+})
+
+test('the room page loads with nothing missing and nothing thrown', async ({ page }) => {
   // BEFORE the first navigation — a listener attached after `goto`
   // misses everything the document itself pulled in.
   const findings = watchForFailures(page)
